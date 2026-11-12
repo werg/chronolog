@@ -72,6 +72,9 @@ export class ChronologNode {
   #consumerPhaseSince = Date.now()
   #stallWatchdog: NodeJS.Timeout | undefined
   #stallReported = false
+  #subscriptionAbort: AbortController | undefined
+  #backlogSince: number | undefined
+  #backlogAtStart = 0
   #lastError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
@@ -452,7 +455,9 @@ export class ChronologNode {
     while (!this.#abort.signal.aborted) {
       try {
         this.#setConsumerPhase('waiting-for-record')
-        for await (const record of this.#options.transport.subscribe(this.#abort.signal)) {
+        this.#subscriptionAbort = new AbortController()
+        const subscriptionSignal = AbortSignal.any([this.#abort.signal, this.#subscriptionAbort.signal])
+        for await (const record of this.#options.transport.subscribe(subscriptionSignal)) {
           this.#setConsumerPhase('waiting-for-ingest-lock')
           await this.ingest(record)
           this.#setConsumerPhase('waiting-for-record')
@@ -461,8 +466,9 @@ export class ChronologNode {
         this.#subscriptionRestarts += 1
       } catch (error) {
         if (this.#abort.signal.aborted) return
-        this.#recordError(error)
         this.#subscriptionRestarts += 1
+        if (this.#subscriptionAbort?.signal.aborted) continue
+        this.#recordError(error)
         await new Promise<void>((resolve) => {
           const timer = setTimeout(resolve, 1_000)
           timer.unref?.()
@@ -1040,11 +1046,30 @@ export class ChronologNode {
    * It only reports; it never changes what the node does.
    */
   async #checkIngestStall(): Promise<void> {
-    if (this.#closed || this.#stallReported || Date.now() - this.#consumerPhaseSince < 20_000) return
+    if (this.#closed) return
     const transport = await this.#options.transport.status()
-    if (transport.records <= this.#seen.size + this.#retryRecords.size) return
-    this.#stallReported = true
-    this.#recordError(new Error(`NODE_INGEST_STALLED:${this.#consumerPhase}`))
+    const backlog = transport.records - this.#seen.size - this.#retryRecords.size
+    if (backlog <= 0) {
+      this.#backlogSince = undefined
+      return
+    }
+    const now = Date.now()
+    if (!this.#stallReported && now - this.#consumerPhaseSince >= 20_000) {
+      this.#stallReported = true
+      this.#recordError(new Error(`NODE_INGEST_STALLED:${this.#consumerPhase}`))
+    }
+    // Fallback: records the transport holds but never delivered to this
+    // subscription (observed once under chaos stress, cause not yet
+    // identified). If the backlog has not shrunk for 20 s while the consumer
+    // keeps running, resubscribe; the new subscription replays history and
+    // already-seen records are skipped.
+    if (this.#backlogSince === undefined || backlog < this.#backlogAtStart) {
+      this.#backlogSince = now
+      this.#backlogAtStart = backlog
+    } else if (now - this.#backlogSince >= 20_000 && this.#consumerPhase === 'waiting-for-record') {
+      this.#backlogSince = undefined
+      this.#subscriptionAbort?.abort()
+    }
   }
 
   #advanceValidatorCutoff(now: number): void {

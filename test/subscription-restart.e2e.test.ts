@@ -55,6 +55,43 @@ describe('transport subscription restart', () => {
     }
     expect(nodeA.subscriptionRestarts).toBeGreaterThanOrEqual(1)
   })
+
+  it('resubscribes when a live subscription silently misses a record', async () => {
+    const network = new MemoryTransportNetwork()
+    const [a, b] = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
+    const capability = bytes32(4)
+    const membership: MembershipResolver = {
+      canWrite: () => false,
+      canValidate: ({ validatorId, validatorCapability }) =>
+        (equalBytes(validatorId, a.publicKeyBytes) || equalBytes(validatorId, b.publicKeyBytes)) && equalBytes(validatorCapability, capability),
+      threshold: () => 1,
+    }
+    const innerA = network.createNode('a')
+    let subscriptions = 0
+    const transportA: ChronologTransport = {
+      identity: innerA.identity,
+      publish: (payload, options) => innerA.publish(payload, options),
+      get: (id) => innerA.get(id),
+      history: () => innerA.history(),
+      // The first subscription stays open but drops every live record from b.
+      subscribe: (signal) => (subscriptions += 1) === 1
+        ? (async function* () { for await (const record of innerA.subscribe(signal)) if (record.author !== 'b') yield record })()
+        : innerA.subscribe(signal),
+      status: () => innerA.status(),
+      feedContiguousThrough: (feedId) => innerA.feedContiguousThrough(feedId),
+      close: () => innerA.close(),
+    }
+    const nodeA = await node('a2', a, transportA, membership, capability)
+    const nodeB = await node('b2', b, network.createNode('b'), membership, capability)
+    network.connectAll()
+    await nodeB.publishHeartbeat()
+    const deadline = Date.now() + 40_000
+    while ((await nodeA.status()).processedTransportRecords < 1) {
+      if (Date.now() > deadline) throw new Error('node A never recovered the missed record')
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    expect(subscriptions).toBeGreaterThanOrEqual(2)
+  }, 60_000)
 })
 
 async function node(name: string, identity: Ed25519KeyPair, transport: ChronologTransport, membership: MembershipResolver, capability: Uint8Array): Promise<ChronologNode> {
