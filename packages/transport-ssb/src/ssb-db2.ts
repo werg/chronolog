@@ -250,6 +250,7 @@ export class SsbDb2Transport implements ChronologTransport {
       }
       sbot = stack.use(db2).use(db2EbtCompat).use(ebt).call(null, {
         ...options.config,
+        db2: { ...DB2_LATENCY_DEFAULTS, ...configRecord(options.config?.db2) },
         path: options.path,
         keys,
         ...networkConfig,
@@ -626,6 +627,21 @@ export class SsbDb2Transport implements ChronologTransport {
 }
 
 const MAXIMUM_PENDING_DURABILITY_EVENTS = 4_096
+
+/**
+ * ssb-db2 debounces the append-log block write (`writeTimeout`) and each
+ * leveldb index flush (`flushDebounce`) by 250 ms each. publish() resolves
+ * only after the base index has drained, so those library defaults put about
+ * half a second of idle time on every local publish, and a validator
+ * publishes twice per admitted candidate. Both remain debounces (bursts still
+ * coalesce) and both remain overridable through `config.db2`; durability is
+ * unchanged because publish() still waits for the fsynced block write.
+ */
+const DB2_LATENCY_DEFAULTS = { writeTimeout: 10, flushDebounce: 10 } as const
+
+function configRecord(value: unknown): Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+}
 
 type PullEnd = true | Error | null
 type PullSource<T> = (end: PullEnd, callback: (end: PullEnd, value?: T) => void) => void
