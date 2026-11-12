@@ -411,7 +411,7 @@ export function canonicalSqlValueToCbor(value: CanonicalSqlValue): CborValue {
     case 'integer':
       protocolInvariant(value.value >= -(1n << 63n) && value.value <= (1n << 63n) - 1n, 'INTEGER_OUT_OF_RANGE', 'SQL integer is outside int64')
       return [1n, value.value]
-    case 'real': return [2n, finiteRealBits(value.bits, 'SQL real bits')]
+    case 'real': return [2n, canonicalResultRealBits(value.bits, 'SQL real bits')]
     case 'text': {
       try { new TextDecoder('utf-8', { fatal: true }).decode(value.utf8) } catch { protocolInvariant(false, 'SCHEMA_INVALID', 'SQL text is invalid UTF-8') }
       return [3n, value.utf8]
@@ -437,7 +437,7 @@ export function canonicalSqlValueFromCbor(value: CborValue, name = 'sql_value'):
     protocolInvariant(integer >= -(1n << 63n) && integer <= (1n << 63n) - 1n, 'INTEGER_OUT_OF_RANGE', `${name}.integer is outside int64`)
     return { kind: 'integer', value: integer }
   }
-  if (kind === 2n && tuple.length === 2) return { kind: 'real', bits: finiteRealBits(expectBytes(tuple[1] ?? null, `${name}.real`, 8), `${name}.real`) }
+  if (kind === 2n && tuple.length === 2) return { kind: 'real', bits: canonicalResultRealBits(expectBytes(tuple[1] ?? null, `${name}.real`, 8), `${name}.real`) }
   if (kind === 3n && tuple.length === 2) {
     const text = expectBytes(tuple[1] ?? null, `${name}.text`)
     try { new TextDecoder('utf-8', { fatal: true }).decode(text) } catch { protocolInvariant(false, 'SCHEMA_INVALID', `${name}.text is invalid UTF-8`) }
@@ -681,10 +681,16 @@ export function decodeSqlRejectionAttribution(bytes: Uint8Array): SqlRejectionAt
   return sqlRejectionAttributionFromCbor(assertCanonicalCbor(bytes))
 }
 
+/**
+ * Result REALs normalize negative zero to positive zero. SQLite compares
+ * -0.0 and 0.0 as equal and no function in the profile can observe the sign,
+ * so tied rows differing only in that sign could otherwise surface in
+ * replica-dependent order. Bindings keep their exact bits (Spec 10 §6.3).
+ */
 export function numberToCanonicalReal(value: number): CanonicalSqlValue {
   protocolInvariant(Number.isFinite(value), 'SCHEMA_INVALID', 'Canonical SQL real must be finite')
   const bits = new Uint8Array(8)
-  new DataView(bits.buffer).setFloat64(0, value, false)
+  new DataView(bits.buffer).setFloat64(0, value === 0 ? 0 : value, false)
   return { kind: 'real', bits }
 }
 
@@ -708,6 +714,12 @@ function finiteRealBits(value: Uint8Array, name: string): Uint8Array {
   const bits = expectEightBytes(value, name)
   const number = new DataView(bits.buffer, bits.byteOffset, 8).getFloat64(0, false)
   protocolInvariant(Number.isFinite(number), 'SCHEMA_INVALID', `${name} must encode a finite binary64 value`)
+  return bits
+}
+
+function canonicalResultRealBits(value: Uint8Array, name: string): Uint8Array {
+  const bits = finiteRealBits(value, name)
+  protocolInvariant(bits[0] !== 0x80 || bits.subarray(1).some((byte) => byte !== 0), 'SCHEMA_INVALID', `${name} must not encode negative zero`)
   return bits
 }
 

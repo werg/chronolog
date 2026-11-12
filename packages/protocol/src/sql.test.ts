@@ -167,7 +167,7 @@ describe('canonical deterministic SQL protocol', () => {
     })).toThrow(/nonnullable/u)
   })
 
-  it('round-trips every SQL value tag and preserves negative zero REAL bits', () => {
+  it('round-trips every SQL value tag and normalizes negative zero REAL results', () => {
     const negativeZero = numberToCanonicalReal(-0)
     const digest = bytes32(90)
     const result = {
@@ -187,7 +187,11 @@ describe('canonical deterministic SQL protocol', () => {
     expect(decoded).toEqual(result)
     const real = decoded.rows[2]?.[0]
     expect(real?.kind).toBe('real')
-    if (real?.kind === 'real') expect(Object.is(canonicalRealToNumber(real), -0)).toBe(true)
+    if (real?.kind === 'real') expect(Object.is(canonicalRealToNumber(real), 0)).toBe(true)
+    const negativeZeroBits = Uint8Array.of(0x80, 0, 0, 0, 0, 0, 0, 0)
+    expect(() => encodeCanonicalSqlResult({
+      mode: 'ordered', columns: [dynamicColumn('v')], rows: [[{ kind: 'real', bits: negativeZeroBits }]],
+    })).toThrow(/negative zero/u)
   })
 
   it('round-trips canonical SQL-first rejection attribution', () => {

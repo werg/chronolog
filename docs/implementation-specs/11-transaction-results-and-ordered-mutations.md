@@ -116,7 +116,11 @@ registered = [6, type_id, implementation_digest_32, canonical_payload]
 ```
 
 The initial binary REAL profile accepts only finite IEEE 754 binary64 values,
-encodes their exact bits in network byte order, and preserves negative zero.
+encodes their exact bits in network byte order, and normalizes negative zero
+to positive zero (encoding `-0.0` is invalid). SQLite compares the two as
+equal and no profile function can observe the sign, so preserving it would let
+tied ordered rows surface in replica-dependent order (Spec 10 §12.3 makes
+signed zero a profile input). Bindings still preserve negative zero.
 NaN and infinities fail with a manifest-defined deterministic error until a
 future profile defines their SQLite and canonical-byte behavior. Registered
 payload bytes are meaningful only under the matching type ID and immutable

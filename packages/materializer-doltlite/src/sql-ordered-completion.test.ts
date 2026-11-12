@@ -89,15 +89,16 @@ describe('ordered result tie completion', () => {
     })
   })
 
-  it('leaves the sign of REAL zero as a residual tie that SQLite cannot observe', () => {
+  it('neutralizes the unobservable sign of REAL zero by normalizing results', () => {
     withReplicas((left, right) => {
       for (const probe of ["quote(v)", 'hex(v)', 'CAST(v AS TEXT)', "printf('%!.17g', v)", 'json_quote(v)', '1 / v']) {
         expect(raw(left, `SELECT ${probe} FROM t WHERE k = 2 ORDER BY v`))
           .toBe(raw(left, `SELECT ${probe} FROM t WHERE k = 2 ORDER BY v DESC`))
       }
       const sql = 'SELECT v FROM t WHERE k = 2 ORDER BY k'
+      // Raw SQLite rows still differ in scan order; canonical results do not.
       expect(raw(left, sql)).not.toBe(raw(right, sql))
-      expect(Buffer.from(observe(left, sql))).not.toEqual(Buffer.from(observe(right, sql)))
+      expect(Buffer.from(observe(left, sql))).toEqual(Buffer.from(observe(right, sql)))
     }, ['(2, -0.0, NULL)', '(2, 0.0, NULL)'])
   })
 })

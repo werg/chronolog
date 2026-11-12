@@ -242,7 +242,8 @@ export interface OrderedResultCompletion {
  * built-in function available to this profile (text conversion, quote(),
  * hex(), printf() and JSON render -0.0 as 0.0, division by zero yields NULL,
  * and math functions such as atan2() are not compiled in), so -0.0 and 0.0
- * in the same column remain tied.
+ * in the same column remain tied. The value profile closes this by
+ * normalizing result REAL -0.0 to 0.0, making such tied rows identical.
  */
 export function completeOrderedResultSql(
   compiled: CompiledSqlSource,
