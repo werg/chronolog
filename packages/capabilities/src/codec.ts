@@ -19,6 +19,7 @@ import type {
   CapabilityGrant,
   CapabilityRevision,
   ClockPolicy,
+  ForkOrigin,
   GenesisManifest,
   ReaderHistoryScope,
   ResourcePolicy,
@@ -173,7 +174,22 @@ function genesisToCbor(value: GenesisManifest): CborValue {
     [7, value.initialCapabilities.map(grantToCbor)], [8, value.validationPolicies.map(policyToCbor)],
     [9, clockToCbor(value.clockPolicy)], [10, resourceToCbor(value.resourcePolicy)],
     [11, value.encryptionSuite], [12, value.createdAtMs],
+    [13, value.forkedFrom === undefined ? undefined : integerMap([
+      [0, value.forkedFrom.groupId],
+      [1, value.forkedFrom.snapshotManifestSha256],
+      [2, value.forkedFrom.materializedRevision],
+    ])],
   ])
+}
+
+function forkOriginFromCbor(value: CborValue): ForkOrigin {
+  const map = expectMap(value, 'genesis.forked_from')
+  assertKnownIntegerKeys(map, [0, 1, 2], 'genesis.forked_from')
+  return {
+    groupId: expectBytes(required(map, 0, 'genesis.forked_from.group_id'), 'genesis.forked_from.group_id', 32),
+    snapshotManifestSha256: expectBytes(required(map, 1, 'genesis.forked_from.snapshot_sha256'), 'genesis.forked_from.snapshot_sha256', 32),
+    materializedRevision: expectUint64(required(map, 2, 'genesis.forked_from.revision'), 'genesis.forked_from.revision'),
+  }
 }
 
 export function encodeGenesisManifest(value: GenesisManifest): Uint8Array {
@@ -183,8 +199,9 @@ export function encodeGenesisManifest(value: GenesisManifest): Uint8Array {
 export function decodeGenesisManifest(bytes: Uint8Array): GenesisManifest {
   const map = expectMap(assertCanonicalCbor(bytes), 'genesis')
   // Keys 5 and 6 are retired (formerly recovery keys and threshold).
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12], 'genesis')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13], 'genesis')
   expectVersion(map, 1n, 'genesis')
+  const forkedFrom = optional(map, 13)
   const manifest: GenesisManifest = {
     groupId: expectBytes(required(map, 1, 'genesis.group_id'), 'genesis.group_id'),
     schemaId: expectBytes(required(map, 2, 'genesis.schema_id'), 'genesis.schema_id'),
@@ -196,6 +213,7 @@ export function decodeGenesisManifest(bytes: Uint8Array): GenesisManifest {
     resourcePolicy: resourceFromCbor(required(map, 10, 'genesis.resource_policy')),
     encryptionSuite: expectString(required(map, 11, 'genesis.encryption_suite'), 'genesis.encryption_suite'),
     createdAtMs: expectUint64(required(map, 12, 'genesis.created_at'), 'genesis.created_at'),
+    ...(forkedFrom === undefined ? {} : { forkedFrom: forkOriginFromCbor(forkedFrom) }),
   }
   genesisToCbor(manifest)
   return manifest

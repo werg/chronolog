@@ -191,7 +191,7 @@ Status: in progress
 Acceptance:
 
 - [ ] No unresolved release-blocking fuzz, sanitizer, crash, or security finding.
-- [ ] Pilot operators can install, onboard, rotate, recover, inspect, and
+- [ ] Pilot operators can install, onboard, rotate, fork, inspect, and
       upgrade without editing internal stores.
 - [x] The active manifest advertises no unimplemented or unproven feature.
 

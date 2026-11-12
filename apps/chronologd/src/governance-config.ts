@@ -6,6 +6,7 @@ import {
   encodeSignedGenesis,
   signGenesis,
   validationPolicyId,
+  type ForkOrigin,
   type GenesisManifest,
   type SignedGenesis,
   type ValidationPolicy,
@@ -56,6 +57,12 @@ export async function loadOrCreateGovernanceBootstrap(options: {
   readonly transportAuthor: string
   readonly now?: () => number
   readonly secretStore?: DaemonSecretStore
+  /**
+   * Used only when `governance.json` does not exist yet. By default a new
+   * genesis is created with this node as root. `adopt` joins an existing
+   * group's genesis; `forkedFrom` records the source of a forked group.
+   */
+  readonly bootstrap?: { readonly adopt: SignedGenesis } | { readonly forkedFrom: ForkOrigin }
 }): Promise<LoadedGovernanceBootstrap> {
   const path = join(options.dataDirectory, 'governance.json')
   let document: StoredGovernanceDocument
@@ -65,37 +72,10 @@ export async function loadOrCreateGovernanceBootstrap(options: {
   } catch (error) {
     if (!isMissing(error)) throw error
     const recipient = await generateX25519KeyPair()
-    const policy: ValidationPolicy = {
-      version: 1n,
-      minimumValidators: 1n,
-      classMinimums: new Map(),
-      requiredOrganizations: [],
-    }
-    const common = {
-      subjectId: options.identity.publicKeyBytes,
-      signingPublicKey: options.identity.publicKeyBytes,
-      transportAuthor: options.transportAuthor,
-      validFromRevision: 0n,
-    }
-    const manifest: GenesisManifest = {
-      groupId: options.groupId,
-      schemaId: options.schemaId,
-      rootAdminPublicKey: options.identity.publicKeyBytes,
-      capabilityLogFeed: new TextEncoder().encode(options.transportAuthor),
-      initialCapabilities: [
-        { ...common, role: 'administrator' },
-        { ...common, role: 'schema-administrator' },
-        { ...common, role: 'writer' },
-        { ...common, role: 'validator', minimumAuthorTimestampMs: 0n },
-        { ...common, role: 'reader', readerScope: 'audit', hpkePublicKey: recipient.publicKeyBytes },
-      ],
-      validationPolicies: [policy],
-      clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 60_000n, heartbeatIntervalMs: 30_000n },
-      resourcePolicy: { maxCandidateBytes: 16_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 1_000n, maxMutations: 1_000n },
-      encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM',
-      createdAtMs: BigInt(Math.trunc(options.now?.() ?? Date.now())),
-    }
-    const genesis = await signGenesis(manifest, options.identity.privateKey)
+    const genesis = options.bootstrap !== undefined && 'adopt' in options.bootstrap
+      ? options.bootstrap.adopt
+      : await createGenesis(options, recipient.publicKeyBytes,
+        options.bootstrap !== undefined && 'forkedFrom' in options.bootstrap ? options.bootstrap.forkedFrom : undefined)
     const inlineDocument: GovernanceDocument = {
       format: 'chronolog-governance-bootstrap-v1',
       signedGenesis: base64(encodeSignedGenesis(genesis)),
@@ -122,6 +102,51 @@ export async function loadOrCreateGovernanceBootstrap(options: {
     recipientPublicKey: unbase64(resolved.recipientPublicKey),
     recipientPrivateKey: await importX25519PrivateKey(unbase64(resolved.recipientPrivateKeyPkcs8), false),
   }
+}
+
+async function createGenesis(
+  options: {
+    readonly groupId: Uint8Array
+    readonly schemaId: Uint8Array
+    readonly identity: Ed25519KeyPair
+    readonly transportAuthor: string
+    readonly now?: () => number
+  },
+  recipientPublicKey: Uint8Array,
+  forkedFrom: ForkOrigin | undefined,
+): Promise<SignedGenesis> {
+  const policy: ValidationPolicy = {
+    version: 1n,
+    minimumValidators: 1n,
+    classMinimums: new Map(),
+    requiredOrganizations: [],
+  }
+  const common = {
+    subjectId: options.identity.publicKeyBytes,
+    signingPublicKey: options.identity.publicKeyBytes,
+    transportAuthor: options.transportAuthor,
+    validFromRevision: 0n,
+  }
+  const manifest: GenesisManifest = {
+    groupId: options.groupId,
+    schemaId: options.schemaId,
+    rootAdminPublicKey: options.identity.publicKeyBytes,
+    capabilityLogFeed: new TextEncoder().encode(options.transportAuthor),
+    initialCapabilities: [
+      { ...common, role: 'administrator' },
+      { ...common, role: 'schema-administrator' },
+      { ...common, role: 'writer' },
+      { ...common, role: 'validator', minimumAuthorTimestampMs: 0n },
+      { ...common, role: 'reader', readerScope: 'audit', hpkePublicKey: recipientPublicKey },
+    ],
+    validationPolicies: [policy],
+    clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 60_000n, heartbeatIntervalMs: 30_000n },
+    resourcePolicy: { maxCandidateBytes: 16_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 1_000n, maxMutations: 1_000n },
+    encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM',
+    createdAtMs: BigInt(Math.trunc(options.now?.() ?? Date.now())),
+    ...(forkedFrom === undefined ? {} : { forkedFrom }),
+  }
+  return signGenesis(manifest, options.identity.privateKey)
 }
 
 function parseDocument(value: unknown): StoredGovernanceDocument {

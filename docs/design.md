@@ -295,7 +295,10 @@ longer reach its policy, or a need to admit history below a closed timestamp
 floor. Participants either coordinate out of band or fork: they start a new
 group with its own genesis, seeded from an agreed snapshot of the old one.
 The old group's history stays as it was, and a fork is visible because it is a
-different group.
+different group: its genesis carries a signed `forkedFrom` reference (source
+group, snapshot manifest digest, revision), and its first transactions recreate
+the snapshot's application data as ordinary replayed transactions (see the
+governance guide).
 
 ## 7. Transaction representation
 

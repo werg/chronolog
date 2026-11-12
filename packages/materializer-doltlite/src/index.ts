@@ -4,6 +4,7 @@ export * from './portable.js'
 export {
   digestNativeEngineManifest,
   nativeEngineDescriptor,
+  openReadOnlyDatabase,
   readNativeEngineInfo,
   type NativeEngineInfo,
 } from './driver.js'

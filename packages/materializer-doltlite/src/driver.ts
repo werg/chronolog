@@ -9,6 +9,7 @@ import type {
   NativeEngineManifest,
   SecurityConfiguration,
 } from './types.js'
+import { discoverPublishedRef } from './checkpoints.js'
 import { assertNativeSecurityConfiguration, configureSqliteLimits } from './sql-profile.js'
 
 export interface OpenedDatabase {
@@ -30,6 +31,24 @@ export function readNativeEngineInfo(): NativeEngineInfo {
     manifest,
     descriptor: nativeEngineDescriptor(manifest),
     digest: digestNativeEngineManifest(manifest),
+  }
+}
+
+/**
+ * Opens a materialized database read-only for offline inspection (fork seeding,
+ * verification), positioned on the published revision when one exists. It
+ * never participates in consensus execution.
+ */
+export function openReadOnlyDatabase(path: string): DatabaseLike {
+  const database = new DatabaseSync(path, { readOnly: true }) as unknown as DatabaseLike
+  try {
+    assertNativeSecurityConfiguration(database.configureSecurity())
+    const published = discoverPublishedRef(database)
+    if (published !== null) database.doltCheckout(published.branchRef)
+    return database
+  } catch (error) {
+    database.close()
+    throw error
   }
 }
 

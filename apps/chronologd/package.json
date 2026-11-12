@@ -15,5 +15,8 @@
     "@chronolog/rpc": "workspace:*",
     "@chronolog/transport-ssb": "workspace:*",
     "tsx": "^4.20.3"
+  },
+  "devDependencies": {
+    "@dolthub/doltlite": "0.11.29"
   }
 }

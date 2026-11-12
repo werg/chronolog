@@ -54,16 +54,66 @@ Residual exposures:
 - A `command` helper is fully trusted: it sees every secret and reference, and
   it alone is responsible for PIN handling, durability, and non-extractability.
 
+## Joining a group
+
+Every node of a governed group must use the same signed genesis and group
+route. With all daemons stopped:
+
+```sh
+# On an existing member (usually the administrator):
+pnpm group descriptor /secure/group.json
+# On the new node, with an empty data directory:
+CHRONOLOG_DATA_DIR=/var/lib/chronolog pnpm group join /secure/group.json
+```
+
+The descriptor holds only public material. `join` creates the node's identity,
+SSB feed and reader key, adopts the genesis, and prints `suggestedGrants` (reader,
+writer and validator grant JSON). The administrator submits the ones it wants
+with `chronolog governance grant`, then runs `chronolog governance rotate` so
+the new reader receives the current epoch key. Add the administrator's SSB
+address to the new node's `CHRONOLOG_SSB_PEERS` and start it. A joined node
+does not create epochs of its own; only the administration-feed owner does.
+
 ## When the ordinary path fails
 
 There is no in-protocol recovery mechanism. The root administrator rotates its
 own key or administration feed with an ordinary signed revision, and replaces
 validators the same way. If the root key is lost or compromised, the validator
 set can no longer satisfy its policy, or history below a closed timestamp floor
-must be admitted, participants coordinate out of band or fork. Forking means
-starting a new group with its own genesis, seeded from an agreed snapshot of the
-old one. There is no dedicated fork tool yet; see
-[snapshot-recovery.md](snapshot-recovery.md) for exporting snapshots.
+must be admitted, participants coordinate out of band and fork.
+
+### Forking a group
+
+A fork is a new group with its own genesis, seeded from an agreed signed
+snapshot of the old one. The old group's history is untouched; the fork's
+genesis records the source group, the snapshot manifest's SHA-256 and its
+revision (`forkedFrom`), so anyone can see where it came from.
+
+```sh
+# 1. Agree on a snapshot out of band and export it from a member of the old group
+#    (see snapshot-recovery.md): chronolog-snapshot export /secure/snapshot-r120
+# 2. On the new group's first node, with an empty data directory:
+CHRONOLOG_DATA_DIR=/var/lib/fork pnpm group fork /secure/snapshot-r120 --signer BASE64URL_SNAPSHOT_SIGNER
+# 3. Start chronologd on /var/lib/fork, then seed it:
+pnpm cli seed @/var/lib/fork/fork-seed.json
+# 4. Optionally stop the daemon and confirm the data matches the snapshot:
+CHRONOLOG_DATA_DIR=/var/lib/fork pnpm group verify-fork /secure/snapshot-r120
+# 5. Other participants join the fork with `pnpm group descriptor` / `join` as above.
+```
+
+`fork` verifies the archive exactly like a snapshot import (file evidence, the
+operator-chosen signer, execution manifest, materialized evidence) and makes
+this node the fork's root administrator. It writes `fork-seed.json`: ordinary
+transactions that recreate the snapshot's application tables, rows (in
+foreign-key order), indexes, views and triggers. Each batch asserts that it has
+not been applied yet and records itself in a `fork_seed` table, so `seed` can be
+rerun safely after an interruption. Every replica of the fork replays the seed
+like any other transaction.
+
+Limits: every table needs a primary key; foreign-key cycles between tables and
+virtual tables are refused; Dolt commit history and `AUTOINCREMENT` counters of
+the old group are not carried over; `verify-fork` compares application tables
+only.
 
 ## Live operations
 
@@ -107,6 +157,8 @@ daemon and never returned by RPC.
   active reader;
 - `grantHistoricalAccess` rewraps retained epochs only for an active audit
   reader.
+- `ownsCapabilityFeed` tells whether this node is the administration-feed
+  owner, the only node that publishes capability revisions and epochs.
 
 Every controller rebuilds the same revision snapshots and epoch chain from
 transport history and follows new records live. Capability records and epoch

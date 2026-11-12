@@ -53,6 +53,15 @@ export interface GenesisManifest {
   readonly resourcePolicy: ResourcePolicy
   readonly encryptionSuite: string
   readonly createdAtMs: bigint
+  /** Present when this group was forked from a signed snapshot of another group. */
+  readonly forkedFrom?: ForkOrigin
+}
+
+export interface ForkOrigin {
+  readonly groupId: Uint8Array
+  /** SHA-256 of the source snapshot's canonical signed manifest (`snapshot.cbor`). */
+  readonly snapshotManifestSha256: Uint8Array
+  readonly materializedRevision: bigint
 }
 
 export interface SignedGenesis {

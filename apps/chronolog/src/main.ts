@@ -33,7 +33,11 @@ interface MigrationSpec {
   readonly checksum?: string
   readonly statements: readonly SqlSpec[]
 }
-type JsonSqlValue = null | boolean | number | string | { readonly $int64: string } | { readonly $blob: string }
+type JsonSqlValue = null | boolean | number | string | { readonly $int64: string } | { readonly $blob: string } | { readonly $real: string }
+interface SeedPlan {
+  readonly format: 'chronolog-fork-seed-v1'
+  readonly batches: readonly { readonly batch: number; readonly label: string; readonly precondition: string; readonly statements: readonly SqlSpec[] }[]
+}
 interface CapabilitySpec {
   readonly subjectId: string
   readonly signingPublicKey: string
@@ -165,6 +169,29 @@ try {
       }
       break
     }
+    case 'seed': {
+      // Submits a fork seed plan (see `pnpm group fork`) one batch at a time.
+      // Each batch asserts it has not been applied yet, so a rerun after an
+      // interruption skips finished batches instead of duplicating rows.
+      const plan = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'seed @fork-seed.json'))) as SeedPlan
+      const batches: SeedPlan['batches'] = plan.batches
+      if (plan.format !== 'chronolog-fork-seed-v1' || !(batches as unknown instanceof Array)) throw new Error('Not a fork seed plan')
+      let applied = 0
+      let skipped = 0
+      for (const batch of batches) {
+        const handle = await client.transaction((tx) => {
+          tx.assert(batch.precondition, [], labelOptions(`fork seed batch ${batch.batch} not yet applied`))
+          tx.exec(batch.statements.map((statement: SqlSpec) => ({ sql: statement.sql, parameters: jsonBindings(statement.bindings ?? []) })))
+        })
+        const outcome = await waitForOutcome(handle.transactionId, 10 * 60_000)
+        if (outcome.outcome.type === 'accepted') applied += 1
+        else if (outcome.outcome.type === 'rejected' && outcome.outcome.attribution.phase === 'precondition') skipped += 1
+        else throw new Error(`Seed batch ${batch.batch} (${batch.label}) did not apply: ${JSON.stringify(outcome.outcome)}`)
+        process.stderr.write(`seed ${batch.batch}/${batches.length} ${outcome.outcome.type === 'accepted' ? 'applied' : 'already applied'}: ${batch.label}\n`)
+      }
+      output({ seeded: true, batches: batches.length, applied, skipped })
+      break
+    }
     default: process.stderr.write(`Unknown command: ${command}\n`); usage(1)
   }
 } finally {
@@ -182,11 +209,15 @@ function jsonValue(value: unknown): ClientSqlValue {
   if (typeof value !== 'object') throw new Error('Unsupported SQL binding value')
   if ('$int64' in value && typeof value.$int64 === 'string') return BigInt(value.$int64)
   if ('$blob' in value && typeof value.$blob === 'string') return Uint8Array.from(Buffer.from(value.$blob, 'base64url'))
+  if ('$real' in value && typeof value.$real === 'string' && /^[0-9a-f]{16}$/u.test(value.$real)) {
+    // Exact IEEE 754 binary64 bits (big-endian hex), so REAL values such as 1.0 stay REAL.
+    return { kind: 'real', bits: Uint8Array.from(Buffer.from(value.$real, 'hex')) } as unknown as ClientSqlValue
+  }
   throw new Error('Unsupported SQL binding value')
 }
 
-async function waitForOutcome(transactionId: string) {
-  const deadline = Date.now() + 30_000
+async function waitForOutcome(transactionId: string, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
   while (true) {
     const outcome = await client.getTransactionOutcome(transactionId)
     if (outcome.outcome.type !== 'pending' || Date.now() >= deadline) return outcome
@@ -232,6 +263,6 @@ function jsonReplacer(_key: string, value: unknown): unknown {
   return value
 }
 function usage(code: number): never {
-  process.stderr.write('Usage: chronolog <status|doctor|query|transact|outcome|result|evidence|watermark|replication|governance|migrations|catalog> ...\n')
+  process.stderr.write('Usage: chronolog <status|doctor|query|transact|outcome|result|evidence|watermark|replication|governance|migrations|catalog|seed> ...\n')
   process.exit(code)
 }

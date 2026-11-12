@@ -109,6 +109,8 @@ export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): Daemon
 export async function loadOrCreateConfig(
   dataDirectory: string,
   secretStore?: DaemonSecretStore,
+  /** Group identity to use when no config exists yet (joining or forking); random otherwise. */
+  group?: { readonly groupId: Uint8Array; readonly groupRoute: Uint8Array },
 ): Promise<LoadedDaemonConfig> {
   const path = join(dataDirectory, 'config.json')
   let document: DaemonConfigDocument
@@ -120,8 +122,8 @@ export async function loadOrCreateConfig(
     const identity = await generateEd25519KeyPair()
     const config: DaemonConfig = {
       format: 'chronolog-daemon',
-      groupId: randomBase64(32),
-      groupRoute: randomBase64(32),
+      groupId: group === undefined ? randomBase64(32) : toBase64(group.groupId),
+      groupRoute: group === undefined ? randomBase64(32) : toBase64(group.groupRoute),
       membershipRevision: randomBase64(32),
       validationPolicy: randomBase64(32),
       validatorCapability: randomBase64(32),
