@@ -1,11 +1,26 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { ControlStore } from './control-store.js'
-import { JsonFileControlStorePersistence, MemoryControlStorePersistence } from './persistence.js'
+import {
+  JsonFileControlStorePersistence,
+  MemoryControlStorePersistence,
+  encodeControlStoreSnapshot,
+  readControlStoreSnapshot,
+} from './persistence.js'
+import type { PutCandidateInput, StoredAttestation } from './types.js'
 
 const directories: string[] = []
 
@@ -148,5 +163,204 @@ describe('JsonFileControlStorePersistence', () => {
       'CONTROL_STORE_CUTOFF_JOURNAL_MISSING',
     )
     expect(existsSync(path)).toBe(true)
+  })
+})
+
+describe('JsonFileControlStorePersistence journal', () => {
+  function temporaryPath(): string {
+    const directory = mkdtempSync(join(tmpdir(), 'chronolog-control-journal-'))
+    directories.push(directory)
+    return join(directory, 'control.json')
+  }
+
+  const bytes = (...values: number[]) => Uint8Array.from(values)
+  function candidate(id: number): PutCandidateInput {
+    return {
+      txId: bytes(id),
+      groupId: bytes(1),
+      candidateDigest: bytes(100, id),
+      validationPolicy: bytes(2),
+      orderKey: {
+        authorTimestampMs: BigInt(1_000 - id),
+        authorId: bytes(3),
+        authorFeedSequence: BigInt(id),
+        txId: bytes(id),
+      },
+      canonicalPayload: bytes(4, id),
+      state: 'pending_validation',
+    }
+  }
+  function attestation(id: number): StoredAttestation {
+    return {
+      attestationId: bytes(50, id),
+      txId: bytes(id),
+      validatorId: bytes(9),
+      validatorCapability: bytes(9, 1),
+      membershipRevision: bytes(1),
+      candidateDigest: bytes(100, id),
+      validatorFeedSequence: BigInt(id),
+      authorTimestampMs: BigInt(1_000 - id),
+      acceptedAboveMs: 0n,
+      policyVersion: 1n,
+      transportAuthor: '@validator.ed25519',
+    }
+  }
+  /** Exercises every journaled operation kind; admission inserts out of order. */
+  function mutate(store: ControlStore, from: number, to: number): void {
+    for (let id = from; id <= to; id += 1) {
+      store.putCandidate(candidate(id))
+      store.putAttestation(attestation(id))
+      store.setCandidateState(bytes(id), 'admissible', { proofAttestationIds: [bytes(50, id)] })
+      store.recordHeartbeat({
+        heartbeatId: bytes(60, id),
+        validatorId: bytes(9),
+        validatorCapability: bytes(9, 1),
+        membershipRevision: bytes(1),
+        validatorFeedSequence: BigInt(100 + id),
+        acceptanceCutoffMs: BigInt(id),
+        feedContiguous: true,
+      })
+      store.publishMaterializedHead({
+        localRevision: BigInt(id),
+        headRef: `rev-${id}`,
+        orderLength: store.orderedTransactionIds().length,
+        orderDigest: bytes(70, id),
+      })
+      store.putCheckpoint({
+        prefixLength: store.orderedTransactionIds().length,
+        checkpointRef: `cp-${id}`,
+        prefixDigest: bytes(80, id),
+        pinned: id % 2 === 0,
+      })
+    }
+  }
+  const encoded = (store: ControlStore) => encodeControlStoreSnapshot(store.snapshot())
+  const journalLines = (path: string) => readFileSync(`${path}.journal`, 'utf8').split('\n').filter((line) => line !== '')
+
+  it('appends operations instead of rewriting the snapshot and replays them exactly', () => {
+    const path = temporaryPath()
+    const store = new ControlStore(new JsonFileControlStorePersistence(path))
+    mutate(store, 1, 3)
+    store.flush()
+    expect(existsSync(path)).toBe(false)
+    const firstFlush = statSync(`${path}.journal`).size
+    expect(journalLines(path)).toHaveLength(18)
+    mutate(store, 4, 5)
+    store.flush()
+    // The earlier bytes are untouched; only the new operations were appended.
+    expect(statSync(`${path}.journal`).size).toBeGreaterThan(firstFlush)
+    expect(journalLines(path)).toHaveLength(30)
+    expect(existsSync(path)).toBe(false)
+
+    expect(readControlStoreSnapshot(path)).toEqual(store.snapshot())
+    expect(existsSync(`${path}.journal`)).toBe(true) // the reader is read-only
+
+    const reopened = new ControlStore(new JsonFileControlStorePersistence(path))
+    expect(encoded(reopened)).toBe(encoded(store))
+    expect(reopened.changesSince(10n)).toEqual(store.changesSince(10n))
+    // Reopening compacts the journal into the snapshot.
+    expect(existsSync(`${path}.journal`)).toBe(false)
+    expect(existsSync(path)).toBe(true)
+    mutate(reopened, 6, 6)
+    reopened.flush()
+    expect(journalLines(path)).toHaveLength(6)
+    expect(encoded(new ControlStore(new JsonFileControlStorePersistence(path)))).toBe(encoded(reopened))
+  })
+
+  it('coalesces appends and compacts after the configured number of entries', async () => {
+    const path = temporaryPath()
+    const store = new ControlStore(new JsonFileControlStorePersistence(path, { compactAfterEntries: 10, flushDelayMs: 5 }))
+    mutate(store, 1, 1)
+    expect(existsSync(`${path}.journal`)).toBe(false) // buffered until the flush window
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(journalLines(path)).toHaveLength(6)
+    mutate(store, 2, 2) // twelve entries: compaction requested
+    store.flush()
+    expect(existsSync(`${path}.journal`)).toBe(false)
+    expect(encoded(new ControlStore(new JsonFileControlStorePersistence(path)))).toBe(encoded(store))
+  })
+
+  it('ignores a torn final append and compacts it away before appending', () => {
+    const path = temporaryPath()
+    const store = new ControlStore(new JsonFileControlStorePersistence(path))
+    mutate(store, 1, 2)
+    store.flush()
+    const complete = new ControlStore(new MemoryControlStorePersistence())
+    mutate(complete, 1, 2)
+    // Crash in the middle of the next appended batch.
+    mutate(store, 3, 3)
+    store.flush()
+    const journal = readFileSync(`${path}.journal`, 'utf8')
+    const lines = journal.split('\n')
+    const torn = `${lines.slice(0, 12).join('\n')}\n${lines[12]!.slice(0, 40)}`
+    writeFileSync(`${path}.journal`, torn)
+
+    const reopened = new ControlStore(new JsonFileControlStorePersistence(path))
+    expect(encoded(reopened)).toBe(encoded(complete))
+    expect(existsSync(`${path}.journal`)).toBe(false)
+    mutate(reopened, 3, 3)
+    reopened.flush()
+    expect(encoded(new ControlStore(new JsonFileControlStorePersistence(path)))).toBe(encoded(reopened))
+  })
+
+  it('skips entries already contained in a snapshot written just before a crash', () => {
+    const path = temporaryPath()
+    const persistence = new JsonFileControlStorePersistence(path)
+    const store = new ControlStore(persistence)
+    mutate(store, 1, 2)
+    store.flush()
+    const journal = readFileSync(`${path}.journal`, 'utf8')
+    // Crash after the compacted snapshot was renamed into place but before
+    // the journal was removed.
+    persistence.save(store.snapshot())
+    writeFileSync(`${path}.journal`, journal)
+    expect(encoded(new ControlStore(new JsonFileControlStorePersistence(path)))).toBe(encoded(store))
+  })
+
+  it('quarantines snapshot and journal on corruption other than a torn tail', () => {
+    for (const damage of [
+      (lines: string[]) => { lines[3] = lines[3]!.replace('"', "'") }, // checksum mismatch
+      (lines: string[]) => { lines.splice(4, 1) }, // intact lines, missing operation
+      (lines: string[]) => { lines.splice(5, 0, lines[5]!) }, // duplicated operation
+    ]) {
+      const path = temporaryPath()
+      const store = new ControlStore(new JsonFileControlStorePersistence(path))
+      store.persistValidatorCutoff(bytes(9), 777n)
+      mutate(store, 1, 2)
+      store.flush()
+      const lines = readFileSync(`${path}.journal`, 'utf8').split('\n')
+      damage(lines)
+      writeFileSync(`${path}.journal`, lines.join('\n'))
+
+      const restored = new ControlStore(new JsonFileControlStorePersistence(path))
+      expect(restored.sequence).toBe(0n)
+      expect(restored.validatorCutoff(bytes(9))).toBe(777n)
+      const names = readdirSync(join(path, '..'))
+      expect(names.some((name) => name.startsWith('control.json.journal.corrupt-'))).toBe(true)
+      expect(existsSync(`${path}.journal`)).toBe(false)
+    }
+  })
+
+  it('fails closed on a corrupt journal when no cutoff journal exists', () => {
+    const path = temporaryPath()
+    const store = new ControlStore(new JsonFileControlStorePersistence(path))
+    mutate(store, 1, 1)
+    store.flush()
+    rmSync(`${path}.validator-cutoffs`)
+    appendFileSync(`${path}.journal`, 'not a journal line\n')
+    expect(() => new ControlStore(new JsonFileControlStorePersistence(path))).toThrow('CONTROL_STORE_JOURNAL_INVALID')
+    expect(existsSync(`${path}.journal`)).toBe(true)
+  })
+
+  it('keeps validator cutoffs synchronous while index operations are buffered', () => {
+    const path = temporaryPath()
+    const store = new ControlStore(new JsonFileControlStorePersistence(path))
+    mutate(store, 1, 1)
+    store.persistValidatorCutoff(bytes(9), 900n)
+    // Crash before the buffered journal flush: the index operations are lost
+    // (they are rebuilt from the transport), the signing cutoff is not.
+    const restored = new ControlStore(new JsonFileControlStorePersistence(path))
+    expect(restored.validatorCutoff(bytes(9))).toBe(900n)
+    expect(restored.sequence).toBe(0n)
   })
 })

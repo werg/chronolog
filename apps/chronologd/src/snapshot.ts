@@ -136,8 +136,11 @@ async function applyFeedRepair(dataDirectory: string, manifest: TrustedSnapshotM
 }
 
 async function invalidateControlSnapshot(dataDirectory: string, revision: bigint): Promise<void> {
-  try { await rename(join(dataDirectory, 'control.json'), join(dataDirectory, `control.json.pre-snapshot-r${revision}`)) }
-  catch (error) { if (!missing(error)) throw error }
+  // The journal only applies on top of its snapshot; move both aside.
+  for (const name of ['control.json', 'control.json.journal']) {
+    try { await rename(join(dataDirectory, name), join(dataDirectory, `${name}.pre-snapshot-r${revision}`)) }
+    catch (error) { if (!missing(error)) throw error }
+  }
 }
 function option(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name)

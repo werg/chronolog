@@ -5,6 +5,8 @@ import type {
   AdmissionEvaluator,
   CandidateState,
   ControlStoreDelta,
+  ControlStoreJournalEntry,
+  ControlStoreOperation,
   ControlStorePersistence,
   ControlStoreSnapshot,
   MaterializedHead,
@@ -48,6 +50,7 @@ export class ControlStore {
   readonly #deltas: ControlStoreDelta[] = []
   readonly #checkpoints = new Map<number, StoredCheckpoint>()
   #materializedHead: MaterializedHead | null = null
+  #replaying = false
 
   constructor(
     persistence: ControlStorePersistence | null = null,
@@ -60,16 +63,18 @@ export class ControlStore {
     }
     const journalCutoffs = persistence?.loadValidatorCutoffs?.() ?? null
     const snapshot = persistence?.load()
-    if (snapshot !== null && snapshot !== undefined) {
-      try {
-        this.#restore(snapshot)
-      } catch (error) {
-        if (persistence?.recoverCorruptSnapshot?.(error) !== true) throw error
-        this.#reset()
-      }
+    try {
+      if (snapshot !== null && snapshot !== undefined) this.#restore(snapshot)
+      this.#replayJournal(persistence?.loadJournal?.() ?? [])
+    } catch (error) {
+      if (persistence?.recoverCorruptSnapshot?.(error) !== true) throw error
+      this.#reset()
     }
     for (const cutoff of journalCutoffs ?? []) this.#mergeValidatorCutoff(cutoff)
     persistence?.initializeValidatorCutoffs?.(this.#listValidatorCutoffs())
+    // Compact on open: bounds replay work and discards any torn final line
+    // before new entries are appended after it.
+    if (persistence?.journalPresent?.() === true) persistence.save(this.snapshot())
   }
 
   get sequence(): bigint {
@@ -138,7 +143,7 @@ export class ControlStore {
       this.#appendDelta({ kind: 'candidate_added', txId: candidate.txId, state: candidate.state }),
     ]
     if (candidate.state === 'admissible') deltas.push(this.#insertOrder(candidate))
-    this.#persist()
+    this.#persist({ kind: 'put_candidate', candidate })
     return { added: true, deltas: clone(deltas) }
   }
 
@@ -179,7 +184,7 @@ export class ControlStore {
       txId: stored.txId,
       unresolvedCandidate: !this.#candidates.has(txKey),
     })
-    this.#persist()
+    this.#persist({ kind: 'put_attestation', attestation: stored })
     return { added: true, delta: clone(delta) }
   }
 
@@ -257,7 +262,13 @@ export class ControlStore {
     if (candidate.state !== 'admissible' && state === 'admissible') {
       deltas.push(this.#insertOrder(next))
     }
-    this.#persist()
+    this.#persist({
+      kind: 'set_candidate_state',
+      txId: next.txId,
+      state,
+      proofAttestationIds,
+      ...(options.reason === undefined ? {} : { reason: options.reason }),
+    })
     return clone(deltas)
   }
 
@@ -307,7 +318,7 @@ export class ControlStore {
       cutoffMs: next.acceptanceCutoffMs,
       feedContiguous: next.feedContiguous,
     })
-    this.#persist()
+    this.#persist({ kind: 'record_heartbeat', heartbeat: next })
     return clone(delta)
   }
 
@@ -456,7 +467,7 @@ export class ControlStore {
     }
     this.#materializedHead = clone(head)
     const delta = this.#appendDelta({ kind: 'materialized_head_published', head })
-    this.#persist()
+    this.#persist({ kind: 'publish_materialized_head', head })
     return clone(delta)
   }
 
@@ -475,7 +486,7 @@ export class ControlStore {
     }
     this.#checkpoints.set(checkpoint.prefixLength, clone(checkpoint))
     const delta = this.#appendDelta({ kind: 'checkpoint_stored', checkpoint })
-    this.#persist()
+    this.#persist({ kind: 'put_checkpoint', checkpoint })
     return clone(delta)
   }
 
@@ -563,11 +574,77 @@ export class ControlStore {
     )
   }
 
-  #persist(): void {
+  #persist(operation: ControlStoreOperation): void {
+    if (this.#replaying) return
+    const persistence = this.#persistence
+    if (persistence?.appendJournal !== undefined) {
+      const compact = persistence.appendJournal({ sequence: this.#sequence, operation: clone(operation) })
+      if (compact) {
+        if (persistence.requestSave !== undefined) persistence.requestSave(() => this.snapshot())
+        else persistence.save(this.snapshot())
+      }
+      return
+    }
     if (this.#persistence?.requestSave !== undefined) {
       this.#persistence.requestSave(() => this.snapshot())
     } else {
       this.#persistence?.save(this.snapshot())
+    }
+  }
+
+  /**
+   * Re-applies journaled operations through the normal mutation paths. Every
+   * entry must advance the sequence to exactly the recorded value, so a
+   * missing, reordered, duplicated or altered entry fails closed. A leading
+   * run of entries already covered by the snapshot (a crash between writing a
+   * compacted snapshot and removing the journal) is skipped.
+   */
+  #replayJournal(entries: readonly ControlStoreJournalEntry[]): void {
+    if (entries.length === 0) return
+    this.#replaying = true
+    try {
+      let applying = false
+      for (const entry of entries) {
+        if (entry.sequence <= this.#sequence) {
+          if (applying) throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_JOURNAL_SEQUENCE')
+          continue
+        }
+        applying = true
+        this.#applyOperation(entry.operation)
+        if (this.#sequence !== entry.sequence) {
+          throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_JOURNAL_SEQUENCE')
+        }
+      }
+    } finally {
+      this.#replaying = false
+    }
+  }
+
+  #applyOperation(operation: ControlStoreOperation): void {
+    switch (operation.kind) {
+      case 'put_candidate':
+        this.putCandidate(operation.candidate)
+        return
+      case 'put_attestation':
+        this.putAttestation(operation.attestation)
+        return
+      case 'set_candidate_state':
+        this.setCandidateState(operation.txId, operation.state, {
+          proofAttestationIds: operation.proofAttestationIds,
+          ...(operation.reason === undefined ? {} : { reason: operation.reason }),
+        })
+        return
+      case 'record_heartbeat':
+        this.recordHeartbeat(operation.heartbeat)
+        return
+      case 'publish_materialized_head':
+        this.publishMaterializedHead(operation.head)
+        return
+      case 'put_checkpoint':
+        this.putCheckpoint(operation.checkpoint)
+        return
+      default:
+        throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_JOURNAL_OPERATION')
     }
   }
 

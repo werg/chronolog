@@ -1,6 +1,7 @@
-import { access, readFile, readdir } from 'node:fs/promises'
+import { access, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
+import { readControlStoreSnapshot } from '@chronolog/control-store'
 import { SsbDb2Transport } from '@chronolog/transport-ssb'
 
 export interface RunInspection {
@@ -33,7 +34,8 @@ export async function inspectRun(directory: string): Promise<RunInspection> {
         records.push({ sequence: Number(record.sequence), id: record.id, ...(record.previous === undefined ? {} : { previous: record.previous }) })
         feeds.set(record.author, records)
       }
-      const control = JSON.parse(await readFile(join(directory, 'control.json'), 'utf8')) as Record<string, unknown>
+      // Snapshot plus append-only journal; read without compacting.
+      const control = (readControlStoreSnapshot(join(directory, 'control.json')) ?? {}) as unknown as Record<string, unknown>
       nodes.push({
         name,
         uncleanMarker,

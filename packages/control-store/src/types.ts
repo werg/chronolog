@@ -172,9 +172,47 @@ export interface ControlStoreSnapshot {
   }[]
 }
 
+/**
+ * One state mutation of the rebuildable control index, as recorded in an
+ * append-only journal. Replaying the operations in order through the store's
+ * own mutation methods reproduces the state, sequence and deltas exactly.
+ */
+export type ControlStoreOperation =
+  | { readonly kind: 'put_candidate'; readonly candidate: StoredCandidate }
+  | { readonly kind: 'put_attestation'; readonly attestation: StoredAttestation }
+  | {
+      readonly kind: 'set_candidate_state'
+      readonly txId: Uint8Array
+      readonly state: CandidateState
+      readonly proofAttestationIds: readonly Uint8Array[]
+      readonly reason?: string
+    }
+  | { readonly kind: 'record_heartbeat'; readonly heartbeat: ValidatorHeartbeat }
+  | { readonly kind: 'publish_materialized_head'; readonly head: MaterializedHead }
+  | { readonly kind: 'put_checkpoint'; readonly checkpoint: StoredCheckpoint }
+
+export interface ControlStoreJournalEntry {
+  /** Store sequence after the operation was applied. */
+  readonly sequence: bigint
+  readonly operation: ControlStoreOperation
+}
+
 export interface ControlStorePersistence {
   load(): ControlStoreSnapshot | null
   save(snapshot: ControlStoreSnapshot): void
+  /**
+   * Operations recorded after the snapshot returned by load(), in order.
+   * Entries at or below the snapshot sequence are already contained in it.
+   */
+  loadJournal?(): readonly ControlStoreJournalEntry[]
+  /**
+   * Records one mutation instead of rewriting the snapshot. When present the
+   * store calls it in place of requestSave()/save() per mutation. Returns true
+   * when the journal should be compacted into a fresh snapshot.
+   */
+  appendJournal?(entry: ControlStoreJournalEntry): boolean
+  /** True when loadJournal() found a journal file that should be compacted. */
+  journalPresent?(): boolean
   /** Loads non-rebuildable validator signing state from its independent journal. */
   loadValidatorCutoffs?(): readonly ValidatorCutoffState[] | null
   /** Initializes the independent cutoff journal after loading a valid legacy snapshot. */

@@ -159,6 +159,9 @@ importers:
       '@chronolog/client':
         specifier: workspace:*
         version: link:../client
+      '@chronolog/control-store':
+        specifier: workspace:*
+        version: link:../control-store
       '@chronolog/ir':
         specifier: workspace:*
         version: link:../ir

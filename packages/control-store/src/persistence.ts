@@ -1,16 +1,23 @@
+import { createHash } from 'node:crypto'
 import {
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
 
+import { ControlStore } from './control-store.js'
 import type {
+  ControlStoreJournalEntry,
   ControlStorePersistence,
   ControlStoreSnapshot,
   ValidatorCutoffState,
@@ -19,29 +26,82 @@ import type {
 const BYTES_TAG = '$chronologBytes'
 const BIGINT_TAG = '$chronologBigInt'
 
-export function encodeControlStoreSnapshot(snapshot: ControlStoreSnapshot): string {
-  return JSON.stringify(snapshot, (_key, value: unknown) => {
-    if (typeof value === 'bigint') return { [BIGINT_TAG]: value.toString(10) }
-    if (value instanceof Uint8Array) {
-      return { [BYTES_TAG]: Buffer.from(value).toString('base64') }
+function encodeTagged(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => {
+    if (typeof item === 'bigint') return { [BIGINT_TAG]: item.toString(10) }
+    if (item instanceof Uint8Array) {
+      return { [BYTES_TAG]: Buffer.from(item).toString('base64') }
     }
-    return value
+    return item
   })
 }
 
-export function decodeControlStoreSnapshot(text: string): ControlStoreSnapshot {
-  const parsed = JSON.parse(text, (_key, value: unknown) => {
+function decodeTagged(text: string): unknown {
+  return JSON.parse(text, (_key, value: unknown) => {
     if (isTagged(value, BIGINT_TAG)) return BigInt(value[BIGINT_TAG]!)
     if (isTagged(value, BYTES_TAG)) {
       return Uint8Array.from(Buffer.from(value[BYTES_TAG]!, 'base64'))
     }
     return value
-  }) as ControlStoreSnapshot
+  })
+}
+
+export function encodeControlStoreSnapshot(snapshot: ControlStoreSnapshot): string {
+  return encodeTagged(snapshot)
+}
+
+export function decodeControlStoreSnapshot(text: string): ControlStoreSnapshot {
+  const parsed = decodeTagged(text) as ControlStoreSnapshot
 
   if (parsed.format !== 'chronolog-control-store/v1') {
     throw new Error('CONTROL_STORE_UNSUPPORTED_FORMAT')
   }
   return parsed
+}
+
+const JOURNAL_CHECKSUM_LENGTH = 16
+const JOURNAL_OPERATION_KINDS = new Set([
+  'put_candidate',
+  'put_attestation',
+  'set_candidate_state',
+  'record_heartbeat',
+  'publish_materialized_head',
+  'put_checkpoint',
+])
+
+/** One journal line: a truncated SHA-256 of the body, a space, the body. */
+export function encodeControlStoreJournalEntry(entry: ControlStoreJournalEntry): string {
+  const body = encodeTagged({ sequence: entry.sequence, operation: entry.operation })
+  return `${journalChecksum(body)} ${body}\n`
+}
+
+/**
+ * Decodes a journal file. Only the text after the last newline may be
+ * incomplete: it is an append torn by a crash, whose operation had not been
+ * reported durable, and is ignored. Any other malformed line fails closed.
+ */
+export function decodeControlStoreJournal(text: string): ControlStoreJournalEntry[] {
+  const lines = text.split('\n')
+  return lines.slice(0, -1).map((line) => {
+    const body = line.slice(JOURNAL_CHECKSUM_LENGTH + 1)
+    if (line[JOURNAL_CHECKSUM_LENGTH] !== ' ' || line.slice(0, JOURNAL_CHECKSUM_LENGTH) !== journalChecksum(body)) {
+      throw new Error('CONTROL_STORE_JOURNAL_INVALID')
+    }
+    let value: unknown
+    try { value = decodeTagged(body) } catch (error) {
+      throw new Error('CONTROL_STORE_JOURNAL_INVALID', { cause: error })
+    }
+    if (
+      !isRecord(value) || typeof value.sequence !== 'bigint' || value.sequence < 1n ||
+      !isRecord(value.operation) || typeof value.operation.kind !== 'string' ||
+      !JOURNAL_OPERATION_KINDS.has(value.operation.kind)
+    ) throw new Error('CONTROL_STORE_JOURNAL_INVALID')
+    return value as unknown as ControlStoreJournalEntry
+  })
+}
+
+function journalChecksum(body: string): string {
+  return createHash('sha256').update(body, 'utf8').digest('hex').slice(0, JOURNAL_CHECKSUM_LENGTH)
 }
 
 function isTagged(value: unknown, tag: string): value is Record<string, string> {
@@ -83,23 +143,59 @@ export class MemoryControlStorePersistence implements ControlStorePersistence {
   }
 }
 
-/** A small crash-safe snapshot persistence for the rebuildable control index. */
+export interface JsonFileControlStorePersistenceOptions {
+  /**
+   * Minimum journal entries before compaction. Compaction additionally waits
+   * until the journal is at least as large as the last snapshot, so the
+   * amortized bytes written per operation stay constant as history grows.
+   */
+  readonly compactAfterEntries?: number
+  /** Coalescing window for journal appends and snapshot writes. */
+  readonly flushDelayMs?: number
+}
+
+/**
+ * Crash-safe persistence for the rebuildable control index: a snapshot
+ * (`control.json`, written atomically) plus an append-only operation journal
+ * (`control.json.journal`). Mutations are buffered and appended in one write
+ * plus fsync at most once per flush window, so per-mutation cost no longer
+ * grows with history. The journal is compacted into a fresh snapshot on open
+ * and once it holds `compactAfterEntries` entries and at least as many bytes
+ * as the previous snapshot. Validator signing cutoffs are not
+ * rebuildable and live in a separate file that is written synchronously.
+ */
 export class JsonFileControlStorePersistence implements ControlStorePersistence {
   readonly #path: string
+  readonly #journalPath: string
   readonly #cutoffPath: string
+  readonly #compactAfterEntries: number
+  readonly #flushDelayMs: number
   #cutoffs: Map<string, ValidatorCutoffState> | null = null
   #pendingSnapshot: (() => ControlStoreSnapshot) | null = null
+  #pendingJournal: string[] = []
+  #journalEntries = 0
+  #journalBytes = 0
+  #snapshotBytes = 0
+  #journalPresent = false
   #saveTimer: ReturnType<typeof setTimeout> | undefined
 
-  constructor(path: string) {
+  constructor(path: string, options: JsonFileControlStorePersistenceOptions = {}) {
     this.#path = path
+    this.#journalPath = `${path}.journal`
     this.#cutoffPath = `${path}.validator-cutoffs`
+    this.#compactAfterEntries = options.compactAfterEntries ?? 1_024
+    this.#flushDelayMs = options.flushDelayMs ?? 100
+    if (!Number.isSafeInteger(this.#compactAfterEntries) || this.#compactAfterEntries < 1) {
+      throw new RangeError('CONTROL_STORE_INVALID_COMPACTION_INTERVAL')
+    }
   }
 
   load(): ControlStoreSnapshot | null {
     this.flush()
     try {
-      return decodeControlStoreSnapshot(readFileSync(this.#path, 'utf8'))
+      const text = readFileSync(this.#path, 'utf8')
+      this.#snapshotBytes = Buffer.byteLength(text)
+      return decodeControlStoreSnapshot(text)
     } catch (error) {
       if (isMissingFile(error)) return null
       if (isCorruptSnapshot(error)) {
@@ -113,8 +209,42 @@ export class JsonFileControlStorePersistence implements ControlStorePersistence 
     }
   }
 
+  /** Writes a full snapshot atomically; it supersedes every journal entry. */
   save(snapshot: ControlStoreSnapshot): void {
     this.#write(snapshot)
+  }
+
+  loadJournal(): readonly ControlStoreJournalEntry[] {
+    let text: string
+    try {
+      text = readFileSync(this.#journalPath, 'utf8')
+    } catch (error) {
+      if (isMissingFile(error)) {
+        this.#journalPresent = false
+        this.#journalEntries = 0
+        this.#journalBytes = 0
+        return []
+      }
+      throw error
+    }
+    this.#journalPresent = true
+    const entries = decodeControlStoreJournal(text)
+    this.#journalEntries = entries.length
+    this.#journalBytes = Buffer.byteLength(text)
+    return entries
+  }
+
+  journalPresent(): boolean {
+    return this.#journalPresent
+  }
+
+  appendJournal(entry: ControlStoreJournalEntry): boolean {
+    const line = encodeControlStoreJournalEntry(entry)
+    this.#pendingJournal.push(line)
+    this.#journalEntries += 1
+    this.#journalBytes += Buffer.byteLength(line)
+    this.#scheduleFlush()
+    return this.#journalEntries >= this.#compactAfterEntries && this.#journalBytes >= this.#snapshotBytes
   }
 
   loadValidatorCutoffs(): readonly ValidatorCutoffState[] | null {
@@ -164,12 +294,7 @@ export class JsonFileControlStorePersistence implements ControlStorePersistence 
 
   requestSave(snapshot: () => ControlStoreSnapshot): void {
     this.#pendingSnapshot = snapshot
-    if (this.#saveTimer !== undefined) return
-    this.#saveTimer = setTimeout(() => {
-      this.#saveTimer = undefined
-      this.flush()
-    }, 100)
-    this.#saveTimer.unref?.()
+    this.#scheduleFlush()
   }
 
   flush(): void {
@@ -179,17 +304,67 @@ export class JsonFileControlStorePersistence implements ControlStorePersistence 
     }
     const snapshot = this.#pendingSnapshot
     this.#pendingSnapshot = null
-    if (snapshot !== null) this.#write(snapshot())
+    if (snapshot !== null) {
+      // The snapshot is taken now, so it contains every buffered operation.
+      this.#write(snapshot())
+      return
+    }
+    if (this.#pendingJournal.length === 0) return
+    const lines = this.#pendingJournal.join('')
+    mkdirSync(dirname(this.#journalPath), { recursive: true })
+    const created = !existsSync(this.#journalPath)
+    const descriptor = openSync(this.#journalPath, 'a', 0o600)
+    try {
+      const size = fstatSync(descriptor).size
+      try {
+        writeAll(descriptor, lines)
+        fsyncSync(descriptor)
+      } catch (error) {
+        // Do not leave a partial line for a later append to follow; the
+        // buffered entries stay pending and are retried on the next flush.
+        try { ftruncateSync(descriptor, size) } catch { /* reported below */ }
+        throw error
+      }
+    } finally {
+      closeSync(descriptor)
+    }
+    if (created) syncPath(dirname(this.#journalPath))
+    this.#journalPresent = true
+    this.#pendingJournal = []
   }
 
-  recoverCorruptSnapshot(_error: unknown): boolean {
+  recoverCorruptSnapshot(error: unknown): boolean {
+    // I/O failures are not corruption and must not discard state.
+    if (isFileSystemError(error)) return false
     if (!existsSync(this.#cutoffPath)) return false
     this.#quarantine()
     return true
   }
 
+  #scheduleFlush(): void {
+    if (this.#saveTimer !== undefined) return
+    this.#saveTimer = setTimeout(() => {
+      this.#saveTimer = undefined
+      this.flush()
+    }, this.#flushDelayMs)
+    this.#saveTimer.unref?.()
+  }
+
   #write(snapshot: ControlStoreSnapshot): void {
-    writeCrashSafe(this.#path, encodeControlStoreSnapshot(snapshot))
+    const encoded = encodeControlStoreSnapshot(snapshot)
+    writeCrashSafe(this.#path, encoded)
+    this.#snapshotBytes = Buffer.byteLength(encoded)
+    this.#journalBytes = 0
+    // Buffered operations are contained in the snapshot. A crash before the
+    // journal is removed leaves entries at or below the snapshot sequence,
+    // which replay skips.
+    this.#pendingJournal = []
+    this.#journalEntries = 0
+    if (this.#journalPresent || existsSync(this.#journalPath)) {
+      rmSync(this.#journalPath, { force: true })
+      syncPath(dirname(this.#journalPath))
+    }
+    this.#journalPresent = false
   }
 
   #writeCutoffs(): void {
@@ -197,13 +372,59 @@ export class JsonFileControlStorePersistence implements ControlStorePersistence 
   }
 
   #quarantine(): void {
-    try {
-      renameSync(this.#path, `${this.#path}.corrupt-${process.pid}-${Date.now()}`)
-      syncPath(dirname(this.#path))
-    } catch (error) {
-      if (!isMissingFile(error)) throw error
+    // The journal only has meaning on top of its snapshot; set both aside.
+    const suffix = `corrupt-${process.pid}-${Date.now()}`
+    for (const [source, target] of [
+      [this.#path, `${this.#path}.${suffix}`],
+      [this.#journalPath, `${this.#journalPath}.${suffix}`],
+    ] as const) {
+      try {
+        renameSync(source, target)
+      } catch (error) {
+        if (!isMissingFile(error)) throw error
+      }
     }
+    syncPath(dirname(this.#path))
+    this.#pendingJournal = []
+    this.#journalEntries = 0
+    this.#journalBytes = 0
+    this.#journalPresent = false
   }
+}
+
+/**
+ * Reads the effective control index (snapshot plus journal) without
+ * quarantining, compacting or otherwise writing. For inspection tools.
+ */
+export function readControlStoreSnapshot(path: string): ControlStoreSnapshot | null {
+  let snapshot: ControlStoreSnapshot | null = null
+  try {
+    snapshot = decodeControlStoreSnapshot(readFileSync(path, 'utf8'))
+  } catch (error) {
+    if (!isMissingFile(error)) throw error
+  }
+  let journal: ControlStoreJournalEntry[] = []
+  try {
+    journal = decodeControlStoreJournal(readFileSync(`${path}.journal`, 'utf8'))
+  } catch (error) {
+    if (!isMissingFile(error)) throw error
+  }
+  if (snapshot === null && journal.length === 0) return null
+  return new ControlStore({ load: () => snapshot, save: () => {}, loadJournal: () => journal }).snapshot()
+}
+
+function writeAll(descriptor: number, text: string): void {
+  const buffer = Buffer.from(text, 'utf8')
+  let offset = 0
+  while (offset < buffer.length) offset += writeSync(descriptor, buffer, offset, buffer.length - offset)
+}
+
+function isFileSystemError(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null &&
+    typeof (error as { code?: unknown }).code === 'string' &&
+    typeof (error as { syscall?: unknown }).syscall === 'string'
+  )
 }
 
 function writeCrashSafe(path: string, contents: string): void {
