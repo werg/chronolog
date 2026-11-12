@@ -66,6 +66,7 @@ export class ChronologNode {
   #started = false
   #closed = false
   #consumeTask: Promise<void> | null = null
+  #subscriptionRestarts = 0
   #lastError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
@@ -121,6 +122,8 @@ export class ChronologNode {
   }
   get controlStore(): ControlStore { return this.#control }
   get revision(): bigint { return this.#revision }
+  /** Times the transport subscription ended early and was re-established. */
+  get subscriptionRestarts(): number { return this.#subscriptionRestarts }
   get materializedRevision(): bigint { return this.#options.materialization.queries.revision }
   get orderLength(): number { return this.#options.materialization.queries.orderLength }
 
@@ -135,8 +138,7 @@ export class ChronologNode {
     const history = await this.#options.transport.history()
     await this.#recoverValidatorCutoff(history)
     this.#started = true
-    const subscription = this.#options.transport.subscribe(this.#abort.signal)
-    this.#consumeTask = this.#consume(subscription)
+    this.#consumeTask = this.#consume()
     await this.#drainHistory(history)
     // The control store is authoritative and is committed before the derived
     // DoltLite revision. A crash between those two writes can therefore leave
@@ -430,11 +432,29 @@ export class ChronologNode {
     for (const record of history) await this.ingest(record)
   }
 
-  async #consume(records: AsyncIterable<TransportRecord>): Promise<void> {
-    try {
-      for await (const record of records) await this.ingest(record)
-    } catch (error) {
-      if (!this.#abort.signal.aborted) this.#recordError(error)
+  /**
+   * Follows the transport until the node closes. A transport may end a
+   * subscription early, for example when this consumer falls more than the
+   * subscriber buffer behind during a replication burst; the node then
+   * subscribes again. A new subscription replays history first and already
+   * ingested records are skipped, so nothing is lost or applied twice.
+   */
+  async #consume(): Promise<void> {
+    while (!this.#abort.signal.aborted) {
+      try {
+        for await (const record of this.#options.transport.subscribe(this.#abort.signal)) await this.ingest(record)
+        if (this.#abort.signal.aborted) return
+        this.#subscriptionRestarts += 1
+      } catch (error) {
+        if (this.#abort.signal.aborted) return
+        this.#recordError(error)
+        this.#subscriptionRestarts += 1
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 1_000)
+          timer.unref?.()
+          this.#abort.signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+        })
+      }
     }
   }
 
