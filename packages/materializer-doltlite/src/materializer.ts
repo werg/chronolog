@@ -301,14 +301,19 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     let replayBaseRef: string | null = null
     try {
       const transactions = orderedTransactions.map(cloneTransaction)
-      await validateTransactionSet(transactions)
+      // Rows of the published log were fully verified when they were read;
+      // byte-identical rows are not re-verified, so an append costs O(1)
+      // verification work instead of O(history).
+      const verifiedLog = this.#log
+      await validateTransactionSet(transactions, verifiedLog)
       ensureMonotonicSet(this.#order, transactions.map((transaction) => transaction.txId))
       validateExistingIdentities(this.#log, transactions)
       const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
       if (difference === null) return null
 
       const previousRevision = this.revision
-      const previousLog = this.#log.map(cloneLogRow)
+      // #log is replaced, never mutated, so the reference stays a stable copy.
+      const previousLog = this.#log
       const isAppend = difference === this.#order.length
       const checkpoint = isAppend ? null : this.#checkpointAtOrBefore(difference)
       if (!isAppend && checkpoint === null) throw new Error('MATERIALIZER_GENESIS_CHECKPOINT_MISSING')
@@ -321,7 +326,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       this.#writer.doltCheckout(replayBranch)
       verifyDatabaseState(this.#writer, this.#artifacts)
       const replayLog = readSystemLog(this.#writer)
-      await verifyLogResultIntegrity(replayLog, this.#executionManifest.errorCodes)
+      await verifyLogResultIntegrity(replayLog, this.#executionManifest.errorCodes, verifiedLog)
       verifyReplayBase(replayLog, transactions, replayFrom)
 
       for (let index = replayFrom; index < transactions.length; index += 1) {
@@ -330,7 +335,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       }
 
       const candidateLog = readSystemLog(this.#writer)
-      await verifyLogResultIntegrity(candidateLog, this.#executionManifest.errorCodes)
+      await verifyLogResultIntegrity(candidateLog, this.#executionManifest.errorCodes, verifiedLog)
       verifyDesiredLog(candidateLog, transactions)
       verifyDatabaseState(this.#writer, this.#artifacts)
       const commitHash = this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
@@ -354,7 +359,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       candidateReader.doltCheckout(revisionBranch)
       verifyDatabaseState(candidateReader, this.#artifacts)
       const readerLog = readSystemLog(candidateReader)
-      await verifyLogResultIntegrity(readerLog, this.#executionManifest.errorCodes)
+      await verifyLogResultIntegrity(readerLog, this.#executionManifest.errorCodes, verifiedLog)
       verifyPublishedLog(nextPublished, readerLog)
       if (candidateReader.doltHashOf(revisionBranch) !== contentHash) {
         throw new Error('MATERIALIZER_CANDIDATE_READER_CONTENT_MISMATCH')
@@ -647,8 +652,20 @@ async function validateCheckpointRefs(
   return valid.sort((left, right) => left.prefixLength - right.prefixLength)
 }
 
-async function verifyLogResultIntegrity(log: readonly TransactionLogRow[], errorCodes: readonly string[]): Promise<void> {
-  for (const row of log) {
+/**
+ * Verifies every protected result field of a log read from the database.
+ * `verified` is a log this materializer already verified (with the same
+ * error-code registry); a row whose verification inputs are byte-identical to
+ * the row at the same index there has the same verdict and is skipped.
+ */
+async function verifyLogResultIntegrity(
+  log: readonly TransactionLogRow[],
+  errorCodes: readonly string[],
+  verified: readonly TransactionLogRow[] = [],
+): Promise<void> {
+  for (const [index, row] of log.entries()) {
+    const known = verified[index]
+    if (known !== undefined && sameVerificationInputs(row, known)) continue
     if (row.outcome === 'accepted') {
       if (
         row.rejectionCode !== null || row.failurePhase !== null ||
@@ -716,23 +733,36 @@ function verifyEnvelopeAgainstProgram(
   }
 }
 
-async function validateTransactionSet(transactions: readonly AdmittedTransaction[]): Promise<void> {
+async function validateTransactionSet(
+  transactions: readonly AdmittedTransaction[],
+  verified: readonly TransactionLogRow[],
+): Promise<void> {
   let previous: TransactionOrderKey | null = null
   const seen = new Set<string>()
-  for (const transaction of transactions) {
+  for (const [index, transaction] of transactions.entries()) {
     if (transaction.txId.length === 0) throw new MaterializerInputError('MATERIALIZER_TRANSACTION_ID_INVALID')
     if (transaction.authorFeedSequence < 0n || transaction.authorFeedSequence > (1n << 63n) - 1n) {
       throw new MaterializerInputError('MATERIALIZER_AUTHOR_FEED_SEQUENCE_INVALID')
     }
-    if (!bytesEqual(encodeTransactionCore(transaction.core), transaction.canonicalCandidate)) {
+    if (!sameBytes(encodeTransactionCore(transaction.core), transaction.canonicalCandidate)) {
       throw new MaterializerInputError('MATERIALIZER_CANONICAL_CANDIDATE_MISMATCH')
     }
-    if (!bytesEqual(await transactionDigest(transaction.canonicalCandidate), transaction.candidateDigest)) {
-      throw new MaterializerInputError('MATERIALIZER_CANDIDATE_DIGEST_MISMATCH')
-    }
-    try { compileSqlProgram(transaction.core.program) } catch (error) {
-      if (error instanceof SqlCompilerError) throw new MaterializerInputError(error.code)
-      throw error
+    // A logged row's digest and program were checked when it was admitted.
+    // Both are pure functions of the canonical bytes, which the check above
+    // binds to this core, so a byte-identical candidate needs no recheck.
+    const known = verified[index]
+    const alreadyVerified = known !== undefined &&
+      sameBytes(known.txId, transaction.txId) &&
+      sameBytes(known.canonicalCandidate, transaction.canonicalCandidate) &&
+      sameBytes(known.candidateDigest, transaction.candidateDigest)
+    if (!alreadyVerified) {
+      if (!sameBytes(await transactionDigest(transaction.canonicalCandidate), transaction.candidateDigest)) {
+        throw new MaterializerInputError('MATERIALIZER_CANDIDATE_DIGEST_MISMATCH')
+      }
+      try { compileSqlProgram(transaction.core.program) } catch (error) {
+        if (error instanceof SqlCompilerError) throw new MaterializerInputError(error.code)
+        throw error
+      }
     }
     const key = orderKeyOf(transaction)
     if (previous !== null && compareTransactionOrder(previous, key) >= 0) {
@@ -934,6 +964,27 @@ function cloneTransaction(transaction: AdmittedTransaction): AdmittedTransaction
 function cloneLogRow(row: TransactionLogRow): TransactionLogRow { return structuredClone(row) }
 function idKey(bytes: Uint8Array): string { return Buffer.from(bytes).toString('base64url') }
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean { return left.length === right.length && left.every((value, index) => value === right[index]) }
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return Buffer.from(left.buffer, left.byteOffset, left.byteLength).equals(Buffer.from(right.buffer, right.byteOffset, right.byteLength))
+}
+function sameNullableBytes(left: Uint8Array | null, right: Uint8Array | null): boolean {
+  return left === null || right === null ? left === right : sameBytes(left, right)
+}
+/** Every field verifyLogResultIntegrity reads. */
+function sameVerificationInputs(left: TransactionLogRow, right: TransactionLogRow): boolean {
+  return left.outcome === right.outcome &&
+    left.rejectionCode === right.rejectionCode &&
+    left.failurePhase === right.failurePhase &&
+    left.failingPreconditionId === right.failingPreconditionId &&
+    left.failingPreconditionIndex === right.failingPreconditionIndex &&
+    left.failingStatementIndex === right.failingStatementIndex &&
+    left.resultEnvelopeVersion === right.resultEnvelopeVersion &&
+    sameNullableBytes(left.failingConstraintIdentity, right.failingConstraintIdentity) &&
+    sameNullableBytes(left.failingTriggerIdentity, right.failingTriggerIdentity) &&
+    sameNullableBytes(left.resultEnvelope, right.resultEnvelope) &&
+    sameNullableBytes(left.resultDigest, right.resultDigest) &&
+    sameBytes(left.canonicalCandidate, right.canonicalCandidate)
+}
 function copyBytes(value: Uint8Array): Uint8Array { return Uint8Array.from(value) }
 function validatePositiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new MaterializerInputError(`MATERIALIZER_INVALID_${name.toUpperCase()}`)
