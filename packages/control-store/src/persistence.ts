@@ -435,7 +435,8 @@ function writeCrashSafe(path: string, contents: string): void {
     mode: 0o600,
   })
   syncPath(temporaryPath)
-  syncPath(dirname(path))
+  // Only the rename needs a durable directory entry; the temporary name's
+  // entry is irrelevant after a crash, so no directory fsync before it.
   renameSync(temporaryPath, path)
   syncPath(dirname(path))
 }
