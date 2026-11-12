@@ -12,6 +12,7 @@ export default defineConfig({
         'apps/*/src/main.ts',
         'apps/chronologd/src/custody.ts',
         'apps/chronologd/src/snapshot.ts',
+        'apps/chronologd/src/blob-gc.ts',
         'packages/chaos/src/cli.ts',
         // Runnable demo, not shipped code.
         'examples/**',

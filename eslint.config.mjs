@@ -6,6 +6,7 @@ export default tseslint.config(
   {
     ignores: [
       ".chaos/**",
+      ".claude/**",
       ".chronolog/**",
       "coverage/**",
       "dist/**",

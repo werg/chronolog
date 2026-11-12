@@ -30,19 +30,35 @@ deployment, delivered through the supervisor, and protected by TLS. A remote
 404 moves to the next peer; network or integrity failures are retryable ingest
 errors and never substitute bytes into consensus state.
 
-There is deliberately no automatic garbage collection yet: fetched and
-authored chunks are retained. Operators must size `blobs/`, monitor disk use,
+There is deliberately no automatic or distributed garbage collection: fetched
+and authored chunks are retained unless an operator runs the local collector
+described below. Operators must size `blobs/`, monitor disk use,
 and keep at least two independently administered peers for manifests that are
 not reconstructible from inline SSB history. Do not manually delete chunks
 referenced by retained feed history. A future retention protocol must prove
 global reachability before deletion and is a separate compatibility decision.
 
-## Garbage-collection design analysis (not implemented)
+## Garbage-collection design
 
-Status: analysis only. No collector, quarantine, or `blob` command exists, and
-nothing in this section changes the rule above: there is no automatic GC and no
-distributed GC. The analysis records what a future operator-invoked, local-only
-collector would have to preserve.
+Status: an operator-invoked, local-only collector implements this design
+(`packages/node-core/src/blob-gc.ts`, command `pnpm blob`). There is still no
+automatic GC and no distributed GC.
+
+```sh
+# daemon stopped; CHRONOLOG_DATA_DIR points at the data directory
+pnpm blob stats [--verify]          # mark evidence, missing/corrupt referenced chunks
+pnpm blob gc                        # dry run: print the plan
+pnpm blob gc --apply [--grace-days 7] [--keep-modified-since ISO_TIME]
+pnpm blob restore [--run RUN_ID]    # move quarantined files back (digest-verified)
+pnpm blob purge [--min-quarantine-days 7]
+```
+
+`gc --apply` moves candidates to `<data>/blob-gc/quarantine/<run>/`; `purge`
+re-marks, restores anything now referenced, and deletes the rest once old
+enough. Every step is written to the fsynced `<data>/blob-gc/journal.ndjson`
+(serving as both intent journal and audit log); each command first resolves
+intents left by a crash and refuses state where both or neither copy exists.
+A refusal exits with status 3 and a `BLOB_GC_*` code.
 
 ### What "reachable" means today
 
@@ -109,8 +125,24 @@ the only copy a lagging peer can fetch. Do not collect after restoring or
 replacing the SSB log until every feed has re-replicated. Keep two independently
 administered peers holding manifest chunks, as above.
 
-### Open work
+### Implementation notes and remaining limits
 
-The collector, `blob stats|gc|restore|purge` command, and tests (late-predecessor
-reference, partially fetched blob, corrupt manifest, concurrent daemon lock,
-restore from quarantine, crash mid-sweep) have not been built.
+- Mark refusals: `BLOB_GC_FEED_QUARANTINED`, `BLOB_GC_FEED_NOT_CONTIGUOUS`,
+  `BLOB_GC_FEED_CHAIN_BROKEN`, `BLOB_GC_CLOCK_MISMATCH`,
+  `BLOB_GC_LOG_BEHIND_CONTINUITY` (rolled-back log),
+  `BLOB_GC_ENVELOPE_UNDECODABLE`, `BLOB_GC_MANIFEST_INVALID`,
+  `BLOB_GC_CHUNK_SIZE_CONFLICT`. The mark reads only the outer envelope, so it
+  needs no decryption keys.
+- Temporary files (`<chunk>.<pid>.tmp`) are collected like unreferenced chunks
+  even when their target chunk is referenced, since the store never reads them.
+- A file is moved only if its size, mtime and inode are unchanged since the scan.
+- Holds are limited to `--keep-modified-since`; holding by a snapshot archive's
+  feed heads is not implemented. Do not run the collector after restoring or
+  replacing the SSB log until every feed has re-replicated (see the caveat
+  above); `BLOB_GC_LOG_BEHIND_CONTINUITY` only catches a rollback when
+  `feed-continuity.json` was not restored with it.
+- Tests: `packages/node-core/src/blob-gc.test.ts` (late reference restored at
+  purge, partially fetched blob, corrupt and size-mismatched referenced chunks,
+  undecodable envelope, rolled-back log, changed-since-scan, quarantine and
+  restore with digest verification, crash mid-sweep and torn journal). The
+  data-directory lock is the existing `acquireDataDirectoryLock`.
