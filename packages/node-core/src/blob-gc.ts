@@ -191,6 +191,32 @@ export interface BlobPlanOptions {
   readonly keepModifiedSinceMs?: number
 }
 
+/** A snapshot archive the operator wants to keep restorable. */
+export interface BlobSnapshotHold {
+  readonly feedHeads: readonly { readonly feedId: string; readonly sequence: bigint }[]
+  readonly createdAtMs: bigint
+}
+
+/**
+ * Holds may only make collection more conservative. A local log that is behind
+ * a held snapshot's feed heads (for example after restoring an older `ssb/`)
+ * blocks collection; otherwise the returned floor keeps every file modified
+ * since the oldest held snapshot was created.
+ */
+export function snapshotHoldFloor(mark: BlobMark, holds: readonly BlobSnapshotHold[]): number | undefined {
+  const heads = new Map(mark.feedHeads.map((head) => [head.feedId, BigInt(head.sequence)]))
+  let floor: number | undefined
+  for (const hold of holds) {
+    for (const head of hold.feedHeads) {
+      const local = heads.get(head.feedId) ?? 0n
+      if (local < head.sequence) throw new BlobGcRefusal('BLOB_GC_LOG_BEHIND_SNAPSHOT', `${head.feedId}:${local}:${head.sequence}`)
+    }
+    const created = Number(hold.createdAtMs)
+    floor = floor === undefined ? created : Math.min(floor, created)
+  }
+  return floor
+}
+
 export function planBlobCollection(mark: BlobMark, scan: BlobStoreScan, options: BlobPlanOptions): BlobCollectionPlan {
   if (!Number.isSafeInteger(options.graceMs) || options.graceMs < 0) throw new BlobGcRefusal('BLOB_GC_GRACE_INVALID')
   let retentionFloorMs = options.nowMs - options.graceMs

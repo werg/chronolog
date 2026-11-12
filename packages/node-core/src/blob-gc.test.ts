@@ -17,6 +17,7 @@ import {
   recoverBlobGcJournal,
   restoreQuarantinedBlobs,
   scanBlobStore,
+  snapshotHoldFloor,
   verifyReferencedBlobs,
   type BlobGcPaths,
   type BlobMark,
@@ -294,5 +295,29 @@ describe('blob quarantine, restore and purge', () => {
     appendFileSync(journal, `${JSON.stringify(restoreIntent)}\n`)
     writeFileSync(join(paths.blobRoot, chunkPath(orphans[0]!)), readFileSync(join(paths.dataDirectory, restoreIntent.quarantinePath)))
     expect(() => recoverBlobGcJournal(paths, NOW)).toThrow('BLOB_GC_JOURNAL_AMBIGUOUS')
+  })
+})
+
+describe('snapshot holds', () => {
+  const mark: BlobMark = {
+    reachable: new Map(),
+    feedHeads: [{ feedId: '@a', sequence: '10', id: 'a10' }, { feedId: '@b', sequence: '3', id: 'b3' }],
+    manifestRecords: 0,
+    evidenceDigest: '',
+  }
+
+  it('lowers the retention floor to the oldest held snapshot', () => {
+    expect(snapshotHoldFloor(mark, [])).toBeUndefined()
+    expect(snapshotHoldFloor(mark, [
+      { feedHeads: [{ feedId: '@a', sequence: 9n }], createdAtMs: 5_000n },
+      { feedHeads: [{ feedId: '@a', sequence: 10n }, { feedId: '@b', sequence: 3n }], createdAtMs: 2_000n },
+    ])).toBe(2_000)
+  })
+
+  it('refuses while the local log is behind a held snapshot', () => {
+    expect(() => snapshotHoldFloor(mark, [{ feedHeads: [{ feedId: '@a', sequence: 11n }], createdAtMs: 1n }]))
+      .toThrow(new BlobGcRefusal('BLOB_GC_LOG_BEHIND_SNAPSHOT', '@a:10:11'))
+    expect(() => snapshotHoldFloor(mark, [{ feedHeads: [{ feedId: '@c', sequence: 1n }], createdAtMs: 1n }]))
+      .toThrow('BLOB_GC_LOG_BEHIND_SNAPSHOT:@c:0:1')
   })
 })

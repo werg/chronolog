@@ -1,19 +1,24 @@
 // Operator-invoked local blob garbage collection. Run with the daemon stopped:
 //
 //   pnpm blob stats [--verify]
-//   pnpm blob gc [--grace-days 7] [--keep-modified-since ISO_TIME] [--apply]
+//   pnpm blob gc [--grace-days 7] [--keep-modified-since ISO_TIME] [--hold-snapshot ARCHIVE ...] [--apply]
 //   pnpm blob restore [--run RUN_ID]
 //   pnpm blob purge [--min-quarantine-days 7]
 //
 // gc without --apply only prints the plan. Applying moves candidates into
 // <data>/blob-gc/quarantine; purge deletes quarantined files after a fresh mark
 // and restores any that became referenced. Every step is journaled in
-// <data>/blob-gc/journal.ndjson. See docs/blob-replication.md.
+// <data>/blob-gc/journal.ndjson. --hold-snapshot (repeatable) keeps a snapshot
+// archive restorable: it refuses to collect while the local log is behind the
+// archive's feed heads and keeps files modified since the archive was created.
+// See docs/blob-replication.md.
+import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import {
   BlobGcRefusal,
   JsonFeedForkPersistence,
+  decodeSignedSnapshotManifest,
   listQuarantinedBlobs,
   markReachableBlobs,
   planBlobCollection,
@@ -22,6 +27,7 @@ import {
   recoverBlobGcJournal,
   restoreQuarantinedBlobs,
   scanBlobStore,
+  snapshotHoldFloor,
   verifyReferencedBlobs,
   type BlobGcPaths,
   type BlobMark,
@@ -34,7 +40,7 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const args = process.argv.slice(2)
 const command = args.shift()
 if (command === undefined || !['stats', 'gc', 'restore', 'purge'].includes(command)) {
-  process.stderr.write('Usage: pnpm blob <stats [--verify] | gc [--grace-days N] [--keep-modified-since ISO] [--apply] | restore [--run RUN_ID] | purge [--min-quarantine-days N]>\n')
+  process.stderr.write('Usage: pnpm blob <stats [--verify] | gc [--grace-days N] [--keep-modified-since ISO] [--hold-snapshot ARCHIVE ...] [--apply] | restore [--run RUN_ID] | purge [--min-quarantine-days N]>\n')
   process.exit(2)
 }
 const dataDirectory = resolve(process.env.CHRONOLOG_DATA_DIR ?? '.chronolog')
@@ -69,8 +75,11 @@ try {
       })
     } else if (command === 'gc') {
       const keepSince = option('--keep-modified-since')
-      const keepModifiedSinceMs = keepSince === undefined ? undefined : Date.parse(keepSince)
-      if (keepModifiedSinceMs !== undefined && !Number.isFinite(keepModifiedSinceMs)) throw new Error('--keep-modified-since must be an ISO time')
+      const explicitKeepMs = keepSince === undefined ? undefined : Date.parse(keepSince)
+      if (explicitKeepMs !== undefined && !Number.isFinite(explicitKeepMs)) throw new Error('--keep-modified-since must be an ISO time')
+      const holdFloorMs = snapshotHoldFloor(mark, options('--hold-snapshot').map(snapshotHold))
+      const keepModifiedSinceMs = explicitKeepMs === undefined ? holdFloorMs
+        : holdFloorMs === undefined ? explicitKeepMs : Math.min(explicitKeepMs, holdFloorMs)
       const plan = planBlobCollection(mark, scan, {
         nowMs: now,
         graceMs: days('--grace-days', 7),
@@ -120,6 +129,17 @@ async function markFromLocalHistory(): Promise<BlobMark> {
 function option(name: string): string | undefined {
   const index = args.indexOf(name)
   return index === -1 ? undefined : args[index + 1]
+}
+
+function options(name: string): string[] {
+  return args.flatMap((value, index) => value === name && args[index + 1] !== undefined ? [args[index + 1]!] : [])
+}
+
+function snapshotHold(archiveDirectory: string) {
+  // A hold can only make collection more conservative, so the archive's
+  // signature is not checked here; snapshot import checks it before use.
+  const { manifest } = decodeSignedSnapshotManifest(Uint8Array.from(readFileSync(join(resolve(archiveDirectory), 'snapshot.cbor'))))
+  return { feedHeads: manifest.feedHeads, createdAtMs: manifest.createdAtMs }
 }
 
 function days(name: string, fallback: number): number {

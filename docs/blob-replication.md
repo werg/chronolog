@@ -136,8 +136,10 @@ administered peers holding manifest chunks, as above.
 - Temporary files (`<chunk>.<pid>.tmp`) are collected like unreferenced chunks
   even when their target chunk is referenced, since the store never reads them.
 - A file is moved only if its size, mtime and inode are unchanged since the scan.
-- Holds are limited to `--keep-modified-since`; holding by a snapshot archive's
-  feed heads is not implemented. Do not run the collector after restoring or
+- Holds: `--keep-modified-since ISO` and `--hold-snapshot ARCHIVE` (repeatable).
+  A snapshot hold refuses with `BLOB_GC_LOG_BEHIND_SNAPSHOT` while the local log
+  is behind the archive's feed heads, and keeps every file modified since the
+  archive was created. Do not run the collector after restoring or
   replacing the SSB log until every feed has re-replicated (see the caveat
   above); `BLOB_GC_LOG_BEHIND_CONTINUITY` only catches a rollback when
   `feed-continuity.json` was not restored with it.
