@@ -89,6 +89,15 @@ describe('feed continuity journal', () => {
     expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).snapshot()).toEqual(registry.snapshot())
   })
 
+  it('drops a torn first append so later appends stay readable', () => {
+    const path = temporaryPath()
+    // Crash during the very first append: no snapshot, only a fragment.
+    writeFileSync(`${path}.journal`, '{"feedId":"@writer.ed25519","seq')
+    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
+    expect(registry.observe(record(1n, 'a'))).toBe('accepted')
+    expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).snapshot()).toEqual(registry.snapshot())
+  })
+
   it('fails closed on a corrupt or conflicting journal entry', () => {
     const path = temporaryPath()
     const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))

@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 import type { TransportRecord } from '@chronolog/transport-ssb'
@@ -255,7 +255,9 @@ export class JsonFeedForkPersistence implements FeedForkPersistence {
 
   #readJournal(): FeedContinuityEntry[] {
     if (!existsSync(this.#journalPath)) return []
-    const lines = readFileSync(this.#journalPath, 'utf8').split('\n')
+    const text = readFileSync(this.#journalPath, 'utf8')
+    if (text.length > 0 && !text.endsWith('\n')) this.#truncateTornAppend(text)
+    const lines = text.split('\n')
     // The element after the last newline is either '' or a torn append.
     return lines.slice(0, -1).map((line) => {
       let value: unknown
@@ -263,6 +265,16 @@ export class JsonFeedForkPersistence implements FeedForkPersistence {
       if (!isJournalEntry(value)) throw new Error('FEED_FORK_JOURNAL_INVALID')
       return value
     })
+  }
+
+  // Without a snapshot the registry does not compact on open, so a torn
+  // final fragment must be removed before the next append lands after it.
+  #truncateTornAppend(text: string): void {
+    const file = openSync(this.#journalPath, 'r+')
+    try {
+      ftruncateSync(file, Buffer.byteLength(text.slice(0, text.lastIndexOf('\n') + 1)))
+      fsyncSync(file)
+    } finally { closeSync(file) }
   }
 }
 
