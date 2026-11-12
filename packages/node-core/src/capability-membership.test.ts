@@ -74,6 +74,7 @@ function snapshot(
     capabilityLogFeed: bytes(0x91),
     capabilities: new Map(all.map((item) => [bytesToHex(item.id), item])),
     policies: new Map([[bytesToHex(policyId), effective]]),
+    validatorFloorMs: 0n,
     ...overrides,
   }
 }

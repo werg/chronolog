@@ -81,7 +81,15 @@ async function genesisSnapshot(genesis: SignedGenesis): Promise<CapabilitySnapsh
     capabilityLogFeed: manifest.capabilityLogFeed,
     capabilities,
     policies,
+    validatorFloorMs: raiseValidatorFloor(0n, manifest.initialCapabilities),
   }
+}
+
+function raiseValidatorFloor(floor: bigint, grants: readonly CapabilityGrant[]): bigint {
+  return grants.reduce((maximum, grant) => {
+    const granted = grant.role === 'validator' ? grant.minimumAuthorTimestampMs ?? 0n : 0n
+    return granted > maximum ? granted : maximum
+  }, floor)
 }
 
 export async function reduceCapabilityLog(
@@ -117,15 +125,7 @@ export async function applyCapabilityRevision(
     for (const grant of revision.grants) {
       protocolInvariant(grant.validFromRevision === revision.revision, 'SCHEMA_INVALID', 'New capability must begin at its containing revision')
       if (grant.role === 'validator') {
-        // Validators revoked by this same revision were still authorized before it and keep their floor.
-        const currentFloor = [...capabilities.values()]
-          .filter((entry) => entry.grant.role === 'validator'
-            && (entry.revokedAtRevision === undefined || entry.revokedAtRevision === revision.revision))
-          .reduce((maximum, entry) => {
-            const floor = entry.grant.minimumAuthorTimestampMs ?? 0n
-            return floor > maximum ? floor : maximum
-          }, 0n)
-        protocolInvariant((grant.minimumAuthorTimestampMs ?? -1n) >= currentFloor, 'SCHEMA_INVALID', 'New validator would reopen closed timestamp history')
+        protocolInvariant((grant.minimumAuthorTimestampMs ?? -1n) >= snapshot.validatorFloorMs, 'SCHEMA_INVALID', 'New validator would reopen closed timestamp history')
       }
       const id = await capabilityId(grant)
       protocolInvariant(!capabilities.has(bytesToHex(id)), 'SCHEMA_INVALID', 'Capability revision contains a duplicate grant')
@@ -146,6 +146,7 @@ export async function applyCapabilityRevision(
       capabilityLogFeed: revision.successorCapabilityLogFeed ?? snapshot.capabilityLogFeed,
       capabilities,
       policies,
+      validatorFloorMs: raiseValidatorFloor(snapshot.validatorFloorMs, revision.grants),
     }
 }
 
@@ -182,6 +183,7 @@ export async function capabilitySnapshotDigest(snapshot: CapabilitySnapshot): Pr
     [3, snapshot.rootAdminPublicKey], [4, snapshot.capabilityLogFeed],
     [5, entries.map((entry) => (awaitImportHackGrant(entry)))],
     [6, policies.map((entry) => (awaitImportHackPolicy(entry)))],
+    [7, snapshot.validatorFloorMs],
   ])
   return hashDomain(DOMAINS.capabilitySnapshot, encodeCanonicalCbor(value))
 }

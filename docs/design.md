@@ -265,7 +265,9 @@ minimum author timestamp it may attest
 The minimum author timestamp is crucial. A newly added validator must inherit a
 floor no lower than the group history it is allowed to help close. Otherwise,
 adding a validator with a zero floor would reopen the entire past for fresh
-backdated attestations.
+backdated attestations. The membership state therefore keeps the highest
+validator floor ever granted. Revocation or expiry never lowers it, so
+removing validators and then adding a lower-floor one is rejected too.
 
 A transaction pins a validation policy reference before attestations are
 collected. The v0.1 policy grammar uses absolute capability thresholds with

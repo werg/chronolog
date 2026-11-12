@@ -98,6 +98,12 @@ export interface CapabilitySnapshot {
   readonly capabilityLogFeed: Uint8Array
   readonly capabilities: ReadonlyMap<string, EffectiveCapability>
   readonly policies: ReadonlyMap<string, EffectivePolicy>
+  /**
+   * Highest minimum author timestamp ever granted to a validator. It only rises:
+   * revoking or expiring validators never lowers it, so closed history cannot be
+   * reopened by membership changes. Admitting older history requires a fork.
+   */
+  readonly validatorFloorMs: bigint
 }
 
 export interface ValidatorEvidence {

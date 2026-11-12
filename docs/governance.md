@@ -123,8 +123,10 @@ A snapshot reader receives only epochs explicitly published to it while its
 grant is active. An audit reader may receive historical keys through an
 explicit rewrap. Historical access never changes old transaction bytes.
 
-A new validator's timestamp floor may not be lower than the floors of the
-active validators. Admitting history below a closed floor requires a fork.
+The capability snapshot records the highest timestamp floor ever granted to a
+validator. It only rises, so a new validator's floor may not be lower even
+after every earlier validator has been revoked or has expired. Admitting
+history below that floor requires a fork.
 
 ## Static override
 

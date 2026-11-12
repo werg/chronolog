@@ -140,6 +140,24 @@ describe('capability revision chain', () => {
     expect((await applyCapabilityRevision(f.snapshot, flooredSwap)).revision).toBe(1n)
   })
 
+  it('keeps the floor after every validator is revoked in an earlier revision', async () => {
+    const f = await fixture()
+    const highFloorId = await capabilityId(validatorAt(21, 0n, 1_000n))
+    const emptied = await applyCapabilityRevision(f.snapshot, await signCapabilityRevision(
+      revisionAfter(f, { revocations: [highFloorId] }),
+      f.root.privateKey,
+    ))
+    expect(emptied.validatorFloorMs).toBe(1_000n)
+    const next = { snapshot: emptied, root: f.root }
+    const lowered = await signCapabilityRevision(revisionAfter(next, { grants: [validatorAt(22, 2n, 500n)] }), f.root.privateKey)
+    await expect(applyCapabilityRevision(emptied, lowered)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
+    const raised = await applyCapabilityRevision(emptied, await signCapabilityRevision(
+      revisionAfter(next, { grants: [validatorAt(22, 2n, 2_000n)] }),
+      f.root.privateKey,
+    ))
+    expect(raised.validatorFloorMs).toBe(2_000n)
+  })
+
   it('stops honoring the old root after succession', async () => {
     const f = await fixture()
     const successor = await generateEd25519KeyPair()

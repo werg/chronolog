@@ -80,6 +80,7 @@ function capabilitySnapshot(): CapabilitySnapshot {
       grantedAtRevision: 0n,
     }]]),
     policies: new Map(),
+    validatorFloorMs: 0n,
   }
 }
 
