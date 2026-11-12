@@ -485,8 +485,10 @@ export class ChronologNode {
     const validatorCapability = this.#validatorCapability()
     if (validatorCapability === undefined) return
     const now = this.#clockNow()
+    // The advanced cutoff only becomes a commitment once it is signed, so it
+    // is persisted just before signing. Persisting here for every candidate
+    // fsynced once per record during history replay (seconds per restart).
     this.#advanceValidatorCutoff(now)
-    this.#persistValidatorCutoff()
     const futureLimit = BigInt(Math.trunc(now + (validator.maxFutureSkewMs ?? 30_000)))
     if (core.authorTimestampMs > futureLimit || core.authorTimestampMs <= this.#acceptedAboveMs) return
     const context = {
@@ -510,6 +512,7 @@ export class ChronologNode {
     if (policyVersion < 0n) return
     const configuredPolicyVersion = validator.policyVersion ?? policyVersion
     if (configuredPolicyVersion !== policyVersion) throw new Error('VALIDATOR_POLICY_VERSION_MISMATCH')
+    this.#persistValidatorCutoff()
     const attestation: ValidatorAttestation = {
       groupId: core.groupId,
       membershipRevision: core.membershipRevision,
