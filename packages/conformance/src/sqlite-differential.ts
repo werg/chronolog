@@ -43,6 +43,12 @@ interface CorpusFixture {
     readonly prepare: 'accepted' | 'rejected'
     readonly error?: string
     readonly execute?: RuntimeExecutionExpectation
+    /**
+     * Sorted, de-duplicated SQL function names the engine reported to an
+     * allow-all recording authorizer (SQLITE_FUNCTION) during prepare and
+     * execution. Omitted means no authorizer is installed.
+     */
+    readonly authorizedFunctions?: readonly string[]
   }
 }
 
@@ -63,6 +69,7 @@ export interface DifferentialFixtureResult {
   readonly columns?: readonly string[]
   readonly rows?: readonly (readonly JsonScalar[])[]
   readonly affectedRows?: string | null
+  readonly authorizedFunctions?: readonly string[]
   readonly failures: readonly string[]
 }
 
@@ -78,6 +85,8 @@ export interface SqliteDifferentialReport {
   readonly fixtures: readonly DifferentialFixtureResult[]
   readonly failures: readonly string[]
 }
+
+const SQLITE_FUNCTION_AUTHORIZER_ACTION = 31
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url))
 const defaultCorpusPath = resolve(moduleDirectory, '../fixtures/sqlite-differential.json')
@@ -161,6 +170,14 @@ function runFixture(database: DatabaseSync, fixture: CorpusFixture): Differentia
   let columns: readonly string[] | undefined
   let rows: readonly (readonly JsonScalar[])[] | undefined
   let affectedRows: string | null | undefined
+  const recordedFunctions = new Set<string>()
+  let recordingFunctions = true
+  if (fixture.runtime.authorizedFunctions !== undefined) {
+    database.setAuthorizer((action, arg1, arg2) => {
+      if (recordingFunctions && action === SQLITE_FUNCTION_AUTHORIZER_ACTION) recordedFunctions.add((arg2 ?? arg1 ?? '').toLowerCase())
+      return 0
+    })
+  }
   try {
     const statement = database.prepare(fixture.sql)
     if (fixture.runtime.execute !== undefined) {
@@ -173,6 +190,8 @@ function runFixture(database: DatabaseSync, fixture: CorpusFixture): Differentia
           if (!Array.isArray(row)) throw new Error('DIFFERENTIAL_RUNTIME_ROW_NOT_ARRAY')
           return row.map(jsonScalar)
         })
+        // The harness's own changes() probe is not part of the fixture.
+        recordingFunctions = false
         affectedRows = isMutationClass(fixture.compiler.statementClass) ? readChanges(database) : null
       } else {
         const result = statement.run(...parameters)
@@ -183,6 +202,13 @@ function runFixture(database: DatabaseSync, fixture: CorpusFixture): Differentia
   } catch (error) {
     runtimePrepare = 'rejected'
     runtimeError = sqliteErrorName(error)
+  } finally {
+    if (fixture.runtime.authorizedFunctions !== undefined) database.setAuthorizer(null)
+  }
+  const authorizedFunctions = fixture.runtime.authorizedFunctions === undefined ? undefined : [...recordedFunctions].sort()
+  if (authorizedFunctions !== undefined &&
+      JSON.stringify(authorizedFunctions) !== JSON.stringify(fixture.runtime.authorizedFunctions)) {
+    failures.push(`AUTHORIZED_FUNCTIONS:${authorizedFunctions.join(',')}!=${fixture.runtime.authorizedFunctions?.join(',') ?? ''}`)
   }
   if (runtimePrepare !== fixture.runtime.prepare) failures.push(`RUNTIME_PREPARE:${runtimePrepare}!=${fixture.runtime.prepare}`)
   if (fixture.runtime.error !== undefined && runtimeError !== fixture.runtime.error) {
@@ -197,6 +223,7 @@ function runFixture(database: DatabaseSync, fixture: CorpusFixture): Differentia
     ...(columns === undefined ? {} : { columns }),
     ...(rows === undefined ? {} : { rows }),
     ...(affectedRows === undefined ? {} : { affectedRows }),
+    ...(authorizedFunctions === undefined ? {} : { authorizedFunctions }),
     failures,
   }
 }
@@ -207,6 +234,7 @@ function createFixtureDatabase(): DatabaseSync {
     CREATE TABLE accounts (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
     CREATE TABLE archive (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
     CREATE TABLE source (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
+    CREATE TABLE defaulted (id INTEGER PRIMARY KEY, code TEXT NOT NULL DEFAULT (lower('NEW'))) STRICT;
     CREATE INDEX accounts_value_idx ON accounts(value);
     INSERT INTO accounts VALUES (1, 'one'), (2, 'two');
     INSERT INTO source VALUES (1, 'updated');

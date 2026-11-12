@@ -581,6 +581,8 @@ function validateStarFunction(node: FunctionCallStarExpr, sql: string): void {
 
 function hasUnsafeTimeArgument(node: FunctionCallExpr): boolean {
   if (node.args === undefined || node.args.length === 0) return true
+  // strftime(FORMAT) has no time-value argument, so SQLite substitutes 'now'.
+  if (asciiLower(node.name.name) === 'strftime' && node.args.length < 2) return true
   return node.args.some((argument) => {
     if (argument.type === 'NumericLiteral' || argument.type === 'NullLiteral') return false
     if (argument.type !== 'StringLiteral') return true

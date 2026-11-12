@@ -187,6 +187,8 @@ describe('deterministic SQL compiler', () => {
     ['SELECT random()', 'SQL_FUNCTION_TEMPORARILY_GATED'],
     ["SELECT datetime('now')", 'SQL_AMBIENT_TIME_PROHIBITED'],
     ["SELECT datetime(?)", 'SQL_AMBIENT_TIME_PROHIBITED'],
+    ["SELECT strftime('%s')", 'SQL_AMBIENT_TIME_PROHIBITED'],
+    ["CREATE TABLE stamped (id INTEGER PRIMARY KEY, at TEXT DEFAULT (strftime('%Y-%m-%d')))", 'SQL_AMBIENT_TIME_PROHIBITED'],
     ['SELECT (SELECT id FROM accounts)', 'SQL_SCALAR_SUBQUERY_TEMPORARILY_GATED'],
     ['SELECT id FROM accounts LIMIT 1', 'SQL_UNORDERED_LIMIT_TEMPORARILY_GATED'],
     ['INSERT INTO accounts SELECT * FROM archived_accounts', 'SQL_INSERT_SELECT_TEMPORARILY_GATED'],
