@@ -27,7 +27,7 @@ opens the stage through the production DoltLite adapter, and independently
 rechecks revision, order, content hash, and the exact protected-log digest.
 Only the literal confirmation flag permits the final atomic rename. The prior
 database remains as `application.db.pre-snapshot-rREVISION`; the rebuildable
-`control.json` is moved aside so the next start reconstructs it from the
+`control.json` and its `control.json.journal` are moved aside so the next start reconstructs it from the
 authenticated transport log. Keep the backup until restart, health,
 replication, governance, and application queries are verified.
 
