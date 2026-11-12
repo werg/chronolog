@@ -67,6 +67,11 @@ export class ChronologNode {
   #closed = false
   #consumeTask: Promise<void> | null = null
   #subscriptionRestarts = 0
+  /** What the transport consumer is doing, for stall diagnosis. */
+  #consumerPhase = 'idle'
+  #consumerPhaseSince = Date.now()
+  #stallWatchdog: NodeJS.Timeout | undefined
+  #stallReported = false
   #lastError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
@@ -139,6 +144,8 @@ export class ChronologNode {
     await this.#recoverValidatorCutoff(history)
     this.#started = true
     this.#consumeTask = this.#consume()
+    this.#stallWatchdog = setInterval(() => { void this.#checkIngestStall().catch(() => {}) }, 5_000)
+    this.#stallWatchdog.unref?.()
     await this.#drainHistory(history)
     // The control store is authoritative and is committed before the derived
     // DoltLite revision. A crash between those two writes can therefore leave
@@ -257,6 +264,7 @@ export class ChronologNode {
   async ingest(record: TransportRecord): Promise<void> {
     await this.#mutex.run(async () => {
       if (this.#seen.has(record.id)) return
+      this.#setConsumerPhase('ingesting')
       try {
         const continuity = this.#feedForks.observe(record)
         if (continuity === 'discarded') {
@@ -414,6 +422,7 @@ export class ChronologNode {
     this.#closed = true
     this.#abort.abort()
     if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer)
+    if (this.#stallWatchdog) clearInterval(this.#stallWatchdog)
     if (this.#materializationDebounceTimer) clearTimeout(this.#materializationDebounceTimer)
     if (this.#materializationRetryTimer) clearTimeout(this.#materializationRetryTimer)
     if (this.#ingestionRetryTimer) clearTimeout(this.#ingestionRetryTimer)
@@ -442,7 +451,12 @@ export class ChronologNode {
   async #consume(): Promise<void> {
     while (!this.#abort.signal.aborted) {
       try {
-        for await (const record of this.#options.transport.subscribe(this.#abort.signal)) await this.ingest(record)
+        this.#setConsumerPhase('waiting-for-record')
+        for await (const record of this.#options.transport.subscribe(this.#abort.signal)) {
+          this.#setConsumerPhase('waiting-for-ingest-lock')
+          await this.ingest(record)
+          this.#setConsumerPhase('waiting-for-record')
+        }
         if (this.#abort.signal.aborted) return
         this.#subscriptionRestarts += 1
       } catch (error) {
@@ -495,6 +509,7 @@ export class ChronologNode {
     if (inserted.added) this.#emit('candidate', txId)
     if (canWrite) {
       await this.#evaluateAdmission(txId, core)
+      this.#setConsumerPhase('attesting')
       await this.#maybeAttest(txId, candidate, core)
     }
   }
@@ -549,6 +564,7 @@ export class ChronologNode {
     const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'attestation', payload, this.#options.identity, this.#options.envelopeCipher, this.#options.blobPayloads)
     // Publishing before returning is the validator durability rule. The newly
     // appended record is handled by the normal subscription path.
+    this.#setConsumerPhase('publishing-attestation')
     await this.#options.transport.publish(envelope, { timestampMs: now })
   }
 
@@ -1011,6 +1027,26 @@ export class ChronologNode {
     this.#lastAuthoredTimestampMs = authorTimestampMs
     return { authorTimestampMs, nonce: this.#randomBytes(32) }
   }
+  #setConsumerPhase(phase: string): void {
+    if (phase === this.#consumerPhase) return
+    this.#consumerPhase = phase
+    this.#consumerPhaseSince = Date.now()
+    this.#stallReported = false
+  }
+
+  /**
+   * Records NODE_INGEST_STALLED:<phase> when the transport holds records this
+   * node has not processed and the consumer has not changed phase for 20 s.
+   * It only reports; it never changes what the node does.
+   */
+  async #checkIngestStall(): Promise<void> {
+    if (this.#closed || this.#stallReported || Date.now() - this.#consumerPhaseSince < 20_000) return
+    const transport = await this.#options.transport.status()
+    if (transport.records <= this.#seen.size + this.#retryRecords.size) return
+    this.#stallReported = true
+    this.#recordError(new Error(`NODE_INGEST_STALLED:${this.#consumerPhase}`))
+  }
+
   #advanceValidatorCutoff(now: number): void {
     const validator = this.#options.validator
     if (!validator) return
