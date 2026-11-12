@@ -176,6 +176,15 @@ describe('HttpRpcServer request validation', () => {
     expect(calls).toHaveLength(1)
   })
 
+  it('rejects a malformed JSON body with invalid_argument without calling the handler', async () => {
+    const { service, calls } = recordingService()
+    const url = await start({ service })
+    const response = await post(`${url}/rpc/unary/node.getStatus`, '{"groupId":')
+    expect(response.status).toBe(400)
+    expect((await errorOf(response)).code).toBe('invalid_argument')
+    expect(calls).toEqual([])
+  })
+
   it('enforces the body limit on chunked uploads without a content-length', async () => {
     const { service, calls } = recordingService()
     const url = new URL(await start({ service, maxBodyBytes: 1024 }))

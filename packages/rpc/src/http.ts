@@ -191,7 +191,10 @@ export class HttpRpcServer {
     // although the peer is still waiting; body-phase errors must still be reported.
     let readingBody = true
     try {
-      const requestValue = decodeJson(await readBody(request, this.#options.maxBodyBytes ?? 4 * 1024 * 1024))
+      const body = await readBody(request, this.#options.maxBodyBytes ?? 4 * 1024 * 1024)
+      let requestValue: unknown
+      try { requestValue = decodeJson(body) }
+      catch { throw new ChronologRpcError('invalid_argument', 'Request body is not valid JSON') }
       readingBody = false
       const context: RpcCallContext = {
         method: method as UnaryRpcMethod,
