@@ -212,6 +212,52 @@ describe('SQL-first DoltLite materialization', () => {
     materializer.close()
   })
 
+  it('decides schema-dependent determinism proofs against the schema at each statement', async () => {
+    const { path, manifest } = await fixture()
+    let materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, checkpointEvery: 1 })
+    const proven = await transaction(1n, 'schema-proven', {
+      version: 1,
+      preconditions: [truePrecondition()],
+      body: [
+        // DDL earlier in the transaction is the schema later statements see.
+        statement('CREATE TABLE labels (id INTEGER PRIMARY KEY, label TEXT NOT NULL) STRICT'),
+        statement("INSERT INTO labels (label) VALUES ('b'), ('a'), ('b')"),
+        statement('SELECT label, count(*) AS total FROM labels GROUP BY label'),
+        statement('SELECT group_concat(label ORDER BY label) AS joined FROM labels'),
+        statement('SELECT * FROM labels AS x JOIN labels AS y ON x.label = y.label ORDER BY x.label'),
+      ],
+    }, materializer.executionManifestDigest)
+    const unproven = await transaction(2n, 'schema-unproven', {
+      version: 1,
+      preconditions: [truePrecondition()],
+      body: [
+        statement('CREATE TABLE loose_labels (label)'),
+        statement('SELECT label, count(*) AS total FROM loose_labels GROUP BY label'),
+      ],
+    }, materializer.executionManifestDigest)
+    await materializer.materialize([proven, unproven])
+    expect(materializer.outcome(proven.txId)?.outcome).toBe('accepted')
+    const results = materializer.transactionResult(proven.txId)!.statements
+    expect(results[2]?.result?.rows).toHaveLength(2)
+    expect(results[3]?.result?.rows).toEqual([[{ kind: 'text', utf8: utf8('a,b,b') }]])
+    expect(results[4]?.result?.rows).toHaveLength(5)
+    // The gate is a registered deterministic rejection, not a materializer halt.
+    expect(materializer.outcome(unproven.txId)).toMatchObject({
+      outcome: 'rejected_execution',
+      rejectionCode: 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED',
+      failingStatementIndex: 1,
+    })
+    const envelope = materializer.transactionResult(proven.txId)
+    materializer.close()
+
+    materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, checkpointEvery: 1 })
+    expect(materializer.transactionResult(proven.txId)).toEqual(envelope)
+    expect(materializer.validateStatement(statement('SELECT label, count(*) FROM labels GROUP BY label'), 'precondition')).toEqual([])
+    expect(materializer.validateStatement(statement('SELECT label, count(*) FROM loose_labels GROUP BY label'), 'precondition'))
+      .toEqual([expect.objectContaining({ code: 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED' })])
+    materializer.close()
+  })
+
   it('replays pinned JSON arrows and deterministic trigger RAISE actions', async () => {
     const { path, manifest } = await fixture()
     let materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, checkpointEvery: 1 })

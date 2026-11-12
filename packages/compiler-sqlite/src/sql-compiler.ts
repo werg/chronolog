@@ -18,6 +18,7 @@ import {
   type PragmaStmt,
   type QualifiedName,
   type Select,
+  type SortedColumn,
   type Stmt,
   type VariableExpr,
 } from 'sqlite3-parser/sqlite-3.53.0'
@@ -56,6 +57,56 @@ export interface CompiledSqlSource {
   readonly maximumParameterIndex: number
   readonly sourceSpan: SqlSourceSpan
   readonly orderedMutation: OrderedMutationPlan | null
+  /** Schema the statement was compiled against; null for admission. */
+  readonly catalog: SqlCatalog | null
+}
+
+/** A table or view in `main` as stored in `sqlite_schema`. */
+export interface SqlCatalogObject {
+  readonly type: 'table' | 'view'
+  readonly sql: string
+}
+
+/**
+ * Read-only view of the schema a statement executes against: the replayed
+ * schema at that statement's position, including DDL earlier in the same
+ * transaction. Names are matched ASCII case-insensitively, as SQLite does.
+ */
+export interface SqlCatalog {
+  lookup(name: string): SqlCatalogObject | null
+}
+
+/** Looks up one table or view of `main` by name (bind the name as ?1). */
+export const SQL_CATALOG_LOOKUP_SQL =
+  "SELECT type, sql FROM main.sqlite_schema WHERE type IN ('table', 'view') AND name = ?1 COLLATE NOCASE"
+
+/**
+ * A catalog over a live connection, where `lookupRow(name)` runs
+ * SQL_CATALOG_LOOKUP_SQL and returns its row (or undefined). NOCASE folds
+ * ASCII only, matching SQLite's identifier comparison.
+ */
+export function sqlCatalogFromLookup(lookupRow: (name: string) => unknown): SqlCatalog {
+  return {
+    lookup(name) {
+      const row = lookupRow(name)
+      if (typeof row !== 'object' || row === null || Array.isArray(row)) return null
+      const { type, sql } = row as { readonly type?: unknown; readonly sql?: unknown }
+      return (type === 'table' || type === 'view') && typeof sql === 'string' ? { type, sql } : null
+    },
+  }
+}
+
+export interface SqlCompileOptions {
+  /**
+   * Schema visible to the statement. Without a catalog the statement is
+   * compiled for admission: a determinism proof that only the schema can
+   * complete (a column's declared type and collation, or the columns a star
+   * expands to) is assumed, and the statement must be compiled again with
+   * its catalog before it executes. A catalog can only turn admission's
+   * acceptance into rejection, never the reverse, so admission never rejects
+   * a statement that some replica could execute.
+   */
+  readonly catalog?: SqlCatalog
 }
 
 export interface OrderedMutationPlan {
@@ -131,7 +182,9 @@ export function compileSqlProgram(program: SqlTransactionProgram): CompiledSqlPr
 export function compileSqlStatement(
   statement: SqlStatement,
   mode: SqlCompilationMode,
+  options: SqlCompileOptions = {},
 ): CompiledSqlSource {
+  const catalog = options.catalog ?? null
   const orderedMutationSyntax = parseOrderedMutationSyntax(statement.sql)
   const ast = parseOne(orderedMutationSyntax?.parserSql ?? statement.sql)
   if (PROHIBITED_STATEMENTS.has(ast.type)) throw compilerError('SQL_STATEMENT_PROHIBITED', statement.sql, ast)
@@ -144,7 +197,8 @@ export function compileSqlStatement(
   if (ast.type === 'PragmaStmt') validatePragma(ast, statement.sql)
   validateTemporaryObjects(ast, statement.sql)
   validateObjectNames(ast, statement.sql)
-  validateDeterministicExpressions(ast, statement.sql)
+  const tables = new Map<string, TableShape | null>()
+  validateDeterministicExpressions(ast, proofContext(ast, statement.sql, catalog, true, tables))
   validateOrderSensitiveMutation(ast, statement.sql, orderedMutationSyntax !== null)
 
   const parameterPlan = orderedMutationSyntax === null
@@ -165,7 +219,7 @@ export function compileSqlStatement(
       .replace(orderedMutation.selectionColumnsToken, 'rowid')
       .replace(orderedMutation.identityOrderToken, 'rowid')
     const selectionAst = parseOne(validationSql)
-    validateDeterministicExpressions(selectionAst, validationSql)
+    validateDeterministicExpressions(selectionAst, proofContext(selectionAst, validationSql, catalog, true, tables))
   }
   return {
     source: statement,
@@ -180,6 +234,7 @@ export function compileSqlStatement(
     maximumParameterIndex: parameterPlan.maximumParameterIndex,
     sourceSpan: sourceSpan(statement.sql, ast),
     orderedMutation,
+    catalog,
   }
 }
 
@@ -260,7 +315,9 @@ export function completeOrderedResultSql(
   const parameters = parameterOccurrences(sql)
   const copy = (node: AstNode): string =>
     rewriteSourceSegment(sql, node.span.offset, node.span.offset + node.span.length, parameters)
-  const plan = orderedCompletionPlan(select)
+  // Completion runs at execution; it never assumes a proof the catalog lacks.
+  const context = proofContext(compiled.ast, sql, compiled.catalog, false)
+  const plan = orderedCompletionPlan(select, context)
   if (plan === 'gated') throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
   const edits: Array<{ readonly offset: number; readonly text: string }> = []
   const tieTerms: string[] = []
@@ -276,23 +333,9 @@ export function completeOrderedResultSql(
     for (let index = 1; index <= count; index += 1) tieTerms.push(`${index} COLLATE BINARY`, `${count + index}`)
   } else {
     const core = select.select as Extract<Select['select'], { type: 'SelectFrom' }>
-    const explicit = core.columns.filter((column) => column.type === 'ExprResultColumn').length
-    const starWidth = count - explicit
-    const hasStar = explicit !== core.columns.length
-    if (hasStar ? starWidth < 0 : starWidth !== 0) throw new SqlCompilerError('SQL_RESULT_COLUMN_COUNT_INVALID')
-    const references: string[] = []
-    for (const column of core.columns) {
-      if (column.type === 'ExprResultColumn') {
-        references.push(copy(column.expr))
-        continue
-      }
-      const qualifier = starQualifier(column, core.from)!
-      const names = resultColumnNames.slice(references.length, references.length + starWidth)
-      if (names.some((name) => name === null) || new Set(names.map((name) => asciiLower(name!))).size !== names.length) {
-        throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
-      }
-      for (const name of names) references.push(`${quoteSqlIdentifier(qualifier)}.${quoteSqlIdentifier(name!)}`)
-    }
+    const references = starAddressing(core, context) === 'by-name'
+      ? referencesByName(core, resultColumnNames, copy)
+      : referencesFromCatalog(core, resultColumnNames, copy, context)
     references.forEach((reference, index) => {
       tieTerms.push(`${index + 1} COLLATE BINARY`, `typeof(${reference})`)
     })
@@ -320,11 +363,11 @@ type SelectFromCore = Extract<SelectCore, { type: 'SelectFrom' }>
  *   the sorter input order is authored, or every column is type-pinned);
  * - `gated`: no injective completion is known.
  */
-function orderedCompletionPlan(select: Select): 'typed' | 'hidden-columns' | 'binary' | 'gated' {
+function orderedCompletionPlan(select: Select, context: ProofContext): 'typed' | 'hidden-columns' | 'binary' | 'gated' {
   const arms = [select.select, ...(select.compounds ?? []).map((compound) => compound.select)]
   if (arms.every(isTableFreeArm)) return 'binary'
   if (arms.every((arm) => arm.type === 'SelectFrom' && arm.columns.every((column) =>
-    column.type === 'ExprResultColumn' && isTypePinnedExpression(column.expr)))) return 'binary'
+    column.type === 'ExprResultColumn' && isTypePinnedExpression(column.expr, arm, context)))) return 'binary'
   if (select.compounds !== undefined && select.compounds.length > 0) {
     return select.compounds.every((compound) => compound.operator === 'UnionAll') &&
       arms.every((arm) => armExpressionRows(arm) !== null)
@@ -333,9 +376,72 @@ function orderedCompletionPlan(select: Select): 'typed' | 'hidden-columns' | 'bi
   }
   const core = select.select
   if (core.type !== 'SelectFrom') return 'gated'
+  return starAddressing(core, context) === null ? 'gated' : 'typed'
+}
+
+/**
+ * How the typed plan re-addresses star result columns: `by-name` through
+ * the single star's one qualified source and the prepared result column
+ * names, or `catalog` through the declared columns of each expanded base
+ * table (which also covers joins and several stars).
+ */
+function starAddressing(core: SelectFromCore, context: ProofContext): 'by-name' | 'catalog' | null {
   const stars = core.columns.filter((column) => column.type !== 'ExprResultColumn')
-  if (stars.length > 1) return 'gated'
-  return stars.every((column) => starQualifier(column, core.from) !== null) ? 'typed' : 'gated'
+  if (stars.length === 1 && starQualifier(stars[0]!, core.from) !== null) return 'by-name'
+  return stars.every((column) => starColumns(column, core, context) !== null) ? 'catalog' : null
+}
+
+function referencesByName(
+  core: SelectFromCore,
+  resultColumnNames: readonly (string | null)[],
+  copy: (node: AstNode) => string,
+): string[] {
+  const count = resultColumnNames.length
+  const explicit = core.columns.filter((column) => column.type === 'ExprResultColumn').length
+  const starWidth = count - explicit
+  const hasStar = explicit !== core.columns.length
+  if (hasStar ? starWidth < 0 : starWidth !== 0) throw new SqlCompilerError('SQL_RESULT_COLUMN_COUNT_INVALID')
+  const references: string[] = []
+  for (const column of core.columns) {
+    if (column.type === 'ExprResultColumn') {
+      references.push(copy(column.expr))
+      continue
+    }
+    const qualifier = starQualifier(column, core.from)!
+    const names = resultColumnNames.slice(references.length, references.length + starWidth)
+    if (names.some((name) => name === null) || new Set(names.map((name) => asciiLower(name!))).size !== names.length) {
+      throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
+    }
+    for (const name of names) references.push(`${quoteSqlIdentifier(qualifier)}.${quoteSqlIdentifier(name!)}`)
+  }
+  return references
+}
+
+function referencesFromCatalog(
+  core: SelectFromCore,
+  resultColumnNames: readonly (string | null)[],
+  copy: (node: AstNode) => string,
+  context: ProofContext,
+): string[] {
+  const references: string[] = []
+  for (const column of core.columns) {
+    if (column.type === 'ExprResultColumn') {
+      references.push(copy(column.expr))
+      continue
+    }
+    const expansion = starColumns(column, core, context)
+    if (!Array.isArray(expansion)) throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
+    for (const item of expansion) {
+      // The prepared statement must agree with the catalog's expansion.
+      const name = resultColumnNames[references.length]
+      if (name === undefined || name === null || asciiLower(name) !== asciiLower(item.name)) {
+        throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
+      }
+      references.push(item.reference)
+    }
+  }
+  if (references.length !== resultColumnNames.length) throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
+  return references
 }
 
 function isTableFreeArm(arm: SelectCore): boolean {
@@ -373,9 +479,15 @@ function starQualifier(
 }
 
 /** SQLite column affinity named by a CAST type, following sqlite3AffinityType. */
-function castAffinity(node: AstNode): 'integer' | 'text' | 'blob' | 'real' | 'numeric' | null {
-  if (node.type !== 'CastExpr') return null
-  const name = asciiLower(node.typeName?.name ?? '')
+function castAffinity(node: AstNode): ColumnAffinity | null {
+  return node.type === 'CastExpr' ? typeAffinity(node.typeName?.name ?? '') : null
+}
+
+type ColumnAffinity = 'integer' | 'text' | 'blob' | 'real' | 'numeric'
+
+/** Affinity of a declared type name, following sqlite3AffinityType. */
+function typeAffinity(typeName: string): ColumnAffinity {
+  const name = asciiLower(typeName)
   if (name.includes('int')) return 'integer'
   if (name.includes('char') || name.includes('clob') || name.includes('text')) return 'text'
   if (name.includes('blob') || name === '') return 'blob'
@@ -384,13 +496,15 @@ function castAffinity(node: AstNode): 'integer' | 'text' | 'blob' | 'real' | 'nu
 }
 
 /**
- * Expressions whose non-NULL values all share one storage class in which
- * BINARY equality implies identical canonical values.
+ * Expressions for which BINARY equality implies identical canonical values:
+ * their non-NULL values never include both an INTEGER and a REAL (the only
+ * distinct storage classes SQLite compares as equal).
  */
-function isTypePinnedExpression(node: AstNode): boolean {
+function isTypePinnedExpression(node: AstNode, core: SelectFromCore | null, context: ProofContext): boolean {
   if (isTypeofCall(node)) return true
   const affinity = castAffinity(node)
-  return affinity === 'integer' || affinity === 'text' || affinity === 'blob'
+  return affinity === 'integer' || affinity === 'text' || affinity === 'blob' ||
+    columnProof(node, core, context)?.binaryInjective === true
 }
 
 function isTypeofCall(node: AstNode): boolean {
@@ -402,6 +516,212 @@ function isTypeofCall(node: AstNode): boolean {
 function isBinaryCollation(node: AstNode): node is Extract<AstNode, { type: 'CollateExpr' }> {
   return node.type === 'CollateExpr' && asciiLower(node.collation) === 'binary'
 }
+
+/**
+ * Schema-dependent proofs for one statement. Without a catalog, `assume`
+ * selects admission (a proof that only the schema can complete is assumed;
+ * see SqlCompileOptions.catalog) or no schema proofs at all. Every
+ * structural precondition is checked in every mode, so a catalog can only
+ * withdraw a proof that admission assumed.
+ */
+interface ProofContext {
+  readonly sql: string
+  readonly catalog: SqlCatalog | null
+  readonly assume: boolean
+  /**
+   * CREATE VIEW and CREATE TRIGGER bodies run later, against whatever schema
+   * then exists (a referenced table can be dropped and recreated), so their
+   * column references are never proven from the current catalog.
+   */
+  readonly storedObject: boolean
+  /** Every CTE name in the statement; a source with one of them is not proven to be a base table. */
+  readonly cteNames: ReadonlySet<string>
+  readonly tables: Map<string, TableShape | null>
+}
+
+interface ColumnShape {
+  readonly name: string
+  /** BINARY comparison equates only identical canonical values. */
+  readonly binaryInjective: boolean
+  /**
+   * The column's own comparison equates only identical canonical values,
+   * and its declared collation is BINARY (a compound operator applies the
+   * leftmost arm's collation to every arm, even when that arm's values are
+   * integers).
+   */
+  readonly stable: boolean
+}
+
+interface TableShape { readonly columns: readonly ColumnShape[] }
+
+const ASSUMED_COLUMN: ColumnShape = { name: '', binaryInjective: true, stable: true }
+const TABLE_FLAG_WITHOUT_ROWID = 128
+const TABLE_FLAG_STRICT = 65_536
+
+function proofContext(
+  ast: Stmt,
+  sql: string,
+  catalog: SqlCatalog | null,
+  assume: boolean,
+  tables = new Map<string, TableShape | null>(),
+): ProofContext {
+  const cteNames = new Set<string>()
+  traverse(ast, { nodes: { CommonTableExpr(node) { cteNames.add(asciiLower(node.tblName.text)) } } })
+  return {
+    sql,
+    catalog,
+    assume,
+    storedObject: ast.type === 'CreateViewStmt' || ast.type === 'CreateTriggerStmt',
+    cteNames,
+    tables,
+  }
+}
+
+interface PlainSource { readonly qualifier: string; readonly qualifierText: string; readonly table: string }
+
+/**
+ * The FROM sources of a core when every one is a plain reference to a
+ * possible base table with a distinct qualifier; null otherwise (subqueries,
+ * table functions, CTEs and protected objects are not proven).
+ */
+function plainSources(core: SelectFromCore | null, context: ProofContext): PlainSource[] | null {
+  if (core === null || context.storedObject || core.from?.select === undefined) return null
+  const sources: PlainSource[] = []
+  for (const table of [core.from.select, ...(core.from.joins ?? []).map((join) => join.table)]) {
+    if (table.type !== 'TableSelectTable') return null
+    const name = table.tblName.objName.text
+    if (context.cteNames.has(asciiLower(name)) || isReservedSchemaObjectName(name)) return null
+    const qualifierText = table.alias?.name.text ?? name
+    sources.push({ qualifier: asciiLower(qualifierText), qualifierText, table: name })
+  }
+  return new Set(sources.map((source) => source.qualifier)).size === sources.length ? sources : null
+}
+
+function tableShape(name: string, context: ProofContext): TableShape | null {
+  const key = asciiLower(name)
+  const known = context.tables.get(key)
+  if (known !== undefined) return known
+  const object = context.catalog!.lookup(name)
+  const shape = object?.type === 'table' ? parseTableShape(object.sql) : null
+  context.tables.set(key, shape)
+  return shape
+}
+
+/**
+ * Column guarantees from a stored CREATE TABLE. Only these are proven:
+ * - a rowid alias (INTEGER PRIMARY KEY of a rowid table, not the DESC column
+ *   form) holds only integers;
+ * - a STRICT INT/INTEGER or BLOB column holds only that class (and NULL);
+ * - a STRICT TEXT column, or any TEXT-affinity column (numeric values are
+ *   converted to text on write), holds only TEXT, BLOB or NULL.
+ * Non-STRICT INTEGER/REAL/NUMERIC affinity can still store an INTEGER and a
+ * REAL that compare equal (for example -2^63 and -2^63.0), and STRICT REAL
+ * or ANY columns mix with INTEGER through compound operators, so those and
+ * generated columns stay unproven.
+ */
+function parseTableShape(sql: string): TableShape | null {
+  let ast: Stmt
+  try { ast = parseOne(sql) } catch { return null }
+  if (ast.type !== 'CreateTableStmt' || ast.body.type !== 'ColumnsAndConstraintsCreateTableBody') return null
+  const body = ast.body
+  const strict = (body.flags & TABLE_FLAG_STRICT) !== 0
+  const rowidTable = (body.flags & TABLE_FLAG_WITHOUT_ROWID) === 0
+  const tableKey = body.constraints?.map((constraint) => constraint.constraint)
+    .find((constraint) => constraint.type === 'PrimaryKeyTableConstraint')
+  const tableKeyColumn = tableKey?.columns.length === 1 && tableKey.columns[0]!.expr.type === 'Id' &&
+    tableKey.columns[0]!.order !== 'Desc'
+    ? asciiLower(tableKey.columns[0]!.expr.name)
+    : null
+  return {
+    columns: body.columns.map((definition) => {
+      const name = definition.colName.text
+      const constraints = definition.constraints.map((constraint) => constraint.constraint)
+      const binaryCollation = constraints.every((constraint) =>
+        constraint.type !== 'CollateColumnConstraint' || asciiLower(constraint.collationName.text) === 'binary')
+      if (constraints.some((constraint) => constraint.type === 'GeneratedColumnConstraint')) {
+        return { name, binaryInjective: false, stable: false }
+      }
+      const typeName = definition.colType?.size === undefined ? asciiLower(definition.colType?.name ?? '') : null
+      const columnKey = constraints.find((constraint) => constraint.type === 'PrimaryKeyColumnConstraint')
+      const rowidAlias = rowidTable && typeName === 'integer' && (columnKey === undefined
+        ? tableKeyColumn === asciiLower(name)
+        : columnKey.order !== 'Desc')
+      let binaryInjective: boolean
+      if (rowidAlias) binaryInjective = true
+      else if (strict) binaryInjective = typeName === 'int' || typeName === 'integer' || typeName === 'blob' || typeName === 'text'
+      else binaryInjective = typeAffinity(definition.colType?.name ?? '') === 'text'
+      return { name, binaryInjective, stable: binaryInjective && binaryCollation }
+    }),
+  }
+}
+
+/**
+ * Guarantees for a plain column reference resolved the way SQLite resolves
+ * it within `core`: a qualified name against the one source with that
+ * qualifier, an unqualified name against the one source that declares it.
+ * Anything else (outer references, aliases, ambiguity, unknown sources) is
+ * unproven.
+ */
+function columnProof(node: AstNode, core: SelectFromCore | null, context: ProofContext): ColumnShape | null {
+  let qualifier: string | null
+  let column: string
+  if (node.type === 'Id') {
+    qualifier = null
+    column = node.name
+  } else if (node.type === 'QualifiedExpr' && node.schema === undefined) {
+    qualifier = asciiLower(node.table.text)
+    column = node.column.text
+  } else return null
+  const sources = plainSources(core, context)
+  if (sources === null) return null
+  const candidates = qualifier === null ? sources : sources.filter((source) => source.qualifier === qualifier)
+  if (candidates.length === 0) return null
+  if (context.catalog === null) return context.assume ? ASSUMED_COLUMN : null
+  let found: ColumnShape | null = null
+  for (const source of candidates) {
+    const shape = tableShape(source.table, context)
+    if (shape === null) return null
+    const matches = shape.columns.filter((item) => asciiLower(item.name) === asciiLower(column))
+    if (matches.length > 1 || (matches.length === 1 && found !== null)) return null
+    if (matches.length === 1) found = matches[0]!
+  }
+  return found
+}
+
+/**
+ * Qualified references a star expands to, from the catalog; `'assumed'` at
+ * admission; null when the expansion is not provable (non-table sources,
+ * or USING/NATURAL joins, which fold duplicate columns).
+ */
+function starColumns(
+  column: SelectFromCore['columns'][number],
+  core: SelectFromCore,
+  context: ProofContext,
+): Array<{ readonly name: string; readonly reference: string }> | 'assumed' | null {
+  const sources = plainSources(core, context)
+  if (sources === null) return null
+  let selected: PlainSource[]
+  if (column.type === 'StarResultColumn') {
+    if ((core.from?.joins ?? []).some((join) => join.constraint?.type === 'UsingJoinConstraint' ||
+      (join.operator.type === 'TypedJoinJoinOperator' && ((join.operator.joinType ?? 0) & JOIN_NATURAL) !== 0))) return null
+    selected = sources
+  } else if (column.type === 'TableStarResultColumn') {
+    selected = sources.filter((source) => source.qualifier === asciiLower(column.table.text))
+    if (selected.length !== 1) return null
+  } else return null
+  if (context.catalog === null) return context.assume ? 'assumed' : null
+  const expansion: Array<{ readonly name: string; readonly reference: string }> = []
+  for (const source of selected) {
+    const shape = tableShape(source.table, context)
+    if (shape === null) return null
+    for (const item of shape.columns) {
+      expansion.push({ name: item.name, reference: `${quoteSqlIdentifier(source.qualifierText)}.${quoteSqlIdentifier(item.name)}` })
+    }
+  }
+  return expansion
+}
+
+const JOIN_NATURAL = 4
 
 function parseOne(sql: string): Stmt {
   if (typeof sql !== 'string' || sql.length === 0 || sql.includes('\0')) {
@@ -482,16 +802,27 @@ function isAllowedConsensusReadName(name: string): boolean {
     (name.startsWith('pragma_') && DETERMINISTIC_READ_ONLY_PRAGMAS.has(name.slice('pragma_'.length)))
 }
 
-function validateDeterministicExpressions(ast: Stmt, sql: string): void {
+function validateDeterministicExpressions(ast: Stmt, context: ProofContext): void {
+  const sql = context.sql
+  // Innermost SELECT core whose FROM resolves the current node's column
+  // references (null inside VALUES and in a compound's ORDER BY).
+  const cores: Array<SelectFromCore | null> = []
+  const core = (): SelectFromCore | null => cores.at(-1) ?? null
   traverse(ast, {
     enter(node) {
       if (
         node.type === 'CurrentDateLiteral' || node.type === 'CurrentTimeLiteral' ||
         node.type === 'CurrentTimestampLiteral'
       ) throw compilerError('SQL_SIGNED_TIME_TEMPORARILY_GATED', sql, node)
+      if (node.type === 'Select') {
+        cores.push(node.select.type === 'SelectFrom' && (node.compounds ?? []).length === 0 ? node.select : null)
+      } else if (node.type === 'SelectFrom') cores.push(node)
+    },
+    leave(node) {
+      if (node.type === 'Select' || node.type === 'SelectFrom') cores.pop()
     },
     nodes: {
-      FunctionCallExpr(node) { validateFunction(node, sql) },
+      FunctionCallExpr(node) { validateFunction(node, core(), context) },
       FunctionCallStarExpr(node) { validateStarFunction(node, sql) },
       LikeExpr(node) {
         if (node.op === 'Match' || node.op === 'Regexp') {
@@ -500,25 +831,29 @@ function validateDeterministicExpressions(ast: Stmt, sql: string): void {
       },
       CollateExpr(node) { validateBuiltinCollation(node.collation, sql, node) },
       CollateColumnConstraint(node) { validateBuiltinCollation(node.collationName.text, sql, node) },
+      SelectFrom(node, parent) {
+        // Checked per core so that compound arms are covered too. A core
+        // without FROM yields at most one row.
+        if (node.distinctness === 'Distinct' && node.from !== undefined &&
+            !isRepresentativeStableProjection(node, context, false)) {
+          throw compilerError('SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED', sql, node)
+        }
+        const orderBy = parent?.type === 'Select' && (parent.compounds ?? []).length === 0 ? parent.orderBy : undefined
+        if (!isSafeAggregateCore(node, orderBy, context)) {
+          throw compilerError('SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED', sql, node)
+        }
+      },
       Select(node) {
         const topLevelResult = ast.type === 'SelectStmt' && node === ast.body
         if (node.limit !== undefined && !isProvablyAtMostOneRow(node) && (!topLevelResult || node.orderBy === undefined)) {
           throw compilerError('SQL_UNORDERED_LIMIT_TEMPORARILY_GATED', sql, node.limit)
         }
-        if (node.select.type === 'SelectFrom' && node.select.distinctness === 'Distinct' &&
-            !isRepresentativeStableProjection(node.select.columns, sql) && !isProvablyAtMostOneRow(node)) {
-          throw compilerError('SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED', sql, node.select)
-        }
-        if (node.select.type === 'SelectFrom' && node.select.groupBy !== undefined &&
-            !isSafeGroupedProjection(node.select, sql)) {
-          throw compilerError('SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED', sql, node.select)
-        }
         if (node.compounds?.some((compound) => compound.operator !== 'UnionAll') === true &&
-            !isRepresentativeStableCompound(node, sql)) {
+            !isRepresentativeStableCompound(node, context)) {
           throw compilerError('SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED', sql, node)
         }
         if (topLevelResult && node.orderBy !== undefined && node.orderBy.length > 0 &&
-            orderedCompletionPlan(node) === 'gated') {
+            orderedCompletionPlan(node, context) === 'gated') {
           throw compilerError(ORDERED_COMPLETION_GATED, sql, node)
         }
       },
@@ -546,9 +881,10 @@ function validateBuiltinCollation(name: string, sql: string, node: AstNode): voi
   }
 }
 
-function validateFunction(node: FunctionCallExpr, sql: string): void {
+function validateFunction(node: FunctionCallExpr, core: SelectFromCore | null, context: ProofContext): void {
+  const sql = context.sql
   const name = asciiLower(node.name.name)
-  if (name === 'group_concat' && isSafeOrderedGroupConcat(node, sql)) return
+  if (name === 'group_concat' && isSafeOrderedGroupConcat(node, core, context)) return
   if (TEMPORARILY_GATED_FUNCTIONS.has(name)) {
     throw compilerError('SQL_FUNCTION_TEMPORARILY_GATED', sql, node)
   }
@@ -566,7 +902,7 @@ function validateFunction(node: FunctionCallExpr, sql: string): void {
     throw compilerError('SQL_FUNCTION_NOT_REGISTERED', sql, node)
   }
   if ((name === 'min' || name === 'max') && node.args?.length === 1) {
-    if (!isRepresentativeStableExpression(node.args[0]!)) {
+    if (!isRepresentativeStableExpression(node.args[0]!, core, context, false)) {
       throw compilerError('SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED', sql, node)
     }
   }
@@ -631,12 +967,9 @@ function isProvablySingletonFrom(from: NonNullable<Extract<Stmt, { type: 'Update
     isProvablyAtMostOneRow(source.select)
 }
 
-function isRepresentativeStableProjection(
-  columns: Extract<Select['select'], { type: 'SelectFrom' }>['columns'],
-  _sql: string,
-): boolean {
-  return columns.length > 0 && columns.every((column) =>
-    column.type === 'ExprResultColumn' && isRepresentativeStableExpression(column.expr))
+function isRepresentativeStableProjection(core: SelectFromCore, context: ProofContext, compound: boolean): boolean {
+  return core.columns.length > 0 && core.columns.every((column) =>
+    column.type === 'ExprResultColumn' && isRepresentativeStableExpression(column.expr, core, context, compound))
 }
 
 /**
@@ -645,47 +978,123 @@ function isRepresentativeStableProjection(
  * canonical values, so SQLite's choice of representative is unobservable.
  * CAST(... AS TEXT) inherits its operand's collation (for example a column
  * declared NOCASE), so it qualifies only under an explicit COLLATE BINARY.
+ * In a compound arm the comparison uses the leftmost arm's collation for
+ * every arm, so an inherited collation matters even for INTEGER or BLOB
+ * values there: `compound` additionally requires a BINARY (or no)
+ * collation.
  */
-function isRepresentativeStableExpression(node: AstNode): boolean {
+function isRepresentativeStableExpression(
+  node: AstNode,
+  core: SelectFromCore | null,
+  context: ProofContext,
+  compound: boolean,
+): boolean {
   if (isTypeofCall(node)) return true
   const affinity = castAffinity(node)
-  if (affinity === 'integer' || affinity === 'blob') return true
-  return isBinaryCollation(node) && (castAffinity(node.expr) === 'text' || isRepresentativeStableExpression(node.expr))
+  if (!compound && (affinity === 'integer' || affinity === 'blob')) return true
+  if (columnProof(node, core, context)?.stable === true) return true
+  return isBinaryCollation(node) && (
+    castAffinity(node.expr) === 'text' ||
+    isRepresentativeStableExpression(node.expr, core, context, false) ||
+    columnProof(node.expr, core, context)?.binaryInjective === true
+  )
 }
 
-function isSafeGroupedProjection(
-  select: Extract<Select['select'], { type: 'SelectFrom' }>,
-  sql: string,
+/**
+ * In an aggregate query each group (the whole input when there is no GROUP
+ * BY) yields one row, and a column referenced outside an aggregate reads
+ * an arbitrary member of the group: a bare column of an aggregate query, or
+ * a GROUP BY key whose comparison merges distinct canonical values (1 and
+ * 1.0, or 'a' and 'A' under NOCASE). That applies to the result columns,
+ * HAVING, and the ORDER BY that sorts the groups.
+ */
+function isSafeAggregateCore(
+  core: SelectFromCore,
+  orderBy: readonly SortedColumn[] | undefined,
+  context: ProofContext,
 ): boolean {
-  const groups = select.groupBy ?? []
-  return groups.length > 0 && select.columns.every((column) => {
-    if (column.type !== 'ExprResultColumn') return false
-    // A projected group key returns one arbitrary member of its group, so the
-    // grouping comparison must not merge distinct canonical values (1 and
-    // 1.0, -0.0 and 0, or 'a' and 'A' under NOCASE).
-    if (groups.some((group) => sameSource(group, column.expr, sql))) {
-      return isRepresentativeStableExpression(column.expr)
-    }
-    return isDeterministicAggregateExpression(column.expr)
+  const groups = core.groupBy ?? []
+  const expressions = core.columns.flatMap((column) => column.type === 'ExprResultColumn' ? [column.expr] : [])
+  const orderTerms = (orderBy ?? []).map((term) => term.expr)
+  const terms: AstNode[] = [...expressions, ...(core.having === undefined ? [] : [core.having]), ...orderTerms]
+  if (groups.length === 0 && !terms.some(containsAggregate)) return true
+  if (expressions.length !== core.columns.length) return false
+  const aliases = new Set(core.columns.flatMap((column) =>
+    column.type === 'ExprResultColumn' && column.alias !== undefined ? [asciiLower(column.alias.name.text)] : []))
+  // An identifier that names no source column resolves to a result alias.
+  const isAlias = (node: AstNode): boolean => node.type === 'Id' && aliases.has(asciiLower(node.name)) &&
+    namesNoSourceColumn(node.name, core, context)
+  const isResultReference = (node: AstNode): boolean => {
+    const term = node.type === 'CollateExpr' ? node.expr : node
+    // ORDER BY resolves an alias or a column number before source columns.
+    return term.type === 'NumericLiteral' || (term.type === 'Id' && aliases.has(asciiLower(term.name)))
+  }
+  const hasBareReference = (root: AstNode): boolean => {
+    let bare = false
+    traverse(root, {
+      enter(node, parent) {
+        if (bare) return 'break'
+        if (node.type === 'Id' && (parent?.type === 'FunctionCallExpr' || parent?.type === 'FunctionCallStarExpr') &&
+            parent.name === node) return 'skip'
+        const group = groups.find((item) => sameSource(item, node, context.sql))
+        if (group !== undefined) {
+          if (!isRepresentativeStableExpression(group, core, context, false)) bare = true
+          return 'skip'
+        }
+        if (isAggregateCall(node)) return 'skip'
+        if (node.type === 'Id' || node.type === 'QualifiedExpr') {
+          if (!isAlias(node)) bare = true
+          return 'skip'
+        }
+        return undefined
+      },
+    })
+    return bare
+  }
+  return expressions.every((expression) => !hasBareReference(expression)) &&
+    (core.having === undefined || !hasBareReference(core.having)) &&
+    orderTerms.every((term) => isResultReference(term) || !hasBareReference(term))
+}
+
+const AGGREGATE_FUNCTIONS: ReadonlySet<string> = new Set([
+  'avg', 'count', 'group_concat', 'json_group_array', 'json_group_object', 'jsonb_group_array',
+  'jsonb_group_object', 'string_agg', 'sum', 'total',
+])
+
+function isAggregateCall(node: AstNode): boolean {
+  if (node.type === 'FunctionCallStarExpr') return node.filterOver?.overClause === undefined
+  if (node.type !== 'FunctionCallExpr' || node.filterOver?.overClause !== undefined) return false
+  const name = asciiLower(node.name.name)
+  return AGGREGATE_FUNCTIONS.has(name) || ((name === 'min' || name === 'max') && node.args?.length === 1)
+}
+
+function containsAggregate(root: AstNode): boolean {
+  let found = false
+  traverse(root, {
+    enter(node) {
+      if (found) return 'break'
+      // An aggregate inside a subquery belongs to that subquery.
+      if (node.type === 'Select') return 'skip'
+      if (isAggregateCall(node)) found = true
+      return undefined
+    },
+  })
+  return found
+}
+
+function namesNoSourceColumn(name: string, core: SelectFromCore, context: ProofContext): boolean {
+  const sources = plainSources(core, context)
+  if (sources === null) return false
+  if (context.catalog === null) return context.assume
+  return sources.every((source) => {
+    const shape = tableShape(source.table, context)
+    return shape !== null && !shape.columns.some((column) => asciiLower(column.name) === asciiLower(name))
   })
 }
 
-function isDeterministicAggregateExpression(node: AstNode): boolean {
-  if (node.type === 'FunctionCallStarExpr') {
-    return asciiLower(node.name.name) === 'count' && node.filterOver?.overClause === undefined
-  }
-  if (node.type !== 'FunctionCallExpr' || node.filterOver?.overClause !== undefined) return false
-  const name = asciiLower(node.name.name)
-  if (name === 'count') return true
-  return (name === 'min' || name === 'max') && node.args?.length === 1 &&
-    isRepresentativeStableExpression(node.args[0]!)
-}
-
-function isRepresentativeStableCompound(select: Select, sql: string): boolean {
-  if (select.select.type !== 'SelectFrom' || !isRepresentativeStableProjection(select.select.columns, sql)) return false
-  return select.compounds?.every((compound) => compound.operator === 'UnionAll' || (
-    compound.select.type === 'SelectFrom' && isRepresentativeStableProjection(compound.select.columns, sql)
-  )) ?? true
+function isRepresentativeStableCompound(select: Select, context: ProofContext): boolean {
+  return [select.select, ...(select.compounds ?? []).map((compound) => compound.select)].every((arm) =>
+    arm.type === 'SelectFrom' && isRepresentativeStableProjection(arm, context, true))
 }
 
 function isPeerStableWindow(node: FunctionCallExpr): boolean {
@@ -696,7 +1105,8 @@ function isPeerStableWindow(node: FunctionCallExpr): boolean {
     over.window.orderBy !== undefined && over.window.orderBy.length > 0
 }
 
-function isSafeOrderedGroupConcat(node: FunctionCallExpr, sql: string): boolean {
+function isSafeOrderedGroupConcat(node: FunctionCallExpr, core: SelectFromCore | null, context: ProofContext): boolean {
+  const sql = context.sql
   if (node.args === undefined || node.args.length < 1 || node.args.length > 2 ||
       node.distinctness !== undefined || node.filterOver?.overClause !== undefined) return false
   // A per-row separator would make the output depend on which tied row comes first.
@@ -710,8 +1120,8 @@ function isSafeOrderedGroupConcat(node: FunctionCallExpr, sql: string): boolean 
   // `value COLLATE BINARY` when value is pinned to one storage class, or
   // `value COLLATE BINARY, typeof(value)` in general (BINARY treats 1 and
   // 1.0 as equal; -0.0 and 0.0 both render as '0.0').
-  if (sameSource(last, value, sql) && isRepresentativeStableExpression(value)) return true
-  if (isBinaryCollation(last) && sameSource(last.expr, value, sql) && isTypePinnedExpression(value)) return true
+  if (sameSource(last, value, sql) && isRepresentativeStableExpression(value, core, context, false)) return true
+  if (isBinaryCollation(last) && sameSource(last.expr, value, sql) && isTypePinnedExpression(value, core, context)) return true
   const previous = ordering.at(-2)?.expr
   return previous !== undefined && isTypeofCall(last) && last.type === 'FunctionCallExpr' &&
     sameSource(last.args![0]!, value, sql) && isBinaryCollation(previous) && sameSource(previous.expr, value, sql)

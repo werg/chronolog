@@ -63,7 +63,10 @@ also admits scalar subqueries, unordered/nested `LIMIT`, `INSERT ... SELECT`,
 at-most-one-row proof removes every row choice; broader forms fail closed.
 Representative-stable `DISTINCT`, grouping, distinct compounds, `MIN`/`MAX`,
 peer-stable `rank`/`dense_rank`, and value-completed ordered `group_concat`
-have similarly explicit structural proofs.
+have similarly explicit structural proofs, plus column proofs from the schema
+the statement executes against (rowid aliases, STRICT INT/TEXT/BLOB and
+TEXT-affinity columns with BINARY collation). Admission defers those column
+proofs; execution decides them against the replayed catalog.
 Ordered results require an authored outer `ORDER BY`; the executor completes
 ties with canonical returned-column keys. Unordered results are canonicalized
 as tagged row sets or multisets. All authored statements are recompiled by the

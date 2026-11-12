@@ -5,9 +5,44 @@ import {
   compileSqlStatement,
   completeOrderedResultSql,
   orderedSqlBindingValues,
+  type SqlCatalog,
   type SqlCompilerError,
 } from './sql-compiler.js'
 import { createCoreExecutionManifest } from './manifest.js'
+
+function catalog(tables: Record<string, string>, views: Record<string, string> = {}): SqlCatalog {
+  const objects = new Map<string, { type: 'table' | 'view'; sql: string }>([
+    ...Object.entries(tables).map(([name, sql]) => [name.toLowerCase(), { type: 'table' as const, sql }] as const),
+    ...Object.entries(views).map(([name, sql]) => [name.toLowerCase(), { type: 'view' as const, sql }] as const),
+  ])
+  return { lookup: (name) => objects.get(name.toLowerCase()) ?? null }
+}
+
+/** Untyped columns: nothing is provable from this schema. */
+const LOOSE = catalog({
+  accounts: 'CREATE TABLE accounts (id, value)',
+  archived_accounts: 'CREATE TABLE archived_accounts (id, value)',
+  source: 'CREATE TABLE source (id, value)',
+})
+
+const PROVEN = catalog({
+  s: 'CREATE TABLE s (id INTEGER PRIMARY KEY, n INT, t TEXT, b BLOB, r REAL, a ANY, ci TEXT COLLATE NOCASE, ' +
+    'g INT AS (n + 1), ni INTEGER COLLATE NOCASE) STRICT',
+  l: 'CREATE TABLE "l" (k INTEGER PRIMARY KEY, name VARCHAR(20), tag TEXT COLLATE NOCASE, num INTEGER, raw, ' +
+    'real_value REAL, kd INT)',
+  d: 'CREATE TABLE d (k INTEGER PRIMARY KEY DESC, v TEXT)',
+  w: 'CREATE TABLE w (k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID',
+  p: 'CREATE TABLE p (k INTEGER, v TEXT, PRIMARY KEY (k))',
+}, { v: 'CREATE VIEW v AS SELECT n FROM s' })
+
+function compileCode(sql: string, sqlCatalog?: SqlCatalog): string {
+  try {
+    compileSqlStatement({ sql, bindings: [] }, 'body', sqlCatalog === undefined ? {} : { catalog: sqlCatalog })
+    return 'accepted'
+  } catch (error) {
+    return (error as SqlCompilerError).code
+  }
+}
 
 describe('deterministic SQL compiler', () => {
   it('does not let the core manifest advertise unavailable extension profiles', () => {
@@ -209,7 +244,7 @@ describe('deterministic SQL compiler', () => {
     ['SELECT CAST(value AS TEXT), count(*) FROM accounts GROUP BY CAST(value AS TEXT)', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
     ['SELECT CAST(value AS REAL), count(*) FROM accounts GROUP BY CAST(value AS REAL)', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
     ['SELECT * FROM accounts JOIN archived_accounts USING (id) ORDER BY id', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
-    ['SELECT a.*, b.* FROM accounts AS a, archived_accounts AS b ORDER BY a.id', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    ['SELECT a.*, b.* FROM accounts AS a, (SELECT id FROM archived_accounts) AS b ORDER BY a.id', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
     ['SELECT * FROM (SELECT id FROM accounts) ORDER BY id', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
     ['SELECT id FROM accounts UNION SELECT id FROM archived_accounts ORDER BY id', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
     ['SELECT typeof(id) FROM accounts UNION ALL SELECT * FROM archived_accounts ORDER BY 1', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
@@ -223,7 +258,7 @@ describe('deterministic SQL compiler', () => {
     ['CREATE TRIGGER attack AFTER INSERT ON accounts BEGIN DELETE FROM chronolog_transactions; END', 'SQL_PROTECTED_OBJECT_WRITE'],
     ['SELECT 1; SELECT 2', 'SQL_MULTIPLE_STATEMENTS'],
   ])('rejects %s with %s', (sql, code) => {
-    expect(() => compileSqlStatement({ sql, bindings: [] }, 'body')).toThrowError(
+    expect(() => compileSqlStatement({ sql, bindings: [] }, 'body', { catalog: LOOSE })).toThrowError(
       expect.objectContaining<Partial<SqlCompilerError>>({ code }),
     )
   })
@@ -249,5 +284,132 @@ describe('deterministic SQL compiler', () => {
       preconditions: [{ id: 1, query: { sql: 'SELECT 1', bindings: [] }, resultMode: 'scalar', expectation: { kind: 'assert_true' } }],
       body: [{ sql: 'SELECT 1', bindings: [] }],
     })).toThrowError(expect.objectContaining({ code: 'SQL_EFFECT_CAPABLE_STATEMENT_REQUIRED' }))
+  })
+})
+
+describe('schema-proven representative stability', () => {
+  it.each([
+    // rowid alias, STRICT INT/BLOB, STRICT TEXT and TEXT affinity under BINARY
+    'SELECT id, count(*) FROM s GROUP BY id',
+    'SELECT n, count(*) FROM s GROUP BY n',
+    'SELECT s.t, count(*) AS c FROM s GROUP BY s.t HAVING c > 1 ORDER BY c DESC, 1',
+    'SELECT b, count(*) FROM s GROUP BY b',
+    'SELECT name, count(*) FROM l GROUP BY name ORDER BY name',
+    'SELECT k, count(*) FROM p GROUP BY k',
+    'SELECT x.k, count(*) FROM l AS x JOIN s ON s.id = x.k GROUP BY x.k',
+    'SELECT DISTINCT n, t FROM s',
+    'SELECT min(n), max(t), min(k), max(name) FROM s, l',
+    'SELECT n FROM s UNION SELECT k FROM l',
+    'SELECT group_concat(n ORDER BY n) FROM s',
+    'SELECT group_concat(name ORDER BY name) FROM l',
+    // BINARY-injective columns under an explicit COLLATE BINARY
+    'SELECT group_concat(tag ORDER BY tag COLLATE BINARY) FROM l',
+    'SELECT ci COLLATE BINARY, count(*) FROM s GROUP BY ci COLLATE BINARY',
+    // nothing outside aggregates; the HAVING alias names no column
+    'SELECT count(*) AS c FROM l HAVING c > 0',
+    'SELECT coalesce(max(k), 0) + 1 FROM l',
+  ])('admits %s against the catalog', (sql) => {
+    expect(compileCode(sql, PROVEN)).toBe('accepted')
+    // A catalog never admits what admission rejects.
+    expect(compileCode(sql)).toBe('accepted')
+  })
+
+  it.each([
+    // Unproven column kinds: REAL/ANY/untyped, non-STRICT INTEGER affinity,
+    // NOCASE collation, generated columns, and rowid aliases that are not.
+    ['SELECT r, count(*) FROM s GROUP BY r', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT a, count(*) FROM s GROUP BY a', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT raw, count(*) FROM l GROUP BY raw', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT num, count(*) FROM l GROUP BY num', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT kd, count(*) FROM l GROUP BY kd', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT tag, count(*) FROM l GROUP BY tag', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT ci, count(*) FROM s GROUP BY ci', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT g, count(*) FROM s GROUP BY g', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT k, count(*) FROM d GROUP BY k', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT k, count(*) FROM w GROUP BY k', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT group_concat(real_value ORDER BY real_value) FROM l', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    ['SELECT group_concat(tag ORDER BY tag) FROM l', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    ['SELECT DISTINCT tag FROM l', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    // The compound applies the leftmost arm's NOCASE to the other arm's text.
+    ['SELECT ni FROM s UNION SELECT t FROM s', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    // Resolution that the catalog cannot pin down.
+    ['SELECT n, count(*) FROM v GROUP BY n', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT n, count(*) FROM missing GROUP BY n', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['WITH s AS (SELECT raw AS n FROM l) SELECT n, count(*) FROM s GROUP BY n', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT n, count(*) FROM (SELECT n FROM s) GROUP BY n', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT k, count(*) FROM p, w GROUP BY k', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT nope, count(*) FROM s GROUP BY nope', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT * FROM l JOIN v ON v.n = l.k ORDER BY l.k', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    // An unstable group key leaks through HAVING, the group ORDER BY, and
+    // DISTINCT in any compound arm, not only through the projection.
+    ["SELECT count(*) FROM l GROUP BY tag HAVING tag = 'a' COLLATE BINARY", 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT count(*) FROM l GROUP BY tag ORDER BY tag COLLATE BINARY', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT 1 UNION ALL SELECT DISTINCT tag FROM l', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+  ])('keeps %s gated against the catalog with %s', (sql, code) => {
+    expect(compileCode(sql, PROVEN)).toBe(code)
+  })
+
+  it.each([
+    // Stored bodies run against whatever schema exists later.
+    ['CREATE VIEW grouped AS SELECT n, count(*) FROM s GROUP BY n', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['CREATE TRIGGER grouped AFTER INSERT ON s BEGIN SELECT group_concat(n ORDER BY n) FROM s; END', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    // Admission rejects shapes no catalog can prove.
+    ['SELECT r COLLATE NOCASE, count(*) FROM s GROUP BY r COLLATE NOCASE', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT * FROM l JOIN s USING (k) ORDER BY 1', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    ['SELECT * FROM l NATURAL JOIN s ORDER BY 1', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    ['SELECT * FROM l JOIN (SELECT 1 AS one) ORDER BY 1', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    // Representative leaks that need no schema to see: a bare column of an
+    // aggregate query, and an inherited collation in a compound arm.
+    ['SELECT name, count(*) FROM l', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT count(*) FROM s GROUP BY n HAVING EXISTS (SELECT 1 FROM l WHERE raw = n)', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT CAST(tag AS INTEGER) FROM l UNION SELECT CAST(tag AS TEXT) COLLATE BINARY FROM l', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+  ])('rejects %s with or without a catalog', (sql, code) => {
+    expect(compileCode(sql)).toBe(code)
+    expect(compileCode(sql, PROVEN)).toBe(code)
+  })
+
+  it('defers schema proofs at admission and withdraws them against an unproving catalog', () => {
+    for (const sql of [
+      'SELECT value, count(*) FROM accounts GROUP BY value',
+      'SELECT group_concat(value ORDER BY value) FROM accounts',
+      'SELECT min(value) FROM accounts',
+    ]) {
+      expect(compileCode(sql)).toBe('accepted')
+      expect(compileCode(sql, LOOSE)).not.toBe('accepted')
+    }
+    // Join stars need only the declared columns, whatever their types.
+    const star = 'SELECT * FROM accounts JOIN source ON source.id = accounts.id ORDER BY accounts.id'
+    expect(compileCode(star, LOOSE)).toBe('accepted')
+    expect(compileCode(star, catalog({ accounts: 'CREATE TABLE accounts (id, value)' }))).toBe(
+      'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED',
+    )
+    // Compiled for admission, completion never assumes a schema proof.
+    const admitted = compileSqlStatement({ sql: 'SELECT n FROM s ORDER BY n', bindings: [] }, 'precondition')
+    expect(completeOrderedResultSql(admitted, ['n']).sql).toBe('SELECT n FROM s ORDER BY n, 1 COLLATE BINARY, typeof(n)')
+    const joined = compileSqlStatement({
+      sql: 'SELECT * FROM accounts JOIN source ON source.id = accounts.id ORDER BY accounts.id', bindings: [],
+    }, 'precondition')
+    expect(() => completeOrderedResultSql(joined, ['id', 'value', 'id', 'value'])).toThrowError(
+      expect.objectContaining({ code: 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED' }),
+    )
+  })
+
+  it('expands join stars from the catalog and keeps binary-only ties for proven columns', () => {
+    const joined = compileSqlStatement({
+      sql: 'SELECT *, 1 AS one FROM l AS x JOIN p ON p.k = x.k ORDER BY x.k', bindings: [],
+    }, 'precondition', { catalog: PROVEN })
+    const names = ['k', 'name', 'tag', 'num', 'raw', 'real_value', 'kd', 'k', 'v', 'one']
+    expect(completeOrderedResultSql(joined, names).sql).toBe(
+      'SELECT *, 1 AS one FROM l AS x JOIN p ON p.k = x.k ORDER BY x.k, ' +
+      names.map((name, index) => `${index + 1} COLLATE BINARY, typeof(${
+        index === 9 ? '1' : `"${index < 7 ? 'x' : 'p'}"."${name}"`})`).join(', '),
+    )
+    // A prepared statement that disagrees with the catalog is not completed.
+    expect(() => completeOrderedResultSql(joined, ['k', ...names.slice(2)])).toThrowError(
+      expect.objectContaining({ code: 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED' }),
+    )
+    const pinned = compileSqlStatement({ sql: 'SELECT n, t, k FROM s, l ORDER BY 1', bindings: [] }, 'precondition', { catalog: PROVEN })
+    expect(completeOrderedResultSql(pinned, ['n', 't', 'k']).sql)
+      .toBe('SELECT n, t, k FROM s, l ORDER BY 1, 1 COLLATE BINARY, 2 COLLATE BINARY, 3 COLLATE BINARY')
   })
 })

@@ -41,6 +41,7 @@ import {
 import { openDatabase } from './driver.js'
 import { isOperationalSqliteError, withAuthorizer } from './sql-profile.js'
 import {
+  compileSqlStatementForDatabase,
   DeterministicSqlRejection,
   evaluateSqlPrecondition,
   executeSqlBodyStatement,
@@ -273,7 +274,9 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
   validateStatement(statement: SqlStatement, mode: 'precondition' | 'body') {
     try {
-      compileSqlStatement(statement, mode)
+      // Advisory: checks against the head schema; consensus recompiles each
+      // statement against the schema at its own position.
+      compileSqlStatementForDatabase(this.#reader, statement, mode)
       return []
     } catch (error) {
       return [sqlCompilerDiagnostic(error)]

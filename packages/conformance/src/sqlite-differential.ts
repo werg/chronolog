@@ -4,6 +4,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import {
   compileSqlStatement,
+  SQL_CATALOG_LOOKUP_SQL,
+  sqlCatalogFromLookup,
   SQLITE_PARSER_BASELINE,
   SqlCompilerError,
 } from '@chronolog/compiler-sqlite'
@@ -145,7 +147,10 @@ function runFixture(database: DatabaseSync, fixture: CorpusFixture): Differentia
             ? { kind: 'text' as const, utf8: new TextEncoder().encode(binding.value ?? '') }
             : { kind: 'null' as const },
       })),
-    }, 'body')
+    }, 'body', {
+      // Consensus execution compiles against the schema the statement sees.
+      catalog: sqlCatalogFromLookup((name) => database.prepare(SQL_CATALOG_LOOKUP_SQL).get(name)),
+    })
     if (fixture.compiler.status !== 'accepted') failures.push(`COMPILER_ACCEPTED_EXPECTED_${fixture.compiler.code ?? 'REJECTION'}`)
     if (fixture.compiler.statementClass !== undefined && compiled.statementClass !== fixture.compiler.statementClass) {
       failures.push(`STATEMENT_CLASS:${compiled.statementClass}!=${fixture.compiler.statementClass}`)
@@ -235,8 +240,10 @@ function createFixtureDatabase(): DatabaseSync {
     CREATE TABLE archive (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
     CREATE TABLE source (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
     CREATE TABLE defaulted (id INTEGER PRIMARY KEY, code TEXT NOT NULL DEFAULT (lower('NEW'))) STRICT;
+    CREATE TABLE loose (id INTEGER, value, label TEXT COLLATE NOCASE);
     CREATE INDEX accounts_value_idx ON accounts(value);
     INSERT INTO accounts VALUES (1, 'one'), (2, 'two');
+    INSERT INTO loose VALUES (1, 1, 'a'), (1, 1.0, 'A');
     INSERT INTO source VALUES (1, 'updated');
   `)
   return database

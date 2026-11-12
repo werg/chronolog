@@ -4,8 +4,12 @@ import {
   compileSqlStatement,
   completeOrderedResultSql,
   orderedSqlBindingValues,
+  SQL_CATALOG_LOOKUP_SQL,
+  sqlCatalogFromLookup,
   SqlCompilerError,
   type CompiledSqlSource,
+  type SqlCatalog,
+  type SqlCompilationMode,
 } from '@chronolog/compiler-sqlite'
 import {
   canonicalRealToNumber,
@@ -59,6 +63,28 @@ export interface SqlResultExecutionLimits {
 
 export interface SqlTransactionResultBudget { rows: number }
 
+/**
+ * The schema `database` exposes right now, including uncommitted DDL of the
+ * current transaction. Replicas replay the same statements, so every
+ * replica sees the same catalog at the same statement.
+ */
+export function databaseSqlCatalog(database: DatabaseLike): SqlCatalog {
+  return sqlCatalogFromLookup((name) => database.prepare(SQL_CATALOG_LOOKUP_SQL).get(name))
+}
+
+/**
+ * Compile `statement` against the catalog of `database`, the authoritative
+ * compile before consensus execution. Admission (compileSqlProgram without
+ * a catalog) may have assumed schema proofs that this withdraws.
+ */
+export function compileSqlStatementForDatabase(
+  database: DatabaseLike,
+  statement: SqlStatement,
+  mode: SqlCompilationMode,
+): CompiledSqlSource {
+  return compileSqlStatement(statement, mode, { catalog: databaseSqlCatalog(database) })
+}
+
 export async function evaluateSqlPrecondition(
   database: DatabaseLike,
   precondition: SqlPrecondition,
@@ -70,7 +96,7 @@ export async function evaluateSqlPrecondition(
   transactionBudget?: SqlTransactionResultBudget,
 ): Promise<AcceptedPreconditionResult> {
   try {
-    const compiled = compileSqlStatement(precondition.query, 'precondition')
+    const compiled = compileSqlStatementForDatabase(database, precondition.query, 'precondition')
     const result = executeSqlResult(
       database,
       compiled,
@@ -118,7 +144,7 @@ export function executeSqlBodyStatement(
   transactionBudget?: SqlTransactionResultBudget,
 ): AcceptedStatementResult {
   try {
-    const compiled = compileSqlStatement(statement, 'body')
+    const compiled = compileSqlStatementForDatabase(database, statement, 'body')
     if (compiled.orderedMutation !== null) {
       return executeOrderedMutation(
         database, compiled, index, maximumRows, maximumBytes, sqlLimits,
@@ -173,7 +199,7 @@ export function executeSqlObservation(
   maximumBytes: number,
   sqlLimits: Partial<SqlRuntimeLimits> = {},
 ): CanonicalSqlResult {
-  const compiled = compileSqlStatement(statement, 'precondition')
+  const compiled = compileSqlStatementForDatabase(database, statement, 'precondition')
   return executeSqlResult(
     database, compiled, resultMode, maximumRows, maximumBytes,
     'consensus_precondition', sqlLimits,
