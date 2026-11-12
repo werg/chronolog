@@ -83,6 +83,7 @@ export interface RpcNodeStatusSnapshot {
   readonly materializationPending: boolean
   readonly quarantinedFeeds: readonly string[]
   readonly lastError?: string
+  readonly ingest?: { readonly phase: string; readonly phaseAgeMs: number; readonly subscriptionRestarts: number; readonly retryRecords: number }
   readonly transport: {
     readonly records: number
     readonly peers: readonly string[]

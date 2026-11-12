@@ -55,7 +55,7 @@ export async function waitForConvergence(options: {
       await options.artifacts.writeJson('snapshots.last.json', last)
       try { coverage = await transactionCoverage(options.cluster, transactionIds, last[0]?.logRows ?? []) } catch { /* Keep the last successful coverage. */ }
     }
-    const nodes = last.map((snapshot) => `${snapshot.node}:status=${snapshot.status}${snapshot.lastErrorCode ? `(${snapshot.lastErrorCode})` : ''},state=${snapshot.stateDigest.slice(0, 10)},schema=${snapshot.schemaDigest.slice(0, 10)},log=${snapshot.logDigest.slice(0, 10)},order=${snapshot.publishedOrderLength},peers=${snapshot.connectedPeers}/${snapshot.knownPeers},payloads=${snapshot.pendingPayloads},ingest=${snapshot.ingestionBacklog},materializing=${snapshot.materializationPending}`).join(';')
+    const nodes = last.map((snapshot) => `${snapshot.node}:status=${snapshot.status}${snapshot.lastErrorCode ? `(${snapshot.lastErrorCode})` : ''},state=${snapshot.stateDigest.slice(0, 10)},schema=${snapshot.schemaDigest.slice(0, 10)},log=${snapshot.logDigest.slice(0, 10)},order=${snapshot.publishedOrderLength},peers=${snapshot.connectedPeers}/${snapshot.knownPeers},payloads=${snapshot.pendingPayloads},ingest=${snapshot.ingestionBacklog}${snapshot.ingestionBacklog > 0 && snapshot.ingestDiagnostics !== undefined ? `(${snapshot.ingestDiagnostics})` : ''},materializing=${snapshot.materializationPending}`).join(';')
     const details = `stable=${stable},admitted=${coverage.admitted},excluded=${coverage.excluded},unresolved=${coverage.unresolved}${nodes.length > 0 ? `,nodes=[${nodes}]` : ''}${lastError instanceof Error ? `,lastError=${lastError.message}` : ''}`
     await options.artifacts.record({ type: 'invariant', phase: 'failure', name: 'convergence_timeout', details: { explanation: details } })
     throw new Error(`CHAOS_CONVERGENCE_TIMEOUT:${details}`)
@@ -128,6 +128,7 @@ async function snapshotNode(
     knownPeers: replication.knownPeers,
     pendingPayloads: replication.pendingPayloads,
     ingestionBacklog: replication.ingestionBacklog,
+    ...(replication.ingestDiagnostics === undefined ? {} : { ingestDiagnostics: replication.ingestDiagnostics }),
     materializationPending: replication.materializationPending,
   }
 }

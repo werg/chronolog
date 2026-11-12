@@ -168,6 +168,13 @@ export interface NodeStatus {
   readonly lastError?: string
   readonly transport: TransportStatus
   readonly quarantinedFeeds: readonly string[]
+  /** Transport consumer state, for diagnosing ingestion that stops progressing. */
+  readonly ingest?: {
+    readonly phase: string
+    readonly phaseAgeMs: number
+    readonly subscriptionRestarts: number
+    readonly retryRecords: number
+  }
 }
 
 export type NodeObservationResult = MaterializedObservationResult

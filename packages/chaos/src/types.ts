@@ -94,6 +94,7 @@ export interface NodeSnapshot {
   readonly knownPeers: number
   readonly pendingPayloads: number
   readonly ingestionBacklog: number
+  readonly ingestDiagnostics?: string
   readonly materializationPending: boolean
 }
 

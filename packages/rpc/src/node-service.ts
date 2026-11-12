@@ -704,6 +704,12 @@ export class NodeRpcService implements ChronologRpcService {
       quarantinedFeeds: [...status.quarantinedFeeds],
       pendingPayloads,
       ingestionBacklog,
+      ...(status.ingest === undefined && status.transport.lastCatchUpError === undefined ? {} : {
+        ingestDiagnostics: [
+          ...(status.ingest === undefined ? [] : [`phase=${status.ingest.phase}`, `age=${status.ingest.phaseAgeMs}ms`, `restarts=${status.ingest.subscriptionRestarts}`, `retry=${status.ingest.retryRecords}`]),
+          ...(status.transport.lastCatchUpError === undefined ? [] : [`catchUp=${status.transport.lastCatchUpError}`]),
+        ].join(' '),
+      }),
       materializationPending: status.materializationPending,
       state: status.lastError !== undefined || status.transport.lastCatchUpError !== undefined || status.quarantinedFeeds.length > 0
         ? 'degraded'

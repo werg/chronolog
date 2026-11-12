@@ -399,6 +399,12 @@ export class ChronologNode {
       validating: this.#options.validator !== undefined,
       transport: await this.#options.transport.status(),
       quarantinedFeeds: this.#feedForks.quarantineEvidence().map((item) => item.feedId),
+      ingest: {
+        phase: this.#consumerPhase,
+        phaseAgeMs: Date.now() - this.#consumerPhaseSince,
+        subscriptionRestarts: this.#subscriptionRestarts,
+        retryRecords: this.#retryRecords.size,
+      },
       ...(error === undefined ? {} : { lastError: error.message }),
     }
     return status
