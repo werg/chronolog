@@ -48,7 +48,7 @@ function localValueToDatabaseValue(value: LocalSqlValue): unknown {
     }
     case 'real':
       if (!Number.isFinite(value.value)) throw new SqlProfileError('SQL_INVALID_REAL_PARAMETER')
-      return value.value
+      return Float64Array.of(value.value)
     case 'text': return value.value
     case 'blob': return Uint8Array.from(value.value)
   }

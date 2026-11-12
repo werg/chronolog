@@ -33,6 +33,7 @@
     "dev": "tsx apps/chronologd/src/main.ts",
     "cli": "tsx apps/chronolog/src/main.ts",
     "snapshot": "tsx apps/chronologd/src/snapshot.ts",
+    "group": "tsx apps/chronologd/src/group.ts",
     "blob": "tsx apps/chronologd/src/blob-gc.ts",
     "demo": "tsx examples/end-to-end.ts",
     "chaos": "tsx packages/chaos/src/cli.ts",

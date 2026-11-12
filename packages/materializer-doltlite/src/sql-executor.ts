@@ -460,7 +460,9 @@ function logicalValueToDatabaseValue(value: SqlBindingValue): unknown {
     case 'blob': case 'uuid': return Uint8Array.from(value.bytes)
     case 'json': return canonicalJsonToText(value.value)
     case 'vector': return Uint8Array.from(value.bytes)
-    case 'real': return canonicalRealToNumber(value)
+    // A one-element Float64Array binds as an exact REAL; a plain integral JS
+    // number (1.0, -0.0) would bind as INTEGER (patched native binding).
+    case 'real': return Float64Array.of(canonicalRealToNumber(value))
   }
 }
 

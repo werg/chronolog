@@ -307,7 +307,7 @@ index 7be6aba8d05c3c02ff80efd1adbe55a3615264fd..6f4acc76b508661f97eca792f8e78729
  run(process.execPath, [path.join(__dirname, "download.js")])
  run("node-gyp", ["rebuild"])
 diff --git a/src/addon.cpp b/src/addon.cpp
-index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..dcb55a9d1e896ae8cb94a0207864b05f7075650b 100644
+index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..6d50d1d13fee415ff3388c93cf62b0b923d81090 100644
 --- a/src/addon.cpp
 +++ b/src/addon.cpp
 @@ -2,13 +2,37 @@
@@ -323,7 +323,7 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..dcb55a9d1e896ae8cb94a0207864b05f
 +  manifest.Set("doltliteSourceSha256", "6611b083ea08cf1e4a9ca71d8e873e9fccd989ad893d6ab38b3df3a48aeac6a8");
 +  manifest.Set("sqliteVecVersion", "0.1.9");
 +  manifest.Set("sqliteVecSourceSha256", "3acd67cb4aff080c7050926fd3cf8227905fe5b7ee3829d8ee5024ab1283cf61");
-+  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-v1");
++  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-v3");
 +  manifest.Set("fts5", true);
 +  manifest.Set("json1", true);
 +  manifest.Set("rtree", true);
@@ -747,7 +747,7 @@ index cc6588d619dd27477f8ccba169b337aa0cf4f0f5..51a2528a075a5d0f795bbafa6f1869eb
    static Napi::FunctionReference& GetConstructor(Napi::Env env);
  };
 diff --git a/src/util.h b/src/util.h
-index 99ddd3be6640c1f857da64d8f2fbd6912fffb55b..3a4a22be751e777784441e4cdbb56bff23156bce 100644
+index 99ddd3be6640c1f857da64d8f2fbd6912fffb55b..fd15548d467901b311e40d20d2d70d73273e36fa 100644
 --- a/src/util.h
 +++ b/src/util.h
 @@ -3,6 +3,8 @@
@@ -759,7 +759,7 @@ index 99ddd3be6640c1f857da64d8f2fbd6912fffb55b..3a4a22be751e777784441e4cdbb56bff
  // Converts a SQLite column value to a Napi::Value.
  inline Napi::Value ColumnToNapi(Napi::Env env, sqlite3_stmt* stmt, int col,
                                  bool readBigInts = false) {
-@@ -56,32 +58,42 @@ inline Napi::Array RowToArray(Napi::Env env, sqlite3_stmt* stmt,
+@@ -56,32 +58,52 @@ inline Napi::Array RowToArray(Napi::Env env, sqlite3_stmt* stmt,
  
  // Binds a JS value to a prepared statement parameter (1-based index).
  inline bool BindNapi(Napi::Env env, sqlite3_stmt* stmt, int idx, Napi::Value val) {
@@ -784,10 +784,20 @@ index 99ddd3be6640c1f857da64d8f2fbd6912fffb55b..3a4a22be751e777784441e4cdbb56bff
    } else if (val.IsBoolean()) {
 -    sqlite3_bind_int(stmt, idx, val.As<Napi::Boolean>().Value() ? 1 : 0);
 +    rc = sqlite3_bind_int(stmt, idx, val.As<Napi::Boolean>().Value() ? 1 : 0);
++  } else if (val.IsTypedArray() &&
++             val.As<Napi::TypedArray>().TypedArrayType() == napi_float64_array &&
++             val.As<Napi::TypedArray>().ElementLength() == 1) {
++    // Chronolog: a one-element Float64Array is an exact REAL. Plain JS numbers
++    // that happen to be integral (1.0, -0.0) would otherwise bind as INTEGER.
++    rc = sqlite3_bind_double(stmt, idx, val.As<Napi::Float64Array>()[0]);
    } else if (val.IsBuffer()) {
      auto buf = val.As<Napi::Buffer<uint8_t>>();
 -    sqlite3_bind_blob(stmt, idx, buf.Data(), (int)buf.ByteLength(), SQLITE_TRANSIENT);
-+    rc = sqlite3_bind_blob(stmt, idx, buf.Data(), (int)buf.ByteLength(), SQLITE_TRANSIENT);
++    // Chronolog: an empty buffer may have a null data pointer, which SQLite
++    // binds as NULL; bind a zero-length BLOB explicitly instead.
++    rc = buf.ByteLength() == 0
++      ? sqlite3_bind_zeroblob(stmt, idx, 0)
++      : sqlite3_bind_blob(stmt, idx, buf.Data(), (int)buf.ByteLength(), SQLITE_TRANSIENT);
    } else if (val.IsBigInt()) {
      bool lossless;
      int64_t i = val.As<Napi::BigInt>().Int64Value(&lossless);
@@ -809,7 +819,7 @@ index 99ddd3be6640c1f857da64d8f2fbd6912fffb55b..3a4a22be751e777784441e4cdbb56bff
    return true;
  }
  
-@@ -92,13 +104,19 @@ inline bool BindArgs(Napi::Env env, sqlite3_stmt* stmt,
+@@ -92,13 +114,19 @@ inline bool BindArgs(Napi::Env env, sqlite3_stmt* stmt,
                       const Napi::CallbackInfo& info, size_t startIdx = 0,
                       bool allowBare = true, bool allowUnknown = false) {
    sqlite3_clear_bindings(stmt);
@@ -830,7 +840,7 @@ index 99ddd3be6640c1f857da64d8f2fbd6912fffb55b..3a4a22be751e777784441e4cdbb56bff
      for (uint32_t i = 0; i < keys.Length(); i++) {
        std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
        int idx = 0;
-@@ -118,30 +136,76 @@ inline bool BindArgs(Napi::Env env, sqlite3_stmt* stmt,
+@@ -118,30 +146,76 @@ inline bool BindArgs(Napi::Env env, sqlite3_stmt* stmt,
          return false;
        }
        if (!BindNapi(env, stmt, idx, obj.Get(keys.Get(i)))) return false;
