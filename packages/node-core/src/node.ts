@@ -74,7 +74,7 @@ export class ChronologNode {
   #stallReported = false
   #subscriptionAbort: AbortController | undefined
   #backlogSince: number | undefined
-  #backlogAtStart = 0
+  #backlogAtWindowStart = 0
   #lastError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
@@ -1064,17 +1064,23 @@ export class ChronologNode {
       this.#stallReported = true
       this.#recordError(new Error(`NODE_INGEST_STALLED:${this.#consumerPhase}`))
     }
-    // Fallback: records the transport holds but never delivered to this
-    // subscription (observed once under chaos stress, cause not yet
-    // identified). If the backlog has not shrunk for 20 s while the consumer
-    // keeps running, resubscribe; the new subscription replays history and
-    // already-seen records are skipped.
-    if (this.#backlogSince === undefined || backlog < this.#backlogAtStart) {
+    // Fallback: records the transport holds but never delivered to this live
+    // subscription (observed under chaos stress: older replicated records
+    // missing while new ones flowed; history replay finds them). If records
+    // stay unprocessed for 20 s, resubscribe; the new subscription replays
+    // history and already-seen records are skipped.
+    // A live stream keeps adding records that are ingested promptly, so the
+    // backlog fluctuates; what matters is that it never reaches zero. The
+    // window restarts only when the backlog is fully drained (above).
+    // A node catching up on a large backlog drains it steadily; only a
+    // window without real progress (still >= 90% of where it started) counts.
+    if (this.#backlogSince === undefined) {
       this.#backlogSince = now
-      this.#backlogAtStart = backlog
-    } else if (now - this.#backlogSince >= 20_000 && this.#consumerPhase === 'waiting-for-record') {
+      this.#backlogAtWindowStart = backlog
+    } else if (now - this.#backlogSince >= 20_000) {
+      const stalled = backlog * 10 >= this.#backlogAtWindowStart * 9
       this.#backlogSince = undefined
-      this.#subscriptionAbort?.abort()
+      if (stalled) this.#subscriptionAbort?.abort()
     }
   }
 
