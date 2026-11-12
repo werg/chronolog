@@ -98,9 +98,10 @@ Status: complete
 
 Acceptance:
 
-- [x] Multi-node tests onboard, revoke, rotate, recover, and converge.
+- [x] Multi-node tests onboard, revoke, rotate, and converge.
 - [x] Removed participants cannot author, validate, or decrypt new epochs.
-- [x] Recovery and history-reopening effects are visible in settlement evidence.
+- [x] In-protocol threshold recovery removed (2026-11-12); failures are handled
+      by forking the group or out of band.
 
 ## Project 6 — Deterministic SQL row-choice expansion
 
@@ -213,10 +214,8 @@ Progress:
       public-address discovery.
 - [x] Internal authorizer/protocol threat review with unresolved release
       findings recorded.
-- [x] Authenticated governance status/grant/revoke/epoch/history/recovery RPC
+- [x] Authenticated governance status/grant/revoke/epoch/history RPC
       and CLI workflows that keep content keys inside the daemon.
-- [x] Verified recovery-share export/purge plus network-independent canonical
-      prepare/inspect/sign/combine/verify tooling; pilot custodian drill pending.
 - [x] Self-verifying Linux/macOS native package assembly, OIDC-attested archive
       evidence, and packaged persistent-data replacement drill; cross-version
       evidence waits for the first prior release artifact.
@@ -226,7 +225,7 @@ Progress:
       verification and immutable local read-through retention.
 - [x] External-vantage SSB address/key reachability proof, public-scope health
       gating, combined operator doctor, sizing/alerting guidance, and complete
-      install/onboard/migrate/rotate/backup/upgrade/recovery/incident runbook.
-- [ ] Execute and record the independent-custodian, snapshot-repair, multi-host
+      install/onboard/migrate/rotate/backup/upgrade/incident runbook.
+- [ ] Execute and record the snapshot-repair, multi-host
       blob, traversal, alert, and previous-version upgrade drills; commission
       the independent external security assessment.

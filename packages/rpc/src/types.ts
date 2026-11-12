@@ -257,9 +257,8 @@ export interface TransactionOutcome {
 export interface GetOutcomeRequest { readonly groupId: GroupId; readonly transactionId: TransactionId; readonly requestId: RequestId }
 export interface StreamOutcomeRequest extends GetOutcomeRequest { readonly resumeAfterEventSetRevision?: Revision }
 
-export type SettlementConfidence = 'insufficient' | 'provisional' | 'policy_watermark_reached' | 'history_reopened'
+export type SettlementConfidence = 'insufficient' | 'provisional' | 'policy_watermark_reached'
 export interface EvidenceReference { readonly kind: 'candidate' | 'attestation' | 'heartbeat' | 'membership' | 'epoch'; readonly reference: string }
-export interface HistoryReopeningEvent { readonly eventId: string; readonly type: 'recovery' | 'membership_change' | 'epoch_change'; readonly effectiveFromTimestamp: string; readonly membershipRevision: string }
 export interface SettlementEvidence {
   readonly transactionId: TransactionId
   readonly outcome: TransactionOutcome
@@ -271,7 +270,6 @@ export interface SettlementEvidence {
   readonly policyWatermarkTimestamp?: string
   readonly blockingHeartbeats: readonly string[]
   readonly unresolvedReferences: readonly EvidenceReference[]
-  readonly historyReopeningEvents: readonly HistoryReopeningEvent[]
   readonly confidence: SettlementConfidence
   readonly calculatedAt: string
 }
@@ -315,7 +313,6 @@ export interface GovernanceStatus {
   readonly rootAdminPublicKey: string
   readonly capabilityLogFeed: string
   readonly currentEpoch: string | null
-  readonly historyReopened: boolean
   readonly capabilities: readonly GovernanceCapabilityStatus[]
 }
 
@@ -338,5 +335,3 @@ export type RotateEpochRequest = GetGovernanceStatusRequest
 export interface RotateEpochResponse { readonly epoch: string }
 export interface GrantHistoricalAccessRequest extends GetGovernanceStatusRequest { readonly subjectId: string }
 export interface GrantHistoricalAccessResponse { readonly epochManifestsPublished: number }
-export interface PublishRecoveryRequest extends GetGovernanceStatusRequest { readonly canonicalRecoveryRecord: string }
-export interface PublishRecoveryResponse { readonly published: true }

@@ -157,12 +157,6 @@ async function startRuntime() {
         transport,
         identity,
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
-        onHistoryReopened: (event) => controlStore.recordHistoryReopening({
-          id: event.id,
-          floorMs: 0n,
-          membershipRevision: event.membershipRevision,
-          reason: event.reason,
-        }),
       })
       await governance.start()
       if (governance.currentEpoch === null) {

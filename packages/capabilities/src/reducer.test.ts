@@ -2,21 +2,16 @@ import { describe, expect, it } from 'vitest'
 import { generateEd25519KeyPair, type Ed25519KeyPair } from '@chronolog/protocol'
 import {
   applyCapabilityRevision,
-  applyRecoveryRecord,
   capabilityId,
-  combineRecoverySignatures,
   isCapabilityActive,
   reduceCapabilityLog,
   signCapabilityRevision,
   signGenesis,
-  signRecoveryPayload,
-  verifyRecoveryRecord,
   verifySignedGenesis,
   type CapabilityGrant,
   type CapabilityRevision,
   type CapabilitySnapshot,
   type GenesisManifest,
-  type RecoveryPayload,
   type ValidationPolicy,
 } from './index.js'
 
@@ -31,11 +26,8 @@ const validatorAt = (subject: number, revision: bigint, floor: bigint): Capabili
 
 async function fixture(overrides: Partial<GenesisManifest> = {}) {
   const root = await generateEd25519KeyPair()
-  const recovery = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair(), generateEd25519KeyPair()])
   const manifest: GenesisManifest = {
     groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, capabilityLogFeed: bytes(3),
-    recoveryPublicKeys: [recovery[0].publicKeyBytes, recovery[1].publicKeyBytes, recovery[2].publicKeyBytes],
-    recoveryThreshold: 2n,
     initialCapabilities: [writer, validatorAt(21, 0n, 1_000n)], validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 300_000n, heartbeatIntervalMs: 30_000n },
     resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 100n, maxMutations: 100n },
@@ -43,7 +35,7 @@ async function fixture(overrides: Partial<GenesisManifest> = {}) {
     ...overrides,
   }
   const genesis = await signGenesis(manifest, root.privateKey)
-  return { root, recovery, manifest, genesis, snapshot: await reduceCapabilityLog(genesis, []) }
+  return { root, manifest, genesis, snapshot: await reduceCapabilityLog(genesis, []) }
 }
 
 function revisionAfter(
@@ -79,24 +71,6 @@ describe('genesis verification', () => {
     expect(duplicate).toMatchObject({ code: 'SCHEMA_INVALID' })
     const policyRepeat = await fixture({ validationPolicies: [policy, policy] }).then(() => undefined, (error: unknown) => error)
     expect(policyRepeat).toMatchObject({ code: 'SCHEMA_INVALID' })
-  })
-
-  it('refuses a recovery set that would let one key satisfy two-of-three', async () => {
-    const key = (await generateEd25519KeyPair()).publicKeyBytes
-    const other = (await generateEd25519KeyPair()).publicKeyBytes
-    const error = await fixture({ recoveryPublicKeys: [key, key, other] }).then(() => undefined, (cause: unknown) => cause)
-    expect(error).toMatchObject({ code: 'SCHEMA_INVALID' })
-  })
-
-  it('rejects thresholds other than two and wrong recovery key counts', async () => {
-    for (const overrides of [
-      { recoveryThreshold: 1n },
-      { recoveryThreshold: 0n },
-      { recoveryThreshold: 3n },
-    ] satisfies Partial<GenesisManifest>[]) {
-      const error = await fixture(overrides).then(() => undefined, (cause: unknown) => cause)
-      expect(error, String(overrides.recoveryThreshold)).toMatchObject({ code: 'SCHEMA_INVALID' })
-    }
   })
 })
 
@@ -199,99 +173,5 @@ describe('capability validity windows', () => {
     expect(isCapabilityActive({ ...base, grant }, 5n)).toBe(false)
     expect(isCapabilityActive({ ...base, grant, revokedAtRevision: 3n }, 2n)).toBe(true)
     expect(isCapabilityActive({ ...base, grant, revokedAtRevision: 3n }, 3n)).toBe(false)
-  })
-})
-
-describe('recovery verification', () => {
-  async function recoveryFixture() {
-    const f = await fixture()
-    const newRoot = await generateEd25519KeyPair()
-    const payload: RecoveryPayload = {
-      groupId: f.snapshot.groupId, lastRevision: f.snapshot.revision, lastRevisionDigest: f.snapshot.revisionDigest,
-      newRevision: 1n, newRootPublicKey: newRoot.publicKeyBytes, newCapabilityLogFeed: bytes(9),
-      validatorGrants: [validatorAt(30, 1n, 2_000n)], reopenHistory: false,
-    }
-    const sign = (index: number, body: RecoveryPayload = payload) =>
-      signRecoveryPayload(body, BigInt(index), f.recovery[index]!.privateKey)
-    return { ...f, newRoot, payload, sign }
-  }
-
-  it('applies a two-of-three recovery and retires old validators and the old root', async () => {
-    const f = await recoveryFixture()
-    const record = combineRecoverySignatures(f.payload, [await f.sign(0), await f.sign(1)])
-    const recovered = await applyRecoveryRecord(f.snapshot, record)
-    expect(recovered.historyReopened).toBe(false)
-    const oldValidator = [...recovered.capabilities.values()].find((entry) => entry.grant.subjectId[0] === 21)!
-    expect(isCapabilityActive(oldValidator, recovered.revision)).toBe(false)
-    expect(isCapabilityActive(oldValidator, 0n)).toBe(true)
-    const newValidator = [...recovered.capabilities.values()].find((entry) => entry.grant.subjectId[0] === 30)!
-    expect(isCapabilityActive(newValidator, recovered.revision)).toBe(true)
-  })
-
-  it('rejects a recovery signed by the same custodian twice or by a non-custodian', async () => {
-    const f = await recoveryFixture()
-    const outsider = await generateEd25519KeyPair()
-    const duplicated = combineRecoverySignatures(f.payload, [await f.sign(0), await f.sign(0)])
-    expect(await verifyRecoveryRecord(f.snapshot, duplicated)).toBe(false)
-    const outsiderSignature = await signRecoveryPayload(f.payload, 1n, outsider.privateKey)
-    expect(await verifyRecoveryRecord(f.snapshot, combineRecoverySignatures(f.payload, [await f.sign(0), outsiderSignature]))).toBe(false)
-    await expect(applyRecoveryRecord(f.snapshot, duplicated)).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
-  })
-
-  it('rejects a signature presented under the wrong custodian index', async () => {
-    const f = await recoveryFixture()
-    const real = await f.sign(0)
-    const relabeled = { ...real, recoveryKeyIndex: 2n }
-    expect(await verifyRecoveryRecord(f.snapshot, combineRecoverySignatures(f.payload, [await f.sign(1), relabeled]))).toBe(false)
-    const outOfRange = { ...real, recoveryKeyIndex: 3n }
-    expect(await verifyRecoveryRecord(f.snapshot, { payload: f.payload, signatures: [outOfRange, await f.sign(1)] })).toBe(false)
-    const negative = { ...real, recoveryKeyIndex: -1n }
-    expect(await verifyRecoveryRecord(f.snapshot, { payload: f.payload, signatures: [negative, await f.sign(1)] })).toBe(false)
-  })
-
-  it('binds signatures to the exact payload, group, predecessor and revision', async () => {
-    const f = await recoveryFixture()
-    const signatures = [await f.sign(0), await f.sign(1)]
-    expect(await verifyRecoveryRecord(f.snapshot, { payload: f.payload, signatures })).toBe(true)
-    const mutated: readonly RecoveryPayload[] = [
-      { ...f.payload, newRootPublicKey: bytes(77) },
-      { ...f.payload, newCapabilityLogFeed: bytes(77) },
-      { ...f.payload, validatorGrants: [] },
-    ]
-    for (const payload of mutated) expect(await verifyRecoveryRecord(f.snapshot, { payload, signatures })).toBe(false)
-
-    const rebound: readonly RecoveryPayload[] = [
-      { ...f.payload, groupId: bytes(98) },
-      { ...f.payload, lastRevisionDigest: bytes(98) },
-      { ...f.payload, lastRevision: 4n, newRevision: 5n },
-    ]
-    for (const payload of rebound) {
-      const resigned = [await f.sign(0, payload), await f.sign(1, payload)]
-      expect(await verifyRecoveryRecord(f.snapshot, { payload, signatures: resigned })).toBe(false)
-    }
-  })
-
-  it('does not let recovery silently lower the validator floor without declaring a reopening', async () => {
-    const f = await recoveryFixture()
-    const payload: RecoveryPayload = { ...f.payload, validatorGrants: [validatorAt(30, 1n, 10n)] }
-    const record = combineRecoverySignatures(payload, [await f.sign(0, payload), await f.sign(1, payload)])
-    await expect(applyRecoveryRecord(f.snapshot, record)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
-  })
-
-  it('rejects recovery grants that start at the wrong revision or repeat a capability', async () => {
-    const f = await recoveryFixture()
-    const early: RecoveryPayload = { ...f.payload, validatorGrants: [validatorAt(30, 0n, 2_000n)] }
-    await expect(applyRecoveryRecord(f.snapshot, combineRecoverySignatures(early, [await f.sign(0, early), await f.sign(1, early)])))
-      .rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
-    const repeated: RecoveryPayload = { ...f.payload, validatorGrants: [validatorAt(30, 1n, 2_000n), validatorAt(30, 1n, 2_000n)] }
-    await expect(applyRecoveryRecord(f.snapshot, combineRecoverySignatures(repeated, [await f.sign(0, repeated), await f.sign(1, repeated)])))
-      .rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
-  })
-
-  it('does not replay a recovery after it has been applied', async () => {
-    const f = await recoveryFixture()
-    const record = combineRecoverySignatures(f.payload, [await f.sign(0), await f.sign(1)])
-    const recovered = await applyRecoveryRecord(f.snapshot, record)
-    expect(await verifyRecoveryRecord(recovered, record)).toBe(false)
   })
 })

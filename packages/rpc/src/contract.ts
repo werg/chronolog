@@ -45,8 +45,6 @@ import type {
   RotateEpochResponse,
   GrantHistoricalAccessRequest,
   GrantHistoricalAccessResponse,
-  PublishRecoveryRequest,
-  PublishRecoveryResponse,
 } from './types.js'
 
 export interface RpcCallOptions { readonly signal?: AbortSignal; readonly token?: string; readonly timeoutMs?: number; readonly metadata?: Readonly<Record<string, string>> }
@@ -74,7 +72,6 @@ export interface UnaryRpcMethods {
   'governance.revokeCapabilities': { request: RevokeCapabilitiesRequest; response: RevokeCapabilitiesResponse }
   'governance.rotateEpoch': { request: RotateEpochRequest; response: RotateEpochResponse }
   'governance.grantHistoricalAccess': { request: GrantHistoricalAccessRequest; response: GrantHistoricalAccessResponse }
-  'governance.publishRecovery': { request: PublishRecoveryRequest; response: PublishRecoveryResponse }
 }
 export interface StreamRpcMethods {
   'node.streamStatus': { request: StreamStatusRequest; response: NodeStatus }
@@ -122,6 +119,5 @@ export interface ChronologRpcService {
   revokeCapabilities(request: RevokeCapabilitiesRequest, context: RpcCallContext): Promise<RevokeCapabilitiesResponse>
   rotateEpoch(request: RotateEpochRequest, context: RpcCallContext): Promise<RotateEpochResponse>
   grantHistoricalAccess(request: GrantHistoricalAccessRequest, context: RpcCallContext): Promise<GrantHistoricalAccessResponse>
-  publishRecovery(request: PublishRecoveryRequest, context: RpcCallContext): Promise<PublishRecoveryResponse>
 }
 export type ChronologService = ChronologRpcService

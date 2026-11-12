@@ -2,7 +2,6 @@ import {
   DOMAINS,
   assertCanonicalCbor,
   assertKnownIntegerKeys,
-  bytesToHex,
   encodeCanonicalCbor,
   expectArray,
   expectBytes,
@@ -22,8 +21,6 @@ import type {
   ClockPolicy,
   GenesisManifest,
   ReaderHistoryScope,
-  RecoveryPayload,
-  RecoveryRecord,
   ResourcePolicy,
   SignedCapabilityRevision,
   SignedGenesis,
@@ -169,13 +166,10 @@ function resourceFromCbor(value: CborValue): ResourcePolicy {
 
 function genesisToCbor(value: GenesisManifest): CborValue {
   protocolInvariant(value.rootAdminPublicKey.length === 32, 'SCHEMA_INVALID', 'Genesis root key must contain 32 bytes')
-  protocolInvariant(value.recoveryPublicKeys.length === 3 && value.recoveryPublicKeys.every((key) => key.length === 32), 'SCHEMA_INVALID', 'Genesis requires exactly three 32-byte recovery keys')
-  protocolInvariant(value.recoveryThreshold === 2n, 'SCHEMA_INVALID', 'V0.1 recovery threshold must be two of three')
-  protocolInvariant(new Set(value.recoveryPublicKeys.map(bytesToHex)).size === 3, 'SCHEMA_INVALID', 'Genesis recovery keys must be distinct')
   protocolInvariant(value.validationPolicies.length > 0, 'SCHEMA_INVALID', 'Genesis requires at least one validation policy')
   return integerMap([
     [0, 1n], [1, value.groupId], [2, value.schemaId], [3, value.rootAdminPublicKey],
-    [4, value.capabilityLogFeed], [5, value.recoveryPublicKeys], [6, value.recoveryThreshold],
+    [4, value.capabilityLogFeed],
     [7, value.initialCapabilities.map(grantToCbor)], [8, value.validationPolicies.map(policyToCbor)],
     [9, clockToCbor(value.clockPolicy)], [10, resourceToCbor(value.resourcePolicy)],
     [11, value.encryptionSuite], [12, value.createdAtMs],
@@ -188,21 +182,14 @@ export function encodeGenesisManifest(value: GenesisManifest): Uint8Array {
 
 export function decodeGenesisManifest(bytes: Uint8Array): GenesisManifest {
   const map = expectMap(assertCanonicalCbor(bytes), 'genesis')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 'genesis')
+  // Keys 5 and 6 are retired (formerly recovery keys and threshold).
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12], 'genesis')
   expectVersion(map, 1n, 'genesis')
-  const recovery = expectArray(required(map, 5, 'genesis.recovery_keys'), 'genesis.recovery_keys')
-  protocolInvariant(recovery.length === 3, 'SCHEMA_INVALID', 'Genesis requires exactly three recovery keys')
   const manifest: GenesisManifest = {
     groupId: expectBytes(required(map, 1, 'genesis.group_id'), 'genesis.group_id'),
     schemaId: expectBytes(required(map, 2, 'genesis.schema_id'), 'genesis.schema_id'),
     rootAdminPublicKey: expectBytes(required(map, 3, 'genesis.root_key'), 'genesis.root_key', 32),
     capabilityLogFeed: expectBytes(required(map, 4, 'genesis.capability_feed'), 'genesis.capability_feed'),
-    recoveryPublicKeys: [
-      expectBytes(recovery[0] ?? null, 'genesis.recovery_keys[0]', 32),
-      expectBytes(recovery[1] ?? null, 'genesis.recovery_keys[1]', 32),
-      expectBytes(recovery[2] ?? null, 'genesis.recovery_keys[2]', 32),
-    ],
-    recoveryThreshold: expectUint64(required(map, 6, 'genesis.recovery_threshold'), 'genesis.recovery_threshold'),
     initialCapabilities: expectArray(required(map, 7, 'genesis.capabilities'), 'genesis.capabilities').map((item, index) => grantFromCbor(item, `genesis.capabilities[${index}]`)),
     validationPolicies: expectArray(required(map, 8, 'genesis.policies'), 'genesis.policies').map((item, index) => policyFromCbor(item, `genesis.policies[${index}]`)),
     clockPolicy: clockFromCbor(required(map, 9, 'genesis.clock_policy')),
@@ -287,90 +274,11 @@ export function decodeSignedCapabilityRevision(bytes: Uint8Array): SignedCapabil
   }
 }
 
-function recoveryToCbor(value: RecoveryPayload): CborValue {
-  protocolInvariant(value.newRevision > value.lastRevision, 'SCHEMA_INVALID', 'Recovery must advance the membership revision')
-  protocolInvariant(value.newRootPublicKey.length === 32, 'SCHEMA_INVALID', 'Recovery root key must contain 32 bytes')
-  protocolInvariant(value.reopenHistory === (value.reopeningReason !== undefined), 'SCHEMA_INVALID', 'History reopening requires exactly one explicit reason')
-  protocolInvariant(value.validatorGrants.every((grant) => grant.role === 'validator'), 'SCHEMA_INVALID', 'Recovery validator grants must all be validator capabilities')
-  return integerMap([
-    [0, 1n], [1, value.groupId], [2, value.lastRevision], [3, value.lastRevisionDigest],
-    [4, value.newRevision], [5, value.newRootPublicKey], [6, value.newCapabilityLogFeed],
-    [7, value.validatorGrants.map(grantToCbor)], [8, value.reopenHistory], [9, value.reopeningReason],
-  ])
-}
-
-export function encodeRecoveryPayload(value: RecoveryPayload): Uint8Array {
-  return encodeCanonicalCbor(recoveryToCbor(value))
-}
-
-export function decodeRecoveryPayload(bytes: Uint8Array): RecoveryPayload {
-  const map = expectMap(assertCanonicalCbor(bytes), 'recovery')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 'recovery')
-  expectVersion(map, 1n, 'recovery')
-  const reason = optional(map, 9)
-  const payload: RecoveryPayload = {
-    groupId: expectBytes(required(map, 1, 'recovery.group_id'), 'recovery.group_id'),
-    lastRevision: expectUint64(required(map, 2, 'recovery.last_revision'), 'recovery.last_revision'),
-    lastRevisionDigest: expectBytes(required(map, 3, 'recovery.last_digest'), 'recovery.last_digest', 32),
-    newRevision: expectUint64(required(map, 4, 'recovery.new_revision'), 'recovery.new_revision'),
-    newRootPublicKey: expectBytes(required(map, 5, 'recovery.new_root'), 'recovery.new_root', 32),
-    newCapabilityLogFeed: expectBytes(required(map, 6, 'recovery.new_feed'), 'recovery.new_feed'),
-    validatorGrants: expectArray(required(map, 7, 'recovery.validator_grants'), 'recovery.validator_grants').map((item, index) => grantFromCbor(item, `recovery.validator_grants[${index}]`)),
-    reopenHistory: (() => {
-      const value = required(map, 8, 'recovery.reopen_history')
-      protocolInvariant(typeof value === 'boolean', 'SCHEMA_INVALID', 'Recovery history-reopening flag must be boolean')
-      return value
-    })(),
-    ...(reason === undefined ? {} : { reopeningReason: expectString(reason, 'recovery.reopening_reason') }),
-  }
-  recoveryToCbor(payload)
-  return payload
-}
-
-export function encodeRecoveryRecord(value: RecoveryRecord): Uint8Array {
-  return encodeCanonicalCbor(integerMap([
-    [0, 1n],
-    [1, encodeRecoveryPayload(value.payload)],
-    [2, value.signatures.map((signature) => integerMap([
-      [0, signature.recoveryKeyIndex],
-      [1, signature.signature],
-    ]))],
-  ]))
-}
-
-export function decodeRecoveryRecord(bytes: Uint8Array): RecoveryRecord {
-  const map = expectMap(assertCanonicalCbor(bytes), 'recovery_record')
-  assertKnownIntegerKeys(map, [0, 1, 2], 'recovery_record')
-  expectVersion(map, 1n, 'recovery_record')
-  const signatures = expectArray(required(map, 2, 'recovery_record.signatures'), 'recovery_record.signatures')
-    .map((item, index) => {
-      const signature = expectMap(item, `recovery_record.signatures[${index}]`)
-      assertKnownIntegerKeys(signature, [0, 1], `recovery_record.signatures[${index}]`)
-      return {
-        recoveryKeyIndex: expectUint64(required(signature, 0, 'recovery_signature.key_index'), 'recovery_signature.key_index'),
-        signature: expectBytes(required(signature, 1, 'recovery_signature.signature'), 'recovery_signature.signature', 64),
-      }
-    })
-  protocolInvariant(signatures.length > 0, 'SCHEMA_INVALID', 'Recovery record must contain at least one signature')
-  for (let index = 1; index < signatures.length; index += 1) {
-    protocolInvariant(
-      (signatures[index - 1]?.recoveryKeyIndex ?? -1n) < (signatures[index]?.recoveryKeyIndex ?? -1n),
-      'SCHEMA_INVALID',
-      'Recovery signatures must be uniquely sorted by recovery key index',
-    )
-  }
-  return {
-    payload: decodeRecoveryPayload(expectBytes(required(map, 1, 'recovery_record.payload'), 'recovery_record.payload')),
-    signatures,
-  }
-}
-
 export const capabilityCodecInternals = {
   grantToCbor,
   policyToCbor,
   genesisToCbor,
   revisionToCbor,
-  recoveryToCbor,
 }
 
 export { DOMAINS }

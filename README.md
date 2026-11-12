@@ -10,9 +10,10 @@ The core behavior is implemented end to end:
 
 - Strict deterministic CBOR, domain-separated SHA-256, and Ed25519 protocol
   messages.
-- Signed capability-revision and recovery primitives with readers, writers,
-  validators, administrators, class/organization validation policies, and
-  2-of-3 recovery.
+- Signed capability-revision primitives with readers, writers, validators,
+  administrators, and class/organization validation policies. There is no
+  in-protocol recovery; failures are handled by forking the group or out of
+  band.
 - RFC 9180 HPKE epoch-key wrapping primitives and AES-256-GCM encrypted SSB
   envelopes.
 - Durable SSB-DB2 feeds plus authenticated, explicitly allow-listed EBT peer
@@ -166,24 +167,16 @@ signature, capability revision, validation policy, group route, epoch, and
 ciphertext.
 
 Without `CHRONOLOG_STATIC_MEMBERSHIP_FILE`, the daemon creates or reloads a
-signed governance genesis in `governance.json`, consumes replicated capability,
-recovery, and epoch-manifest records, and changes authorization and encryption
+signed governance genesis in `governance.json`, consumes replicated capability
+and epoch-manifest records, and changes authorization and encryption
 keys without a restart. The bootstrap grants the local identity administrator,
-schema-administrator, writer, validator, and audit-reader roles and creates a
-2-of-3 development recovery kit. The file is mode `0600`; production operators
-must export the recovery keys to independent offline custody before treating a
-group as durable. See the [governance guide](docs/governance.md).
+schema-administrator, writer, validator, and audit-reader roles. The file is
+mode `0600`. See the [governance guide](docs/governance.md).
 
 Linux hosts can set `CHRONOLOG_SECRET_STORE=secret-service` (and optionally
 `CHRONOLOG_SECRET_SERVICE`) to migrate daemon and governance private material
 from JSON into an unlocked Secret Service collection. Startup then requires
 that provider and fails closed on a missing reference.
-
-`pnpm custody export|purge` moves the three development recovery shares out of
-the daemon's secret namespace after a verified handoff, while `pnpm recovery`
-provides network-independent canonical payload inspection, isolated signing,
-threshold combination, and verification. The detailed ceremony and its
-mandatory independent-custodian drill are in the governance guide.
 
 `pnpm release:distribution` creates a relocatable, self-verifying native
 archive for the current OS/architecture. `pnpm test:distribution-upgrade`
@@ -246,9 +239,7 @@ transport traffic.
 The static file is an out-of-band bootstrap snapshot, not replicated consensus
 state and not a live administration interface. In the default profile,
 `chronolog governance` provides status, live grants/revocations, epoch
-rotation, audit-history rewrapping, and relay of an offline-signed threshold
-recovery record. Verified export/purge and offline signing tooling are shipped;
-the independent-custodian pilot ceremony remains a release gate.
+rotation, and audit-history rewrapping.
 
 ## Workspace
 
@@ -311,7 +302,7 @@ through the deterministic compiler. See the [extension profile](docs/extensions.
 for the native-versus-consensus boundary.
 
 Before production use, the remaining work is witnessed pilot execution of the
-implemented custody, snapshot/fork, blob, traversal, alerting, and upgrade
+implemented snapshot/fork, blob, traversal, alerting, and upgrade
 workflows; non-Linux/hardware-backed key providers; resolution of recorded
 security findings; and an independent external security review. The
 [upcoming work](upcoming.md) retains the full acceptance criteria.

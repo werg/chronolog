@@ -136,17 +136,11 @@ describe('ControlStore', () => {
     expect(incomplete.watermark(policy).cutoffMs).toBeNull()
   })
 
-  it('surfaces unresolved attestation references and explicit history reopening', () => {
+  it('surfaces unresolved attestation references', () => {
     const store = new ControlStore()
     store.putCandidate(candidate(1, 85n))
     store.setCandidateState(bytes(1), 'admissible')
     store.putAttestation(attestation(99, 9, 1))
-    store.recordHistoryReopening({
-      id: 'recovery-1',
-      floorMs: 80n,
-      membershipRevision: bytes(3),
-      reason: 'offline recovery',
-    })
     store.recordHeartbeat(heartbeat(1, 100n))
 
     const evidence = store.settlementEvidence(bytes(1), {
@@ -156,7 +150,6 @@ describe('ControlStore', () => {
       threshold: 1,
     })
     expect(evidence.unresolvedAttestationIds).toEqual([bytes(99)])
-    expect(evidence.historyReopeningIds).toEqual(['recovery-1'])
   })
 
   it('persists exact bigint/byte state and returns defensive copies', () => {

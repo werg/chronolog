@@ -47,11 +47,8 @@ const writer: CapabilityGrant = { subjectId: bytes(20), signingPublicKey: bytes(
 
 async function fixture(extraGrants: readonly CapabilityGrant[] = []) {
   const root = await generateEd25519KeyPair()
-  const recovery = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair(), generateEd25519KeyPair()])
   const manifest: GenesisManifest = {
     groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, capabilityLogFeed: bytes(3),
-    recoveryPublicKeys: [recovery[0].publicKeyBytes, recovery[1].publicKeyBytes, recovery[2].publicKeyBytes],
-    recoveryThreshold: 2n,
     initialCapabilities: [writer, validator(21, 'A'), validator(22, 'B'), ...extraGrants],
     validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 300_000n, heartbeatIntervalMs: 30_000n },

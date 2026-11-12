@@ -81,9 +81,6 @@ async function genesisSnapshot(genesis: SignedGenesis): Promise<CapabilitySnapsh
     capabilityLogFeed: manifest.capabilityLogFeed,
     capabilities,
     policies,
-    recoveryPublicKeys: manifest.recoveryPublicKeys,
-    recoveryThreshold: manifest.recoveryThreshold,
-    historyReopened: false,
   }
 }
 
@@ -97,7 +94,7 @@ export async function reduceCapabilityLog(
   return snapshot
 }
 
-/** Applies one verified successor, including after a threshold recovery event. */
+/** Applies one verified successor revision. */
 export async function applyCapabilityRevision(
   snapshot: CapabilitySnapshot,
   signed: SignedCapabilityRevision,
@@ -185,7 +182,6 @@ export async function capabilitySnapshotDigest(snapshot: CapabilitySnapshot): Pr
     [3, snapshot.rootAdminPublicKey], [4, snapshot.capabilityLogFeed],
     [5, entries.map((entry) => (awaitImportHackGrant(entry)))],
     [6, policies.map((entry) => (awaitImportHackPolicy(entry)))],
-    [7, snapshot.historyReopened], [8, snapshot.recoveryEventDigest],
   ])
   return hashDomain(DOMAINS.capabilitySnapshot, encodeCanonicalCbor(value))
 }

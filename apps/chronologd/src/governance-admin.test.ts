@@ -28,7 +28,7 @@ describe('governance admin RPC adapter', () => {
     const admin = createGovernanceRpcAdmin({ governance, rootPrivateKey: {} as CryptoKey, now: () => 12_345 })
 
     const status = await admin.getStatus({ groupId: b64(snapshot.groupId), requestId: 'status' })
-    expect(status).toMatchObject({ revision: '3', currentEpoch: '7', historyReopened: false })
+    expect(status).toMatchObject({ revision: '3', currentEpoch: '7' })
     expect(status.capabilities).toEqual([expect.objectContaining({ role: 'administrator', active: true })])
 
     const response = await admin.grantCapability({
@@ -58,22 +58,6 @@ describe('governance admin RPC adapter', () => {
     await expect(admin.grantCapability({ ...common, role: 'writer', signingPublicKey: 'not base64!' })).rejects.toMatchObject({ code: 'invalid_argument' })
     await expect(admin.grantCapability({ ...common, role: 'writer', validUntilRevision: '3' })).rejects.toMatchObject({ code: 'invalid_argument' })
   })
-
-  it('accepts only same-group canonical offline recovery records', async () => {
-    const publishRecovery = vi.fn()
-    const governance = {
-      snapshot: capabilitySnapshot(),
-      currentEpoch: null,
-      publishRecovery,
-    } as unknown as GovernanceControlPlane
-    const admin = createGovernanceRpcAdmin({ governance, rootPrivateKey: {} as CryptoKey })
-    await expect(admin.publishRecovery({
-      groupId: b64(governance.snapshot.groupId),
-      requestId: 'recover',
-      canonicalRecoveryRecord: b64(Uint8Array.of(1, 2, 3)),
-    })).rejects.toMatchObject({ code: 'invalid_argument' })
-    expect(publishRecovery).not.toHaveBeenCalled()
-  })
 })
 
 function capabilitySnapshot(): CapabilitySnapshot {
@@ -96,9 +80,6 @@ function capabilitySnapshot(): CapabilitySnapshot {
       grantedAtRevision: 0n,
     }]]),
     policies: new Map(),
-    recoveryPublicKeys: [bytes(5), bytes(6), bytes(7)],
-    recoveryThreshold: 2n,
-    historyReopened: false,
   }
 }
 

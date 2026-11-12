@@ -78,21 +78,21 @@ and size for indefinite immutable retention.
 
 ## Recovery and incidents
 
-- For quorum loss, three independent custodians inspect the same payload via an
-  independent channel. Any two sign offline; combine and verify publicly before
-  publishing recovery. Record approvals and digests, never private shares.
+- For a lost root key or lost validator quorum there is no in-protocol
+  recovery. Agree a snapshot out of band and fork the group under a new
+  genesis.
 - For a feed fork, stop and retain the original directory. Obtain the signed
   snapshot and complete prefix independently, then use snapshot repair. Keep
   both branch IDs, quarantine evidence, plan, backup, and rebuild diagnostics.
 - For blob loss, never fabricate or bypass a digest. Restore an exact retained
   copy or authenticated peer; unresolved chunks remain pending.
 - For key/token exposure, revoke capabilities, rotate epoch and service tokens,
-  inspect history reopening, and decide whether threshold recovery is needed.
+  and fork the group if the root key itself is exposed.
 
 ## Mandatory drills and exit evidence
 
 Witness: clean install; two-node onboarding; schema migration with old/new
-clients; reader removal/rotation; three-person custody plus two-person recovery;
+clients; reader removal/rotation;
 previous-to-candidate upgrade when a prior release exists; snapshot restore;
 synthetic fork repair; cache-miss multi-host blob fetch; externally verified
 traversal; crash/restart; and alert delivery.

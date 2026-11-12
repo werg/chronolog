@@ -63,7 +63,7 @@ export interface TransportAuthorContext {
 /**
  * Resolves authority at the transaction's pinned membership revision. It can be
  * backed by the in-log capability system, a central service, a chain, or a
- * recovery-controlled out-of-band source. No fixed validator set is assumed.
+ * operator-controlled out-of-band source. No fixed validator set is assumed.
  */
 export interface MembershipResolver {
   canWrite(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): boolean | Promise<boolean>

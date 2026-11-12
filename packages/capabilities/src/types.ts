@@ -47,8 +47,6 @@ export interface GenesisManifest {
   readonly schemaId: Uint8Array
   readonly rootAdminPublicKey: Uint8Array
   readonly capabilityLogFeed: Uint8Array
-  readonly recoveryPublicKeys: readonly [Uint8Array, Uint8Array, Uint8Array]
-  readonly recoveryThreshold: bigint
   readonly initialCapabilities: readonly CapabilityGrant[]
   readonly validationPolicies: readonly ValidationPolicy[]
   readonly clockPolicy: ClockPolicy
@@ -100,10 +98,6 @@ export interface CapabilitySnapshot {
   readonly capabilityLogFeed: Uint8Array
   readonly capabilities: ReadonlyMap<string, EffectiveCapability>
   readonly policies: ReadonlyMap<string, EffectivePolicy>
-  readonly recoveryPublicKeys: readonly [Uint8Array, Uint8Array, Uint8Array]
-  readonly recoveryThreshold: bigint
-  readonly historyReopened: boolean
-  readonly recoveryEventDigest?: Uint8Array
 }
 
 export interface ValidatorEvidence {
@@ -117,26 +111,4 @@ export interface PolicyEvaluation {
   readonly satisfied: boolean
   readonly selected: readonly ValidatorEvidence[]
   readonly missing: readonly string[]
-}
-
-export interface RecoveryPayload {
-  readonly groupId: Uint8Array
-  readonly lastRevision: bigint
-  readonly lastRevisionDigest: Uint8Array
-  readonly newRevision: bigint
-  readonly newRootPublicKey: Uint8Array
-  readonly newCapabilityLogFeed: Uint8Array
-  readonly validatorGrants: readonly CapabilityGrant[]
-  readonly reopenHistory: boolean
-  readonly reopeningReason?: string
-}
-
-export interface RecoverySignature {
-  readonly recoveryKeyIndex: bigint
-  readonly signature: Uint8Array
-}
-
-export interface RecoveryRecord {
-  readonly payload: RecoveryPayload
-  readonly signatures: readonly RecoverySignature[]
 }

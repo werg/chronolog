@@ -39,7 +39,6 @@ const unaryDispatch: Record<UnaryRpcMethod, keyof ChronologRpcService> = {
   'governance.revokeCapabilities': 'revokeCapabilities',
   'governance.rotateEpoch': 'rotateEpoch',
   'governance.grantHistoricalAccess': 'grantHistoricalAccess',
-  'governance.publishRecovery': 'publishRecovery',
 }
 
 const streamDispatch: Record<StreamRpcMethod, keyof ChronologRpcService> = {

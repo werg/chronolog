@@ -84,7 +84,6 @@ export interface SettlementEvidence {
   readonly watermark: WatermarkEvidence
   readonly belowWatermark: boolean
   readonly unresolvedAttestationIds: readonly Uint8Array[]
-  readonly historyReopeningIds: readonly string[]
 }
 
 export interface MaterializedHead {
@@ -101,12 +100,6 @@ export interface StoredCheckpoint {
   readonly pinned: boolean
 }
 
-export interface HistoryReopening {
-  readonly id: string
-  readonly floorMs: bigint
-  readonly membershipRevision: Uint8Array
-  readonly reason: string
-}
 
 export type ControlStoreDelta =
   | {
@@ -155,11 +148,6 @@ export type ControlStoreDelta =
       readonly kind: 'checkpoint_stored'
       readonly checkpoint: StoredCheckpoint
     }
-  | {
-      readonly sequence: bigint
-      readonly kind: 'history_reopened'
-      readonly reopening: HistoryReopening
-    }
 
 export interface ControlStoreSnapshot {
   readonly format: 'chronolog-control-store/v1'
@@ -173,7 +161,6 @@ export interface ControlStoreSnapshot {
   readonly deltaFloor?: bigint
   readonly materializedHead: MaterializedHead | null
   readonly checkpoints: readonly StoredCheckpoint[]
-  readonly historyReopenings: readonly HistoryReopening[]
   /**
    * Cutoffs are validator signing state rather than a rebuildable index. They
    * are written synchronously before a validator publishes a signed record.

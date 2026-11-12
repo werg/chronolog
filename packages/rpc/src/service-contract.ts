@@ -14,8 +14,6 @@ import type {
   GrantHistoricalAccessRequest,
   GrantHistoricalAccessResponse,
   LocalSqlValue,
-  PublishRecoveryRequest,
-  PublishRecoveryResponse,
   RevokeCapabilitiesRequest,
   RevokeCapabilitiesResponse,
   RotateEpochRequest,
@@ -28,7 +26,6 @@ export interface GovernanceRpcAdmin {
   revokeCapabilities(request: RevokeCapabilitiesRequest): Promise<RevokeCapabilitiesResponse>
   rotateEpoch(request: RotateEpochRequest): Promise<RotateEpochResponse>
   grantHistoricalAccess(request: GrantHistoricalAccessRequest): Promise<GrantHistoricalAccessResponse>
-  publishRecovery(request: PublishRecoveryRequest): Promise<PublishRecoveryResponse>
 }
 
 export interface SqlObservationExecution {
@@ -65,7 +62,6 @@ export interface RpcNodeCandidateCore {
 }
 
 export interface RpcNodeSettlementEvidence {
-  readonly historyReopeningIds: readonly string[]
   readonly unresolvedAttestationIds: readonly Uint8Array[]
   readonly belowWatermark: boolean
   readonly watermark: { readonly cutoffMs: bigint | null; readonly heartbeatIds: readonly Uint8Array[] }
@@ -122,7 +118,6 @@ export interface ChronologRpcNodeService {
   readonly executionManifestDigest: Uint8Array
   readonly controlStore: {
     listCandidates(): readonly { readonly state: string }[]
-    snapshot(): { readonly historyReopenings: readonly { readonly id: string; readonly floorMs: bigint; readonly membershipRevision: Uint8Array }[] }
   }
   reserveTransactionContext(): { readonly authorTimestampMs: bigint; readonly nonce: Uint8Array }
   publish(input: { readonly program: SqlTransactionProgram; readonly authorTimestampMs: bigint; readonly nonce: Uint8Array }): Promise<{

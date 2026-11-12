@@ -29,7 +29,7 @@ export interface TransactionCore {
 
 export interface PayloadChunk { readonly digest: Uint8Array; readonly size: bigint }
 export interface PayloadManifest { readonly totalDigest: Uint8Array; readonly totalSize: bigint; readonly chunks: readonly PayloadChunk[] }
-export type EnvelopeMessageType = 'candidate' | 'attestation' | 'heartbeat' | 'capability' | 'recovery' | 'epoch-manifest' | 'proof-bundle' | 'snapshot'
+export type EnvelopeMessageType = 'candidate' | 'attestation' | 'heartbeat' | 'capability' | 'epoch-manifest' | 'proof-bundle' | 'snapshot'
 export interface ChronologEnvelope {
   readonly groupRoute: Uint8Array
   readonly messageType: EnvelopeMessageType
@@ -138,7 +138,8 @@ function manifestFromCbor(value: CborValue): PayloadManifest {
   return { totalDigest: expectBytes(required(map, 0, 'payload_manifest.total_digest'), 'payload_manifest.total_digest', 32), totalSize, chunks }
 }
 
-const MESSAGE_TYPES: readonly EnvelopeMessageType[] = ['candidate', 'attestation', 'heartbeat', 'capability', 'recovery', 'epoch-manifest', 'proof-bundle', 'snapshot']
+// Wire codes are positions in this list; code 4 (formerly 'recovery') is retired.
+const MESSAGE_TYPES: readonly (EnvelopeMessageType | null)[] = ['candidate', 'attestation', 'heartbeat', 'capability', null, 'epoch-manifest', 'proof-bundle', 'snapshot']
 export function encodeEnvelope(value: ChronologEnvelope): Uint8Array {
   const messageIndex = MESSAGE_TYPES.indexOf(value.messageType); protocolInvariant(messageIndex >= 0, 'SCHEMA_INVALID', 'Unknown envelope message type')
   const payload = value.payload.type === 'inline' ? [0n, value.payload.bytes] as const : [1n, manifestToCbor(value.payload.manifest)] as const
@@ -147,7 +148,7 @@ export function encodeEnvelope(value: ChronologEnvelope): Uint8Array {
 export function decodeEnvelope(bytes: Uint8Array): ChronologEnvelope {
   const map = expectMap(assertCanonicalCbor(bytes), 'envelope'); assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5], 'envelope'); expectVersion(map, 1n, 'envelope')
   const typeIndex = expectUint64(required(map, 2, 'envelope.message_type'), 'envelope.message_type'); protocolInvariant(typeIndex < BigInt(MESSAGE_TYPES.length), 'SCHEMA_INVALID', 'Unknown envelope message type')
-  const messageType = MESSAGE_TYPES[Number(typeIndex)]; protocolInvariant(messageType !== undefined, 'SCHEMA_INVALID', 'Unknown envelope message type')
+  const messageType = MESSAGE_TYPES[Number(typeIndex)]; protocolInvariant(messageType !== undefined && messageType !== null, 'SCHEMA_INVALID', 'Unknown envelope message type')
   const epoch = required(map, 3, 'envelope.encryption_epoch'); protocolInvariant(epoch === null || epoch instanceof Uint8Array, 'SCHEMA_INVALID', 'Envelope encryption epoch must be null or bytes')
   const encodedPayload = expectArray(required(map, 5, 'envelope.payload'), 'envelope.payload'); protocolInvariant(encodedPayload.length === 2, 'SCHEMA_INVALID', 'Envelope payload has invalid arity')
   const payloadType = expectUint64(encodedPayload[0] ?? null, 'envelope.payload.type')

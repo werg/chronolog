@@ -211,7 +211,7 @@ describe('drill evidence verification', () => {
     expect((await verify(missingRole, wrongRole)).errors).toContain(`ROLE_UNEXPECTED:bystander`)
   })
 
-  it('enforces independence groups between roles and among custodians', async () => {
+  it('enforces independence groups between roles', async () => {
     const snapshot = await fixture('snapshot-repair')
     const sameGroup: DrillRoster = {
       ...snapshot.roster,
@@ -225,13 +225,6 @@ describe('drill evidence verification', () => {
     }
     expect((await verify(snapshot, snapshot.record, ungrouped)).errors).toContain('INDEPENDENCE_GROUP_MISSING:reviewer')
 
-    const custodians = await fixture('custodian-handoff')
-    const shared: DrillRoster = {
-      ...custodians.roster,
-      entries: custodians.roster.entries.map((entry) => entry.roles.includes('custodian')
-        ? { ...entry, independenceGroup: 'same-person' } : entry),
-    }
-    expect((await verify(custodians, custodians.record, shared)).errors).toContain('INDEPENDENCE_GROUP_SHARED:custodian')
   })
 
   it('rejects a record bound to a different commit', async () => {

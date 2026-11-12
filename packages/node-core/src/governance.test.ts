@@ -1,15 +1,11 @@
 import {
-  combineRecoverySignatures,
   signGenesis,
-  signRecoveryPayload,
   validationPolicyId,
   type CapabilityGrant,
   type GenesisManifest,
-  type RecoveryPayload,
   type ValidationPolicy,
 } from '@chronolog/capabilities'
 import { generateX25519KeyPair } from '@chronolog/crypto'
-import { ControlStore } from '@chronolog/control-store'
 import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -106,90 +102,13 @@ describe('replicated governance control plane', () => {
     await waitFor(() => auditor.cipherRing.epochs().length === 2)
     expect(auditor.cipherRing.epochs()).toEqual([0n, 1n])
   })
-
-  it('recovers quorum control, revokes a compromised root, and records history reopening', async () => {
-    const reopenings: string[] = []
-    const control = new ControlStore()
-    const fixture = await governanceFixture((event) => {
-      reopenings.push(event.reason)
-      control.recordHistoryReopening({
-        id: event.id,
-        floorMs: 0n,
-        membershipRevision: event.membershipRevision,
-        reason: event.reason,
-      })
-    })
-    const newRoot = await generateEd25519KeyPair()
-    const newFeed = fixture.network.createNode('admin2')
-    fixture.network.connectAll()
-    const recoveryValidator = grant(newRoot.publicKeyBytes, 'validator', { minimumAuthorTimestampMs: 0n, validFromRevision: 5n, transportAuthor: 'admin2' }) as CapabilityGrant
-    const payload: RecoveryPayload = {
-      groupId: fixture.groupId,
-      lastRevision: fixture.admin.snapshot.revision,
-      lastRevisionDigest: fixture.admin.snapshot.revisionDigest,
-      newRevision: 5n,
-      newRootPublicKey: newRoot.publicKeyBytes,
-      newCapabilityLogFeed: new TextEncoder().encode('admin2'),
-      validatorGrants: [recoveryValidator],
-      reopenHistory: true,
-      reopeningReason: 'replace compromised root and restore validator quorum',
-    }
-    const record = combineRecoverySignatures(payload, [
-      await signRecoveryPayload(payload, 0n, fixture.recovery[0].privateKey),
-      await signRecoveryPayload(payload, 2n, fixture.recovery[2].privateKey),
-    ])
-    await fixture.admin.publishRecovery(record)
-    await waitFor(() => fixture.admin.snapshot.revision === 5n)
-    expect(reopenings).toEqual(['replace compromised root and restore validator quorum'])
-    const [reopening] = control.snapshot().historyReopenings
-    expect(reopening).toBeDefined()
-    control.putCandidate({
-      txId: bytes32(40),
-      groupId: fixture.groupId,
-      candidateDigest: bytes32(41),
-      validationPolicy: bytes32(42),
-      orderKey: {
-        authorTimestampMs: 1n,
-        authorId: fixture.root.publicKeyBytes,
-        authorFeedSequence: 1n,
-        txId: bytes32(40),
-      },
-      canonicalPayload: Uint8Array.of(1),
-      state: 'admissible',
-    })
-    expect(control.settlementEvidence(bytes32(40), {
-      kind: 'threshold',
-      policyId: 'recovered-quorum',
-      validatorIds: [newRoot.publicKeyBytes],
-      threshold: 1,
-    }).historyReopeningIds).toEqual([reopening!.id])
-    expect([...fixture.admin.snapshot.capabilities.values()].filter((item) =>
-      bytesEqual(item.grant.signingPublicKey, fixture.root.publicKeyBytes) && item.revokedAtRevision === undefined)).toEqual([])
-
-    const successor = await GovernanceControlPlane.create({
-      genesis: fixture.genesis,
-      groupRoute: fixture.groupRoute,
-      transport: newFeed,
-      identity: newRoot,
-    })
-    controllers.push(successor)
-    await successor.start()
-    expect(successor.snapshot.revision).toBe(5n)
-    await successor.publishCapabilityChange({ grants: [
-      grant(newRoot.publicKeyBytes, 'administrator', { transportAuthor: 'admin2' }),
-      grant(newRoot.publicKeyBytes, 'writer', { transportAuthor: 'admin2' }),
-    ] }, newRoot.privateKey)
-    await waitFor(() => fixture.admin.snapshot.revision === 6n)
-    expect(fixture.admin.snapshot.revisionDigest).toEqual(successor.snapshot.revisionDigest)
-  })
 })
 
-async function governanceFixture(onHistoryReopened?: NonNullable<Parameters<typeof GovernanceControlPlane.create>[0]['onHistoryReopened']>) {
+async function governanceFixture() {
   const network = new MemoryTransportNetwork()
   const adminTransport = network.createNode('admin')
   const root = await generateEd25519KeyPair()
   const rootHpke = await generateX25519KeyPair()
-  const recovery = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair(), generateEd25519KeyPair()])
   const groupId = bytes32(1)
   const groupRoute = bytes32(2)
   const policy: ValidationPolicy = { version: 1n, minimumValidators: 1n, classMinimums: new Map(), requiredOrganizations: [] }
@@ -198,8 +117,6 @@ async function governanceFixture(onHistoryReopened?: NonNullable<Parameters<type
     schemaId: bytes32(3),
     rootAdminPublicKey: root.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode('admin'),
-    recoveryPublicKeys: [recovery[0].publicKeyBytes, recovery[1].publicKeyBytes, recovery[2].publicKeyBytes],
-    recoveryThreshold: 2n,
     initialCapabilities: [
       { ...grant(root.publicKeyBytes, 'administrator', { transportAuthor: 'admin' }), validFromRevision: 0n },
       { ...grant(root.publicKeyBytes, 'writer', { transportAuthor: 'admin' }), validFromRevision: 0n },
@@ -219,11 +136,10 @@ async function governanceFixture(onHistoryReopened?: NonNullable<Parameters<type
     transport: adminTransport,
     identity: root,
     recipient: { id: root.publicKeyBytes, privateKey: rootHpke.privateKey },
-    ...(onHistoryReopened === undefined ? {} : { onHistoryReopened }),
   })
   controllers.push(admin)
   await admin.start()
-  return { network, root, recovery, genesis, admin, groupId, groupRoute, policy }
+  return { network, root, genesis, admin, groupId, groupRoute, policy }
 }
 
 function grant(
@@ -249,7 +165,4 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 
 function bytes32(seed: number): Uint8Array {
   return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff)
-}
-function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index])
 }

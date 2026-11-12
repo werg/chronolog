@@ -1,11 +1,9 @@
 import {
   capabilityId,
-  decodeRecoveryRecord,
   isCapabilityActive,
   type CapabilityGrant,
 } from '@chronolog/capabilities'
 import type { GovernanceControlPlane } from '@chronolog/node-core'
-import { equalBytes } from '@chronolog/protocol'
 import {
   ChronologRpcError,
   type GovernanceCapabilityStatus,
@@ -45,7 +43,6 @@ export function createGovernanceRpcAdmin(options: {
         rootAdminPublicKey: base64url(snapshot.rootAdminPublicKey),
         capabilityLogFeed: new TextDecoder().decode(snapshot.capabilityLogFeed),
         currentEpoch: options.governance.currentEpoch?.toString(10) ?? null,
-        historyReopened: snapshot.historyReopened,
         capabilities,
       }
     },
@@ -100,15 +97,6 @@ export function createGovernanceRpcAdmin(options: {
         options.rootPrivateKey,
       ))
       return { epochManifestsPublished: published }
-    },
-
-    async publishRecovery(request) {
-      let record
-      try { record = decodeRecoveryRecord(bytes(request.canonicalRecoveryRecord, 'canonicalRecoveryRecord')) }
-      catch (error) { throw invalid('canonicalRecoveryRecord is not a canonical recovery record', error) }
-      if (!equalBytes(record.payload.groupId, options.governance.snapshot.groupId)) throw invalid('Recovery record belongs to another group')
-      await operation(() => options.governance.publishRecovery(record))
-      return { published: true }
     },
   }
 }

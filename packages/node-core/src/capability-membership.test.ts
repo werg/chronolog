@@ -74,9 +74,6 @@ function snapshot(
     capabilityLogFeed: bytes(0x91),
     capabilities: new Map(all.map((item) => [bytesToHex(item.id), item])),
     policies: new Map([[bytesToHex(policyId), effective]]),
-    recoveryPublicKeys: [bytes(0xa0), bytes(0xa1), bytes(0xa2)],
-    recoveryThreshold: 2n,
-    historyReopened: false,
     ...overrides,
   }
 }

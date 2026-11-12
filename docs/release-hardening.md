@@ -69,8 +69,7 @@ pnpm release:metadata
 ```
 
 The distribution command requires a clean worktree and uses pnpm's isolated
-deployment to assemble the daemon, online CLI, custody tool, offline recovery
-CLI, TypeScript runtime, and native dependencies for the current OS and
+deployment to assemble the daemon, online CLI, snapshot tool, TypeScript runtime, and native dependencies for the current OS and
 architecture. It rejects escaping symlinks, records every regular file's hash
 and size, emits a relocatable tar archive, and includes `chronolog-verify` for
 post-extraction verification. Node.js 22 or later remains a host prerequisite.
@@ -93,13 +92,9 @@ GitHub OIDC build-provenance attestations over the archive and evidence.
 ## OS-backed key custody
 
 Linux pilot hosts can set `CHRONOLOG_SECRET_STORE=secret-service` to migrate
-daemon identity, epoch, recipient, and bootstrap-recovery private material out
-of JSON and into the host Secret Service. See the governance guide for host
-requirements, migration behavior, and the remaining requirement to separate
-recovery shares across custodians. The verified export/purge workflow and
-network-independent signer prove key/genesis matching and absence from the
-daemon store; release evidence must additionally record a real handoff to
-three independent custodians and a two-custodian drill.
+daemon identity, epoch, and recipient private material out of JSON and into
+the host Secret Service. See the governance guide for host requirements and
+migration behavior.
 
 ## Network and observability
 

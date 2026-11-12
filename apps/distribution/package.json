@@ -5,7 +5,6 @@
   "type": "module",
   "dependencies": {
     "chronolog-cli": "workspace:*",
-    "chronolog-recovery-cli": "workspace:*",
     "chronologd": "workspace:*",
     "tsx": "^4.20.3"
   }

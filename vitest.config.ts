@@ -10,7 +10,6 @@ export default defineConfig({
         // Process entry points: top-level argv/env wiring that runs on import, so it is
         // only exercisable as a subprocess (distribution upgrade drill, e2e, container chaos).
         'apps/*/src/main.ts',
-        'apps/chronologd/src/custody.ts',
         'apps/chronologd/src/snapshot.ts',
         'apps/chronologd/src/blob-gc.ts',
         'packages/chaos/src/cli.ts',

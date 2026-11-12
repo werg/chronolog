@@ -3,14 +3,10 @@ import {
   generateEd25519KeyPair,
 } from '@chronolog/protocol'
 import {
-  applyRecoveryRecord,
   capabilityId,
   canReaderAccessRevision,
-  combineRecoverySignatures,
-  decodeRecoveryRecord,
   decodeSignedCapabilityRevision,
   decodeSignedGenesis,
-  encodeRecoveryRecord,
   encodeSignedCapabilityRevision,
   encodeSignedGenesis,
   evaluateValidationPolicy,
@@ -18,8 +14,6 @@ import {
   reduceCapabilityLog,
   signCapabilityRevision,
   signGenesis,
-  signRecoveryPayload,
-  verifyRecoveryRecord,
   type CapabilityGrant,
   type GenesisManifest,
   type ValidationPolicy,
@@ -44,7 +38,6 @@ const policy: ValidationPolicy = {
 
 async function fixture() {
   const root = await generateEd25519KeyPair()
-  const recovery = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair(), generateEd25519KeyPair()])
   const writer: CapabilityGrant = {
     subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', validFromRevision: 0n,
   }
@@ -52,14 +45,12 @@ async function fixture() {
   const manifest: GenesisManifest = {
     groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes,
     capabilityLogFeed: bytes(3),
-    recoveryPublicKeys: [recovery[0].publicKeyBytes, recovery[1].publicKeyBytes, recovery[2].publicKeyBytes],
-    recoveryThreshold: 2n,
     initialCapabilities: [writer, initialValidator], validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 300_000n, heartbeatIntervalMs: 30_000n },
     resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 100n, maxMutations: 100n },
     encryptionSuite: 'DHKEM(X25519,HKDF-SHA256)/HKDF-SHA256/AES-256-GCM', createdAtMs: 10n,
   }
-  return { root, recovery, writer, initialValidator, signedGenesis: await signGenesis(manifest, root.privateKey) }
+  return { root, writer, initialValidator, signedGenesis: await signGenesis(manifest, root.privateKey) }
 }
 
 describe('capability chain', () => {
@@ -133,27 +124,5 @@ describe('reader history scopes', () => {
     expect(canReaderAccessRevision({ ...base, grant: { ...base.grant, readerScope: 'snapshot' } }, 4n)).toBe(false)
     expect(canReaderAccessRevision({ ...base, grant: { ...base.grant, readerScope: 'snapshot' } }, 5n)).toBe(true)
     expect(canReaderAccessRevision({ ...base, grant: { ...base.grant, readerScope: 'audit' } }, 0n)).toBe(true)
-  })
-})
-
-describe('offline recovery', () => {
-  it('requires any two distinct genesis recovery keys and surfaces reopening', async () => {
-    const f = await fixture()
-    const state = await reduceCapabilityLog(f.signedGenesis, [])
-    const newRoot = await generateEd25519KeyPair()
-    const payload = {
-      groupId: state.groupId, lastRevision: state.revision, lastRevisionDigest: state.revisionDigest,
-      newRevision: 1n, newRootPublicKey: newRoot.publicKeyBytes, newCapabilityLogFeed: bytes(9),
-      validatorGrants: [validator(30, 1n, 10n, 'R')], reopenHistory: true, reopeningReason: 'lost validator quorum',
-    } as const
-    const one = await signRecoveryPayload(payload, 0n, f.recovery[0].privateKey)
-    expect(await verifyRecoveryRecord(state, combineRecoverySignatures(payload, [one]))).toBe(false)
-    const two = await signRecoveryPayload(payload, 2n, f.recovery[2].privateKey)
-    const record = combineRecoverySignatures(payload, [two, one, one])
-    const roundTripped = decodeRecoveryRecord(encodeRecoveryRecord(record))
-    expect(await verifyRecoveryRecord(state, roundTripped)).toBe(true)
-    const recovered = await applyRecoveryRecord(state, roundTripped)
-    expect(recovered.historyReopened).toBe(true)
-    expect(recovered.rootAdminPublicKey).toEqual(newRoot.publicKeyBytes)
   })
 })

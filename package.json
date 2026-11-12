@@ -31,8 +31,6 @@
     "conformance:sqlite": "tsx packages/conformance/src/sqlite-differential.ts",
     "dev": "tsx apps/chronologd/src/main.ts",
     "cli": "tsx apps/chronolog/src/main.ts",
-    "custody": "tsx apps/chronologd/src/custody.ts",
-    "recovery": "tsx apps/chronolog-recovery/src/main.ts",
     "snapshot": "tsx apps/chronologd/src/snapshot.ts",
     "blob": "tsx apps/chronologd/src/blob-gc.ts",
     "demo": "tsx examples/end-to-end.ts",

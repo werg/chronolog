@@ -54,7 +54,7 @@ resolves.
 | Document | Status | Contents |
 | --- | --- | --- |
 | [pilot-runbook.md](pilot-runbook.md) | Operational | Install, onboard, capacity, backup, upgrade, recovery, mandatory drills. |
-| [governance.md](governance.md) | Operational | Replicated capabilities, epochs, custody, recovery ceremony. |
+| [governance.md](governance.md) | Operational | Replicated capabilities, epochs, key storage, failure handling. |
 | [snapshot-recovery.md](snapshot-recovery.md) | Operational | Signed snapshots, restore, feed-fork repair. |
 | [blob-replication.md](blob-replication.md) | Operational | Opt-in authenticated envelope blob fetch and retention. |
 | [release-hardening.md](release-hardening.md) | Operational | Fuzz, sanitizer, crash, soak, distribution, observability gates. |

@@ -193,12 +193,11 @@ validator capability classes and organization labels
 absolute validation threshold and optional class constraints
 clock and heartbeat policy
 encryption policy
-membership authority and recovery policy
+membership authority
 ```
 
 The v0.1 reference membership mechanism is an SSB-replicated root capability
-log. Genesis names the root administration key, the recovery keys, and the
-capability-log feed. Other membership providers may later emit the same
+log. Genesis names the root administration key and the capability-log feed. Other membership providers may later emit the same
 normalized capability records, but they are adapters rather than alternative
 v0.1 wire semantics.
 
@@ -281,26 +280,20 @@ expressive power needed by the first implementation. Later membership changes
 are prospective and do not invalidate attestations that were valid when
 published and still satisfy the transaction's pinned policy.
 
-### 6.3 Recovery
+### 6.3 Failure handling
 
-Genesis names three offline recovery keys, independent of active administrator,
-writer, and validator device keys. The v0.1 recovery threshold is two of those
-three keys. A recovery record carrying two valid recovery-key signatures
-installs a new root administration key, successor capability-log feed,
-membership revision, and validator capabilities while referencing the last
-recognized membership state.
+The protocol has no in-band emergency path: no recovery keys, recovery
+records, or history-reopening flag. The root administrator can rotate its own
+key and feed through an ordinary signed revision (`successorRootPublicKey`,
+`successorCapabilityLogFeed`) and can replace validators the same way.
 
-Any participant may relay a valid recovery record through SSB; its validity
-depends on the embedded recovery signatures rather than the relay's feed. It
-requires neither the active root key nor validator attestations, so recovery
-remains available when the ordinary administration or validation path is
-liveness-starved.
-
-Recovery keys need not be readers and should normally remain offline in
-separate custody. An explicit recovery may lower a timestamp floor, but doing
-so reopens history and must be visible to clients. Because recovery may occur
-during a partition, clients must display it as an authority-driven recovery
-event rather than silently treating it as an ordinary membership update.
+Failures the ordinary path cannot handle are resolved outside the protocol.
+These include a lost or compromised root key, a validator set that can no
+longer reach its policy, or a need to admit history below a closed timestamp
+floor. Participants either coordinate out of band or fork: they start a new
+group with its own genesis, seeded from an agreed snapshot of the old one.
+The old group's history stays as it was, and a fork is visible because it is a
+different group.
 
 ## 7. Transaction representation
 
@@ -872,7 +865,6 @@ pinned validation policy and membership revision
 policy-relative watermark timestamp
 validator heartbeat references forming the blocking set
 unresolved candidate or attestation references on those feeds
-recovery or history-reopening events relevant to the timestamp range
 ```
 
 An application applies its own policy to that evidence and may display labels
@@ -1007,8 +999,7 @@ work items and release gates are in
 ### Phase 1: Protocol model
 
 - Deterministic CBOR, SHA-256 domain-separated hashes, and Ed25519 signatures.
-- Root capability log, two-of-three recovery, and dynamic validator
-  capabilities.
+- Root capability log and dynamic validator capabilities.
 - Transaction candidate, attestation, policy, and admission-proof validation.
 - Signed author wall-clock timestamps, validator cutoffs, and deterministic
   tie-break ordering.
@@ -1082,10 +1073,7 @@ At minimum, automated tests must demonstrate:
   known unresolved references rather than collapsing them into a boolean.
 - Snapshot readers cannot obtain historical epoch keys without an explicit
   audit-reader grant.
-- One recovery signature cannot change membership, while any valid two of the
-  three genesis recovery keys can install a recovery revision.
-- Adding a validator cannot lower the admissible timestamp floor unless an
-  explicit recovery action authorizes history reopening.
+- Adding a validator cannot lower the admissible timestamp floor.
 - Revoked validator and writer feed sequences are rejected consistently.
 - Checkpoint replay produces the same database as replay from genesis.
 
@@ -1099,7 +1087,8 @@ The initial profile fixes the previously open protocol choices:
 - Author-attested wall-clock ordering with lagging monotonic validator cutoffs.
 - Envelope and resource validation by validators; deterministic SQL validation
   by reducers.
-- An SSB root capability log with two-of-three offline recovery.
+- An SSB root capability log; failures beyond it are handled by forking the
+  group or out of band.
 - HPKE-wrapped symmetric epoch keys.
 - Snapshot-reader and audit-reader history scopes.
 - Structured settlement evidence rather than a finality boolean.

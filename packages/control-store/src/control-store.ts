@@ -7,7 +7,6 @@ import type {
   ControlStoreDelta,
   ControlStorePersistence,
   ControlStoreSnapshot,
-  HistoryReopening,
   MaterializedHead,
   PutCandidateInput,
   SettlementEvidence,
@@ -48,7 +47,6 @@ export class ControlStore {
   readonly #orderedTxIds: Uint8Array[] = []
   readonly #deltas: ControlStoreDelta[] = []
   readonly #checkpoints = new Map<number, StoredCheckpoint>()
-  readonly #historyReopenings = new Map<string, HistoryReopening>()
   #materializedHead: MaterializedHead | null = null
 
   constructor(
@@ -429,10 +427,6 @@ export class ControlStore {
     const candidate = this.#requiredCandidate(txId)
     const watermark = this.watermark(policy, membershipRevision)
     const unresolved = this.#unresolvedAttestations()
-    const historyReopenings = [...this.#historyReopenings.values()]
-      .filter((event) => event.floorMs <= candidate.orderKey.authorTimestampMs)
-      .map((event) => event.id)
-      .sort()
     return {
       txId: copyBytes(txId),
       candidateState: candidate.state,
@@ -442,7 +436,6 @@ export class ControlStore {
       belowWatermark:
         watermark.cutoffMs !== null && candidate.orderKey.authorTimestampMs <= watermark.cutoffMs,
       unresolvedAttestationIds: unresolved.map((attestation) => copyBytes(attestation.attestationId)),
-      historyReopeningIds: historyReopenings,
     }
   }
 
@@ -499,20 +492,6 @@ export class ControlStore {
     return nearest === null ? null : clone(nearest)
   }
 
-  recordHistoryReopening(reopening: HistoryReopening): ControlStoreDelta | null {
-    const previous = this.#historyReopenings.get(reopening.id)
-    if (previous !== undefined) {
-      if (!sameValue(previous, reopening)) {
-        throw new ControlStoreConflictError('CONTROL_STORE_REOPENING_CONFLICT')
-      }
-      return null
-    }
-    this.#historyReopenings.set(reopening.id, clone(reopening))
-    const delta = this.#appendDelta({ kind: 'history_reopened', reopening })
-    this.#persist()
-    return clone(delta)
-  }
-
   changesSince(sequence: bigint): readonly ControlStoreDelta[] {
     if (sequence < this.#deltaFloor) {
       throw new ControlStoreConflictError('CONTROL_STORE_DELTA_HISTORY_RESET')
@@ -532,7 +511,6 @@ export class ControlStore {
       deltaFloor: this.#deltaFloor,
       materializedHead: this.materializedHead(),
       checkpoints: [...this.#checkpoints.values()].map(clone),
-      historyReopenings: [...this.#historyReopenings.values()].map(clone),
       validatorCutoffs: [...this.#validatorCutoffs.entries()].map(([key, acceptedAboveMs]) => ({
         validatorId: Uint8Array.from(Buffer.from(key, 'base64url')),
         acceptedAboveMs,
@@ -621,9 +599,6 @@ export class ControlStore {
     for (const checkpoint of snapshot.checkpoints) {
       this.#checkpoints.set(checkpoint.prefixLength, clone(checkpoint))
     }
-    for (const reopening of snapshot.historyReopenings) {
-      this.#historyReopenings.set(reopening.id, clone(reopening))
-    }
     this.#verifyRestoredOrder()
   }
 
@@ -694,7 +669,6 @@ export class ControlStore {
     this.#orderedTxIds.splice(0)
     this.#deltas.splice(0)
     this.#checkpoints.clear()
-    this.#historyReopenings.clear()
     this.#materializedHead = null
   }
 

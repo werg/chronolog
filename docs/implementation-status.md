@@ -98,13 +98,12 @@ protected-state access are prohibited rather than merely unimplemented.
 
 The generated daemon configuration bootstraps a signed single-participant
 genesis and persists its private governance material with mode `0600`. The
-daemon replays and follows capability, recovery, and epoch-manifest messages,
+daemon replays and follows capability and epoch-manifest messages,
 uses revisioned capability snapshots for authorization, and decrypts retained
 epochs through a live key ring. Snapshot readers receive only epochs published
 while authorized; audit readers may receive explicit historical rewraps.
-Threshold recovery replaces the root key and administration feed, revokes
-capabilities tied to the compromised root, and records any deliberate history
-reopening in settlement evidence.
+There is no in-protocol recovery: a lost root key or validator quorum is
+handled by forking the group or out of band.
 
 The first pilot deployment target is the native daemon. Its coordinator and
 publication adapter must match the direct native replay digest under
@@ -115,17 +114,13 @@ See [production execution](production-execution.md) for the decision and the
 criteria for reconsidering workerd.
 
 `CHRONOLOG_STATIC_MEMBERSHIP_FILE` is retained as an explicit legacy/testing
-override. Custody export/purge, self-verifying native distributions, and
-`chronolog doctor` have shipped. Remaining release-hardening work is an
-independent custodian ceremony, verification of the non-Linux and hardware key
-providers on real platforms, and prior-release upgrade evidence; the bootstrap
-recovery keys must not remain co-located for a real deployment.
+override. Self-verifying native distributions and `chronolog doctor` have
+shipped. Remaining release-hardening work is verification of the non-Linux and
+hardware key providers on real platforms, and prior-release upgrade evidence.
 
 Linux pilots may set `CHRONOLOG_SECRET_STORE=secret-service`; the daemon then
-atomically migrates inline identity, epoch, governance-recipient, and recovery
-private material into Secret Service references and fails closed on missing
-custody. This removes secrets from daemon JSON but does not turn three shares
-held by one OS account into an independent recovery quorum.
+atomically migrates inline identity, epoch, and governance-recipient private
+material into Secret Service references and fails closed on a missing secret.
 
 Feed author/sequence/previous conflicts are persisted and quarantine the node;
 quarantined nodes report degraded, refuse new publication, and expose bounded
@@ -142,7 +137,7 @@ external-vantage address/key reachability proof and degrades health without it.
 - validation of the configured Linux/macOS portable replay digest comparison,
   plus deterministic resource characterization on release hardware;
 - non-Linux/hardware-backed key providers and external security review; and
-- witnessed pilot evidence for custody/recovery, prior-version upgrade,
+- witnessed pilot evidence for prior-version upgrade,
   snapshot/fork repair, multi-host blobs, traversal, sizing, and alerting.
 
 The current internal authorizer/protocol assessment and unresolved release

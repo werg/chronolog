@@ -20,7 +20,6 @@ export const DRILL_KEY_FORMAT = 'chronolog-drill-key-v1'
 export const DRILL_RECORD_SUFFIX = '.drill.json'
 
 export const DRILL_KINDS = [
-  'custodian-handoff',
   'snapshot-repair',
   'multi-host-blob',
   'traversal',
@@ -55,24 +54,6 @@ export interface DrillSpec {
 const BASE_ENVIRONMENT = ['os', 'node'] as const
 
 export const DRILL_SPECS: Readonly<Record<DrillKind, DrillSpec>> = {
-  'custodian-handoff': {
-    kind: 'custodian-handoff',
-    title: 'Independent-custodian recovery handoff and two-person drill',
-    findings: ['SEC-001'],
-    references: ['docs/security-threat-review.md SEC-001', 'docs/governance.md', 'docs/pilot-runbook.md (custody drill)'],
-    roles: { operator: { min: 1 }, custodian: { min: 3, distinctGroups: true } },
-    environment: BASE_ENVIRONMENT,
-    details: [],
-    checks: [
-      'shares_exported_and_verified',
-      'shares_purged_from_daemon_store',
-      'payload_inspected_by_all_custodians',
-      'two_custodian_offline_signing',
-      'combine_and_verify_on_public_host',
-      'no_private_share_in_evidence',
-    ],
-    artifacts: ['recovery-payload', 'combined-recovery-verification'],
-  },
   'snapshot-repair': {
     kind: 'snapshot-repair',
     title: 'Packaged snapshot restore and synthetic fork repair drill',

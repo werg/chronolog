@@ -39,8 +39,8 @@ The principal boundaries are:
 | Row, representative, peer, or conflict nondeterminism | Structural row-choice proofs, canonical result ordering, bounded ordered mutation identities, replay corpus | Broader catalog-dependent proofs remain gated |
 | Partial candidate publication or crash | Private replay branch, independent reader verification, atomic head move, five-point `SIGKILL` matrix | Filesystem/hardware failure behavior still depends on the supported storage stack |
 | Replay result substitution | Protected result bytes and domain-separated digest verified on reopen | Stored-data format migration is intentionally absent in the prototype |
-| Capability or epoch rollback | Signed revision chain, exact previous digest, scoped readers, epoch chain, threshold recovery records, verified share export/purge, offline signing and threshold verification | A production quorum exists only after a recorded independent-custodian ceremony and drill |
-| Plaintext daemon private keys | Reference-only v2 config/governance documents and Linux Secret Service migration; opt-in macOS Keychain, Windows DPAPI, and command-hook providers (fail closed, stdin-only secrets, write read-back) | The macOS/Windows/command providers are implemented but UNVERIFIED on real macOS, Windows, or hardware tokens; reference names appear in argv, macOS/DPAPI items are readable by any process of the same user, the Linux provider inherits the full environment, and a command helper is fully trusted. Independent recovery custody remains open |
+| Capability or epoch rollback | Signed revision chain, exact previous digest, scoped readers, epoch chain | No in-protocol recovery: a lost or compromised root key is handled by forking the group or out of band |
+| Plaintext daemon private keys | Reference-only v2 config/governance documents and Linux Secret Service migration; opt-in macOS Keychain, Windows DPAPI, and command-hook providers (fail closed, stdin-only secrets, write read-back) | The macOS/Windows/command providers are implemented but UNVERIFIED on real macOS, Windows, or hardware tokens; reference names appear in argv, macOS/DPAPI items are readable by any process of the same user, the Linux provider inherits the full environment, and a command helper is fully trusted |
 | Blob substitution or truncation | Per-chunk and total domain-separated digests, bounded authenticated HTTPS retrieval, verified read-through retention, content-addressed stores, outer digest/decryption/inner signature checks | No distributed reachability-aware garbage collection; blob mode remains explicit opt-in |
 | Snapshot rollback or foreign-state import | Fixed archive paths and hashes, authorized signature, group/manifest/no-rollback checks, staged production-adapter DB/log verification, fsynced atomic replacement and retained backup | Pilot restore/repair drill and platform filesystem qualification remain required |
 | RPC credential disclosure or unauthenticated remote bind | Remote bind requires bearer token; timing-safe comparison; metrics/blob routes share authentication | Bearer tokens need deployment TLS/secret rotation outside this process |
@@ -48,11 +48,9 @@ The principal boundaries are:
 
 ## Findings and disposition
 
-- `SEC-001` — The daemon can now verify/export each genesis recovery share,
-  remove all online references after explicit confirmation, and run canonical
-  prepare/sign/combine/verify steps offline. Release blocker remains procedural:
-  three independent custodians must complete the handoff and a two-person drill
-  on the exact release candidate; a local test cannot establish human custody.
+- `SEC-001` — Withdrawn. The threshold recovery mechanism it concerned was
+  removed; root-key loss or compromise is handled by forking the group or out
+  of band.
 - `SEC-002` — Blob manifests now have authenticated bounded inter-node fetch,
   exact digest verification, and immutable local read-through retention.
   Automatic garbage collection remains prohibited until a distributed

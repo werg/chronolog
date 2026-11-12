@@ -118,7 +118,7 @@ try {
       break
     }
     case 'governance': {
-      const operation = requiredArg(args.shift(), 'governance <status|grant|revoke|rotate|history|recover> ...')
+      const operation = requiredArg(args.shift(), 'governance <status|grant|revoke|rotate|history> ...')
       const base = { groupId, requestId: randomUUID() }
       if (operation === 'status') output(await transport.unary('governance.getStatus', base))
       else if (operation === 'grant') {
@@ -134,9 +134,6 @@ try {
           ...base,
           subjectId: requiredArg(args.shift(), 'governance history SUBJECT_ID'),
         }))
-      } else if (operation === 'recover') {
-        const encoded = (await inlineOrFile(requiredArg(args.shift(), 'governance recover BASE64URL_OR_@FILE'))).trim()
-        output(await transport.unary('governance.publishRecovery', { ...base, canonicalRecoveryRecord: encoded }))
       } else throw new Error(`Unknown governance operation: ${operation}`)
       break
     }

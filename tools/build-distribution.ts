@@ -33,8 +33,6 @@ try {
   await Promise.all([
     launcher('chronologd', 'chronologd/src/main.ts'),
     launcher('chronolog', 'chronolog-cli/src/main.ts'),
-    launcher('chronolog-custody', 'chronologd/src/custody.ts'),
-    launcher('chronolog-recovery', 'chronolog-recovery-cli/src/main.ts'),
     launcher('chronolog-snapshot', 'chronologd/src/snapshot.ts'),
   ])
   await writeFile(join(staging, 'verify-distribution.mjs'), await readFile(join(root, 'tools', 'verify-distribution.mjs')), { mode: 0o755 })

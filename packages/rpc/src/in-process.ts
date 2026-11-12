@@ -44,7 +44,6 @@ const unaryDispatch: {
   'governance.revokeCapabilities': 'revokeCapabilities',
   'governance.rotateEpoch': 'rotateEpoch',
   'governance.grantHistoricalAccess': 'grantHistoricalAccess',
-  'governance.publishRecovery': 'publishRecovery',
 }
 
 const streamDispatch: {

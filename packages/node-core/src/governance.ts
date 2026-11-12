@@ -1,10 +1,7 @@
 import {
   applyCapabilityRevision,
-  applyRecoveryRecord,
   capabilityId,
-  decodeRecoveryRecord as decodeRecoveryRecordBytes,
   decodeSignedCapabilityRevision as decodeSignedCapabilityRevisionBytes,
-  encodeRecoveryRecord as encodeRecoveryRecordBytes,
   encodeSignedCapabilityRevision as encodeSignedCapabilityRevisionBytes,
   isCapabilityActive,
   reduceCapabilityLog,
@@ -12,7 +9,6 @@ import {
   type CapabilityGrant,
   type CapabilityRevision,
   type CapabilitySnapshot,
-  type RecoveryRecord,
   type SignedCapabilityRevision,
   type SignedGenesis,
   type ValidationPolicy,
@@ -47,15 +43,14 @@ import type { ChronologTransport, TransportRecord } from '@chronolog/transport-s
 import { Mutex, RevisionBroadcaster } from './async.js'
 import { EpochCipherRing } from './cipher.js'
 
-type GovernanceMessageType = Extract<EnvelopeMessageType, 'capability' | 'recovery' | 'epoch-manifest'>
+type GovernanceMessageType = Extract<EnvelopeMessageType, 'capability' | 'epoch-manifest'>
 
 export interface GovernanceEvent {
   readonly revision: bigint
-  readonly type: 'capability' | 'recovery' | 'epoch_rotated' | 'historical_access_granted'
+  readonly type: 'capability' | 'epoch_rotated' | 'historical_access_granted'
   readonly recordId: string
   readonly membershipRevision: Uint8Array
   readonly epoch?: bigint
-  readonly historyReopened: boolean
 }
 
 export interface GovernanceControlPlaneOptions {
@@ -69,11 +64,6 @@ export interface GovernanceControlPlaneOptions {
     readonly privateKey: CryptoKey
   }
   readonly now?: () => number
-  readonly onHistoryReopened?: (event: {
-    readonly id: string
-    readonly membershipRevision: Uint8Array
-    readonly reason: string
-  }) => void
 }
 
 export interface CapabilityChange {
@@ -167,10 +157,6 @@ export class GovernanceControlPlane {
     return this.publishCapabilityChange({ revocations: capabilityIds }, rootPrivateKey)
   }
 
-  async publishRecovery(record: RecoveryRecord): Promise<void> {
-    await this.#publish('recovery', encodeCanonicalCbor([1n, encodeRecoveryRecordBytes(record)]))
-  }
-
   async rotateEpoch(rootPrivateKey: CryptoKey, contentKey?: Uint8Array): Promise<SignedEpochManifest> {
     this.#assertCapabilityFeedOwner()
     const recipients = [...this.#snapshot.capabilities.values()]
@@ -230,7 +216,7 @@ export class GovernanceControlPlane {
     let decoded: { readonly type: GovernanceMessageType; readonly payload: Uint8Array }
     try { decoded = await decodeGovernanceEnvelope(record.payload, this.#options.groupRoute) }
     catch { return false }
-    if (decoded.type !== 'recovery' && record.author !== feedAuthor(this.#snapshot.capabilityLogFeed)) {
+    if (record.author !== feedAuthor(this.#snapshot.capabilityLogFeed)) {
       throw new Error('GOVERNANCE_CAPABILITY_FEED_UNAUTHORIZED')
     }
     const tagged = assertCanonicalCbor(decoded.payload)
@@ -242,19 +228,6 @@ export class GovernanceControlPlane {
       this.#snapshot = await applyCapabilityRevision(this.#snapshot, signed)
       this.#rememberSnapshot(this.#snapshot)
       this.#emit('capability', record.id)
-    } else if (decoded.type === 'recovery') {
-      const recovery = decodeRecoveryRecordBytes(tagged[1])
-      this.#snapshot = await applyRecoveryRecord(this.#snapshot, recovery)
-      this.#rememberSnapshot(this.#snapshot)
-      if (recovery.payload.reopenHistory) {
-        const id = bytesToHex(this.#snapshot.recoveryEventDigest!)
-        this.#options.onHistoryReopened?.({
-          id,
-          membershipRevision: this.#snapshot.revisionDigest,
-          reason: recovery.payload.reopeningReason!,
-        })
-      }
-      this.#emit('recovery', record.id)
     } else {
       const signed = decodeSignedEpochManifest(tagged[1])
       await this.#ingestEpoch(signed, tagged[0] === 2n, record.id)
@@ -343,7 +316,6 @@ export class GovernanceControlPlane {
       recordId,
       membershipRevision: this.#snapshot.revisionDigest.slice(),
       ...(epoch === undefined ? {} : { epoch }),
-      historyReopened: this.#snapshot.historyReopened,
     })
   }
 }
@@ -371,7 +343,7 @@ async function decodeGovernanceEnvelope(
 ): Promise<{ readonly type: GovernanceMessageType; readonly payload: Uint8Array }> {
   const envelope = decodeEnvelope(bytes)
   if (!equalBytes(envelope.groupRoute, groupRoute) || envelope.encryptionEpoch !== null || envelope.payload.type !== 'inline' ||
-      (envelope.messageType !== 'capability' && envelope.messageType !== 'recovery' && envelope.messageType !== 'epoch-manifest')) {
+      (envelope.messageType !== 'capability' && envelope.messageType !== 'epoch-manifest')) {
     throw new Error('GOVERNANCE_ENVELOPE_INVALID')
   }
   if (!equalBytes(await hashDomain(DOMAINS.envelope, envelope.payload.bytes), envelope.payloadDigest)) {
@@ -390,7 +362,6 @@ async function decodeGovernanceEnvelope(
 
 function domainFor(type: GovernanceMessageType): ProtocolDomain {
   if (type === 'capability') return DOMAINS.capabilityRevision
-  if (type === 'recovery') return DOMAINS.recovery
   return DOMAINS.epochManifest
 }
 

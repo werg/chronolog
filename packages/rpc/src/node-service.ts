@@ -51,8 +51,6 @@ import type {
   ObserveSqlResponse,
   PublishDraftRequest,
   PublishDraftResponse,
-  PublishRecoveryRequest,
-  PublishRecoveryResponse,
   RebaseDraftRequest,
   RebaseDraftResponse,
   RefreshedObservation,
@@ -228,11 +226,6 @@ export class NodeRpcService implements ChronologRpcService {
   async grantHistoricalAccess(request: GrantHistoricalAccessRequest, _context: RpcCallContext): Promise<GrantHistoricalAccessResponse> {
     this.#assertGroup(request.groupId)
     return this.#admin().grantHistoricalAccess(request)
-  }
-
-  async publishRecovery(request: PublishRecoveryRequest, _context: RpcCallContext): Promise<PublishRecoveryResponse> {
-    this.#assertGroup(request.groupId)
-    return this.#admin().publishRecovery(request)
   }
 
   async *streamStatus(request: StreamStatusRequest, context: RpcCallContext): AsyncIterable<NodeStatus> {
@@ -659,11 +652,6 @@ export class NodeRpcService implements ChronologRpcService {
     const core = this.#node.candidateCore(txId)
     if (candidate === null || core === null) throw new ChronologRpcError('not_found', 'Unknown transaction')
     const evidence = await this.#node.settlementEvidence(txId)
-    const reopenings = new Map(this.#node.controlStore.snapshot().historyReopenings.map((event) => [event.id, event]))
-    const historyReopeningEvents = (evidence?.historyReopeningIds ?? []).flatMap((id) => {
-      const event = reopenings.get(id)
-      return event === undefined ? [] : [{ eventId: event.id, type: 'recovery' as const, effectiveFromTimestamp: event.floorMs.toString(10), membershipRevision: toBase64Url(event.membershipRevision) }]
-    })
     return {
       transactionId: request.transactionId,
       outcome,
@@ -675,10 +663,7 @@ export class NodeRpcService implements ChronologRpcService {
       ...(evidence?.watermark.cutoffMs == null ? {} : { policyWatermarkTimestamp: evidence.watermark.cutoffMs.toString(10) }),
       blockingHeartbeats: (evidence?.watermark.heartbeatIds ?? []).map(toBase64Url),
       unresolvedReferences: (evidence?.unresolvedAttestationIds ?? []).map((reference) => ({ kind: 'attestation' as const, reference: toBase64Url(reference) })),
-      historyReopeningEvents,
-      confidence: historyReopeningEvents.length > 0
-        ? 'history_reopened'
-        : evidence?.belowWatermark === true ? 'policy_watermark_reached' : evidence === null ? 'insufficient' : 'provisional',
+      confidence: evidence?.belowWatermark === true ? 'policy_watermark_reached' : evidence === null ? 'insufficient' : 'provisional',
       calculatedAt: new Date(this.#now()).toISOString(),
     }
   }
