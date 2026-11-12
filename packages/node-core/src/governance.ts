@@ -105,6 +105,8 @@ export class GovernanceControlPlane {
   get snapshot(): CapabilitySnapshot { return structuredClone(this.#snapshot) }
   get cipherRing(): EpochCipherRing { return this.#cipherRing }
   get currentEpoch(): bigint | null { return this.#currentEpoch < 0n ? null : this.#currentEpoch }
+  /** Whether this node's transport feed is the current administration feed. */
+  get ownsCapabilityFeed(): boolean { return this.#options.transport.identity === feedAuthor(this.#snapshot.capabilityLogFeed) }
 
   snapshotForRevision(digest: Uint8Array): CapabilitySnapshot | null {
     const snapshot = this.#snapshots.get(bytesToHex(digest))

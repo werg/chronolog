@@ -87,6 +87,11 @@ export async function decodeSignedEnvelope(
     ? undefined
     : isCipherResolver(cipher) ? cipher.resolve(envelope.encryptionEpoch) : cipher
   if ((envelope.encryptionEpoch === null) !== (cipher === undefined)) throw wireError('WIRE_ENCRYPTION_REQUIRED')
+  // A key ring may receive the epoch later (a newly granted reader), so a
+  // missing epoch there is distinguishable from a fixed cipher's mismatch.
+  if (envelope.encryptionEpoch !== null && activeCipher === undefined && cipher !== undefined && isCipherResolver(cipher)) {
+    throw wireError(WIRE_ENCRYPTION_EPOCH_UNAVAILABLE)
+  }
   if (envelope.encryptionEpoch !== null && (activeCipher === undefined || !equalBytes(envelope.encryptionEpoch, activeCipher.epochId))) {
     throw wireError('WIRE_ENCRYPTION_EPOCH_UNKNOWN')
   }
@@ -132,6 +137,8 @@ function envelopeAssociatedData(
 ): Uint8Array {
   return encodeCanonicalCbor([1n, groupRoute, BigInt(WIRE_TYPES.indexOf(type)), epochId])
 }
+
+export const WIRE_ENCRYPTION_EPOCH_UNAVAILABLE = 'WIRE_ENCRYPTION_EPOCH_UNAVAILABLE'
 
 function wireError(code: string): Error {
   const error = new Error(code)

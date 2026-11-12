@@ -46,7 +46,7 @@ import type {
   PublishedTransaction,
   ReservedTransactionContext,
 } from './types.js'
-import { decodeSignedEnvelope, encodeSignedEnvelope } from './wire.js'
+import { WIRE_ENCRYPTION_EPOCH_UNAVAILABLE, decodeSignedEnvelope, encodeSignedEnvelope } from './wire.js'
 import { FeedForkRegistry } from './feed-forks.js'
 
 export class ChronologNode {
@@ -154,7 +154,12 @@ export class ChronologNode {
     })
     if (this.#options.validator?.heartbeatIntervalMs) {
       const interval = this.#options.validator.heartbeatIntervalMs
-      this.#heartbeatTimer = setInterval(() => { void this.publishHeartbeat().catch((error) => this.#recordError(error)) }, interval)
+      this.#heartbeatTimer = setInterval(() => {
+        // Governed membership can grant or revoke the validator role at any
+        // time; while this node holds none, there is nothing to publish.
+        if (this.#validatorCapability() === undefined) return
+        void this.publishHeartbeat().catch((error) => this.#recordError(error))
+      }, interval)
       this.#heartbeatTimer.unref?.()
     }
   }
@@ -799,6 +804,9 @@ export class ChronologNode {
     try {
       return await decodeSignedEnvelope(record.payload, this.#groupRoute(), this.#options.envelopeCipher, this.#options.blobPayloads?.store)
     } catch (error) {
+      // Not terminal: the epoch key may still arrive (for example, a node that
+      // just joined), and the retry loop or history replay will decode it then.
+      if (error instanceof Error && error.message === WIRE_ENCRYPTION_EPOCH_UNAVAILABLE) throw error
       throw new TerminalIngestError('INVALID_SIGNED_ENVELOPE', { cause: error })
     }
   }

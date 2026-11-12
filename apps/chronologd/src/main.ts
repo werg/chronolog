@@ -130,7 +130,7 @@ async function startRuntime() {
     let membershipRevision = configuredMembershipRevision
     let validationPolicy = configuredValidationPolicy
     let validatorCapability = configuredValidatorCapability
-    let envelopeCipher = createEpochEnvelopeCipher(fromBase64(config.epochContentKey), BigInt(config.epoch))
+    const envelopeCipher = createEpochEnvelopeCipher(fromBase64(config.epochContentKey), BigInt(config.epoch))
     let membershipState: (() => {
       readonly membershipRevision: Uint8Array
       readonly validationPolicy: Uint8Array
@@ -159,7 +159,9 @@ async function startRuntime() {
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
       })
       await governance.start()
-      if (governance.currentEpoch === null) {
+      // Only the administration-feed owner creates the first epoch; a node that
+      // joined an existing group waits for the epoch wrapped to its reader key.
+      if (governance.currentEpoch === null && governance.ownsCapabilityFeed) {
         await governance.rotateEpoch(identity.privateKey, fromBase64(config.epochContentKey))
       }
       membership = new CapabilityMembershipResolver({
@@ -182,7 +184,8 @@ async function startRuntime() {
       membershipRevision = initial.membershipRevision
       validatorCapability = initial.validatorCapability ?? configuredValidatorCapability
       membershipState = state
-      envelopeCipher = governance.cipherRing.current()
+      // The node reads the ring's current epoch lazily: a node that joined an
+      // existing group has no epoch until the administrator wraps one to it.
     }
     const localBlobStore = runtime.blobMaxInlineBytes === undefined
       ? undefined
