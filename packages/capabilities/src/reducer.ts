@@ -120,8 +120,10 @@ export async function applyCapabilityRevision(
     for (const grant of revision.grants) {
       protocolInvariant(grant.validFromRevision === revision.revision, 'SCHEMA_INVALID', 'New capability must begin at its containing revision')
       if (grant.role === 'validator') {
+        // Validators revoked by this same revision were still authorized before it and keep their floor.
         const currentFloor = [...capabilities.values()]
-          .filter((entry) => entry.grant.role === 'validator' && entry.revokedAtRevision === undefined)
+          .filter((entry) => entry.grant.role === 'validator'
+            && (entry.revokedAtRevision === undefined || entry.revokedAtRevision === revision.revision))
           .reduce((maximum, entry) => {
             const floor = entry.grant.minimumAuthorTimestampMs ?? 0n
             return floor > maximum ? floor : maximum

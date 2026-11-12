@@ -180,16 +180,24 @@ export class HttpRpcServer {
     const abortClosedResponse = () => {
       if (!response.writableFinished) abortPeer()
     }
+    // Capture the socket: IncomingMessage drops its socket reference once the
+    // request is destroyed (for example after an oversized body), and cleanup
+    // must still be able to detach the listener.
+    const socket = request.socket
     request.once('aborted', abortPeer)
     response.once('close', abortClosedResponse)
-    request.socket.once('close', abortPeer)
+    socket.once('close', abortPeer)
     this.#calls.add(controller)
+    // Abandoning an oversized body destroys the request, which emits 'aborted'
+    // although the peer is still waiting; body-phase errors must still be reported.
+    let readingBody = true
     try {
       const requestValue = decodeJson(await readBody(request, this.#options.maxBodyBytes ?? 4 * 1024 * 1024))
+      readingBody = false
       const context: RpcCallContext = {
         method: method as UnaryRpcMethod,
         signal: controller.signal,
-        ...(request.socket.remoteAddress === undefined ? {} : { peer: request.socket.remoteAddress }),
+        ...(socket.remoteAddress === undefined ? {} : { peer: socket.remoteAddress }),
         ...(request.headers.authorization === undefined ? {} : { token: request.headers.authorization.replace(/^Bearer\s+/iu, '') }),
       }
       if (mode === 'unary') {
@@ -217,7 +225,7 @@ export class HttpRpcServer {
       }
       if (!response.writableEnded && !response.destroyed) response.end()
     } catch (error) {
-      if (!response.headersSent && !controller.signal.aborted) throw error
+      if (!response.headersSent && (readingBody || !controller.signal.aborted)) throw error
       if (!controller.signal.aborted && !response.writableEnded && !response.destroyed) {
         response.end(`${encodeJson(errorPayload(error))}\n`)
       }
@@ -225,7 +233,7 @@ export class HttpRpcServer {
       this.#calls.delete(controller)
       request.removeListener('aborted', abortPeer)
       response.removeListener('close', abortClosedResponse)
-      request.socket.removeListener('close', abortPeer)
+      socket.removeListener('close', abortPeer)
     }
   }
 

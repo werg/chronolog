@@ -1,6 +1,5 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { mkdirSync } from 'node:fs'
 
 import type { TransportRecord } from '@chronolog/transport-ssb'
 
@@ -26,9 +25,22 @@ export interface FeedForkSnapshot {
   readonly discardedRecordIds: readonly string[]
 }
 
+export interface FeedContinuityEntry {
+  readonly feedId: string
+  readonly sequence: string
+  readonly id: string
+  readonly previous: string | null
+}
+
 export interface FeedForkPersistence {
   load(): FeedForkSnapshot | null
   save(snapshot: FeedForkSnapshot): void
+  /**
+   * Durably records one newly accepted record without rewriting the whole
+   * snapshot. Optional; registries fall back to save() when absent.
+   * Returns true when the caller should compact by calling save().
+   */
+  append?(entry: FeedContinuityEntry): boolean
 }
 
 export interface FeedRepairPlan {
@@ -45,6 +57,7 @@ export class FeedForkRegistry {
   constructor(private readonly persistence?: FeedForkPersistence) {
     const snapshot = persistence?.load()
     if (snapshot !== null && snapshot !== undefined) this.#restore(snapshot)
+    if (persistence?.append !== undefined && snapshot !== null && snapshot !== undefined) this.#save()
   }
 
   observe(record: TransportRecord): 'accepted' | 'duplicate' | 'discarded' | 'quarantined' {
@@ -72,7 +85,8 @@ export class FeedForkRegistry {
       return 'quarantined'
     }
     feed.set(record.sequence, { id: record.id, previous })
-    this.#save()
+    if (this.persistence?.append === undefined) this.#save()
+    else if (this.persistence.append({ feedId: record.author, sequence: record.sequence.toString(), id: record.id, previous })) this.#save()
     return 'accepted'
   }
 
@@ -172,20 +186,98 @@ export class FeedForkRegistry {
   }
 }
 
+/**
+ * Snapshot plus append-only journal. Accepted records are appended as one
+ * JSON line each and fsynced, so per-record cost no longer grows with history.
+ * save() writes a full snapshot atomically and truncates the journal; load()
+ * replays the journal over the snapshot. A torn final line (crash during an
+ * append) is ignored, since its record is re-observed from the transport; any
+ * other malformed line fails closed.
+ */
 export class JsonFeedForkPersistence implements FeedForkPersistence {
-  constructor(private readonly path: string) {}
-  load(): FeedForkSnapshot | null {
-    if (!existsSync(this.path)) return null
-    return JSON.parse(readFileSync(this.path, 'utf8')) as FeedForkSnapshot
+  readonly #journalPath: string
+  #journalEntries = 0
+
+  constructor(private readonly path: string, private readonly compactAfterEntries = 1_024) {
+    this.#journalPath = `${path}.journal`
   }
+
+  load(): FeedForkSnapshot | null {
+    const base = existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) as FeedForkSnapshot : null
+    const entries = this.#readJournal()
+    this.#journalEntries = entries.length
+    if (entries.length === 0) return base
+    const snapshot: FeedForkSnapshot = base ?? { format: 'chronolog-feed-continuity-v1', feeds: [], quarantines: [], discardedRecordIds: [] }
+    const feeds = new Map(snapshot.feeds.map((feed) => [
+      feed.feedId,
+      new Map(feed.records.map((record) => [record.sequence, record])),
+    ]))
+    for (const entry of entries) {
+      const records = feeds.get(entry.feedId) ?? new Map<string, FeedForkSnapshot['feeds'][number]['records'][number]>()
+      const existing = records.get(entry.sequence)
+      // A crash after the snapshot rename but before the journal is removed
+      // leaves entries that the snapshot already contains.
+      if (existing !== undefined) {
+        if (existing.id !== entry.id || existing.previous !== entry.previous) throw new Error('FEED_FORK_JOURNAL_CONFLICT')
+        continue
+      }
+      records.set(entry.sequence, { sequence: entry.sequence, id: entry.id, previous: entry.previous })
+      feeds.set(entry.feedId, records)
+    }
+    return { ...snapshot, feeds: [...feeds.entries()].map(([feedId, records]) => ({ feedId, records: [...records.values()] })) }
+  }
+
   save(snapshot: FeedForkSnapshot): void {
     mkdirSync(dirname(this.path), { recursive: true })
     const temporary = `${this.path}.tmp`
-    writeFileSync(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+    writeFileSync(temporary, `${JSON.stringify(snapshot)}\n`, { encoding: 'utf8', mode: 0o600 })
     const file = openSync(temporary, 'r')
     try { fsyncSync(file) } finally { closeSync(file) }
     renameSync(temporary, this.path)
+    syncDirectory(dirname(this.path))
+    // The snapshot now contains every journaled entry.
+    rmSync(this.#journalPath, { force: true })
+    this.#journalEntries = 0
   }
+
+  append(entry: FeedContinuityEntry): boolean {
+    mkdirSync(dirname(this.path), { recursive: true })
+    const created = !existsSync(this.#journalPath)
+    const file = openSync(this.#journalPath, 'a', 0o600)
+    try {
+      writeSync(file, `${JSON.stringify(entry)}\n`)
+      fsyncSync(file)
+    } finally { closeSync(file) }
+    if (created) syncDirectory(dirname(this.path))
+    this.#journalEntries += 1
+    return this.#journalEntries >= this.compactAfterEntries
+  }
+
+  #readJournal(): FeedContinuityEntry[] {
+    if (!existsSync(this.#journalPath)) return []
+    const lines = readFileSync(this.#journalPath, 'utf8').split('\n')
+    // The element after the last newline is either '' or a torn append.
+    return lines.slice(0, -1).map((line) => {
+      let value: unknown
+      try { value = JSON.parse(line) } catch { throw new Error('FEED_FORK_JOURNAL_INVALID') }
+      if (!isJournalEntry(value)) throw new Error('FEED_FORK_JOURNAL_INVALID')
+      return value
+    })
+  }
+}
+
+function isJournalEntry(value: unknown): value is FeedContinuityEntry {
+  if (typeof value !== 'object' || value === null) return false
+  const entry = value as Record<string, unknown>
+  return typeof entry.feedId === 'string' && entry.feedId.length > 0 &&
+    typeof entry.sequence === 'string' && /^[1-9][0-9]*$/u.test(entry.sequence) &&
+    typeof entry.id === 'string' && entry.id.length > 0 &&
+    (entry.previous === null || typeof entry.previous === 'string')
+}
+
+function syncDirectory(path: string): void {
+  const descriptor = openSync(path, 'r')
+  try { fsyncSync(descriptor) } finally { closeSync(descriptor) }
 }
 
 function validateRecord(record: TransportRecord): void {

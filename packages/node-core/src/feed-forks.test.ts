@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -38,6 +38,66 @@ describe('feed fork quarantine and repair', () => {
     expect(registry.quarantined()).toBe(false)
     expect(registry.observe(record(2n, 'left', 'first'))).toBe('discarded')
     expect(registry.observe(record(3n, 'third', 'right'))).toBe('accepted')
+  })
+})
+
+describe('feed continuity journal', () => {
+  function temporaryPath(): string {
+    const directory = mkdtempSync(join(tmpdir(), 'chronolog-feed-journal-'))
+    directories.push(directory)
+    return join(directory, 'continuity.json')
+  }
+
+  it('appends accepted records instead of rewriting the snapshot', () => {
+    const path = temporaryPath()
+    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
+    registry.observe(record(1n, 'first'))
+    const snapshotSize = existsSync(path) ? statSync(path).size : 0
+    for (let sequence = 2n; sequence <= 20n; sequence += 1n) {
+      registry.observe(record(sequence, `id-${sequence}`, sequence === 2n ? 'first' : `id-${sequence - 1n}`))
+    }
+    expect(existsSync(path) ? statSync(path).size : 0).toBe(snapshotSize)
+    expect(readFileSync(`${path}.journal`, 'utf8').trim().split('\n')).toHaveLength(20)
+    const reopened = new FeedForkRegistry(new JsonFeedForkPersistence(path))
+    expect(reopened.snapshot()).toEqual(registry.snapshot())
+    // Reopening compacts the journal into the snapshot.
+    expect(existsSync(`${path}.journal`)).toBe(false)
+    expect(reopened.observe(record(2n, 'fork', 'first'))).toBe('quarantined')
+  })
+
+  it('compacts after the configured number of entries', () => {
+    const path = temporaryPath()
+    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path, 3))
+    registry.observe(record(1n, 'a'))
+    registry.observe(record(2n, 'b', 'a'))
+    expect(existsSync(`${path}.journal`)).toBe(true)
+    registry.observe(record(3n, 'c', 'b'))
+    expect(existsSync(`${path}.journal`)).toBe(false)
+    expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).snapshot()).toEqual(registry.snapshot())
+  })
+
+  it('ignores a torn final append and tolerates entries already compacted', () => {
+    const path = temporaryPath()
+    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
+    registry.observe(record(1n, 'a'))
+    registry.observe(record(2n, 'b', 'a'))
+    const journal = readFileSync(`${path}.journal`, 'utf8')
+    // Crash after compaction renamed the snapshot but before the journal was removed.
+    new JsonFeedForkPersistence(path).save(registry.snapshot())
+    writeFileSync(`${path}.journal`, journal)
+    appendFileSync(`${path}.journal`, '{"feedId":"@writer.ed25519","seq')
+    expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).snapshot()).toEqual(registry.snapshot())
+  })
+
+  it('fails closed on a corrupt or conflicting journal entry', () => {
+    const path = temporaryPath()
+    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
+    registry.observe(record(1n, 'a'))
+    new JsonFeedForkPersistence(path).save(registry.snapshot())
+    writeFileSync(`${path}.journal`, 'not json\n')
+    expect(() => new FeedForkRegistry(new JsonFeedForkPersistence(path))).toThrow('FEED_FORK_JOURNAL_INVALID')
+    writeFileSync(`${path}.journal`, `${JSON.stringify({ feedId: '@writer.ed25519', sequence: '1', id: 'other', previous: null })}\n`)
+    expect(() => new FeedForkRegistry(new JsonFeedForkPersistence(path))).toThrow('FEED_FORK_JOURNAL_CONFLICT')
   })
 })
 

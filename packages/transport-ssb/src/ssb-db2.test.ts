@@ -34,6 +34,10 @@ describe('SsbDb2Transport', () => {
         maximumSequence: '1',
         hasGaps: false,
       })
+      expect(await transport.feedContiguousThrough(transport.identity)).toBe(1n)
+      await transport.publish(new Uint8Array([3]))
+      expect(await transport.feedContiguousThrough(transport.identity)).toBe(2n)
+      expect(await transport.feedContiguousThrough('@unknown.ed25519')).toBe(0n)
       await transport.close()
       transport = await SsbDb2Transport.open({ path: dbPath })
       expect((await transport.get(record.id))?.payload).toEqual(payload)

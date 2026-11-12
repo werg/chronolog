@@ -51,4 +51,7 @@ EXPOSE 8787 8008
 HEALTHCHECK --interval=1s --timeout=2s --start-period=20s --retries=30 \
   CMD node -e "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-CMD ["pnpm", "tsx", "apps/chronologd/src/main.ts"]
+# Run node directly as PID 1 so SIGTERM reaches the daemon. pnpm and the tsx
+# CLI are signal-forwarding wrappers; pnpm crashed with "kill EACCES" while
+# forwarding, so graceful shutdown waited for Docker's SIGKILL.
+CMD ["node", "--import", "tsx", "apps/chronologd/src/main.ts"]

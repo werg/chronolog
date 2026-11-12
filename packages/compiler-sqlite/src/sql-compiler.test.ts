@@ -71,21 +71,68 @@ describe('deterministic SQL compiler', () => {
       'SELECT typeof(value) FROM accounts UNION SELECT typeof(value) FROM archived_accounts',
       'SELECT rank() OVER (ORDER BY value), value FROM accounts',
       'SELECT dense_rank() OVER (ORDER BY value), value FROM accounts',
-      'SELECT group_concat(value ORDER BY value) FROM accounts',
+      'SELECT group_concat(value ORDER BY value COLLATE BINARY, typeof(value)) FROM accounts',
+      "SELECT group_concat(CAST(value AS TEXT), ',' ORDER BY CAST(value AS TEXT) COLLATE BINARY) FROM accounts",
+      'SELECT group_concat(typeof(value) ORDER BY typeof(value)) FROM accounts',
+      'SELECT CAST(value AS INTEGER), count(*) FROM accounts GROUP BY CAST(value AS INTEGER)',
+      'SELECT CAST(value AS TEXT) COLLATE BINARY, count(*) FROM accounts GROUP BY CAST(value AS TEXT) COLLATE BINARY',
+      'SELECT DISTINCT CAST(value AS BLOB) FROM accounts',
     ]
     expect(statements.map((sql) => compileSqlStatement({ sql, bindings: [] }, 'body').statementClass)).toEqual(
       Array.from({ length: statements.length }, () => 'read'),
     )
   })
 
-  it('adds binary result-column ties after authored outer ordering', () => {
+  it('adds binary and storage-class result-column ties after authored outer ordering', () => {
     const compiled = compileSqlStatement({
       sql: 'SELECT id, name FROM accounts ORDER BY name COLLATE NOCASE DESC NULLS LAST LIMIT 5',
       bindings: [],
     }, 'precondition')
-    expect(completeOrderedResultSql(compiled, 2)).toBe(
-      'SELECT id, name FROM accounts ORDER BY name COLLATE NOCASE DESC NULLS LAST, 1 COLLATE BINARY, 2 COLLATE BINARY LIMIT 5',
+    expect(completeOrderedResultSql(compiled, ['id', 'name'])).toEqual({
+      sql: 'SELECT id, name FROM accounts ORDER BY name COLLATE NOCASE DESC NULLS LAST, 1 COLLATE BINARY, typeof(id), 2 COLLATE BINARY, typeof(name) LIMIT 5',
+      visibleColumnCount: 2,
+    })
+  })
+
+  it('re-addresses star columns and renumbers anonymous parameters in tie keys', () => {
+    const star = compileSqlStatement({ sql: 'SELECT *, ? + 1 AS next FROM accounts AS a ORDER BY id', bindings: [
+      { parameter: { kind: 'index', index: 1 }, value: { kind: 'int64', value: 1n } },
+    ] }, 'precondition')
+    expect(completeOrderedResultSql(star, ['id', 'value', 'next']).sql).toBe(
+      'SELECT *, ? + 1 AS next FROM accounts AS a ORDER BY id, 1 COLLATE BINARY, typeof("a"."id"), ' +
+      '2 COLLATE BINARY, typeof("a"."value"), 3 COLLATE BINARY, typeof(?1 + 1)',
     )
+    const qualified = compileSqlStatement({
+      sql: 'SELECT b.* FROM accounts AS a JOIN archived_accounts AS b ON a.id = b.id ORDER BY a.id', bindings: [],
+    }, 'precondition')
+    expect(completeOrderedResultSql(qualified, ['id']).sql).toBe(
+      'SELECT b.* FROM accounts AS a JOIN archived_accounts AS b ON a.id = b.id ORDER BY a.id, 1 COLLATE BINARY, typeof("b"."id")',
+    )
+    expect(() => completeOrderedResultSql(star, ['id', 'ID', 'next'])).toThrowError(
+      expect.objectContaining({ code: 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED' }),
+    )
+  })
+
+  it('projects hidden storage-class ties through every UNION ALL arm', () => {
+    const compiled = compileSqlStatement({
+      sql: 'SELECT id AS key FROM accounts UNION ALL VALUES (1.0) UNION ALL SELECT value FROM archived_accounts ORDER BY key DESC',
+      bindings: [],
+    }, 'precondition')
+    expect(completeOrderedResultSql(compiled, ['key'])).toEqual({
+      sql: 'SELECT id AS key, typeof(id) FROM accounts UNION ALL VALUES (1.0, typeof(1.0)) ' +
+        'UNION ALL SELECT value, typeof(value) FROM archived_accounts ORDER BY key DESC, 1 COLLATE BINARY, 2',
+      visibleColumnCount: 1,
+    })
+  })
+
+  it('keeps binary-only completion where ties are already identical or authored', () => {
+    for (const sql of [
+      'SELECT 1 UNION ALL SELECT 1.0 ORDER BY 1',
+      'SELECT typeof(value) FROM accounts UNION SELECT typeof(value) FROM archived_accounts ORDER BY 1',
+    ]) {
+      expect(completeOrderedResultSql(compileSqlStatement({ sql, bindings: [] }, 'precondition'), ['c']).sql)
+        .toBe(`${sql}, 1 COLLATE BINARY`)
+    }
   })
 
   it('lowers ordered mutation syntax into private frozen-rowid operations', () => {
@@ -152,6 +199,18 @@ describe('deterministic SQL compiler', () => {
     ['SELECT value FROM accounts UNION SELECT value FROM archived_accounts', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
     ['SELECT row_number() OVER (ORDER BY value), value FROM accounts', 'SQL_WINDOW_TEMPORARILY_GATED'],
     ['SELECT group_concat(value ORDER BY id) FROM accounts', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    ['SELECT group_concat(value ORDER BY value) FROM accounts', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    ['SELECT group_concat(value ORDER BY value COLLATE BINARY) FROM accounts', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    ['SELECT group_concat(CAST(value AS TEXT) ORDER BY CAST(value AS TEXT)) FROM accounts', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    ['SELECT group_concat(typeof(value), id ORDER BY typeof(value)) FROM accounts', 'SQL_FUNCTION_TEMPORARILY_GATED'],
+    ['SELECT value, count(*) FROM accounts GROUP BY value', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT CAST(value AS TEXT), count(*) FROM accounts GROUP BY CAST(value AS TEXT)', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT CAST(value AS REAL), count(*) FROM accounts GROUP BY CAST(value AS REAL)', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT * FROM accounts JOIN archived_accounts USING (id) ORDER BY id', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    ['SELECT a.*, b.* FROM accounts AS a, archived_accounts AS b ORDER BY a.id', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    ['SELECT * FROM (SELECT id FROM accounts) ORDER BY id', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
+    ['SELECT id FROM accounts UNION SELECT id FROM archived_accounts ORDER BY id', 'SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED'],
+    ['SELECT typeof(id) FROM accounts UNION ALL SELECT * FROM archived_accounts ORDER BY 1', 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'],
     ['SELECT value COLLATE application_custom FROM accounts', 'SQL_COLLATION_NOT_REGISTERED'],
     ['CREATE TABLE custom_collation (value TEXT COLLATE application_custom)', 'SQL_COLLATION_NOT_REGISTERED'],
     ['CREATE VIRTUAL TABLE search_docs USING fts5(body)', 'SQL_VIRTUAL_TABLE_TEMPORARILY_GATED'],

@@ -177,6 +177,14 @@ export class MemoryTransport implements ChronologTransport {
     }
   }
 
+  async feedContiguousThrough(feedId: string): Promise<bigint> {
+    const sequences = new Set<bigint>()
+    for (const record of this.#records.values()) if (record.author === feedId) sequences.add(record.sequence)
+    let contiguousThrough = 0n
+    while (sequences.has(contiguousThrough + 1n)) contiguousThrough += 1n
+    return contiguousThrough
+  }
+
   async status(): Promise<TransportStatus> {
     const feeds = new Map<string, bigint[]>()
     for (const record of this.#records.values()) {

@@ -54,5 +54,14 @@ describe('MemoryTransportNetwork', () => {
         hasGaps: true,
       }],
     })
+    expect(await node.feedContiguousThrough('@remote.ed25519')).toBe(0n)
+    node.receive({
+      id: '%first.sha256',
+      author: '@remote.ed25519',
+      sequence: 1n,
+      receivedAtMs: 2,
+      payload: Uint8Array.of(8),
+    })
+    expect(await node.feedContiguousThrough('@remote.ed25519')).toBe(2n)
   })
 })

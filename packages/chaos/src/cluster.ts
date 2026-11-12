@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process'
 import { resolve } from 'node:path'
 
 import { ChronologClient } from '@chronolog/client'
@@ -437,10 +438,30 @@ export class ChaosCluster {
   }
 }
 
+// testcontainers' builder resolves when the build stream ends even if the
+// stream reported a build error, and then only checks that the tag exists, so
+// a failed build silently reused the previous image. Use the Docker CLI and
+// trust its exit status instead.
 export async function buildChaosImage(rootDirectory: string, image: string): Promise<void> {
-  await GenericContainer.fromDockerfile(resolve(rootDirectory), 'chaos/Dockerfile')
-    .withBuildkit()
-    .build(image, { deleteOnExit: false })
+  const output: string[] = []
+  const status = await new Promise<number | null>((resolveStatus, reject) => {
+    const child = spawn('docker', ['build', '--file', 'chaos/Dockerfile', '--tag', image, '.'], {
+      cwd: resolve(rootDirectory),
+      env: { ...process.env, DOCKER_BUILDKIT: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const keep = (chunk: Buffer) => {
+      output.push(chunk.toString('utf8'))
+      if (output.length > 200) output.splice(0, output.length - 200)
+    }
+    child.stdout.on('data', keep)
+    child.stderr.on('data', keep)
+    child.once('error', reject)
+    child.once('close', resolveStatus)
+  })
+  if (status !== 0) {
+    throw new Error(`CHAOS_IMAGE_BUILD_FAILED:${status}\n${output.join('').split('\n').slice(-40).join('\n')}`)
+  }
 }
 
 function splitLink(link: LinkName): readonly [NodeName, NodeName] {

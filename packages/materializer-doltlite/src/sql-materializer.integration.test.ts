@@ -166,7 +166,7 @@ describe('SQL-first DoltLite materialization', () => {
         statement('SELECT typeof(value) AS storage_type FROM aggregate_values UNION SELECT typeof(value) FROM aggregate_values'),
         statement('SELECT rank() OVER (ORDER BY typeof(value)) AS peer_rank, typeof(value) AS storage_type FROM aggregate_values'),
         statement('SELECT dense_rank() OVER (ORDER BY typeof(value)) AS peer_rank, typeof(value) AS storage_type FROM aggregate_values'),
-        statement('SELECT group_concat(CAST(value AS TEXT) ORDER BY CAST(value AS TEXT)) AS joined FROM aggregate_values'),
+        statement('SELECT group_concat(CAST(value AS TEXT) ORDER BY CAST(value AS TEXT) COLLATE BINARY) AS joined FROM aggregate_values'),
       ],
     }, materializer.executionManifestDigest)
     await materializer.materialize([aggregate])

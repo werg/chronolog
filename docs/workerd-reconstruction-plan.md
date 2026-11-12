@@ -167,6 +167,49 @@ M0, then M1. Concretely:
 Exit criteria: identical hashes and no memory fault, or a precise defect list
 to carry into M2.
 
+### Option D: celld (assessed 2026-11-12)
+
+[celld](https://github.com/denoland/celld) (Apache-2.0, beta v0.6.3 per its
+`docs/limitations.md`, commit `8702f6d`) runs Cloudflare Workers and Durable
+Objects on self-hosted machines. Facts below are **verified-read** from its
+repository.
+
+- It is not a workerd fork: a Rust daemon embedding V8 directly (`v8 = "152.1"`)
+  with SQLite through `rusqlite` 0.31 (`bundled` feature) and a static
+  `sqlite-vec` 0.1.9.
+- Durability comes from capturing SQLite WAL pages into LTX files (the
+  Litestream format) and uploading them to an S3/GCS/Azure bucket. Exactly one
+  node owns a cell at a time, enforced by conditional writes to the bucket
+  (fencing); followers in the same fleet hold the write before it is
+  acknowledged.
+- Its trust model is one operator: the bucket and a fleet HMAC control the
+  fleet, and peer traffic is plaintext HTTP.
+
+Fit with Chronolog:
+
+- **Replication conflicts.** Chronolog's source of truth is the signed SSB
+  event set replicated between mutually distrusting members; celld's is a
+  single owner's SQLite pages in a shared bucket. celld would add a second,
+  centrally trusted replication layer that Chronolog cannot use.
+- **Storage does not fit.** DoltLite replaces the B-tree with a prolly-tree
+  chunk store behind the VFS, so page-level WAL/LTX capture cannot represent
+  it. Running DoltLite would mean forking celld to link a different
+  `libsqlite3-sys` and bypass LTX, keeping little of what celld provides.
+- **No determinism contract.** `Date.now()` and `performance.now()` are live
+  clocks (see its `cloudflare-compat.md`); nothing pins time, randomness or
+  locale for a reducer, which the "Reconsidering workerd" gates require.
+- **What is better than workerd:** it is a Cargo build (Rust 1.93 is
+  installed here) instead of Bazel plus clang 22, and it already bundles
+  sqlite-vec. If a fork is ever needed (option A), a celld fork is cheaper to
+  build than a workerd fork.
+
+Recommendation: do not switch. celld solves a different problem
+(single-operator Durable Objects with object-storage durability). It does not
+help the native daemon, which remains the production path, and it fits the
+experimental reducer runtime no better than option B. Reconsider only as an
+**application host** that calls `chronologd` over HTTP (equivalent to option
+C) if self-hosted Workers become a product requirement.
+
 ## 7. Honest unknowns
 
 - Upstream workerd SQLite/JSG source layout and swap-ability (not read).

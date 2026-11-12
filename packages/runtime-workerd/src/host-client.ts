@@ -123,12 +123,34 @@ export interface ChronologWorkerdBundleExecutionResponse {
   readonly transportOutputs: readonly WorkerdDatabaseReducerRunDatabase[]
 }
 
-const DEFAULT_COMMIT: DatabaseReducerCommitOptions = Object.freeze({
+// DoltLite stores `explicitTimestamp ? explicitTimestamp : time(0)`, so a
+// commit date that parses to the Unix epoch (1970-01-01T00:00:00) is treated
+// as unset and replaced by wall-clock time, which makes commit hashes
+// irreproducible. Dates are parsed with strptime + timegm (UTC, independent of
+// TZ). Use a fixed non-zero instant and reject dates DoltLite would discard.
+export const DEFAULT_REDUCER_COMMIT: DatabaseReducerCommitOptions = Object.freeze({
   message: 'Chronolog materialization',
   authorName: 'Chronolog reducer',
   authorEmail: 'reducer@chronolog.invalid',
-  timestamp: '1970-01-01T00:00:00',
+  timestamp: '2000-01-01T00:00:00',
 })
+
+const COMMIT_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})$/
+
+export function resolveReducerCommitOptions(commit?: DatabaseReducerCommitOptions): DatabaseReducerCommitOptions {
+  const resolved = commit ?? DEFAULT_REDUCER_COMMIT
+  const match = COMMIT_TIMESTAMP.exec(resolved.timestamp)
+  if (match === null) throw new Error('WORKERD_COMMIT_TIMESTAMP_INVALID')
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number) as [number, number, number, number, number, number]
+  const epochMs = Date.UTC(year, month - 1, day, hour, minute, second)
+  const roundTrip = new Date(epochMs)
+  if (
+    roundTrip.getUTCFullYear() !== year || roundTrip.getUTCMonth() !== month - 1 || roundTrip.getUTCDate() !== day ||
+    roundTrip.getUTCHours() !== hour || roundTrip.getUTCMinutes() !== minute || roundTrip.getUTCSeconds() !== second
+  ) throw new Error('WORKERD_COMMIT_TIMESTAMP_INVALID')
+  if (epochMs <= 0) throw new Error('WORKERD_COMMIT_TIMESTAMP_NOT_REPRODUCIBLE')
+  return resolved
+}
 
 export class ChronologWorkerdHostClient {
   constructor(private readonly transport: ChronologWorkerdHostTransport) {}
@@ -229,7 +251,7 @@ async function prepareRun(
         sqlAlias: 'materialized_db',
         origin: 'fork-input',
         sourceInput: source.name,
-        commit: request.commit ?? DEFAULT_COMMIT,
+        commit: resolveReducerCommitOptions(request.commit),
       }],
       canonicalInput: encodeDatabaseReducerByteString(encodeChronologReducerInvocationBundle(bundle)),
     },

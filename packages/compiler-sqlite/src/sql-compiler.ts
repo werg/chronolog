@@ -214,29 +214,192 @@ export function orderedSqlBindingValues(compiled: CompiledSqlSource): readonly S
   return values.map((value) => value ?? ({ kind: 'null' } as const))
 }
 
+export interface OrderedResultCompletion {
+  /** SQL to execute in place of the authored statement. */
+  readonly sql: string
+  /**
+   * Number of leading result columns that belong to the authored result.
+   * Completion may append hidden tie-break columns after them; the executor
+   * MUST drop those before canonicalization.
+   */
+  readonly visibleColumnCount: number
+}
+
 /**
- * Complete an authored outer ORDER BY with the returned columns under BINARY
- * collation. Rows that remain tied are byte-identical in the result envelope,
- * so their physical order cannot affect the ordered-result digest.
+ * Complete an authored outer ORDER BY so that rows still tied after
+ * completion are identical in the canonical result envelope, apart from the
+ * sign of a REAL zero (see below).
+ *
+ * `n COLLATE BINARY` alone is not injective: SQLite compares INTEGER 1 and
+ * REAL 1.0 as equal, so such rows would keep plan or rowid order. Each column
+ * therefore also gets a `typeof(...)` key. For a simple SELECT the key
+ * re-evaluates the column's expression in ORDER BY (star columns are
+ * re-addressed through their single qualified source by result-column name).
+ * For a UNION ALL compound, every arm projects hidden `typeof(...)` columns
+ * that the ORDER BY addresses by number and the executor strips.
+ *
+ * Residual: SQLite cannot observe the sign of a REAL zero through any
+ * built-in function available to this profile (text conversion, quote(),
+ * hex(), printf() and JSON render -0.0 as 0.0, division by zero yields NULL,
+ * and math functions such as atan2() are not compiled in), so -0.0 and 0.0
+ * in the same column remain tied.
  */
 export function completeOrderedResultSql(
   compiled: CompiledSqlSource,
-  resultColumnCount: number,
-): string {
+  resultColumnNames: readonly (string | null)[],
+): OrderedResultCompletion {
   if (
     compiled.ast.type !== 'SelectStmt' || compiled.ast.body.orderBy === undefined ||
     compiled.ast.body.orderBy.length === 0
   ) throw new SqlCompilerError('SQL_ORDERED_RESULT_REQUIRES_ORDER_BY')
-  if (!Number.isSafeInteger(resultColumnCount) || resultColumnCount < 1) {
-    throw new SqlCompilerError('SQL_RESULT_COLUMN_COUNT_INVALID')
+  const count = resultColumnNames.length
+  if (count < 1) throw new SqlCompilerError('SQL_RESULT_COLUMN_COUNT_INVALID')
+  const select = compiled.ast.body
+  const sql = compiled.source.sql
+  const parameters = parameterOccurrences(sql)
+  const copy = (node: AstNode): string =>
+    rewriteSourceSegment(sql, node.span.offset, node.span.offset + node.span.length, parameters)
+  const plan = orderedCompletionPlan(select)
+  if (plan === 'gated') throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
+  const edits: Array<{ readonly offset: number; readonly text: string }> = []
+  const tieTerms: string[] = []
+  if (plan === 'binary') {
+    for (let index = 1; index <= count; index += 1) tieTerms.push(`${index} COLLATE BINARY`)
+  } else if (plan === 'hidden-columns') {
+    for (const arm of [select.select, ...(select.compounds ?? []).map((compound) => compound.select)]) {
+      for (const row of armExpressionRows(arm)!) {
+        if (row.expressions.length !== count) throw new SqlCompilerError('SQL_RESULT_COLUMN_COUNT_INVALID')
+        edits.push({ offset: row.insertAt, text: row.expressions.map((expression) => `, typeof(${copy(expression)})`).join('') })
+      }
+    }
+    for (let index = 1; index <= count; index += 1) tieTerms.push(`${index} COLLATE BINARY`, `${count + index}`)
+  } else {
+    const core = select.select as Extract<Select['select'], { type: 'SelectFrom' }>
+    const explicit = core.columns.filter((column) => column.type === 'ExprResultColumn').length
+    const starWidth = count - explicit
+    const hasStar = explicit !== core.columns.length
+    if (hasStar ? starWidth < 0 : starWidth !== 0) throw new SqlCompilerError('SQL_RESULT_COLUMN_COUNT_INVALID')
+    const references: string[] = []
+    for (const column of core.columns) {
+      if (column.type === 'ExprResultColumn') {
+        references.push(copy(column.expr))
+        continue
+      }
+      const qualifier = starQualifier(column, core.from)!
+      const names = resultColumnNames.slice(references.length, references.length + starWidth)
+      if (names.some((name) => name === null) || new Set(names.map((name) => asciiLower(name!))).size !== names.length) {
+        throw new SqlCompilerError(ORDERED_COMPLETION_GATED)
+      }
+      for (const name of names) references.push(`${quoteSqlIdentifier(qualifier)}.${quoteSqlIdentifier(name!)}`)
+    }
+    references.forEach((reference, index) => {
+      tieTerms.push(`${index + 1} COLLATE BINARY`, `typeof(${reference})`)
+    })
   }
-  const lastTerm = compiled.ast.body.orderBy.at(-1)!
-  const insertionOffset = lastTerm.span.offset + lastTerm.span.length
-  const tieTerms = Array.from(
-    { length: resultColumnCount },
-    (_value, index) => `${index + 1} COLLATE BINARY`,
-  ).join(', ')
-  return `${compiled.source.sql.slice(0, insertionOffset)}, ${tieTerms}${compiled.source.sql.slice(insertionOffset)}`
+  const lastTerm = select.orderBy!.at(-1)!
+  edits.push({ offset: lastTerm.span.offset + lastTerm.span.length, text: `, ${tieTerms.join(', ')}` })
+  let completed = sql
+  for (const edit of [...edits].sort((left, right) => right.offset - left.offset)) {
+    completed = `${completed.slice(0, edit.offset)}${edit.text}${completed.slice(edit.offset)}`
+  }
+  return { sql: completed, visibleColumnCount: count }
+}
+
+const ORDERED_COMPLETION_GATED = 'SQL_ORDERED_RESULT_COMPLETION_TEMPORARILY_GATED'
+
+type SelectCore = Select['select']
+type SelectFromCore = Extract<SelectCore, { type: 'SelectFrom' }>
+
+/**
+ * Static choice of tie completion for a top-level ordered SELECT:
+ * - `typed`: simple SELECT; BINARY plus re-evaluated `typeof(...)` keys;
+ * - `hidden-columns`: UNION ALL compound whose arms list every column
+ *   explicitly; hidden `typeof(...)` columns are projected by each arm;
+ * - `binary`: BINARY keys are already injective (every arm is table-free, so
+ *   the sorter input order is authored, or every column is type-pinned);
+ * - `gated`: no injective completion is known.
+ */
+function orderedCompletionPlan(select: Select): 'typed' | 'hidden-columns' | 'binary' | 'gated' {
+  const arms = [select.select, ...(select.compounds ?? []).map((compound) => compound.select)]
+  if (arms.every(isTableFreeArm)) return 'binary'
+  if (arms.every((arm) => arm.type === 'SelectFrom' && arm.columns.every((column) =>
+    column.type === 'ExprResultColumn' && isTypePinnedExpression(column.expr)))) return 'binary'
+  if (select.compounds !== undefined && select.compounds.length > 0) {
+    return select.compounds.every((compound) => compound.operator === 'UnionAll') &&
+      arms.every((arm) => armExpressionRows(arm) !== null)
+      ? 'hidden-columns'
+      : 'gated'
+  }
+  const core = select.select
+  if (core.type !== 'SelectFrom') return 'gated'
+  const stars = core.columns.filter((column) => column.type !== 'ExprResultColumn')
+  if (stars.length > 1) return 'gated'
+  return stars.every((column) => starQualifier(column, core.from) !== null) ? 'typed' : 'gated'
+}
+
+function isTableFreeArm(arm: SelectCore): boolean {
+  return arm.type === 'SelectValues' || arm.from === undefined
+}
+
+function armExpressionRows(arm: SelectCore): Array<{ readonly expressions: readonly AstNode[]; readonly insertAt: number }> | null {
+  if (arm.type === 'SelectValues') {
+    // A VALUES row span ends with its closing parenthesis.
+    return arm.values.map((row) => ({ expressions: row.values, insertAt: row.span.offset + row.span.length - 1 }))
+  }
+  const expressions: AstNode[] = []
+  for (const column of arm.columns) {
+    if (column.type !== 'ExprResultColumn') return null
+    expressions.push(column.expr)
+  }
+  const last = arm.columns.at(-1)
+  if (last === undefined) return null
+  return [{ expressions, insertAt: last.span.offset + last.span.length }]
+}
+
+function starQualifier(
+  column: SelectFromCore['columns'][number],
+  from: SelectFromCore['from'],
+): string | null {
+  if (column.type === 'TableStarResultColumn') return column.table.text
+  if (column.type !== 'StarResultColumn' || from?.select === undefined) return null
+  if (from.joins !== undefined && from.joins.length > 0) return null
+  const source = from.select
+  if (source.type === 'TableSelectTable' || source.type === 'TableCallSelectTable') {
+    return source.alias?.name.text ?? source.tblName.objName.text
+  }
+  if (source.type === 'SelectSelectTable') return source.alias?.name.text ?? null
+  return null
+}
+
+/** SQLite column affinity named by a CAST type, following sqlite3AffinityType. */
+function castAffinity(node: AstNode): 'integer' | 'text' | 'blob' | 'real' | 'numeric' | null {
+  if (node.type !== 'CastExpr') return null
+  const name = asciiLower(node.typeName?.name ?? '')
+  if (name.includes('int')) return 'integer'
+  if (name.includes('char') || name.includes('clob') || name.includes('text')) return 'text'
+  if (name.includes('blob') || name === '') return 'blob'
+  if (name.includes('real') || name.includes('floa') || name.includes('doub')) return 'real'
+  return 'numeric'
+}
+
+/**
+ * Expressions whose non-NULL values all share one storage class in which
+ * BINARY equality implies identical canonical values.
+ */
+function isTypePinnedExpression(node: AstNode): boolean {
+  if (isTypeofCall(node)) return true
+  const affinity = castAffinity(node)
+  return affinity === 'integer' || affinity === 'text' || affinity === 'blob'
+}
+
+function isTypeofCall(node: AstNode): boolean {
+  return node.type === 'FunctionCallExpr' && asciiLower(node.name.name) === 'typeof' &&
+    node.args?.length === 1 && node.distinctness === undefined && node.orderBy === undefined &&
+    node.filterOver === undefined
+}
+
+function isBinaryCollation(node: AstNode): node is Extract<AstNode, { type: 'CollateExpr' }> {
+  return node.type === 'CollateExpr' && asciiLower(node.collation) === 'binary'
 }
 
 function parseOne(sql: string): Stmt {
@@ -352,6 +515,10 @@ function validateDeterministicExpressions(ast: Stmt, sql: string): void {
         if (node.compounds?.some((compound) => compound.operator !== 'UnionAll') === true &&
             !isRepresentativeStableCompound(node, sql)) {
           throw compilerError('SQL_CANONICAL_REPRESENTATIVE_TEMPORARILY_GATED', sql, node)
+        }
+        if (topLevelResult && node.orderBy !== undefined && node.orderBy.length > 0 &&
+            orderedCompletionPlan(node) === 'gated') {
+          throw compilerError(ORDERED_COMPLETION_GATED, sql, node)
         }
       },
       SubqueryExpr(node) {
@@ -469,10 +636,18 @@ function isRepresentativeStableProjection(
     column.type === 'ExprResultColumn' && isRepresentativeStableExpression(column.expr))
 }
 
+/**
+ * Expressions whose own comparison (including any collation inherited
+ * through CAST) treats two values as equal only when they are identical
+ * canonical values, so SQLite's choice of representative is unobservable.
+ * CAST(... AS TEXT) inherits its operand's collation (for example a column
+ * declared NOCASE), so it qualifies only under an explicit COLLATE BINARY.
+ */
 function isRepresentativeStableExpression(node: AstNode): boolean {
-  return node.type === 'FunctionCallExpr' && asciiLower(node.name.name) === 'typeof' &&
-    node.args?.length === 1 && node.distinctness === undefined && node.orderBy === undefined &&
-    node.filterOver === undefined
+  if (isTypeofCall(node)) return true
+  const affinity = castAffinity(node)
+  if (affinity === 'integer' || affinity === 'blob') return true
+  return isBinaryCollation(node) && (castAffinity(node.expr) === 'text' || isRepresentativeStableExpression(node.expr))
 }
 
 function isSafeGroupedProjection(
@@ -482,7 +657,12 @@ function isSafeGroupedProjection(
   const groups = select.groupBy ?? []
   return groups.length > 0 && select.columns.every((column) => {
     if (column.type !== 'ExprResultColumn') return false
-    if (groups.some((group) => sameSource(group, column.expr, sql))) return true
+    // A projected group key returns one arbitrary member of its group, so the
+    // grouping comparison must not merge distinct canonical values (1 and
+    // 1.0, -0.0 and 0, or 'a' and 'A' under NOCASE).
+    if (groups.some((group) => sameSource(group, column.expr, sql))) {
+      return isRepresentativeStableExpression(column.expr)
+    }
     return isDeterministicAggregateExpression(column.expr)
   })
 }
@@ -516,9 +696,27 @@ function isPeerStableWindow(node: FunctionCallExpr): boolean {
 function isSafeOrderedGroupConcat(node: FunctionCallExpr, sql: string): boolean {
   if (node.args === undefined || node.args.length < 1 || node.args.length > 2 ||
       node.distinctness !== undefined || node.filterOver?.overClause !== undefined) return false
+  // A per-row separator would make the output depend on which tied row comes first.
+  if (node.args.length === 2 && !isConstantOperand(node.args[1]!)) return false
   const ordering = node.orderBy?.type === 'SortListFunctionCallOrder' ? node.orderBy.columns : undefined
-  return ordering !== undefined && ordering.length > 0 &&
-    sameSource(ordering.at(-1)!.expr, node.args[0]!, sql)
+  if (ordering === undefined || ordering.length === 0) return false
+  const value = node.args[0]!
+  const last = ordering.at(-1)!.expr
+  // Rows tied under the final key must render identical text:
+  // `value` itself when its comparison is already injective,
+  // `value COLLATE BINARY` when value is pinned to one storage class, or
+  // `value COLLATE BINARY, typeof(value)` in general (BINARY treats 1 and
+  // 1.0 as equal; -0.0 and 0.0 both render as '0.0').
+  if (sameSource(last, value, sql) && isRepresentativeStableExpression(value)) return true
+  if (isBinaryCollation(last) && sameSource(last.expr, value, sql) && isTypePinnedExpression(value)) return true
+  const previous = ordering.at(-2)?.expr
+  return previous !== undefined && isTypeofCall(last) && last.type === 'FunctionCallExpr' &&
+    sameSource(last.args![0]!, value, sql) && isBinaryCollation(previous) && sameSource(previous.expr, value, sql)
+}
+
+function isConstantOperand(node: AstNode): boolean {
+  return node.type === 'StringLiteral' || node.type === 'NumericLiteral' || node.type === 'NullLiteral' ||
+    node.type === 'VariableExpr'
 }
 
 function sameSource(left: AstNode, right: AstNode, sql: string): boolean {

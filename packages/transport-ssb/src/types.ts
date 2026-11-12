@@ -47,6 +47,12 @@ export interface ChronologTransport {
   history(): Promise<readonly TransportRecord[]>
   subscribe(signal?: AbortSignal): AsyncIterable<TransportRecord>
   status(): Promise<TransportStatus>
+  /**
+   * Highest sequence of `feedId` whose complete signed prefix is present
+   * locally (0 when none). Equivalent to the matching `status().feedStates`
+   * entry, but must be cheap enough to call once per ingested record.
+   */
+  feedContiguousThrough?(feedId: string): Promise<bigint>
   close(): Promise<void>
 }
 

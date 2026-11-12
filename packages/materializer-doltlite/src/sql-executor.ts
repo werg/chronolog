@@ -195,23 +195,27 @@ function executeSqlResult(
   if (mode === 'ordered' && compiled.resultMode !== 'ordered') {
     throw new SqlProfileError('SQL_ORDERED_RESULT_REQUIRES_ORDER_BY')
   }
-  const executionSql = compiled.resultMode === 'ordered'
+  const completion = compiled.resultMode === 'ordered'
     ? completeOrderedResultSql(compiled, withProfiledStatement(
       database,
       compiled.source.sql,
       authorizationMode,
-      (statement) => statement.columns().length,
+      (statement) => statement.columns().map((column) => column.name),
       sqlLimits,
     ))
-    : compiled.source.sql
+    : null
+  const executionSql = completion?.sql ?? compiled.source.sql
   return withProfiledStatement(database, executionSql, authorizationMode, (statement) => {
     statement.setReturnArrays?.(true)
     statement.setReadBigInts?.(true)
-    const backendRows = statement.all(...(bindingOverride ?? bindingValues(compiled)))
+    const visibleColumnCount = completion?.visibleColumnCount ?? statement.columns().length
+    // Completion may append hidden tie-break columns; they never reach the result.
+    const backendRows = statement.all(...(bindingOverride ?? bindingValues(compiled))).map((row) =>
+      Array.isArray(row) && row.length > visibleColumnCount ? row.slice(0, visibleColumnCount) : row)
     const rowLimit = resultLimits?.maxRowsPerStatement ?? maximumRows
     const byteLimit = resultLimits?.maxBytesPerStatement ?? maximumBytes
     if (backendRows.length > Math.min(maximumRows, rowLimit)) throw new SqlProfileError('SQL_RESULT_ROW_LIMIT')
-    const columns = statement.columns().map((column, index) => ({
+    const columns = statement.columns().slice(0, visibleColumnCount).map((column, index) => ({
       nameUtf8: new TextEncoder().encode(column.name ?? `column_${index}`),
       type: { kind: 'dynamic' as const },
       nullable: 'unknown' as const,

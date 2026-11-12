@@ -962,7 +962,11 @@ export class ChronologNode {
     })
   }
   async #isFeedContiguous(record: TransportRecord): Promise<boolean> {
-    const status = await this.#options.transport.status()
+    const transport = this.#options.transport
+    if (transport.feedContiguousThrough !== undefined) {
+      return await transport.feedContiguousThrough(record.author) >= record.sequence
+    }
+    const status = await transport.status()
     const feed = status.feedStates?.find((candidate) => candidate.feedId === record.author)
     if (feed === undefined || !/^(0|[1-9][0-9]*)$/.test(feed.contiguousThrough)) return false
     return BigInt(feed.contiguousThrough) >= record.sequence

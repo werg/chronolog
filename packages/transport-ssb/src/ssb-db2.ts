@@ -481,6 +481,14 @@ export class SsbDb2Transport implements ChronologTransport {
     }
   }
 
+  // Reads only the EBT vector clock. status() additionally runs a full
+  // count() query over the log, which is O(history) and waits for index
+  // drain; the node calls this once per ingested heartbeat.
+  async feedContiguousThrough(feedId: string): Promise<bigint> {
+    const clock = await readEbtClock(this.#sbot)
+    return BigInt(clock[feedId] ?? 0)
+  }
+
   async status(): Promise<TransportStatus> {
     const [records, clock] = await Promise.all([countChronologRecords(this.#sbot.db), readEbtClock(this.#sbot)])
     const feedIds = new Set([...Object.keys(clock), ...this.#feedProgress.keys(), ...this.#configuredPeers.keys()])
