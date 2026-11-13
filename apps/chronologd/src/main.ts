@@ -2,7 +2,7 @@ import { join, resolve } from 'node:path'
 
 import { createExecutionManifest } from '@chronolog/protocol'
 import { isCapabilityActive } from '@chronolog/capabilities'
-import { ControlStore, JsonFileControlStorePersistence } from '@chronolog/control-store'
+import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import {
   DeterministicMaterializer,
   createDoltLiteMaterializationRuntime,
@@ -13,7 +13,7 @@ import {
   ChronologNode,
   GovernanceControlPlane,
   FeedForkRegistry,
-  JsonFeedForkPersistence,
+  SqliteFeedForkPersistence,
   createEpochEnvelopeCipher,
   type MembershipResolver,
 } from '@chronolog/node-core'
@@ -46,7 +46,7 @@ const executionManifest = createExecutionManifest({
   profile: 'chronolog-core-portable',
   engineDigest: nativeEngine.digest,
 })
-const { transport, materializer, node, server, address, governance, nat } = await startRuntime()
+const { transport, materializer, node, server, address, governance, nat, nodeState } = await startRuntime()
 process.stdout.write(`${JSON.stringify({
   event: 'chronologd.ready',
   url: address.url,
@@ -76,6 +76,7 @@ async function stop(signal: string): Promise<void> {
   await server.close()
   await governance?.close()
   await node.close()
+  nodeState.close()
   await dataLock.release()
 }
 
@@ -114,13 +115,15 @@ async function startRuntime() {
   let server: HttpRpcServer | undefined
   let governance: GovernanceControlPlane | undefined
   let reachability: NatVerificationResult = { status: 'not-configured', address: null }
+  // The node's own state (control index, validator cutoffs, feed continuity).
+  const nodeState = new NodeStateDatabase(join(dataDirectory, 'node-state.sqlite'))
   try {
     materializer = await DeterministicMaterializer.open({
       path: join(dataDirectory, 'application.db'),
       checkpointEvery: runtime.checkpointEvery,
       executionManifest,
     })
-    const controlStore = new ControlStore(new JsonFileControlStorePersistence(join(dataDirectory, 'control.json')))
+    const controlStore = new ControlStore(new SqliteControlStorePersistence(nodeState))
     let membership: MembershipResolver
     let membershipRevision = configuredMembershipRevision
     let validationPolicy = configuredValidationPolicy
@@ -200,9 +203,7 @@ async function startRuntime() {
         heartbeatIntervalMs: runtime.heartbeatIntervalMs,
       },
       envelopeCipher: governance?.cipherRing ?? envelopeCipher,
-      feedForkRegistry: new FeedForkRegistry(
-        new JsonFeedForkPersistence(join(dataDirectory, 'feed-continuity.json')),
-      ),
+      feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
     })
     await node.start()
     server = new HttpRpcServer({
@@ -229,7 +230,7 @@ async function startRuntime() {
       timeoutMs: runtime.natDiscoveryTimeoutMs,
       ...(runtime.natVerificationUrl === undefined ? {} : { verificationUrl: runtime.natVerificationUrl }),
     })
-    return { transport, materializer, node, server, address, governance, nat: { ...nat, reachability } }
+    return { transport, materializer, node, server, address, governance, nat: { ...nat, reachability }, nodeState }
   } catch (error) {
     await server?.close().catch(() => undefined)
     await governance?.close().catch(() => undefined)
@@ -239,6 +240,7 @@ async function startRuntime() {
       materializer?.close()
       await transport.close().catch(() => undefined)
     }
+    nodeState.close()
     throw error
   }
 }

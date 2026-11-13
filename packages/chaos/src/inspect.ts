@@ -1,7 +1,7 @@
-import { access, readdir } from 'node:fs/promises'
+import { readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
-import { readControlStoreSnapshot } from '@chronolog/control-store'
+import { readNodeStateControlSnapshot } from '@chronolog/control-store'
 import { FeedTransport } from '@chronolog/transport-ssb'
 
 export interface RunInspection {
@@ -24,7 +24,6 @@ export async function inspectRun(directory: string): Promise<RunInspection> {
     const nodes = []
     for (const name of names) {
     const directory = join(nodesDirectory, name)
-    const uncleanMarker = await exists(join(directory, 'ssb', '.chronolog-ssb-open'))
     const transport = await FeedTransport.open({ path: join(directory, 'ssb'), network: { reconnect: false } })
     try {
       const history = await transport.history()
@@ -35,10 +34,9 @@ export async function inspectRun(directory: string): Promise<RunInspection> {
         feeds.set(record.author, records)
       }
       // Snapshot plus append-only journal; read without compacting.
-      const control = (readControlStoreSnapshot(join(directory, 'control.json')) ?? {}) as unknown as Record<string, unknown>
+      const control = (readNodeStateControlSnapshot(join(directory, 'node-state.sqlite')) ?? {}) as unknown as Record<string, unknown>
       nodes.push({
         name,
-        uncleanMarker,
         transportRecords: history.length,
         feeds: [...feeds.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([author, records]) => {
           const sequences = records.map((record) => record.sequence)
@@ -73,7 +71,3 @@ export async function inspectRun(directory: string): Promise<RunInspection> {
 
 function arrayLength(value: unknown): number | undefined { return Array.isArray(value) ? value.length : undefined }
 function isPowerOfTwo(value: number): boolean { return value > 0 && (value & (value - 1)) === 0 }
-
-async function exists(path: string): Promise<boolean> {
-  try { await access(path); return true } catch { return false }
-}

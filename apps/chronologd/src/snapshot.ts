@@ -1,6 +1,7 @@
-import { readFile, rename } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
+import { NodeStateDatabase } from '@chronolog/control-store'
 import { createExecutionManifest, type ExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
@@ -8,7 +9,7 @@ import {
 } from '@chronolog/materializer-doltlite'
 import {
   FeedForkRegistry,
-  JsonFeedForkPersistence,
+  SqliteFeedForkPersistence,
   commitStagedSnapshot,
   exportSnapshotArchive,
   signSnapshotManifest,
@@ -62,7 +63,7 @@ try {
         orderLength: materializer.orderLength,
         databaseContentHash: materializer.databaseContentHash,
         transactionLogDigest: await materializer.transactionLogDigest(),
-        feedHeads: feedHeads(join(dataDirectory, 'feed-continuity.json')),
+        feedHeads: feedHeads(dataDirectory),
         createdAtMs: BigInt(Date.now()),
       }
     } finally { materializer.close() }
@@ -86,7 +87,7 @@ try {
     if (!args.includes('--confirm-replace')) throw new Error('SNAPSHOT_REPLACE_CONFIRMATION_REQUIRED')
     const backupPath = `${databasePath}.pre-snapshot-r${staged.manifest.materializedRevision}`
     await commitStagedSnapshot({ staged, targetDatabasePath: databasePath, backupPath })
-    await invalidateControlSnapshot(dataDirectory, staged.manifest.materializedRevision)
+    invalidateControlSnapshot(dataDirectory)
     if (command === 'repair') {
       const planPath = required(option(args, '--plan'), 'repair requires --plan FILE')
       await applyFeedRepair(dataDirectory, staged.manifest, JSON.parse(await readFile(resolve(planPath), 'utf8')) as RepairPlanDocument)
@@ -112,8 +113,14 @@ async function validateMaterializer(
   } finally { materializer.close() }
 }
 
-function feedHeads(path: string): readonly SnapshotFeedHead[] {
-  const snapshot = new JsonFeedForkPersistence(path).load()
+function nodeState(dataDirectory: string): NodeStateDatabase {
+  return new NodeStateDatabase(join(dataDirectory, 'node-state.sqlite'))
+}
+
+function feedHeads(dataDirectory: string): readonly SnapshotFeedHead[] {
+  const state = nodeState(dataDirectory)
+  let snapshot
+  try { snapshot = new SqliteFeedForkPersistence(state.database).load() } finally { state.close() }
   return (snapshot?.feeds ?? []).flatMap((feed) => {
     const head = feed.records.at(-1)
     return head === undefined ? [] : [{ feedId: feed.feedId, sequence: BigInt(head.sequence), recordId: head.id }]
@@ -131,16 +138,18 @@ async function applyFeedRepair(dataDirectory: string, manifest: TrustedSnapshotM
     receivedAtMs: record.receivedAtMs,
     payload: b64bytes(record.payload),
   }))
-  const registry = new FeedForkRegistry(new JsonFeedForkPersistence(join(dataDirectory, 'feed-continuity.json')))
-  registry.applyRepair(registry.createRepairPlan(document.feedId, records, document.trustedHeadId))
+  const state = nodeState(dataDirectory)
+  try {
+    const registry = new FeedForkRegistry(new SqliteFeedForkPersistence(state.database))
+    registry.applyRepair(registry.createRepairPlan(document.feedId, records, document.trustedHeadId))
+  } finally { state.close() }
 }
 
-async function invalidateControlSnapshot(dataDirectory: string, revision: bigint): Promise<void> {
-  // The journal only applies on top of its snapshot; move both aside.
-  for (const name of ['control.json', 'control.json.journal']) {
-    try { await rename(join(dataDirectory, name), join(dataDirectory, `${name}.pre-snapshot-r${revision}`)) }
-    catch (error) { if (!missing(error)) throw error }
-  }
+function invalidateControlSnapshot(dataDirectory: string): void {
+  // The control index is rebuilt from feeds; validator cutoffs are kept.
+  const state = nodeState(dataDirectory)
+  try { state.database.exec('BEGIN IMMEDIATE; DELETE FROM control_snapshot; DELETE FROM control_journal; COMMIT') }
+  finally { state.close() }
 }
 function option(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name)
@@ -155,5 +164,4 @@ function b64bytes(value: string, length?: number): Uint8Array {
   return result
 }
 function b64(value: Uint8Array): string { return Buffer.from(value).toString('base64url') }
-function missing(error: unknown): boolean { return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'ENOENT' }
 function output(value: unknown): void { process.stdout.write(`${JSON.stringify(value)}\n`) }

@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 
-import { ControlStore, JsonFileControlStorePersistence } from '@chronolog/control-store'
+import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
@@ -26,7 +26,7 @@ import {
 import {
   ChronologNode,
   FeedForkRegistry,
-  JsonFeedForkPersistence,
+  SqliteFeedForkPersistence,
   type MembershipResolver,
 } from '@chronolog/node-core'
 import { equalBytes, generateEd25519KeyPair, type SqlTransactionProgram } from '@chronolog/protocol'
@@ -64,8 +64,9 @@ const membership: MembershipResolver = {
 const transport: ChronologTransport = values.transport === 'memory'
   ? new MemoryTransportNetwork().createNode('bench')
   : await FeedTransport.open({ path: join(directory, 'ssb') })
+const nodeState = new NodeStateDatabase(join(directory, 'node-state.sqlite'))
 const controlStore = values.control === 'file'
-  ? new ControlStore(new JsonFileControlStorePersistence(join(directory, 'control.json')))
+  ? new ControlStore(new SqliteControlStorePersistence(nodeState))
   : new ControlStore()
 // Admission emits no node event, so record the transition time directly.
 const admittedAt = new Map<string, number>()
@@ -87,7 +88,7 @@ const node = new ChronologNode({
   controlStore,
   ...(values.control === 'file'
     ? {
-        feedForkRegistry: new FeedForkRegistry(new JsonFeedForkPersistence(join(directory, 'feed-continuity.json'))),
+        feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
       }
     : {}),
 })
@@ -123,6 +124,7 @@ try {
   stop.abort()
 } finally {
   await node.close()
+  nodeState.close()
   await rm(directory, { recursive: true, force: true })
 }
 

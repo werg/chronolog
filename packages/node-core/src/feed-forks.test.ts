@@ -1,20 +1,13 @@
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
 
-import { FeedForkRegistry, JsonFeedForkPersistence } from './feed-forks.js'
-
-const directories: string[] = []
-afterEach(() => directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true })))
+import { FeedForkRegistry, SqliteFeedForkPersistence } from './feed-forks.js'
 
 describe('feed fork quarantine and repair', () => {
   it('persists quarantine when one author sequence has divergent identities', () => {
-    const directory = mkdtempSync(join(tmpdir(), 'chronolog-feed-fork-'))
-    directories.push(directory)
-    const path = join(directory, 'continuity.json')
-    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
+    const database = new DatabaseSync(':memory:')
+    const registry = new FeedForkRegistry(new SqliteFeedForkPersistence(database))
     expect(registry.observe(record(1n, 'first'))).toBe('accepted')
     expect(registry.observe(record(2n, 'left', 'first'))).toBe('accepted')
     expect(registry.observe(record(2n, 'right', 'first'))).toBe('quarantined')
@@ -22,8 +15,7 @@ describe('feed fork quarantine and repair', () => {
     expect(registry.quarantineEvidence()).toMatchObject([{
       feedId: '@writer.ed25519', sequence: '2', acceptedId: 'left', conflictingId: 'right',
     }])
-    expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ format: 'chronolog-feed-continuity-v1' })
-    expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).quarantined()).toBe(true)
+    expect(new FeedForkRegistry(new SqliteFeedForkPersistence(database)).quarantined()).toBe(true)
   })
 
   it('requires a complete trusted prefix before clearing quarantine', () => {
@@ -41,75 +33,6 @@ describe('feed fork quarantine and repair', () => {
   })
 })
 
-describe('feed continuity journal', () => {
-  function temporaryPath(): string {
-    const directory = mkdtempSync(join(tmpdir(), 'chronolog-feed-journal-'))
-    directories.push(directory)
-    return join(directory, 'continuity.json')
-  }
-
-  it('appends accepted records instead of rewriting the snapshot', () => {
-    const path = temporaryPath()
-    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
-    registry.observe(record(1n, 'first'))
-    const snapshotSize = existsSync(path) ? statSync(path).size : 0
-    for (let sequence = 2n; sequence <= 20n; sequence += 1n) {
-      registry.observe(record(sequence, `id-${sequence}`, sequence === 2n ? 'first' : `id-${sequence - 1n}`))
-    }
-    expect(existsSync(path) ? statSync(path).size : 0).toBe(snapshotSize)
-    expect(readFileSync(`${path}.journal`, 'utf8').trim().split('\n')).toHaveLength(20)
-    const reopened = new FeedForkRegistry(new JsonFeedForkPersistence(path))
-    expect(reopened.snapshot()).toEqual(registry.snapshot())
-    // Reopening compacts the journal into the snapshot.
-    expect(existsSync(`${path}.journal`)).toBe(false)
-    expect(reopened.observe(record(2n, 'fork', 'first'))).toBe('quarantined')
-  })
-
-  it('compacts after the configured number of entries', () => {
-    const path = temporaryPath()
-    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path, 3))
-    registry.observe(record(1n, 'a'))
-    registry.observe(record(2n, 'b', 'a'))
-    expect(existsSync(`${path}.journal`)).toBe(true)
-    registry.observe(record(3n, 'c', 'b'))
-    expect(existsSync(`${path}.journal`)).toBe(false)
-    expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).snapshot()).toEqual(registry.snapshot())
-  })
-
-  it('ignores a torn final append and tolerates entries already compacted', () => {
-    const path = temporaryPath()
-    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
-    registry.observe(record(1n, 'a'))
-    registry.observe(record(2n, 'b', 'a'))
-    const journal = readFileSync(`${path}.journal`, 'utf8')
-    // Crash after compaction renamed the snapshot but before the journal was removed.
-    new JsonFeedForkPersistence(path).save(registry.snapshot())
-    writeFileSync(`${path}.journal`, journal)
-    appendFileSync(`${path}.journal`, '{"feedId":"@writer.ed25519","seq')
-    expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).snapshot()).toEqual(registry.snapshot())
-  })
-
-  it('drops a torn first append so later appends stay readable', () => {
-    const path = temporaryPath()
-    // Crash during the very first append: no snapshot, only a fragment.
-    writeFileSync(`${path}.journal`, '{"feedId":"@writer.ed25519","seq')
-    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
-    expect(registry.observe(record(1n, 'a'))).toBe('accepted')
-    expect(new FeedForkRegistry(new JsonFeedForkPersistence(path)).snapshot()).toEqual(registry.snapshot())
-  })
-
-  it('fails closed on a corrupt or conflicting journal entry', () => {
-    const path = temporaryPath()
-    const registry = new FeedForkRegistry(new JsonFeedForkPersistence(path))
-    registry.observe(record(1n, 'a'))
-    new JsonFeedForkPersistence(path).save(registry.snapshot())
-    writeFileSync(`${path}.journal`, 'not json\n')
-    expect(() => new FeedForkRegistry(new JsonFeedForkPersistence(path))).toThrow('FEED_FORK_JOURNAL_INVALID')
-    writeFileSync(`${path}.journal`, `${JSON.stringify({ feedId: '@writer.ed25519', sequence: '1', id: 'other', previous: null })}\n`)
-    expect(() => new FeedForkRegistry(new JsonFeedForkPersistence(path))).toThrow('FEED_FORK_JOURNAL_CONFLICT')
-  })
-})
-
 function record(sequence: bigint, id: string, previous?: string) {
   return {
     author: '@writer.ed25519',
@@ -120,3 +43,19 @@ function record(sequence: bigint, id: string, previous?: string) {
     payload: new Uint8Array(),
   }
 }
+
+describe('SqliteFeedForkPersistence', () => {
+  it('restores continuity, quarantines and discarded ids across reopen', () => {
+    const database = new DatabaseSync(':memory:')
+    const record = (sequence: bigint, id: string, previous?: string) => ({
+      id, author: '@feed', sequence, receivedAtMs: 1, payload: Uint8Array.of(1), ...(previous === undefined ? {} : { previous }),
+    })
+    const registry = new FeedForkRegistry(new SqliteFeedForkPersistence(database))
+    expect(registry.observe(record(1n, '%a'))).toBe('accepted')
+    expect(registry.observe(record(2n, '%b', '%a'))).toBe('accepted')
+    expect(registry.observe(record(2n, '%c', '%a'))).toBe('quarantined')
+    const reopened = new FeedForkRegistry(new SqliteFeedForkPersistence(database))
+    expect(reopened.snapshot()).toEqual(registry.snapshot())
+    expect(reopened.quarantined('@feed')).toBe(true)
+  })
+})
