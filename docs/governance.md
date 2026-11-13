@@ -1,16 +1,16 @@
 # Replicated Governance
 
 Chronolog's default daemon profile derives authorization and encryption state
-from signed administration records carried by the same durable SSB transport as
-transaction traffic. Static membership files are an explicit compatibility
+from signed administration records carried on the administrator's feed, which
+replicates like any other feed. Static membership files are an explicit compatibility
 override, not the normal multi-node control plane.
 
 ## Bootstrap and key storage
 
 On first start, `chronologd` writes `governance.json` with mode `0600`. It
 contains the signed genesis and the local HPKE reader key. The genesis gives the local identity administrator,
-schema-administrator, writer, validator, and audit-reader capabilities and
-binds those protocol keys to the daemon's authenticated SSB feed.
+writer, validator, and reader capabilities and binds those protocol keys to
+the daemon's feed.
 
 On Linux, set `CHRONOLOG_SECRET_STORE=secret-service` to keep the daemon
 signing key, epoch content key, and governance recipient key in the host
@@ -71,8 +71,10 @@ SSB feed and reader key, adopts the genesis, and prints `suggestedGrants` (reade
 writer and validator grant JSON). The administrator submits the ones it wants
 with `chronolog governance grant`, then runs `chronolog governance rotate` so
 the new reader receives the current epoch key. Add the administrator's SSB
-address to the new node's `CHRONOLOG_SSB_PEERS` and start it. A joined node
-does not create epochs of its own; only the administration-feed owner does.
+address to the new node's `CHRONOLOG_SSB_PEERS` and start it. Every member
+replicates the feed of every granted member, so the administrator picks up the
+new node's records once its grant is published. A joined node does not create
+epochs of its own; only the administration-feed owner does.
 
 ## When the ordinary path fails
 
@@ -138,12 +140,12 @@ A grant file contains public material only. For example:
   "signingPublicKey": "BASE64URL_ED25519_PUBLIC_KEY",
   "transportAuthor": "@participant-feed.ed25519",
   "role": "reader",
-  "readerScope": "snapshot",
   "hpkePublicKey": "BASE64URL_X25519_PUBLIC_KEY"
 }
 ```
 
-Reader grants require a scope and HPKE public key. Validator grants default
+Roles are `writer`, `validator`, `reader` and `administrator`. A grant ends
+only by revocation. Reader grants require an HPKE public key. Validator grants default
 their minimum author timestamp to the daemon's current time unless an explicit
 unsigned decimal value is supplied. Epoch keys are generated inside the
 daemon and never returned by RPC.
@@ -151,12 +153,13 @@ daemon and never returned by RPC.
 `GovernanceControlPlane` in `@chronolog/node-core` backs that surface:
 
 - `publishCapabilityChange` atomically grants roles, revokes capability IDs,
-  installs validation policies, or transfers the root/feed;
+  installs validation policies (`minimumValidators`: how many distinct
+  validators must attest), or transfers the root/feed;
 - `revoke` removes every selected active capability at the next revision;
 - `rotateEpoch` publishes a fresh content key wrapped independently to every
   active reader;
-- `grantHistoricalAccess` rewraps retained epochs only for an active audit
-  reader.
+- `grantHistoricalAccess` rewraps retained historical epochs for an active
+  reader; this is the only way a reader gets epochs from before its grant.
 - `ownsCapabilityFeed` tells whether this node is the administration-feed
   owner, the only node that publishes capability revisions and epochs.
 
@@ -171,13 +174,13 @@ membership revision. Rotate the epoch after removing a reader: the removed
 device may retain plaintext and old epoch keys it already possessed, but it is
 not included in the new manifest and cannot decrypt later traffic.
 
-A snapshot reader receives only epochs explicitly published to it while its
-grant is active. An audit reader may receive historical keys through an
-explicit rewrap. Historical access never changes old transaction bytes.
+Every active reader receives each new epoch at rotation. Earlier epochs reach
+a reader only through an explicit `grantHistoricalAccess`. Historical access
+never changes old transaction bytes.
 
 The capability snapshot records the highest timestamp floor ever granted to a
 validator. It only rises, so a new validator's floor may not be lower even
-after every earlier validator has been revoked or has expired. Admitting
+after every earlier validator has been revoked. Admitting
 history below that floor requires a fork.
 
 ## Static override

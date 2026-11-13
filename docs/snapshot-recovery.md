@@ -16,15 +16,15 @@ CHRONOLOG_DATA_DIR=/var/lib/chronolog chronolog-snapshot import /secure/snapshot
 
 An export contains only `application.db`, the canonical signed snapshot
 manifest, and a fixed-name archive index. It never copies daemon signing,
-recipient, epoch, recovery, RPC, or SSB secret material. The manifest binds the
+recipient, epoch, RPC, or SSB secret material. The manifest binds the
 group, execution manifest, materialized revision/order, Dolt content hash,
-every protected transaction-log field, and canonical feed heads.
+a digest of every `chronolog_transactions` row, and canonical feed heads.
 
 Import verifies fixed filenames, size and SHA-256 evidence, the authorized
 signature, group and execution manifest, and a no-rollback floor equal to the
 locally materialized revision. It copies to a same-directory stage, fsyncs it,
 opens the stage through the production DoltLite adapter, and independently
-rechecks revision, order, content hash, and the exact protected-log digest.
+rechecks revision, order, content hash, and the exact transaction-log digest.
 Only the literal confirmation flag permits the final atomic rename. The prior
 database remains as `application.db.pre-snapshot-rREVISION`; the rebuildable
 `control.json` and its `control.json.journal` are moved aside so the next start reconstructs it from the
@@ -52,7 +52,7 @@ The trusted head must exactly match that feed's head in the signed snapshot;
 the prefix must be gap-free and every previous link must match. Repair records
 the rejected side of the observed fork as discarded, clears quarantine only
 after resolving the exact recorded conflict, and then rebuilds derived state.
-When the old SSB history is replayed, explicitly discarded record identities
+When the old feed history is replayed, explicitly discarded record identities
 are skipped rather than re-quarantining or entering consensus state.
 
 Do not use ordinary import to conceal a feed fork. Keep the original data

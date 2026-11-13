@@ -1,192 +1,35 @@
 # Upcoming Work
 
-Status: active ordered roadmap for the unreleased SQL-first prototype
+Status: active ordered roadmap for the unreleased prototype
 
-This file is the execution queue. Work proceeds from top to bottom. A project
-is complete only when its acceptance checks pass and the implementation status
-and compatibility ledger describe the resulting boundary accurately.
+This file is the execution queue; work proceeds from top to bottom. What
+already works is in [implementation status](docs/implementation-status.md).
+The 2026-11-13 redesign replaced the earlier SQL compiler, dialect, result
+envelopes, blob replication and ssb-db2/EBT transport; the projects that built
+them are not tracked here any more (see git history).
 
-Intentional prohibitions such as transaction control, attachments, temporary
-state, dynamic extensions, `VACUUM`, and protected-state access are not backlog
-items unless a separate design decision changes that policy.
-
-## Project 1 — Reconcile roadmap and specification status
-
-Status: complete
-
-- Make Specifications 10 and 11 the clearly identified normative SQL-first
-  contract.
-- Mark Specifications 1–9 and the former implementation plan as historical
-  relational-IR design material where they conflict with Specification 10.
-- Update the result/ordered-mutation implementation status to match the
-  compatibility ledger and executable coverage.
-- Make `docs/implementation-status.md` the concise human-readable source of
-  current capability and `docs/sqlite-compatibility-ledger.json` the
-  machine-readable feature boundary.
-
-Acceptance:
-
-- [x] No roadmap index describes relational IR as the active transaction path.
-- [x] Specifications 10/11, implementation status, README, and ledger agree.
-- [x] Documentation links identify historical versus normative material.
-
-## Project 2 — SQLite parser alignment and differential corpus
-
-Status: complete
-
-- Align the parser grammar with the pinned SQLite 3.54 runtime, or pin a
-  measured compatibility boundary when an exact grammar is unavailable.
-- Add a corpus runner that compares parse category, prepare outcome, statement
-  class, parameters, result shape, affected rows, and stable errors.
-- Cover every ledger statement/expression family plus malformed and
-  version-skew fixtures.
-- Fail closed on any unclassified parser/runtime disagreement.
-
-Acceptance:
-
-- [x] `pnpm conformance:sqlite` runs the checked-in differential corpus.
-- [x] Every mismatch is classified in the compatibility ledger.
-- [x] The parser/runtime temporary-debt entry is resolved or narrowed with
-      executable evidence.
-
-## Project 3 — Machine-readable conformance and platform CI
-
-Status: complete
-
-- Add `pnpm conformance` and a versioned report schema containing source,
-  manifest, fixture, platform, feature, test-group, and replay digests.
-- Check canonical fixtures and replay digests across supported platforms.
-- Add Linux/macOS CI, with Windows enabled only if the native runtime is
-  supportable without weakening the profile.
-- Publish reports and failure artifacts from CI.
-
-Acceptance:
-
-- [x] Reports are deterministic except explicitly operational metadata.
-- [x] CI compares portable semantic digests across supported platforms.
-- [x] Enabled features have linked passing evidence for the exact manifest.
-
-## Project 4 — Migration and revisioned schema tooling
-
-Status: complete
-
-- Provide an application migration-history convention with IDs, versions,
-  checksums, and signed exact/minimum-version assertions.
-- Add revision-pinned catalog inspection and catalog diffing.
-- Add CLI `migrations status`, `apply`, and `wait` workflows with explicit
-  accepted, rejected, conflicting-checksum, and watermark-excluded states.
-- Generate optional TypeScript bindings from a pinned catalog revision without
-  introducing an authoritative consensus schema manifest.
-- Add live resources for migration settlement and schema revision changes.
-
-Acceptance:
-
-- [x] Migration helpers are application-facing rather than chaos-only.
-- [x] Reapplying an identical migration is safe and a checksum conflict fails.
-- [x] CLI and client integration tests cover replay and concurrent old/new
-      clients.
-
-## Project 5 — Operational capability and epoch control plane
-
-Status: complete
-
-- Implement live onboarding/removal, capability grant/revocation, recovery,
-  epoch/content-key rotation, and historical-access policy.
-- Persist and replicate administration events instead of requiring matching
-  static membership files and restarts.
-- Add compromised-node replacement and quorum-loss recovery workflows.
-
-Acceptance:
-
-- [x] Multi-node tests onboard, revoke, rotate, and converge.
-- [x] Removed participants cannot author, validate, or decrypt new epochs.
-- [x] In-protocol threshold recovery removed (2026-11-12); failures are handled
-      by forking the group or out of band.
-
-## Project 6 — Deterministic SQL row-choice expansion
-
-Status: complete
-
-- Add canonical REAL input bindings.
-- Complete scalar subqueries and nested/unordered `LIMIT` proofs.
-- Add `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, `UPDATE ... FROM`,
-  and conflict-sensitive mutation forms only with explicit row-choice proofs.
-- Expand ordered update/delete support through ledger-recorded conformance.
-
-Acceptance:
-
-- [x] Each enabled surface has compiler, reference, replay, result, and fault
-      fixtures.
-- [x] Corresponding ledger entries move from `temporarily_gated` only after
-      those fixtures pass.
-
-## Project 7 — Aggregates, compounds, and windows
-
-Status: complete
-
-- Determinize `DISTINCT`, `GROUP BY`, representative-sensitive `MIN`/`MAX`,
-  distinct compounds, windows, and ordered/order-sensitive aggregates.
-- Define canonical peer/tie completion and bounded sort/resource behavior.
-
-Acceptance:
-
-- [x] Independent reference and DoltLite results agree for adversarial ties,
-      Nulls, dynamic types, and duplicate encodings.
-- [x] Replay and cross-platform digests agree.
-
-## Project 8 — Registered extensions and advanced indexes
-
-Status: complete
-
-- Complete registered deterministic functions and collations.
-- Gate virtual tables and table-valued functions behind immutable identities
-  and resource contracts.
-- Complete replay gates for JSON operators, trigger `RAISE`, FTS, sqlite-vec,
-  spatial features, and deterministic WASM.
-- Characterize `ANALYZE` and `REINDEX`; keep them gated if physical effects
-  cannot be made replay-safe.
-
-Note: FTS, sqlite-vec, spatial (RTree), and WASM are characterized natively
-(transaction, branch-isolation, and reopen tests) but remain disabled in the
-consensus profile; they are not active consensus features. See
-[extensions](docs/extensions.md) and the SQLite compatibility ledger.
-
-Acceptance:
-
-- [x] Every enabled extension has a pinned implementation digest, reference
-      behavior, resource limits, and cross-platform replay evidence.
-- [x] Unavailable modules fail before validation or execution.
-
-## Project 9 — Production workerd/CAS execution path
-
-Status: complete
-
-- Decide and record whether the first deployment target is pure workerd or the
-  native daemon.
-- If workerd remains the target, implement the fail-closed JSG/DoltLite kernel,
-  immutable CAS export/import, real workerd execution, and daemon publication
-  cutover.
-- Preserve exact stepping, result, error, limit, checkpoint, and replay
-  contracts across adapters.
-
-Acceptance:
-
-- [x] The selected production path runs the same conformance corpus and replay
-      digests as the reference native path.
-- [x] Publication and CAS failure boundaries are crash-tested.
-
-## Project 10 — Release and operational hardening
+## Project 1 — Release and operational hardening
 
 Status: in progress
 
-- Add fuzzing, native sanitizers, crash injection at publication boundaries,
-  long-running recovery/storage tests, and deterministic resource/performance
-  characterization.
-- Produce signed native distributions, provenance/SBOMs, and OS-backed key
-  storage.
-- Add feed-fork quarantine/repair, snapshot trust workflows, blob manifests,
-  NAT discovery, deployment sizing, and operational observability.
-- Complete authorizer/protocol threat review and external security review.
+Done: deterministic codec fuzz corpora, native ASan/UBSan runner, publication
+crash matrix, replay soak and characterization, SBOM/provenance/OIDC
+attestations, self-verifying Linux/macOS archives with a same-build
+replacement drill, Linux Secret Service key storage, feed-fork quarantine and
+signed-head repair, signed snapshot export/import, health/metrics/doctor,
+external-vantage reachability proof, the internal threat review, and the
+governance RPC/CLI.
+
+Remaining:
+
+- [ ] Cross-platform (Linux/macOS) replay comparison of the pinned engine
+      build and resource characterization on release hardware.
+- [ ] Verify the macOS, Windows and command key providers on real hosts.
+- [ ] Execute and record the snapshot-repair, traversal, alert and
+      previous-version upgrade drills ([drill evidence](docs/drill-evidence.md)).
+- [ ] Resolve or accept every finding in the
+      [threat review](docs/security-threat-review.md) and commission the
+      independent external security assessment.
 
 Acceptance:
 
@@ -195,37 +38,11 @@ Acceptance:
       upgrade without editing internal stores.
 - [x] The active manifest advertises no unimplemented or unproven feature.
 
-Progress:
+## Project 2 — Workerd execution target
 
-- [x] Deterministic codec/compiler mutation fuzz corpora and scheduled CI.
-- [x] Native ASan/UBSan rebuild runner.
-- [x] Process-level publication crash matrix.
-- [x] Reopen/late-predecessor soak and deterministic/operational
-      characterization report.
-- [x] CycloneDX SBOM, in-toto/SLSA provenance, and CI OIDC attestations for
-      Linux/macOS release evidence.
-- [x] Linux Secret Service migration for daemon, epoch, recipient, and
-      bootstrap recovery private material.
-- [x] Persistent feed-fork quarantine, degraded/non-writable behavior, and
-      complete-prefix repair validation.
-- [x] Signed anti-rollback snapshot manifests and verified local blob-manifest
-      storage/wire resolution (later milestones complete archive and fetch).
-- [x] Detailed health, authenticated Prometheus metrics, and bounded explicit
-      public-address discovery.
-- [x] Internal authorizer/protocol threat review with unresolved release
-      findings recorded.
-- [x] Authenticated governance status/grant/revoke/epoch/history RPC
-      and CLI workflows that keep content keys inside the daemon.
-- [x] Self-verifying Linux/macOS native package assembly, OIDC-attested archive
-      evidence, and packaged persistent-data replacement drill; cross-version
-      evidence waits for the first prior release artifact.
-- [x] Offline signed snapshot archive export/stage/verify/atomic import and
-      signed-head-bound feed repair with losing-fork discard and state rebuild.
-- [x] Opt-in authenticated HTTPS blob serving/fetch with bounded exact-digest
-      verification and immutable local read-through retention.
-- [x] External-vantage SSB address/key reachability proof, public-scope health
-      gating, combined operator doctor, sizing/alerting guidance, and complete
-      install/onboard/migrate/rotate/backup/upgrade/incident runbook.
-- [ ] Execute and record the snapshot-repair, multi-host
-      blob, traversal, alert, and previous-version upgrade drills; commission
-      the independent external security assessment.
+Status: analysis only
+
+Follow the staged plan in
+[workerd-reconstruction-plan.md](docs/workerd-reconstruction-plan.md). The
+native daemon stays the production path until workerd meets the criteria in
+[production execution](docs/production-execution.md#reconsidering-workerd).

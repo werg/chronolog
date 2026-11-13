@@ -21,7 +21,6 @@ export const DRILL_RECORD_SUFFIX = '.drill.json'
 
 export const DRILL_KINDS = [
   'snapshot-repair',
-  'multi-host-blob',
   'traversal',
   'alert',
   'upgrade',
@@ -74,24 +73,6 @@ export const DRILL_SPECS: Readonly<Record<DrillKind, DrillSpec>> = {
       'rebuild_diagnostics_retained',
     ],
     artifacts: ['snapshot-manifest', 'repair-plan', 'doctor-output', 'quarantine-evidence'],
-  },
-  'multi-host-blob': {
-    kind: 'multi-host-blob',
-    title: 'Cache-miss multi-host blob fetch and retention drill',
-    findings: ['SEC-002'],
-    references: ['docs/security-threat-review.md SEC-002', 'docs/blob-replication.md', 'docs/pilot-runbook.md (blob loss)'],
-    roles: { operator: { min: 1 }, host: { min: 2 } },
-    environment: BASE_ENVIRONMENT,
-    details: [],
-    checks: [
-      'cache_miss_remote_fetch',
-      'digest_verified_before_retention',
-      'chunks_retained_locally',
-      'tampered_peer_response_rejected',
-      'unauthenticated_fetch_rejected',
-      'no_automatic_gc_observed',
-    ],
-    artifacts: ['blob-manifest', 'fetch-log', 'metrics-baseline'],
   },
   traversal: {
     kind: 'traversal',

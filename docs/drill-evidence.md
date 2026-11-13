@@ -2,7 +2,7 @@
 
 `pnpm drill` records, signs, verifies, and gates the human drills that the
 release checklists require (snapshot restore and fork repair,
-multi-host blob fetch, public-address traversal, alert delivery, upgrade, and
+public-address traversal, alert delivery, upgrade, and
 external review). It turns "we ran the drill" into an offline-verifiable bundle
 bound to one release commit. It is a bookkeeping and tamper-evidence tool; it
 does not run any drill.

@@ -12,8 +12,8 @@ not replace an external security review or operator pilot.
 pnpm test:fuzz
 ```
 
-The checked-in seeds cover arbitrary bounded canonical CBOR, mutations of the
-transaction-result envelope, and arbitrary bounded SQL compiler input. Every
+The checked-in seeds cover arbitrary bounded canonical CBOR and mutations of
+the signed transaction program encoding. Every
 accepted mutation must re-encode byte-for-byte; rejected inputs must fail with
 an ordinary error rather than terminate the process. Seeds and case counts are
 fixed so CI failures reproduce locally. These tests complement, rather than
@@ -38,7 +38,7 @@ pnpm test:soak
 
 Both commands repeatedly append transactions, inject older predecessors,
 replay suffixes, close and reopen the native repository, and verify the exact
-protected log and application row count. The JSON report splits deterministic
+`chronolog_transactions` log and application row count. The JSON report splits deterministic
 workload/replay/state evidence from operational wall time, RSS, and repository
 bytes. Compare operational values only on equivalent release hardware; compare
 the deterministic section everywhere.
@@ -123,23 +123,19 @@ through the offline signed-snapshot workflow described next.
 Signed snapshot manifests and the offline snapshot CLI now provide exact
 archive hashing, signer/group/manifest/rollback checks, independent staged
 Dolt/log validation, atomic database replacement with backup, derived-state
-rebuild, and signed-head-bound fork repair. Content-addressed blob stores
-provide local chunk integrity. Opt-in cross-node retrieval uses authenticated
-HTTPS, bounded exact-digest fetches, and a verified local read-through cache;
-automatic distributed garbage collection remains intentionally absent.
+rebuild, and signed-head-bound fork repair.
 
 ## Outstanding release gates
 
 - previous-release-to-candidate upgrade evidence (self-verifying Linux/macOS
   artifacts, same-build replacement, SBOM, provenance, and CI attestations are
   implemented);
-- macOS/Windows OS key providers and hardware-backed custody policy (Linux
-  Secret Service migration and independent recovery export/sign/purge tooling
-  are implemented; the pilot ceremony remains required);
-- production drill evidence for trusted snapshot import/fork repair and
-  multi-host large-payload retention/availability;
-- witnessed pilot execution of the sizing, alerting, traversal, recovery,
-  restore, repair, blob, and upgrade runbook;
+- verified macOS/Windows OS key providers and hardware-backed custody (Linux
+  Secret Service migration is implemented);
+- cross-platform (Linux/macOS) replay comparison of the pinned engine build;
+- production drill evidence for trusted snapshot import and fork repair;
+- witnessed pilot execution of the sizing, alerting, traversal, restore,
+  repair, and upgrade runbook;
 - resolution or explicit acceptance of every finding in the
   [internal threat review](security-threat-review.md);
 - an independent external security review of the release candidate.

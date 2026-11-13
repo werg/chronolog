@@ -1,159 +1,80 @@
 # Implementation Status
 
-Chronolog is an unreleased prototype with one signed SQL transaction format
-and one consensus execution path. It has application-facing SQL migration
-tooling, but no stored-data compatibility decoder or protocol migration path.
-The exact working and gated SQLite boundary is machine-readable in the
-[compatibility ledger](sqlite-compatibility-ledger.json).
+Chronolog is an unreleased prototype with one signed transaction format and
+one execution path. There is no stored-data compatibility decoder or protocol
+migration path. The contract is
+[Specification 10](implementation-specs/10-deterministic-sql-transactions.md)
+and the [design](design.md).
 
 ## End-to-end path
 
 Implemented and covered by executable tests:
 
-- exact signed SQL source, canonical typed bindings, mandatory SQL
-  preconditions, and ordered body statements;
-- canonical scalar, ordered, multiset, and set results, plus versioned accepted
-  transaction result envelopes and domain-separated digests;
-- a SQLite 3.53 grammar parser pinned through `sqlite3-parser@0.7.1`, with the
-  runtime pinned to the SQLite 3.54 DoltLite build, unknown syntax failing
-  closed, and a differential corpus covering all 57 classified SQL families;
-- semantic compilation of one statement at a time, exact SQLite parameter
-  numbering, protected-object/effect analysis, deterministic function gates,
-  ordering checks, stable diagnostics, and whole-program validation;
-- separate local read-only SQLite and deterministic consensus SQL profiles;
-- an authorizer backstop that denies protected state, attachments, transaction
-  control, temporary state, unsafe pragmas/functions, and direct Dolt control;
-- sequential DDL and DML in one candidate transaction, including tables,
-  indexes, views, triggers, `ALTER`, drops, ordinary mutations, and bounded DML
-  `RETURNING` results;
-- empty-schema genesis, atomic schema/data rollback, prefix-catalog visibility,
-  Dolt checkpoints, suffix replay, restart/reopen, and accepted/rejected outcome
-  changes after late predecessors;
-- protected accepted/rejected transaction-log rows with phase,
-  precondition/statement attribution, result envelope version, bytes, and
-  digest;
-- SQL observation, expectation, assertion, statement, validation, rebase,
-  local/live query, outcome, and result RPCs;
-- TypeScript `query`, `observe`, `expect`, `assert`, and `exec` APIs accepting
-  conventional `{ sql, parameters }` statements, with exact result-download
-  verification and draft/statement provenance checks;
-- checksummed application migration history, exact/minimum signed schema
-  assumptions, revision-pinned catalog inspection/diffing, advisory TypeScript
-  bindings, migration/schema live resources, and CLI status/apply/wait flows;
-- replicated signed governance events for live capability grants/revocations,
-  authenticated feed binding, validator changes, HPKE epoch rotation, scoped
-  history access, and 2-of-3 administration recovery;
-- SQL-first daemon, CLI, React hooks, examples, and chaos workloads; and
-- canonical CBOR, signatures, capability/recovery primitives, encryption,
-  durable allow-listed SSB replication, deterministic ordering, validator
-  admission, checkpoints, and settlement evidence from the existing protocol
-  layers.
-
-There is no authoritative application schema manifest, schema digest,
-`schema.cbor`, signed query/mutation IR, special schema transaction, or legacy
-SQL/IR RPC pair. Logical-value and execution-manifest codecs remain internal
-building blocks for the SQL protocol and compiler.
-
-## Current deterministic SQL boundary
-
-The compiler currently admits ordinary `SELECT`, values-based `INSERT`,
-`UPDATE`, `DELETE`, supported read-only catalog pragmas, and streamed DDL. It
-also admits scalar subqueries, unordered/nested `LIMIT`, `INSERT ... SELECT`,
-`CREATE TABLE ... AS SELECT`, and `UPDATE ... FROM` when a syntactic
-at-most-one-row proof removes every row choice; broader forms fail closed.
-Representative-stable `DISTINCT`, grouping, distinct compounds, `MIN`/`MAX`,
-peer-stable `rank`/`dense_rank`, and value-completed ordered `group_concat`
-have similarly explicit structural proofs, plus column proofs from the schema
-the statement executes against (rowid aliases, STRICT INT/TEXT/BLOB and
-TEXT-affinity columns with BINARY collation). Admission defers those column
-proofs; execution decides them against the replayed catalog.
-Ordered results require an authored outer `ORDER BY`; the executor completes
-ties with canonical returned-column keys. Unordered results are canonicalized
-as tagged row sets or multisets. All authored statements are recompiled by the
-node before publication and again under the same profile during replay.
-
-The following valid SQLite surfaces remain explicitly gated pending the named
-determinism/conformance work:
-
-- an exact SQLite 3.54 parser grammar (the current measured 3.53/3.54 boundary
-  is executable through `pnpm conformance:sqlite`);
-- catalog-dependent scalar-subquery uniqueness and multirow nested/unordered
-  `LIMIT` choices;
-- representative-sensitive `DISTINCT`, grouping, compounds, and `MIN`/`MAX`;
-  peer-sensitive windows such as `row_number`, `ntile`, `lag`, and `lead`; and
-  floating or incompletely ordered aggregates;
-- multirow `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, and `UPDATE ...
-  FROM` without an input/source uniqueness proof, plus order-sensitive conflict
-  modes;
-- external registered functions/collations, virtual tables, and non-pragma
-  table-valued functions;
-- `ANALYZE` and `REINDEX` replay conformance;
-- ambient-state surfaces: `MATCH`/`REGEXP` operators (until registered
-  extensions exist), current-time literals (`CURRENT_TIME` and friends, until
-  signed time is wired), `random()`/`randomblob()`, and the connection-state
-  functions `changes()`, `last_insert_rowid()`, and `total_changes()`.
-
-Transaction control, attachment, temporary objects, stateful pragmas, dynamic
-extensions, Dolt control functions, physical maintenance such as `VACUUM`, and
-protected-state access are prohibited rather than merely unimplemented.
+- transactions as ordered lists of ordinary SQLite statements with positional
+  or named bindings over SQLite's five storage classes;
+- a pinned native DoltLite engine with per-transaction fixed inputs (`'now'` =
+  author timestamp, `random()` seeded from the transaction id, UTC
+  `localtime`, zeroed connection counters) and native `chronolog_assert`;
+- an authorizer block-list (attachments, transaction control, writing pragmas,
+  temporary objects, Dolt functions and tables, `chronolog_*` writes,
+  `total_changes`, `sqlite_offset`, storage-reading modules); everything else
+  the engine supports is allowed, including DDL, triggers, views, generated
+  columns, windows, JSON, FTS5, R-tree and sqlite-vec;
+- accepted/rejected outcomes with a rejection code (`assert:<code>`,
+  `constraint`, `step_limit`, `denied`, `prepare`, `binding`, `too_large`,
+  `mismatch`, `error`, `manifest_mismatch`) and failing statement index,
+  recorded in the replicated `chronolog_transactions` table;
+- empty-schema genesis, atomic rollback of rejected transactions, Dolt
+  checkpoints, suffix replay, restart/reopen, and outcome changes after late
+  predecessors;
+- signed hash-chained feeds in one SQLite file per node, pull replication over
+  the SSB secret handshake, relay through any connected member, fork evidence
+  and quarantine;
+- replicated signed governance: capability grants/revocations, validator
+  changes with a monotonic timestamp floor, HPKE epoch rotation, explicit
+  historical access, joining and forking groups;
+- validator attestation and heartbeats, deterministic ordering, settlement
+  evidence and watermarks;
+- `transaction.submit`, outcome, settlement, local and live query RPCs; the
+  TypeScript client, React hooks, CLI, daemon, examples and chaos workloads.
 
 ## Daemon operational profile
 
 The generated daemon configuration bootstraps a signed single-participant
 genesis and persists its private governance material with mode `0600`. The
-daemon replays and follows capability and epoch-manifest messages,
-uses revisioned capability snapshots for authorization, and decrypts retained
-epochs through a live key ring. Snapshot readers receive only epochs published
-while authorized; audit readers may receive explicit historical rewraps.
-There is no in-protocol recovery: a lost root key or validator quorum is
-handled by forking the group or out of band.
+daemon replays and follows capability and epoch-manifest messages, uses
+revisioned capability snapshots for authorization, and decrypts retained
+epochs through a live key ring. Every active reader receives new epochs;
+historical epochs only through an explicit administrator rewrap. There is no
+in-protocol recovery: a lost root key or validator quorum is handled by
+forking the group or out of band.
 
 The first pilot deployment target is the native daemon. Its coordinator and
 publication adapter must match the direct native replay digest under
 `pnpm conformance:production`; process-level publication crashes are exercised
 on both sides of the atomic Dolt head move. The transport-neutral workerd/CAS
-contracts remain experimental and are not advertised by the active manifest.
-See [production execution](production-execution.md) for the decision and the
+contracts remain experimental. See
+[production execution](production-execution.md) for the decision and the
 criteria for reconsidering workerd.
 
-`CHRONOLOG_STATIC_MEMBERSHIP_FILE` is retained as an explicit legacy/testing
-override. Self-verifying native distributions and `chronolog doctor` have
-shipped. Remaining release-hardening work is verification of the non-Linux and
-hardware key providers on real platforms, and prior-release upgrade evidence.
+`CHRONOLOG_STATIC_MEMBERSHIP_FILE` is a testing override. Self-verifying native
+distributions and `chronolog doctor` have shipped. Linux pilots may set
+`CHRONOLOG_SECRET_STORE=secret-service`.
 
-Linux pilots may set `CHRONOLOG_SECRET_STORE=secret-service`; the daemon then
-atomically migrates inline identity, epoch, and governance-recipient private
-material into Secret Service references and fails closed on a missing secret.
-
-Feed author/sequence/previous conflicts are persisted and quarantine the node;
-quarantined nodes report degraded, refuse new publication, and expose bounded
-Prometheus metrics and an operator doctor check. Signed snapshot archives have
-staged Dolt/log validation, atomic replacement, and signed-head fork repair.
-Opt-in content-addressed envelope blobs support authenticated bounded inter-node
-fetch and immutable retention. Public SSB discovery can require an
-external-vantage address/key reachability proof and degrades health without it.
+Feed conflicts quarantine the feed; quarantined nodes report degraded, refuse
+new publication, and expose metrics and a doctor check. Signed snapshot
+archives have staged validation, atomic replacement, and signed-head fork
+repair. Public SSB discovery can require an external-vantage reachability
+proof and degrades health without it.
 
 ## Release gates outside this prototype
 
-- exact SQLite 3.54 parser synchronization, or continued executable proof of
-  the measured 3.53/3.54 compatibility boundary;
-- validation of the configured Linux/macOS portable replay digest comparison,
-  plus deterministic resource characterization on release hardware;
+- cross-platform replay comparison (Linux/macOS) of the pinned engine build,
+  plus resource characterization on release hardware;
 - non-Linux/hardware-backed key providers and external security review; and
-- witnessed pilot evidence for prior-version upgrade,
-  snapshot/fork repair, multi-host blobs, traversal, sizing, and alerting.
+- witnessed pilot evidence for prior-version upgrade, snapshot/fork repair,
+  traversal, sizing, and alerting.
 
-The current internal authorizer/protocol assessment and unresolved release
-findings are recorded in [the threat review](security-threat-review.md).
-
-The broader delivery criteria remain in the
-[conformance specification](archive/implementation-specs/09-conformance-delivery.md),
-[deterministic SQL specification](implementation-specs/10-deterministic-sql-transactions.md),
-and [transaction result specification](implementation-specs/11-transaction-results-and-ordered-mutations.md).
-
-## Active roadmap
-
-The ordered implementation queue and acceptance criteria live in
-[`upcoming.md`](../upcoming.md). The active tranche is release and operational
-hardening. Historical relational-IR plans are kept for design context but are
-not the active transaction roadmap.
+The internal authorizer/protocol assessment and unresolved findings are in
+[the threat review](security-threat-review.md). The ordered queue is
+[`upcoming.md`](../upcoming.md).

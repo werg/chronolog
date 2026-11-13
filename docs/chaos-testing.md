@@ -78,28 +78,29 @@ validator identity to that node's exact authenticated SSB feed ID through
 otherwise valid signed candidate, attestation, or heartbeat through a different
 feed is rejected.
 
-Workers choose from a seeded mix of transactions:
+Workers choose from a seeded mix of transactions. Every assumption is an
+ordinary `chronolog_assert` statement at the top of the transaction:
 
-1. isolated v1→v2 migration chains that record version/checksum history,
-   backfill existing rows, replace an index/view/trigger set, and query the
-   migrated projection and trigger audit;
+1. isolated v1→v2 migration chains (guarded by a schema-version assertion)
+   that record version history, backfill rows, replace an index/view/trigger
+   set, and query the migrated projection;
 2. deliberately failing migrations that create tables, indexes, views,
-   triggers, and history before a constraint error, proving atomic catalog and
-   history rollback;
-3. concurrent legacy-client inserts that omit additive v2 columns and
-   current-client inserts that populate them, both guarded by explicit signed
-   schema-version assumptions;
-4. observed balance updates with a mandatory `expect` precondition and an
-   append-only ledger entry;
-5. two-account transfers with two observations, two expectations, two ordered
-   updates, and matching debit/credit ledger legs;
-6. ordered `UPDATE ... RETURNING ... ORDER BY ... LIMIT ... OFFSET` mutations;
-7. empty `RETURNING` result sets;
+   triggers, and history before a constraint error, proving atomic rollback;
+3. concurrent legacy-client and current-client inserts, each guarded by a
+   schema-version assertion;
+4. balance updates that read the balance locally, assert it is unchanged, and
+   append a ledger entry;
+5. two-account transfers with two balance assertions, two updates, and
+   matching debit/credit ledger legs;
+6. `UPDATE ... WHERE id IN (SELECT ... ORDER BY ... LIMIT ... OFFSET)`
+   touches;
+7. empty `RETURNING` statements;
 8. inserts containing text, blobs, and nullable values;
-9. multi-statement `CREATE TABLE`, `ALTER TABLE`, and ordered schema queries;
-10. deliberately false assertions that must produce precondition rejections;
-11. deliberately duplicated primary keys after a large sentinel update, which
-   must produce an attributed execution rejection and roll back the update.
+9. multi-statement `CREATE TABLE`, `ALTER TABLE`, and catalog queries;
+10. deliberately false assertions that must be rejected with
+   `assert:intentional_false`;
+11. duplicated primary keys after a large sentinel update, which must be
+   rejected with `constraint` and roll back the update.
 
 The default percentages favor contended balance changes and transfers while
 still exercising every class above. Short runs begin with one attempt of every
@@ -108,17 +109,9 @@ If the nominal duration expires while a slower worker still owns a coverage
 slot, that worker completes its remaining slots before stopping.
 A scenario can override the mix with sparse
 `workload.operationWeights`; omitted kinds then have weight zero. It can also
-set `maximumTransfer` and `resultSampleSize`. Every invocation records its
-operation kind, arguments, publication ID, expected outcome class, and local
-submission failure.
-
-Schema assumptions use the same signed precondition path as data assumptions.
-`schemaVersionPrecondition(component, version)` builds a deterministic
-`EXISTS` query against `chaos_schema_migrations`, including a useful application
-label. Migration and client operations use it with `draft.assert(...)`, so a
-schema mismatch is replay-visible and attributed instead of becoming an
-unexplained body failure. Run output and `summary.json` report counts by
-operation kind, making missing migration coverage immediately visible.
+set `maximumTransfer`. Every invocation records its operation kind,
+arguments, publication ID, expected outcome, and local submission failure.
+Run output and `summary.json` report counts by operation kind.
 
 The random seed fixes workload choices and fault selection. OS scheduling,
 network timing, cryptographic identities, and wall-clock transaction times are
@@ -166,13 +159,8 @@ requires three consecutive stable samples. A passing run proves:
 - every admitted log outcome is terminal (`accepted` or a replay-visible
   rejection);
 - every admitted workload transaction has an outcome allowed by its generated
-  intent, including exact assertion and constraint rejection codes;
-- accepted rows have a versioned, non-empty result envelope and no failure
-  attribution, while rejected rows have no result envelope and have internally
-  consistent precondition, statement, or finalize attribution;
-- a configurable balanced sample of accepted and rejected publications is
-  queried through `transaction.getResult`; accepted envelopes must decode and
-  rejected transactions must return `result_not_available`;
+  intent, including exact rejection codes and failing statement indexes;
+- accepted rows have no rejection code, and rejected rows have a code;
 - each account balance and committed-update version exactly matches the sum and
   count of its append-only ledger legs;
 - neither the million-unit rejection sentinel nor an extra reserved ledger row
@@ -234,7 +222,7 @@ known gap, so connected peer counts alone do not prove that a node is current.
 The offline inspector reports the corresponding per-feed sequences and gaps. Use
 `metrics.ndjson` to find
 CPU starvation, memory growth, network stalls, or write spikes. Node stores are
-retained precisely so an SSB feed, control store, or DoltLite branch can be
+retained precisely so the feed store, control store, or DoltLite branch can be
 opened offline without trying to reproduce a transient failure first.
 
 The runner uses host UID/GID in containers so developers can inspect and remove
@@ -246,11 +234,6 @@ reaper is a second line of defense for an abruptly killed runner.
 The container profiles exercise persistence and catch-up paths that ordinary
 unit tests do not. During development they exposed and now regress:
 
-- SSB-DB2 acknowledging an in-memory append before its base log was drained;
-- `SIGKILL` rolling an author's mutable append-log tail back after peers had
-  already replicated it, fixed by a checksummed tail-block journal plus an
-  exact signed-author-tail recovery store;
-- stale disposable DB2 indexes and live-hook delivery gaps after restart;
 - an admissible persisted control order getting ahead of its derived DoltLite
   revision, fixed by startup reconciliation and bounded retry;
 - full rollback on a replay rejection restoring DoltLite's previous branch

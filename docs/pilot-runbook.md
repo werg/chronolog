@@ -14,7 +14,7 @@ release-blocking.
    `CHRONOLOG_DATA_DIR` owned by the daemon account.
 3. On Linux, install `libsecret-tools`, unlock a dedicated Secret Service
    collection, and set `CHRONOLOG_SECRET_STORE=secret-service`.
-4. Supply RPC and blob-peer bearer tokens through the supervisor's secret
+4. Supply the RPC bearer token through the supervisor's secret
    environment. Non-loopback RPC without a token fails startup.
 5. Supervise graceful `SIGTERM`, bounded restarts, and an open-file limit based
    on characterization. Never run two processes on one data directory.
@@ -45,22 +45,21 @@ mapping.
    Confirm removed identities cannot write, validate, or decrypt new epochs.
 4. Run governance status, replication, and doctor on every participant. Require
    the expected revision digest/epoch/roles and no gaps or quarantines.
-5. Apply checksummed migrations, wait for settlement/watermark, inspect the
-   pinned catalog, and run old/new client transactions with explicit schema
-   assumptions.
+5. Submit the application's DDL as ordinary transactions, wait for
+   settlement/watermark, inspect the schema, and run old/new client
+   transactions whose assumptions are written with `chronolog_assert`.
 
 ## Capacity and alerting
 
-Run characterization on the actual storage class with pilot-like rows, result
+Run characterization on the actual storage class with pilot-like rows, record
 sizes, replay depth, and peer count. Record p50/p95/p99 operational latency,
-RSS, repository/blob bytes, replay duration, and free-space headroom. Do not
+RSS, repository and `feeds.sqlite` bytes, replay duration, and free-space headroom. Do not
 present one host's measurements as protocol limits.
 
 Alert when `chronolog_up == 0`, quarantined feeds or gaps are non-zero,
 materialization exceeds the characterized p99 window, revision progress stalls
 under traffic, RSS crosses budget, or free space falls below the larger of 20%
-and two snapshot sizes. Blob deployments also alert on remote fetch failures
-and size for indefinite immutable retention.
+and two snapshot sizes.
 
 ## Backup, restore, and upgrade
 
@@ -72,8 +71,7 @@ and size for indefinite immutable retention.
 3. Before upgrade, back up data/secrets, unpack beside the old package, verify
    it, and run the explicit previous-package-to-candidate upgrade drill.
 4. Start the candidate on unchanged data. Require stable group/node/SSB/
-   manifest/governance/epoch identities, replication convergence, migration
-   status, and an accepted canary. Downgrade only when release notes declare
+   manifest/governance/epoch identities, replication convergence, and an accepted canary. Downgrade only when release notes declare
    storage compatibility; otherwise restore the verified backup.
 
 ## Recovery and incidents
@@ -84,17 +82,15 @@ and size for indefinite immutable retention.
 - For a feed fork, stop and retain the original directory. Obtain the signed
   snapshot and complete prefix independently, then use snapshot repair. Keep
   both branch IDs, quarantine evidence, plan, backup, and rebuild diagnostics.
-- For blob loss, never fabricate or bypass a digest. Restore an exact retained
-  copy or authenticated peer; unresolved chunks remain pending.
 - For key/token exposure, revoke capabilities, rotate epoch and service tokens,
   and fork the group if the root key itself is exposed.
 
 ## Mandatory drills and exit evidence
 
-Witness: clean install; two-node onboarding; schema migration with old/new
+Witness: clean install; two-node onboarding; a schema change with old/new
 clients; reader removal/rotation;
 previous-to-candidate upgrade when a prior release exists; snapshot restore;
-synthetic fork repair; cache-miss multi-host blob fetch; externally verified
+synthetic fork repair; group fork; externally verified
 traversal; crash/restart; and alert delivery.
 
 Attach conformance, fuzz/sanitizer/crash/soak results, SBOM, provenance,
