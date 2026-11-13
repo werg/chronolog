@@ -54,6 +54,29 @@ Residual exposures:
 - A `command` helper is fully trusted: it sees every secret and reference, and
   it alone is responsible for PIN handling, durability, and non-extractability.
 
+## Schema administration and the `group` collective
+
+Capability roles decide who may author, validate and read. What a writer may
+do to the database's rows is decided inside the database
+([owner-controlled rows](design-owner-rows.md)):
+
+- The genesis root administrator is the first admin of the **`group`
+  collective** (id: 32 zero bytes), created when the materialized database is
+  initialized. The daemon reads the root key from the genesis
+  (`rootAdminPublicKey`), or from `rootAdministrator` in a static membership
+  file.
+- Active admins of the `group` collective are the **schema administrators**.
+  Only they may run DDL (tables, indexes, views, app triggers, `ALTER TABLE`)
+  and register tables. A group admin adds another with a `set_members` step
+  (`{"platform":"set_members","collectiveId":"group","changes":[{"member":KEY,"role":"admin"}]}`);
+  the new admin joins by submitting `accept_membership` for `group`.
+- Schema administrators are not data owners. They cannot update or delete
+  other keys' rows, or re-own them; they can only narrow access with app
+  triggers.
+- Revoking a node's `writer` capability stops its new transactions. Rows it
+  owns stay owned by its key; a planned key change is a bulk transfer signed by
+  the old key and accepted by the new one.
+
 ## Joining a group
 
 Every node of a governed group must use the same signed genesis and group
@@ -105,17 +128,30 @@ CHRONOLOG_DATA_DIR=/var/lib/fork pnpm group verify-fork /secure/snapshot-r120
 
 `fork` verifies the archive exactly like a snapshot import (file evidence, the
 operator-chosen signer, execution manifest, materialized evidence) and makes
-this node the fork's root administrator. It writes `fork-seed.json`: ordinary
-transactions that recreate the snapshot's application tables, rows (in
-foreign-key order), indexes, views and triggers. Each batch asserts that it has
-not been applied yet and records itself in a `fork_seed` table, so `seed` can be
-rerun safely after an interruption. Every replica of the fork replays the seed
-like any other transaction.
+this node the fork's root administrator. It writes `fork-seed.json`
+(`chronolog-fork-seed-v4`): transactions that recreate and register the
+snapshot's application tables, then write their rows with the `seed_rows`
+platform operation, in foreign-key order and keeping every row's
+`chronolog_owner`, then the teams, memberships, grants and open transfer
+offers, and finally the indexes, views and app triggers (after the rows, so
+they do not fire during seeding). Each batch asserts that it has not been
+applied yet and records itself in a `fork_seed` table, so `seed` can be rerun
+safely after an interruption. Every replica of the fork replays the seed like
+any other transaction.
+
+`seed_rows` is accepted only from the fork's root administrator, and only until
+the plan's last batch (`end_seeding`) or the first accepted transaction by any
+other key, whichever comes first: **seed the fork before other participants
+write to it.** After `end_seeding` not even the root can seed rows. Members keep their keys in the fork, so they still
+own their rows. The old group's `group` collective is not carried over; the
+fork's root administrator is its only schema administrator until it adds
+others.
 
 Limits: every table needs a primary key; foreign-key cycles between tables and
 virtual tables are refused; Dolt commit history and `AUTOINCREMENT` counters of
-the old group are not carried over; `verify-fork` compares application tables
-only.
+the old group are not carried over. `verify-fork` compares every application
+table, including owners, and the ownership state: registered tables, teams,
+memberships, grants and transfer offers.
 
 ## Live operations
 

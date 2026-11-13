@@ -34,6 +34,13 @@ export interface RpcSqlStatement {
   readonly bindings: readonly RpcSqlBinding[]
 }
 
+/** A platform operation (grant, transfer, register a table, …) as its canonical CBOR encoding. */
+export interface RpcPlatformStep {
+  readonly platform: Uint8Array
+}
+
+export type RpcProgramStep = RpcSqlStatement | RpcPlatformStep
+
 export interface RevisionMetadata {
   readonly groupId: GroupId
   readonly eventSetRevision: Revision
@@ -87,8 +94,9 @@ export interface StreamStatusRequest extends GetStatusRequest { readonly resumeA
 export interface SubmitTransactionRequest {
   readonly groupId: GroupId
   readonly requestId: RequestId
-  readonly statements: readonly RpcSqlStatement[]
-  /** Repeating a key with the same statements returns the original submission. */
+  /** SQL statements and platform operations, executed in order as this node's key. */
+  readonly steps: readonly RpcProgramStep[]
+  /** Repeating a key with the same steps returns the original submission. */
   readonly idempotencyKey?: string
 }
 export interface SubmitTransactionResponse {
@@ -103,9 +111,9 @@ export interface SubmitTransactionResponse {
 
 export type TransactionPhase = 'candidate_published' | 'collecting_attestations' | 'validation_threshold_met' | 'admissible' | 'replicated' | 'accepted' | 'rejected'
 export interface TransactionRejection {
-  /** `assert:<code>`, `constraint`, `step_limit`, `denied`, … */
+  /** `assert:<code>`, `policy:<table>:<command>`, `platform:<reason>`, `constraint`, `denied`, … */
   readonly code: string
-  /** Index of the failing statement; null for whole-transaction rejections. */
+  /** Index of the failing step; null for whole-transaction rejections. */
   readonly statementIndex: number | null
 }
 export type TransactionResult =

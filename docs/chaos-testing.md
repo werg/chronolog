@@ -100,7 +100,17 @@ ordinary `chronolog_assert` statement at the top of the transaction:
 10. deliberately false assertions that must be rejected with
    `assert:intentional_false`;
 11. duplicated primary keys after a large sentinel update, which must be
-   rejected with `constraint` and roll back the update.
+   rejected with `constraint` and roll back the update;
+12. an `owner_probe` update of every profile row, accepted only while all of
+   them belong to the signer and otherwise rejected with
+   `policy:chaos_profiles:update` (never a partial update).
+
+Writes come from mixed authors under owner-controlled rows. The first node is
+the root administrator: it creates and registers the schema, owns the shared
+`accounts` rows and grants every other node `update` on them. DDL operations
+(migrations and `ddl_sequence`) are always submitted through it; every other
+operation goes to a random node, which owns the ledger, document and profile
+rows it inserts.
 
 The default percentages favor contended balance changes and transfers while
 still exercising every class above. Short runs begin with one attempt of every
@@ -161,6 +171,10 @@ requires three consecutive stable samples. A passing run proves:
 - every admitted workload transaction has an outcome allowed by its generated
   intent, including exact rejection codes and failing statement indexes;
 - accepted rows have no rejection code, and rejected rows have a code;
+- the generated platform triggers and views (`chronolog_*`) are identical on
+  every node;
+- every `chronolog_owner` in every registered table is a node key or a
+  collective;
 - each account balance and committed-update version exactly matches the sum and
   count of its append-only ledger legs;
 - neither the million-unit rejection sentinel nor an extra reserved ledger row

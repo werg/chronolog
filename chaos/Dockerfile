@@ -18,11 +18,9 @@ COPY packages/canonical/package.json packages/canonical/package.json
 COPY packages/capabilities/package.json packages/capabilities/package.json
 COPY packages/chaos/package.json packages/chaos/package.json
 COPY packages/client/package.json packages/client/package.json
-COPY packages/compiler-sqlite/package.json packages/compiler-sqlite/package.json
 COPY packages/control-store/package.json packages/control-store/package.json
 COPY packages/crypto/package.json packages/crypto/package.json
-COPY packages/ir/package.json packages/ir/package.json
-COPY packages/kernels/package.json packages/kernels/package.json
+COPY packages/materializer/package.json packages/materializer/package.json
 COPY packages/materializer-doltlite/package.json packages/materializer-doltlite/package.json
 COPY packages/node-core/package.json packages/node-core/package.json
 COPY packages/protocol/package.json packages/protocol/package.json

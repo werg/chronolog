@@ -1,6 +1,8 @@
 import { sha256, utf8 } from '@chronolog/canonical'
 import {
   assertValidSqlTransactionProgram,
+  decodePlatformOp,
+  type ProgramStep,
   type SqlStatement,
   type SqlTransactionProgram,
   type SqlValue,
@@ -30,6 +32,7 @@ import type {
   RevokeCapabilitiesResponse,
   ReplicationStatus,
   RevisionMetadata,
+  RpcProgramStep,
   RpcSqlStatement,
   SettlementEvidence,
   StreamOutcomeRequest,
@@ -225,7 +228,7 @@ export class NodeRpcService implements ChronologRpcService {
 
   async submitTransaction(request: SubmitTransactionRequest, context: RpcCallContext): Promise<SubmitTransactionResponse> {
     this.#assertGroup(request.groupId)
-    const program: SqlTransactionProgram = { version: 1, statements: decodeStatements(request.statements) }
+    const program: SqlTransactionProgram = { version: 2, steps: decodeSteps(request.steps) }
     try { assertValidSqlTransactionProgram(program) } catch (error) {
       throw new ChronologRpcError('invalid_argument', `Invalid SQL transaction: ${errorCode(error, 'SQL_PROGRAM_INVALID')}`, { cause: error })
     }
@@ -250,7 +253,7 @@ export class NodeRpcService implements ChronologRpcService {
     if (request.idempotencyKey === undefined) return operation()
     this.#prune()
     const key = `${principal(context)}\0${request.groupId}\0${request.idempotencyKey}`
-    const fingerprint = stableFingerprint({ statements: request.statements })
+    const fingerprint = stableFingerprint({ steps: request.steps })
     const existing = this.#publications.get(key)
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) throw new ChronologRpcError('already_exists', 'Idempotency key is already in use')
@@ -410,9 +413,21 @@ export class NodeRpcService implements ChronologRpcService {
   }
 }
 
-function decodeStatements(values: readonly RpcSqlStatement[]): SqlStatement[] {
-  if (!(values instanceof Array)) throw invalid('statements must be an array')
-  return values.map((value) => {
+function decodeSteps(values: readonly RpcProgramStep[]): ProgramStep[] {
+  if (!(values instanceof Array)) throw invalid('steps must be an array')
+  return values.map((value): ProgramStep => {
+    if (typeof value === 'object' && value !== null && 'platform' in value) {
+      if (!(value.platform instanceof Uint8Array)) throw invalid('Platform step must be canonical CBOR bytes')
+      try { return decodePlatformOp(value.platform) } catch (error) {
+        throw new ChronologRpcError('invalid_argument', `Invalid platform step: ${errorCode(error, 'PLATFORM_OP_INVALID')}`, { cause: error })
+      }
+    }
+    return decodeStatement(value)
+  })
+}
+
+function decodeStatement(value: RpcSqlStatement): SqlStatement {
+  {
     const bindings: RpcSqlStatement['bindings'] = value?.bindings
     if (typeof value?.sql !== 'string' || !(bindings instanceof Array)) throw invalid('SQL statement is malformed')
     return {
@@ -426,7 +441,7 @@ function decodeStatements(values: readonly RpcSqlStatement[]): SqlStatement[] {
         value: rpcValueToSqlValue(binding.value),
       })),
     }
-  })
+  }
 }
 
 /** The JSON-safe RPC value (integer as decimal text) as a protocol SqlValue. */

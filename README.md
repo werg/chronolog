@@ -12,6 +12,14 @@ replay from where it belongs. Validators never sign database states.
   dialect or migration system. Assumptions are SQL statements, usually
   `SELECT chronolog_assert(condition, 'code')`; a failing statement rejects the
   whole transaction.
+- **Owner-controlled rows.** Every application table is registered and gets a
+  `chronolog_owner` column stamped with the signer of the insert, stored as a
+  small integer id (`chronolog_principals` maps ids to keys).
+  Generated triggers let only the owner, a collective it belongs to, or a key
+  it granted access update or delete a row; administrators included. Schema
+  administrators may run DDL and write app triggers that narrow, never widen,
+  those rights. Violations abort the whole transaction
+  ([design](docs/design-owner-rows.md)).
 - **Determinism from a pinned engine.** Every replica runs the same engine
   build; `'now'`, `random()` and `localtime` are fixed per transaction; a short
   authorizer block-list keeps statements inside the database.
@@ -38,7 +46,7 @@ verifies its SHA-256 and compiles the patched binding.
 ```sh
 pnpm install
 pnpm test
-pnpm demo        # in-memory node; a late predecessor flips an outcome on replay
+pnpm demo        # two in-memory nodes: an ownership rejection, a grant, and a replay flip
 pnpm dev         # persistent daemon on http://127.0.0.1:8787, data in .chronolog/
 ```
 
@@ -51,30 +59,50 @@ pnpm cli transact @transaction.json
 pnpm cli outcome TRANSACTION_ID
 ```
 
-A transaction file lists statements; bindings are JSON scalars or tagged
-values (`{"kind":"integer","value":"9007199254740993"}`,
-`{"kind":"real","value":1}`, `{"kind":"blob","value":"BASE64URL"}`):
+A transaction file lists steps: SQL statements and platform operations.
+Bindings are JSON scalars or tagged values
+(`{"kind":"integer","value":"9007199254740993"}`, `{"kind":"real","value":1}`,
+`{"kind":"blob","value":"BASE64URL"}`). The daemon's own node is the group's
+root administrator, so it may create and register a table:
 
 ```json
 {
-  "statements": [
-    { "sql": "SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = ?) >= ?, 'insufficient_funds')", "bindings": [1, 50] },
-    { "sql": "UPDATE accounts SET balance = balance - ? WHERE id = ?", "bindings": [50, 1] }
+  "steps": [
+    { "sql": "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT" },
+    { "platform": "register_table", "table": "accounts" },
+    { "sql": "INSERT INTO accounts (id, balance) VALUES (?, ?)", "bindings": [1, 100] }
   ],
   "wait": true
 }
 ```
 
+The row now belongs to this node's key. Another node's
+`UPDATE accounts SET balance = 0 WHERE id = 1` is rejected with
+`policy:accounts:update`, until the owner grants it access:
+
+```json
+{ "steps": [{ "platform": "grant", "table": "accounts", "grantee": "BOB_KEY_BASE64URL", "operations": ["update"], "rowKey": [1], "columns": ["balance"] }] }
+```
+
 From TypeScript:
 
 ```ts
+import { platformOp } from '@chronolog/client'
+
 const tx = await client.transaction([
-  { sql: "SELECT chronolog_assert(NOT EXISTS (SELECT 1 FROM accounts WHERE id = :id), 'exists')", params: { id: 1 } },
-  { sql: 'INSERT INTO accounts (id, balance) VALUES (:id, :balance)', params: { id: 1, balance: 100 } },
+  { sql: "SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = :id) >= 50, 'insufficient_funds')", params: { id: 1 } },
+  { sql: 'UPDATE accounts SET balance = balance - 50 WHERE id = :id', params: { id: 1 } },
+  platformOp.grant({ table: 'accounts', grantee: bobKey, operations: ['update'], rowKey: [1] }),
 ])
 const outcome = await tx.settled()   // accepted, or rejected with { code, statementIndex }
-const rows = await client.query('SELECT * FROM accounts')
+const rows = await client.query(`SELECT a.id, a.balance, p.key AS owner
+  FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner`)
 ```
+
+`platformOp` also builds collectives (`createCollective`, `acceptMembership`,
+`setMembers`, `leave`), revocations and transfers (`transferRow`,
+`transferAll`, `acceptTransfer`); the CLI accepts the same operations as
+`{"platform": ...}` steps (see `apps/chronolog/src/main.ts`).
 
 Set `CHRONOLOG_URL`, `CHRONOLOG_GROUP_ID` and `CHRONOLOG_TOKEN` for a
 non-default daemon. RPC refuses a non-loopback bind without a token.
@@ -105,7 +133,8 @@ feed repair), `pnpm group fork|verify-fork` (forking a group),
 `chronolog doctor`. See the [pilot runbook](docs/pilot-runbook.md).
 
 `CHRONOLOG_STATIC_MEMBERSHIP_FILE` is a testing override that replaces
-governance with a fixed out-of-band membership file.
+governance with a fixed out-of-band membership file; its `rootAdministrator`
+key is the first schema administrator.
 
 ## Testing
 
@@ -124,13 +153,13 @@ See the [chaos testing guide](docs/chaos-testing.md) and the
 | Package | Responsibility |
 | --- | --- |
 | `canonical` | Strict bounded CBOR, bytes, typed hash domains |
-| `protocol` | Signed messages, SQL program and value codecs, execution manifest, order keys |
+| `protocol` | Signed messages, program (SQL and platform-operation) and value codecs, execution manifest, order keys |
 | `capabilities` | Genesis, grants, revocations, validation policy |
 | `crypto` | HPKE, signed epochs, content encryption |
 | `transport-ssb` | SQLite signed-feed store, replication over the SSB handshake, in-memory simulator |
 | `control-store` | Candidates, attestations, order, heartbeats, settlement evidence |
 | `node-core` | Ingestion, admission, attestation, encryption, orchestration |
-| `materializer-doltlite` | Deterministic SQL execution, Dolt checkpoints, suffix replay, local SQL |
+| `materializer-doltlite` | Deterministic SQL execution, owner-controlled rows (platform operations, generated triggers), Dolt checkpoints, suffix replay, local SQL |
 | `materializer` | Portable materialization contracts shared with the workerd path |
 | `runtime-workerd` | Experimental workerd execution contract ([plan](docs/workerd-reconstruction-plan.md)) |
 | `rpc` | Service contract, in-process and HTTP transports |

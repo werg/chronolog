@@ -28,7 +28,7 @@ function core(index: number): TransactionCore {
     authorTimestampMs: 1_000n + BigInt(index),
     nonce: bytes(0x80 + index),
     executionManifestDigest: manifestDigest,
-    program: { version: 1, statements: [{ sql: `INSERT INTO t VALUES (${index})`, bindings: [] }] },
+    program: { version: 2, steps: [{ sql: `INSERT INTO t VALUES (${index})`, bindings: [] }] },
   }
 }
 

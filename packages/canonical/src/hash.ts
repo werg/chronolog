@@ -8,6 +8,7 @@ export const HASH_DOMAINS = Object.freeze({
   expectation: 'chronolog/expectation',
   module: 'chronolog/module',
   entropy: 'chronolog/entropy',
+  platformObject: 'chronolog/platform-object',
 } as const)
 
 export type HashDomainKey = keyof typeof HASH_DOMAINS

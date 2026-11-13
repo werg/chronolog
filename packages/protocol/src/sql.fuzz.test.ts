@@ -1,18 +1,27 @@
 import { describe, expect, it } from 'vitest'
 
+import { platformOp } from './platform.js'
 import {
   decodeSqlTransactionProgram,
   encodeSqlTransactionProgram,
-  sqlStatement,
-  sqlValue,
   type SqlTransactionProgram,
-} from './sql.js'
+} from './program.js'
+import { sqlStatement, sqlValue } from './sql.js'
+
+const key = (fill: number): Uint8Array => new Uint8Array(32).fill(fill)
 
 const fixture: SqlTransactionProgram = {
-  version: 1,
-  statements: [
+  version: 2,
+  steps: [
     sqlStatement("SELECT chronolog_assert(? > 0, 'positive')", [7n]),
     sqlStatement('INSERT INTO t VALUES (:a, :b, :c, :d)', { a: sqlValue.real(1.5), b: 'text', c: new Uint8Array([1, 2]), d: null }),
+    platformOp.registerTable('t'),
+    platformOp.grant({ table: 't', grantee: key(2), operations: ['update', 'delete'], rowKey: [7n, 'k'], columns: ['b'] }),
+    platformOp.createCollective({ governance: { insert: 'member', update: 'member', delete: 'admin' }, invitees: [key(3)] }),
+    platformOp.setMembers(key(4), [{ member: key(5), role: 'admin' }, { member: key(6), role: 'remove' }]),
+    platformOp.transferRow({ table: 't', rowKey: [1n], toOwner: key(7), carry: true }),
+    platformOp.transferAll({ toOwner: key(8) }),
+    platformOp.seedRows('t', ['a', 'chronolog_owner'], [[1n, key(9)]]),
   ],
 }
 

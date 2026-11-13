@@ -1,33 +1,27 @@
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-
 import {
-  createExecutionManifest,
-  encodeTransactionCore,
+  platformOp,
   sqlStatement,
   sqlValue,
-  transactionDigest,
   utf8,
   type ExecutionLimits,
-  type SqlStatement,
-  type TransactionCore,
+  type ProgramStep,
 } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { readNativeEngineInfo } from './driver.js'
 import { DeterministicMaterializer } from './materializer.js'
-import type { AdmittedTransaction, LocalSqlValue } from './types.js'
+import { MaterializerFixture, ROOT_KEY, admitted, rows } from './test-fixtures.js'
+import type { AdmittedTransaction } from './types.js'
 
-const directories: string[] = []
-afterEach(async () => Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))))
+const fixtures = new MaterializerFixture()
+afterEach(async () => fixtures.cleanup())
 
 describe('replicated SQL materialization', () => {
   it('executes DDL and DML in order and keeps the state across reopen', async () => {
     const { path, manifest } = await fixture()
-    let materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, checkpointEvery: 1 })
+    let materializer = await open(path, manifest, 1)
     const bootstrap = await transaction(1n, 'bootstrap', [
       sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT'),
+      platformOp.registerTable('accounts'),
       sqlStatement('INSERT INTO accounts (id, value) VALUES (?, ?) RETURNING id', [2n, 'two']),
       sqlStatement('SELECT id, value FROM accounts ORDER BY id'),
     ], materializer.executionManifestDigest)
@@ -35,23 +29,25 @@ describe('replicated SQL materialization', () => {
     expect(materializer.outcome(bootstrap.txId)).toMatchObject({ outcome: 'accepted', rejectionCode: null, failingStatementIndex: null })
     materializer.close()
 
-    materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, checkpointEvery: 1 })
+    materializer = await open(path, manifest, 1)
     expect(rows(materializer, 'SELECT id, value FROM accounts')).toEqual([['2', 'two']])
     materializer.close()
   })
 
   it('rejects with the assertion code, rolls back schema and data, and flips after a late predecessor', async () => {
     const { path, manifest } = await fixture()
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, checkpointEvery: 1 })
+    const materializer = await open(path, manifest, 1)
     const digest = materializer.executionManifestDigest
     const setup = await transaction(1n, 'setup', [
       sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
-      sqlStatement('INSERT INTO accounts VALUES (1, 10)'),
+      platformOp.registerTable('accounts'),
+      sqlStatement('INSERT INTO accounts (id, balance) VALUES (1, 10)'),
     ], digest)
     const withdraw = await transaction(5n, 'withdraw', [
-      sqlStatement('CREATE TABLE audit (note TEXT)'),
+      sqlStatement('CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)'),
       sqlStatement("SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = 1) >= :amount, 'insufficient_funds')", { amount: 50n }),
       sqlStatement('UPDATE accounts SET balance = balance - 50 WHERE id = 1'),
+      platformOp.registerTable('audit'),
     ], digest)
     await materializer.materialize([setup, withdraw])
     expect(materializer.outcome(withdraw.txId)).toMatchObject({
@@ -68,23 +64,28 @@ describe('replicated SQL materialization', () => {
   })
 
   it('pins now, random, localtime and connection counters to the transaction, identically under replay', async () => {
-    const program: SqlStatement[] = [
-      sqlStatement('CREATE TABLE IF NOT EXISTS probes (tx TEXT PRIMARY KEY, now TEXT, local TEXT, r INTEGER, blob BLOB, last_rowid INTEGER, changed INTEGER)'),
-      sqlStatement(`INSERT INTO probes VALUES (:tx, datetime('now'), datetime('now', 'localtime'), random(), randomblob(8),
-        last_insert_rowid(), changes())`, { tx: 'probe' }),
+    const program: ProgramStep[] = [
+      sqlStatement(`INSERT INTO probes (tx, now, local, r, blob, last_rowid, changed) VALUES (:tx, datetime('now'), datetime('now', 'localtime'),
+        random(), randomblob(8), last_insert_rowid(), changes())`, { tx: 'probe' }),
     ]
     const { path: first, manifest } = await fixture()
-    const incremental = await DeterministicMaterializer.open({ path: first, executionManifest: manifest, checkpointEvery: 1 })
+    const incremental = await open(first, manifest, 1)
     const digest = incremental.executionManifestDigest
-    const late = await transaction(2n, 'late', [sqlStatement('CREATE TABLE marker (id INTEGER PRIMARY KEY)'), sqlStatement('INSERT INTO marker VALUES (7)')], digest)
+    const setup = await transaction(1n, 'setup', [
+      sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY, now TEXT, local TEXT, r INTEGER, blob BLOB, last_rowid INTEGER, changed INTEGER)'),
+      platformOp.registerTable('probes'),
+    ], digest)
+    const late = await transaction(2n, 'late', [
+      sqlStatement('CREATE TABLE marker (id INTEGER PRIMARY KEY)'), platformOp.registerTable('marker'), sqlStatement('INSERT INTO marker (id) VALUES (7)'),
+    ], digest)
     const probe = await transaction(1_700_000_000_000n, 'probe', program, digest)
-    await incremental.materialize([probe])
+    await incremental.materialize([setup, probe])
     // The late transaction sorts before the probe, so the probe is replayed after it.
-    await incremental.materialize([late, probe])
+    await incremental.materialize([setup, late, probe])
 
     const { path: second } = await fixture()
-    const fresh = await DeterministicMaterializer.open({ path: second, executionManifest: manifest, checkpointEvery: 1 })
-    await fresh.materialize([late, probe])
+    const fresh = await open(second, manifest, 1)
+    await fresh.materialize([setup, late, probe])
 
     const probeRows = rows(incremental, 'SELECT now, local, r, hex(blob), last_rowid, changed FROM probes')
     expect(probeRows).toEqual(rows(fresh, 'SELECT now, local, r, hex(blob), last_rowid, changed FROM probes'))
@@ -98,16 +99,19 @@ describe('replicated SQL materialization', () => {
 
   it('accepts ordinary SQLite: aggregates, windows, NOCASE grouping, JSON, triggers, views and generated columns', async () => {
     const { path, manifest } = await fixture()
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest })
+    const materializer = await open(path, manifest)
     const digest = materializer.executionManifestDigest
     const tx = await transaction(1n, 'ordinary', [
       sqlStatement('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, price REAL, doubled REAL GENERATED ALWAYS AS (price * 2))'),
+      platformOp.registerTable('items'),
       sqlStatement("INSERT INTO items (name, price) VALUES ('a', 1.5), ('A', 2.25), ('b', 3)"),
-      sqlStatement('CREATE TABLE totals (name TEXT, total REAL, names TEXT, rank INTEGER)'),
-      sqlStatement(`INSERT INTO totals SELECT name, sum(price), group_concat(name), rank() OVER (ORDER BY sum(price) DESC)
+      sqlStatement('CREATE TABLE totals (name TEXT PRIMARY KEY, total REAL, names TEXT, rank INTEGER)'),
+      platformOp.registerTable('totals'),
+      sqlStatement(`INSERT INTO totals (name, total, names, rank) SELECT name, sum(price), group_concat(name), rank() OVER (ORDER BY sum(price) DESC)
         FROM items GROUP BY name`),
-      sqlStatement('CREATE TABLE log (message TEXT)'),
-      sqlStatement("CREATE TRIGGER items_log AFTER INSERT ON items BEGIN INSERT INTO log VALUES ('added ' || NEW.name); END"),
+      sqlStatement('CREATE TABLE log (id INTEGER PRIMARY KEY, message TEXT)'),
+      platformOp.registerTable('log'),
+      sqlStatement("CREATE TRIGGER items_log AFTER INSERT ON items BEGIN INSERT INTO log (message) VALUES ('added ' || NEW.name); END"),
       sqlStatement("CREATE VIEW cheap AS SELECT name FROM items WHERE price < 2"),
       sqlStatement('ALTER TABLE items ADD COLUMN note TEXT'),
       sqlStatement("INSERT INTO items (name, price) VALUES (json_extract('{\"n\":\"c\"}', '$.n'), 1.0)"),
@@ -122,10 +126,10 @@ describe('replicated SQL materialization', () => {
 
   it('rejects denied, malformed, unbound, over-budget and constraint-violating statements', async () => {
     const { path, manifest } = await fixture({ maxVmSteps: 5_000 })
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest })
+    const materializer = await open(path, manifest)
     const digest = materializer.executionManifestDigest
-    const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)')], digest)
-    const cases: [string, SqlStatement, string][] = [
+    const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)'), platformOp.registerTable('t')], digest)
+    const cases: [string, ProgramStep, string][] = [
       ['attach', sqlStatement("ATTACH DATABASE ':memory:' AS other"), 'denied'],
       ['pragma', sqlStatement('PRAGMA writable_schema = 1'), 'denied'],
       ['log-write', sqlStatement('DELETE FROM chronolog_transactions'), 'denied'],
@@ -135,7 +139,7 @@ describe('replicated SQL materialization', () => {
       ['total-changes', sqlStatement('SELECT total_changes()'), 'denied'],
       ['syntax', sqlStatement('SELEC 1'), 'prepare'],
       ['two-statements', sqlStatement('SELECT 1; SELECT 2'), 'prepare'],
-      ['unbound', { sql: 'INSERT INTO t VALUES (?, ?)', bindings: [{ parameter: { kind: 'index', index: 1 }, value: sqlValue.integer(1) }] }, 'binding'],
+      ['unbound', { sql: 'INSERT INTO t (id, v) VALUES (?, ?)', bindings: [{ parameter: { kind: 'index', index: 1 }, value: sqlValue.integer(1) }] }, 'binding'],
       ['not-null', sqlStatement('INSERT INTO t (id) VALUES (1)'), 'constraint'],
       ['steps', sqlStatement('WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n'), 'step_limit'],
     ]
@@ -154,12 +158,12 @@ describe('replicated SQL materialization', () => {
 
   it('lets a transaction depend on an earlier outcome through chronolog_transactions', async () => {
     const { path, manifest } = await fixture()
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest })
+    const materializer = await open(path, manifest)
     const digest = materializer.executionManifestDigest
-    const first = await transaction(1n, 'first', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)')], digest)
+    const first = await transaction(1n, 'first', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)'), platformOp.registerTable('t')], digest)
     const second = await transaction(2n, 'second', [
       sqlStatement("SELECT chronolog_assert(EXISTS (SELECT 1 FROM chronolog_transactions WHERE tx_id = ? AND outcome = 'accepted'), 'needs_first')", [utf8('first')]),
-      sqlStatement('INSERT INTO t VALUES (1)'),
+      sqlStatement('INSERT INTO t (id) VALUES (1)'),
     ], digest)
     const orphan = await transaction(3n, 'orphan', [
       sqlStatement("SELECT chronolog_assert(EXISTS (SELECT 1 FROM chronolog_transactions WHERE tx_id = ?), 'needs_missing')", [utf8('missing')]),
@@ -172,10 +176,11 @@ describe('replicated SQL materialization', () => {
 
   it('binds REAL, empty BLOB and named parameters exactly', async () => {
     const { path, manifest } = await fixture()
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest })
+    const materializer = await open(path, manifest)
     const tx = await transaction(1n, 'values', [
-      sqlStatement('CREATE TABLE v (a ANY, b ANY, c ANY, d ANY) STRICT'),
-      sqlStatement('INSERT INTO v VALUES (:real, :int, :blob, :text)', {
+      sqlStatement('CREATE TABLE v (id INTEGER PRIMARY KEY, a ANY, b ANY, c ANY, d ANY) STRICT'),
+      platformOp.registerTable('v'),
+      sqlStatement('INSERT INTO v (a, b, c, d) VALUES (:real, :int, :blob, :text)', {
         real: sqlValue.real(1), int: 1n, blob: new Uint8Array(0), text: 'é',
       }),
     ], materializer.executionManifestDigest)
@@ -186,7 +191,7 @@ describe('replicated SQL materialization', () => {
 
   it('rejects a transaction authored for another execution manifest without running it', async () => {
     const { path, manifest } = await fixture()
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest })
+    const materializer = await open(path, manifest)
     const tx = await transaction(1n, 'foreign', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)')], new Uint8Array(32))
     await materializer.materialize([tx])
     expect(materializer.outcome(tx.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'manifest_mismatch', failingStatementIndex: null })
@@ -194,42 +199,23 @@ describe('replicated SQL materialization', () => {
   })
 })
 
-function rows(materializer: DeterministicMaterializer, sql: string): unknown[][] {
-  return materializer.localSql(sql).rows.map((row) => row.map(plain))
-}
-
-function plain(value: LocalSqlValue): unknown {
-  return value.kind === 'null' ? null : value.value
-}
-
 async function fixture(limits: Partial<ExecutionLimits> = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'chronolog-sql-materializer-'))
-  directories.push(directory)
-  const native = readNativeEngineInfo()
-  return {
-    path: join(directory, 'application.db'),
-    manifest: createExecutionManifest({ profile: 'chronolog-core-portable', engine: native.descriptor, engineDigest: native.digest, limits }),
-  }
+  const directory = await fixtures.directory()
+  const { createDoltLiteExecutionManifest } = await import('./manifest.js')
+  return { path: `${directory}/application.db`, manifest: createDoltLiteExecutionManifest({ limits }) }
+}
+
+function open(path: string, manifest: Awaited<ReturnType<typeof fixture>>['manifest'], checkpointEvery?: number): Promise<DeterministicMaterializer> {
+  return DeterministicMaterializer.open({
+    path, executionManifest: manifest, rootAdministrator: ROOT_KEY, ...(checkpointEvery === undefined ? {} : { checkpointEvery }),
+  })
 }
 
 async function transaction(
   timestamp: bigint,
   id: string,
-  statements: readonly SqlStatement[],
+  steps: readonly ProgramStep[],
   executionManifestDigest: Uint8Array,
 ): Promise<AdmittedTransaction> {
-  const core: TransactionCore = {
-    groupId: bytes32(1), membershipRevision: bytes32(2), validationPolicy: bytes32(3), authorId: bytes32(4),
-    authorTimestampMs: timestamp, nonce: bytes32(Number(timestamp % 200n) + 10), executionManifestDigest,
-    program: { version: 1, statements },
-  }
-  const canonicalCandidate = encodeTransactionCore(core)
-  return {
-    txId: utf8(id),
-    authorFeedSequence: timestamp,
-    candidateDigest: await transactionDigest(canonicalCandidate),
-    canonicalCandidate,
-    core,
-  }
+  return admitted(timestamp, id, steps, executionManifestDigest)
 }
-function bytes32(seed: number): Uint8Array { return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff) }

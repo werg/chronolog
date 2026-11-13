@@ -1,10 +1,15 @@
-// Builds the ordinary signed transactions that recreate a snapshot's
-// application schema and rows in a forked group. Every replica of the fork
-// replays them like any other transaction, so no special base-state import is
-// needed. The plan is plain JSON so the operator can inspect it before seeding.
+// Builds the signed transactions that recreate a snapshot's application
+// schema, rows and ownership state in a forked group. Every replica of the
+// fork replays them like any other transaction, so no special base-state
+// import is needed. Rows keep their owners: they are written with the
+// `seed_rows` platform operation, which only the fork's genesis root may run,
+// before anyone else writes; the plan's last batch ends seeding for good
+// (docs/design-owner-rows.md §7). The plan is plain
+// JSON so the operator can inspect it before seeding.
 import { createHash } from 'node:crypto'
 
-import { isReservedSchemaObjectName } from '@chronolog/materializer-doltlite'
+import { GROUP_COLLECTIVE_ID, platformOp, sqlStatement, sqlValue, type ProgramStep, type SqlValue } from '@chronolog/protocol'
+import { OWNER_COLUMN, SEEDABLE_PLATFORM_TABLES, isReservedSchemaObjectName } from '@chronolog/materializer-doltlite'
 
 /** Marker table written by every seed batch; makes seeding idempotent. */
 export const FORK_SEED_TABLE = 'fork_seed'
@@ -22,21 +27,36 @@ export interface SeedStatement {
   readonly bindings: readonly SeedValue[]
 }
 
+/** A platform operation step, in readable JSON. */
+export type SeedPlatformStep =
+  | { readonly platform: 'register_table'; readonly table: string }
+  | {
+    readonly platform: 'seed_rows'
+    readonly table: string
+    readonly columns: readonly string[]
+    readonly rows: readonly (readonly SeedValue[])[]
+  }
+  | { readonly platform: 'end_seeding' }
+
+export type SeedStep = SeedStatement | SeedPlatformStep
+
 export interface SeedBatch {
   readonly batch: number
   readonly label: string
   /**
-   * Ordinary transaction statements. The first asserts the batch has not been
-   * applied (rejection code `assert:fork_seed_applied`); the last records it.
+   * Transaction steps. The first asserts the batch has not been applied
+   * (rejection code `assert:fork_seed_applied`); the last records it.
    */
-  readonly statements: readonly SeedStatement[]
+  readonly steps: readonly SeedStep[]
 }
 
 export const FORK_SEED_APPLIED_CODE = 'fork_seed_applied'
 
 
+export const FORK_SEED_FORMAT = 'chronolog-fork-seed-v4'
+
 export interface ForkSeedPlan {
-  readonly format: 'chronolog-fork-seed-v2'
+  readonly format: typeof FORK_SEED_FORMAT
   readonly sourceGroupId: string
   readonly snapshotManifestSha256: string
   readonly sourceRevision: string
@@ -68,6 +88,8 @@ interface TableShape {
 
 const MAX_ROWS_PER_BATCH = 250
 const MAX_BINDING_BYTES_PER_BATCH = 4 * 1024 * 1024
+/** One transaction holds at most 256 steps: guard, marker and the rest. */
+const MAX_SCHEMA_STEPS = 254
 
 export function buildForkSeedPlan(
   source: ReadableDatabase,
@@ -75,6 +97,7 @@ export function buildForkSeedPlan(
 ): ForkSeedPlan {
   const objects = applicationSchema(source)
   const tables = objects.filter((object) => object.type === 'table').map((object) => tableShape(source, object.name))
+  const ordered = insertionOrder(tables)
   const batches: SeedBatch[] = []
   const marker = (batch: number, label: string): SeedStatement => ({
     sql: `INSERT INTO ${FORK_SEED_TABLE} (batch, label) VALUES (?, ?)`,
@@ -87,41 +110,60 @@ export function buildForkSeedPlan(
   const notApplied = (batch: number): SeedStatement =>
     guard(`NOT EXISTS (SELECT 1 FROM ${FORK_SEED_TABLE} WHERE batch = ${batch})`)
 
+  // Tables are created and registered together: reconciliation refuses an
+  // unregistered table at the end of the transaction that created it.
+  const schemaSteps: SeedStep[] = [
+    { sql: `CREATE TABLE ${FORK_SEED_TABLE} (batch INTEGER PRIMARY KEY, label TEXT NOT NULL) STRICT`, bindings: [] },
+    { platform: 'register_table', table: FORK_SEED_TABLE },
+    ...objects.filter((object) => object.type === 'table').flatMap((object): SeedStep[] => [
+      { sql: object.sql, bindings: [] },
+      { platform: 'register_table', table: object.name },
+    ]),
+  ]
+  if (schemaSteps.length > MAX_SCHEMA_STEPS) throw new Error('FORK_SEED_TOO_MANY_TABLES')
   batches.push({
     batch: 1,
     label: 'schema: tables',
-    statements: [
+    steps: [
       guard(`NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '${FORK_SEED_TABLE}')`),
-      { sql: `CREATE TABLE ${FORK_SEED_TABLE} (batch INTEGER PRIMARY KEY, label TEXT NOT NULL) STRICT`, bindings: [] },
-      ...objects.filter((object) => object.type === 'table').map((object) => ({ sql: object.sql, bindings: [] })),
+      ...schemaSteps,
       marker(1, 'schema: tables'),
     ],
   })
 
-  for (const table of insertionOrder(tables)) {
-    let pending: SeedStatement[] = []
+  const seed = (shape: TableShape, label: string, rows: Iterable<unknown[]>): void => {
+    let pending: SeedValue[][] = []
     let bytes = 0
     let part = 1
     const flush = (): void => {
       if (pending.length === 0) return
       const batch = batches.length + 1
-      const label = `rows: ${table.name} #${part}`
-      batches.push({ batch, label, statements: [notApplied(batch), ...pending, marker(batch, label)] })
+      const name = `${label} #${part}`
+      batches.push({
+        batch,
+        label: name,
+        steps: [notApplied(batch), { platform: 'seed_rows', table: shape.name, columns: shape.columns, rows: pending }, marker(batch, name)],
+      })
       pending = []
       bytes = 0
       part += 1
     }
-    const insert = `INSERT INTO ${quote(table.name)} (${table.columns.map(quote).join(', ')}) VALUES (${table.columns.map(() => '?').join(', ')})`
-    for (const row of tableRows(source, table)) {
-      const bindings = row.map(seedValue)
-      const rowBytes = bindings.reduce<number>((total, value) => total + seedValueBytes(value), 0)
-      // Each batch is one transaction of at most 256 statements (guard + rows + marker).
+    for (const row of rows) {
+      const values = row.map(seedValue)
+      const rowBytes = values.reduce<number>((total, value) => total + seedValueBytes(value), 0)
       if (pending.length >= MAX_ROWS_PER_BATCH || (pending.length > 0 && bytes + rowBytes > MAX_BINDING_BYTES_PER_BATCH)) flush()
-      pending.push({ sql: insert, bindings })
+      pending.push(values)
       bytes += rowBytes
     }
     flush()
   }
+
+  // Teams, memberships, grants and transfer offers, verbatim.
+  for (const name of SEEDABLE_PLATFORM_TABLES) {
+    const shape = platformTableShape(source, name)
+    seed(shape, `platform: ${name}`, platformRows(source, shape))
+  }
+  for (const table of ordered) seed(table, `rows: ${table.name}`, tableRows(source, table))
 
   const rest = objects.filter((object) => object.type !== 'table')
   if (rest.length > 0) {
@@ -129,16 +171,75 @@ export function buildForkSeedPlan(
     batches.push({
       batch,
       label: 'schema: indexes, views, triggers',
-      statements: [notApplied(batch), ...rest.map((object) => ({ sql: object.sql, bindings: [] })), marker(batch, 'schema: indexes, views, triggers')],
+      steps: [notApplied(batch), ...rest.map((object) => ({ sql: object.sql, bindings: [] })), marker(batch, 'schema: indexes, views, triggers')],
     })
   }
+  // Close seeding so the fork's root cannot seed rows (with any owner) later.
+  const sealBatch = batches.length + 1
+  batches.push({
+    batch: sealBatch,
+    label: 'end seeding',
+    steps: [notApplied(sealBatch), { platform: 'end_seeding' }, marker(sealBatch, 'end seeding')],
+  })
   return {
-    format: 'chronolog-fork-seed-v2',
+    format: FORK_SEED_FORMAT,
     sourceGroupId: origin.sourceGroupId,
     snapshotManifestSha256: origin.snapshotManifestSha256,
     sourceRevision: origin.sourceRevision.toString(10),
     batches,
   }
+}
+
+/**
+ * Digest of the ownership state a fork carries: registered table names and
+ * the seeded platform tables (teams, memberships, grants, offers), without
+ * the `group` collective, which each group administers itself.
+ */
+export function platformTableDigests(database: ReadableDatabase): Record<string, string> {
+  const result: Record<string, string> = {}
+  const registered = query(database, `SELECT name FROM chronolog_tables WHERE name <> '${FORK_SEED_TABLE}' COLLATE NOCASE ORDER BY name`)
+  result.chronolog_tables = createHash('sha256').update(JSON.stringify(registered.map((row) => (row as unknown[])[0]))).digest('hex')
+  for (const name of SEEDABLE_PLATFORM_TABLES) {
+    const shape = platformTableShape(database, name)
+    const hash = createHash('sha256')
+    for (const row of platformRows(database, shape)) hash.update(JSON.stringify(row.map(seedValue))).update('\n')
+    result[name] = hash.digest('hex')
+  }
+  return result
+}
+
+/** A plan step as a transaction program step. */
+export function seedStepToProgramStep(step: SeedStep): ProgramStep {
+  if ('sql' in step) return sqlStatement(step.sql, step.bindings.map(seedSqlValue))
+  if (step.platform === 'register_table') return platformOp.registerTable(step.table)
+  if (step.platform === 'end_seeding') return platformOp.endSeeding()
+  return platformOp.seedRows(step.table, step.columns, step.rows.map((row) => row.map(seedSqlValue)))
+}
+
+export function seedSqlValue(value: SeedValue): SqlValue {
+  switch (value.kind) {
+    case 'null': return sqlValue.null()
+    case 'integer': return sqlValue.integer(BigInt(value.value))
+    case 'real': return sqlValue.real(value.value)
+    case 'text': return sqlValue.text(value.value)
+    case 'blob': return sqlValue.blob(Buffer.from(value.value, 'base64url'))
+  }
+}
+
+function platformTableShape(database: ReadableDatabase, name: string): TableShape {
+  const columns = query(database, `SELECT name, pk FROM pragma_table_info(${literal(name)}) ORDER BY cid`).map((row) => row as [string, bigint | number])
+  return {
+    name,
+    columns: columns.map(([column]) => column),
+    primaryKey: columns.filter(([, pk]) => Number(pk) > 0).sort((left, right) => Number(left[1]) - Number(right[1])).map(([column]) => column),
+    foreignKeys: [],
+  }
+}
+
+function platformRows(database: ReadableDatabase, shape: TableShape): unknown[][] {
+  const group = shape.columns.includes('collective_id') ? ` WHERE collective_id <> x'${Buffer.from(GROUP_COLLECTIVE_ID).toString('hex')}'` : ''
+  return query(database, `SELECT ${shape.columns.map(quote).join(', ')} FROM ${quote(shape.name)}${group} ORDER BY ${shape.primaryKey.map(quote).join(', ')}`)
+    .map((row) => row as unknown[])
 }
 
 /**
@@ -211,7 +312,11 @@ function insertionOrder(tables: readonly TableShape[]): TableShape[] {
 
 /** Rows in primary-key order, with self-referencing rows after the rows they reference. */
 function tableRows(database: ReadableDatabase, table: TableShape): unknown[][] {
-  const rows = query(database, `SELECT ${table.columns.map(quote).join(', ')} FROM ${quote(table.name)} ORDER BY ${table.primaryKey.map(quote).join(', ')}`)
+  // Owners are carried as keys: principal ids are local to each group.
+  const select = table.columns.map((column) => column.toLowerCase() === OWNER_COLUMN
+    ? `(SELECT key FROM chronolog_principals WHERE id = t.${quote(column)})`
+    : `t.${quote(column)}`)
+  const rows = query(database, `SELECT ${select.join(', ')} FROM ${quote(table.name)} AS t ORDER BY ${table.primaryKey.map((column) => `t.${quote(column)}`).join(', ')}`)
     .map((row) => row as unknown[])
   const selfReferences = table.foreignKeys.filter((reference) => reference.table.toLowerCase() === table.name.toLowerCase())
   if (selfReferences.length === 0) return rows

@@ -12,7 +12,7 @@ import {
   sqlTransactionProgramFromCanonicalCbor,
   sqlTransactionProgramToCanonicalCbor,
   type SqlTransactionProgram,
-} from './sql.js'
+} from './program.js'
 
 export interface TransactionCore {
   readonly groupId: Uint8Array

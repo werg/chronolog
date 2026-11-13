@@ -73,6 +73,8 @@ export async function prepareCluster(
     groupId,
     membershipRevision,
     validationPolicy,
+    // The first node is the schema administrator: it creates and registers the chaos tables.
+    rootAdministrator: nodes[0]!.publicKey,
     // Bind every inner protocol signer to its authenticated outer SSB feed.
     // Without this mapping, copying a valid signed message into another feed
     // would erase the provenance that the replication layer authenticated.

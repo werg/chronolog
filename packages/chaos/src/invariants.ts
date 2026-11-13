@@ -4,7 +4,7 @@ import type { DecodedLocalSqlValue } from '@chronolog/client'
 
 import type { RunArtifacts } from './artifacts.js'
 import type { ChaosCluster } from './cluster.js'
-import { schemaQuery, stateQuery, transactionLogQuery } from './schema.js'
+import { ownersQuery, platformObjectsQuery, registeredTablesQuery, schemaQuery, stateQuery, transactionLogQuery } from './schema.js'
 import type { NodeSnapshot, WorkloadExpectation } from './types.js'
 
 interface InvariantResult {
@@ -73,6 +73,8 @@ export async function waitForConvergence(options: {
     { name: 'application_schema_converged', passed: same(last.map((value) => value.schemaDigest)) },
     { name: 'transaction_log_converged', passed: same(last.map((value) => value.logDigest)) },
     { name: 'transaction_order_length_converged', passed: same(last.map((value) => value.publishedOrderLength)) },
+    { name: 'platform_triggers_converged', passed: same(last.map((value) => value.platformDigest)) },
+    { name: 'owners_are_known_keys_or_collectives', ...checkOwnersKnown(snapshot.ownerRows, options.cluster.nodeKeys()) },
     {
       name: 'all_published_transactions_resolved',
       passed: coverage.unresolved === 0,
@@ -99,13 +101,16 @@ async function snapshotNode(
   node: NodeSnapshot['node'],
   client: ReturnType<ChaosCluster['client']>,
 ): Promise<NodeSnapshot> {
-  const [status, replication, state, schema, log] = await Promise.all([
+  const [status, replication, state, schema, log, platform, registered] = await Promise.all([
     client.getStatus(),
     client.getReplicationStatus(),
     client.query(stateQuery().sql),
     client.query(schemaQuery().sql),
     client.query(transactionLogQuery().sql),
+    client.query(platformObjectsQuery().sql),
+    client.query(registeredTablesQuery().sql),
   ])
+  const owners = await client.query(ownersQuery(registered.result.rows.map((row) => String(row[0]))).sql)
   if (!status.revision) throw new Error(`CHAOS_NODE_NOT_READY:${node}`)
   return {
     node,
@@ -114,6 +119,8 @@ async function snapshotNode(
     stateDigest: rowsDigest(state.result.rows),
     schemaDigest: rowsDigest(schema.result.rows),
     logDigest: rowsDigest(log.result.rows),
+    platformDigest: rowsDigest(platform.result.rows),
+    ownerRows: owners.result.rows.map(normalizeRow),
     stateRows: state.result.rows.map(normalizeRow),
     schemaRows: schema.result.rows.map(normalizeRow),
     logRows: log.result.rows.map(normalizeRow),
@@ -128,6 +135,13 @@ async function snapshotNode(
     ...(replication.ingestDiagnostics === undefined ? {} : { ingestDiagnostics: replication.ingestDiagnostics }),
     materializationPending: replication.materializationPending,
   }
+}
+
+/** Every row is owned by a node key or a collective (§7 determinism checks). */
+export function checkOwnersKnown(ownerRows: readonly (readonly unknown[])[], nodeKeys: readonly string[]): Pick<InvariantResult, 'passed' | 'details'> {
+  const known = new Set(nodeKeys)
+  const unknown = ownerRows.filter((row) => String(row[1]) !== '1' && !known.has(bytesText(row[0]))).map((row) => bytesText(row[0]))
+  return unknown.length === 0 ? { passed: true } : { passed: false, details: `Unknown owners: ${unknown.join(', ')}` }
 }
 
 export function checkLedgerConsistency(stateRows: readonly (readonly unknown[])[]): Pick<InvariantResult, 'passed' | 'details'> {

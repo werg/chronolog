@@ -16,8 +16,8 @@ import {
 } from './index.js'
 
 const program: SqlTransactionProgram = {
-  version: 1,
-  statements: [
+  version: 2,
+  steps: [
     sqlStatement('CREATE TABLE t (a, b, c, d, e)'),
     sqlStatement("SELECT chronolog_assert(NOT EXISTS (SELECT 1 FROM t), 'empty')"),
     sqlStatement('INSERT INTO t VALUES (?, ?, ?, ?, ?)', [null, 9_007_199_254_740_993n, sqlValue.real(1), 'é', new Uint8Array(0)]),
@@ -51,31 +51,36 @@ describe('SQL transaction programs', () => {
   })
 
   it('rejects empty programs, empty SQL, NUL, non-finite REALs, out-of-range INTEGERs and duplicate bindings', () => {
-    expect(() => encodeSqlTransactionProgram({ version: 1, statements: [] })).toThrow()
-    expect(() => encodeSqlTransactionProgram({ version: 1, statements: [{ sql: '  ', bindings: [] }] })).toThrow()
+    expect(() => encodeSqlTransactionProgram({ version: 2, steps: [] })).toThrow()
+    expect(() => encodeSqlTransactionProgram({ version: 2, steps: [{ sql: '  ', bindings: [] }] })).toThrow()
     expect(() => sqlStatement('SELECT 1\0')).toThrow()
     expect(() => sqlValue.real(Number.NaN)).toThrow()
     expect(() => sqlValue.integer(1n << 63n)).toThrow()
     expect(() => encodeSqlTransactionProgram({
-      version: 1,
-      statements: [{ sql: 'SELECT ?', bindings: [
+      version: 2,
+      steps: [{ sql: 'SELECT ?', bindings: [
         { parameter: { kind: 'index', index: 1 }, value: sqlValue.null() },
         { parameter: { kind: 'index', index: 1 }, value: sqlValue.null() },
       ] }],
     })).toThrow()
     expect(() => encodeSqlTransactionProgram({
-      version: 1,
-      statements: Array.from({ length: 257 }, () => sqlStatement('SELECT 1')),
+      version: 2,
+      steps: Array.from({ length: 257 }, () => sqlStatement('SELECT 1')),
     })).toThrow()
   })
 })
 
 describe('execution manifest', () => {
-  it('round-trips and pins the engine digest and limits', () => {
-    const manifest = createExecutionManifest({ profile: 'test', engineDigest: new Uint8Array(32).fill(7), limits: { maxVmSteps: 42 } })
+  it('round-trips and pins the engine digest, platform digest, profile pragma and limits', () => {
+    const manifest = createExecutionManifest({
+      profile: 'test', engineDigest: new Uint8Array(32).fill(7), platformDigest: new Uint8Array(32).fill(8), limits: { maxVmSteps: 42 },
+    })
     const decoded = decodeExecutionManifest(encodeExecutionManifest(manifest))
     expect(decoded).toEqual(manifest)
     expect(decoded.limits.maxVmSteps).toBe(42)
-    expect(() => createExecutionManifest({ profile: 'test', engineDigest: new Uint8Array(31) })).toThrow()
+    expect(decoded.programVersion).toBe(2)
+    expect(decoded.recursiveTriggers).toBe(true)
+    expect(() => createExecutionManifest({ profile: 'test', engineDigest: new Uint8Array(31), platformDigest: new Uint8Array(32) })).toThrow()
+    expect(() => createExecutionManifest({ profile: 'test', engineDigest: new Uint8Array(32), platformDigest: new Uint8Array(31) })).toThrow()
   })
 })

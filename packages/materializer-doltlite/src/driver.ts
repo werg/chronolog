@@ -10,6 +10,7 @@ import type {
   SecurityConfiguration,
 } from './types.js'
 import { discoverPublishedRef } from './checkpoints.js'
+import { readRootAdministrator } from './platform/schema.js'
 import { assertNativeSecurityConfiguration, configureSqliteLimits } from './sql-profile.js'
 
 export interface OpenedDatabase {
@@ -52,7 +53,17 @@ export function openReadOnlyDatabase(path: string): DatabaseLike {
   }
 }
 
-export function openDatabase(options: MaterializerOptions): OpenedDatabase {
+/** The genesis root administrator stored in a materialized database, read offline. */
+export function readMaterializedRootAdministrator(path: string): Uint8Array {
+  const database = openReadOnlyDatabase(path)
+  try {
+    return readRootAdministrator(database)
+  } finally {
+    database.close()
+  }
+}
+
+export function openDatabase(options: Pick<MaterializerOptions, 'path'>): OpenedDatabase {
   const path = options.path
   if (path === undefined || path === ':memory:') {
     throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
@@ -64,8 +75,11 @@ export function openDatabase(options: MaterializerOptions): OpenedDatabase {
     assertNativeSecurityConfiguration(security)
     configureSqliteLimits(database)
     database.exec('PRAGMA foreign_keys = ON')
+    // Part of the execution profile (manifest `recursiveTriggers`): REPLACE
+    // deletions fire delete triggers, so the platform's delete check applies.
     database.exec('PRAGMA recursive_triggers = ON')
     database.exec('PRAGMA trusted_schema = OFF')
+    if (readPragma(database, 'recursive_triggers') !== 1) throw new Error('MATERIALIZER_RECURSIVE_TRIGGERS_UNAVAILABLE')
     const native = readNativeEngineInfo()
     return {
       database,
@@ -98,6 +112,12 @@ export function digestNativeEngineManifest(manifest: NativeEngineManifest): Uint
 
 export function nativeEngineDescriptor(manifest: NativeEngineManifest): string {
   return `chronolog-engine-manifest-v1\n${stableJson(manifest)}`
+}
+
+function readPragma(database: DatabaseLike, name: 'recursive_triggers'): number {
+  const row = database.prepare(`PRAGMA ${name}`).get()
+  if (row === undefined || Array.isArray(row)) throw new Error('MATERIALIZER_PRAGMA_UNAVAILABLE')
+  return Number(row[name])
 }
 
 function readOptionalScalar(database: DatabaseLike, sql: string): string | null {

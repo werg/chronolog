@@ -36,13 +36,6 @@ export interface SqlStatement {
   readonly bindings: readonly SqlBinding[]
 }
 
-/** Ordinary SQLite statements, executed in order; any failure rejects the transaction. */
-export interface SqlTransactionProgram {
-  readonly version: 1
-  readonly statements: readonly SqlStatement[]
-}
-
-export const MAX_SQL_PROGRAM_STATEMENTS = 256
 export const MAX_SQL_STATEMENT_BINDINGS = 1_000
 export const MAX_ASSERT_CODE_BYTES = 128
 
@@ -210,39 +203,6 @@ export function sqlStatementFromCanonicalCbor(value: CborValue, name = 'sql_stat
   return statement
 }
 
-export function assertValidSqlTransactionProgram(value: SqlTransactionProgram): void {
-  protocolInvariant(value.version === 1, 'UNSUPPORTED_VERSION', 'Unsupported SQL transaction program version')
-  protocolInvariant(value.statements.length > 0, 'SCHEMA_INVALID', 'SQL transaction program requires a statement')
-  protocolInvariant(value.statements.length <= MAX_SQL_PROGRAM_STATEMENTS, 'SCHEMA_INVALID', 'SQL transaction program has too many statements')
-  for (const statement of value.statements) sqlStatementToCanonicalCbor(statement)
-}
-
-export function sqlTransactionProgramToCanonicalCbor(value: SqlTransactionProgram): CborValue {
-  assertValidSqlTransactionProgram(value)
-  return integerMap([[0, 1n], [1, value.statements.map(sqlStatementToCanonicalCbor)]])
-}
-
-export function sqlTransactionProgramFromCanonicalCbor(value: CborValue): SqlTransactionProgram {
-  const map = expectMap(value, 'sql_transaction_program')
-  assertKnownIntegerKeys(map, [0, 1], 'sql_transaction_program')
-  expectVersion(map, 1n, 'sql_transaction_program')
-  const program: SqlTransactionProgram = {
-    version: 1,
-    statements: expectArray(required(map, 1, 'sql_transaction_program.statements'), 'sql_transaction_program.statements')
-      .map((statement, index) => sqlStatementFromCanonicalCbor(statement, `sql_transaction_program.statements[${index}]`)),
-  }
-  assertValidSqlTransactionProgram(program)
-  return program
-}
-
-export function encodeSqlTransactionProgram(value: SqlTransactionProgram): Uint8Array {
-  return encodeCanonicalCbor(sqlTransactionProgramToCanonicalCbor(value))
-}
-
-export function decodeSqlTransactionProgram(bytes: Uint8Array): SqlTransactionProgram {
-  return sqlTransactionProgramFromCanonicalCbor(assertCanonicalCbor(bytes))
-}
-
 // ── Execution manifest ──────────────────────────────────────────────────────
 
 export interface ExecutionLimits {
@@ -255,18 +215,23 @@ export interface ExecutionLimits {
 }
 
 /**
- * What a transaction was authored for: the exact engine build and the
- * execution limits. A replica only executes transactions for the manifest it
- * runs; changing either is a group-wide upgrade.
+ * What a transaction was authored for: the exact engine build, the platform
+ * code that enforces row ownership, the SQL profile and the execution limits.
+ * A replica only executes transactions for the manifest it runs; changing any
+ * of them is a group-wide upgrade.
  */
 export interface ExecutionManifest {
-  readonly version: 1
+  readonly version: 2
   readonly profile: string
   /** Engine build identity, e.g. the native patch profile. */
   readonly engine: string
   /** SHA-256 over the native engine descriptor. */
   readonly engineDigest: Uint8Array
-  readonly programVersion: 1
+  readonly programVersion: 2
+  /** SHA-256 over the platform operations and the trigger and view generators. */
+  readonly platformDigest: Uint8Array
+  /** `PRAGMA recursive_triggers` during consensus execution; always on. */
+  readonly recursiveTriggers: true
   readonly limits: ExecutionLimits
 }
 
@@ -279,15 +244,18 @@ export const DEFAULT_EXECUTION_LIMITS: Readonly<ExecutionLimits> = Object.freeze
 export function createExecutionManifest(options: {
   readonly profile: string
   readonly engineDigest: Uint8Array
+  readonly platformDigest: Uint8Array
   readonly engine?: string
   readonly limits?: Partial<ExecutionLimits>
 }): ExecutionManifest {
   const manifest: ExecutionManifest = {
-    version: 1,
+    version: 2,
     profile: options.profile,
     engine: options.engine ?? 'doltlite',
     engineDigest: Uint8Array.from(options.engineDigest),
-    programVersion: 1,
+    programVersion: 2,
+    platformDigest: Uint8Array.from(options.platformDigest),
+    recursiveTriggers: true,
     limits: { ...DEFAULT_EXECUTION_LIMITS, ...options.limits },
   }
   executionManifestToCbor(manifest)
@@ -300,28 +268,32 @@ function positiveLimit(value: number, name: string): bigint {
 }
 
 export function executionManifestToCbor(value: ExecutionManifest): CborValue {
-  protocolInvariant(value.version === 1 && value.programVersion === 1, 'UNSUPPORTED_VERSION', 'Unsupported execution manifest version')
+  protocolInvariant(value.version === 2 && value.programVersion === 2, 'UNSUPPORTED_VERSION', 'Unsupported execution manifest version')
   protocolInvariant(value.profile.length > 0 && value.engine.length > 0, 'SCHEMA_INVALID', 'Execution manifest needs a profile and engine')
   protocolInvariant(value.engineDigest.length === 32, 'SCHEMA_INVALID', 'Execution manifest engine digest must be 32 bytes')
+  protocolInvariant(value.platformDigest.length === 32, 'SCHEMA_INVALID', 'Execution manifest platform digest must be 32 bytes')
+  protocolInvariant(value.recursiveTriggers === true, 'SCHEMA_INVALID', 'Consensus execution requires recursive_triggers')
   return integerMap([
-    [0, 1n],
+    [0, 2n],
     [1, value.profile],
     [2, value.engine],
     [3, Uint8Array.from(value.engineDigest)],
-    [4, 1n],
+    [4, 2n],
     [5, integerMap([
       [0, positiveLimit(value.limits.maxSqlBytes, 'maxSqlBytes')],
       [1, positiveLimit(value.limits.maxVmSteps, 'maxVmSteps')],
       [2, positiveLimit(value.limits.maxValueBytes, 'maxValueBytes')],
     ])],
+    [6, Uint8Array.from(value.platformDigest)],
+    [7, integerMap([[0, true]])],
   ])
 }
 
 export function executionManifestFromCbor(value: CborValue): ExecutionManifest {
   const map = expectMap(value, 'execution_manifest')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5], 'execution_manifest')
-  expectVersion(map, 1n, 'execution_manifest')
-  protocolInvariant(expectUint64(required(map, 4, 'execution_manifest.program_version'), 'execution_manifest.program_version') === 1n,
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7], 'execution_manifest')
+  expectVersion(map, 2n, 'execution_manifest')
+  protocolInvariant(expectUint64(required(map, 4, 'execution_manifest.program_version'), 'execution_manifest.program_version') === 2n,
     'UNSUPPORTED_VERSION', 'Unsupported program version')
   const limits = expectMap(required(map, 5, 'execution_manifest.limits'), 'execution_manifest.limits')
   assertKnownIntegerKeys(limits, [0, 1, 2], 'execution_manifest.limits')
@@ -330,12 +302,18 @@ export function executionManifestFromCbor(value: CborValue): ExecutionManifest {
     protocolInvariant(parsed >= 1n && parsed <= BigInt(Number.MAX_SAFE_INTEGER), 'INTEGER_OUT_OF_RANGE', `${name} is out of range`)
     return Number(parsed)
   }
+  const sqlProfile = expectMap(required(map, 7, 'execution_manifest.sql_profile'), 'execution_manifest.sql_profile')
+  assertKnownIntegerKeys(sqlProfile, [0], 'execution_manifest.sql_profile')
+  protocolInvariant(required(sqlProfile, 0, 'execution_manifest.sql_profile.recursive_triggers') === true,
+    'SCHEMA_INVALID', 'Consensus execution requires recursive_triggers')
   const manifest: ExecutionManifest = {
-    version: 1,
+    version: 2,
     profile: expectString(required(map, 1, 'execution_manifest.profile'), 'execution_manifest.profile'),
     engine: expectString(required(map, 2, 'execution_manifest.engine'), 'execution_manifest.engine'),
     engineDigest: Uint8Array.from(expectBytes(required(map, 3, 'execution_manifest.engine_digest'), 'execution_manifest.engine_digest', 32)),
-    programVersion: 1,
+    programVersion: 2,
+    platformDigest: Uint8Array.from(expectBytes(required(map, 6, 'execution_manifest.platform_digest'), 'execution_manifest.platform_digest', 32)),
+    recursiveTriggers: true,
     limits: {
       maxSqlBytes: limit(0, 'execution_manifest.limits.max_sql_bytes'),
       maxVmSteps: limit(1, 'execution_manifest.limits.max_vm_steps'),
@@ -345,7 +323,6 @@ export function executionManifestFromCbor(value: CborValue): ExecutionManifest {
   executionManifestToCbor(manifest)
   return manifest
 }
-
 export function encodeExecutionManifest(value: ExecutionManifest): Uint8Array {
   return encodeCanonicalCbor(executionManifestToCbor(value))
 }

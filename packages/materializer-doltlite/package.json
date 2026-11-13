@@ -3,7 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/test-fixtures.ts"
+  },
   "dependencies": {
     "@chronolog/materializer": "workspace:*",
     "@chronolog/protocol": "workspace:*",

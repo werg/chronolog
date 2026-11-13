@@ -2,14 +2,14 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { ChronologClient, sqlValue } from '@chronolog/client'
+import { ChronologClient, platformOp, sqlValue } from '@chronolog/client'
 import {
   DeterministicMaterializer,
+  createDoltLiteExecutionManifest,
   createDoltLiteMaterializationRuntime,
-  readNativeEngineInfo,
 } from '@chronolog/materializer-doltlite'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
-import { createExecutionManifest, equalBytes, generateEd25519KeyPair, sqlStatement } from '@chronolog/protocol'
+import { equalBytes, generateEd25519KeyPair, sqlStatement } from '@chronolog/protocol'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -25,7 +25,8 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client, node } = await runtime()
     const bootstrap = await client.transaction([
       'CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT',
-      { sql: 'INSERT INTO accounts VALUES (:id, :balance)', params: { id: 1n, balance: 100n } },
+      platformOp.registerTable('accounts'),
+      { sql: 'INSERT INTO accounts (id, balance) VALUES (:id, :balance)', params: { id: 1n, balance: 100n } },
     ])
     expect((await terminal(client, bootstrap.transactionId)).outcome.type).toBe('accepted')
     expect((await client.query('SELECT balance FROM accounts WHERE id = ?', [1n])).result.rows).toEqual([[100n]])
@@ -39,19 +40,23 @@ describe('SQL client → RPC → node → reducer', () => {
     expect((await client.query('SELECT balance FROM accounts WHERE id = ?', [1n])).result.rows).toEqual([[90n]])
 
     const core = node.candidateCore(new TextEncoder().encode(update.transactionId))
-    expect(core?.program.statements[1]?.sql).toBe('UPDATE accounts SET balance = :next WHERE id = :id RETURNING id, balance')
+    const step = core?.program.steps[1]
+    expect(step !== undefined && 'sql' in step ? step.sql : null).toBe('UPDATE accounts SET balance = :next WHERE id = :id RETURNING id, balance')
+    // Rows belong to the signing key.
+    expect((await client.query('SELECT p.key FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner')).result.rows).toEqual([[Uint8Array.from(core!.authorId)]])
   })
 
   it('reports the failing statement and code, and rolls back partial work', async () => {
     const { client } = await runtime()
     await terminal(client, (await client.transaction([
       'CREATE TABLE guarded_values (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT',
-      'INSERT INTO guarded_values VALUES (1, 10)',
+      platformOp.registerTable('guarded_values'),
+      'INSERT INTO guarded_values (id, value) VALUES (1, 10)',
     ])).transactionId)
 
     const failedStatement = await client.transaction([
       'UPDATE guarded_values SET value = 20 WHERE id = 1 RETURNING value',
-      'INSERT INTO guarded_values VALUES (1, 30)',
+      'INSERT INTO guarded_values (id, value) VALUES (1, 30)',
     ])
     expect((await terminal(client, failedStatement.transactionId)).outcome).toEqual({
       type: 'rejected',
@@ -77,6 +82,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client } = await runtime()
     const transaction = await client.transaction([
       'CREATE TABLE dynamic_values (id INTEGER PRIMARY KEY, value)',
+      platformOp.registerTable('dynamic_values'),
       {
         sql: 'INSERT INTO dynamic_values (value) VALUES (?), (?), (?), (?), (?), (?), (?)',
         params: [null, 42, 1.5, sqlValue.real(2), 'Grüße', Uint8Array.of(0, 255), new Uint8Array(0)],
@@ -97,6 +103,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client, node } = await runtime()
     const transaction = await client.transaction([
       'CREATE TABLE stamped (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, noise INTEGER NOT NULL)',
+      platformOp.registerTable('stamped'),
       "INSERT INTO stamped (at, noise) VALUES (unixepoch('now', 'subsec') * 1000, random())",
     ])
     expect((await terminal(client, transaction.transactionId)).outcome.type).toBe('accepted')
@@ -141,7 +148,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const rollback = await client.transaction([schemaVersionAssertion('profiles', 2), ...migrationRollbackStatements(rollbackPrefix)])
     expect((await terminal(client, rollback.transactionId)).outcome).toEqual({
       type: 'rejected',
-      rejection: { code: 'constraint', statementIndex: 6 },
+      rejection: { code: 'constraint', statementIndex: 7 },
     })
     expect((await client.query('SELECT name FROM sqlite_schema WHERE name LIKE ?', [`${rollbackPrefix}%`])).result.rows).toEqual([])
     expect((await client.query('SELECT version FROM chaos_schema_migrations WHERE component = ?', [rollbackPrefix])).result.rows).toEqual([])
@@ -152,7 +159,8 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client, node } = await runtime({ clockNow: () => now })
     const bootstrap = await client.transaction([
       'CREATE TABLE replay_accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT',
-      'INSERT INTO replay_accounts VALUES (1, 100)',
+      platformOp.registerTable('replay_accounts'),
+      'INSERT INTO replay_accounts (id, balance) VALUES (1, 100)',
     ])
     await terminal(client, bootstrap.transactionId)
 
@@ -175,7 +183,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const bootstrapTimestamp = node.candidateCore(new TextEncoder().encode(bootstrap.transactionId))!.authorTimestampMs
     const predecessor = await node.publish({
       authorTimestampMs: bootstrapTimestamp,
-      program: { version: 1, statements: [sqlStatement('UPDATE replay_accounts SET balance = 80 WHERE id = 1')] },
+      program: { version: 2, steps: [sqlStatement('UPDATE replay_accounts SET balance = 80 WHERE id = 1')] },
     })
     expect((await terminal(client, predecessor.txIdText)).outcome.type).toBe('accepted')
     await waitFor(() => outcomeResource.getSnapshot().value?.outcome.type === 'rejected')
@@ -216,10 +224,11 @@ async function runtime(options: { readonly clockNow?: () => number } = {}) {
   const membershipRevision = bytes32(2)
   const validationPolicy = bytes32(3)
   const capability = bytes32(4)
-  const native = readNativeEngineInfo()
   const materializer = await DeterministicMaterializer.open({
     path: join(directory, 'application.db'),
-    executionManifest: createExecutionManifest({ profile: 'chronolog-core-portable', engine: native.descriptor, engineDigest: native.digest }),
+    executionManifest: createDoltLiteExecutionManifest(),
+    // The node is the group's root administrator, so it may run DDL.
+    rootAdministrator: identity.publicKeyBytes,
   })
   const membership: MembershipResolver = {
     canWrite: ({ writerId }) => equalBytes(writerId, identity.publicKeyBytes),

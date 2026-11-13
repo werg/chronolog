@@ -20,6 +20,7 @@
     "test:publication-crash": "vitest run test/materializer-publication-crash.integration.test.ts",
     "test:native-sanitizers": "bash tools/run-native-sanitizers.sh",
     "bench:ingest": "tsx tools/bench-ingest.ts",
+    "bench:materialize": "tsx tools/bench-materialize.ts",
     "test:soak": "tsx packages/conformance/src/release-characterization.ts --iterations 500 --reopen-every 25 --late-every 10 --late-depth 7 --output artifacts/release/soak.json",
     "characterize": "tsx packages/conformance/src/release-characterization.ts --iterations 100 --reopen-every 20 --late-every 10 --late-depth 5 --output artifacts/release/characterization.json",
     "release:metadata": "pnpm build && tsx tools/generate-release-metadata.ts --output artifacts/release",

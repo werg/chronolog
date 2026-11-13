@@ -2,7 +2,8 @@
 
 Status: current design of the unreleased prototype. The transaction contract
 is [Specification 10](implementation-specs/10-deterministic-sql-transactions.md);
-membership details are in [governance.md](governance.md).
+membership details are in [governance.md](governance.md); row ownership is in
+[design-owner-rows.md](design-owner-rows.md).
 
 ## 1. What Chronolog is
 
@@ -41,25 +42,47 @@ A transaction candidate is signed by its author and carries:
 
 - the group, membership revision and validation policy it was written for;
 - `author_timestamp_ms`, fixed by the author;
-- the execution manifest digest (engine build and limits);
-- a program: an ordered list of SQLite statements with bindings.
+- the execution manifest digest (engine build, platform code and limits);
+- a program: an ordered list of steps, each a SQLite statement with bindings
+  or a typed platform operation (register a table, grant, collective,
+  transfer).
 
 Values are SQLite's own storage classes (NULL, INTEGER, REAL, TEXT, BLOB).
 DDL and DML travel in the same stream. There is no schema manifest, dialect
 or migration system: the schema is whatever the accepted transactions created.
+Only schema administrators (admins of the `group` collective, starting with
+the root administrator) may run DDL.
 
 A transaction that depends on earlier state says so in SQL, usually with
 `chronolog_assert(condition, 'code')`. If any statement fails, the transaction
 is **rejected** and has no effect; otherwise it is **accepted**. Only the
-outcome (and a rejection code and statement index) is recorded. Values
+outcome (and a rejection code and step index) is recorded. Values
 returned by statements are not replicated.
+
+## 3a. Owner-controlled rows
+
+Every application table is registered and has a `chronolog_owner` column,
+stamped with the signer of the transaction that inserted the row (stored as
+a small integer id; `chronolog_principals` maps ids to keys).
+Platform-generated triggers, enforced by the pinned engine on every replica,
+let only the owner, a collective the signer belongs to, or a key the owner
+granted access insert, update or delete a row. The root administrator and
+schema administrators are ordinary actors under these checks: they cannot
+widen anyone's rights, but they may narrow them with ordinary app triggers,
+whose writes are themselves checked as the signer. Any violation aborts the
+whole transaction (`policy:<table>:<command>`); rows are never skipped.
+Ownership moves only by an offer accepted by the recipient; a planned key
+change is a bulk transfer. Reads are not restricted: every reader node holds
+every row. See [design-owner-rows.md](design-owner-rows.md).
 
 ## 4. Determinism
 
 Every replica runs the same pinned DoltLite engine build on the same state in
 the same order. The engine inputs that do not come from SQL are fixed per
 transaction: `'now'` is the author timestamp, `random()` is seeded from the
-transaction id, `localtime` is UTC, and connection counters start at zero. A
+transaction id, `localtime` is UTC, connection counters start at zero, and
+`chronolog_actor()` is the signing key. Platform operations are trusted
+TypeScript whose digest is part of the execution manifest. A
 short block-list (attachments, transaction control, writing pragmas, temporary
 objects, Dolt functions, Chronolog's own tables, storage-dependent functions)
 is enforced by SQLite's authorizer. Everything else SQLite supports is
@@ -134,15 +157,15 @@ There is no in-protocol recovery. A node whose state is suspect restores from
 a verified snapshot or replays from feeds. If the root key is lost, the
 validator set can no longer meet its policy, or settled history must change,
 participants coordinate out of band and **fork**: a new group whose genesis
-names its origin and is seeded with ordinary transactions
-([governance.md](governance.md#forking-a-group)).
+names its origin and is seeded by its root administrator, keeping every row's
+owner ([governance.md](governance.md#forking-a-group)).
 
 ## 10. Security consequences
 
 The protocol prevents forged transactions, reordering of admitted
 transactions, backdating below validators' cutoffs, silent feed rewrites
 (detected as forks), and replicas disagreeing about state without detection.
-It permits a member to write anything its role allows, a validator set that
+It permits a writer to change only rows it owns or was granted, a validator set that
 meets the policy to admit any well-formed transaction, and readers to keep
 what they were able to decrypt. Compromised writer or validator keys are
 handled by revocation; a compromised root key by forking. See the

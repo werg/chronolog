@@ -136,4 +136,25 @@ describe('FeedTransport', () => {
     expect(status.peers).toEqual([b.identity])
     expect(status.feedsWithGaps).toBe(0)
   })
+
+  it('is healthy again once a restarted peer reconnects and replicates', async () => {
+    const [aPath, bPath] = [await directory(), await directory()]
+    let b = await open(bPath, { network: { listen: { port: 0 }, reconnect: false } })
+    const bAddress = b.address()!
+    const port = Number(/:(\d+)~/u.exec(bAddress)![1])
+    const a = await open(aPath, {
+      network: { peers: [{ address: bAddress, feedId: b.identity }], reconnect: { initialDelayMs: 50, maximumDelayMs: 100, connectTimeoutMs: 2_000 } },
+    })
+    const first = await b.publish(Uint8Array.of(1))
+    await eventually(async () => (await a.get(first.id)) !== undefined)
+
+    // The peer goes away mid-stream (a restart), then comes back on the same address.
+    await b.close()
+    transports.splice(transports.indexOf(b), 1)
+    await eventually(async () => (await a.status()).peers.length === 0, 30_000)
+    b = await open(bPath, { network: { listen: { port }, reconnect: false } })
+    const second = await b.publish(Uint8Array.of(2))
+    await eventually(async () => (await a.get(second.id)) !== undefined, 30_000)
+    expect((await a.status()).lastCatchUpError).toBeUndefined()
+  }, 60_000)
 })

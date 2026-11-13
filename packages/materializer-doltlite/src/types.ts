@@ -15,9 +15,9 @@ export interface TransactionOutcome {
   readonly orderKey: TransactionOrderKey
   readonly orderIndex: number
   readonly outcome: TransactionOutcomeKind
-  /** `assert:<code>`, `constraint`, `step_limit`, … ; null when accepted. */
+  /** `assert:<code>`, `policy:<table>:<command>`, `platform:<reason>`, `constraint`, … ; null when accepted. */
   readonly rejectionCode: string | null
-  /** Index of the statement that failed; null when accepted. */
+  /** Index of the program step that failed; null when accepted or for whole-transaction checks. */
   readonly failingStatementIndex: number | null
 }
 
@@ -179,8 +179,8 @@ export interface DatabaseLike {
   /** Returns the previous value, matching sqlite3_limit(). */
   setLimit(category: number, value: number): number
   interrupt(): void
-  /** Pin 'now', the PRNG seed and UTC localtime; resets last_insert_rowid. */
-  setDeterministicContext(unixMs: bigint, seed: number): void
+  /** Pin 'now', the PRNG seed, UTC localtime, chronolog_actor() and chronolog_actor_id(); resets last_insert_rowid. */
+  setDeterministicContext(unixMs: bigint, seed: number, actor?: Uint8Array | null, actorId?: bigint | null): void
   clearDeterministicContext(): void
   doltCommit(message: string): string
   doltBranch(name: string, from?: string): void
@@ -197,6 +197,18 @@ export interface DatabaseLike {
 export interface MaterializerOptions {
   readonly path?: string
   readonly executionManifest: ExecutionManifest
+  /**
+   * The group's genesis root administrator key: the first admin of the
+   * `group` collective, and the only key that may seed rows into a fork.
+   */
+  readonly rootAdministrator: Uint8Array
+  /**
+   * The group is a fork (its genesis names a source group): the new database
+   * starts with fork seeding open, so the root may `SeedRows` until another
+   * author's first accepted transaction. Every other group never allows
+   * seeding. Used only when the database is created.
+   */
+  readonly forkSeeding?: boolean
   readonly checkpointEvery?: number
   readonly retainCheckpoints?: number
   /**

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { checkLedgerConsistency, checkMigrationConsistency } from './invariants.js'
+import { checkLedgerConsistency, checkMigrationConsistency, checkOwnersKnown } from './invariants.js'
 import type { WorkloadExpectation } from './types.js'
 
 describe('chaos ledger oracle', () => {
@@ -71,5 +71,15 @@ describe('chaos migration oracle', () => {
     const result = checkMigrationConsistency(stateRows, [...schemaRows, ['table', `${rollbackPrefix}_items`]], expectations, logRows)
     expect(result.passed).toBe(false)
     expect(result.details).toContain('leaked rolled-back schema')
+  })
+})
+
+describe('owner invariant', () => {
+  it('accepts node keys and collectives and reports any other owner', () => {
+    const alice = Buffer.alloc(32, 1).toString('base64url')
+    const team = Buffer.alloc(32, 2).toString('base64url')
+    const stranger = Buffer.alloc(32, 3).toString('base64url')
+    expect(checkOwnersKnown([[{ bytes: alice }, '0'], [{ bytes: team }, '1']], [alice])).toEqual({ passed: true })
+    expect(checkOwnersKnown([[{ bytes: stranger }, '0']], [alice])).toEqual({ passed: false, details: `Unknown owners: ${stranger}` })
   })
 })

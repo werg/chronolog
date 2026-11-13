@@ -1,12 +1,16 @@
-import type { SqlStatement, SqlTransactionProgram, SqlValue } from '@chronolog/protocol'
+import { isPlatformOp, type SqlStatement, type SqlTransactionProgram } from '@chronolog/protocol'
 
-import { isOperationalSqliteError, SqlProfileError, sqlitePrimaryCode, withProfiledStatement } from './sql-profile.js'
+import { cachedInternalStatement, PlatformRejection, PlatformSession, toDatabaseValue, writeProtectedTables } from './platform/session.js'
+import { isOperationalSqliteError, SqlProfileError, sqlitePrimaryCode, withProfiledStatement, type SqlAuthorizationOptions } from './sql-profile.js'
 import type { DatabaseLike, SqlRuntimeLimits, StatementLike } from './types.js'
+
+export { toDatabaseValue }
 
 /** A deterministic reason a transaction is rejected; recorded in the log. */
 export class SqlRejection extends Error {
-  constructor(readonly code: string, readonly statementIndex: number) {
-    super(`${code} (statement ${statementIndex})`)
+  /** `statementIndex` is the failing step, or null for whole-transaction checks. */
+  constructor(readonly code: string, readonly statementIndex: number | null) {
+    super(statementIndex === null ? code : `${code} (step ${statementIndex})`)
     this.name = 'SqlRejection'
   }
 }
@@ -16,6 +20,8 @@ export interface DeterministicContext {
   readonly authorTimestampMs: bigint
   /** Seeds random()/randomblob(); derived from the transaction id. */
   readonly txId: Uint8Array
+  /** The signing key: chronolog_actor() and the owner of new rows. */
+  readonly actor: Uint8Array
 }
 
 const SQLITE_CONSTRAINT = 19
@@ -24,12 +30,15 @@ const SQLITE_TOOBIG = 18
 const SQLITE_MISMATCH = 20
 const SQLITE_RANGE = 25
 const ASSERT_PREFIX = 'chronolog_assert:'
+const POLICY_PREFIX = 'chronolog_policy:'
 
 /**
- * Execute a transaction program as ordinary SQLite statements with the
- * engine's non-SQL inputs pinned to the transaction. Throws SqlRejection for
- * a deterministic failure; any other error is operational and stops replay.
- * Must run synchronously: the pinned clock and PRNG are process-global.
+ * Execute a transaction program as its signer: SQL steps as ordinary SQLite
+ * statements, platform operations through trusted platform code, with the
+ * engine's non-SQL inputs pinned to the transaction. A transaction that
+ * changed the schema is reconciled before it may commit. Throws SqlRejection
+ * for a deterministic failure; any other error is operational and stops
+ * replay. Must run synchronously: the pinned context is process-global.
  */
 export function executeTransactionProgram(
   database: DatabaseLike,
@@ -37,11 +46,32 @@ export function executeTransactionProgram(
   context: DeterministicContext,
   limits: Partial<SqlRuntimeLimits> = {},
 ): void {
-  database.setDeterministicContext(context.authorTimestampMs, prngSeed(context.txId))
+  const platform = new PlatformSession(database, { actor: context.actor, txId: context.txId, limits })
+  // Before the context: it assigns a first-time signer its principal id, which
+  // the context pins as chronolog_actor_id().
+  const { actorId, schemaAdmin: signerIsSchemaAdmin, schemaVersion: schemaBefore } = platform.begin()
+  database.setDeterministicContext(context.authorTimestampMs, prngSeed(context.txId), context.actor, actorId)
   try {
     resetChangeCounter(database)
-    for (const [index, statement] of program.statements.entries()) {
-      executeStatement(database, statement, index, limits)
+    let schemaAdmin = signerIsSchemaAdmin
+    for (const [index, step] of program.steps.entries()) {
+      if (isPlatformOp(step)) {
+        try {
+          platform.execute(step, index)
+        } catch (error) {
+          throw rejectionFor(error, index)
+        }
+        schemaAdmin = platform.isSchemaAdmin()
+      } else {
+        executeStatement(database, step, index, limits, { schemaAdmin, writeProtectedTables: writeProtectedTables(database) })
+      }
+    }
+    if (schemaVersion(database) !== schemaBefore) {
+      try {
+        platform.reconcile()
+      } catch (error) {
+        throw rejectionFor(error, null)
+      }
     }
   } finally {
     database.clearDeterministicContext()
@@ -53,14 +83,22 @@ function executeStatement(
   statement: SqlStatement,
   index: number,
   limits: Partial<SqlRuntimeLimits>,
+  authorization: SqlAuthorizationOptions,
 ): void {
   try {
     withProfiledStatement(database, statement.sql, 'consensus', (prepared) => {
       prepared.run(bindingArray(prepared, statement, index))
-    }, limits)
+    }, limits, authorization)
   } catch (error) {
     throw rejectionFor(error, index)
   }
+}
+
+/** SQLite's schema cookie; every DDL statement changes it. */
+function schemaVersion(database: DatabaseLike): number {
+  const row = cachedInternalStatement(database, 'PRAGMA schema_version').get()
+  if (row === undefined || Array.isArray(row)) throw new Error('MATERIALIZER_SCHEMA_VERSION_UNAVAILABLE')
+  return Number(row.schema_version)
 }
 
 /** Positional values for every parameter SQLite found in the statement. */
@@ -80,19 +118,9 @@ function bindingArray(prepared: StatementLike, statement: SqlStatement, index: n
   return values
 }
 
-export function toDatabaseValue(value: SqlValue): unknown {
-  switch (value.kind) {
-    case 'null': return null
-    case 'integer': return value.value
-    // A one-element Float64Array binds as an exact REAL even when integral.
-    case 'real': return Float64Array.of(value.value)
-    case 'text': return value.value
-    case 'blob': return Buffer.from(value.value.buffer, value.value.byteOffset, value.value.byteLength)
-  }
-}
-
-function rejectionFor(error: unknown, index: number): Error {
+function rejectionFor(error: unknown, index: number | null): Error {
   if (error instanceof SqlRejection) return error
+  if (error instanceof PlatformRejection) return new SqlRejection(error.code, index)
   if (error instanceof SqlProfileError) {
     switch (error.code) {
       case 'SQL_STEP_LIMIT': return new SqlRejection('step_limit', index)
@@ -107,6 +135,11 @@ function rejectionFor(error: unknown, index: number): Error {
   const assertAt = message.indexOf(ASSERT_PREFIX)
   if (extended === SQLITE_CONSTRAINT_FUNCTION && assertAt >= 0) {
     return new SqlRejection(`assert:${message.slice(assertAt + ASSERT_PREFIX.length)}`, index)
+  }
+  // Only platform triggers can call chronolog_policy_violation (§4).
+  const policyAt = message.indexOf(POLICY_PREFIX)
+  if (extended === SQLITE_CONSTRAINT_FUNCTION && policyAt >= 0) {
+    return new SqlRejection(`policy:${message.slice(policyAt + POLICY_PREFIX.length)}`, index)
   }
   switch (sqlitePrimaryCode(error)) {
     case SQLITE_CONSTRAINT: return new SqlRejection('constraint', index)

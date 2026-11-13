@@ -1,3 +1,4 @@
+import { shadowTables } from './platform/session.js'
 import { SqlProfileError, withProfiledStatement } from './sql-profile.js'
 import type { DatabaseLike, LocalSqlValue, SqlRuntimeLimits } from './types.js'
 
@@ -14,6 +15,7 @@ export function executeLocalSql(
   readonly columns: readonly { readonly name: string; readonly declaredType?: string }[]
   readonly rows: readonly (readonly LocalSqlValue[])[]
 } {
+  const authorization = { shadowTables: shadowTables(database) }
   return withProfiledStatement(database, sql, 'local_read', (statement) => {
     statement.setReturnArrays?.(true)
     statement.setReadBigInts?.(true)
@@ -32,7 +34,7 @@ export function executeLocalSql(
       throw new SqlProfileError('SQL_RESULT_LIMIT')
     }
     return { columns, rows: resultRows }
-  }, inputLimits)
+  }, inputLimits, authorization)
 }
 
 function localValueToDatabaseValue(value: LocalSqlValue): unknown {

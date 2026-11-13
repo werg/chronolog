@@ -1,12 +1,12 @@
 import { join, resolve } from 'node:path'
 
-import { createExecutionManifest } from '@chronolog/protocol'
+import { executionManifestArtifacts } from '@chronolog/protocol'
 import { isCapabilityActive } from '@chronolog/capabilities'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import {
   DeterministicMaterializer,
+  createDoltLiteExecutionManifest,
   createDoltLiteMaterializationRuntime,
-  readNativeEngineInfo,
 } from '@chronolog/materializer-doltlite'
 import {
   CapabilityMembershipResolver,
@@ -23,7 +23,7 @@ import { FeedTransport, type SsbPeer } from '@chronolog/transport-ssb'
 
 import { fromBase64, loadOrCreateConfig, parseDaemonRuntimeConfig } from './config.js'
 import { loadOrCreateGovernanceBootstrap } from './governance-config.js'
-import { loadStaticMembership } from './static-membership.js'
+import { loadStaticMembership, readStaticRootAdministrator } from './static-membership.js'
 import { discoverPublicSsbAddress, verifyPublicSsbReachability, type NatVerificationResult } from './nat-discovery.js'
 import { daemonHealth, prometheusMetrics } from './observability.js'
 import { daemonSecretStoreFromEnvironment } from './secret-store.js'
@@ -41,11 +41,8 @@ const configuredValidationPolicy = fromBase64(config.validationPolicy)
 const configuredValidatorCapability = fromBase64(config.validatorCapability)
 
 const configuredPeers: readonly SsbPeer[] = runtime.peers
-const nativeEngine = readNativeEngineInfo()
-const executionManifest = createExecutionManifest({
-  profile: 'chronolog-core-portable',
-  engineDigest: nativeEngine.digest,
-})
+const executionManifest = createDoltLiteExecutionManifest()
+const { executionManifestDigest } = await executionManifestArtifacts(executionManifest)
 const { transport, materializer, node, server, address, governance, nat, nodeState } = await startRuntime()
 process.stdout.write(`${JSON.stringify({
   event: 'chronologd.ready',
@@ -117,12 +114,19 @@ async function startRuntime() {
   let reachability: NatVerificationResult = { status: 'not-configured', address: null }
   // The node's own state (control index, validator cutoffs, feed continuity).
   const nodeState = new NodeStateDatabase(join(dataDirectory, 'node-state.sqlite'))
-  try {
+  // Opened once the genesis root administrator is known: it is the first schema administrator.
+  // A fork's genesis names its source group; only then may the root seed rows.
+  const openMaterializer = async (rootAdministrator: Uint8Array, forkSeeding = false): Promise<DeterministicMaterializer> => {
     materializer = await DeterministicMaterializer.open({
       path: join(dataDirectory, 'application.db'),
       checkpointEvery: runtime.checkpointEvery,
       executionManifest,
+      rootAdministrator,
+      forkSeeding,
     })
+    return materializer
+  }
+  try {
     const controlStore = new ControlStore(new SqliteControlStorePersistence(nodeState))
     let membership: MembershipResolver
     let membershipRevision = configuredMembershipRevision
@@ -135,20 +139,23 @@ async function startRuntime() {
       readonly validatorCapability?: Uint8Array
     }) | undefined
     if (process.env.CHRONOLOG_STATIC_MEMBERSHIP_FILE !== undefined) {
-      membership = await loadStaticMembership(resolve(process.env.CHRONOLOG_STATIC_MEMBERSHIP_FILE), {
+      const membershipFile = resolve(process.env.CHRONOLOG_STATIC_MEMBERSHIP_FILE)
+      membership = await loadStaticMembership(membershipFile, {
         groupId,
         membershipRevision,
         validationPolicy,
       })
+      await openMaterializer(await readStaticRootAdministrator(membershipFile))
     } else {
       const bootstrap = await loadOrCreateGovernanceBootstrap({
         dataDirectory,
         groupId,
-        schemaId: materializer.executionManifestDigest,
+        schemaId: executionManifestDigest,
         identity,
         transportAuthor: transport.identity,
         ...(secretStore === undefined ? {} : { secretStore }),
       })
+      await openMaterializer(bootstrap.genesis.manifest.rootAdminPublicKey, bootstrap.genesis.manifest.forkedFrom !== undefined)
       governance = await GovernanceControlPlane.create({
         genesis: bootstrap.genesis,
         groupRoute: fromBase64(config.groupRoute),
@@ -192,7 +199,7 @@ async function startRuntime() {
       validationPolicy,
       identity,
       transport,
-      materialization: createDoltLiteMaterializationRuntime(materializer),
+      materialization: createDoltLiteMaterializationRuntime(materializer!),
       controlStore,
       membership,
       ...(membershipState === undefined ? {} : { membershipState }),
@@ -230,7 +237,7 @@ async function startRuntime() {
       timeoutMs: runtime.natDiscoveryTimeoutMs,
       ...(runtime.natVerificationUrl === undefined ? {} : { verificationUrl: runtime.natVerificationUrl }),
     })
-    return { transport, materializer, node, server, address, governance, nat: { ...nat, reachability }, nodeState }
+    return { transport, materializer: materializer!, node, server, address, governance, nat: { ...nat, reachability }, nodeState }
   } catch (error) {
     await server?.close().catch(() => undefined)
     await governance?.close().catch(() => undefined)

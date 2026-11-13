@@ -2,10 +2,10 @@ import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { NodeStateDatabase } from '@chronolog/control-store'
-import { createExecutionManifest, type ExecutionManifest } from '@chronolog/protocol'
+import type { ExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
-  readNativeEngineInfo,
+  createDoltLiteExecutionManifest,
 } from '@chronolog/materializer-doltlite'
 import {
   FeedForkRegistry,
@@ -22,6 +22,7 @@ import type { TransportRecord } from '@chronolog/transport-ssb'
 
 import { fromBase64, loadOrCreateConfig } from './config.js'
 import { acquireDataDirectoryLock } from './data-lock.js'
+import { resolveRootAdministrator } from './root-administrator.js'
 import { daemonSecretStoreFromEnvironment } from './secret-store.js'
 
 interface RepairPlanDocument {
@@ -46,13 +47,11 @@ try {
   const secretStore = daemonSecretStoreFromEnvironment(process.env)
   const { config, identity } = await loadOrCreateConfig(dataDirectory, secretStore)
   const groupId = fromBase64(config.groupId)
-  const executionManifest = createExecutionManifest({
-    profile: 'chronolog-core-portable',
-    engineDigest: readNativeEngineInfo().digest,
-  })
+  const executionManifest = createDoltLiteExecutionManifest()
   const databasePath = join(dataDirectory, 'application.db')
+  const rootAdministrator = await resolveRootAdministrator(dataDirectory)
   if (command === 'export') {
-    const materializer = await DeterministicMaterializer.open({ path: databasePath, executionManifest })
+    const materializer = await DeterministicMaterializer.open({ path: databasePath, executionManifest, rootAdministrator })
     let manifest: TrustedSnapshotManifest
     try {
       manifest = {
@@ -75,14 +74,15 @@ try {
     output({ exported: true, archiveDirectory, revision: manifest.materializedRevision.toString(10), signer: b64(identity.publicKeyBytes) })
   } else if (command === 'import' || command === 'repair') {
     const signer = b64bytes(required(option(args, '--signer'), `${command} requires --signer BASE64URL_PUBLIC_KEY`), 32)
-    const current = await DeterministicMaterializer.open({ path: databasePath, executionManifest })
+    const current = await DeterministicMaterializer.open({ path: databasePath, executionManifest, rootAdministrator })
     const minimumRevision = current.revision
     current.close()
     const staged = await stageSnapshotArchive({
       archiveDirectory,
       targetDatabasePath: databasePath,
       expectations: { groupId, executionManifestDigest: current.executionManifestDigest, authorizedSigners: [signer], minimumRevision },
-      validateDatabase: async (path, manifest) => validateMaterializer(path, executionManifest, manifest),
+      // The snapshot's database must belong to this group: same genesis root administrator.
+      validateDatabase: async (path, manifest) => validateMaterializer(path, executionManifest, rootAdministrator, manifest),
     })
     if (!args.includes('--confirm-replace')) throw new Error('SNAPSHOT_REPLACE_CONFIRMATION_REQUIRED')
     const backupPath = `${databasePath}.pre-snapshot-r${staged.manifest.materializedRevision}`
@@ -101,9 +101,10 @@ try {
 async function validateMaterializer(
   path: string,
   executionManifest: ExecutionManifest,
+  rootAdministrator: Uint8Array,
   manifest: TrustedSnapshotManifest,
 ): Promise<void> {
-  const materializer = await DeterministicMaterializer.open({ path, executionManifest })
+  const materializer = await DeterministicMaterializer.open({ path, executionManifest, rootAdministrator })
   try {
     if (materializer.revision !== manifest.materializedRevision || materializer.orderLength !== manifest.orderLength ||
         materializer.databaseContentHash !== manifest.databaseContentHash ||

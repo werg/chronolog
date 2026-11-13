@@ -1,3 +1,5 @@
+import { platformOp, type PlatformOp } from '@chronolog/protocol'
+
 import type { ChaosCluster } from './cluster.js'
 import { errorText, type RunArtifacts } from './artifacts.js'
 import type { SeededRandom } from './rng.js'
@@ -23,7 +25,11 @@ export const DEFAULT_OPERATION_WEIGHTS: Readonly<Record<WorkloadOperationKind, n
   ddl_sequence: 3,
   precondition_rejection: 7,
   constraint_rejection: 6,
+  owner_probe: 6,
 })
+
+/** Operations that run DDL; only the root (schema) administrator may submit them. */
+const SCHEMA_OPERATIONS: ReadonlySet<WorkloadOperationKind> = new Set(['migration_chain', 'migration_rollback', 'ddl_sequence'])
 
 export interface WorkloadResult {
   readonly attempted: number
@@ -56,12 +62,13 @@ export async function runWorkload(options: {
       performance.now() - options.startedAt < options.scenario.durationMs ||
       hasPendingCoverage(options.scenario.workload, worker, operation)
     )) {
-      const node = random.pick(options.cluster.nodeNames())
+      const picked = random.pick(options.cluster.nodeNames())
       const account = random.integer(0, options.scenario.workload.accounts - 1)
       const delta = random.integer(options.scenario.workload.minimumDelta, options.scenario.workload.maximumDelta)
       const operationIndex = operation++
       const operationId = `worker-${worker}-operation-${operationIndex}`
       const kind = chooseScheduledWorkloadOperation(random, options.scenario.workload, worker, operationIndex)
+      const node = SCHEMA_OPERATIONS.has(kind) ? options.cluster.adminNodeName() : picked
       byKind[kind] = (byKind[kind] ?? 0) + 1
       attempted += 1
       await options.artifacts.record({
@@ -112,7 +119,7 @@ export async function runWorkload(options: {
   return { attempted, published, failed, transactionIds, expectations, byKind }
 }
 
-type WorkloadStatement = { readonly sql: string; readonly params?: readonly unknown[] }
+type WorkloadStatement = { readonly sql: string; readonly params?: readonly unknown[] } | PlatformOp
 
 /**
  * Statements for one workload operation. Assumptions about the state the
@@ -179,13 +186,14 @@ async function workloadStatements(kind: WorkloadOperationKind, context: {
       return [{ sql: 'UPDATE accounts SET touched = touched WHERE id = -1 RETURNING id, touched' }]
     case 'document_insert':
       return [{
-        sql: 'INSERT INTO chaos_documents VALUES (?, ?, ?, ?, ?) RETURNING document_id, account_id, title, payload, optional_text',
+        sql: 'INSERT INTO chaos_documents (document_id, account_id, title, payload, optional_text) VALUES (?, ?, ?, ?, ?) RETURNING document_id, account_id, title, payload, optional_text',
         params: [operationId, BigInt(account), `title-${delta}`, random.bytes(random.integer(0, 32)), random.integer(0, 1) === 0 ? null : `optional-${worker}`],
       }]
     case 'ddl_sequence': {
       const table = `chaos_ddl_${worker}_${context.operation}`
       return [
         { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, marker TEXT) STRICT` },
+        platformOp.registerTable(table),
         { sql: `ALTER TABLE ${table} ADD COLUMN payload BLOB` },
         { sql: `SELECT name, type FROM pragma_table_info('${table}') ORDER BY cid` },
       ]
@@ -198,8 +206,13 @@ async function workloadStatements(kind: WorkloadOperationKind, context: {
     case 'constraint_rejection':
       return [
         { sql: 'UPDATE accounts SET touched = touched + 1000000 WHERE id = ? RETURNING touched', params: [BigInt(account)] },
-        { sql: "INSERT INTO chaos_ledger VALUES ('__reserved_constraint_key__', 0, 0, 0, NULL, X'')" },
+        { sql: "INSERT INTO chaos_ledger (operation_id, leg, account_id, delta, note, payload) VALUES ('__reserved_constraint_key__', 0, 0, 0, NULL, X'')" },
       ]
+    case 'owner_probe':
+      // Touches every profile, including other writers' rows. It is accepted
+      // only while all of them belong to the signer; otherwise the owner
+      // check aborts the whole transaction instead of skipping rows.
+      return [{ sql: 'UPDATE chaos_profiles SET display_name = display_name RETURNING profile_id' }]
   }
 }
 
@@ -256,7 +269,7 @@ function ledgerInsert(
   random: SeededRandom,
 ) {
   return {
-    sql: 'INSERT INTO chaos_ledger VALUES (?, ?, ?, ?, ?, ?) RETURNING operation_id, leg, account_id, delta, note, payload',
+    sql: 'INSERT INTO chaos_ledger (operation_id, leg, account_id, delta, note, payload) VALUES (?, ?, ?, ?, ?, ?) RETURNING operation_id, leg, account_id, delta, note, payload',
     params: [operationId, BigInt(leg), BigInt(account), BigInt(delta), delta % 2 === 0 ? null : `delta-${delta}`, random.bytes(random.integer(0, 16))],
   }
 }
@@ -278,25 +291,29 @@ function expectationFor(kind: WorkloadOperationKind, operationId: string): Omit<
     case 'migration_chain':
       return { allowedOutcomes: ['accepted'], migrationPrefix: migrationPrefix('migrate', operationId) }
     case 'migration_rollback':
-      // Statement 0 is the schema assertion; the duplicate history insert is statement 6.
-      return { allowedOutcomes: ['rejected'], rejectionCode: 'constraint', failingStatementIndex: 6, migrationPrefix: migrationPrefix('rollback', operationId) }
+      // Step 0 is the schema assertion; the duplicate history insert is step 7.
+      return { allowedOutcomes: ['rejected'], rejectionCode: 'constraint', failingStatementIndex: 7, migrationPrefix: migrationPrefix('rollback', operationId) }
+    case 'owner_probe':
+      return { allowedOutcomes: ['accepted', 'rejected'], rejectionCode: 'policy:chaos_profiles:update', failingStatementIndex: 0 }
     default:
       return { allowedOutcomes: ['accepted'] }
   }
 }
 
 /** Complete v1→v2 lifecycle: backfill, replacement index/view/trigger, and version history. */
-export function migrationChainStatements(prefix: string) {
+export function migrationChainStatements(prefix: string): WorkloadStatement[] {
   const table = `${prefix}_items`
   const audit = `${prefix}_audit`
   return [
     { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, legacy_name TEXT NOT NULL) STRICT` },
-    { sql: `INSERT INTO ${table} VALUES (1, 'Alpha'), (2, 'Beta') RETURNING id, legacy_name` },
-    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 1, ?)', params: [prefix, `${prefix}-v1`] },
+    platformOp.registerTable(table),
+    { sql: `INSERT INTO ${table} (id, legacy_name) VALUES (1, 'Alpha'), (2, 'Beta') RETURNING id, legacy_name` },
+    { sql: 'INSERT INTO chaos_schema_migrations (component, version, checksum) VALUES (?, 1, ?)', params: [prefix, `${prefix}-v1`] },
     { sql: `CREATE INDEX ${prefix}_legacy_idx ON ${table}(legacy_name)` },
     { sql: `CREATE VIEW ${prefix}_legacy_view AS SELECT id, legacy_name FROM ${table}` },
-    { sql: `CREATE TABLE ${audit} (item_id INTEGER NOT NULL, normalized_name TEXT NOT NULL) STRICT` },
-    { sql: `CREATE TRIGGER ${prefix}_legacy_trigger AFTER INSERT ON ${table} BEGIN INSERT INTO ${audit} VALUES (NEW.id, NEW.legacy_name); END` },
+    { sql: `CREATE TABLE ${audit} (item_id INTEGER PRIMARY KEY NOT NULL, normalized_name TEXT NOT NULL) STRICT` },
+    platformOp.registerTable(audit),
+    { sql: `CREATE TRIGGER ${prefix}_legacy_trigger AFTER INSERT ON ${table} BEGIN INSERT INTO ${audit} (item_id, normalized_name) VALUES (NEW.id, NEW.legacy_name); END` },
     { sql: `ALTER TABLE ${table} ADD COLUMN normalized_name TEXT` },
     { sql: `UPDATE ${table} SET normalized_name = lower(legacy_name) RETURNING id, normalized_name` },
     { sql: `DROP TRIGGER ${prefix}_legacy_trigger` },
@@ -304,9 +321,9 @@ export function migrationChainStatements(prefix: string) {
     { sql: `DROP INDEX ${prefix}_legacy_idx` },
     { sql: `CREATE UNIQUE INDEX ${prefix}_current_idx ON ${table}(normalized_name)` },
     { sql: `CREATE VIEW ${prefix}_current_view AS SELECT id, normalized_name FROM ${table} WHERE normalized_name IS NOT NULL` },
-    { sql: `CREATE TRIGGER ${prefix}_current_trigger AFTER INSERT ON ${table} BEGIN INSERT INTO ${audit} VALUES (NEW.id, COALESCE(NEW.normalized_name, lower(NEW.legacy_name))); END` },
+    { sql: `CREATE TRIGGER ${prefix}_current_trigger AFTER INSERT ON ${table} BEGIN INSERT INTO ${audit} (item_id, normalized_name) VALUES (NEW.id, COALESCE(NEW.normalized_name, lower(NEW.legacy_name))); END` },
     { sql: `ALTER TABLE ${table} ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 2` },
-    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 2, ?)', params: [prefix, `${prefix}-v2`] },
+    { sql: 'INSERT INTO chaos_schema_migrations (component, version, checksum) VALUES (?, 2, ?)', params: [prefix, `${prefix}-v2`] },
     { sql: `INSERT INTO ${table} (id, legacy_name, normalized_name) VALUES (3, 'Gamma', 'gamma') RETURNING id, normalized_name, schema_version` },
     { sql: `SELECT id, normalized_name, schema_version FROM ${table} ORDER BY id` },
     { sql: `SELECT item_id, normalized_name FROM ${audit} ORDER BY item_id` },
@@ -314,15 +331,16 @@ export function migrationChainStatements(prefix: string) {
 }
 
 /** A deliberately failing migration whose catalog and history writes must roll back atomically. */
-export function migrationRollbackStatements(prefix: string) {
+export function migrationRollbackStatements(prefix: string): WorkloadStatement[] {
   const table = `${prefix}_items`
   return [
     { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT` },
+    platformOp.registerTable(table),
     { sql: `CREATE INDEX ${prefix}_idx ON ${table}(value)` },
     { sql: `CREATE VIEW ${prefix}_view AS SELECT id, value FROM ${table}` },
     { sql: `CREATE TRIGGER ${prefix}_trigger AFTER INSERT ON ${table} BEGIN SELECT 1; END` },
-    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 1, ?)', params: [prefix, `${prefix}-must-rollback`] },
-    { sql: "INSERT INTO chaos_schema_migrations VALUES ('profiles', 1, 'duplicate-must-fail')" },
+    { sql: 'INSERT INTO chaos_schema_migrations (component, version, checksum) VALUES (?, 1, ?)', params: [prefix, `${prefix}-must-rollback`] },
+    { sql: "INSERT INTO chaos_schema_migrations (component, version, checksum) VALUES ('profiles', 1, 'duplicate-must-fail')" },
   ]
 }
 

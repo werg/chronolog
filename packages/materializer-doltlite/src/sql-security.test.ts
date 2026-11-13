@@ -2,6 +2,7 @@ import { DatabaseSync } from '@dolthub/doltlite'
 import { describe, expect, it } from 'vitest'
 
 import type {
+  SqlAuthorizationOptions,
   SqlProfileError} from './sql-profile.js';
 import {
   assertNativeSecurityConfiguration,
@@ -31,14 +32,17 @@ function database(): DatabaseLike {
   return db
 }
 
-function expectProfileViolation(db: DatabaseLike, sql: string, mode: 'local_read' | 'consensus' = 'consensus'): void {
-  expect(() => prepareProfiledStatement(db, sql, mode)).toThrowError(
+type Mode = 'local_read' | 'consensus' | 'platform'
+const ADMIN: SqlAuthorizationOptions = { schemaAdmin: true }
+
+function expectProfileViolation(db: DatabaseLike, sql: string, mode: Mode = 'consensus', options: SqlAuthorizationOptions = ADMIN): void {
+  expect(() => prepareProfiledStatement(db, sql, mode, {}, options), sql).toThrowError(
     expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_PROFILE_VIOLATION' }),
   )
 }
 
-function expectAllowed(db: DatabaseLike, sql: string, mode: 'local_read' | 'consensus' = 'consensus'): void {
-  expect(() => prepareProfiledStatement(db, sql, mode)).not.toThrow()
+function expectAllowed(db: DatabaseLike, sql: string, mode: Mode = 'consensus', options: SqlAuthorizationOptions = ADMIN): void {
+  expect(() => prepareProfiledStatement(db, sql, mode, {}, options), sql).not.toThrow()
 }
 
 describe('SQL authorization block-list', () => {
@@ -63,7 +67,7 @@ describe('SQL authorization block-list', () => {
         'CREATE VIRTUAL TABLE docs USING fts5(body)',
         'WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v + 1 FROM n WHERE v < 5) SELECT count(*) FROM n',
       ]) {
-        try { prepareProfiledStatement(db, sql, 'consensus') } catch (error) { throw new Error(`denied: ${sql}: ${(error as { code?: string }).code ?? String(error)}`, { cause: error }) }
+        try { prepareProfiledStatement(db, sql, 'consensus', {}, ADMIN) } catch (error) { throw new Error(`denied: ${sql}: ${(error as { code?: string }).code ?? String(error)}`, { cause: error }) }
       }
     } finally {
       db.close()
@@ -104,6 +108,56 @@ describe('SQL authorization block-list', () => {
         'CREATE TABLE chronolog_extra (id INTEGER)',
         'ALTER TABLE chronolog_transactions ADD COLUMN x',
       ]) expectProfileViolation(db, sql)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('limits DDL to schema administrators and protects platform objects', () => {
+    const db = database()
+    try {
+      db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, chronolog_owner BLOB);
+        CREATE TRIGGER chronolog_k_notes_upd BEFORE UPDATE ON notes BEGIN SELECT 1; END;
+        CREATE VIEW chronolog_my_owner_ids_update AS SELECT 1 AS id`)
+      for (const sql of [
+        'CREATE TABLE t (id INTEGER PRIMARY KEY)',
+        'CREATE INDEX notes_id ON notes (id)',
+        'CREATE VIEW v AS SELECT 1',
+        'CREATE TRIGGER app AFTER INSERT ON notes BEGIN SELECT 1; END',
+        'CREATE VIRTUAL TABLE docs USING fts5(body)',
+        'ALTER TABLE notes ADD COLUMN extra TEXT',
+        'DROP TABLE notes',
+      ]) {
+        expectProfileViolation(db, sql, 'consensus', {})
+        expectAllowed(db, sql, 'consensus', ADMIN)
+      }
+      expectAllowed(db, 'ANALYZE', 'consensus', {})
+      for (const sql of [
+        'DROP TRIGGER chronolog_k_notes_upd',
+        'DROP VIEW chronolog_my_owner_ids_update',
+        'CREATE TRIGGER chronolog_k_x BEFORE INSERT ON notes BEGIN SELECT 1; END',
+        'ALTER TABLE notes DROP COLUMN chronolog_owner',
+        "SELECT chronolog_policy_violation('notes', 'update')",
+        'UPDATE chronolog_transactions SET outcome = 1',
+      ]) expectProfileViolation(db, sql, 'consensus', ADMIN)
+      // Dropping a table takes its platform triggers with it.
+      expectAllowed(db, 'DROP TABLE notes', 'consensus', ADMIN)
+      // Platform code may write and create chronolog_* objects.
+      expectAllowed(db, 'UPDATE chronolog_transactions SET outcome = 1', 'platform', {})
+      expectAllowed(db, 'CREATE TRIGGER chronolog_k_x BEFORE INSERT ON notes BEGIN SELECT 1; END', 'platform', {})
+    } finally {
+      db.close()
+    }
+  })
+
+  it('compiles app triggers fired by platform statements under consensus rules', () => {
+    const db = database()
+    try {
+      db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, chronolog_owner BLOB);
+        CREATE TRIGGER app_forge AFTER UPDATE ON notes BEGIN DELETE FROM chronolog_transactions; END;`)
+      expectProfileViolation(db, 'UPDATE notes SET chronolog_owner = NULL', 'platform', {})
+      db.exec('DROP TRIGGER app_forge; CREATE TRIGGER app_touch AFTER UPDATE ON notes BEGIN SELECT 1; END')
+      expectAllowed(db, 'UPDATE notes SET chronolog_owner = NULL', 'platform', {})
     } finally {
       db.close()
     }

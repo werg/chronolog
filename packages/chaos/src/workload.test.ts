@@ -23,6 +23,7 @@ const operationKinds = [
   'ddl_sequence',
   'precondition_rejection',
   'constraint_rejection',
+  'owner_probe',
 ] as const
 
 const workload: WorkloadSpec = {
@@ -54,12 +55,12 @@ describe('chaos mixed workload selection', () => {
 
   it('covers every enabled operation at the start of a short multi-worker run', () => {
     const random = new SeededRandom('coverage-prefix')
-    const operations = Array.from({ length: 4 }, (_value, operation) =>
+    const operations = Array.from({ length: 5 }, (_value, operation) =>
       Array.from({ length: 3 }, (_workerValue, worker) =>
         chooseScheduledWorkloadOperation(random, { ...workload, workers: 3 }, worker, operation),
       ),
     ).flat()
-    expect(operations).toEqual(operationKinds)
+    expect(operations.slice(0, operationKinds.length)).toEqual(operationKinds)
   })
 
   it('falls back from transfers when only one account exists', () => {
@@ -75,8 +76,8 @@ describe('chaos mixed workload selection', () => {
 describe('chaos migration workload builders', () => {
   it('builds an inspectable v1-to-v2 lifecycle with backfill and catalog replacement', () => {
     const statements = migrationChainStatements('chaos_migrate_test')
-    expect(statements).toHaveLength(20)
-    expect(statements.map((statement) => statement.sql)).toEqual(expect.arrayContaining([
+    expect(statements).toHaveLength(22)
+    expect(statements.map((statement) => 'sql' in statement ? statement.sql : statement.op)).toEqual(expect.arrayContaining([
       expect.stringContaining('ALTER TABLE chaos_migrate_test_items ADD COLUMN normalized_name'),
       expect.stringContaining('UPDATE chaos_migrate_test_items SET normalized_name'),
       expect.stringContaining('DROP TRIGGER chaos_migrate_test_legacy_trigger'),
@@ -88,8 +89,9 @@ describe('chaos migration workload builders', () => {
 
   it('builds a failing migration whose last statement collides with migration history', () => {
     const statements = migrationRollbackStatements('chaos_rollback_test')
-    expect(statements).toHaveLength(6)
-    expect(statements.at(-1)?.sql).toContain("VALUES ('profiles', 1")
+    expect(statements).toHaveLength(7)
+    const last = statements.at(-1)
+    expect(last !== undefined && 'sql' in last ? last.sql : '').toContain("VALUES ('profiles', 1")
   })
 
   it('provides a reusable schema-version assertion', () => {

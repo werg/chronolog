@@ -65,7 +65,8 @@ interface Server {
   connect?(address: string, callback: (error: Error | null, rpc?: Rpc) => void): void
   getAddress?(scope?: string): string | undefined
   on?(event: string, callback: (...arguments_: unknown[]) => void): void
-  close(callback: (error?: Error) => void): void
+  /** `true` also closes every peer connection; without it, close waits for peers to hang up. */
+  close(force: true, callback: (error?: Error) => void): void
 }
 
 interface HistoryRequest {
@@ -108,7 +109,12 @@ export class FeedTransport implements ChronologTransport {
   readonly #forkRecords: TransportRecord[] = []
   #reconnect?: ReconnectOptions
   #reconnectTimer?: ReturnType<typeof setInterval>
-  #lastError: string | undefined
+  /**
+   * The current error of each live stream, by connection and feed. An entry
+   * clears when that stream makes progress or its connection closes, so a
+   * peer restart does not leave the node degraded after it reconnects.
+   */
+  readonly #streamErrors = new Map<Rpc, Map<string, string>>()
   /** Incremented on every stored change; lets readers wait without losing a wakeup. */
   #version = 0
   #closed = false
@@ -314,7 +320,7 @@ export class FeedTransport implements ChronologTransport {
         })),
       feedStates,
       feedsWithGaps: 0,
-      ...(this.#lastError === undefined ? {} : { lastCatchUpError: this.#lastError }),
+      ...(this.#lastStreamError() === undefined ? {} : { lastCatchUpError: this.#lastStreamError()! }),
     }
   }
 
@@ -344,6 +350,7 @@ export class FeedTransport implements ChronologTransport {
       closed = true
       for (const stop of this.#streams.get(rpc)?.values() ?? []) stop()
       this.#streams.delete(rpc)
+      this.#streamErrors.delete(rpc)
       connections.delete(rpc)
       if (connections.size === 0) this.#connections.delete(feedId)
       const configured = this.#configured.get(feedId)
@@ -359,7 +366,7 @@ export class FeedTransport implements ChronologTransport {
     try {
       source = rpc.chronologFeeds.history({ feed, after: this.#store.head(feed).sequence.toString(10) })
     } catch (error) {
-      this.#lastError = errorMessage(error)
+      this.#setStreamError(rpc, feed, error)
       return
     }
     let stopped = false
@@ -377,12 +384,14 @@ export class FeedTransport implements ChronologTransport {
         if (end) {
           stopped = true
           streams.delete(feed)
-          if (end !== true) this.#lastError = errorMessage(end)
+          if (end !== true) this.#setStreamError(rpc, feed, end)
           this.#restreamLater(rpc, feed)
           return
         }
-        const restart = !this.#accept(value)
-        if (restart) {
+        const accepted = this.#accept(value)
+        if (accepted === true) this.#clearStreamError(rpc, feed)
+        else if (accepted !== false) this.#setStreamError(rpc, feed, accepted.error)
+        if (accepted !== true) {
           stop()
           this.#restreamLater(rpc, feed)
           return
@@ -398,8 +407,32 @@ export class FeedTransport implements ChronologTransport {
     timer.unref?.()
   }
 
-  /** Store one received record; false when the stream must restart from the local head. */
-  #accept(value: string | undefined): boolean {
+  #setStreamError(rpc: Rpc, feed: string, error: unknown): void {
+    // A stream of a connection that already closed is gone; its error is moot.
+    if (!this.#streams.has(rpc)) return
+    const errors = this.#streamErrors.get(rpc) ?? new Map<string, string>()
+    errors.set(feed, errorMessage(error))
+    this.#streamErrors.set(rpc, errors)
+  }
+
+  #clearStreamError(rpc: Rpc, feed: string): void {
+    const errors = this.#streamErrors.get(rpc)
+    if (errors === undefined) return
+    errors.delete(feed)
+    if (errors.size === 0) this.#streamErrors.delete(rpc)
+  }
+
+  #lastStreamError(): string | undefined {
+    for (const errors of this.#streamErrors.values()) for (const error of errors.values()) return error
+    return undefined
+  }
+
+  /**
+   * Store one received record. True when stored (or already held); otherwise
+   * the stream restarts from the local head: false for a record that does not
+   * follow it yet, or the error that made the record unusable.
+   */
+  #accept(value: string | undefined): boolean | { readonly error: unknown } {
     try {
       if (typeof value !== 'string') throw new FeedRecordError('FEED_RECORD_MALFORMED')
       const record = decodeFeedRecord(Uint8Array.from(Buffer.from(value, 'base64')), this.#maxRecordBytes)
@@ -416,8 +449,7 @@ export class FeedTransport implements ChronologTransport {
       }
       return result.kind === 'duplicate'
     } catch (error) {
-      this.#lastError = errorMessage(error)
-      return false
+      return { error }
     }
   }
 
@@ -547,7 +579,7 @@ function parseReconnectOptions(
 }
 
 function closeServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => server.close((error) => {
+  return new Promise((resolve, reject) => server.close(true, (error) => {
     if (error && !(typeof error === 'object' && 'code' in error && error.code === 'ERR_SERVER_NOT_RUNNING')) reject(error)
     else resolve()
   }))

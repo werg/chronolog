@@ -3,10 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
-  readNativeEngineInfo,
+  createDoltLiteExecutionManifest,
   type MaterializerPublicationFaultPoint,
 } from '@chronolog/materializer-doltlite'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -23,7 +22,7 @@ const postPublication: readonly MaterializerPublicationFaultPoint[] = [
 ]
 
 afterEach(async () => Promise.all(
-  directories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  directories.splice(0).map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
 ))
 
 describe('native publication crash recovery', () => {
@@ -44,15 +43,11 @@ describe('native publication crash recovery', () => {
         `${result.stdout}\n${result.stderr}`,
       ).toBe(true)
 
-      const native = readNativeEngineInfo()
-      const manifest = createExecutionManifest({
-        profile: 'chronolog-native-production-v1',
-        engine: native.descriptor,
-        engineDigest: native.digest,
-      })
+      const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-native-production-v1' })
       const reopened = await DeterministicMaterializer.open({
         path,
         executionManifest: manifest,
+        rootAdministrator: Uint8Array.from({ length: 32 }, (_value, index) => (4 + index) & 0xff),
         checkpointEvery: 1,
       })
       try {

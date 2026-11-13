@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@dolthub/doltlite@0.11.29':
-    hash: 9b0f8bb352443e09640711a32c1522f2317d6ecb1f5ef4747f648013bc8af75f
+    hash: b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a
     path: patches/@dolthub__doltlite@0.11.29.patch
 
 importers:
@@ -112,7 +112,7 @@ importers:
     devDependencies:
       '@dolthub/doltlite':
         specifier: 0.11.29
-        version: 0.11.29(patch_hash=9b0f8bb352443e09640711a32c1522f2317d6ecb1f5ef4747f648013bc8af75f)
+        version: 0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)
 
   apps/distribution:
     dependencies:
@@ -186,7 +186,7 @@ importers:
         version: link:../protocol
       '@dolthub/doltlite':
         specifier: 0.11.29
-        version: 0.11.29(patch_hash=9b0f8bb352443e09640711a32c1522f2317d6ecb1f5ef4747f648013bc8af75f)
+        version: 0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)
 
   packages/control-store:
     dependencies:
@@ -222,7 +222,7 @@ importers:
         version: link:../protocol
       '@dolthub/doltlite':
         specifier: 0.11.29
-        version: 0.11.29(patch_hash=9b0f8bb352443e09640711a32c1522f2317d6ecb1f5ef4747f648013bc8af75f)
+        version: 0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)
 
   packages/node-core:
     dependencies:
@@ -2608,7 +2608,7 @@ snapshots:
 
   '@bcoe/v8-coverage@1.0.2': {}
 
-  '@dolthub/doltlite@0.11.29(patch_hash=9b0f8bb352443e09640711a32c1522f2317d6ecb1f5ef4747f648013bc8af75f)':
+  '@dolthub/doltlite@0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)':
     dependencies:
       node-addon-api: 8.9.0
 

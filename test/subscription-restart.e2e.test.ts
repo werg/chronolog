@@ -2,11 +2,10 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   createDoltLiteMaterializationRuntime,
-  readNativeEngineInfo,
+  createDoltLiteExecutionManifest,
 } from '@chronolog/materializer-doltlite'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
 import { equalBytes, generateEd25519KeyPair, type Ed25519KeyPair } from '@chronolog/protocol'
@@ -96,10 +95,10 @@ describe('transport subscription restart', () => {
 
 async function node(name: string, identity: Ed25519KeyPair, transport: ChronologTransport, membership: MembershipResolver, capability: Uint8Array): Promise<ChronologNode> {
   const directory = await mkdtemp(join(tmpdir(), `chronolog-subscription-${name}-`))
-  const native = readNativeEngineInfo()
   const materializer = await DeterministicMaterializer.open({
     path: join(directory, 'application.db'),
-    executionManifest: createExecutionManifest({ profile: 'chronolog-core-portable', engine: native.descriptor, engineDigest: native.digest }),
+    executionManifest: createDoltLiteExecutionManifest(),
+    rootAdministrator: identity.publicKeyBytes,
   })
   const created = new ChronologNode({
     groupId: bytes32(1),

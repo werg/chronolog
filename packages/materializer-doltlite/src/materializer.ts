@@ -35,6 +35,8 @@ import {
   readSystemLog,
 } from './system-log.js'
 import { materializedLogDigest } from './snapshot-evidence.js'
+import { PLATFORM_DIGEST } from './platform/digest.js'
+import { initializePlatform, readRootAdministrator } from './platform/schema.js'
 import type {
   AdmittedTransaction,
   DatabaseLike,
@@ -69,6 +71,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   readonly #backend: MaterializerBackendInfo
   readonly #executionManifest: ExecutionManifest
   readonly #artifacts: ManifestArtifacts
+  readonly #rootAdministrator: Uint8Array
   readonly #subscribers = new Set<RevisionSubscriber>()
   #published: PublishedRef
   #checkpoints: MaterializerCheckpointInfo[]
@@ -95,6 +98,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#backend = backend
     this.#executionManifest = structuredClone(executionManifest)
     this.#artifacts = artifacts
+    this.#rootAdministrator = copyBytes(options.rootAdministrator)
     this.#published = published
     this.#checkpoints = checkpoints
     this.#log = log
@@ -106,7 +110,14 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   static async open(options: MaterializerOptions): Promise<DeterministicMaterializer> {
+    if (!(options.rootAdministrator instanceof Uint8Array) || options.rootAdministrator.length !== 32) {
+      throw new MaterializerInputError('MATERIALIZER_ROOT_ADMINISTRATOR_INVALID')
+    }
+    if (!bytesEqual(options.executionManifest.platformDigest, PLATFORM_DIGEST)) {
+      throw new MaterializerInputError('MATERIALIZER_PLATFORM_DIGEST_MISMATCH')
+    }
     const artifacts = await executionManifestArtifacts(options.executionManifest)
+    const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator }
     const opened = openDatabase(options)
     let reader: DatabaseLike | null = null
     try {
@@ -115,11 +126,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       }
       let published = discoverPublishedRef(opened.database)
       if (published === null) {
-        published = initializeRepository(opened.database, artifacts)
+        published = initializeRepository(opened.database, expected, options.forkSeeding === true)
       } else {
         resetActiveWorkingSet(opened.database)
         opened.database.doltCheckout(HEAD_BRANCH)
-        verifyDatabaseState(opened.database, artifacts)
+        verifyDatabaseState(opened.database, expected)
       }
       const log = readSystemLog(opened.database)
       verifyPublishedLog(published, log)
@@ -132,7 +143,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
       }
       reader.doltCheckout(published.branchRef)
-      verifyDatabaseState(reader, artifacts)
+      verifyDatabaseState(reader, expected)
       const readerLog = readSystemLog(reader)
       verifyPublishedLog(published, readerLog)
       if (reader.doltHashOf(published.branchRef) !== published.contentHash) {
@@ -244,7 +255,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
       replayBranch = createReplayBranch(this.#writer, nextRevision, baseRef)
       this.#writer.doltCheckout(replayBranch)
-      verifyDatabaseState(this.#writer, this.#artifacts)
+      verifyDatabaseState(this.#writer, this.#expected)
       verifyReplayBase(readSystemLog(this.#writer), transactions, replayFrom)
 
       for (let index = replayFrom; index < transactions.length; index += 1) {
@@ -254,7 +265,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
       const candidateLog = readSystemLog(this.#writer)
       verifyDesiredLog(candidateLog, transactions)
-      verifyDatabaseState(this.#writer, this.#artifacts)
+      verifyDatabaseState(this.#writer, this.#expected)
       const commitHash = this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
       const contentHash = this.#writer.doltHashOf(commitHash)
       if (contentHash !== this.#writer.doltHashOf()) throw new Error('MATERIALIZER_COMMIT_CONTENT_MISMATCH')
@@ -274,7 +285,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       const candidateOpened = openDatabase(this.#sourceOptions)
       candidateReader = candidateOpened.database
       candidateReader.doltCheckout(revisionBranch)
-      verifyDatabaseState(candidateReader, this.#artifacts)
+      verifyDatabaseState(candidateReader, this.#expected)
       const readerLog = readSystemLog(candidateReader)
       verifyPublishedLog(nextPublished, readerLog)
       if (candidateReader.doltHashOf(revisionBranch) !== contentHash) {
@@ -360,6 +371,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         executeTransactionProgram(this.#writer, transaction.core.program, {
           authorTimestampMs: transaction.core.authorTimestampMs,
           txId: transaction.txId,
+          actor: transaction.core.authorId,
         }, this.#executionManifest.limits)
       }
     } catch (error) {
@@ -381,6 +393,10 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       rollbackIfActive(this.#writer)
       throw new Error(`MATERIALIZER_LOG_WRITE_FAILED:${errorMessage(error)}`, { cause: error })
     }
+  }
+
+  get #expected(): ExpectedState {
+    return { artifacts: this.#artifacts, rootAdministrator: this.#rootAdministrator }
   }
 
   #publicationFault(point: MaterializerPublicationFaultPoint): void {
@@ -415,18 +431,26 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   #assertOpen(): void { if (this.#closed) throw new Error('MATERIALIZER_CLOSED') }
 }
 
+interface ExpectedState {
+  readonly artifacts: ManifestArtifacts
+  readonly rootAdministrator: Uint8Array
+}
+
+/** `forkSeeding`: the genesis is a fork's, so its root may seed rows until the plan ends seeding. */
 function initializeRepository(
   database: DatabaseLike,
-  artifacts: ManifestArtifacts,
+  expected: ExpectedState,
+  forkSeeding: boolean,
 ): PublishedRef {
   if (!isFreshRepository(database)) throw new Error('MATERIALIZER_RESERVED_HEAD_MISSING')
   database.exec('BEGIN IMMEDIATE')
   try {
     withAuthorizer(database, 'internal_bootstrap', () => {
       initializeSystemLog(database)
-      insertExecutionManifest(database, storedManifest(artifacts))
+      insertExecutionManifest(database, storedManifest(expected.artifacts))
+      initializePlatform(database, expected.rootAdministrator, forkSeeding)
     })
-    verifyDatabaseState(database, artifacts)
+    verifyDatabaseState(database, expected)
     database.exec('COMMIT')
   } catch (error) {
     rollbackIfActive(database)
@@ -453,9 +477,12 @@ function isFreshRepository(database: DatabaseLike): boolean {
 
 function verifyDatabaseState(
   database: DatabaseLike,
-  artifacts: ManifestArtifacts,
+  expected: ExpectedState,
 ): void {
-  verifyStoredManifest(readExecutionManifest(database), artifacts)
+  verifyStoredManifest(readExecutionManifest(database), expected.artifacts)
+  if (!bytesEqual(readRootAdministrator(database), expected.rootAdministrator)) {
+    throw new Error('DATABASE_ROOT_ADMINISTRATOR_MISMATCH')
+  }
 }
 
 function validateCheckpointRefs(

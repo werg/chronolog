@@ -2,15 +2,41 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-import { ChronologClient, sqlValue, type ClientSqlBindings, type ClientSqlValue, type SqlValue } from '@chronolog/client'
+import {
+  ChronologClient,
+  GROUP_COLLECTIVE_ID,
+  platformOp,
+  sqlValue,
+  type ClientSqlBindings,
+  type ClientSqlValue,
+  type CollectiveRole,
+  type GrantOperation,
+  type PlatformOp,
+  type SqlValue,
+  type TransactionStepInput,
+} from '@chronolog/client'
 import { HttpRpcTransport } from '@chronolog/rpc'
 
 interface SqlSpec {
   readonly sql: string
   readonly bindings?: readonly JsonSqlValue[] | Readonly<Record<string, JsonSqlValue>>
 }
+/**
+ * A platform operation in JSON. Keys and ids are base64url; `group` names the
+ * group collective. Row keys are primary-key values, like SQL bindings.
+ *   {"platform":"register_table","table":"notes"}
+ *   {"platform":"grant","table":"notes","grantee":KEY,"operations":["update"],"rowKey":[1],"columns":["status"],"grantor":ID?}
+ *   {"platform":"revoke_grant","grantId":ID}
+ *   {"platform":"create_collective","governance":{"insert":"member","update":"member","delete":"admin"},"invitees":[KEY]}
+ *   {"platform":"accept_membership","collectiveId":ID}   {"platform":"leave","collectiveId":ID}
+ *   {"platform":"set_members","collectiveId":ID,"changes":[{"member":KEY,"role":"admin|member|remove"}]}
+ *   {"platform":"transfer_row","table":"notes","rowKey":[1],"toOwner":ID,"carry":true,"fromOwner":ID?}
+ *   {"platform":"transfer_all","toOwner":KEY,"fromOwner":ID?}
+ *   {"platform":"accept_transfer","offerId":ID}
+ */
+type PlatformSpec = { readonly platform: string } & Readonly<Record<string, unknown>>
 interface TransactionSpec {
-  readonly statements: readonly SqlSpec[]
+  readonly steps: readonly (SqlSpec | PlatformSpec)[]
   readonly wait?: boolean
   readonly idempotencyKey?: string
 }
@@ -23,12 +49,17 @@ type SeedValue =
   | { readonly kind: 'real'; readonly value: number }
   | { readonly kind: 'text'; readonly value: string }
   | { readonly kind: 'blob'; readonly value: string }
+type SeedStep =
+  | { readonly sql: string; readonly bindings: readonly SeedValue[] }
+  | { readonly platform: 'register_table'; readonly table: string }
+  | { readonly platform: 'seed_rows'; readonly table: string; readonly columns: readonly string[]; readonly rows: readonly (readonly SeedValue[])[] }
+  | { readonly platform: 'end_seeding' }
 interface SeedPlan {
-  readonly format: 'chronolog-fork-seed-v2'
+  readonly format: 'chronolog-fork-seed-v4'
   readonly batches: readonly {
     readonly batch: number
     readonly label: string
-    readonly statements: readonly { readonly sql: string; readonly bindings: readonly SeedValue[] }[]
+    readonly steps: readonly SeedStep[]
   }[]
 }
 /** Rejection code of a seed batch whose guard found it already applied. */
@@ -71,10 +102,12 @@ try {
     }
     case 'transact': {
       const spec = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'transact SPEC_JSON_OR_@FILE'))) as TransactionSpec
-      const statements: readonly SqlSpec[] = spec.statements
-      if (!(statements as unknown instanceof Array) || statements.length === 0) throw new Error('Transaction spec requires statements')
+      const steps: TransactionSpec['steps'] = spec.steps
+      if (!(steps as unknown instanceof Array) || steps.length === 0) throw new Error('Transaction spec requires steps')
       const handle = await client.transaction(
-        statements.map((statement) => ({ sql: statement.sql, params: jsonBindings(statement.bindings ?? []) })),
+        steps.map((step): TransactionStepInput => 'platform' in step
+          ? jsonPlatformOp(step)
+          : { sql: step.sql, params: jsonBindings(step.bindings ?? []) }),
         spec.idempotencyKey === undefined ? {} : { idempotencyKey: spec.idempotencyKey },
       )
       output(spec.wait === true ? { submission: handle.submission, outcome: await waitForOutcome(handle.transactionId) } : handle.submission)
@@ -132,14 +165,16 @@ try {
       // rerun after an interruption skips finished batches.
       const plan = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'seed @fork-seed.json'))) as SeedPlan
       const batches: SeedPlan['batches'] = plan.batches
-      if (plan.format !== 'chronolog-fork-seed-v2' || !(batches as unknown instanceof Array)) throw new Error('Not a fork seed plan')
+      if (plan.format !== 'chronolog-fork-seed-v4' || !(batches as unknown instanceof Array)) throw new Error('Not a fork seed plan')
       let applied = 0
       let skipped = 0
       for (const batch of batches) {
-        const handle = await client.transaction(batch.statements.map((statement) => ({
-          sql: statement.sql,
-          params: statement.bindings.map(seedValue),
-        })))
+        const handle = await client.transaction(batch.steps.map((step): TransactionStepInput => {
+          if ('sql' in step) return { sql: step.sql, params: step.bindings.map(seedValue) }
+          if (step.platform === 'register_table') return platformOp.registerTable(step.table)
+          if (step.platform === 'end_seeding') return platformOp.endSeeding()
+          return platformOp.seedRows(step.table, step.columns, step.rows.map((row) => row.map(seedValue)))
+        }))
         handle.dispose()
         const outcome = await waitForOutcome(handle.transactionId, 10 * 60_000)
         if (outcome.outcome.type === 'accepted') applied += 1
@@ -173,6 +208,72 @@ function jsonValue(value: unknown): ClientSqlValue {
     if (tagged.kind === 'blob' && typeof tagged.value === 'string') return sqlValue.blob(Buffer.from(tagged.value, 'base64url'))
   }
   throw new Error('Unsupported SQL binding value')
+}
+
+function jsonPlatformOp(spec: PlatformSpec): PlatformOp {
+  const text = (name: string): string => {
+    const value = spec[name]
+    if (typeof value !== 'string') throw new Error(`Platform step ${spec.platform} requires ${name}`)
+    return value
+  }
+  const key = (value: unknown, name: string): Uint8Array => {
+    const bytes = typeof value === 'string' ? Uint8Array.from(Buffer.from(value, 'base64url')) : new Uint8Array()
+    if (bytes.length !== 32) throw new Error(`${name} must be 32 bytes of base64url`)
+    return bytes
+  }
+  const id = (name: string): Uint8Array => {
+    const value = text(name)
+    return value === 'group' ? GROUP_COLLECTIVE_ID : key(value, name)
+  }
+  const optionalId = (name: string): Uint8Array | undefined => spec[name] === undefined ? undefined : id(name)
+  const list = (name: string): readonly unknown[] => {
+    const value = spec[name]
+    if (!Array.isArray(value)) throw new Error(`Platform step ${spec.platform} requires a ${name} list`)
+    return value
+  }
+  const rowKey = (): ClientSqlValue[] => list('rowKey').map(jsonValue)
+  const keyList = (name: string): Uint8Array[] => list(name).map((value, index) => key(value, `${name}[${index}]`))
+  switch (spec.platform) {
+    case 'register_table': return platformOp.registerTable(text('table'))
+    case 'grant': {
+      const grantor = optionalId('grantor')
+      return platformOp.grant({
+        table: text('table'),
+        grantee: id('grantee'),
+        operations: list('operations') as GrantOperation[],
+        ...(grantor === undefined ? {} : { grantor }),
+        ...(spec.rowKey === undefined ? {} : { rowKey: rowKey() }),
+        ...(spec.columns === undefined ? {} : { columns: list('columns') as string[] }),
+      })
+    }
+    case 'revoke_grant': return platformOp.revokeGrant(id('grantId'))
+    case 'create_collective': return platformOp.createCollective({
+      governance: spec.governance as { insert: CollectiveRole; update: CollectiveRole; delete: CollectiveRole },
+      invitees: spec.invitees === undefined ? [] : keyList('invitees'),
+    })
+    case 'accept_membership': return platformOp.acceptMembership(id('collectiveId'))
+    case 'leave': return platformOp.leave(id('collectiveId'))
+    case 'set_members': return platformOp.setMembers(id('collectiveId'), list('changes').map((change) => {
+      const entry = change as { readonly member?: unknown; readonly role?: unknown }
+      if (typeof entry.member !== 'string' || (entry.role !== 'admin' && entry.role !== 'member' && entry.role !== 'remove')) {
+        throw new Error('set_members changes are {"member": KEY, "role": "admin"|"member"|"remove"}')
+      }
+      return { member: key(entry.member, 'member'), role: entry.role }
+    }))
+    case 'transfer_row': {
+      const fromOwner = optionalId('fromOwner')
+      return platformOp.transferRow({
+        table: text('table'), rowKey: rowKey(), toOwner: id('toOwner'), carry: spec.carry === true,
+        ...(fromOwner === undefined ? {} : { fromOwner }),
+      })
+    }
+    case 'transfer_all': {
+      const fromOwner = optionalId('fromOwner')
+      return platformOp.transferAll({ toOwner: id('toOwner'), ...(fromOwner === undefined ? {} : { fromOwner }) })
+    }
+    case 'accept_transfer': return platformOp.acceptTransfer(id('offerId'))
+    default: throw new Error(`Unknown platform step: ${spec.platform}`)
+  }
 }
 
 function seedValue(value: SeedValue): SqlValue {

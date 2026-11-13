@@ -1,6 +1,9 @@
 import {
+  encodePlatformOp,
+  isPlatformOp,
   isSqlValue,
   toSqlValue,
+  type PlatformOp,
   type SqlStatement,
   type SqlValue,
 } from '@chronolog/protocol'
@@ -13,6 +16,7 @@ import {
   type ReplicationStatus,
   type RevisionMetadata,
   type RpcCallOptions,
+  type RpcProgramStep,
   type RpcSqlStatement,
   type RpcTransport,
   type SettlementEvidence,
@@ -64,7 +68,7 @@ export interface LiveQueryValue {
 
 export interface TransactionOptions {
   readonly signal?: AbortSignal
-  /** Repeating a key with the same statements returns the original submission. */
+  /** Repeating a key with the same steps returns the original submission. */
   readonly idempotencyKey?: string
 }
 
@@ -80,6 +84,9 @@ export interface CompiledSqlStatement {
 }
 
 export type TransactionStatementInput = string | CompiledSqlStatement | SqlStatement
+
+/** One step of a transaction: a SQL statement, or a platform operation built with `platformOp`. */
+export type TransactionStepInput = TransactionStatementInput | PlatformOp
 
 export class TransactionHandle {
   readonly outcome: StreamResource<TransactionOutcome>
@@ -177,15 +184,17 @@ export class ChronologClient {
   }
 
   /**
-   * Submit ordinary SQLite statements as one replicated transaction. Any
-   * failing statement rejects the whole transaction; use
-   * `SELECT chronolog_assert(condition, 'code')` to state assumptions.
+   * Submit SQLite statements and platform operations as one replicated
+   * transaction, executed in order as this node's key. Any failing step
+   * rejects the whole transaction; use `SELECT chronolog_assert(condition,
+   * 'code')` to state assumptions. Rows written belong to this node's key
+   * unless a grant or collective says otherwise.
    */
-  async transaction(statements: readonly TransactionStatementInput[], options: TransactionOptions = {}): Promise<TransactionHandle> {
+  async transaction(steps: readonly TransactionStepInput[], options: TransactionOptions = {}): Promise<TransactionHandle> {
     const submission = await this._unary('transaction.submit', {
       groupId: this.groupId,
       requestId: this._requestId(),
-      statements: statements.map(encodeTransactionStatement),
+      steps: steps.map(encodeTransactionStep),
       ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
     }, options.signal === undefined ? {} : { signal: options.signal })
     return new TransactionHandle(this, submission)
@@ -304,6 +313,10 @@ export class ChronologClient {
   #callOptions(signal?: AbortSignal): RpcCallOptions {
     return { ...(signal === undefined ? {} : { signal }), ...(this.#token === undefined ? {} : { token: this.#token }) }
   }
+}
+
+function encodeTransactionStep(input: TransactionStepInput): RpcProgramStep {
+  return typeof input !== 'string' && isPlatformOp(input) ? { platform: encodePlatformOp(input) } : encodeTransactionStatement(input)
 }
 
 function encodeTransactionStatement(input: TransactionStatementInput): RpcSqlStatement {

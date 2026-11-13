@@ -10,7 +10,7 @@ import {
   type SettlementEvidence,
   type StreamResource,
   type StreamSnapshot,
-  type TransactionStatementInput,
+  type TransactionStepInput,
   type TransactionHandle,
   type TransactionOptions,
   type TransactionOutcome,
@@ -180,7 +180,7 @@ export type TransactionMutationState =
 export interface TransactionMutation {
   readonly state: TransactionMutationState
   readonly run: (
-    statements: readonly TransactionStatementInput[],
+    steps: readonly TransactionStepInput[],
     options?: TransactionOptions,
   ) => Promise<TransactionHandle>
   readonly reset: () => void
@@ -190,12 +190,12 @@ export function useChronologTransaction(clientOverride?: ChronologClient): Trans
   const client = useChronologClient(clientOverride)
   const [state, setState] = useState<TransactionMutationState>({ status: 'idle' })
   const run = useCallback(async (
-    statements: readonly TransactionStatementInput[],
+    steps: readonly TransactionStepInput[],
     options: TransactionOptions = {},
   ) => {
     setState({ status: 'publishing' })
     try {
-      const handle = await client.transaction(statements, options)
+      const handle = await client.transaction(steps, options)
       setState({ status: 'published', handle })
       return handle
     } catch (error) {

@@ -7,13 +7,14 @@ import { performance } from 'node:perf_hooks'
 
 import {
   DeterministicMaterializer,
-  readNativeEngineInfo,
+  createDoltLiteExecutionManifest,
   type AdmittedTransaction,
 } from '@chronolog/materializer-doltlite'
 import {
   encodeTransactionCore,
   transactionDigest,
-  createExecutionManifest,
+  platformOp,
+  sqlProgram,
   sqlStatement,
   utf8,
   type SqlTransactionProgram,
@@ -59,17 +60,13 @@ export async function characterizeNativeRecovery(
   validateOptions(options)
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-release-characterization-'))
   const path = join(directory, 'application.db')
-  const native = readNativeEngineInfo()
-  const manifest = createExecutionManifest({
-    profile: 'chronolog-native-release-characterization-v1',
-    engine: native.descriptor,
-    engineDigest: native.digest,
-  })
+  const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-native-release-characterization-v1' })
   const started = performance.now()
   let peakRssBytes = process.memoryUsage.rss()
   let materializer = await DeterministicMaterializer.open({
     path,
     executionManifest: manifest,
+    rootAdministrator: AUTHOR,
     checkpointEvery: Math.max(1, options.reopenEvery),
   })
   const ordered: AdmittedTransaction[] = []
@@ -107,6 +104,7 @@ export async function characterizeNativeRecovery(
         materializer = await DeterministicMaterializer.open({
           path,
           executionManifest: manifest,
+          rootAdministrator: AUTHOR,
           checkpointEvery: Math.max(1, options.reopenEvery),
         })
         reopenCount += 1
@@ -157,20 +155,17 @@ async function requireRevision(
 }
 
 function bootstrapProgram(): SqlTransactionProgram {
-  return {
-    version: 1,
-    statements: [sqlStatement('CREATE TABLE release_events (id INTEGER PRIMARY KEY, iteration INTEGER NOT NULL, kind TEXT NOT NULL) STRICT')],
-  }
+  return sqlProgram(
+    sqlStatement('CREATE TABLE release_events (id INTEGER PRIMARY KEY, iteration INTEGER NOT NULL, kind TEXT NOT NULL) STRICT'),
+    platformOp.registerTable('release_events'),
+  )
 }
 
 function insertProgram(iteration: number, kind: string): SqlTransactionProgram {
-  return {
-    version: 1,
-    statements: [sqlStatement(
-      'INSERT INTO release_events (id, iteration, kind) VALUES (?, ?, ?)',
-      [BigInt(iteration * 2 + (kind === 'late' ? 1 : 0)), BigInt(iteration), kind],
-    )],
-  }
+  return sqlProgram(sqlStatement(
+    'INSERT INTO release_events (id, iteration, kind) VALUES (?, ?, ?)',
+    [BigInt(iteration * 2 + (kind === 'late' ? 1 : 0)), BigInt(iteration), kind],
+  ))
 }
 
 async function transaction(
@@ -183,7 +178,7 @@ async function transaction(
     groupId: bytes32(1),
     membershipRevision: bytes32(2),
     validationPolicy: bytes32(3),
-    authorId: bytes32(4),
+    authorId: AUTHOR,
     authorTimestampMs: timestamp,
     nonce: bytes32(id + 10),
     executionManifestDigest,
@@ -220,6 +215,9 @@ function digestJson(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value, (_key, item: unknown) =>
     typeof item === 'bigint' ? item.toString() : item), 'utf8').digest('hex')
 }
+
+/** The fixture's only author, and the group's root administrator. */
+const AUTHOR = bytes32(4)
 
 function bytes32(seed: number): Uint8Array {
   return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff)

@@ -12,8 +12,9 @@
 //       recreates the snapshot's tables and rows as ordinary transactions.
 //       Start the daemon, then run `chronolog seed @fork-seed.json`.
 //   pnpm group verify-fork ARCHIVE_DIRECTORY
-//       Compare every application table of this (stopped) fork with the
-//       snapshot it was seeded from.
+//       Compare every application table (rows and owners) and the ownership
+//       state (registered tables, teams, memberships, grants, offers) of this
+//       (stopped) fork with the snapshot it was seeded from.
 //
 // See docs/governance.md ("Joining a group" and "Forking a group").
 import { createHash } from 'node:crypto'
@@ -21,11 +22,12 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { decodeSignedGenesis, encodeSignedGenesis, type SignedGenesis } from '@chronolog/capabilities'
-import { createExecutionManifest, type ExecutionManifest } from '@chronolog/protocol'
+import { executionManifestArtifacts, type ExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
+  createDoltLiteExecutionManifest,
   openReadOnlyDatabase,
-  readNativeEngineInfo,
+  readMaterializedRootAdministrator,
 } from '@chronolog/materializer-doltlite'
 import { decodeSignedSnapshotManifest, stageSnapshotArchive, type TrustedSnapshotManifest } from '@chronolog/node-core'
 import { equalBytes } from '@chronolog/protocol'
@@ -33,7 +35,7 @@ import { FeedTransport } from '@chronolog/transport-ssb'
 
 import { fromBase64, loadOrCreateConfig } from './config.js'
 import { acquireDataDirectoryLock } from './data-lock.js'
-import { applicationTableDigests, buildForkSeedPlan } from './fork-seed.js'
+import { applicationTableDigests, buildForkSeedPlan, platformTableDigests } from './fork-seed.js'
 import { loadOrCreateGovernanceBootstrap } from './governance-config.js'
 import { daemonSecretStoreFromEnvironment } from './secret-store.js'
 
@@ -90,14 +92,12 @@ async function forkGroup(archiveDirectory: string, signerText: string): Promise<
   await assertEmptyDataDirectory()
   const signer = b64bytes(signerText, 32)
   const snapshotBytes = await readFile(join(archiveDirectory, 'snapshot.cbor'))
-  const executionManifest = createExecutionManifest({ profile: 'chronolog-core-portable', engineDigest: readNativeEngineInfo().digest })
+  const executionManifest = createDoltLiteExecutionManifest()
   const scratch = await mkdtemp(join(dataDirectory, '.fork-source-'))
   try {
     // Same trust checks as a snapshot import: archive evidence, the operator-chosen
     // signer, the execution manifest, and the database's materialized evidence.
-    const probe = await DeterministicMaterializer.open({ path: join(scratch, 'probe.db'), executionManifest })
-    const executionManifestDigest = probe.executionManifestDigest
-    probe.close()
+    const { executionManifestDigest } = await executionManifestArtifacts(executionManifest)
     const sourceGroup = await snapshotGroup(archiveDirectory)
     const staged = await stageSnapshotArchive({
       archiveDirectory,
@@ -149,6 +149,7 @@ async function verifyFork(archiveDirectory: string): Promise<void> {
   if (!snapshotSha256.equals(origin.snapshotManifestSha256)) throw new Error('FORK_SNAPSHOT_MISMATCH')
   const sourceDigests = digestsOf(join(archiveDirectory, 'application.db'))
   const forkDigests = digestsOf(join(dataDirectory, 'application.db'))
+  // Owners are ordinary columns of each row, so the table digests compare them too.
   const tables = [...new Set([...Object.keys(sourceDigests), ...Object.keys(forkDigests)])].sort()
   const mismatched = tables.filter((table) => sourceDigests[table] !== forkDigests[table])
   output({ identical: mismatched.length === 0, tables: tables.length, mismatched })
@@ -165,10 +166,8 @@ async function initialize(
   const transport = await FeedTransport.open({ path: join(dataDirectory, 'ssb') })
   const transportAuthor = transport.identity
   await transport.close()
-  const executionManifest = createExecutionManifest({ profile: 'chronolog-core-portable', engineDigest: readNativeEngineInfo().digest })
-  const materializer = await DeterministicMaterializer.open({ path: join(dataDirectory, 'application.db'), executionManifest })
-  const schemaId = materializer.executionManifestDigest
-  materializer.close()
+  // The daemon creates the database on first start, once the genesis names its root administrator.
+  const { executionManifestDigest: schemaId } = await executionManifestArtifacts(createDoltLiteExecutionManifest())
   const loaded = await loadOrCreateGovernanceBootstrap({
     dataDirectory,
     groupId: group.groupId,
@@ -217,7 +216,8 @@ async function validateMaterializer(
   executionManifest: ExecutionManifest,
   manifest: TrustedSnapshotManifest,
 ): Promise<void> {
-  const materializer = await DeterministicMaterializer.open({ path, executionManifest })
+  // A snapshot database carries its own group's root administrator.
+  const materializer = await DeterministicMaterializer.open({ path, executionManifest, rootAdministrator: readMaterializedRootAdministrator(path) })
   try {
     if (materializer.revision !== manifest.materializedRevision || materializer.orderLength !== manifest.orderLength ||
         materializer.databaseContentHash !== manifest.databaseContentHash ||
@@ -229,7 +229,10 @@ async function validateMaterializer(
 
 function digestsOf(path: string): Record<string, string> {
   const database = openReadOnlyDatabase(path)
-  try { return applicationTableDigests(database) } finally { database.close() }
+  try {
+    const platform = Object.entries(platformTableDigests(database)).map(([name, digest]) => [`platform:${name}`, digest] as const)
+    return { ...applicationTableDigests(database), ...Object.fromEntries(platform) }
+  } finally { database.close() }
 }
 
 function forkOrigin(genesis: SignedGenesis) {

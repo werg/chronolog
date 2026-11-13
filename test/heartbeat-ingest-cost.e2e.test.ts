@@ -2,11 +2,10 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   createDoltLiteMaterializationRuntime,
-  readNativeEngineInfo,
+  createDoltLiteExecutionManifest,
 } from '@chronolog/materializer-doltlite'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
 import { equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
@@ -25,10 +24,10 @@ describe('heartbeat ingestion cost', () => {
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-heartbeat-cost-'))
     const identity = await generateEd25519KeyPair()
     const capability = bytes32(4)
-    const native = readNativeEngineInfo()
     const materializer = await DeterministicMaterializer.open({
       path: join(directory, 'application.db'),
-      executionManifest: createExecutionManifest({ profile: 'chronolog-core-portable', engine: native.descriptor, engineDigest: native.digest }),
+      executionManifest: createDoltLiteExecutionManifest(),
+      rootAdministrator: identity.publicKeyBytes,
     })
     const membership: MembershipResolver = {
       canWrite: ({ writerId }) => equalBytes(writerId, identity.publicKeyBytes),

@@ -147,9 +147,11 @@ export class ChaosCluster {
       }))
       const cluster = new ChaosCluster(options.prepared, options.scenario, options.artifacts, network, toxiproxy, links, nodes)
       await cluster.#waitForReplicationMesh()
-      const bootstrapClient = cluster.client(cluster.nodeNames()[0]!)
+      // The root administrator creates the schema and grants every other writer access to the shared accounts.
+      const bootstrapClient = cluster.client(cluster.adminNodeName())
+      const writers = options.prepared.nodes.slice(1).map((node) => Uint8Array.from(Buffer.from(node.publicKey, 'base64')))
       for (let attempt = 1; attempt <= 3; attempt += 1) {
-        const bootstrap = await bootstrapClient.transaction(chaosBootstrapStatements(options.scenario.workload.accounts), { idempotencyKey: `chronolog-chaos-bootstrap-v1-attempt-${attempt}` })
+        const bootstrap = await bootstrapClient.transaction(chaosBootstrapStatements(options.scenario.workload.accounts, writers), { idempotencyKey: `chronolog-chaos-bootstrap-v2-attempt-${attempt}` })
         try {
           const deadline = Date.now() + 30_000
           let settlement = 'unavailable'
@@ -189,6 +191,14 @@ export class ChaosCluster {
   }
 
   nodeNames(): readonly NodeName[] { return [...this.#nodes.keys()].sort() }
+
+  /** The genesis root administrator (the static membership's `rootAdministrator`): the only schema administrator. */
+  adminNodeName(): NodeName { return this.prepared.nodes[0]!.name }
+
+  /** Every node's signing key, base64url: the only keys that may own rows. */
+  nodeKeys(): readonly string[] {
+    return this.prepared.nodes.map((node) => Buffer.from(node.publicKey, 'base64').toString('base64url'))
+  }
 
   client(name: NodeName): ChronologClient {
     const node = this.#nodes.get(name)

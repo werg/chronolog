@@ -22,6 +22,7 @@ The principal boundaries are:
 2. authenticated outer feed identity to the inner Chronolog signer;
 3. signed protocol bytes to capability- and policy-authorized candidates;
 4. authored SQL to the pinned engine and its authorizer block-list;
+4a. the signer to the rows it may write (owner-controlled rows);
 5. candidate replay state to the atomic published Dolt head;
 6. local RPC callers to submission, query and governance authority;
 7. JSON references to OS-held private material;
@@ -36,8 +37,11 @@ The principal boundaries are:
 | Feed impersonation or copied signed payload | Feed signatures and the SSB secret handshake, plus capability-revision binding of inner signer to exact outer feed | A feed-key compromise remains equivalent to that transport identity |
 | Feed equivocation | Author/sequence/previous continuity registry; persistent quarantine; node becomes non-writable and degraded; signed-head snapshot repair accepts only a complete prefix and discards the recorded losing identity during rebuild | Operator signer/head selection and the repair ceremony require pilot evidence |
 | Unauthorized SQL or protected-state access | Native authorizer block-list: attachments, transaction control, writing pragmas, temporary objects, Dolt functions and tables, `chronolog_*` writes, storage-reading modules; authorizer adversarial tests | A block-list admits everything else the pinned engine supports; a new engine build or patch must be reviewed against it |
+| A writer, the root administrator or a schema administrator changing another owner's rows | Generated `BEFORE` triggers on every registered table check each insert/update/delete against `chronolog_actor()` (the signing key), the owner's collectives and live grants; reconciliation refuses unregistered tables, missing or foreign `chronolog_*` triggers/views, cross-owner FK cascades and `RAISE(IGNORE)`; the authorizer denies writes to platform tables, `chronolog_*` DDL, dropping the owner column and calling the policy function outside platform triggers; app triggers fired by platform operations are compiled under consensus rules. Tests: `owner-rows.integration.test.ts` (REPLACE, upsert, `INSERT … SELECT`, FK cascade/set-null, app-trigger writes, recursion, transfer with an app trigger, replay), `owner-engine.test.ts`, `sql-security.test.ts` | Schema administrators can narrow (block owners) with app triggers by design. Virtual tables (FTS5, R-tree, sqlite-vec and its `_vector_chunksNN` tables) carry no triggers; top-level writes to them are denied, so only app sync triggers (written by schema administrators) fill them. The `RAISE(IGNORE)` lint is a policy check, not a security boundary. A lost owner key has no in-protocol recovery |
+| Silent partial writes | Every owner-check violation aborts the whole transaction; there is no filtering policy; `RAISE(IGNORE)` triggers are refused | `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` remain explicit conflict handling |
+| Forged ownership at fork seeding | `SeedRows` only in a fork (genesis with `forkedFrom`), only by the genesis root, only until the first accepted transaction by another key; `verify-fork` compares owners and ownership state with the signed snapshot | The fork's root is trusted to seed faithfully until another member writes |
 | Ambient time/random/connection state | Fixed per-transaction inputs (`'now'` = author timestamp, seeded `random()`, UTC `localtime`, zeroed counters); `total_changes` and `sqlite_offset` denied; step and size limits | Any newly compiled-in function must be checked for ambient inputs before the manifest changes |
-| Engine nondeterminism across replicas | One pinned DoltLite build named by the execution manifest; candidates for another manifest are rejected (`manifest_mismatch`); replay-equivalence conformance | Cross-platform (Linux/macOS) replay comparison remains a release gate |
+| Engine nondeterminism across replicas | One pinned DoltLite build and one platform-code digest named by the execution manifest; candidates for another manifest are rejected (`manifest_mismatch`); replay-equivalence conformance; chaos invariants for platform-trigger digests and known owners | Cross-platform (Linux/macOS) replay comparison remains a release gate |
 | Partial candidate publication or crash | Private replay branch, independent reader verification, atomic head move, five-point `SIGKILL` matrix | Filesystem/hardware failure behavior still depends on the supported storage stack |
 | Outcome substitution | Outcomes are recomputed by every replica from signed bytes and recorded in the replicated `chronolog_transactions` table; validators never sign database states | Stored-data format migration is intentionally absent in the prototype |
 | Capability or epoch rollback | Signed revision chain, exact previous digest, epoch chain, monotonic validator timestamp floor | No in-protocol recovery: a lost or compromised root key is handled by forking the group or out of band |
@@ -89,8 +93,9 @@ drill occurred.
 ## Review gate
 
 Any change to protocol domains/codecs, capability admission, wire encryption,
-the authorizer block-list, the pinned engine or its fixed inputs, the
-publication sequence, snapshot trust, or secret storage must update this document and add or
+the authorizer block-list, the pinned engine or its fixed inputs, the platform
+operations or generated triggers, the publication sequence, snapshot trust, or
+secret storage must update this document and add or
 identify executable evidence. An external reviewer must receive the exact
 release commit, SBOM, provenance, conformance report, sanitizer/fuzz results,
 and every unresolved finding above.

@@ -1,8 +1,9 @@
-import type { RpcTransport, SubmitTransactionRequest, SubmitTransactionResponse } from '@chronolog/rpc'
+import { decodePlatformOp } from '@chronolog/protocol'
+import type { RpcPlatformStep, RpcSqlStatement, RpcTransport, SubmitTransactionRequest, SubmitTransactionResponse } from '@chronolog/rpc'
 import { describe, expect, it } from 'vitest'
 
 import { ChronologClient } from './client.js'
-import { sqlValue } from './values.js'
+import { platformOp, sqlValue } from './values.js'
 
 function recordingClient(): { readonly client: ChronologClient; readonly submitted: SubmitTransactionRequest[] } {
   const submitted: SubmitTransactionRequest[] = []
@@ -33,21 +34,26 @@ describe('ChronologClient.transaction', () => {
       "SELECT chronolog_assert(1, 'ok')",
       { sql: 'INSERT INTO t VALUES (?, ?, ?, ?, ?)', params: [1, 2n ** 62n, 1.5, 'text', new Uint8Array([1, 2])] },
       { sql: 'UPDATE t SET v = :v, w = @w WHERE id = :id', params: { v: sqlValue.real(1), '@w': null, id: true } },
+      platformOp.grant({ table: 't', grantee: new Uint8Array(32).fill(2), operations: ['update'], rowKey: [1n] }),
     ], { idempotencyKey: 'key-1' })
     handle.dispose()
     expect(handle.transactionId).toBe('tx-1')
     expect(submitted).toHaveLength(1)
     const request = submitted[0]!
     expect(request.idempotencyKey).toBe('key-1')
-    expect(request.statements[0]).toEqual({ sql: "SELECT chronolog_assert(1, 'ok')", bindings: [] })
-    expect(request.statements[1]?.bindings.map((binding) => binding.value)).toEqual([
+    const statement = (index: number): RpcSqlStatement => request.steps[index] as RpcSqlStatement
+    expect(statement(0)).toEqual({ sql: "SELECT chronolog_assert(1, 'ok')", bindings: [] })
+    expect(statement(1).bindings.map((binding) => binding.value)).toEqual([
       { kind: 'integer', value: '1' },
       { kind: 'integer', value: (2n ** 62n).toString() },
       { kind: 'real', value: 1.5 },
       { kind: 'text', value: 'text' },
       { kind: 'blob', value: new Uint8Array([1, 2]) },
     ])
-    expect(request.statements[2]?.bindings).toEqual([
+    // Platform operations travel as their canonical CBOR.
+    expect(decodePlatformOp((request.steps[3] as RpcPlatformStep).platform)).toEqual(
+      platformOp.grant({ table: 't', grantee: new Uint8Array(32).fill(2), operations: ['update'], rowKey: [1n] }))
+    expect(statement(2).bindings).toEqual([
       { parameter: { kind: 'name', name: ':v' }, value: { kind: 'real', value: 1 } },
       { parameter: { kind: 'name', name: '@w' }, value: { kind: 'null' } },
       { parameter: { kind: 'name', name: ':id' }, value: { kind: 'integer', value: '1' } },

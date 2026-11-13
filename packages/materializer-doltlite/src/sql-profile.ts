@@ -125,7 +125,42 @@ export const FORBIDDEN_LOCAL_READ_FUNCTIONS: ReadonlySet<string> = new Set([
 export type SqlAuthorizationMode =
   | 'internal_bootstrap'
   | 'consensus'
+  /** Trusted platform operations: may write chronolog_* objects. App triggers they fire stay under consensus rules. */
+  | 'platform'
   | 'local_read'
+
+export interface SqlAuthorizationOptions {
+  /** The signer is an admin of the `group` collective and may run DDL. */
+  readonly schemaAdmin?: boolean
+  /**
+   * Lower-case names of tables that carry no owner checks (virtual tables and
+   * sqlite-vec chunk tables). App SQL may write them only from app triggers,
+   * which fire on owner-checked writes to registered tables.
+   */
+  readonly writeProtectedTables?: ReadonlySet<string>
+  /**
+   * Lower-case names of SQLite shadow tables (owned by virtual-table modules).
+   * Local reads let a module prepare its own writes to them (R-tree prepares
+   * them on connect); defensive mode keeps them read-only to app SQL, and
+   * writes to the virtual tables themselves stay denied.
+   */
+  readonly shadowTables?: ReadonlySet<string>
+}
+
+/**
+ * Whether the statement is being prepared (app SQL, including trigger bodies,
+ * is authorized then) or stepped (only SQL that virtual-table modules prepare
+ * internally is authorized then).
+ */
+interface StatementPhase { stepping: boolean }
+
+/** Pragmas FTS5 and R-tree read internally; never available to app SQL. */
+const MODULE_INTERNAL_PRAGMAS: ReadonlySet<string> = new Set(['data_version', 'page_size'])
+
+/** Raises a policy rejection; callable only from chronolog_* triggers and views. */
+export const POLICY_VIOLATION_FUNCTION = 'chronolog_policy_violation'
+/** The owner column every registered table carries. */
+export const OWNER_COLUMN = 'chronolog_owner'
 
 /** Names owned by SQLite, Dolt or Chronolog rather than the application. */
 export function isReservedSchemaObjectName(value: string): boolean {
@@ -210,10 +245,12 @@ export function prepareProfiledStatement(
   sql: string,
   mode: SqlAuthorizationMode,
   inputLimits: Partial<SqlRuntimeLimits> = {},
+  authorization: SqlAuthorizationOptions = {},
 ): StatementLike {
   const limits = normalizeSqlRuntimeLimits(inputLimits)
   validateSqlSource(sql, limits)
-  return withProfileControls(database, mode, limits, () => {
+  if (mode === 'consensus' || mode === 'local_read') assertConsensusPragma(sql)
+  return withProfileControls(database, mode, limits, authorization, () => {
     let statement: StatementLike
     try {
       statement = database.prepare(sql)
@@ -237,10 +274,13 @@ export function withProfiledStatement<T>(
   mode: SqlAuthorizationMode,
   operation: (statement: StatementLike) => T,
   inputLimits: Partial<SqlRuntimeLimits> = {},
+  authorization: SqlAuthorizationOptions = {},
 ): T {
   const limits = normalizeSqlRuntimeLimits(inputLimits)
   validateSqlSource(sql, limits)
-  return withProfileControls(database, mode, limits, () => {
+  if (mode === 'consensus' || mode === 'local_read') assertConsensusPragma(sql)
+  const phase: StatementPhase = { stepping: false }
+  return withProfileControls(database, mode, limits, authorization, () => {
     let statement: StatementLike
     try {
       statement = database.prepare(sql)
@@ -250,16 +290,18 @@ export function withProfiledStatement<T>(
       throw new SqlProfileError('SQL_PREPARE_FAILED')
     }
     validateSingleStatement(sql, statement)
+    phase.stepping = true
     return operation(statement)
-  })
+  }, phase)
 }
 
 export function withAuthorizer<T>(
   database: DatabaseLike,
   mode: SqlAuthorizationMode,
   operation: () => T,
+  authorization: SqlAuthorizationOptions = {},
 ): T {
-  database.setAuthorizer(createAuthorizer(mode))
+  database.setAuthorizer(createAuthorizer(mode, authorization))
   try {
     return operation()
   } catch (error) {
@@ -300,9 +342,11 @@ function withProfileControls<T>(
   database: DatabaseLike,
   mode: SqlAuthorizationMode,
   limits: SqlRuntimeLimits,
+  authorization: SqlAuthorizationOptions,
   operation: () => T,
+  phase: StatementPhase = { stepping: false },
 ): T {
-  database.setAuthorizer(createAuthorizer(mode))
+  database.setAuthorizer(createAuthorizer(mode, authorization, phase))
   try {
     return withExecutionBudget(database, operation, limits)
   } catch (error) {
@@ -313,47 +357,94 @@ function withProfileControls<T>(
   }
 }
 
-function createAuthorizer(mode: SqlAuthorizationMode) {
+const DDL_ACTIONS: ReadonlySet<number> = new Set([
+  ACTION.CREATE_INDEX, ACTION.CREATE_TABLE, ACTION.CREATE_TRIGGER, ACTION.CREATE_VIEW,
+  ACTION.DROP_INDEX, ACTION.DROP_TABLE, ACTION.DROP_TRIGGER, ACTION.DROP_VIEW,
+  ACTION.CREATE_VTABLE, ACTION.DROP_VTABLE, ACTION.ALTER_TABLE,
+])
+
+/**
+ * One authorizer per prepared statement. It is stateful only to remember
+ * which tables the statement drops: DROP TABLE reports a DROP_TRIGGER for
+ * each of the table's triggers, including its platform triggers.
+ */
+function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationOptions = {}, phase: StatementPhase = { stepping: false }) {
+  const droppedTables = new Set<string>()
   return (
     action: number,
     arg1: string | null,
     arg2: string | null,
     databaseName: string | null,
-    _triggerOrView: string | null,
+    triggerOrView: string | null,
   ): number => {
     const objectName = asciiLower(arg1)
     const secondaryName = asciiLower(arg2)
     const database = asciiLower(databaseName)
+    const caller = asciiLower(triggerOrView)
     if (mode === 'internal_bootstrap') {
       return action === ACTION.ATTACH || action === ACTION.DETACH ? SQLITE_DENY : SQLITE_OK
+    }
+    // Platform code is trusted, and so are the platform's own triggers and
+    // views it runs. App triggers fired by a platform statement are compiled
+    // inside it; they get exactly the consensus rules.
+    const platform = mode === 'platform' && (caller === '' || caller.startsWith('chronolog_'))
+    if (platform) {
+      return action === ACTION.ATTACH || action === ACTION.DETACH || action === ACTION.TRANSACTION ? SQLITE_DENY : SQLITE_OK
     }
     if (action === ACTION.SELECT || action === ACTION.RECURSIVE) return SQLITE_OK
     if (action === ACTION.FUNCTION) {
       const functionName = secondaryName || objectName
       if (isDoltName(functionName)) return SQLITE_DENY
+      // Only platform triggers and views may raise a policy rejection.
+      if (functionName === POLICY_VIOLATION_FUNCTION) return caller.startsWith('chronolog_') ? SQLITE_OK : SQLITE_DENY
       if (mode === 'local_read') return FORBIDDEN_LOCAL_READ_FUNCTIONS.has(functionName) ? SQLITE_DENY : SQLITE_OK
       if (functionName.startsWith('pragma_')) {
         return READ_ONLY_PRAGMAS.has(functionName.slice('pragma_'.length)) ? SQLITE_OK : SQLITE_DENY
       }
       return CONSENSUS_DENIED_FUNCTIONS.has(functionName) ? SQLITE_DENY : SQLITE_OK
     }
-    if (action === ACTION.PRAGMA) return READ_ONLY_PRAGMAS.has(objectName) ? SQLITE_OK : SQLITE_DENY
+    if (action === ACTION.PRAGMA) {
+      if (READ_ONLY_PRAGMAS.has(objectName)) return SQLITE_OK
+      // A virtual-table module's own query (no caller, no value set). App SQL
+      // cannot issue these: inside views and triggers the caller is set, and
+      // top-level SQL naming them (PRAGMA statements and pragma_* table
+      // functions) is refused by its text before it is prepared
+      // (assertConsensusPragma), since data_version differs between replicas.
+      const moduleInternal = caller === '' && secondaryName === '' && MODULE_INTERNAL_PRAGMAS.has(objectName)
+      return moduleInternal ? SQLITE_OK : SQLITE_DENY
+    }
     if (action === ACTION.READ) {
       // SQLite may omit the database name on follow-on READ callbacks.
       if (database !== '' && database !== 'main' && database !== 'temp') return SQLITE_DENY
       // Dolt system tables expose per-replica history (commit hashes, times).
-      if (mode === 'consensus' && isDoltName(objectName)) return SQLITE_DENY
+      if (mode !== 'local_read' && isDoltName(objectName)) return SQLITE_DENY
       return SQLITE_OK
     }
-    if (mode === 'local_read') return SQLITE_DENY
+    if (mode === 'local_read') {
+      const moduleShadowWrite = (action === ACTION.INSERT || action === ACTION.UPDATE || action === ACTION.DELETE) &&
+        caller === '' && database === 'main' && options.shadowTables?.has(objectName) === true
+      return moduleShadowWrite ? SQLITE_OK : SQLITE_DENY
+    }
     // ── consensus writes ──
     if (action === ACTION.INSERT || action === ACTION.UPDATE || action === ACTION.DELETE) {
       // SQLite maintains its own catalogs (sqlite_schema, sqlite_sequence,
       // sqlite_stat1, the temp catalog) while executing DDL and DML.
       if (objectName.startsWith('sqlite_')) return database === 'main' || database === 'temp' ? SQLITE_OK : SQLITE_DENY
       if (database !== 'main') return SQLITE_DENY
+      // Tables without owner checks: app SQL writes them only from app triggers.
+      // Writes their modules make while the statement runs are their own.
+      if (options.writeProtectedTables?.has(objectName) === true && !phase.stepping && (caller === '' || caller.startsWith('chronolog_'))) {
+        return SQLITE_DENY
+      }
       return isReservedSchemaObjectName(objectName) ? SQLITE_DENY : SQLITE_OK
     }
+    // The first ANALYZE creates SQLite's own statistics table; any writer may ANALYZE.
+    // AUTOINCREMENT (including sqlite-vec's shadow tables) creates sqlite_sequence.
+    if (action === ACTION.CREATE_TABLE && (objectName === 'sqlite_stat1' || objectName === 'sqlite_stat4' || objectName === 'sqlite_sequence')) {
+      return database === 'main' ? SQLITE_OK : SQLITE_DENY
+    }
+    // All other DDL, including triggers, is for schema administrators only.
+    if (DDL_ACTIONS.has(action) && options.schemaAdmin !== true) return SQLITE_DENY
     if (
       action === ACTION.CREATE_TABLE || action === ACTION.CREATE_INDEX ||
       action === ACTION.CREATE_VIEW || action === ACTION.CREATE_TRIGGER ||
@@ -361,13 +452,14 @@ function createAuthorizer(mode: SqlAuthorizationMode) {
       action === ACTION.DROP_VIEW || action === ACTION.DROP_TRIGGER
     ) {
       if (database !== 'main') return SQLITE_DENY
-      // The first ANALYZE creates SQLite's own statistics table.
-      if (action === ACTION.CREATE_TABLE && (objectName === 'sqlite_stat1' || objectName === 'sqlite_stat4')) return SQLITE_OK
       // CREATE INDEX reports the table as arg2; implicit autoindexes are SQLite's own.
       if (action === ACTION.CREATE_INDEX && objectName.startsWith('sqlite_autoindex_')) {
         return isReservedSchemaObjectName(secondaryName) ? SQLITE_DENY : SQLITE_OK
       }
+      // Dropping an application table drops its platform triggers with it.
+      if (action === ACTION.DROP_TRIGGER && objectName.startsWith('chronolog_') && droppedTables.has(secondaryName)) return SQLITE_OK
       if (isReservedSchemaObjectName(objectName)) return SQLITE_DENY
+      if (action === ACTION.DROP_TABLE) droppedTables.add(objectName)
       const onTable = action === ACTION.CREATE_INDEX || action === ACTION.CREATE_TRIGGER ||
         action === ACTION.DROP_INDEX || action === ACTION.DROP_TRIGGER
       return onTable && secondaryName !== '' && isReservedSchemaObjectName(secondaryName) ? SQLITE_DENY : SQLITE_OK
@@ -376,8 +468,10 @@ function createAuthorizer(mode: SqlAuthorizationMode) {
       if (database !== 'main' || isReservedSchemaObjectName(objectName)) return SQLITE_DENY
       return CONSENSUS_DENIED_MODULES.has(secondaryName) ? SQLITE_DENY : SQLITE_OK
     }
-    // SQLITE_ALTER_TABLE reports the database and table through arg1/arg2.
+    // SQLITE_ALTER_TABLE reports the database and table through arg1/arg2,
+    // and DROP COLUMN reports the dropped column as the third argument.
     if (action === ACTION.ALTER_TABLE) {
+      if (database === OWNER_COLUMN) return SQLITE_DENY
       return objectName === 'main' && !isReservedSchemaObjectName(secondaryName) ? SQLITE_OK : SQLITE_DENY
     }
     // Both only rebuild derived structures (indexes, sqlite_stat1) from table contents.
@@ -400,6 +494,32 @@ function asciiLower(value: string | null): string {
     result += code >= 65 && code <= 90 ? String.fromCharCode(code + 32) : character
   }
   return result
+}
+
+/**
+ * A top-level PRAGMA statement must name a read-only pragma, plainly. The
+ * authorizer cannot tell such a statement from a virtual-table module's own
+ * pragma query, so it is checked by its text. Anything this does not
+ * recognize is refused.
+ */
+export function assertConsensusPragma(sql: string): void {
+  let rest = sql
+  for (;;) {
+    const skipped = rest.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)/u, '')
+    if (skipped === rest) break
+    rest = skipped
+  }
+  // Table-valued forms (pragma_data_version, …) reach the authorizer as
+  // PRAGMA actions too. Identifiers cannot be split by comments or escapes,
+  // so naming one anywhere in the text is refused (quotes stripped).
+  const unquoted = asciiLower(sql).replace(/["`[\]]/gu, '')
+  for (const pragma of MODULE_INTERNAL_PRAGMAS) {
+    if (unquoted.includes(`pragma_${pragma}`)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
+  }
+  rest = rest.replace(/^EXPLAIN(?:\s+QUERY\s+PLAN)?\s+/iu, '')
+  if (!/^PRAGMA\b/iu.test(rest)) return
+  const match = /^PRAGMA\s+(?:main\s*\.\s*)?([A-Za-z_]+)\s*(?:\(\s*[^()]*\)\s*)?;?\s*$/iu.exec(rest)
+  if (match === null || !READ_ONLY_PRAGMAS.has(match[1]!.toLowerCase())) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
 }
 
 function validateSqlSource(sql: string, limits: SqlRuntimeLimits): void {

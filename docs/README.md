@@ -40,6 +40,7 @@ resolves.
 | [implementation-status.md](implementation-status.md) | Status | What works end to end and what remains. |
 | [../upcoming.md](../upcoming.md) | Status (ordered roadmap) | Project queue and acceptance checks. |
 | [security-threat-review.md](security-threat-review.md) | Status | Internal authorizer/protocol review and open findings. |
+| [design-owner-rows.md](design-owner-rows.md) | Implemented | Owner-controlled rows: the signing key owns its rows; generated write checks, app triggers narrow (write half of Namlu design K). |
 | [production-execution.md](production-execution.md) | Decision record | Why the first pilot is the native daemon, and criteria to reconsider workerd. |
 
 ## Operational

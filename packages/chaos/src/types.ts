@@ -14,6 +14,7 @@ export const WORKLOAD_OPERATION_KINDS = [
   'ddl_sequence',
   'precondition_rejection',
   'constraint_rejection',
+  'owner_probe',
 ] as const
 export type WorkloadOperationKind = typeof WORKLOAD_OPERATION_KINDS[number]
 
@@ -82,6 +83,10 @@ export interface NodeSnapshot {
   readonly stateDigest: string
   readonly schemaDigest: string
   readonly logDigest: string
+  /** Digest of the generated chronolog_* triggers and views. */
+  readonly platformDigest: string
+  /** Distinct owners across registered tables: [owner, isCollective]. */
+  readonly ownerRows: readonly (readonly unknown[])[]
   readonly stateRows: readonly (readonly unknown[])[]
   readonly schemaRows: readonly (readonly unknown[])[]
   readonly logRows: readonly (readonly unknown[])[]

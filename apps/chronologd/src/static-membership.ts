@@ -11,6 +11,8 @@ export interface StaticMembershipFile {
   readonly groupId: string
   readonly membershipRevision: string
   readonly validationPolicy: string
+  /** The genesis root key: the first schema administrator of the materialized database. */
+  readonly rootAdministrator: string
   readonly writers: readonly (string | {
     readonly publicKey: string
     readonly transportAuthor: string
@@ -42,6 +44,7 @@ export async function loadStaticMembership(
   const groupId = decode32(document.groupId, 'groupId')
   const membershipRevision = decode32(document.membershipRevision, 'membershipRevision')
   const validationPolicy = decode32(document.validationPolicy, 'validationPolicy')
+  decode32(document.rootAdministrator, 'rootAdministrator')
   if (!equalBytes(groupId, pins.groupId)) throw new Error('STATIC_MEMBERSHIP_GROUP_MISMATCH')
   if (!equalBytes(membershipRevision, pins.membershipRevision)) throw new Error('STATIC_MEMBERSHIP_REVISION_MISMATCH')
   if (!equalBytes(validationPolicy, pins.validationPolicy)) throw new Error('STATIC_MEMBERSHIP_POLICY_MISMATCH')
@@ -107,12 +110,17 @@ export async function loadStaticMembership(
   }
 }
 
+/** The root administrator pinned by a static membership file. */
+export async function readStaticRootAdministrator(path: string): Promise<Uint8Array> {
+  return decode32(parseStaticMembership(JSON.parse(await readFile(path, 'utf8'))).rootAdministrator, 'rootAdministrator')
+}
+
 function parseStaticMembership(value: unknown): StaticMembershipFile {
   if (!isRecord(value) || value.format !== 'chronolog-static-membership') {
     throw new Error('STATIC_MEMBERSHIP_UNSUPPORTED')
   }
   const fields = new Set([
-    'format', 'groupId', 'membershipRevision', 'validationPolicy', 'writers', 'validators',
+    'format', 'groupId', 'membershipRevision', 'validationPolicy', 'rootAdministrator', 'writers', 'validators',
     'threshold', 'watermarkThreshold', 'policyVersion',
   ])
   if (
@@ -120,6 +128,7 @@ function parseStaticMembership(value: unknown): StaticMembershipFile {
     typeof value.groupId !== 'string' ||
     typeof value.membershipRevision !== 'string' ||
     typeof value.validationPolicy !== 'string' ||
+    typeof value.rootAdministrator !== 'string' ||
     !Array.isArray(value.writers) || !value.writers.every((writer) =>
       typeof writer === 'string' || (isRecord(writer) &&
         hasOnlyKeys(writer, ['publicKey', 'transportAuthor']) &&

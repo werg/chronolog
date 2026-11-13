@@ -17,11 +17,10 @@ import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
-import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
+  createDoltLiteExecutionManifest,
   createDoltLiteMaterializationRuntime,
-  readNativeEngineInfo,
 } from '@chronolog/materializer-doltlite'
 import {
   ChronologNode,
@@ -29,7 +28,7 @@ import {
   SqliteFeedForkPersistence,
   type MembershipResolver,
 } from '@chronolog/node-core'
-import { equalBytes, generateEd25519KeyPair, type SqlTransactionProgram } from '@chronolog/protocol'
+import { equalBytes, generateEd25519KeyPair, platformOp, type SqlTransactionProgram } from '@chronolog/protocol'
 import { type ChronologTransport, MemoryTransportNetwork, FeedTransport } from '@chronolog/transport-ssb'
 
 const { values } = parseArgs({
@@ -46,14 +45,11 @@ const warmup = Number(values.warmup)
 const directory = await mkdtemp(join(tmpdir(), 'chronolog-bench-ingest-'))
 const identity = await generateEd25519KeyPair()
 const capability = Uint8Array.of(7)
-const native = readNativeEngineInfo()
 const materializer = await DeterministicMaterializer.open({
   path: join(directory, 'application.db'),
-  executionManifest: createExecutionManifest({
-    profile: 'chronolog-core-portable',
-    engine: native.descriptor,
-    engineDigest: native.digest,
-  }),
+  executionManifest: createDoltLiteExecutionManifest(),
+  // The benchmarking node is the root administrator, so it may create the table.
+  rootAdministrator: identity.publicKeyBytes,
 })
 const membership: MembershipResolver = {
   canWrite: ({ writerId }) => equalBytes(writerId, identity.publicKeyBytes),
@@ -149,14 +145,14 @@ function round(value: number): number { return Math.round(value * 10) / 10 }
 function bytes32(seed: number): Uint8Array { return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff) }
 function createProgram(): SqlTransactionProgram {
   return {
-    version: 1,
-    statements: [{ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT', bindings: [] }],
+    version: 2,
+    steps: [{ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT', bindings: [] }, platformOp.registerTable('items')],
   }
 }
 function insertProgram(id: number): SqlTransactionProgram {
   return {
-    version: 1,
-    statements: [{
+    version: 2,
+    steps: [{
       sql: 'INSERT INTO items (id, value) VALUES (?, ?)',
       bindings: [indexed(1, BigInt(id)), indexed(2, BigInt(id * 10))],
     }],

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { loadStaticMembership } from './static-membership.js'
+import { loadStaticMembership, readStaticRootAdministrator } from './static-membership.js'
 
 describe('static membership bootstrap', () => {
   const directories: string[] = []
@@ -18,13 +18,14 @@ describe('static membership bootstrap', () => {
     const path = join(directory, 'membership.json')
     await writeFile(path, JSON.stringify({
       format: 'chronolog-static-membership',
-      groupId: base64(groupId), membershipRevision: base64(membershipRevision), validationPolicy: base64(validationPolicy),
+      groupId: base64(groupId), membershipRevision: base64(membershipRevision), validationPolicy: base64(validationPolicy), rootAdministrator: base64(writer),
       writers: [{ publicKey: base64(writer), transportAuthor: '@writer.ed25519' }],
       validators: [{ publicKey: base64(validator), capability: base64(capability), transportAuthor: '@validator.ed25519' }],
       threshold: 1,
       policyVersion: '4',
     }))
     const resolver = await loadStaticMembership(path, { groupId, membershipRevision, validationPolicy })
+    expect(await readStaticRootAdministrator(path)).toEqual(writer)
     const context = { groupId, membershipRevision, validationPolicy, writerId: writer }
     expect(await resolver.canWrite(context)).toBe(true)
     expect(await resolver.canWrite({ ...context, writerId: bytes(9) })).toBe(false)
@@ -56,7 +57,7 @@ describe('static membership bootstrap', () => {
     const path = join(directory, 'membership.json')
     await writeFile(path, JSON.stringify({
       format: 'chronolog-static-membership',
-      groupId: base64(pins.groupId), membershipRevision: base64(pins.membershipRevision), validationPolicy: base64(pins.validationPolicy),
+      groupId: base64(pins.groupId), membershipRevision: base64(pins.membershipRevision), validationPolicy: base64(pins.validationPolicy), rootAdministrator: base64(bytes(7)),
       writers: [writer], validators: [{ publicKey: validator, capability }], threshold: 2,
     }))
     await expect(loadStaticMembership(path, pins)).rejects.toThrow('STATIC_MEMBERSHIP_INVALID_THRESHOLD')
@@ -71,6 +72,7 @@ describe('static membership bootstrap', () => {
       groupId: base64(pins.groupId),
       membershipRevision: base64(pins.membershipRevision),
       validationPolicy: base64(pins.validationPolicy),
+      rootAdministrator: base64(bytes(4)),
       writers: [{ publicKey: base64(bytes(4)), transportAuthor: 'not-a-feed' }],
       validators: [{ publicKey: base64(bytes(5)), capability: base64(bytes(6)), transportAuthor: '@validator.ed25519' }],
       threshold: 1,

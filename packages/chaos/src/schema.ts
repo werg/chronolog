@@ -1,4 +1,19 @@
-export function chaosBootstrapStatements(accountCount: number) {
+import { platformOp, type PlatformOp } from '@chronolog/protocol'
+
+type BootstrapStep = { readonly sql: string; readonly params?: readonly unknown[] } | PlatformOp
+
+/** Application tables of the chaos schema; every one is registered for owner-controlled rows. */
+export const CHAOS_TABLES = [
+  'accounts', 'chaos_ledger', 'chaos_documents', 'chaos_schema_migrations', 'chaos_profiles', 'chaos_profile_audit',
+] as const
+
+/**
+ * Schema and seed rows, written by the root administrator (the only schema
+ * administrator). The shared `accounts` rows belong to the root; every other
+ * writer gets an update grant on them, and owns the ledger, document and
+ * profile rows it inserts itself.
+ */
+export function chaosBootstrapStatements(accountCount: number, writers: readonly Uint8Array[] = []): BootstrapStep[] {
   return [
     { sql: 'CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL, version INTEGER NOT NULL, touched INTEGER NOT NULL) STRICT' },
     { sql: 'CREATE TABLE chaos_ledger (operation_id TEXT NOT NULL, leg INTEGER NOT NULL, account_id INTEGER NOT NULL, delta INTEGER NOT NULL, note TEXT, payload BLOB, PRIMARY KEY (operation_id, leg)) WITHOUT ROWID, STRICT' },
@@ -6,16 +21,18 @@ export function chaosBootstrapStatements(accountCount: number) {
     { sql: 'CREATE TABLE chaos_schema_migrations (component TEXT NOT NULL, version INTEGER NOT NULL, checksum TEXT NOT NULL, PRIMARY KEY (component, version)) WITHOUT ROWID, STRICT' },
     { sql: 'CREATE TABLE chaos_profiles (profile_id TEXT PRIMARY KEY NOT NULL, display_name TEXT NOT NULL, email TEXT, schema_version INTEGER NOT NULL DEFAULT 2, metadata BLOB) STRICT' },
     { sql: 'CREATE TABLE chaos_profile_audit (profile_id TEXT PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL, email_seen INTEGER NOT NULL) WITHOUT ROWID, STRICT' },
+    ...CHAOS_TABLES.map((table) => platformOp.registerTable(table)),
     { sql: 'CREATE INDEX chaos_profiles_display_name_idx ON chaos_profiles(display_name)' },
     { sql: 'CREATE VIEW chaos_profiles_current AS SELECT profile_id, display_name, email, metadata FROM chaos_profiles WHERE schema_version = 2' },
-    { sql: 'CREATE TRIGGER chaos_profiles_insert_audit AFTER INSERT ON chaos_profiles BEGIN INSERT INTO chaos_profile_audit VALUES (NEW.profile_id, NEW.schema_version, NEW.email IS NOT NULL); END' },
-    { sql: "INSERT INTO chaos_schema_migrations VALUES ('profiles', 1, 'profiles-v1-base')" },
-    { sql: "INSERT INTO chaos_schema_migrations VALUES ('profiles', 2, 'profiles-v2-additive-email-metadata')" },
-    ...Array.from({ length: accountCount }, (_value, account) => ({
-      sql: 'INSERT INTO accounts (id, balance, version, touched) VALUES (?, ?, 0, 0)',
-      params: [BigInt(account), 0n] as const,
-    })),
-    { sql: "INSERT INTO chaos_ledger VALUES ('__reserved_constraint_key__', 0, 0, 0, NULL, X'')" },
+    { sql: 'CREATE TRIGGER chaos_profiles_insert_audit AFTER INSERT ON chaos_profiles BEGIN INSERT INTO chaos_profile_audit (profile_id, schema_version, email_seen) VALUES (NEW.profile_id, NEW.schema_version, NEW.email IS NOT NULL); END' },
+    { sql: "INSERT INTO chaos_schema_migrations (component, version, checksum) VALUES ('profiles', 1, 'profiles-v1-base')" },
+    { sql: "INSERT INTO chaos_schema_migrations (component, version, checksum) VALUES ('profiles', 2, 'profiles-v2-additive-email-metadata')" },
+    {
+      sql: 'WITH RECURSIVE n(id) AS (SELECT 0 WHERE ? > 0 UNION ALL SELECT id + 1 FROM n WHERE id + 1 < ?) INSERT INTO accounts (id, balance, version, touched) SELECT id, 0, 0, 0 FROM n',
+      params: [BigInt(accountCount), BigInt(accountCount)] as const,
+    },
+    { sql: "INSERT INTO chaos_ledger (operation_id, leg, account_id, delta, note, payload) VALUES ('__reserved_constraint_key__', 0, 0, 0, NULL, X'')" },
+    ...writers.map((grantee) => platformOp.grant({ table: 'accounts', grantee, operations: ['update'] })),
   ]
 }
 
@@ -84,6 +101,35 @@ export function schemaQuery() {
          AND name NOT LIKE 'chronolog_%'
        ORDER BY type, name
     `,
+  }
+}
+
+/** The platform's generated triggers and views; equal on every replica. */
+export function platformObjectsQuery() {
+  return {
+    sql: `
+      SELECT type, name, sql FROM sqlite_schema
+       WHERE type IN ('trigger', 'view') AND substr(name, 1, 10) = 'chronolog_'
+       ORDER BY type, name
+    `,
+  }
+}
+
+export function registeredTablesQuery() {
+  return { sql: 'SELECT name FROM chronolog_tables ORDER BY name' }
+}
+
+/**
+ * Every distinct owner across the registered tables, as its key (NULL for an
+ * id without a principal), and whether it is a known collective.
+ */
+export function ownersQuery(tables: readonly string[]) {
+  const owners = tables.map((table) => `SELECT chronolog_owner AS id FROM "${table.replaceAll('"', '""')}"`).join(' UNION ')
+  return {
+    sql: tables.length === 0
+      ? 'SELECT NULL AS owner, 0 AS collective WHERE 0'
+      : `SELECT p.key AS owner, EXISTS (SELECT 1 FROM chronolog_collectives c WHERE c.collective_id = p.key) AS collective
+           FROM (${owners}) AS o LEFT JOIN chronolog_principals AS p ON p.id = o.id ORDER BY o.id`,
   }
 }
 

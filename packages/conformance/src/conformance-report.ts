@@ -8,18 +8,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   createDoltLiteMaterializationRuntime,
   DeterministicMaterializer,
-  readNativeEngineInfo,
+  createDoltLiteExecutionManifest,
   type AdmittedTransaction,
 } from '@chronolog/materializer-doltlite'
 import {
-  createExecutionManifest,
   encodeTransactionCore,
   executionManifestArtifacts,
+  platformOp,
   sqlStatement,
   transactionDigest,
   utf8,
   type ExecutionManifest,
-  type SqlStatement,
+  type ProgramStep,
   type TransactionCore,
 } from '@chronolog/protocol'
 
@@ -57,12 +57,7 @@ interface ReportOptions {
 const moduleDirectory = dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = resolve(moduleDirectory, '../../..')
 export async function generateConformanceReport(options: ReportOptions = {}): Promise<ConformanceReport> {
-  const native = readNativeEngineInfo()
-  const manifest = createExecutionManifest({
-    profile: 'chronolog-portable-core-conformance-v1',
-    engine: native.descriptor,
-    engineDigest: native.digest,
-  })
+  const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-portable-core-conformance-v1' })
   const manifestArtifacts = await executionManifestArtifacts(manifest)
   const replay = await runReplayFixture(manifest, 'reference')
   const productionReplay = await runReplayFixture(manifest, 'native-daemon')
@@ -164,7 +159,7 @@ async function runReplayFixture(
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-conformance-'))
   const path = join(directory, 'application.db')
   try {
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, checkpointEvery: 1 })
+    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, rootAdministrator: AUTHOR, checkpointEvery: 1 })
     const runtime = pathKind === 'native-daemon'
       ? createDoltLiteMaterializationRuntime(materializer)
       : null
@@ -172,14 +167,16 @@ async function runReplayFixture(
       const digest = materializer.executionManifestDigest
       const bootstrap = await transaction(1n, 'bootstrap', [
         sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
-        sqlStatement('INSERT INTO accounts VALUES (1, 100), (2, 200)'),
+        platformOp.registerTable('accounts'),
+        sqlStatement('INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200)'),
         sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY, now TEXT NOT NULL, r INTEGER NOT NULL)'),
+        platformOp.registerTable('probes'),
       ], digest)
       const predecessor = await transaction(10n, 'predecessor', updateProgram(100n, 5n), digest)
       const later = await transaction(20n, 'later', updateProgram(100n, 90n), digest)
       const probe = await transaction(30n, 'probe', [
         sqlStatement('UPDATE accounts SET balance = balance + 1 RETURNING id, balance'),
-        sqlStatement("INSERT INTO probes VALUES ('probe', datetime('now'), random())"),
+        sqlStatement("INSERT INTO probes (tx, now, r) VALUES ('probe', datetime('now'), random())"),
       ], digest)
       await applyConformanceOrder(materializer, runtime, [bootstrap, later])
       await applyConformanceOrder(materializer, runtime, [bootstrap, predecessor, later, probe])
@@ -224,7 +221,7 @@ async function applyConformanceOrder(
   }
 }
 
-function updateProgram(expected: bigint, next: bigint): SqlStatement[] {
+function updateProgram(expected: bigint, next: bigint): ProgramStep[] {
   return [
     sqlStatement("SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = 1) = ?, 'balance_changed')", [expected]),
     sqlStatement('UPDATE accounts SET balance = ? WHERE id = 1', [next]),
@@ -234,18 +231,18 @@ function updateProgram(expected: bigint, next: bigint): SqlStatement[] {
 async function transaction(
   timestamp: bigint,
   id: string,
-  statements: readonly SqlStatement[],
+  steps: readonly ProgramStep[],
   executionManifestDigest: Uint8Array,
 ): Promise<AdmittedTransaction> {
   const core: TransactionCore = {
     groupId: bytes32(1),
     membershipRevision: bytes32(2),
     validationPolicy: bytes32(3),
-    authorId: bytes32(4),
+    authorId: AUTHOR,
     authorTimestampMs: timestamp,
     nonce: bytes32(Number(timestamp) + 10),
     executionManifestDigest,
-    program: { version: 1, statements },
+    program: { version: 2, steps },
   }
   const canonicalCandidate = encodeTransactionCore(core)
   return {
@@ -256,6 +253,9 @@ async function transaction(
     core,
   }
 }
+
+/** The fixture's only author, and the group's root administrator. */
+const AUTHOR = bytes32(4)
 
 function bytes32(seed: number): Uint8Array {
   return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff)

@@ -11,10 +11,10 @@ index 5a16d14992844e5620b4ee223d0894e0833ec64a..81fb162e7934629bf1f45129d41ece54
          "src/bun_compat.cpp",
          "src/database.cpp",
 diff --git a/index.d.ts b/index.d.ts
-index 767f27601ed81cbbb7374519b48ab1f834b76f50..aefd325380b2af215350b83f0f3cf37111306a22 100644
+index 767f27601ed81cbbb7374519b48ab1f834b76f50..a580919b43719ddda222b8155d7478c2df56bf4e 100644
 --- a/index.d.ts
 +++ b/index.d.ts
-@@ -14,6 +14,21 @@
+@@ -14,6 +14,24 @@
   */
  export function binPath(): string
  
@@ -33,10 +33,13 @@ index 767f27601ed81cbbb7374519b48ab1f834b76f50..aefd325380b2af215350b83f0f3cf371
 +/** Exact source/build descriptor baked into the locally compiled addon. */
 +export function chronologNativeManifest(): ChronologNativeManifest
 +
++/** True when the SQL contains RAISE ( IGNORE, found with SQLite's own tokenizer. */
++export function chronologTriggerUsesIgnore(sql: string): boolean
++
  export interface ColumnInfo {
    name: string | null
    column: string | null
-@@ -104,6 +119,12 @@ export class StatementSync {
+@@ -104,6 +122,12 @@ export class StatementSync {
    readonly sourceSQL: string
    /** The SQL text with bound parameters expanded. */
    readonly expandedSQL: string
@@ -49,7 +52,7 @@ index 767f27601ed81cbbb7374519b48ab1f834b76f50..aefd325380b2af215350b83f0f3cf371
  }
  
  export class DatabaseSync {
-@@ -123,6 +144,17 @@ export class DatabaseSync {
+@@ -123,6 +147,21 @@ export class DatabaseSync {
    location(): string | null
    /** Register a user-defined scalar SQL function. */
    createFunction(name: string, fn: (...args: unknown[]) => unknown): void
@@ -60,14 +63,18 @@ index 767f27601ed81cbbb7374519b48ab1f834b76f50..aefd325380b2af215350b83f0f3cf371
 +  setLimit(category: number, value: number): number
 +  interrupt(): void
 +  configureSecurity(): Readonly<Record<string, boolean>>
-+  /** Pin 'now' (unix ms), the PRNG seed and UTC localtime; resets last_insert_rowid. Process-global. */
-+  setDeterministicContext(unixMs: bigint, seed: number): void
++  /**
++   * Pin 'now' (unix ms), the PRNG seed, UTC localtime and the values of
++   * chronolog_actor() and chronolog_actor_id(); resets last_insert_rowid.
++   * Process-global.
++   */
++  setDeterministicContext(unixMs: bigint, seed: number, actor?: Uint8Array | null, actorId?: bigint | null): void
 +  /** Restore the real clock, PRNG and localtime. */
 +  clearDeterministicContext(): void
  
    /** True if the database connection is open. */
    readonly isOpen: boolean
-@@ -153,6 +185,12 @@ export class DatabaseSync {
+@@ -153,6 +192,12 @@ export class DatabaseSync {
  
    /** Reset HEAD. Pass `"--hard"` for a hard reset. */
    doltReset(flag?: "--hard"): void
@@ -81,7 +88,7 @@ index 767f27601ed81cbbb7374519b48ab1f834b76f50..aefd325380b2af215350b83f0f3cf371
    /** Return the working-set status (staged/unstaged changes). */
    doltStatus(): DoltStatusEntry[]
 diff --git a/index.js b/index.js
-index f6ee9536dc748f1891933d49959b4fd4463e88c7..32795882dde50c185095e940ba85bf94838c9454 100644
+index f6ee9536dc748f1891933d49959b4fd4463e88c7..0353b0da4188de1b1419f5089d378bac82fe76e0 100644
 --- a/index.js
 +++ b/index.js
 @@ -13,7 +13,9 @@ function loadAddon() {
@@ -101,13 +108,39 @@ index f6ee9536dc748f1891933d49959b4fd4463e88c7..32795882dde50c185095e940ba85bf94
  
 -const { DatabaseSync, StatementSync } = loadAddon()
 -module.exports = { DatabaseSync, StatementSync, binPath }
-+const { DatabaseSync, StatementSync, chronologNativeManifest } = loadAddon()
-+module.exports = { DatabaseSync, StatementSync, chronologNativeManifest, binPath }
++const { DatabaseSync, StatementSync, chronologNativeManifest, chronologTriggerUsesIgnore } = loadAddon()
++module.exports = { DatabaseSync, StatementSync, chronologNativeManifest, chronologTriggerUsesIgnore, binPath }
 diff --git a/scripts/build-amalgamation.js b/scripts/build-amalgamation.js
-index b9ef6d24aaea5d0c7b90e429073744bf123e0169..d84d7f8cc0e091bdd0f5a6acd582f7ee0d5be45b 100644
+index b9ef6d24aaea5d0c7b90e429073744bf123e0169..8951627fa4863f2eaa1c45e59fdcb0127741c689 100644
 --- a/scripts/build-amalgamation.js
 +++ b/scripts/build-amalgamation.js
-@@ -81,4 +81,16 @@ for (const [wrapName, srcName, archGuard] of simdWrappers) {
+@@ -39,6 +39,25 @@ SQLITE_PRIVATE int sqlite3PagerWalSystemErrno(Pager *pPager){
+   return 0;
+ }
+ #endif
++
++/* Chronolog: 1 when the SQL contains the token sequence RAISE ( IGNORE, found
++** with SQLite's own tokenizer (whitespace and comments skipped), else 0. Used
++** to refuse application triggers that would skip rows silently. */
++int chronolog_sql_uses_raise_ignore(const char *zSql){
++  const unsigned char *z = (const unsigned char*)zSql;
++  int state = 0;
++  while( *z ){
++    int tokenType = 0;
++    i64 n = sqlite3GetToken(z, &tokenType);
++    if( n<=0 ) break;
++    z += n;
++    if( tokenType==TK_SPACE || tokenType==TK_COMMENT ) continue;
++    if( state==2 && tokenType==TK_IGNORE ) return 1;
++    if( state==1 && tokenType==TK_LP ){ state = 2; continue; }
++    state = tokenType==TK_RAISE ? 1 : 0;
++  }
++  return 0;
++}
+ `
+ fs.writeFileSync(outC, amalgamation)
+ fs.copyFileSync(inH, outH)
+@@ -81,4 +100,16 @@ for (const [wrapName, srcName, archGuard] of simdWrappers) {
    console.log(`SIMD wrapper ${wrapName} written`)
  }
  
@@ -125,10 +158,10 @@ index b9ef6d24aaea5d0c7b90e429073744bf123e0169..d84d7f8cc0e091bdd0f5a6acd582f7ee
 +
  console.log(`Amalgamation written to ${outC}`)
 diff --git a/scripts/download.js b/scripts/download.js
-index 5808519c7d3d426a91b898bf29e70a590250f4b2..2fd0b9da68f646600e1a4d02bd7dfd7f69bbf7d7 100644
+index 5808519c7d3d426a91b898bf29e70a590250f4b2..f58f9ac5a7e38c92a6d7958d8e47ba640bc10c63 100644
 --- a/scripts/download.js
 +++ b/scripts/download.js
-@@ -11,18 +11,82 @@
+@@ -11,18 +11,89 @@
  "use strict"
  
  const https  = require("https")
@@ -200,6 +233,13 @@ index 5808519c7d3d426a91b898bf29e70a590250f4b2..2fd0b9da68f646600e1a4d02bd7dfd7f
 +                           &cleanup, &pzError);
 +  }`,
 +    ],
++    [
++      // vec0 only reads and writes its own shadow tables and is deterministic.
++      // Declaring it innocuous lets app triggers keep a vec0 index in sync with
++      // an owner-checked table while trusted_schema is OFF.
++      'rc = sqlite3_declare_vtab(db, zSql);\n  sqlite3_free((void *)zSql);',
++      'rc = sqlite3_declare_vtab(db, zSql);\n  sqlite3_free((void *)zSql);\n  if (rc == SQLITE_OK) sqlite3_vtab_config(db, SQLITE_VTAB_INNOCUOUS);',
++    ],
 +  ]
 +  for (const [before, after] of replacements) {
 +    if (source.includes(after)) continue
@@ -211,7 +251,7 @@ index 5808519c7d3d426a91b898bf29e70a590250f4b2..2fd0b9da68f646600e1a4d02bd7dfd7f
  
  function normalizeVersion(v) {
    return String(v || "").trim().replace(/^v/, "")
-@@ -74,6 +138,12 @@ function fetchSource(cb) {
+@@ -74,6 +145,12 @@ function fetchSource(cb) {
    download(tarballUrl, tarballPath, (err) => {
      if (err) return cb(new Error(`Failed to download source: ${err.message}`))
      try {
@@ -224,7 +264,7 @@ index 5808519c7d3d426a91b898bf29e70a590250f4b2..2fd0b9da68f646600e1a4d02bd7dfd7f
        fs.rmSync(srcRoot, { recursive: true, force: true })
        fs.mkdirSync(srcRoot, { recursive: true })
        execSync(`tar xzf "${tarballPath}" -C "${srcRoot}"`, { stdio: "inherit" })
-@@ -98,6 +168,39 @@ function fetchSource(cb) {
+@@ -98,6 +175,39 @@ function fetchSource(cb) {
    })
  }
  
@@ -264,7 +304,7 @@ index 5808519c7d3d426a91b898bf29e70a590250f4b2..2fd0b9da68f646600e1a4d02bd7dfd7f
  function fetchCli(cb) {
    const key = `${process.platform}-${process.arch}`
    const meta = CLI_TOOLS[key]
-@@ -131,12 +234,18 @@ fetchSource((err) => {
+@@ -131,12 +241,18 @@ fetchSource((err) => {
      console.error(err.message)
      process.exit(1)
    }
@@ -315,10 +355,10 @@ index 7be6aba8d05c3c02ff80efd1adbe55a3615264fd..6f4acc76b508661f97eca792f8e78729
  run(process.execPath, [path.join(__dirname, "download.js")])
  run("node-gyp", ["rebuild"])
 diff --git a/src/addon.cpp b/src/addon.cpp
-index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f05a0c05b 100644
+index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..76dcfd4c6f763895e33c3df4bb0d564ce61982f2 100644
 --- a/src/addon.cpp
 +++ b/src/addon.cpp
-@@ -1,14 +1,134 @@
+@@ -1,14 +1,208 @@
  #include "database.h"
  #include "statement.h"
  
@@ -358,7 +398,21 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f
 +#endif
 +}
 +
-+extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed) {
++// The signing key of the transaction being executed; chronolog_actor()
++// returns it, and NULL outside consensus execution.
++static bool g_hasActor = false;
++static std::string g_actor;
++// The signer's principal id in the database; chronolog_actor_id() returns it.
++static bool g_hasActorId = false;
++static sqlite3_int64 g_actorId = 0;
++
++extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed,
++                                                 const unsigned char* actor, size_t actorBytes,
++                                                 int hasActorId, sqlite3_int64 actorId) {
++  g_hasActorId = hasActorId != 0;
++  g_actorId = actorId;
++  g_hasActor = actor != nullptr;
++  g_actor.assign(actor == nullptr ? "" : std::string((const char*)actor, actorBytes));
 +  g_fixedJulianMs = unixMs + 210866760000000LL;
 +  g_fixedTime = true;
 +  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SEED, (int)(seed == 0 ? 1u : seed), (sqlite3*)nullptr);
@@ -366,6 +420,10 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f
 +}
 +
 +extern "C" void chronologClearDeterministicContext(void) {
++  g_hasActor = false;
++  g_actor.clear();
++  g_hasActorId = false;
++  g_actorId = 0;
 +  g_fixedTime = false;
 +  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SEED, 0, (sqlite3*)nullptr);
 +  sqlite3_test_control(SQLITE_TESTCTRL_LOCALTIME_FAULT, 0);
@@ -392,9 +450,52 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f
 +  sqlite3_result_error_code(ctx, SQLITE_CONSTRAINT_FUNCTION);
 +}
 +
++// chronolog_actor(): the signing key of the transaction being executed, or
++// NULL outside consensus execution. Not deterministic: it depends on context.
++static void ChronologActor(sqlite3_context* ctx, int, sqlite3_value**) {
++  if (!g_hasActor) { sqlite3_result_null(ctx); return; }
++  sqlite3_result_blob(ctx, g_actor.data(), (int)g_actor.size(), SQLITE_TRANSIENT);
++}
++
++// chronolog_actor_id(): the signer's principal id (chronolog_principals.id),
++// or NULL outside consensus execution. The owner column's default.
++static void ChronologActorId(sqlite3_context* ctx, int, sqlite3_value**) {
++  if (!g_hasActorId) { sqlite3_result_null(ctx); return; }
++  sqlite3_result_int64(ctx, g_actorId);
++}
++
++static bool PolicyPart(sqlite3_value* value, std::string* out) {
++  int bytes = sqlite3_value_bytes(value);
++  const unsigned char* text = sqlite3_value_text(value);
++  if (sqlite3_value_type(value) != SQLITE_TEXT || text == nullptr || bytes < 1 || bytes > 128) return false;
++  out->assign((const char*)text, (size_t)bytes);
++  return true;
++}
++
++// chronolog_policy_violation(table, command): always a
++// SQLITE_CONSTRAINT_FUNCTION error "chronolog_policy:<table>:<command>". The
++// consensus authorizer allows it only inside chronolog_* triggers and views.
++static void ChronologPolicyViolation(sqlite3_context* ctx, int, sqlite3_value** argv) {
++  std::string table, command;
++  if (!PolicyPart(argv[0], &table) || !PolicyPart(argv[1], &command)) {
++    sqlite3_result_error(ctx, "chronolog_policy_violation: arguments must be text of 1 to 128 bytes", -1);
++    return;
++  }
++  std::string message = "chronolog_policy:" + table + ":" + command;
++  sqlite3_result_error(ctx, message.c_str(), (int)message.size());
++  sqlite3_result_error_code(ctx, SQLITE_CONSTRAINT_FUNCTION);
++}
++
 +static int ChronologRegisterFunctions(sqlite3* db, char**, const sqlite3_api_routines*) {
-+  return sqlite3_create_function_v2(db, "chronolog_assert", 2,
++  int rc = sqlite3_create_function_v2(db, "chronolog_assert", 2,
 +    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS, nullptr, ChronologAssert, nullptr, nullptr, nullptr);
++  if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "chronolog_actor", 0,
++    SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr, ChronologActor, nullptr, nullptr, nullptr);
++  if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "chronolog_actor_id", 0,
++    SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr, ChronologActorId, nullptr, nullptr, nullptr);
++  if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "chronolog_policy_violation", 2,
++    SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr, ChronologPolicyViolation, nullptr, nullptr, nullptr);
++  return rc;
 +}
 +
 +static bool InstallDeterministicEngine() {
@@ -415,6 +516,18 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f
 +}
 +
  extern "C" int doltliteInstallAutoExt(void);
++extern "C" int chronolog_sql_uses_raise_ignore(const char* sql);
++
++// True when the SQL contains RAISE ( IGNORE, per SQLite's own tokenizer.
++Napi::Value ChronologTriggerUsesIgnore(const Napi::CallbackInfo& info) {
++  Napi::Env env = info.Env();
++  if (info.Length() < 1 || !info[0].IsString()) {
++    Napi::TypeError::New(env, "chronologTriggerUsesIgnore(sql: string)").ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++  std::string sql = info[0].As<Napi::String>().Utf8Value();
++  return Napi::Boolean::New(env, chronolog_sql_uses_raise_ignore(sql.c_str()) != 0);
++}
 +extern "C" int sqlite3_vec_init(sqlite3*, char**, const sqlite3_api_routines*);
 +
 +Napi::Value ChronologNativeManifest(const Napi::CallbackInfo& info) {
@@ -424,7 +537,7 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f
 +  manifest.Set("doltliteSourceSha256", "6611b083ea08cf1e4a9ca71d8e873e9fccd989ad893d6ab38b3df3a48aeac6a8");
 +  manifest.Set("sqliteVecVersion", "0.1.9");
 +  manifest.Set("sqliteVecSourceSha256", "3acd67cb4aff080c7050926fd3cf8227905fe5b7ee3829d8ee5024ab1283cf61");
-+  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-deterministic-context-assert-parameters-v4");
++  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-deterministic-context-assert-parameters-actor-policy-trigger-lint-actor-id-vec-innocuous-v7");
 +  manifest.Set("fts5", true);
 +  manifest.Set("json1", true);
 +  manifest.Set("rtree", true);
@@ -450,11 +563,12 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f
    Statement::Init(env, exports);
    Database::Init(env, exports);
 +  exports.Set("chronologNativeManifest", Napi::Function::New(env, ChronologNativeManifest));
++  exports.Set("chronologTriggerUsesIgnore", Napi::Function::New(env, ChronologTriggerUsesIgnore));
    return exports;
  }
  
 diff --git a/src/database.cpp b/src/database.cpp
-index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb3cb9c734 100644
+index 1537104e3a80018cd4a7147daad8460e27acdea0..b9ab0090df9dfa07f0340320a1493b3cb3566e25 100644
 --- a/src/database.cpp
 +++ b/src/database.cpp
 @@ -19,7 +19,7 @@ static std::string SqliteOpenPath(const std::string& path) {
@@ -515,7 +629,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb
  }
  
  Napi::Value Database::IsOpenGetter(const Napi::CallbackInfo& info) {
-@@ -162,6 +174,176 @@ Napi::Value Database::CreateFunction(const Napi::CallbackInfo& info) {
+@@ -162,6 +174,200 @@ Napi::Value Database::CreateFunction(const Napi::CallbackInfo& info) {
    return env.Undefined();
  }
  
@@ -614,7 +728,9 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb
 +  return info.Env().Undefined();
 +}
 +
-+extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed);
++extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed,
++                                                 const unsigned char* actor, size_t actorBytes,
++                                                 int hasActorId, sqlite3_int64 actorId);
 +extern "C" void chronologClearDeterministicContext(void);
 +
 +// Fix the engine inputs that do not come from SQL or the database: the clock,
@@ -623,9 +739,21 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb
 +Napi::Value Database::SetDeterministicContext(const Napi::CallbackInfo& info) {
 +  Napi::Env env = info.Env();
 +  if (!db_) { Napi::Error::New(env, "Database is closed").ThrowAsJavaScriptException(); return env.Undefined(); }
-+  if (info.Length() < 2 || !info[0].IsBigInt() || !info[1].IsNumber()) {
-+    Napi::TypeError::New(env, "setDeterministicContext(unixMs: bigint, seed: number)").ThrowAsJavaScriptException();
++  bool hasActor = info.Length() >= 3 && !info[2].IsNull() && !info[2].IsUndefined();
++  bool hasActorId = info.Length() >= 4 && !info[3].IsNull() && !info[3].IsUndefined();
++  if (info.Length() < 2 || !info[0].IsBigInt() || !info[1].IsNumber() ||
++      (hasActor && !info[2].IsTypedArray()) || (hasActorId && !info[3].IsBigInt())) {
++    Napi::TypeError::New(env, "setDeterministicContext(unixMs: bigint, seed: number, actor?: Uint8Array | null, actorId?: bigint | null)").ThrowAsJavaScriptException();
 +    return env.Undefined();
++  }
++  std::string actor;
++  if (hasActor) {
++    auto array = info[2].As<Napi::Uint8Array>();
++    if (array.TypedArrayType() != napi_uint8_array || array.ByteLength() < 1 || array.ByteLength() > 64) {
++      Napi::RangeError::New(env, "Deterministic actor must be 1 to 64 bytes").ThrowAsJavaScriptException();
++      return env.Undefined();
++    }
++    actor.assign((const char*)array.Data(), array.ByteLength());
 +  }
 +  bool lossless = false;
 +  int64_t unixMs = info[0].As<Napi::BigInt>().Int64Value(&lossless);
@@ -633,7 +761,17 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb
 +    Napi::RangeError::New(env, "Deterministic time is out of range").ThrowAsJavaScriptException();
 +    return env.Undefined();
 +  }
-+  chronologSetDeterministicContext((sqlite3_int64)unixMs, info[1].As<Napi::Number>().Uint32Value());
++  int64_t actorId = 0;
++  if (hasActorId) {
++    bool actorIdLossless = false;
++    actorId = info[3].As<Napi::BigInt>().Int64Value(&actorIdLossless);
++    if (!actorIdLossless || actorId < 1) {
++      Napi::RangeError::New(env, "Deterministic actor id must be a positive 64-bit integer").ThrowAsJavaScriptException();
++      return env.Undefined();
++    }
++  }
++  chronologSetDeterministicContext((sqlite3_int64)unixMs, info[1].As<Napi::Number>().Uint32Value(),
++    hasActor ? (const unsigned char*)actor.data() : nullptr, actor.size(), hasActorId ? 1 : 0, (sqlite3_int64)actorId);
 +  sqlite3_set_last_insert_rowid(db_, 0);
 +  return env.Undefined();
 +}
@@ -692,7 +830,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb
  // ── Internal query helpers ────────────────────────────────────────────────────
  
  Napi::Array Database::ExecQuery(Napi::Env env, const std::string& sql,
-@@ -277,6 +459,41 @@ Napi::Value Database::DoltReset(const Napi::CallbackInfo& info) {
+@@ -277,6 +483,41 @@ Napi::Value Database::DoltReset(const Napi::CallbackInfo& info) {
    return env.Undefined();
  }
  
@@ -734,7 +872,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb
  Napi::Value Database::DoltStatus(const Napi::CallbackInfo& info) {
    return ExecQuery(info.Env(), "SELECT * FROM dolt_status");
  }
-@@ -414,6 +631,13 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
+@@ -414,6 +655,13 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
      InstanceMethod("open",           &Database::Open),
      InstanceMethod("location",       &Database::Location),
      InstanceMethod("createFunction", &Database::CreateFunction),
@@ -748,7 +886,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb
      InstanceAccessor("isOpen",        &Database::IsOpenGetter,        nullptr),
      InstanceAccessor("inTransaction", &Database::IsTransactionGetter, nullptr),
      // Dolt version-control
-@@ -422,6 +646,9 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
+@@ -422,6 +670,9 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
      InstanceMethod("doltCheckout",   &Database::DoltCheckout),
      InstanceMethod("doltMerge",      &Database::DoltMerge),
      InstanceMethod("doltReset",      &Database::DoltReset),
