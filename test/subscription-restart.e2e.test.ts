@@ -56,7 +56,7 @@ describe('transport subscription restart', () => {
     expect(nodeA.subscriptionRestarts).toBeGreaterThanOrEqual(1)
   })
 
-  it('resubscribes when a live subscription silently misses a record', async () => {
+  it('recovers records a live subscription silently missed from transport history', async () => {
     const network = new MemoryTransportNetwork()
     const [a, b] = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
     const capability = bytes32(4)
@@ -90,7 +90,7 @@ describe('transport subscription restart', () => {
       if (Date.now() > deadline) throw new Error('node A never recovered the missed record')
       await new Promise((resolve) => setTimeout(resolve, 200))
     }
-    expect(subscriptions).toBeGreaterThanOrEqual(2)
+    expect(nodeA.subscriptionRestarts).toBeGreaterThanOrEqual(1)
   }, 60_000)
 })
 

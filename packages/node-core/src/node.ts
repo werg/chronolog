@@ -1080,7 +1080,21 @@ export class ChronologNode {
     } else if (now - this.#backlogSince >= 20_000) {
       const stalled = backlog * 10 >= this.#backlogAtWindowStart * 9
       this.#backlogSince = undefined
-      if (stalled) this.#subscriptionAbort?.abort()
+      if (stalled) await this.#resyncFromHistory()
+    }
+  }
+
+  /**
+   * Ingests every transport record this node has not seen, read through
+   * transport.history(). Under chaos stress a live subscription (and a fresh
+   * one, whose replay uses a streaming query) missed records that the
+   * transport's history query returns; a restart recovers them the same way.
+   */
+  async #resyncFromHistory(): Promise<void> {
+    this.#subscriptionRestarts += 1
+    for (const record of await this.#options.transport.history()) {
+      if (this.#closed) return
+      if (!this.#seen.has(record.id) && !this.#retryRecords.has(record.id)) await this.ingest(record)
     }
   }
 
