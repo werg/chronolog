@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 
 import { ControlStore, JsonFileControlStorePersistence } from '@chronolog/control-store'
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
+import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   createDoltLiteMaterializationRuntime,
@@ -52,7 +52,7 @@ const capability = Uint8Array.of(7)
 const native = readNativeEngineInfo()
 const materializer = await DeterministicMaterializer.open({
   path: join(directory, 'application.db'),
-  executionManifest: createCoreExecutionManifest({
+  executionManifest: createExecutionManifest({
     profile: 'chronolog-core-portable',
     engine: native.descriptor,
     engineDigest: native.digest,
@@ -161,30 +161,18 @@ function bytes32(seed: number): Uint8Array { return Uint8Array.from({ length: 32
 function createProgram(): SqlTransactionProgram {
   return {
     version: 1,
-    preconditions: [{
-      id: 1,
-      query: { sql: 'SELECT 1', bindings: [] },
-      resultMode: 'scalar',
-      expectation: { kind: 'assert_true' },
-    }],
-    body: [{ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT', bindings: [] }],
+    statements: [{ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT', bindings: [] }],
   }
 }
 function insertProgram(id: number): SqlTransactionProgram {
   return {
     version: 1,
-    preconditions: [{
-      id: 1,
-      query: { sql: 'SELECT 1', bindings: [] },
-      resultMode: 'scalar',
-      expectation: { kind: 'assert_true' },
-    }],
-    body: [{
+    statements: [{
       sql: 'INSERT INTO items (id, value) VALUES (?, ?)',
       bindings: [indexed(1, BigInt(id)), indexed(2, BigInt(id * 10))],
     }],
   }
 }
 function indexed(index: number, value: bigint) {
-  return { parameter: { kind: 'index' as const, index }, value: { kind: 'int64' as const, value } }
+  return { parameter: { kind: 'index' as const, index }, value: { kind: 'integer' as const, value } }
 }

@@ -21,7 +21,7 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { decodeSignedGenesis, encodeSignedGenesis, type SignedGenesis } from '@chronolog/capabilities'
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
+import { createExecutionManifest, type ExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   openReadOnlyDatabase,
@@ -90,7 +90,7 @@ async function forkGroup(archiveDirectory: string, signerText: string): Promise<
   await assertEmptyDataDirectory()
   const signer = b64bytes(signerText, 32)
   const snapshotBytes = await readFile(join(archiveDirectory, 'snapshot.cbor'))
-  const executionManifest = createCoreExecutionManifest({ profile: 'chronolog-core-portable', engineDigest: readNativeEngineInfo().digest })
+  const executionManifest = createExecutionManifest({ profile: 'chronolog-core-portable', engineDigest: readNativeEngineInfo().digest })
   const scratch = await mkdtemp(join(dataDirectory, '.fork-source-'))
   try {
     // Same trust checks as a snapshot import: archive evidence, the operator-chosen
@@ -165,7 +165,7 @@ async function initialize(
   const transport = await SsbDb2Transport.open({ path: join(dataDirectory, 'ssb') })
   const transportAuthor = transport.identity
   await transport.close()
-  const executionManifest = createCoreExecutionManifest({ profile: 'chronolog-core-portable', engineDigest: readNativeEngineInfo().digest })
+  const executionManifest = createExecutionManifest({ profile: 'chronolog-core-portable', engineDigest: readNativeEngineInfo().digest })
   const materializer = await DeterministicMaterializer.open({ path: join(dataDirectory, 'application.db'), executionManifest })
   const schemaId = materializer.executionManifestDigest
   materializer.close()
@@ -214,7 +214,7 @@ async function snapshotGroup(archiveDirectory: string): Promise<Uint8Array> {
 
 async function validateMaterializer(
   path: string,
-  executionManifest: ReturnType<typeof createCoreExecutionManifest>,
+  executionManifest: ExecutionManifest,
   manifest: TrustedSnapshotManifest,
 ): Promise<void> {
   const materializer = await DeterministicMaterializer.open({ path, executionManifest })

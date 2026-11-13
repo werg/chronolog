@@ -1,6 +1,6 @@
 import {
   digestExecutionManifest,
-} from '@chronolog/ir'
+} from '@chronolog/protocol'
 import { transactionDigest } from '@chronolog/protocol'
 
 import {

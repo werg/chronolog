@@ -19,7 +19,7 @@ export function executeLocalSql(
     statement.setReadBigInts?.(true)
     const rows = statement.all(...parameters.map(localValueToDatabaseValue))
     const maximumRows = inputLimits.maxResultRows ?? 10_000
-    const maximumBytes = inputLimits.maxResultBytes ?? 16 * 1024 * 1024
+    const maximumBytes = 16 * 1024 * 1024
     if (rows.length > maximumRows) throw new SqlProfileError('SQL_RESULT_LIMIT')
     const columns = statement.columns().map((column, index) => ({
       name: column.name ?? `column_${index}`,
@@ -58,8 +58,8 @@ function databaseValueToLocalValue(value: unknown): LocalSqlValue {
   if (value === null) return { kind: 'null' }
   if (typeof value === 'bigint') return { kind: 'integer', value: value.toString(10) }
   if (typeof value === 'number') {
+    // Integers are read as BigInt, so a JS number is always a SQLite REAL (even 2.0).
     if (!Number.isFinite(value)) throw new Error('SQL_UNSUPPORTED_RESULT_TYPE')
-    if (Number.isSafeInteger(value)) return { kind: 'integer', value: String(value) }
     return { kind: 'real', value }
   }
   if (typeof value === 'string') return { kind: 'text', value }

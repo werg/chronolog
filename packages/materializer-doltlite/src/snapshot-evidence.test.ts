@@ -12,15 +12,7 @@ function row(index: number, overrides: Partial<TransactionLogRow> = {}): Transac
     orderIndex: index,
     outcome: 'accepted',
     rejectionCode: null,
-    failingPreconditionId: null,
-    failingPreconditionIndex: null,
     failingStatementIndex: null,
-    failurePhase: null,
-    failingConstraintIdentity: null,
-    failingTriggerIdentity: null,
-    resultEnvelopeVersion: 1,
-    resultEnvelope: bytes(0x30 + index, 8),
-    resultDigest: bytes(0x40 + index),
     authorId: bytes(0x50),
     authorTimestampMs: 1_000n + BigInt(index),
     authorFeedSequence: BigInt(index + 1),
@@ -61,18 +53,9 @@ describe('materializedLogDigest', () => {
     ['authorFeedSequence', { authorFeedSequence: 99n }],
     ['candidateDigest', { candidateDigest: bytes(0xee) }],
     ['canonicalCandidate', { canonicalCandidate: bytes(0xee, 16) }],
-    ['outcome', { outcome: 'rejected_execution' }],
+    ['outcome', { outcome: 'rejected' }],
     ['rejectionCode', { rejectionCode: 'SQL_CONSTRAINT' }],
-    ['failingPreconditionId', { failingPreconditionId: 0 }],
-    ['failingPreconditionIndex', { failingPreconditionIndex: 0 }],
     ['failingStatementIndex', { failingStatementIndex: 0 }],
-    ['failurePhase', { failurePhase: 'statement' }],
-    ['failingConstraintIdentity', { failingConstraintIdentity: new Uint8Array() }],
-    ['failingTriggerIdentity', { failingTriggerIdentity: new Uint8Array() }],
-    ['resultEnvelopeVersion', { resultEnvelopeVersion: null }],
-    ['resultEnvelope', { resultEnvelope: null }],
-    ['resultEnvelope bytes', { resultEnvelope: bytes(0x30, 7) }],
-    ['resultDigest', { resultDigest: null }],
   ]
 
   it.each(tampered)('changes when %s is altered', async (_field, change) => {
@@ -84,14 +67,8 @@ describe('materializedLogDigest', () => {
     const zeroIndex = hex(await materializedLogDigest([row(0, { failingStatementIndex: 0 })]))
     const nullIndex = hex(await materializedLogDigest([row(0, { failingStatementIndex: null })]))
     expect(zeroIndex).not.toBe(nullIndex)
-    const emptyIdentity = hex(await materializedLogDigest([row(0, { failingConstraintIdentity: new Uint8Array() })]))
-    const nullIdentity = hex(await materializedLogDigest([row(0, { failingConstraintIdentity: null })]))
-    expect(emptyIdentity).not.toBe(nullIdentity)
-  })
-
-  it('does not let a value shift between adjacent fields', async () => {
-    const left = hex(await materializedLogDigest([row(0, { failingPreconditionId: 1, failingPreconditionIndex: null })]))
-    const right = hex(await materializedLogDigest([row(0, { failingPreconditionId: null, failingPreconditionIndex: 1 })]))
-    expect(left).not.toBe(right)
+    const emptyCode = hex(await materializedLogDigest([row(0, { rejectionCode: '' })]))
+    const nullCode = hex(await materializedLogDigest([row(0, { rejectionCode: null })]))
+    expect(emptyCode).not.toBe(nullCode)
   })
 })

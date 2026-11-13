@@ -1,26 +1,11 @@
 import {
-  compileManifestArtifacts,
-  compileSqlProgram,
-  compileSqlStatement,
-  SqlCompilerError,
-  type ManifestArtifacts,
-} from '@chronolog/compiler-sqlite'
-import type { ExecutionManifest } from '@chronolog/ir'
-import {
   compareTransactionOrder,
-  decodeCanonicalSchemaIdentity,
-  decodeTransactionCore,
-  decodeTransactionResultEnvelope,
-  digestCanonicalSqlResult,
-  digestTransactionResultEnvelope,
-  encodeTransactionResultEnvelope,
-  encodeCanonicalSchemaIdentity,
   encodeTransactionCore,
+  executionManifestArtifacts,
   transactionDigest,
-  type SqlStatement,
-  type SqlTransactionProgram,
+  type ExecutionManifest,
+  type ManifestArtifacts,
   type TransactionOrderKey,
-  type TransactionResultEnvelopeV1,
 } from '@chronolog/protocol'
 
 import {
@@ -39,15 +24,8 @@ import {
   type PublishedRef,
 } from './checkpoints.js'
 import { openDatabase } from './driver.js'
-import { isOperationalSqliteError, withAuthorizer } from './sql-profile.js'
-import {
-  compileSqlStatementForDatabase,
-  DeterministicSqlRejection,
-  evaluateSqlPrecondition,
-  executeSqlBodyStatement,
-  executeSqlObservation,
-  type SqlResultExecutionLimits,
-} from './sql-executor.js'
+import { withAuthorizer } from './sql-profile.js'
+import { executeTransactionProgram, SqlRejection } from './sql-executor.js'
 import { executeLocalSql } from './sql-values.js'
 import {
   initializeSystemLog,
@@ -63,7 +41,6 @@ import type {
   LocalSqlOptions,
   LocalSqlQueryResult,
   LocalSqlValue,
-  MaterializedSqlQueryResult,
   MaterializedRevision,
   MaterializerBackendInfo,
   MaterializerCheckpointInfo,
@@ -71,12 +48,10 @@ import type {
   MaterializerOptions,
   MaterializerPublicationFaultPoint,
   OutcomeChange,
-  ObserveSqlOptions,
   RevisionSubscriber,
   StoredExecutionManifest,
   TransactionLogRow,
   TransactionOutcome,
-  TransactionOutcomeKind,
 } from './types.js'
 
 export class MaterializerInputError extends Error {
@@ -131,7 +106,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   static async open(options: MaterializerOptions): Promise<DeterministicMaterializer> {
-    const artifacts = await compileManifestArtifacts(options.executionManifest)
+    const artifacts = await executionManifestArtifacts(options.executionManifest)
     const opened = openDatabase(options)
     let reader: DatabaseLike | null = null
     try {
@@ -147,9 +122,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         verifyDatabaseState(opened.database, artifacts)
       }
       const log = readSystemLog(opened.database)
-      await verifyLogResultIntegrity(log, options.executionManifest.errorCodes)
       verifyPublishedLog(published, log)
-      const checkpoints = await validateCheckpointRefs(opened.database, published, log, artifacts, options.executionManifest.errorCodes)
+      const checkpoints = validateCheckpointRefs(opened.database, published, log, artifacts)
       cleanupOrphanBranches(opened.database, published, checkpoints)
 
       const readerOpened = openDatabase(options)
@@ -160,7 +134,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       reader.doltCheckout(published.branchRef)
       verifyDatabaseState(reader, artifacts)
       const readerLog = readSystemLog(reader)
-      await verifyLogResultIntegrity(readerLog, options.executionManifest.errorCodes)
       verifyPublishedLog(published, readerLog)
       if (reader.doltHashOf(published.branchRef) !== published.contentHash) {
         throw new Error('MATERIALIZER_READER_CONTENT_MISMATCH')
@@ -208,48 +181,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       orderIndex: row.orderIndex,
       outcome: row.outcome,
       rejectionCode: row.rejectionCode,
-      failingPreconditionId: row.failingPreconditionId,
-      failingPreconditionIndex: row.failingPreconditionIndex,
       failingStatementIndex: row.failingStatementIndex,
-      failurePhase: row.failurePhase,
-      failingConstraintIdentity: row.failingConstraintIdentity === null ? null : copyBytes(row.failingConstraintIdentity),
-      failingTriggerIdentity: row.failingTriggerIdentity === null ? null : copyBytes(row.failingTriggerIdentity),
-      resultEnvelopeVersion: row.resultEnvelopeVersion,
-      resultEnvelope: row.resultEnvelope === null ? null : copyBytes(row.resultEnvelope),
-      resultDigest: row.resultDigest === null ? null : copyBytes(row.resultDigest),
-    }
-  }
-
-  transactionResult(txId: Uint8Array): TransactionResultEnvelopeV1 | null {
-    const row = this.#log.find((entry) => bytesEqual(entry.txId, txId))
-    if (row?.resultEnvelope === null || row?.resultEnvelope === undefined) return null
-    return decodeTransactionResultEnvelope(row.resultEnvelope)
-  }
-
-  async observe(statement: SqlStatement, options: ObserveSqlOptions): Promise<MaterializedSqlQueryResult> {
-    this.#assertOpen()
-    this.#assertRevision(options.atRevision)
-    const observation = {
-      revision: this.revision,
-      orderLength: this.orderLength,
-      executionManifestDigest: this.executionManifestDigest,
-    }
-    const diagnostics = this.validateStatement(statement, 'precondition')
-    if (diagnostics.length > 0) throw new MaterializerInputError(diagnostics[0]!.code)
-    const result = executeSqlObservation(
-      this.#reader,
-      statement,
-      options.resultMode,
-      this.#executionManifest.resources.maxQueryRows,
-      this.#executionManifest.resources.maxResultBytes,
-      {},
-    )
-    const resultDigest = await digestCanonicalSqlResult(result)
-    return {
-      ...observation,
-      statement: structuredClone(statement),
-      result,
-      resultDigest,
     }
   }
 
@@ -270,17 +202,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     options: LocalSqlOptions = {},
   ): LocalSqlQueryResult {
     return this.localSql(sql, parameters, options)
-  }
-
-  validateStatement(statement: SqlStatement, mode: 'precondition' | 'body') {
-    try {
-      // Advisory: checks against the head schema; consensus recompiles each
-      // statement against the schema at its own position.
-      compileSqlStatementForDatabase(this.#reader, statement, mode)
-      return []
-    } catch (error) {
-      return [sqlCompilerDiagnostic(error)]
-    }
   }
 
   subscribe(subscriber: RevisionSubscriber): () => void {
@@ -304,8 +225,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       // Rows of the published log were fully verified when they were read;
       // byte-identical rows are not re-verified, so an append costs O(1)
       // verification work instead of O(history).
-      const verifiedLog = this.#log
-      await validateTransactionSet(transactions, verifiedLog)
+      await validateTransactionSet(transactions, this.#log)
       ensureMonotonicSet(this.#order, transactions.map((transaction) => transaction.txId))
       validateExistingIdentities(this.#log, transactions)
       const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
@@ -325,17 +245,14 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       replayBranch = createReplayBranch(this.#writer, nextRevision, baseRef)
       this.#writer.doltCheckout(replayBranch)
       verifyDatabaseState(this.#writer, this.#artifacts)
-      const replayLog = readSystemLog(this.#writer)
-      await verifyLogResultIntegrity(replayLog, this.#executionManifest.errorCodes, verifiedLog)
-      verifyReplayBase(replayLog, transactions, replayFrom)
+      verifyReplayBase(readSystemLog(this.#writer), transactions, replayFrom)
 
       for (let index = replayFrom; index < transactions.length; index += 1) {
         verifyNextLogIndex(this.#writer, index)
-        await this.#applyTransaction(transactions[index]!, index)
+        this.#applyTransaction(transactions[index]!, index)
       }
 
       const candidateLog = readSystemLog(this.#writer)
-      await verifyLogResultIntegrity(candidateLog, this.#executionManifest.errorCodes, verifiedLog)
       verifyDesiredLog(candidateLog, transactions)
       verifyDatabaseState(this.#writer, this.#artifacts)
       const commitHash = this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
@@ -359,7 +276,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       candidateReader.doltCheckout(revisionBranch)
       verifyDatabaseState(candidateReader, this.#artifacts)
       const readerLog = readSystemLog(candidateReader)
-      await verifyLogResultIntegrity(readerLog, this.#executionManifest.errorCodes, verifiedLog)
       verifyPublishedLog(nextPublished, readerLog)
       if (candidateReader.doltHashOf(revisionBranch) !== contentHash) {
         throw new Error('MATERIALIZER_CANDIDATE_READER_CONTENT_MISMATCH')
@@ -433,99 +349,37 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#writer.close()
   }
 
-  async #applyTransaction(transaction: AdmittedTransaction, orderIndex: number): Promise<void> {
+  #applyTransaction(transaction: AdmittedTransaction, orderIndex: number): void {
     this.#writer.exec('BEGIN IMMEDIATE')
     this.#writer.exec('SAVEPOINT chronolog_program')
+    let rejection: { readonly code: string; readonly statementIndex: number | null } | null = null
     try {
       if (!bytesEqual(transaction.core.executionManifestDigest, this.#artifacts.executionManifestDigest)) {
-        throw new DeterministicSqlRejection('EXECUTION_MANIFEST_DIGEST_MISMATCH', 'finalize')
+        rejection = { code: 'manifest_mismatch', statementIndex: null }
+      } else {
+        executeTransactionProgram(this.#writer, transaction.core.program, {
+          authorTimestampMs: transaction.core.authorTimestampMs,
+          txId: transaction.txId,
+        }, this.#executionManifest.limits)
       }
-      compileSqlProgram(transaction.core.program)
-      const resultLimits = sqlResultLimits(this.#executionManifest)
-      const resultBudget = { rows: 0 }
-      const preconditionResults = []
-      for (const [index, precondition] of transaction.core.program.preconditions.entries()) {
-        preconditionResults.push(await evaluateSqlPrecondition(
-          this.#writer,
-          precondition,
-          index,
-          this.#executionManifest.resources.maxQueryRows,
-          this.#executionManifest.resources.maxResultBytes,
-          {},
-          resultLimits,
-          resultBudget,
-        ))
-      }
-      const statementResults = []
-      for (const [index, statement] of transaction.core.program.body.entries()) {
-        statementResults.push(executeSqlBodyStatement(
-          this.#writer,
-          statement,
-          index,
-          this.#executionManifest.resources.maxQueryRows,
-          this.#executionManifest.resources.maxResultBytes,
-          {},
-          resultLimits,
-          resultBudget,
-        ))
-        const partialEnvelope = encodeTransactionResultEnvelope({
-          version: 1,
-          preconditions: preconditionResults,
-          statements: statementResults,
-        })
-        if (partialEnvelope.length > this.#executionManifest.resources.maxTransactionResultBytes) {
-          throw new DeterministicSqlRejection('SQL_TRANSACTION_RESULT_BYTE_LIMIT', 'statement', null, null, index)
-        }
-      }
-      const envelope: TransactionResultEnvelopeV1 = {
-        version: 1,
-        preconditions: preconditionResults,
-        statements: statementResults,
-      }
-      const resultEnvelope = encodeTransactionResultEnvelope(envelope)
-      verifyEnvelopeAgainstProgram(transaction.core.program, envelope)
-      const resultDigest = await digestTransactionResultEnvelope(resultEnvelope)
-      insertSystemLogRow(this.#writer, logRow(transaction, orderIndex, 'accepted', null, {
-        resultEnvelopeVersion: 1,
-        resultEnvelope,
-        resultDigest,
-      }))
-      this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
-      this.#writer.exec('COMMIT')
     } catch (error) {
-      const rejection = deterministicRejection(error)
-      if (rejection === null) {
+      if (!(error instanceof SqlRejection)) {
         rollbackIfActive(this.#writer)
-        if (isOperationalSqliteError(error)) throw error
         throw error
       }
-      if (!this.#executionManifest.errorCodes.includes(rejection.code)) {
-        rollbackIfActive(this.#writer)
-        throw new Error(`MATERIALIZER_UNREGISTERED_REJECTION_CODE:${rejection.code}`, { cause: error })
-      }
-      try {
-        // Keep rejection recording in the same outer transaction. A full
-        // ROLLBACK after checking out a replay branch can restore DoltLite's
-        // previous branch working set, resurrecting later protected-log rows.
-        // The savepoint rolls back every application mutation while preserving
-        // the selected replay base and lets us commit the rejection atomically.
-        this.#writer.exec('ROLLBACK TO SAVEPOINT chronolog_program')
-        this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
-        insertSystemLogRow(this.#writer, logRow(
-          transaction,
-          orderIndex,
-          rejection.failurePhase === 'precondition' ? 'rejected_precondition' : 'rejected_execution',
-          rejection.code,
-          rejection,
-        ))
-        this.#writer.exec('COMMIT')
-      } catch (writeError) {
-        rollbackIfActive(this.#writer)
-        throw new Error(
-          `MATERIALIZER_REJECTION_WRITE_FAILED:${errorMessage(error)}:${errorMessage(writeError)}`,
-          { cause: writeError },
-        )
-      }
+      rejection = { code: error.code, statementIndex: error.statementIndex }
+    }
+    try {
+      // Roll back to the savepoint rather than the outer transaction: a full
+      // ROLLBACK after checking out a replay branch can restore DoltLite's
+      // previous branch working set, resurrecting later log rows.
+      if (rejection !== null) this.#writer.exec('ROLLBACK TO SAVEPOINT chronolog_program')
+      this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
+      insertSystemLogRow(this.#writer, logRow(transaction, orderIndex, rejection))
+      this.#writer.exec('COMMIT')
+    } catch (error) {
+      rollbackIfActive(this.#writer)
+      throw new Error(`MATERIALIZER_LOG_WRITE_FAILED:${errorMessage(error)}`, { cause: error })
     }
   }
 
@@ -559,19 +413,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   #assertOpen(): void { if (this.#closed) throw new Error('MATERIALIZER_CLOSED') }
-}
-
-interface Rejection {
-  readonly code: string
-  readonly failingPreconditionId: number | null
-  readonly failingPreconditionIndex: number | null
-  readonly failingStatementIndex: number | null
-  readonly failurePhase: 'precondition' | 'statement' | 'finalize' | null
-  readonly failingConstraintIdentity: Uint8Array | null
-  readonly failingTriggerIdentity: Uint8Array | null
-  readonly resultEnvelopeVersion: 1 | null
-  readonly resultEnvelope: Uint8Array | null
-  readonly resultDigest: Uint8Array | null
 }
 
 function initializeRepository(
@@ -617,13 +458,12 @@ function verifyDatabaseState(
   verifyStoredManifest(readExecutionManifest(database), artifacts)
 }
 
-async function validateCheckpointRefs(
+function validateCheckpointRefs(
   database: DatabaseLike,
   published: PublishedRef,
   publishedLog: readonly TransactionLogRow[],
   artifacts: ManifestArtifacts,
-  errorCodes: readonly string[],
-): Promise<MaterializerCheckpointInfo[]> {
+): MaterializerCheckpointInfo[] {
   const valid: MaterializerCheckpointInfo[] = []
   for (const checkpoint of discoverCheckpoints(database)) {
     const expectedDigest = orderDigest(publishedLog.slice(0, checkpoint.prefixLength))
@@ -636,7 +476,6 @@ async function validateCheckpointRefs(
       database.doltCheckout(checkpoint.branchRef)
       verifyStoredManifest(readExecutionManifest(database), artifacts)
       const checkpointLog = readSystemLog(database)
-      await verifyLogResultIntegrity(checkpointLog, errorCodes)
       matches = checkpointLog.length === checkpoint.prefixLength && orderDigest(checkpointLog) === expectedDigest
     } catch { matches = false }
     database.doltCheckout(HEAD_BRANCH)
@@ -650,87 +489,6 @@ async function validateCheckpointRefs(
   if (!valid.some((checkpoint) => checkpoint.prefixLength === 0)) throw new Error('MATERIALIZER_GENESIS_CHECKPOINT_MISSING')
   verifyPublishedLog(published, publishedLog)
   return valid.sort((left, right) => left.prefixLength - right.prefixLength)
-}
-
-/**
- * Verifies every protected result field of a log read from the database.
- * `verified` is a log this materializer already verified (with the same
- * error-code registry); a row whose verification inputs are byte-identical to
- * the row at the same index there has the same verdict and is skipped.
- */
-async function verifyLogResultIntegrity(
-  log: readonly TransactionLogRow[],
-  errorCodes: readonly string[],
-  verified: readonly TransactionLogRow[] = [],
-): Promise<void> {
-  for (const [index, row] of log.entries()) {
-    const known = verified[index]
-    if (known !== undefined && sameVerificationInputs(row, known)) continue
-    if (row.outcome === 'accepted') {
-      if (
-        row.rejectionCode !== null || row.failurePhase !== null ||
-        row.failingPreconditionId !== null || row.failingPreconditionIndex !== null ||
-        row.failingStatementIndex !== null || row.failingConstraintIdentity !== null ||
-        row.failingTriggerIdentity !== null ||
-        row.resultEnvelopeVersion !== 1 || row.resultEnvelope === null || row.resultDigest === null
-      ) throw new Error('MATERIALIZER_CORRUPT_ACCEPTED_RESULT_RECORD')
-      const envelope = decodeTransactionResultEnvelope(row.resultEnvelope)
-      const core = decodeTransactionCore(row.canonicalCandidate)
-      verifyEnvelopeAgainstProgram(core.program, envelope)
-      if (!bytesEqual(encodeTransactionResultEnvelope(envelope), row.resultEnvelope)) {
-        throw new Error('MATERIALIZER_NONCANONICAL_RESULT_ENVELOPE')
-      }
-      if (!bytesEqual(await digestTransactionResultEnvelope(row.resultEnvelope), row.resultDigest)) {
-        throw new Error('MATERIALIZER_RESULT_DIGEST_MISMATCH')
-      }
-    } else if (
-      row.rejectionCode === null || row.failurePhase === null ||
-      row.resultEnvelopeVersion !== null || row.resultEnvelope !== null || row.resultDigest !== null
-    ) {
-      throw new Error('MATERIALIZER_CORRUPT_REJECTED_RESULT_RECORD')
-    } else {
-      if (!errorCodes.includes(row.rejectionCode)) throw new Error('MATERIALIZER_UNREGISTERED_REJECTION_CODE')
-      if (row.failingConstraintIdentity !== null) {
-        const identity = decodeCanonicalSchemaIdentity(row.failingConstraintIdentity)
-        if (identity.objectKind !== 'constraint') throw new Error('MATERIALIZER_CORRUPT_CONSTRAINT_IDENTITY')
-      }
-      if (row.failingTriggerIdentity !== null) {
-        const identity = decodeCanonicalSchemaIdentity(row.failingTriggerIdentity)
-        if (identity.objectKind !== 'trigger') throw new Error('MATERIALIZER_CORRUPT_TRIGGER_IDENTITY')
-      }
-    }
-  }
-}
-
-function verifyEnvelopeAgainstProgram(
-  program: SqlTransactionProgram,
-  envelope: TransactionResultEnvelopeV1,
-): void {
-  if (envelope.preconditions.length !== program.preconditions.length) {
-    throw new Error('MATERIALIZER_RESULT_PRECONDITION_COUNT_MISMATCH')
-  }
-  for (const [index, result] of envelope.preconditions.entries()) {
-    if (result.index !== index || result.id !== program.preconditions[index]!.id) {
-      throw new Error('MATERIALIZER_RESULT_PRECONDITION_ID_MISMATCH')
-    }
-  }
-  if (envelope.statements.length !== program.body.length) {
-    throw new Error('MATERIALIZER_RESULT_STATEMENT_COUNT_MISMATCH')
-  }
-  for (const [index, result] of envelope.statements.entries()) {
-    const compiled = compileSqlStatement(program.body[index]!, 'body')
-    if (result.index !== index || result.statementClass !== compiled.statementClass) {
-      throw new Error('MATERIALIZER_RESULT_STATEMENT_CLASS_MISMATCH')
-    }
-    if (compiled.producesResult !== (result.result !== null)) {
-      throw new Error('MATERIALIZER_RESULT_PRESENCE_MISMATCH')
-    }
-    if (result.result !== null && (
-      compiled.statementClass === 'insert' || compiled.statementClass === 'update' || compiled.statementClass === 'delete'
-    ) && result.affectedRows !== BigInt(result.result.rows.length)) {
-      throw new Error('MATERIALIZER_RETURNING_AFFECTED_COUNT_MISMATCH')
-    }
-  }
 }
 
 async function validateTransactionSet(
@@ -747,8 +505,7 @@ async function validateTransactionSet(
     if (!sameBytes(encodeTransactionCore(transaction.core), transaction.canonicalCandidate)) {
       throw new MaterializerInputError('MATERIALIZER_CANONICAL_CANDIDATE_MISMATCH')
     }
-    // A logged row's digest and program were checked when it was admitted.
-    // Both are pure functions of the canonical bytes, which the check above
+    // A logged row's digest was checked when it was admitted. It is a pure function of the canonical bytes, which the check above
     // binds to this core, so a byte-identical candidate needs no recheck.
     const known = verified[index]
     const alreadyVerified = known !== undefined &&
@@ -758,10 +515,6 @@ async function validateTransactionSet(
     if (!alreadyVerified) {
       if (!sameBytes(await transactionDigest(transaction.canonicalCandidate), transaction.candidateDigest)) {
         throw new MaterializerInputError('MATERIALIZER_CANDIDATE_DIGEST_MISMATCH')
-      }
-      try { compileSqlProgram(transaction.core.program) } catch (error) {
-        if (error instanceof SqlCompilerError) throw new MaterializerInputError(error.code)
-        throw error
       }
     }
     const key = orderKeyOf(transaction)
@@ -873,53 +626,11 @@ function earliestDifference(previous: readonly Uint8Array[], next: readonly Uint
   return previous.length === next.length ? null : length
 }
 
-function deterministicRejection(error: unknown): Rejection | null {
-  if (error instanceof DeterministicSqlRejection) {
-    return {
-      code: error.code,
-      failingPreconditionId: error.preconditionId,
-      failingPreconditionIndex: error.preconditionIndex,
-      failingStatementIndex: error.statementIndex,
-      failurePhase: error.phase,
-      failingConstraintIdentity: error.constraintIdentity === null ? null : encodeCanonicalSchemaIdentity(error.constraintIdentity),
-      failingTriggerIdentity: error.triggerIdentity === null ? null : encodeCanonicalSchemaIdentity(error.triggerIdentity),
-      resultEnvelopeVersion: null,
-      resultEnvelope: null,
-      resultDigest: null,
-    }
-  }
-  if (error instanceof SqlCompilerError) {
-    return {
-      code: error.code,
-      failingPreconditionId: null,
-      failingPreconditionIndex: null,
-      failingStatementIndex: null,
-      failurePhase: 'finalize',
-      failingConstraintIdentity: null,
-      failingTriggerIdentity: null,
-      resultEnvelopeVersion: null,
-      resultEnvelope: null,
-      resultDigest: null,
-    }
-  }
-  return null
-}
-
-function sqlCompilerDiagnostic(error: unknown) {
-  if (error instanceof SqlCompilerError) return {
-    code: error.code,
-    ...(error.span === null ? {} : { startByte: error.span.startByte, endByte: error.span.endByte }),
-  }
-  return { code: error instanceof Error ? error.message : 'SQL_COMPILER_REJECTED' }
-}
-
 function logRow(
   transaction: AdmittedTransaction,
   orderIndex: number,
-  outcome: TransactionOutcomeKind,
-  rejectionCode: string | null,
-  details: Partial<Rejection> = {},
-) {
+  rejection: { readonly code: string; readonly statementIndex: number | null } | null,
+): Omit<TransactionLogRow, 'orderKey'> {
   return {
     txId: transaction.txId,
     orderIndex,
@@ -928,17 +639,9 @@ function logRow(
     authorFeedSequence: transaction.authorFeedSequence,
     candidateDigest: transaction.candidateDigest,
     canonicalCandidate: transaction.canonicalCandidate,
-    outcome,
-    rejectionCode,
-    failingPreconditionId: details.failingPreconditionId ?? null,
-    failingPreconditionIndex: details.failingPreconditionIndex ?? null,
-    failingStatementIndex: details.failingStatementIndex ?? null,
-    failurePhase: details.failurePhase ?? null,
-    failingConstraintIdentity: details.failingConstraintIdentity ?? null,
-    failingTriggerIdentity: details.failingTriggerIdentity ?? null,
-    resultEnvelopeVersion: details.resultEnvelopeVersion ?? null,
-    resultEnvelope: details.resultEnvelope ?? null,
-    resultDigest: details.resultDigest ?? null,
+    outcome: rejection === null ? 'accepted' : 'rejected',
+    rejectionCode: rejection?.code ?? null,
+    failingStatementIndex: rejection?.statementIndex ?? null,
   }
 }
 
@@ -967,42 +670,10 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean { return left.
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return Buffer.from(left.buffer, left.byteOffset, left.byteLength).equals(Buffer.from(right.buffer, right.byteOffset, right.byteLength))
 }
-function sameNullableBytes(left: Uint8Array | null, right: Uint8Array | null): boolean {
-  return left === null || right === null ? left === right : sameBytes(left, right)
-}
-/** Every field verifyLogResultIntegrity reads. */
-function sameVerificationInputs(left: TransactionLogRow, right: TransactionLogRow): boolean {
-  return left.outcome === right.outcome &&
-    left.rejectionCode === right.rejectionCode &&
-    left.failurePhase === right.failurePhase &&
-    left.failingPreconditionId === right.failingPreconditionId &&
-    left.failingPreconditionIndex === right.failingPreconditionIndex &&
-    left.failingStatementIndex === right.failingStatementIndex &&
-    left.resultEnvelopeVersion === right.resultEnvelopeVersion &&
-    sameNullableBytes(left.failingConstraintIdentity, right.failingConstraintIdentity) &&
-    sameNullableBytes(left.failingTriggerIdentity, right.failingTriggerIdentity) &&
-    sameNullableBytes(left.resultEnvelope, right.resultEnvelope) &&
-    sameNullableBytes(left.resultDigest, right.resultDigest) &&
-    sameBytes(left.canonicalCandidate, right.canonicalCandidate)
-}
 function copyBytes(value: Uint8Array): Uint8Array { return Uint8Array.from(value) }
 function validatePositiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new MaterializerInputError(`MATERIALIZER_INVALID_${name.toUpperCase()}`)
   return value
-}
-function sqlResultLimits(manifest: ExecutionManifest): SqlResultExecutionLimits {
-  const resources = manifest.resources
-  return {
-    maxColumnsPerStatement: resources.maxResultColumnsPerStatement,
-    maxRowsPerStatement: resources.maxResultRowsPerStatement,
-    maxBytesPerStatement: resources.maxResultBytesPerStatement,
-    maxTransactionRows: resources.maxTransactionResultRows,
-    maxValueBytes: resources.maxResultValueBytes,
-    maxSortWork: resources.maxResultSortWork,
-    maxOrderedMutationTargets: resources.maxOrderedMutationTargets,
-    maxOrderedMutationIdentityBytes: resources.maxOrderedMutationIdentityBytes,
-    maxOrderedMutationBindings: resources.maxOrderedMutationBindings,
-  }
 }
 function nonThrowingDiagnostic(error: unknown, fallback: string): string { return error instanceof Error && error.message.length > 0 ? error.message : fallback }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error) }

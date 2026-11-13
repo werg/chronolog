@@ -13,7 +13,7 @@ export function chaosBootstrapStatements(accountCount: number) {
     { sql: "INSERT INTO chaos_schema_migrations VALUES ('profiles', 2, 'profiles-v2-additive-email-metadata')" },
     ...Array.from({ length: accountCount }, (_value, account) => ({
       sql: 'INSERT INTO accounts (id, balance, version, touched) VALUES (?, ?, 0, 0)',
-      parameters: [BigInt(account), 0n] as const,
+      params: [BigInt(account), 0n] as const,
     })),
     { sql: "INSERT INTO chaos_ledger VALUES ('__reserved_constraint_key__', 0, 0, 0, NULL, X'')" },
   ]
@@ -26,16 +26,23 @@ export function balanceQuery(account: number) {
 export function balanceUpdate(account: number, value: bigint) {
   return {
     sql: 'UPDATE accounts SET balance = ?, version = version + 1 WHERE id = ? RETURNING id, balance, version',
-    parameters: [value, BigInt(account)] as const,
+    params: [value, BigInt(account)] as const,
   }
 }
 
-/** A signed, replay-time schema assumption backed by application migration history. */
-export function schemaVersionPrecondition(component: string, version: number) {
+/** A replay-time schema assumption backed by application migration history. */
+export function schemaVersionAssertion(component: string, version: number) {
   return {
-    sql: 'SELECT EXISTS (SELECT 1 FROM chaos_schema_migrations WHERE component = ? AND version = ?)',
-    parameters: [component, BigInt(version)] as const,
-    applicationLabel: `chaos.schema.${component}.v${version}`,
+    sql: `SELECT chronolog_assert(EXISTS (SELECT 1 FROM chaos_schema_migrations WHERE component = ? AND version = ?), 'schema_${component}_v${version}')`,
+    params: [component, BigInt(version)] as const,
+  }
+}
+
+/** Asserts an account still has the balance the client read locally. */
+export function balanceAssertion(account: number, balance: bigint) {
+  return {
+    sql: "SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = ?) = ?, 'balance_changed')",
+    params: [BigInt(account), balance] as const,
   }
 }
 
@@ -84,10 +91,7 @@ export function transactionLogQuery() {
   return {
     sql: `
       SELECT tx_id, order_index, author_id, author_timestamp_ms, outcome,
-             rejection_code, result_digest, result_envelope_version,
-             length(result_envelope), failure_phase, failing_precondition_id,
-             failing_precondition_index, failing_statement_index,
-             failing_constraint_identity, failing_trigger_identity
+             rejection_code, failing_statement_index
         FROM chronolog_transactions
        ORDER BY order_index, tx_id
     `,

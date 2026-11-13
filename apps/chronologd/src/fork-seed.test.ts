@@ -1,7 +1,7 @@
 import { DatabaseSync } from '@dolthub/doltlite'
 import { describe, expect, it } from 'vitest'
 
-import { applicationTableDigests, buildForkSeedPlan, FORK_SEED_TABLE, type ReadableDatabase, type SeedValue } from './fork-seed.js'
+import { applicationTableDigests, buildForkSeedPlan, FORK_SEED_APPLIED_CODE, FORK_SEED_TABLE, type ReadableDatabase, type SeedValue } from './fork-seed.js'
 
 interface WritableDatabase extends ReadableDatabase {
   exec(sql: string): void
@@ -46,20 +46,20 @@ function source(): WritableDatabase {
 
 function apply(target: WritableDatabase, plan: ReturnType<typeof buildForkSeedPlan>): void {
   for (const batch of plan.batches) {
-    const precondition = target.prepare(batch.precondition)
-    precondition.setReturnArrays?.(true)
-    expect((precondition.all()[0] as unknown[])[0]).toBe(1)
     target.exec('BEGIN')
-    for (const statement of batch.statements) target.prepare(statement.sql).run(...statement.bindings.map(native))
+    for (const statement of batch.statements) target.prepare(statement.sql).run(statement.bindings.map(native))
     target.exec('COMMIT')
   }
 }
 
 function native(value: SeedValue): unknown {
-  if (value === null || typeof value === 'string') return value
-  if ('$int64' in value) return BigInt(value.$int64)
-  if ('$real' in value) return Float64Array.of(Buffer.from(value.$real, 'hex').readDoubleBE())
-  return Uint8Array.from(Buffer.from(value.$blob, 'base64url'))
+  switch (value.kind) {
+    case 'null': return null
+    case 'integer': return BigInt(value.value)
+    case 'real': return Float64Array.of(value.value)
+    case 'text': return value.value
+    case 'blob': return Buffer.from(value.value, 'base64url')
+  }
 }
 
 describe('fork seed plan', () => {
@@ -85,25 +85,24 @@ describe('fork seed plan', () => {
     expect(view.all()).toEqual([['grandchild']])
   })
 
-  it('is idempotent: every batch asserts it has not been applied', () => {
+  it('is idempotent: every batch first asserts it has not been applied', () => {
     const plan = buildForkSeedPlan(source(), ORIGIN)
     const to = database()
     apply(to, plan)
     for (const batch of plan.batches) {
-      const check = to.prepare(batch.precondition)
-      check.setReturnArrays?.(true)
-      expect((check.all()[0] as unknown[])[0]).toBe(0)
+      expect(() => to.prepare(batch.statements[0]!.sql).run([])).toThrow(`chronolog_assert:${FORK_SEED_APPLIED_CODE}`)
     }
   })
 
-  it('splits large tables into bounded batches', () => {
+  it('splits large tables into batches that fit one transaction', () => {
     const db = database()
     db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT')
     const insert = db.prepare('INSERT INTO t VALUES (?, ?)')
-    for (let id = 1; id <= 1_201; id += 1) insert.run(id, `v${id}`)
+    for (let id = 1; id <= 501; id += 1) insert.run(id, `v${id}`)
     const plan = buildForkSeedPlan(db, ORIGIN)
     expect(plan.batches.map((batch) => batch.label)).toEqual(['schema: tables', 'rows: t #1', 'rows: t #2', 'rows: t #3'])
-    expect(plan.batches[1]!.statements).toHaveLength(501)
+    // guard + 250 rows + marker
+    expect(plan.batches[1]!.statements).toHaveLength(252)
   })
 
   it('refuses tables without a primary key and foreign-key cycles between tables', () => {

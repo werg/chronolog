@@ -149,10 +149,7 @@ export class ChaosCluster {
       await cluster.#waitForReplicationMesh()
       const bootstrapClient = cluster.client(cluster.nodeNames()[0]!)
       for (let attempt = 1; attempt <= 3; attempt += 1) {
-        const bootstrap = await bootstrapClient.transaction((tx) => {
-          tx.assert('SELECT 1')
-          tx.exec(chaosBootstrapStatements(options.scenario.workload.accounts))
-        }, { idempotencyKey: `chronolog-chaos-bootstrap-v1-attempt-${attempt}` })
+        const bootstrap = await bootstrapClient.transaction(chaosBootstrapStatements(options.scenario.workload.accounts), { idempotencyKey: `chronolog-chaos-bootstrap-v1-attempt-${attempt}` })
         try {
           const deadline = Date.now() + 30_000
           let settlement = 'unavailable'
@@ -175,8 +172,8 @@ export class ChaosCluster {
           }
           if (bootstrapOutcome.outcome.type === 'accepted') return cluster
           if (bootstrapOutcome.outcome.type === 'rejected') {
-            const attribution = bootstrapOutcome.outcome.attribution
-            throw new Error(`CHAOS_BOOTSTRAP_REJECTED:${attribution.phase}:${attribution.code}:precondition=${attribution.preconditionIndex ?? 'none'}:statement=${attribution.statementIndex ?? 'none'}`)
+            const rejection = bootstrapOutcome.outcome.rejection
+            throw new Error(`CHAOS_BOOTSTRAP_REJECTED:${rejection.code}:statement=${rejection.statementIndex ?? 'none'}`)
           }
         } finally {
           bootstrap.dispose()

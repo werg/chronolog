@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { SeededRandom } from './rng.js'
-import { schemaVersionPrecondition } from './schema.js'
+import { schemaVersionAssertion } from './schema.js'
 import type { WorkloadSpec } from './types.js'
 import {
   chooseScheduledWorkloadOperation,
@@ -92,11 +92,10 @@ describe('chaos migration workload builders', () => {
     expect(statements.at(-1)?.sql).toContain("VALUES ('profiles', 1")
   })
 
-  it('provides a reusable signed schema-version assumption', () => {
-    expect(schemaVersionPrecondition('profiles', 2)).toEqual({
-      sql: 'SELECT EXISTS (SELECT 1 FROM chaos_schema_migrations WHERE component = ? AND version = ?)',
-      parameters: ['profiles', 2n],
-      applicationLabel: 'chaos.schema.profiles.v2',
+  it('provides a reusable schema-version assertion', () => {
+    expect(schemaVersionAssertion('profiles', 2)).toEqual({
+      sql: "SELECT chronolog_assert(EXISTS (SELECT 1 FROM chaos_schema_migrations WHERE component = ? AND version = ?), 'schema_profiles_v2')",
+      params: ['profiles', 2n],
     })
   })
 })

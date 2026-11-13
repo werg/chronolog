@@ -6,7 +6,6 @@
   "dependencies": {
     "@chronolog/client": "workspace:*",
     "@chronolog/control-store": "workspace:*",
-    "@chronolog/ir": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/rpc": "workspace:*",
     "@testcontainers/toxiproxy": "12.0.4",

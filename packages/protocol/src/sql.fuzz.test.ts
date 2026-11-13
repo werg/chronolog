@@ -1,36 +1,31 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  decodeTransactionResultEnvelope,
-  encodeTransactionResultEnvelope,
-  type TransactionResultEnvelopeV1,
+  decodeSqlTransactionProgram,
+  encodeSqlTransactionProgram,
+  sqlStatement,
+  sqlValue,
+  type SqlTransactionProgram,
 } from './sql.js'
 
-const fixture: TransactionResultEnvelopeV1 = {
+const fixture: SqlTransactionProgram = {
   version: 1,
-  preconditions: [{ index: 0, id: 7, resultDigest: bytes(32, 1) }],
-  statements: [{
-    index: 0,
-    statementClass: 'read',
-    affectedRows: null,
-    result: {
-      mode: 'ordered',
-      columns: [{ nameUtf8: new TextEncoder().encode('value'), type: { kind: 'dynamic' }, nullable: 'unknown' }],
-      rows: [[{ kind: 'integer', value: 42n }]],
-    },
-  }],
+  statements: [
+    sqlStatement("SELECT chronolog_assert(? > 0, 'positive')", [7n]),
+    sqlStatement('INSERT INTO t VALUES (:a, :b, :c, :d)', { a: sqlValue.real(1.5), b: 'text', c: new Uint8Array([1, 2]), d: null }),
+  ],
 }
 
-describe('transaction result mutation fuzz corpus', () => {
-  it('accepts only canonical mutated envelopes', () => {
-    const original = encodeTransactionResultEnvelope(fixture)
+describe('transaction program mutation fuzz corpus', () => {
+  it('accepts only canonical mutated programs', () => {
+    const original = encodeSqlTransactionProgram(fixture)
     let state = 0x52534c54
     for (let index = 0; index < 4_000; index += 1) {
       state = next(state)
       const candidate = mutate(original, state)
       try {
-        const decoded = decodeTransactionResultEnvelope(candidate)
-        expect(encodeTransactionResultEnvelope(decoded)).toEqual(candidate)
+        const decoded = decodeSqlTransactionProgram(candidate)
+        expect(encodeSqlTransactionProgram(decoded)).toEqual(candidate)
       } catch (error) {
         expect(error).toBeInstanceOf(Error)
       }
@@ -66,8 +61,4 @@ function next(state: number): number {
   value ^= value >>> 17
   value ^= value << 5
   return value >>> 0
-}
-
-function bytes(length: number, seed: number): Uint8Array {
-  return Uint8Array.from({ length }, (_value, index) => (seed + index) & 0xff)
 }

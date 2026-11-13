@@ -1,7 +1,7 @@
 import { readFile, rename } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
+import { createExecutionManifest, type ExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   readNativeEngineInfo,
@@ -45,7 +45,7 @@ try {
   const secretStore = daemonSecretStoreFromEnvironment(process.env)
   const { config, identity } = await loadOrCreateConfig(dataDirectory, secretStore)
   const groupId = fromBase64(config.groupId)
-  const executionManifest = createCoreExecutionManifest({
+  const executionManifest = createExecutionManifest({
     profile: 'chronolog-core-portable',
     engineDigest: readNativeEngineInfo().digest,
   })
@@ -99,7 +99,7 @@ try {
 
 async function validateMaterializer(
   path: string,
-  executionManifest: ReturnType<typeof createCoreExecutionManifest>,
+  executionManifest: ExecutionManifest,
   manifest: TrustedSnapshotManifest,
 ): Promise<void> {
   const materializer = await DeterministicMaterializer.open({ path, executionManifest })

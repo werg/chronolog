@@ -14,15 +14,7 @@ export function materializedLogDigest(rows: readonly TransactionLogRow[]): Promi
     [6n, row.canonicalCandidate],
     [7n, row.outcome],
     [8n, row.rejectionCode],
-    [9n, row.failingPreconditionId === null ? null : BigInt(row.failingPreconditionId)],
-    [10n, row.failingPreconditionIndex === null ? null : BigInt(row.failingPreconditionIndex)],
-    [11n, row.failingStatementIndex === null ? null : BigInt(row.failingStatementIndex)],
-    [12n, row.failurePhase],
-    [13n, row.failingConstraintIdentity],
-    [14n, row.failingTriggerIdentity],
-    [15n, row.resultEnvelopeVersion === null ? null : BigInt(row.resultEnvelopeVersion)],
-    [16n, row.resultEnvelope],
-    [17n, row.resultDigest],
+    [9n, row.failingStatementIndex === null ? null : BigInt(row.failingStatementIndex)],
   ])))
   return hashDomain(DOMAINS.materializedLog, encoded)
 }

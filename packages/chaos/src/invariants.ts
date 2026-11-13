@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 
-import { isChronologRpcError, type DecodedLocalSqlValue } from '@chronolog/client'
+import type { DecodedLocalSqlValue } from '@chronolog/client'
 
 import type { RunArtifacts } from './artifacts.js'
 import type { ChaosCluster } from './cluster.js'
@@ -23,7 +23,6 @@ export async function waitForConvergence(options: {
   readonly artifacts: RunArtifacts
   readonly timeoutMs: number
   readonly expectations: readonly WorkloadExpectation[]
-  readonly resultSampleSize: number
 }): Promise<ConvergenceResult> {
   const transactionIds = options.expectations.map((expectation) => expectation.transactionId)
   const deadline = Date.now() + options.timeoutMs
@@ -63,13 +62,12 @@ export async function waitForConvergence(options: {
 
   const snapshot = last[0]!
   const logRows = snapshot.logRows
-  const terminalOutcomes = logRows.every((row) => row[4] === 'accepted' || (typeof row[4] === 'string' && row[4].startsWith('rejected_')))
+  const terminalOutcomes = logRows.every((row) => row[4] === 'accepted' || row[4] === 'rejected')
   const ledger = checkLedgerConsistency(snapshot.stateRows)
-  const envelopes = checkResultEnvelopeMetadata(logRows)
+  const logShape = checkLogRowShape(logRows)
   const outcomes = checkExpectedOutcomes(options.expectations, logRows)
   const rollback = checkRollbackSentinels(snapshot.stateRows)
   const migrations = checkMigrationConsistency(snapshot.stateRows, snapshot.schemaRows, options.expectations, logRows)
-  const resultRetrieval = await checkTransactionResults(options.cluster, options.expectations, logRows, options.resultSampleSize)
   const invariants: InvariantResult[] = [
     { name: 'application_state_converged', passed: same(last.map((value) => value.stateDigest)) },
     { name: 'application_schema_converged', passed: same(last.map((value) => value.schemaDigest)) },
@@ -82,11 +80,10 @@ export async function waitForConvergence(options: {
     },
     { name: 'all_outcomes_terminal', passed: terminalOutcomes },
     { name: 'ledger_matches_account_balances_and_versions', ...ledger },
-    { name: 'result_envelope_metadata_is_well_formed', ...envelopes },
+    { name: 'transaction_log_rows_are_well_formed', ...logShape },
     { name: 'workload_outcomes_match_intent', ...outcomes },
     { name: 'rejected_transactions_rolled_back', ...rollback },
     { name: 'migrations_and_mixed_schema_clients_are_consistent', ...migrations },
-    { name: 'sampled_transaction_results_match_outcomes', ...resultRetrieval },
     { name: 'workload_made_progress', passed: transactionIds.length > 0, ...(transactionIds.length > 0 ? {} : { details: 'No transaction was published' }) },
   ]
   for (const invariant of invariants) {
@@ -162,20 +159,13 @@ export function checkLedgerConsistency(stateRows: readonly (readonly unknown[])[
     : { passed: false, details: mismatches.slice(0, 8).join('; ') }
 }
 
-function checkResultEnvelopeMetadata(logRows: readonly (readonly unknown[])[]): Pick<InvariantResult, 'passed' | 'details'> {
+function checkLogRowShape(logRows: readonly (readonly unknown[])[]): Pick<InvariantResult, 'passed' | 'details'> {
   const malformed = logRows.filter((row) => row[4] === 'accepted'
-    ? row[5] !== null || row[6] === null || row[7] !== '1' || typeof row[8] !== 'string' || BigInt(row[8]) <= 0n || row.slice(9).some((value) => value !== null)
-    : row[6] !== null || row[7] !== null || row[8] !== null || row[5] === null || !validFailureAttribution(row))
+    ? row[5] !== null || row[6] !== null
+    : row[4] !== 'rejected' || typeof row[5] !== 'string')
   return malformed.length === 0
     ? { passed: true, details: `${logRows.length} terminal rows checked` }
     : { passed: false, details: `${malformed.length} malformed rows; first tx=${bytesText(malformed[0]?.[0])}` }
-}
-
-function validFailureAttribution(row: readonly unknown[]): boolean {
-  if (row[9] === 'precondition') return row[10] !== null && row[11] !== null && row[12] === null && row[13] === null && row[14] === null
-  if (row[9] === 'statement') return row[10] === null && row[11] === null && row[12] !== null
-  if (row[9] === 'finalize') return row[10] === null && row[11] === null && row[12] === null
-  return false
 }
 
 function checkExpectedOutcomes(expectations: readonly WorkloadExpectation[], logRows: readonly (readonly unknown[])[]): Pick<InvariantResult, 'passed' | 'details'> {
@@ -189,10 +179,10 @@ function checkExpectedOutcomes(expectations: readonly WorkloadExpectation[], log
     const outcome = String(row[4])
     if (!expectation.allowedOutcomes.includes(outcome as WorkloadExpectation['allowedOutcomes'][number])) {
       mismatches.push(`${expectation.operation}:${outcome}`)
-    } else if (expectation.rejectionCode !== undefined && row[5] !== expectation.rejectionCode) {
+    } else if (outcome === 'rejected' && expectation.rejectionCode !== undefined && row[5] !== expectation.rejectionCode) {
       mismatches.push(`${expectation.operation}:${outcome}/${String(row[5])}`)
-    } else if (expectation.failingStatementIndex !== undefined && row[12] !== String(expectation.failingStatementIndex)) {
-      mismatches.push(`${expectation.operation}:${outcome}/statement-${String(row[12])}`)
+    } else if (outcome === 'rejected' && expectation.failingStatementIndex !== undefined && row[6] !== String(expectation.failingStatementIndex)) {
+      mismatches.push(`${expectation.operation}:${outcome}/statement-${String(row[6])}`)
     }
   }
   return mismatches.length === 0
@@ -271,108 +261,6 @@ export function checkMigrationConsistency(
   return failures.length === 0
     ? { passed: true, details: checked }
     : { passed: false, details: `${checked}; ${failures.slice(0, 10).join('; ')}` }
-}
-
-async function checkTransactionResults(
-  cluster: ChaosCluster,
-  expectations: readonly WorkloadExpectation[],
-  logRows: readonly (readonly unknown[])[],
-  sampleSize: number,
-): Promise<Pick<InvariantResult, 'passed' | 'details'>> {
-  const logById = new Map(logRows.map((row) => [bytesText(row[0]), row]))
-  const admitted = expectations.filter((expectation) => logById.has(transactionKey(expectation.transactionId)))
-  const accepted = admitted.filter((expectation) => logById.get(transactionKey(expectation.transactionId))?.[4] === 'accepted')
-  const rejected = admitted.filter((expectation) => logById.get(transactionKey(expectation.transactionId))?.[4] !== 'accepted')
-  const sample = stratifiedSample(accepted, rejected, sampleSize)
-  const failures: string[] = []
-  const client = cluster.clients()[0]?.client
-  if (client === undefined) return { passed: false, details: 'No client available for result retrieval' }
-  await mapConcurrent(sample, 8, async (expectation) => {
-    const row = logById.get(transactionKey(expectation.transactionId))!
-    const outcome = row[4]
-    try {
-      const result = await client.getTransactionResult(expectation.transactionId)
-      if (outcome !== 'accepted') failures.push(`${expectation.operation}:rejected result was retrievable`)
-      else {
-        const shapeError = validateAcceptedEnvelope(expectation, result.envelope)
-        if (result.envelope.version !== 1 || result.digest.length === 0) failures.push(`${expectation.operation}:invalid accepted envelope`)
-        else if (result.digest !== bytesText(row[6])) failures.push(`${expectation.operation}:RPC/protected-log digest mismatch`)
-        else if (shapeError !== undefined) failures.push(`${expectation.operation}:${shapeError}`)
-      }
-    } catch (error) {
-      if (outcome === 'accepted' || !isChronologRpcError(error) || error.code !== 'result_not_available') {
-        failures.push(`${expectation.operation}:${error instanceof Error ? error.message : String(error)}`)
-      }
-    }
-  })
-  return failures.length === 0
-    ? { passed: true, details: `${sample.length} results checked (${sample.filter((value) => accepted.includes(value)).length} accepted)` }
-    : { passed: false, details: `${failures.length} retrieval failures: ${failures.slice(0, 8).join('; ')}` }
-}
-
-function stratifiedSample<T extends WorkloadExpectation>(accepted: readonly T[], rejected: readonly T[], limit: number): T[] {
-  const result: T[] = []
-  const remaining = new Set([...accepted, ...rejected])
-  for (const candidate of [...accepted, ...rejected]) {
-    if (result.some((value) => value.operation === candidate.operation)) continue
-    result.push(candidate)
-    remaining.delete(candidate)
-    if (result.length === limit) return result
-  }
-  const acceptedRemaining = accepted.filter((value) => remaining.has(value))
-  const rejectedRemaining = rejected.filter((value) => remaining.has(value))
-  for (let index = 0; result.length < limit && index < Math.max(acceptedRemaining.length, rejectedRemaining.length); index += 1) {
-    if (acceptedRemaining[index] !== undefined) result.push(acceptedRemaining[index]!)
-    if (result.length < limit && rejectedRemaining[index] !== undefined) result.push(rejectedRemaining[index]!)
-  }
-  return result
-}
-
-function validateAcceptedEnvelope(
-  expectation: WorkloadExpectation,
-  envelope: Awaited<ReturnType<ReturnType<ChaosCluster['client']>['getTransactionResult']>>['envelope'],
-): string | undefined {
-  const expected = expectedEnvelopeShape(expectation.operation)
-  if (envelope.preconditions.length !== expected.preconditions) return `expected ${expected.preconditions} preconditions, received ${envelope.preconditions.length}`
-  if (envelope.statements.length !== expected.classes.length) return `expected ${expected.classes.length} statements, received ${envelope.statements.length}`
-  for (let index = 0; index < expected.classes.length; index += 1) {
-    const statement = envelope.statements[index]!
-    if (statement.index !== index || statement.statementClass !== expected.classes[index]) return `statement ${index} class/index mismatch`
-    const resultMode = statement.result === null ? null : statement.result.mode
-    if (resultMode !== expected.modes[index]) return `statement ${index} result mode ${resultMode ?? 'null'} != ${expected.modes[index] ?? 'null'}`
-  }
-  if (expectation.operation === 'empty_returning' && envelope.statements[0]?.result?.rows.length !== 0) return 'empty RETURNING produced rows'
-  if (expectation.operation === 'document_insert' && envelope.statements[0]?.result?.rows.length !== 1) return 'document RETURNING did not produce one row'
-  if (expectation.operation === 'balance_update' && envelope.statements.some((statement) => statement.result?.rows.length !== 1)) return 'balance statement did not return one row'
-  if (expectation.operation === 'transfer' && envelope.statements.some((statement) => statement.result?.rows.length !== 1)) return 'transfer statement did not return one row'
-  if (expectation.operation === 'ddl_sequence' && envelope.statements[2]?.result?.rows.length !== 3) return 'DDL table_info did not return three columns'
-  if (expectation.operation === 'migration_chain') {
-    if (envelope.statements[8]?.result?.rows.length !== 2) return 'migration backfill did not return two rows'
-    if (envelope.statements[18]?.result?.rows.length !== 3) return 'migrated table query did not return three rows'
-    if (envelope.statements[19]?.result?.rows.length !== 1) return 'replacement trigger did not write one audit row'
-  }
-  return undefined
-}
-
-function expectedEnvelopeShape(operation: WorkloadExpectation['operation']): {
-  readonly preconditions: number
-  readonly classes: readonly ('read' | 'insert' | 'update' | 'schema')[]
-  readonly modes: readonly ('ordered' | 'multiset' | null)[]
-} {
-  switch (operation) {
-    case 'migration_chain': return {
-      preconditions: 1,
-      classes: ['schema', 'insert', 'insert', 'schema', 'schema', 'schema', 'schema', 'schema', 'update', 'schema', 'schema', 'schema', 'schema', 'schema', 'schema', 'schema', 'insert', 'insert', 'read', 'read'],
-      modes: [null, 'multiset', null, null, null, null, null, null, 'multiset', null, null, null, null, null, null, null, null, 'multiset', 'ordered', 'ordered'],
-    }
-    case 'legacy_client_write': case 'current_client_write': return { preconditions: 1, classes: ['insert'], modes: ['multiset'] }
-    case 'balance_update': return { preconditions: 1, classes: ['update', 'insert'], modes: ['multiset', 'multiset'] }
-    case 'transfer': return { preconditions: 2, classes: ['update', 'update', 'insert', 'insert'], modes: ['multiset', 'multiset', 'multiset', 'multiset'] }
-    case 'ordered_touch': case 'empty_returning': return { preconditions: 1, classes: ['update'], modes: ['multiset'] }
-    case 'document_insert': return { preconditions: 1, classes: ['insert'], modes: ['multiset'] }
-    case 'ddl_sequence': return { preconditions: 1, classes: ['schema', 'schema', 'read'], modes: [null, null, 'ordered'] }
-    case 'migration_rollback': case 'precondition_rejection': case 'constraint_rejection': throw new Error(`Rejected operation unexpectedly accepted: ${operation}`)
-  }
 }
 
 function transactionKey(transactionId: string): string { return Buffer.from(transactionId).toString('base64url') }

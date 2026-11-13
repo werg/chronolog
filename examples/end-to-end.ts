@@ -3,14 +3,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { ChronologClient } from '@chronolog/client'
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
 import {
   DeterministicMaterializer,
   createDoltLiteMaterializationRuntime,
   readNativeEngineInfo,
 } from '@chronolog/materializer-doltlite'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
-import { equalBytes, generateEd25519KeyPair, type SqlTransactionProgram } from '@chronolog/protocol'
+import {
+  createExecutionManifest,
+  equalBytes,
+  generateEd25519KeyPair,
+  sqlStatement,
+  type SqlTransactionProgram,
+} from '@chronolog/protocol'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 
@@ -21,7 +26,7 @@ const groupId = bytes32(1)
 const membershipRevision = bytes32(2)
 const validationPolicy = bytes32(3)
 const native = readNativeEngineInfo()
-const executionManifest = createCoreExecutionManifest({
+const executionManifest = createExecutionManifest({
   profile: 'chronolog-core-portable',
   engine: native.descriptor,
   engineDigest: native.digest,
@@ -53,7 +58,6 @@ try {
   const client = new ChronologClient({
     groupId: Buffer.from(groupId).toString('base64url'),
     transport: new InProcessRpcTransport(new NodeRpcService({ node })),
-    bindings: { executionManifestDigest: Buffer.from(materializer.executionManifestDigest).toString('base64url') },
   })
   try {
     const bootstrap = await node.publish({ authorTimestampMs: 1n, program: bootstrapProgram() })
@@ -68,7 +72,7 @@ try {
 
     const predecessor = await node.publish({ authorTimestampMs: 10n, program: updateProgram(100n, 5n) })
     await eventually(() => node.outcome(predecessor.txId)?.outcome === 'accepted')
-    await eventually(() => node.outcome(later.txId)?.outcome === 'rejected_precondition')
+    await eventually(() => node.outcome(later.txId)?.rejectionCode === 'assert:balance_changed')
 
     console.log('replayed balance', (await client.query('SELECT balance FROM accounts WHERE id = ?', [1n])).result.rows)
     console.log('later outcome', node.outcome(later.txId))
@@ -84,40 +88,22 @@ try {
 function bootstrapProgram(): SqlTransactionProgram {
   return {
     version: 1,
-    preconditions: [{
-      id: 1,
-      query: { sql: 'SELECT 1', bindings: [] },
-      resultMode: 'scalar',
-      expectation: { kind: 'assert_true' },
-    }],
-    body: [
-      { sql: 'CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT', bindings: [] },
-      { sql: 'INSERT INTO accounts (id, balance) VALUES (?, ?)', bindings: [indexed(1, 1n), indexed(2, 100n)] },
+    statements: [
+      sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
+      sqlStatement('INSERT INTO accounts (id, balance) VALUES (?, ?)', [1n, 100n]),
     ],
   }
 }
 
+/** Sets the balance only if it still equals `expected` at the transaction's position. */
 function updateProgram(expected: bigint, next: bigint): SqlTransactionProgram {
   return {
     version: 1,
-    preconditions: [{
-      id: 1,
-      query: {
-        sql: 'SELECT balance = ? FROM accounts WHERE id = ?',
-        bindings: [indexed(1, expected), indexed(2, 1n)],
-      },
-      resultMode: 'scalar',
-      expectation: { kind: 'assert_true' },
-    }],
-    body: [{
-      sql: 'UPDATE accounts SET balance = ? WHERE id = ?',
-      bindings: [indexed(1, next), indexed(2, 1n)],
-    }],
+    statements: [
+      sqlStatement("SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = ?) = ?, 'balance_changed')", [1n, expected]),
+      sqlStatement('UPDATE accounts SET balance = ? WHERE id = ?', [next, 1n]),
+    ],
   }
-}
-
-function indexed(index: number, value: bigint) {
-  return { parameter: { kind: 'index' as const, index }, value: { kind: 'int64' as const, value } }
 }
 
 async function eventually(predicate: () => boolean | Promise<boolean>): Promise<void> {

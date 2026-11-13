@@ -22,7 +22,7 @@ import {
   decodeExecutionManifest,
   encodeExecutionManifest,
   type ExecutionManifest,
-} from '@chronolog/ir'
+} from '@chronolog/protocol'
 import {
   decodeTransactionCore,
   encodeTransactionCore,
@@ -516,8 +516,6 @@ export function encodeDifferentialObservation(value: DifferentialObservation): U
     [2, requireDigest(value.orderDigest, 'orderDigest')], [3, contentIdToCbor(value.stateDigest)],
     [4, requireDigest(value.protectedLogDigest, 'protectedLogDigest')],
     [5, requireDigest(value.outcomeSetDigest, 'outcomeSetDigest')],
-    [6, requireDigest(value.queryResultDigest, 'queryResultDigest')],
-    [7, requireDigest(value.rejectionAttributionDigest, 'rejectionAttributionDigest')],
   ]))
 }
 
@@ -526,7 +524,7 @@ export function decodeDifferentialObservation(
   limits: DecodeLimits = MATERIALIZER_DECODE_LIMITS,
 ): DifferentialObservation {
   const map = root(bytes, 'differential_observation', limits)
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7], 'differential_observation')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5], 'differential_observation')
   canonicalInvariant(expectBigint(required(map, 0, 'differential_observation.version'), 'differential_observation.version') === 1n, 'SCHEMA_INVALID', 'Unsupported differential observation version')
   return {
     version: 1,
@@ -535,8 +533,6 @@ export function decodeDifferentialObservation(
     stateDigest: contentIdFromCbor(required(map, 3, 'differential_observation.state_digest'), 'differential_observation.state_digest'),
     protectedLogDigest: expectBytes(required(map, 4, 'differential_observation.protected_log_digest'), 'differential_observation.protected_log_digest', 32),
     outcomeSetDigest: expectBytes(required(map, 5, 'differential_observation.outcome_set_digest'), 'differential_observation.outcome_set_digest', 32),
-    queryResultDigest: expectBytes(required(map, 6, 'differential_observation.query_result_digest'), 'differential_observation.query_result_digest', 32),
-    rejectionAttributionDigest: expectBytes(required(map, 7, 'differential_observation.rejection_attribution_digest'), 'differential_observation.rejection_attribution_digest', 32),
   }
 }
 

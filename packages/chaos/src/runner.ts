@@ -75,7 +75,6 @@ export async function runChaos(options: RunOptions): Promise<CompletedRun> {
       artifacts,
       timeoutMs: options.scenario.convergenceTimeoutMs,
       expectations: workload.expectations,
-      resultSampleSize: options.scenario.workload.resultSampleSize ?? 64,
     })
     snapshots = convergence.snapshots
     invariants = convergence.invariants

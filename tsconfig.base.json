@@ -17,10 +17,7 @@
     "baseUrl": ".",
     "paths": {
       "@chronolog/canonical": ["packages/canonical/src/index.ts"],
-      "@chronolog/ir": ["packages/ir/src/index.ts"],
-      "@chronolog/kernels": ["packages/kernels/src/index.ts"],
       "@chronolog/protocol": ["packages/protocol/src/index.ts"],
-      "@chronolog/compiler-sqlite": ["packages/compiler-sqlite/src/index.ts"],
       "@chronolog/capabilities": ["packages/capabilities/src/index.ts"],
       "@chronolog/crypto": ["packages/crypto/src/index.ts"],
       "@chronolog/control-store": ["packages/control-store/src/index.ts"],

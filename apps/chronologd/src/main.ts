@@ -1,6 +1,6 @@
 import { join, resolve } from 'node:path'
 
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
+import { createExecutionManifest } from '@chronolog/protocol'
 import { isCapabilityActive } from '@chronolog/capabilities'
 import { ControlStore, JsonFileControlStorePersistence } from '@chronolog/control-store'
 import {
@@ -45,7 +45,7 @@ const configuredValidatorCapability = fromBase64(config.validatorCapability)
 
 const configuredPeers: readonly SsbPeer[] = runtime.peers
 const nativeEngine = readNativeEngineInfo()
-const executionManifest = createCoreExecutionManifest({
+const executionManifest = createExecutionManifest({
   profile: 'chronolog-core-portable',
   engineDigest: nativeEngine.digest,
 })

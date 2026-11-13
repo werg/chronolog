@@ -13,7 +13,7 @@ const smoke: ChaosScenario = {
   convergenceTimeoutMs: 45_000,
   checkpointEvery: 5,
   cutoffLagMs: 8_000,
-  workload: { workers: 3, intervalMs: 80, accounts: 8, minimumDelta: -3, maximumDelta: 5, maximumTransfer: 8, resultSampleSize: 32 },
+  workload: { workers: 3, intervalMs: 80, accounts: 8, minimumDelta: -3, maximumDelta: 5, maximumTransfer: 8 },
   faults: [
     { atMs: 1_000, durationMs: 1_200, kind: 'latency', links: 'all', latencyMs: 120, jitterMs: 40 },
     { atMs: 2_700, durationMs: 1_800, kind: 'partition', groups: [['node-0', 'node-1'], ['node-2']] },
@@ -31,7 +31,7 @@ const crash: ChaosScenario = {
   convergenceTimeoutMs: 60_000,
   checkpointEvery: 5,
   cutoffLagMs: 12_000,
-  workload: { workers: 4, intervalMs: 60, accounts: 8, minimumDelta: -3, maximumDelta: 5, maximumTransfer: 8, resultSampleSize: 64 },
+  workload: { workers: 4, intervalMs: 60, accounts: 8, minimumDelta: -3, maximumDelta: 5, maximumTransfer: 8 },
   faults: [
     { atMs: 3_000, durationMs: 3_000, kind: 'crash', node: 'node-2' },
   ],
@@ -47,7 +47,7 @@ const stress: ChaosScenario = {
   convergenceTimeoutMs: 90_000,
   checkpointEvery: 10,
   cutoffLagMs: 15_000,
-  workload: { workers: 12, intervalMs: 25, accounts: 32, minimumDelta: -10, maximumDelta: 15, maximumTransfer: 25, resultSampleSize: 128 },
+  workload: { workers: 12, intervalMs: 25, accounts: 32, minimumDelta: -10, maximumDelta: 15, maximumTransfer: 25 },
   faults: [
     { atMs: 3_000, durationMs: 4_000, kind: 'latency', links: 'all', latencyMs: 250, jitterMs: 150 },
     { atMs: 9_000, durationMs: 5_000, kind: 'partition', groups: [['node-0', 'node-1', 'node-2'], ['node-3', 'node-4']] },
@@ -86,7 +86,6 @@ export function validateScenario(value: unknown): ChaosScenario {
   integerBetween(scenario.workload.minimumDelta, -1_000_000, 1_000_000, 'workload.minimumDelta')
   integerBetween(scenario.workload.maximumDelta, scenario.workload.minimumDelta, 1_000_000, 'workload.maximumDelta')
   if (scenario.workload.maximumTransfer !== undefined) integerBetween(scenario.workload.maximumTransfer, 1, 1_000_000, 'workload.maximumTransfer')
-  if (scenario.workload.resultSampleSize !== undefined) integerBetween(scenario.workload.resultSampleSize, 0, 10_000, 'workload.resultSampleSize')
   if (scenario.workload.operationWeights !== undefined) {
     if (!isRecord(scenario.workload.operationWeights)) throw new Error('CHAOS_WORKLOAD_WEIGHTS_INVALID')
     const unknown = Object.keys(scenario.workload.operationWeights).filter(

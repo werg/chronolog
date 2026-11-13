@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState, useSyncExternalStore, type DependencyList } from 'react'
 import {
   ChronologRpcError,
-  ClientManifestMismatchError,
   type ChronologClient,
   type LocalSqlInput,
   type LiveQueryValue,
@@ -11,7 +10,7 @@ import {
   type SettlementEvidence,
   type StreamResource,
   type StreamSnapshot,
-  type TransactionDraft,
+  type TransactionStatementInput,
   type TransactionHandle,
   type TransactionOptions,
   type TransactionOutcome,
@@ -65,7 +64,6 @@ export type ChronologQueryState =
   | { readonly status: 'reset'; readonly value: LiveQueryValue; readonly reason: string }
   | { readonly status: 'transport_error'; readonly error: unknown; readonly previous?: LiveQueryValue; readonly retrying: boolean }
   | { readonly status: 'query_error'; readonly error: unknown; readonly previous?: LiveQueryValue }
-  | { readonly status: 'manifest_mismatch'; readonly error: ClientManifestMismatchError; readonly previous?: LiveQueryValue }
   | { readonly status: 'disabled' }
 
 export interface UseChronologQueryOptions extends Omit<QueryOptions, 'atRevision' | 'signal'> {
@@ -97,13 +95,6 @@ export function useChronologQuery(
       : { status: 'value', value: snapshot.value }
   }
   if (snapshot.status === 'error') {
-    if (snapshot.error instanceof ClientManifestMismatchError) {
-      return {
-        status: 'manifest_mismatch',
-        error: snapshot.error,
-        ...(snapshot.value === undefined ? {} : { previous: snapshot.value }),
-      }
-    }
     if (isTransportError(snapshot.error)) {
       return {
         status: 'transport_error',
@@ -189,7 +180,7 @@ export type TransactionMutationState =
 export interface TransactionMutation {
   readonly state: TransactionMutationState
   readonly run: (
-    build: (draft: TransactionDraft) => void | Promise<void>,
+    statements: readonly TransactionStatementInput[],
     options?: TransactionOptions,
   ) => Promise<TransactionHandle>
   readonly reset: () => void
@@ -199,12 +190,12 @@ export function useChronologTransaction(clientOverride?: ChronologClient): Trans
   const client = useChronologClient(clientOverride)
   const [state, setState] = useState<TransactionMutationState>({ status: 'idle' })
   const run = useCallback(async (
-    build: (draft: TransactionDraft) => void | Promise<void>,
+    statements: readonly TransactionStatementInput[],
     options: TransactionOptions = {},
   ) => {
     setState({ status: 'publishing' })
     try {
-      const handle = await client.transaction(build, options)
+      const handle = await client.transaction(statements, options)
       setState({ status: 'published', handle })
       return handle
     } catch (error) {

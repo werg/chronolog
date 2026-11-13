@@ -4,17 +4,18 @@
 // needed. The plan is plain JSON so the operator can inspect it before seeding.
 import { createHash } from 'node:crypto'
 
-import { isReservedSchemaObjectName } from '@chronolog/ir'
+import { isReservedSchemaObjectName } from '@chronolog/materializer-doltlite'
 
 /** Marker table written by every seed batch; makes seeding idempotent. */
 export const FORK_SEED_TABLE = 'fork_seed'
 
+/** A JSON-safe SQLite value: INTEGER as decimal text, BLOB as base64url. */
 export type SeedValue =
-  | null
-  | string
-  | { readonly $int64: string }
-  | { readonly $real: string }
-  | { readonly $blob: string }
+  | { readonly kind: 'null' }
+  | { readonly kind: 'integer'; readonly value: string }
+  | { readonly kind: 'real'; readonly value: number }
+  | { readonly kind: 'text'; readonly value: string }
+  | { readonly kind: 'blob'; readonly value: string }
 
 export interface SeedStatement {
   readonly sql: string
@@ -24,13 +25,18 @@ export interface SeedStatement {
 export interface SeedBatch {
   readonly batch: number
   readonly label: string
-  /** Assertion that is true only while this batch has not been applied. */
-  readonly precondition: string
+  /**
+   * Ordinary transaction statements. The first asserts the batch has not been
+   * applied (rejection code `assert:fork_seed_applied`); the last records it.
+   */
   readonly statements: readonly SeedStatement[]
 }
 
+export const FORK_SEED_APPLIED_CODE = 'fork_seed_applied'
+
+
 export interface ForkSeedPlan {
-  readonly format: 'chronolog-fork-seed-v1'
+  readonly format: 'chronolog-fork-seed-v2'
   readonly sourceGroupId: string
   readonly snapshotManifestSha256: string
   readonly sourceRevision: string
@@ -60,8 +66,7 @@ interface TableShape {
   readonly foreignKeys: readonly { readonly table: string; readonly from: readonly string[]; readonly to: readonly string[] }[]
 }
 
-const MAX_ROWS_PER_BATCH = 500
-const MAX_PROGRAM_NODES_PER_BATCH = 8_000
+const MAX_ROWS_PER_BATCH = 250
 const MAX_BINDING_BYTES_PER_BATCH = 4 * 1024 * 1024
 
 export function buildForkSeedPlan(
@@ -73,16 +78,20 @@ export function buildForkSeedPlan(
   const batches: SeedBatch[] = []
   const marker = (batch: number, label: string): SeedStatement => ({
     sql: `INSERT INTO ${FORK_SEED_TABLE} (batch, label) VALUES (?, ?)`,
-    bindings: [{ $int64: String(batch) }, label],
+    bindings: [{ kind: 'integer', value: String(batch) }, { kind: 'text', value: label }],
   })
-  const notApplied = (batch: number): string =>
-    `SELECT NOT EXISTS (SELECT 1 FROM ${FORK_SEED_TABLE} WHERE batch = ${batch})`
+  const guard = (condition: string): SeedStatement => ({
+    sql: `SELECT chronolog_assert(${condition}, '${FORK_SEED_APPLIED_CODE}')`,
+    bindings: [],
+  })
+  const notApplied = (batch: number): SeedStatement =>
+    guard(`NOT EXISTS (SELECT 1 FROM ${FORK_SEED_TABLE} WHERE batch = ${batch})`)
 
   batches.push({
     batch: 1,
     label: 'schema: tables',
-    precondition: `SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '${FORK_SEED_TABLE}')`,
     statements: [
+      guard(`NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '${FORK_SEED_TABLE}')`),
       { sql: `CREATE TABLE ${FORK_SEED_TABLE} (batch INTEGER PRIMARY KEY, label TEXT NOT NULL) STRICT`, bindings: [] },
       ...objects.filter((object) => object.type === 'table').map((object) => ({ sql: object.sql, bindings: [] })),
       marker(1, 'schema: tables'),
@@ -91,28 +100,24 @@ export function buildForkSeedPlan(
 
   for (const table of insertionOrder(tables)) {
     let pending: SeedStatement[] = []
-    let nodes = 0
     let bytes = 0
     let part = 1
     const flush = (): void => {
       if (pending.length === 0) return
       const batch = batches.length + 1
       const label = `rows: ${table.name} #${part}`
-      batches.push({ batch, label, precondition: notApplied(batch), statements: [...pending, marker(batch, label)] })
+      batches.push({ batch, label, statements: [notApplied(batch), ...pending, marker(batch, label)] })
       pending = []
-      nodes = 0
       bytes = 0
       part += 1
     }
     const insert = `INSERT INTO ${quote(table.name)} (${table.columns.map(quote).join(', ')}) VALUES (${table.columns.map(() => '?').join(', ')})`
     for (const row of tableRows(source, table)) {
       const bindings = row.map(seedValue)
-      const rowNodes = table.columns.length + 2
       const rowBytes = bindings.reduce<number>((total, value) => total + seedValueBytes(value), 0)
-      if (pending.length >= MAX_ROWS_PER_BATCH || nodes + rowNodes > MAX_PROGRAM_NODES_PER_BATCH ||
-          (pending.length > 0 && bytes + rowBytes > MAX_BINDING_BYTES_PER_BATCH)) flush()
+      // Each batch is one transaction of at most 256 statements (guard + rows + marker).
+      if (pending.length >= MAX_ROWS_PER_BATCH || (pending.length > 0 && bytes + rowBytes > MAX_BINDING_BYTES_PER_BATCH)) flush()
       pending.push({ sql: insert, bindings })
-      nodes += rowNodes
       bytes += rowBytes
     }
     flush()
@@ -124,12 +129,11 @@ export function buildForkSeedPlan(
     batches.push({
       batch,
       label: 'schema: indexes, views, triggers',
-      precondition: notApplied(batch),
-      statements: [...rest.map((object) => ({ sql: object.sql, bindings: [] })), marker(batch, 'schema: indexes, views, triggers')],
+      statements: [notApplied(batch), ...rest.map((object) => ({ sql: object.sql, bindings: [] })), marker(batch, 'schema: indexes, views, triggers')],
     })
   }
   return {
-    format: 'chronolog-fork-seed-v1',
+    format: 'chronolog-fork-seed-v2',
     sourceGroupId: origin.sourceGroupId,
     snapshotManifestSha256: origin.snapshotManifestSha256,
     sourceRevision: origin.sourceRevision.toString(10),
@@ -246,23 +250,21 @@ function tableRows(database: ReadableDatabase, table: TableShape): unknown[][] {
 }
 
 function seedValue(value: unknown): SeedValue {
-  if (value === null) return null
-  if (typeof value === 'bigint') return { $int64: value.toString(10) }
+  if (value === null) return { kind: 'null' }
+  if (typeof value === 'bigint') return { kind: 'integer', value: value.toString(10) }
+  // Rows are read with BigInt integers, so a JS number is always a REAL.
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new Error('FORK_SEED_NONFINITE_REAL')
-    const bits = Buffer.alloc(8)
-    bits.writeDoubleBE(value)
-    return { $real: bits.toString('hex') }
+    return { kind: 'real', value }
   }
-  if (typeof value === 'string') return value
-  if (value instanceof Uint8Array) return { $blob: Buffer.from(value).toString('base64url') }
+  if (typeof value === 'string') return { kind: 'text', value }
+  if (value instanceof Uint8Array) return { kind: 'blob', value: Buffer.from(value).toString('base64url') }
   throw new Error('FORK_SEED_VALUE_UNSUPPORTED')
 }
 
 function seedValueBytes(value: SeedValue): number {
-  if (value === null) return 1
-  if (typeof value === 'string') return Buffer.byteLength(value)
-  if ('$blob' in value) return Math.ceil(value.$blob.length * 3 / 4)
+  if (value.kind === 'text') return Buffer.byteLength(value.value)
+  if (value.kind === 'blob') return Math.ceil(value.value.length * 3 / 4)
   return 8
 }
 

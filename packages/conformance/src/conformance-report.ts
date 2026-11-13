@@ -1,14 +1,10 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { arch, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import {
-  compileManifestArtifacts,
-  createCoreExecutionManifest,
-} from '@chronolog/compiler-sqlite'
 import {
   createDoltLiteMaterializationRuntime,
   DeterministicMaterializer,
@@ -16,15 +12,16 @@ import {
   type AdmittedTransaction,
 } from '@chronolog/materializer-doltlite'
 import {
+  createExecutionManifest,
   encodeTransactionCore,
+  executionManifestArtifacts,
+  sqlStatement,
   transactionDigest,
   utf8,
-  type SqlBinding,
-  type SqlTransactionProgram,
+  type ExecutionManifest,
+  type SqlStatement,
   type TransactionCore,
 } from '@chronolog/protocol'
-
-import { runSqliteDifferential } from './sqlite-differential.js'
 
 export interface ConformanceTestGroup {
   readonly id: string
@@ -34,8 +31,6 @@ export interface ConformanceTestGroup {
 
 export interface DeterministicConformanceEvidence {
   readonly executionManifestDigest: string
-  readonly fixtureCorpusDigest: string
-  readonly compatibilityLedgerDigest: string
   readonly enabledFeatures: readonly string[]
   readonly featureEvidence: Readonly<Record<string, readonly string[]>>
   readonly testGroups: readonly ConformanceTestGroup[]
@@ -61,31 +56,20 @@ interface ReportOptions {
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = resolve(moduleDirectory, '../../..')
-const corpusPath = resolve(moduleDirectory, '../fixtures/sqlite-differential.json')
-const ledgerPath = resolve(repositoryRoot, 'docs/sqlite-compatibility-ledger.json')
-
 export async function generateConformanceReport(options: ReportOptions = {}): Promise<ConformanceReport> {
-  const [corpus, ledger, sqlite] = await Promise.all([
-    readCanonicalJson(corpusPath),
-    readCanonicalJson(ledgerPath),
-    runSqliteDifferential(),
-  ])
-  if (!sqlite.passed) throw new Error('CONFORMANCE_SQLITE_DIFFERENTIAL_FAILED')
-
   const native = readNativeEngineInfo()
-  const manifest = createCoreExecutionManifest({
+  const manifest = createExecutionManifest({
     profile: 'chronolog-portable-core-conformance-v1',
     engine: native.descriptor,
     engineDigest: native.digest,
   })
-  const manifestArtifacts = await compileManifestArtifacts(manifest)
+  const manifestArtifacts = await executionManifestArtifacts(manifest)
   const replay = await runReplayFixture(manifest, 'reference')
   const productionReplay = await runReplayFixture(manifest, 'native-daemon')
   if (productionReplay.replayDigest !== replay.replayDigest) {
     throw new Error('CONFORMANCE_NATIVE_DAEMON_REPLAY_MISMATCH')
   }
   const testGroups: readonly ConformanceTestGroup[] = [
-    { id: 'sqlite-ledger-v1', passed: true, evidenceDigest: digestJson(sqlite) },
     { id: 'native-replay-v1', passed: true, evidenceDigest: replay.evidenceDigest },
     {
       id: 'native-daemon-production-v1',
@@ -96,28 +80,13 @@ export async function generateConformanceReport(options: ReportOptions = {}): Pr
       }),
     },
   ]
-  const enabledFeatures = [
-    'sql-core-v1',
-    'sql-ordered-mutations-v1',
-    'sql-transaction-results-v1',
-    'sql-json1-arrows-v1',
-    'sql-trigger-raise-v1',
-    'deployment-native-daemon-v1',
-  ] as const
-  const featureEvidence = Object.fromEntries(enabledFeatures.map((feature) => [
-    feature,
-    feature === 'deployment-native-daemon-v1'
-      ? ['native-daemon-production-v1']
-      : feature === 'sql-core-v1'
-        ? ['sqlite-ledger-v1', 'native-replay-v1', 'native-daemon-production-v1']
-      : feature === 'sql-json1-arrows-v1' || feature === 'sql-trigger-raise-v1'
-        ? ['sqlite-ledger-v1']
-        : ['native-replay-v1'],
-  ]))
+  const enabledFeatures = ['sql-core-v2', 'deployment-native-daemon-v1'] as const
+  const featureEvidence = {
+    'sql-core-v2': ['native-replay-v1', 'native-daemon-production-v1'],
+    'deployment-native-daemon-v1': ['native-daemon-production-v1'],
+  }
   const deterministicWithoutDigest = {
     executionManifestDigest: hex(manifestArtifacts.executionManifestDigest),
-    fixtureCorpusDigest: digestJson(corpus),
-    compatibilityLedgerDigest: digestJson(ledger),
     enabledFeatures,
     featureEvidence,
     testGroups,
@@ -149,8 +118,6 @@ export function assertConformanceReport(value: unknown): asserts value is Confor
   if (typeof deterministic !== 'object' || deterministic === null) throw new Error('CONFORMANCE_REPORT_EVIDENCE_INVALID')
   for (const digest of [
     deterministic.executionManifestDigest,
-    deterministic.fixtureCorpusDigest,
-    deterministic.compatibilityLedgerDigest,
     deterministic.replayDigest,
     deterministic.portableSemanticDigest,
   ]) if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error('CONFORMANCE_REPORT_DIGEST_INVALID')
@@ -188,7 +155,7 @@ export function assertConformanceReport(value: unknown): asserts value is Confor
 }
 
 async function runReplayFixture(
-  manifest: ReturnType<typeof createCoreExecutionManifest>,
+  manifest: ExecutionManifest,
   pathKind: 'reference' | 'native-daemon',
 ): Promise<{
   readonly evidenceDigest: string
@@ -203,36 +170,31 @@ async function runReplayFixture(
       : null
     try {
       const digest = materializer.executionManifestDigest
-      const bootstrap = await transaction(1n, 'bootstrap', {
-        version: 1,
-        preconditions: [truePrecondition()],
-        body: [
-          statement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
-          statement('INSERT INTO accounts VALUES (1, 100), (2, 200)'),
-        ],
-      }, digest)
+      const bootstrap = await transaction(1n, 'bootstrap', [
+        sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
+        sqlStatement('INSERT INTO accounts VALUES (1, 100), (2, 200)'),
+        sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY, now TEXT NOT NULL, r INTEGER NOT NULL)'),
+      ], digest)
       const predecessor = await transaction(10n, 'predecessor', updateProgram(100n, 5n), digest)
       const later = await transaction(20n, 'later', updateProgram(100n, 90n), digest)
-      const ordered = await transaction(30n, 'ordered', {
-        version: 1,
-        preconditions: [truePrecondition()],
-        body: [statement('UPDATE accounts SET balance = balance + 1 RETURNING id, balance ORDER BY id DESC LIMIT 1')],
-      }, digest)
+      const probe = await transaction(30n, 'probe', [
+        sqlStatement('UPDATE accounts SET balance = balance + 1 RETURNING id, balance'),
+        sqlStatement("INSERT INTO probes VALUES ('probe', datetime('now'), random())"),
+      ], digest)
       await applyConformanceOrder(materializer, runtime, [bootstrap, later])
-      await applyConformanceOrder(materializer, runtime, [bootstrap, predecessor, later, ordered])
-      const state = materializer.localSql('SELECT id, balance FROM accounts ORDER BY id')
+      await applyConformanceOrder(materializer, runtime, [bootstrap, predecessor, later, probe])
       const evidence = {
-        state: state.rows,
-        outcomes: [bootstrap, predecessor, later, ordered].map((candidate) => {
+        state: materializer.localSql('SELECT id, balance FROM accounts ORDER BY id').rows,
+        probes: materializer.localSql('SELECT tx, now, r FROM probes ORDER BY tx').rows,
+        outcomes: [bootstrap, predecessor, later, probe].map((candidate) => {
           const outcome = materializer.outcome(candidate.txId)
           return {
             id: new TextDecoder().decode(candidate.txId),
             outcome: outcome?.outcome ?? null,
             rejectionCode: outcome?.rejectionCode ?? null,
-            resultDigest: outcome?.resultDigest === null || outcome?.resultDigest === undefined ? null : hex(outcome.resultDigest),
+            failingStatementIndex: outcome?.failingStatementIndex ?? null,
           }
         }),
-        orderedResult: materializer.transactionResult(ordered.txId),
       }
       const replayDigest = digestJson(evidence)
       return { evidenceDigest: replayDigest, replayDigest }
@@ -262,31 +224,17 @@ async function applyConformanceOrder(
   }
 }
 
-function updateProgram(expected: bigint, next: bigint): SqlTransactionProgram {
-  return {
-    version: 1,
-    preconditions: [{
-      id: 1,
-      query: statement('SELECT balance = ? FROM accounts WHERE id = 1', [integer(1, expected)]),
-      resultMode: 'scalar',
-      expectation: { kind: 'assert_true' },
-    }],
-    body: [statement('UPDATE accounts SET balance = ? WHERE id = 1', [integer(1, next)])],
-  }
-}
-
-function truePrecondition() {
-  return { id: 1, query: statement('SELECT 1'), resultMode: 'scalar' as const, expectation: { kind: 'assert_true' as const } }
-}
-function statement(sql: string, bindings: readonly SqlBinding[] = []) { return { sql, bindings } }
-function integer(index: number, value: bigint): SqlBinding {
-  return { parameter: { kind: 'index', index }, value: { kind: 'int64', value } }
+function updateProgram(expected: bigint, next: bigint): SqlStatement[] {
+  return [
+    sqlStatement("SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = 1) = ?, 'balance_changed')", [expected]),
+    sqlStatement('UPDATE accounts SET balance = ? WHERE id = 1', [next]),
+  ]
 }
 
 async function transaction(
   timestamp: bigint,
   id: string,
-  program: SqlTransactionProgram,
+  statements: readonly SqlStatement[],
   executionManifestDigest: Uint8Array,
 ): Promise<AdmittedTransaction> {
   const core: TransactionCore = {
@@ -297,7 +245,7 @@ async function transaction(
     authorTimestampMs: timestamp,
     nonce: bytes32(Number(timestamp) + 10),
     executionManifestDigest,
-    program,
+    program: { version: 1, statements },
   }
   const canonicalCandidate = encodeTransactionCore(core)
   return {
@@ -311,10 +259,6 @@ async function transaction(
 
 function bytes32(seed: number): Uint8Array {
   return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff)
-}
-
-async function readCanonicalJson(path: string): Promise<unknown> {
-  return JSON.parse(await readFile(path, 'utf8')) as unknown
 }
 
 function digestJson(value: unknown): string {

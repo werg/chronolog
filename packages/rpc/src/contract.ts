@@ -1,17 +1,8 @@
 import type {
-  AddPreconditionRequest,
-  AddStatementsRequest,
-  BeginDraftRequest,
-  BeginDraftResponse,
-  CancelDraftRequest,
-  CancelDraftResponse,
-  DraftMutationResponse,
   GetOutcomeRequest,
   GetReplicationStatusRequest,
   GetSettlementEvidenceRequest,
   GetStatusRequest,
-  GetTransactionResultRequest,
-  GetTransactionResultResponse,
   GetGovernanceStatusRequest,
   GetValidatorWatermarkRequest,
   LiveSqlEvent,
@@ -19,13 +10,8 @@ import type {
   LocalSqlRequest,
   LocalSqlResponse,
   NodeStatus,
-  ObserveSqlRequest,
-  ObserveSqlResponse,
-  PublishDraftRequest,
-  PublishDraftResponse,
-  RebaseDraftRequest,
-  RebaseDraftResponse,
-  ReplaceStatementsRequest,
+  SubmitTransactionRequest,
+  SubmitTransactionResponse,
   ReplicationStatus,
   SettlementEvidence,
   StreamOutcomeRequest,
@@ -33,8 +19,6 @@ import type {
   StreamSettlementEvidenceRequest,
   StreamStatusRequest,
   TransactionOutcome,
-  ValidateDraftRequest,
-  ValidateDraftResponse,
   ValidatorWatermark,
   GovernanceStatus,
   GrantCapabilityRequest,
@@ -53,17 +37,8 @@ export interface RpcCallContext extends RpcCallOptions { readonly method: RpcMet
 export interface UnaryRpcMethods {
   'node.getStatus': { request: GetStatusRequest; response: NodeStatus }
   'query.localSql': { request: LocalSqlRequest; response: LocalSqlResponse }
-  'transaction.beginDraft': { request: BeginDraftRequest; response: BeginDraftResponse }
-  'transaction.observeSql': { request: ObserveSqlRequest; response: ObserveSqlResponse }
-  'transaction.addPrecondition': { request: AddPreconditionRequest; response: DraftMutationResponse }
-  'transaction.addStatements': { request: AddStatementsRequest; response: DraftMutationResponse }
-  'transaction.replaceStatements': { request: ReplaceStatementsRequest; response: DraftMutationResponse }
-  'transaction.validateDraft': { request: ValidateDraftRequest; response: ValidateDraftResponse }
-  'transaction.rebaseDraft': { request: RebaseDraftRequest; response: RebaseDraftResponse }
-  'transaction.cancelDraft': { request: CancelDraftRequest; response: CancelDraftResponse }
-  'transaction.publishDraft': { request: PublishDraftRequest; response: PublishDraftResponse }
+  'transaction.submit': { request: SubmitTransactionRequest; response: SubmitTransactionResponse }
   'transaction.getOutcome': { request: GetOutcomeRequest; response: TransactionOutcome }
-  'transaction.getResult': { request: GetTransactionResultRequest; response: GetTransactionResultResponse }
   'evidence.getSettlement': { request: GetSettlementEvidenceRequest; response: SettlementEvidence }
   'evidence.getValidatorWatermark': { request: GetValidatorWatermarkRequest; response: ValidatorWatermark }
   'node.getReplicationStatus': { request: GetReplicationStatusRequest; response: ReplicationStatus }
@@ -97,17 +72,8 @@ export interface ChronologRpcService {
   streamStatus(request: StreamStatusRequest, context: RpcCallContext): AsyncIterable<NodeStatus>
   localSql(request: LocalSqlRequest, context: RpcCallContext): Promise<LocalSqlResponse>
   liveSql(request: LiveSqlRequest, context: RpcCallContext): AsyncIterable<LiveSqlEvent>
-  beginDraft(request: BeginDraftRequest, context: RpcCallContext): Promise<BeginDraftResponse>
-  observeSql(request: ObserveSqlRequest, context: RpcCallContext): Promise<ObserveSqlResponse>
-  addPrecondition(request: AddPreconditionRequest, context: RpcCallContext): Promise<DraftMutationResponse>
-  addStatements(request: AddStatementsRequest, context: RpcCallContext): Promise<DraftMutationResponse>
-  replaceStatements(request: ReplaceStatementsRequest, context: RpcCallContext): Promise<DraftMutationResponse>
-  validateDraft(request: ValidateDraftRequest, context: RpcCallContext): Promise<ValidateDraftResponse>
-  rebaseDraft(request: RebaseDraftRequest, context: RpcCallContext): Promise<RebaseDraftResponse>
-  cancelDraft(request: CancelDraftRequest, context: RpcCallContext): Promise<CancelDraftResponse>
-  publishDraft(request: PublishDraftRequest, context: RpcCallContext): Promise<PublishDraftResponse>
+  submitTransaction(request: SubmitTransactionRequest, context: RpcCallContext): Promise<SubmitTransactionResponse>
   getOutcome(request: GetOutcomeRequest, context: RpcCallContext): Promise<TransactionOutcome>
-  getTransactionResult(request: GetTransactionResultRequest, context: RpcCallContext): Promise<GetTransactionResultResponse>
   streamOutcome(request: StreamOutcomeRequest, context: RpcCallContext): AsyncIterable<TransactionOutcome>
   getSettlementEvidence(request: GetSettlementEvidenceRequest, context: RpcCallContext): Promise<SettlementEvidence>
   streamSettlementEvidence(request: StreamSettlementEvidenceRequest, context: RpcCallContext): AsyncIterable<SettlementEvidence>

@@ -5,7 +5,6 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { performance } from 'node:perf_hooks'
 
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
 import {
   DeterministicMaterializer,
   readNativeEngineInfo,
@@ -14,8 +13,9 @@ import {
 import {
   encodeTransactionCore,
   transactionDigest,
+  createExecutionManifest,
+  sqlStatement,
   utf8,
-  type SqlBinding,
   type SqlTransactionProgram,
   type TransactionCore,
 } from '@chronolog/protocol'
@@ -60,7 +60,7 @@ export async function characterizeNativeRecovery(
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-release-characterization-'))
   const path = join(directory, 'application.db')
   const native = readNativeEngineInfo()
-  const manifest = createCoreExecutionManifest({
+  const manifest = createExecutionManifest({
     profile: 'chronolog-native-release-characterization-v1',
     engine: native.descriptor,
     engineDigest: native.digest,
@@ -159,39 +159,18 @@ async function requireRevision(
 function bootstrapProgram(): SqlTransactionProgram {
   return {
     version: 1,
-    preconditions: [truePrecondition()],
-    body: [{
-      sql: 'CREATE TABLE release_events (id INTEGER PRIMARY KEY, iteration INTEGER NOT NULL, kind TEXT NOT NULL) STRICT',
-      bindings: [],
-    }],
+    statements: [sqlStatement('CREATE TABLE release_events (id INTEGER PRIMARY KEY, iteration INTEGER NOT NULL, kind TEXT NOT NULL) STRICT')],
   }
 }
 
 function insertProgram(iteration: number, kind: string): SqlTransactionProgram {
   return {
     version: 1,
-    preconditions: [truePrecondition()],
-    body: [{
-      sql: 'INSERT INTO release_events (id, iteration, kind) VALUES (?, ?, ?)',
-      bindings: [integer(1, BigInt(iteration * 2 + (kind === 'late' ? 1 : 0))), integer(2, BigInt(iteration)), {
-        parameter: { kind: 'index', index: 3 },
-        value: { kind: 'text', utf8: utf8(kind) },
-      }],
-    }],
+    statements: [sqlStatement(
+      'INSERT INTO release_events (id, iteration, kind) VALUES (?, ?, ?)',
+      [BigInt(iteration * 2 + (kind === 'late' ? 1 : 0)), BigInt(iteration), kind],
+    )],
   }
-}
-
-function truePrecondition() {
-  return {
-    id: 1,
-    query: { sql: 'SELECT 1', bindings: [] },
-    resultMode: 'scalar' as const,
-    expectation: { kind: 'assert_true' as const },
-  }
-}
-
-function integer(index: number, value: bigint): SqlBinding {
-  return { parameter: { kind: 'index', index }, value: { kind: 'int64', value } }
 }
 
 async function transaction(

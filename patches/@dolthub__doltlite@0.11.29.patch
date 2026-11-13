@@ -11,7 +11,7 @@ index 5a16d14992844e5620b4ee223d0894e0833ec64a..81fb162e7934629bf1f45129d41ece54
          "src/bun_compat.cpp",
          "src/database.cpp",
 diff --git a/index.d.ts b/index.d.ts
-index 767f27601ed81cbbb7374519b48ab1f834b76f50..d90dbe5605ef6c1f6458840c781ba357f5cfd6c9 100644
+index 767f27601ed81cbbb7374519b48ab1f834b76f50..aefd325380b2af215350b83f0f3cf37111306a22 100644
 --- a/index.d.ts
 +++ b/index.d.ts
 @@ -14,6 +14,21 @@
@@ -36,16 +36,20 @@ index 767f27601ed81cbbb7374519b48ab1f834b76f50..d90dbe5605ef6c1f6458840c781ba357
  export interface ColumnInfo {
    name: string | null
    column: string | null
-@@ -104,6 +119,8 @@ export class StatementSync {
+@@ -104,6 +119,12 @@ export class StatementSync {
    readonly sourceSQL: string
    /** The SQL text with bound parameters expanded. */
    readonly expandedSQL: string
 +  /** UTF-8 byte offset at which the first prepared statement ends. */
 +  readonly tailOffset: number
++  /** Number of SQL parameters (the largest parameter position). */
++  readonly parameterCount: number
++  /** SQLite's position of a named or numbered parameter, or 0. */
++  parameterIndex(name: string): number
  }
  
  export class DatabaseSync {
-@@ -123,6 +140,13 @@ export class DatabaseSync {
+@@ -123,6 +144,17 @@ export class DatabaseSync {
    location(): string | null
    /** Register a user-defined scalar SQL function. */
    createFunction(name: string, fn: (...args: unknown[]) => unknown): void
@@ -56,10 +60,14 @@ index 767f27601ed81cbbb7374519b48ab1f834b76f50..d90dbe5605ef6c1f6458840c781ba357
 +  setLimit(category: number, value: number): number
 +  interrupt(): void
 +  configureSecurity(): Readonly<Record<string, boolean>>
++  /** Pin 'now' (unix ms), the PRNG seed and UTC localtime; resets last_insert_rowid. Process-global. */
++  setDeterministicContext(unixMs: bigint, seed: number): void
++  /** Restore the real clock, PRNG and localtime. */
++  clearDeterministicContext(): void
  
    /** True if the database connection is open. */
    readonly isOpen: boolean
-@@ -153,6 +177,12 @@ export class DatabaseSync {
+@@ -153,6 +185,12 @@ export class DatabaseSync {
  
    /** Reset HEAD. Pass `"--hard"` for a hard reset. */
    doltReset(flag?: "--hard"): void
@@ -307,12 +315,105 @@ index 7be6aba8d05c3c02ff80efd1adbe55a3615264fd..6f4acc76b508661f97eca792f8e78729
  run(process.execPath, [path.join(__dirname, "download.js")])
  run("node-gyp", ["rebuild"])
 diff --git a/src/addon.cpp b/src/addon.cpp
-index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..6d50d1d13fee415ff3388c93cf62b0b923d81090 100644
+index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..2f5a4702d4a485425d23822f92e3767f05a0c05b 100644
 --- a/src/addon.cpp
 +++ b/src/addon.cpp
-@@ -2,13 +2,37 @@
+@@ -1,14 +1,134 @@
+ #include "database.h"
  #include "statement.h"
  
++#include <cstring>
++#include <ctime>
++#include <string>
++
++// ── Deterministic engine inputs ─────────────────────────────────────────────
++// A wrapper of the default VFS whose clock can be pinned to a transaction's
++// signed timestamp. All other methods are the default VFS's own.
++static sqlite3_vfs g_chronologVfs;
++static sqlite3_vfs* g_baseVfs = nullptr;
++static bool g_fixedTime = false;
++static sqlite3_int64 g_fixedJulianMs = 0;
++
++static int ChronologCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64* out) {
++  if (g_fixedTime) { *out = g_fixedJulianMs; return SQLITE_OK; }
++  if (g_baseVfs->iVersion >= 2 && g_baseVfs->xCurrentTimeInt64) return g_baseVfs->xCurrentTimeInt64(g_baseVfs, out);
++  double now = 0;
++  int rc = g_baseVfs->xCurrentTime(g_baseVfs, &now);
++  *out = (sqlite3_int64)(now * 86400000.0);
++  return rc;
++}
++
++static int ChronologCurrentTime(sqlite3_vfs* vfs, double* out) {
++  sqlite3_int64 ms = 0;
++  int rc = ChronologCurrentTimeInt64(vfs, &ms);
++  *out = ms / 86400000.0;
++  return rc;
++}
++
++static int ChronologUtcLocaltime(const void* t, void* tm) {
++#ifdef _WIN32
++  return gmtime_s((struct tm*)tm, (const time_t*)t) == 0 ? 0 : 1;
++#else
++  return gmtime_r((const time_t*)t, (struct tm*)tm) ? 0 : 1;
++#endif
++}
++
++extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed) {
++  g_fixedJulianMs = unixMs + 210866760000000LL;
++  g_fixedTime = true;
++  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SEED, (int)(seed == 0 ? 1u : seed), (sqlite3*)nullptr);
++  sqlite3_test_control(SQLITE_TESTCTRL_LOCALTIME_FAULT, 2, ChronologUtcLocaltime);
++}
++
++extern "C" void chronologClearDeterministicContext(void) {
++  g_fixedTime = false;
++  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SEED, 0, (sqlite3*)nullptr);
++  sqlite3_test_control(SQLITE_TESTCTRL_LOCALTIME_FAULT, 0);
++}
++
++// chronolog_assert(condition, code): 1 when condition is true, otherwise a
++// SQLITE_CONSTRAINT_FUNCTION error whose message is "chronolog_assert:<code>".
++static void ChronologAssert(sqlite3_context* ctx, int, sqlite3_value** argv) {
++  int codeBytes = sqlite3_value_bytes(argv[1]);
++  const unsigned char* code = sqlite3_value_text(argv[1]);
++  if (sqlite3_value_type(argv[1]) != SQLITE_TEXT || code == nullptr || codeBytes < 1 || codeBytes > 128) {
++    sqlite3_result_error(ctx, "chronolog_assert: code must be text of 1 to 128 bytes", -1);
++    return;
++  }
++  bool truthy = false;
++  switch (sqlite3_value_numeric_type(argv[0])) {
++    case SQLITE_NULL: truthy = false; break;
++    case SQLITE_INTEGER: truthy = sqlite3_value_int64(argv[0]) != 0; break;
++    default: truthy = sqlite3_value_double(argv[0]) != 0.0; break;
++  }
++  if (truthy) { sqlite3_result_int(ctx, 1); return; }
++  std::string message = "chronolog_assert:" + std::string((const char*)code, (size_t)codeBytes);
++  sqlite3_result_error(ctx, message.c_str(), (int)message.size());
++  sqlite3_result_error_code(ctx, SQLITE_CONSTRAINT_FUNCTION);
++}
++
++static int ChronologRegisterFunctions(sqlite3* db, char**, const sqlite3_api_routines*) {
++  return sqlite3_create_function_v2(db, "chronolog_assert", 2,
++    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS, nullptr, ChronologAssert, nullptr, nullptr, nullptr);
++}
++
++static bool InstallDeterministicEngine() {
++  static bool installed = false;
++  if (installed) return true;
++  if (sqlite3_initialize() != SQLITE_OK) return false;
++  g_baseVfs = sqlite3_vfs_find(nullptr);
++  if (g_baseVfs == nullptr) return false;
++  g_chronologVfs = *g_baseVfs;
++  g_chronologVfs.zName = "chronolog";
++  g_chronologVfs.pNext = nullptr;
++  g_chronologVfs.xCurrentTime = ChronologCurrentTime;
++  if (g_chronologVfs.iVersion >= 2) g_chronologVfs.xCurrentTimeInt64 = ChronologCurrentTimeInt64;
++  if (sqlite3_vfs_register(&g_chronologVfs, 1) != SQLITE_OK) return false;
++  if (sqlite3_auto_extension(reinterpret_cast<void (*)(void)>(ChronologRegisterFunctions)) != SQLITE_OK) return false;
++  installed = true;
++  return true;
++}
++
  extern "C" int doltliteInstallAutoExt(void);
 +extern "C" int sqlite3_vec_init(sqlite3*, char**, const sqlite3_api_routines*);
 +
@@ -323,7 +424,7 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..6d50d1d13fee415ff3388c93cf62b0b9
 +  manifest.Set("doltliteSourceSha256", "6611b083ea08cf1e4a9ca71d8e873e9fccd989ad893d6ab38b3df3a48aeac6a8");
 +  manifest.Set("sqliteVecVersion", "0.1.9");
 +  manifest.Set("sqliteVecSourceSha256", "3acd67cb4aff080c7050926fd3cf8227905fe5b7ee3829d8ee5024ab1283cf61");
-+  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-v3");
++  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-deterministic-context-assert-parameters-v4");
 +  manifest.Set("fts5", true);
 +  manifest.Set("json1", true);
 +  manifest.Set("rtree", true);
@@ -340,6 +441,10 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..6d50d1d13fee415ff3388c93cf62b0b9
 +    Napi::Error::New(env, "Failed to register statically linked sqlite-vec").ThrowAsJavaScriptException();
 +    return exports;
 +  }
++  if (!InstallDeterministicEngine()) {
++    Napi::Error::New(env, "Failed to install the Chronolog deterministic engine hooks").ThrowAsJavaScriptException();
++    return exports;
++  }
    // StatementSync must be initialised first so its constructor_ is set before
    // Database::Prepare() can call Statement::Create().
    Statement::Init(env, exports);
@@ -349,7 +454,7 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..6d50d1d13fee415ff3388c93cf62b0b9
  }
  
 diff --git a/src/database.cpp b/src/database.cpp
-index 1537104e3a80018cd4a7147daad8460e27acdea0..50f96ad9d32c0007e76e7ed4d49d1898e0a61303 100644
+index 1537104e3a80018cd4a7147daad8460e27acdea0..18990df0ceb38cdaa4c174f4de28d5bb3cb9c734 100644
 --- a/src/database.cpp
 +++ b/src/database.cpp
 @@ -19,7 +19,7 @@ static std::string SqliteOpenPath(const std::string& path) {
@@ -410,7 +515,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..50f96ad9d32c0007e76e7ed4d49d1898
  }
  
  Napi::Value Database::IsOpenGetter(const Napi::CallbackInfo& info) {
-@@ -162,6 +174,147 @@ Napi::Value Database::CreateFunction(const Napi::CallbackInfo& info) {
+@@ -162,6 +174,176 @@ Napi::Value Database::CreateFunction(const Napi::CallbackInfo& info) {
    return env.Undefined();
  }
  
@@ -509,6 +614,35 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..50f96ad9d32c0007e76e7ed4d49d1898
 +  return info.Env().Undefined();
 +}
 +
++extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed);
++extern "C" void chronologClearDeterministicContext(void);
++
++// Fix the engine inputs that do not come from SQL or the database: the clock,
++// the PRNG seed, localtime (UTC) and last_insert_rowid. Process-global; the
++// caller executes one transaction synchronously between set and clear.
++Napi::Value Database::SetDeterministicContext(const Napi::CallbackInfo& info) {
++  Napi::Env env = info.Env();
++  if (!db_) { Napi::Error::New(env, "Database is closed").ThrowAsJavaScriptException(); return env.Undefined(); }
++  if (info.Length() < 2 || !info[0].IsBigInt() || !info[1].IsNumber()) {
++    Napi::TypeError::New(env, "setDeterministicContext(unixMs: bigint, seed: number)").ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++  bool lossless = false;
++  int64_t unixMs = info[0].As<Napi::BigInt>().Int64Value(&lossless);
++  if (!lossless || unixMs < 0 || unixMs > 253402300799999LL) {
++    Napi::RangeError::New(env, "Deterministic time is out of range").ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++  chronologSetDeterministicContext((sqlite3_int64)unixMs, info[1].As<Napi::Number>().Uint32Value());
++  sqlite3_set_last_insert_rowid(db_, 0);
++  return env.Undefined();
++}
++
++Napi::Value Database::ClearDeterministicContext(const Napi::CallbackInfo& info) {
++  chronologClearDeterministicContext();
++  return info.Env().Undefined();
++}
++
 +Napi::Value Database::ConfigureSecurity(const Napi::CallbackInfo& info) {
 +  Napi::Env env = info.Env();
 +  if (!db_) { Napi::Error::New(env, "Database is closed").ThrowAsJavaScriptException(); return env.Undefined(); }
@@ -558,7 +692,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..50f96ad9d32c0007e76e7ed4d49d1898
  // ── Internal query helpers ────────────────────────────────────────────────────
  
  Napi::Array Database::ExecQuery(Napi::Env env, const std::string& sql,
-@@ -277,6 +430,41 @@ Napi::Value Database::DoltReset(const Napi::CallbackInfo& info) {
+@@ -277,6 +459,41 @@ Napi::Value Database::DoltReset(const Napi::CallbackInfo& info) {
    return env.Undefined();
  }
  
@@ -600,7 +734,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..50f96ad9d32c0007e76e7ed4d49d1898
  Napi::Value Database::DoltStatus(const Napi::CallbackInfo& info) {
    return ExecQuery(info.Env(), "SELECT * FROM dolt_status");
  }
-@@ -414,6 +602,11 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
+@@ -414,6 +631,13 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
      InstanceMethod("open",           &Database::Open),
      InstanceMethod("location",       &Database::Location),
      InstanceMethod("createFunction", &Database::CreateFunction),
@@ -609,10 +743,12 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..50f96ad9d32c0007e76e7ed4d49d1898
 +    InstanceMethod("setLimit",       &Database::SetLimit),
 +    InstanceMethod("interrupt",      &Database::Interrupt),
 +    InstanceMethod("configureSecurity", &Database::ConfigureSecurity),
++    InstanceMethod("setDeterministicContext", &Database::SetDeterministicContext),
++    InstanceMethod("clearDeterministicContext", &Database::ClearDeterministicContext),
      InstanceAccessor("isOpen",        &Database::IsOpenGetter,        nullptr),
      InstanceAccessor("inTransaction", &Database::IsTransactionGetter, nullptr),
      // Dolt version-control
-@@ -422,6 +615,9 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
+@@ -422,6 +646,9 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
      InstanceMethod("doltCheckout",   &Database::DoltCheckout),
      InstanceMethod("doltMerge",      &Database::DoltMerge),
      InstanceMethod("doltReset",      &Database::DoltReset),
@@ -623,7 +759,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..50f96ad9d32c0007e76e7ed4d49d1898
      InstanceMethod("doltLog",        &Database::DoltLog),
      InstanceMethod("doltBranches",   &Database::DoltBranches),
 diff --git a/src/database.h b/src/database.h
-index 9c4dec7fd60afda349a57dc263560335b3051722..8f5fbc9cfbe508af62f20fd412b4c79c7511d8f4 100644
+index 9c4dec7fd60afda349a57dc263560335b3051722..816c3acaac7eb275a813e509d2baf57ea71417ad 100644
 --- a/src/database.h
 +++ b/src/database.h
 @@ -15,6 +15,9 @@ public:
@@ -636,7 +772,7 @@ index 9c4dec7fd60afda349a57dc263560335b3051722..8f5fbc9cfbe508af62f20fd412b4c79c
  
    // node:sqlite-compatible methods
    Napi::Value Exec(const Napi::CallbackInfo& info);
-@@ -25,6 +28,15 @@ private:
+@@ -25,6 +28,17 @@ private:
    Napi::Value IsTransactionGetter(const Napi::CallbackInfo& info);
    Napi::Value Location(const Napi::CallbackInfo& info);
    Napi::Value CreateFunction(const Napi::CallbackInfo& info);
@@ -645,6 +781,8 @@ index 9c4dec7fd60afda349a57dc263560335b3051722..8f5fbc9cfbe508af62f20fd412b4c79c
 +  Napi::Value SetLimit(const Napi::CallbackInfo& info);
 +  Napi::Value Interrupt(const Napi::CallbackInfo& info);
 +  Napi::Value ConfigureSecurity(const Napi::CallbackInfo& info);
++  Napi::Value SetDeterministicContext(const Napi::CallbackInfo& info);
++  Napi::Value ClearDeterministicContext(const Napi::CallbackInfo& info);
 +  static int AuthorizerCallback(void* context, int action, const char* arg1,
 +                                const char* arg2, const char* database,
 +                                const char* trigger);
@@ -652,7 +790,7 @@ index 9c4dec7fd60afda349a57dc263560335b3051722..8f5fbc9cfbe508af62f20fd412b4c79c
  
    // Dolt version-control helpers (thin SQL wrappers)
    Napi::Value DoltCommit(const Napi::CallbackInfo& info);
-@@ -32,6 +44,9 @@ private:
+@@ -32,6 +46,9 @@ private:
    Napi::Value DoltCheckout(const Napi::CallbackInfo& info);
    Napi::Value DoltMerge(const Napi::CallbackInfo& info);
    Napi::Value DoltReset(const Napi::CallbackInfo& info);
@@ -663,7 +801,7 @@ index 9c4dec7fd60afda349a57dc263560335b3051722..8f5fbc9cfbe508af62f20fd412b4c79c
    Napi::Value DoltLog(const Napi::CallbackInfo& info);
    Napi::Value DoltBranches(const Napi::CallbackInfo& info);
 diff --git a/src/statement.cpp b/src/statement.cpp
-index 8474344ba8f1eddfac90b61da28715a3dbc3caa8..4c0080a668485e42f360fdb77c871845ddca4372 100644
+index 8474344ba8f1eddfac90b61da28715a3dbc3caa8..6ff15a9c4cd4fcba37c75b0eed5aaa1a9f54b2d0 100644
 --- a/src/statement.cpp
 +++ b/src/statement.cpp
 @@ -16,12 +16,14 @@ Napi::FunctionReference& Statement::GetConstructor(Napi::Env env) {
@@ -699,7 +837,29 @@ index 8474344ba8f1eddfac90b61da28715a3dbc3caa8..4c0080a668485e42f360fdb77c871845
      ThrowSQLiteError(env, db_->Handle(), "run"); return env.Undefined();
    }
  
-@@ -199,6 +204,10 @@ Napi::Value Statement::ExpandedSQLGetter(const Napi::CallbackInfo& info) {
+@@ -101,6 +106,21 @@ Napi::Value Statement::SetReturnArrays(const Napi::CallbackInfo& info) {
+   return info.Env().Undefined();
+ }
+ 
++Napi::Value Statement::ParameterCountGetter(const Napi::CallbackInfo& info) {
++  return Napi::Number::New(info.Env(), stmt_ ? sqlite3_bind_parameter_count(stmt_) : 0);
++}
++
++// SQLite's own position of a named (:a, @a, $a) or numbered (?7) parameter; 0 if absent.
++Napi::Value Statement::ParameterIndex(const Napi::CallbackInfo& info) {
++  Napi::Env env = info.Env();
++  if (!stmt_ || info.Length() < 1 || !info[0].IsString()) {
++    Napi::TypeError::New(env, "parameterIndex(name)").ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++  std::string name = info[0].As<Napi::String>().Utf8Value();
++  return Napi::Number::New(env, sqlite3_bind_parameter_index(stmt_, name.c_str()));
++}
++
+ Napi::Value Statement::SetReadBigInts(const Napi::CallbackInfo& info) {
+   readBigInts_ = info.Length() > 0 && info[0].ToBoolean().Value();
+   return info.Env().Undefined();
+@@ -199,6 +219,10 @@ Napi::Value Statement::ExpandedSQLGetter(const Napi::CallbackInfo& info) {
    return Napi::String::New(info.Env(), s);
  }
  
@@ -710,7 +870,13 @@ index 8474344ba8f1eddfac90b61da28715a3dbc3caa8..4c0080a668485e42f360fdb77c871845
  // ── Class registration ───────────────────────────────────────────────────────
  
  Napi::Object Statement::Init(Napi::Env env, Napi::Object exports) {
-@@ -214,6 +223,7 @@ Napi::Object Statement::Init(Napi::Env env, Napi::Object exports) {
+@@ -210,10 +234,13 @@ Napi::Object Statement::Init(Napi::Env env, Napi::Object exports) {
+     InstanceMethod("columns",                         &Statement::Columns),
+     InstanceMethod("setReturnArrays",                 &Statement::SetReturnArrays),
+     InstanceMethod("setReadBigInts",                  &Statement::SetReadBigInts),
++    InstanceMethod("parameterIndex",                  &Statement::ParameterIndex),
++    InstanceAccessor("parameterCount", &Statement::ParameterCountGetter, nullptr),
+     InstanceMethod("setAllowBareNamedParameters",     &Statement::SetAllowBareNamedParameters),
      InstanceMethod("setAllowUnknownNamedParameters",  &Statement::SetAllowUnknownNamedParameters),
      InstanceAccessor("sourceSQL",   &Statement::SourceSQLGetter,   nullptr),
      InstanceAccessor("expandedSQL", &Statement::ExpandedSQLGetter, nullptr),
@@ -719,7 +885,7 @@ index 8474344ba8f1eddfac90b61da28715a3dbc3caa8..4c0080a668485e42f360fdb77c871845
    auto* data = new StatementEnvData();
    data->constructor = Napi::Persistent(ctor);
 diff --git a/src/statement.h b/src/statement.h
-index cc6588d619dd27477f8ccba169b337aa0cf4f0f5..51a2528a075a5d0f795bbafa6f1869eb66f0e83b 100644
+index cc6588d619dd27477f8ccba169b337aa0cf4f0f5..b8fb512fdd5ba1f538b7982b8f6c2d9aba75e536 100644
 --- a/src/statement.h
 +++ b/src/statement.h
 @@ -10,12 +10,14 @@ public:
@@ -738,7 +904,13 @@ index cc6588d619dd27477f8ccba169b337aa0cf4f0f5..51a2528a075a5d0f795bbafa6f1869eb
    bool returnArrays_ = false;
    bool readBigInts_ = false;
    bool allowBareNamedParameters_ = true;
-@@ -32,6 +34,7 @@ private:
+@@ -28,10 +30,13 @@ private:
+   Napi::Value Columns(const Napi::CallbackInfo& info);
+   Napi::Value SetReturnArrays(const Napi::CallbackInfo& info);
+   Napi::Value SetReadBigInts(const Napi::CallbackInfo& info);
++  Napi::Value ParameterCountGetter(const Napi::CallbackInfo& info);
++  Napi::Value ParameterIndex(const Napi::CallbackInfo& info);
+   Napi::Value SetAllowBareNamedParameters(const Napi::CallbackInfo& info);
    Napi::Value SetAllowUnknownNamedParameters(const Napi::CallbackInfo& info);
    Napi::Value SourceSQLGetter(const Napi::CallbackInfo& info);
    Napi::Value ExpandedSQLGetter(const Napi::CallbackInfo& info);

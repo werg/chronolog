@@ -1,7 +1,6 @@
 import type { ControlStore, StoredAttestation, WatermarkPolicy } from '@chronolog/control-store'
 import type {
   ChronologMaterializationRuntime,
-  MaterializedObservationResult,
   MaterializedLocalSqlResult,
   MaterializedLocalSqlValue,
 } from '@chronolog/materializer'
@@ -177,7 +176,6 @@ export interface NodeStatus {
   }
 }
 
-export type NodeObservationResult = MaterializedObservationResult
 export type NodeLocalSqlQueryResult = MaterializedLocalSqlResult
 export type NodeSqlStatement = SqlStatement
 export type NodeLocalSqlParameter = MaterializedLocalSqlValue

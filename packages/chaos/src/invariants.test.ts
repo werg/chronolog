@@ -31,13 +31,13 @@ describe('chaos migration oracle', () => {
   const rollbackPrefix = 'chaos_rollback_worker_1_operation_0'
   const expectations: readonly WorkloadExpectation[] = [
     { transactionId: 'chain-tx', operationId: 'worker-0-operation-0', operation: 'migration_chain', allowedOutcomes: ['accepted'], migrationPrefix: prefix },
-    { transactionId: 'rollback-tx', operationId: 'worker-1-operation-0', operation: 'migration_rollback', allowedOutcomes: ['rejected_execution'], migrationPrefix: rollbackPrefix },
+    { transactionId: 'rollback-tx', operationId: 'worker-1-operation-0', operation: 'migration_rollback', allowedOutcomes: ['rejected'], migrationPrefix: rollbackPrefix },
     { transactionId: 'legacy-tx', operationId: 'worker-2-operation-0', operation: 'legacy_client_write', allowedOutcomes: ['accepted'] },
     { transactionId: 'current-tx', operationId: 'worker-0-operation-1', operation: 'current_client_write', allowedOutcomes: ['accepted'] },
   ]
   const logRows = expectations.map((expectation) => [
     { bytes: Buffer.from(expectation.transactionId).toString('base64url') },
-    '0', null, '0', expectation.operation === 'migration_rollback' ? 'rejected_execution' : 'accepted',
+    '0', null, '0', expectation.operation === 'migration_rollback' ? 'rejected' : 'accepted',
   ])
   const stateRows = [
     ['3', 'worker-2-operation-0', '2', '0', '0', '0', 'legacy-2|', null],

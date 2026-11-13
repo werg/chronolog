@@ -28,17 +28,7 @@ function core(index: number): TransactionCore {
     authorTimestampMs: 1_000n + BigInt(index),
     nonce: bytes(0x80 + index),
     executionManifestDigest: manifestDigest,
-    program: {
-      version: 1,
-      preconditions: [{
-        id: 1,
-        query: { sql: 'SELECT 1', bindings: [] },
-        resultMode: 'scalar',
-        expectation: { kind: 'assert_true' },
-        label: 'always',
-      }],
-      body: [{ sql: `INSERT INTO t VALUES (${index})`, bindings: [] }],
-    },
+    program: { version: 1, statements: [{ sql: `INSERT INTO t VALUES (${index})`, bindings: [] }] },
   }
 }
 
@@ -56,25 +46,17 @@ function transaction(index: number): AdmittedTransaction {
 function logRow(item: AdmittedTransaction, orderIndex: number): TransactionLogRow {
   return {
     txId: item.txId,
-    orderKey: { authorTimestampMs: item.core.authorTimestampMs, txId: item.txId },
+    orderKey: { authorTimestampMs: item.core.authorTimestampMs, authorId: item.core.authorId, authorFeedSequence: item.authorFeedSequence, txId: item.txId },
     orderIndex,
     outcome: 'accepted',
     rejectionCode: null,
-    failingPreconditionId: null,
-    failingPreconditionIndex: null,
     failingStatementIndex: null,
-    failurePhase: null,
-    failingConstraintIdentity: null,
-    failingTriggerIdentity: null,
-    resultEnvelopeVersion: null,
-    resultEnvelope: null,
-    resultDigest: null,
     authorId: item.core.authorId,
     authorTimestampMs: item.core.authorTimestampMs,
     authorFeedSequence: item.authorFeedSequence,
     candidateDigest: item.candidateDigest,
     canonicalCandidate: item.canonicalCandidate,
-  } as TransactionLogRow
+  }
 }
 
 interface FakeMaterializer extends DoltLitePortableMaterializerLike {

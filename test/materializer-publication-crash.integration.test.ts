@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
+import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   readNativeEngineInfo,
@@ -45,7 +45,7 @@ describe('native publication crash recovery', () => {
       ).toBe(true)
 
       const native = readNativeEngineInfo()
-      const manifest = createCoreExecutionManifest({
+      const manifest = createExecutionManifest({
         profile: 'chronolog-native-production-v1',
         engine: native.descriptor,
         engineDigest: native.digest,

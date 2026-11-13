@@ -2,42 +2,37 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-import { ChronologClient, type ClientSqlBindings, type ClientSqlValue } from '@chronolog/client'
-import {
-  MigrationManager,
-  defineMigration,
-  diffCatalogs,
-  generateTypeScriptBindings,
-  inspectCatalog,
-  type MigrationDefinition,
-} from '@chronolog/migrations'
+import { ChronologClient, sqlValue, type ClientSqlBindings, type ClientSqlValue, type SqlValue } from '@chronolog/client'
 import { HttpRpcTransport } from '@chronolog/rpc'
 
 interface SqlSpec {
   readonly sql: string
   readonly bindings?: readonly JsonSqlValue[] | Readonly<Record<string, JsonSqlValue>>
-  readonly label?: string
 }
-interface ObservationSpec extends SqlSpec { readonly expect?: boolean; readonly resultMode?: 'scalar' | 'ordered' | 'multiset' | 'set' }
 interface TransactionSpec {
-  readonly assertions?: readonly SqlSpec[]
-  readonly observations?: readonly ObservationSpec[]
   readonly statements: readonly SqlSpec[]
   readonly wait?: boolean
   readonly idempotencyKey?: string
 }
-interface MigrationSpec {
-  readonly component: string
-  readonly id: string
-  readonly version: number
-  readonly checksum?: string
-  readonly statements: readonly SqlSpec[]
-}
-type JsonSqlValue = null | boolean | number | string | { readonly $int64: string } | { readonly $blob: string } | { readonly $real: string }
+/** Plain JSON values, or an explicit SQLite value such as {"kind":"integer","value":"9007199254740993"}. */
+type JsonSqlValue = null | boolean | number | string | { readonly kind: string; readonly value?: unknown }
+/** The positional SQLite value of a fork seed plan; a BLOB is base64url text. */
+type SeedValue =
+  | { readonly kind: 'null' }
+  | { readonly kind: 'integer'; readonly value: string }
+  | { readonly kind: 'real'; readonly value: number }
+  | { readonly kind: 'text'; readonly value: string }
+  | { readonly kind: 'blob'; readonly value: string }
 interface SeedPlan {
-  readonly format: 'chronolog-fork-seed-v1'
-  readonly batches: readonly { readonly batch: number; readonly label: string; readonly precondition: string; readonly statements: readonly SqlSpec[] }[]
+  readonly format: 'chronolog-fork-seed-v2'
+  readonly batches: readonly {
+    readonly batch: number
+    readonly label: string
+    readonly statements: readonly { readonly sql: string; readonly bindings: readonly SeedValue[] }[]
+  }[]
 }
+/** Rejection code of a seed batch whose guard found it already applied. */
+const FORK_SEED_APPLIED_REJECTION = 'assert:fork_seed_applied'
 interface CapabilitySpec {
   readonly subjectId: string
   readonly signingPublicKey: string
@@ -80,23 +75,17 @@ try {
     }
     case 'transact': {
       const spec = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'transact SPEC_JSON_OR_@FILE'))) as TransactionSpec
-      if (!Array.isArray(spec.statements) || spec.statements.length === 0) throw new Error('Transaction spec requires statements')
-      const handle = await client.transaction(async (tx) => {
-        for (const assertion of spec.assertions ?? []) tx.assert(assertion.sql, jsonBindings(assertion.bindings ?? []), labelOptions(assertion.label))
-        for (const observation of spec.observations ?? []) {
-          const observed = await tx.observe(observation.sql, jsonBindings(observation.bindings ?? []), {
-            resultMode: observation.resultMode ?? 'ordered',
-            ...labelOptions(observation.label),
-          })
-          if (observation.expect !== false) tx.expect(observed, labelOptions(observation.label))
-        }
-        tx.exec(spec.statements.map((statement) => ({ sql: statement.sql, parameters: jsonBindings(statement.bindings ?? []) })))
-      }, spec.idempotencyKey === undefined ? {} : { idempotencyKey: spec.idempotencyKey })
-      output(spec.wait === true ? { publication: handle.publication, outcome: await waitForOutcome(handle.transactionId) } : handle.publication)
+      const statements: readonly SqlSpec[] = spec.statements
+      if (!(statements as unknown instanceof Array) || statements.length === 0) throw new Error('Transaction spec requires statements')
+      const handle = await client.transaction(
+        statements.map((statement) => ({ sql: statement.sql, params: jsonBindings(statement.bindings ?? []) })),
+        spec.idempotencyKey === undefined ? {} : { idempotencyKey: spec.idempotencyKey },
+      )
+      output(spec.wait === true ? { submission: handle.submission, outcome: await waitForOutcome(handle.transactionId) } : handle.submission)
+      handle.dispose()
       break
     }
     case 'outcome': output(await client.getTransactionOutcome(requiredArg(args.shift(), 'outcome TRANSACTION_ID'))); break
-    case 'result': output(await client.getTransactionResult(requiredArg(args.shift(), 'result TRANSACTION_ID'))); break
     case 'evidence': output(await client.getSettlementEvidence(requiredArg(args.shift(), 'evidence TRANSACTION_ID'))); break
     case 'watermark': output(await client.validatorWatermark()); break
     case 'replication': output(await client.getReplicationStatus()); break
@@ -141,51 +130,24 @@ try {
       } else throw new Error(`Unknown governance operation: ${operation}`)
       break
     }
-    case 'migrations': {
-      const migrations = new MigrationManager(client)
-      const operation = requiredArg(args.shift(), 'migrations <status|apply|wait> ...')
-      if (operation === 'wait') {
-        const transactionId = requiredArg(args.shift(), 'migrations wait TRANSACTION_ID [--watermark]')
-        output(await migrations.wait(transactionId, { requireWatermark: args.includes('--watermark') }))
-        break
-      }
-      const migration = await migrationFrom(requiredArg(args.shift(), `migrations ${operation} SPEC_JSON_OR_@FILE`))
-      if (operation === 'status') output(await migrations.status(migration))
-      else if (operation === 'apply') output(await migrations.apply(migration, { requireWatermark: args.includes('--watermark') }))
-      else throw new Error(`Unknown migrations operation: ${operation}`)
-      break
-    }
-    case 'catalog': {
-      const operation = requiredArg(args.shift(), 'catalog <inspect|diff|bindings> ...')
-      if (operation === 'diff') {
-        const before = await inspectCatalog(client, requiredArg(args.shift(), 'catalog diff FROM_REVISION TO_REVISION'))
-        const after = await inspectCatalog(client, requiredArg(args.shift(), 'catalog diff FROM_REVISION TO_REVISION'))
-        output(diffCatalogs(before, after))
-      } else {
-        const snapshot = await inspectCatalog(client, args.shift())
-        if (operation === 'inspect') output(snapshot)
-        else if (operation === 'bindings') process.stdout.write(generateTypeScriptBindings(snapshot))
-        else throw new Error(`Unknown catalog operation: ${operation}`)
-      }
-      break
-    }
     case 'seed': {
       // Submits a fork seed plan (see `pnpm group fork`) one batch at a time.
-      // Each batch asserts it has not been applied yet, so a rerun after an
-      // interruption skips finished batches instead of duplicating rows.
+      // Each batch's first statement asserts it has not been applied yet, so a
+      // rerun after an interruption skips finished batches.
       const plan = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'seed @fork-seed.json'))) as SeedPlan
       const batches: SeedPlan['batches'] = plan.batches
-      if (plan.format !== 'chronolog-fork-seed-v1' || !(batches as unknown instanceof Array)) throw new Error('Not a fork seed plan')
+      if (plan.format !== 'chronolog-fork-seed-v2' || !(batches as unknown instanceof Array)) throw new Error('Not a fork seed plan')
       let applied = 0
       let skipped = 0
       for (const batch of batches) {
-        const handle = await client.transaction((tx) => {
-          tx.assert(batch.precondition, [], labelOptions(`fork seed batch ${batch.batch} not yet applied`))
-          tx.exec(batch.statements.map((statement: SqlSpec) => ({ sql: statement.sql, parameters: jsonBindings(statement.bindings ?? []) })))
-        })
+        const handle = await client.transaction(batch.statements.map((statement) => ({
+          sql: statement.sql,
+          params: statement.bindings.map(seedValue),
+        })))
+        handle.dispose()
         const outcome = await waitForOutcome(handle.transactionId, 10 * 60_000)
         if (outcome.outcome.type === 'accepted') applied += 1
-        else if (outcome.outcome.type === 'rejected' && outcome.outcome.attribution.phase === 'precondition') skipped += 1
+        else if (outcome.outcome.type === 'rejected' && outcome.outcome.rejection.code === FORK_SEED_APPLIED_REJECTION) skipped += 1
         else throw new Error(`Seed batch ${batch.batch} (${batch.label}) did not apply: ${JSON.stringify(outcome.outcome)}`)
         process.stderr.write(`seed ${batch.batch}/${batches.length} ${outcome.outcome.type === 'accepted' ? 'applied' : 'already applied'}: ${batch.label}\n`)
       }
@@ -206,14 +168,25 @@ function jsonBindings(value: unknown): ClientSqlBindings {
 
 function jsonValue(value: unknown): ClientSqlValue {
   if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') return value
-  if (typeof value !== 'object') throw new Error('Unsupported SQL binding value')
-  if ('$int64' in value && typeof value.$int64 === 'string') return BigInt(value.$int64)
-  if ('$blob' in value && typeof value.$blob === 'string') return Uint8Array.from(Buffer.from(value.$blob, 'base64url'))
-  if ('$real' in value && typeof value.$real === 'string' && /^[0-9a-f]{16}$/u.test(value.$real)) {
-    // Exact IEEE 754 binary64 bits (big-endian hex), so REAL values such as 1.0 stay REAL.
-    return { kind: 'real', bits: Uint8Array.from(Buffer.from(value.$real, 'hex')) } as unknown as ClientSqlValue
+  if (typeof value === 'object' && 'kind' in value) {
+    const tagged = value as { readonly kind: unknown; readonly value?: unknown }
+    if (tagged.kind === 'null') return sqlValue.null()
+    if (tagged.kind === 'integer' && (typeof tagged.value === 'string' || typeof tagged.value === 'number')) return sqlValue.integer(BigInt(tagged.value))
+    if (tagged.kind === 'real' && typeof tagged.value === 'number') return sqlValue.real(tagged.value)
+    if (tagged.kind === 'text' && typeof tagged.value === 'string') return sqlValue.text(tagged.value)
+    if (tagged.kind === 'blob' && typeof tagged.value === 'string') return sqlValue.blob(Buffer.from(tagged.value, 'base64url'))
   }
   throw new Error('Unsupported SQL binding value')
+}
+
+function seedValue(value: SeedValue): SqlValue {
+  switch (value.kind) {
+    case 'null': return sqlValue.null()
+    case 'integer': return sqlValue.integer(BigInt(value.value))
+    case 'real': return sqlValue.real(value.value)
+    case 'text': return sqlValue.text(value.value)
+    case 'blob': return sqlValue.blob(Buffer.from(value.value, 'base64url'))
+  }
 }
 
 async function waitForOutcome(transactionId: string, timeoutMs = 30_000) {
@@ -234,28 +207,7 @@ async function localDefaults(): Promise<{ readonly groupId?: string }> {
 }
 
 async function inlineOrFile(value: string): Promise<string> { return value.startsWith('@') ? readFile(value.slice(1), 'utf8') : value }
-async function migrationFrom(value: string): Promise<MigrationDefinition> {
-  const raw: unknown = JSON.parse(await inlineOrFile(value))
-  if (typeof raw !== 'object' || raw === null) throw new Error('Migration spec must be an object')
-  const spec = raw as Omit<MigrationSpec, 'statements'> & { readonly statements?: unknown }
-  if (!Array.isArray(spec.statements)) throw new Error('Migration spec requires statements')
-  const statements = (spec.statements as readonly unknown[]).map((rawStatement) => {
-    if (typeof rawStatement !== 'object' || rawStatement === null || typeof (rawStatement as { sql?: unknown }).sql !== 'string') {
-      throw new Error('Migration statements require SQL')
-    }
-    const statement = rawStatement as SqlSpec
-    return { sql: statement.sql, parameters: jsonBindings(statement.bindings ?? []) }
-  })
-  return defineMigration({
-    component: spec.component,
-    id: spec.id,
-    version: spec.version,
-    statements,
-    ...(spec.checksum === undefined ? {} : { checksum: spec.checksum }),
-  })
-}
 function requiredArg(value: string | undefined, usageText: string): string { if (value === undefined) throw new Error(`Usage: chronolog ${usageText}`); return value }
-function labelOptions(label?: string): { readonly applicationLabel?: string } { return label === undefined ? {} : { applicationLabel: label } }
 function output(value: unknown): void { process.stdout.write(`${JSON.stringify(value, jsonReplacer, 2)}\n`) }
 function jsonReplacer(_key: string, value: unknown): unknown {
   if (typeof value === 'bigint') return value.toString(10)
@@ -263,6 +215,6 @@ function jsonReplacer(_key: string, value: unknown): unknown {
   return value
 }
 function usage(code: number): never {
-  process.stderr.write('Usage: chronolog <status|doctor|query|transact|outcome|result|evidence|watermark|replication|governance|migrations|catalog|seed> ...\n')
+  process.stderr.write('Usage: chronolog <status|doctor|query|transact|outcome|evidence|watermark|replication|governance|seed> ...\n')
   process.exit(code)
 }

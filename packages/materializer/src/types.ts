@@ -1,5 +1,4 @@
-import type { ExecutionManifest } from '@chronolog/ir'
-import type { TransactionCore } from '@chronolog/protocol'
+import type { ExecutionManifest, TransactionCore } from '@chronolog/protocol'
 
 export type ContentHashAlgorithm = 'sha2-256' | 'blake3-256' | 'dolt-blake3-160'
 
@@ -180,8 +179,6 @@ export interface DifferentialObservation {
   readonly stateDigest: ContentId
   readonly protectedLogDigest: Uint8Array
   readonly outcomeSetDigest: Uint8Array
-  readonly queryResultDigest: Uint8Array
-  readonly rejectionAttributionDigest: Uint8Array
 }
 
 export interface DifferentialFixtureObject {

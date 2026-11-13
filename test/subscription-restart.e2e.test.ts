@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
+import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   createDoltLiteMaterializationRuntime,
@@ -99,7 +99,7 @@ async function node(name: string, identity: Ed25519KeyPair, transport: Chronolog
   const native = readNativeEngineInfo()
   const materializer = await DeterministicMaterializer.open({
     path: join(directory, 'application.db'),
-    executionManifest: createCoreExecutionManifest({ profile: 'chronolog-core-portable', engine: native.descriptor, engineDigest: native.digest }),
+    executionManifest: createExecutionManifest({ profile: 'chronolog-core-portable', engine: native.descriptor, engineDigest: native.digest }),
   })
   const created = new ChronologNode({
     groupId: bytes32(1),

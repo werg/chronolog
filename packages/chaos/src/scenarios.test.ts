@@ -31,7 +31,6 @@ describe('chaos scenarios', () => {
       workload: {
         ...builtInScenarios.smoke.workload,
         maximumTransfer: 13,
-        resultSampleSize: 7,
         operationWeights: { transfer: 3, constraint_rejection: 1 },
       },
     })

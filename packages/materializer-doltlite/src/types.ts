@@ -1,13 +1,4 @@
-import type { TransactionCore, TransactionOrderKey } from '@chronolog/protocol'
-import type {
-  ExecutionManifest,
-} from '@chronolog/ir'
-import type {
-  CanonicalSqlResult,
-  SqlResultMode,
-  SqlStatement,
-  TransactionResultEnvelopeV1,
-} from '@chronolog/protocol'
+import type { ExecutionManifest, TransactionCore, TransactionOrderKey } from '@chronolog/protocol'
 
 export interface AdmittedTransaction {
   readonly txId: Uint8Array
@@ -17,26 +8,17 @@ export interface AdmittedTransaction {
   readonly core: TransactionCore
 }
 
-export type TransactionOutcomeKind =
-  | 'accepted'
-  | 'rejected_precondition'
-  | 'rejected_execution'
+export type TransactionOutcomeKind = 'accepted' | 'rejected'
 
 export interface TransactionOutcome {
   readonly txId: Uint8Array
   readonly orderKey: TransactionOrderKey
   readonly orderIndex: number
   readonly outcome: TransactionOutcomeKind
+  /** `assert:<code>`, `constraint`, `step_limit`, … ; null when accepted. */
   readonly rejectionCode: string | null
-  readonly failingPreconditionId: number | null
-  readonly failingPreconditionIndex: number | null
+  /** Index of the statement that failed; null when accepted. */
   readonly failingStatementIndex: number | null
-  readonly failurePhase: 'precondition' | 'statement' | 'finalize' | null
-  readonly failingConstraintIdentity: Uint8Array | null
-  readonly failingTriggerIdentity: Uint8Array | null
-  readonly resultEnvelopeVersion: 1 | null
-  readonly resultEnvelope: Uint8Array | null
-  readonly resultDigest: Uint8Array | null
 }
 
 export interface TransactionLogRow extends TransactionOutcome {
@@ -99,16 +81,16 @@ export interface NativeEngineManifest {
 }
 
 export interface SqlRuntimeLimits {
-  /** Maximum signed SQL source size in UTF-8 bytes. */
+  /** Maximum SQL source size in UTF-8 bytes. */
   readonly maxSqlBytes: number
-  /** Approximate SQLite virtual-machine operations per prepare or execution. */
+  /** SQLite virtual-machine operations allowed per statement. */
   readonly maxVmSteps: number
   /** Number of VM operations between progress callbacks. */
   readonly progressGranularity: number
-  /** Maximum rows returned by one query or precondition. */
+  /** Maximum bytes of one string or BLOB value (SQLITE_LIMIT_LENGTH). */
+  readonly maxValueBytes: number
+  /** Maximum rows returned by one local query. */
   readonly maxResultRows: number
-  /** Maximum canonical result bytes returned by one query or precondition. */
-  readonly maxResultBytes: number
 }
 
 export interface NativeSecurityConfiguration {
@@ -135,15 +117,6 @@ export interface DoltBranchInfoLike {
   readonly hash: string
 }
 
-export interface MaterializedSqlQueryResult {
-  readonly revision: bigint
-  readonly orderLength: number
-  readonly executionManifestDigest: Uint8Array
-  readonly statement: SqlStatement
-  readonly result: CanonicalSqlResult
-  readonly resultDigest: Uint8Array
-}
-
 export type LocalSqlValue =
   | { readonly kind: 'null' }
   | { readonly kind: 'integer'; readonly value: string }
@@ -158,11 +131,6 @@ export interface LocalSqlQueryResult {
   readonly rows: readonly (readonly LocalSqlValue[])[]
 }
 
-export interface ObserveSqlOptions {
-  readonly atRevision?: bigint
-  readonly resultMode: SqlResultMode
-}
-
 export interface LocalSqlOptions {
   readonly atRevision?: bigint
 }
@@ -171,16 +139,7 @@ export interface MaterializerSqlBackend {
   readonly revision: bigint
   readonly orderLength: number
   readonly executionManifestDigest: Uint8Array
-  observe(statement: SqlStatement, options: ObserveSqlOptions): Promise<MaterializedSqlQueryResult>
   localQuery(sql: string, parameters?: readonly LocalSqlValue[], options?: LocalSqlOptions): LocalSqlQueryResult
-  validateStatement(statement: SqlStatement, mode: 'precondition' | 'body'): readonly SqlDiagnostic[]
-  transactionResult(txId: Uint8Array): TransactionResultEnvelopeV1 | null
-}
-
-export interface SqlDiagnostic {
-  readonly code: string
-  readonly startByte?: number
-  readonly endByte?: number
 }
 
 export interface StatementLike {
@@ -193,6 +152,10 @@ export interface StatementLike {
   readonly sourceSQL: string
   /** UTF-8 byte offset immediately after the prepared statement. */
   readonly tailOffset: number
+  /** Number of SQL parameters (largest parameter position). */
+  readonly parameterCount: number
+  /** SQLite's position of a named or numbered parameter, or 0. */
+  parameterIndex(name: string): number
 }
 
 export interface DatabaseLike {
@@ -216,6 +179,9 @@ export interface DatabaseLike {
   /** Returns the previous value, matching sqlite3_limit(). */
   setLimit(category: number, value: number): number
   interrupt(): void
+  /** Pin 'now', the PRNG seed and UTC localtime; resets last_insert_rowid. */
+  setDeterministicContext(unixMs: bigint, seed: number): void
+  clearDeterministicContext(): void
   doltCommit(message: string): string
   doltBranch(name: string, from?: string): void
   doltCheckout(branch: string): void

@@ -1,32 +1,22 @@
-import type { LogicalValue } from '@chronolog/ir'
 import {
-  decodeCanonicalSqlResult,
-  decodeTransactionResultEnvelope,
-  digestTransactionResultEnvelope,
-  encodeSqlBindingValue,
-  numberToSqlRealBinding,
-  type CanonicalSqlColumn,
-  type CanonicalSqlResult,
-  type CanonicalSqlValue,
-  type SqlBindingValue,
-  type SqlResultMode,
-  type TransactionResultEnvelopeV1,
+  isSqlValue,
+  toSqlValue,
+  type SqlStatement,
+  type SqlValue,
 } from '@chronolog/protocol'
 import {
   ChronologRpcError,
   isChronologRpcError,
-  type BeginDraftResponse,
   type LiveSqlEvent,
+  type LocalSqlValue,
   type NodeStatus,
-  type PublishDraftResponse,
-  type RebaseDraftResponse,
   type ReplicationStatus,
   type RevisionMetadata,
   type RpcCallOptions,
   type RpcSqlStatement,
   type RpcTransport,
   type SettlementEvidence,
-  type SqlDiagnostic,
+  type SubmitTransactionResponse,
   type TransactionOutcome,
   type UnaryRequest,
   type UnaryResponse,
@@ -43,16 +33,10 @@ import {
   type LocalSqlInput,
 } from './local-sql.js'
 import { StreamResource } from './stream-resource.js'
-import { blob, boolean, int64, text, timestampMsFromDate, type LogicalInput } from './values.js'
-
-export interface GeneratedSchemaBindings {
-  readonly executionManifestDigest: string
-}
 
 export interface ChronologClientOptions {
   readonly transport: RpcTransport
   readonly groupId: string
-  readonly bindings?: GeneratedSchemaBindings
   readonly token?: string
   readonly requestId?: () => string
   readonly unaryRetryAttempts?: number
@@ -80,288 +64,53 @@ export interface LiveQueryValue {
 
 export interface TransactionOptions {
   readonly signal?: AbortSignal
-  readonly atRevision?: string
-  readonly ttlMs?: number
+  /** Repeating a key with the same statements returns the original submission. */
   readonly idempotencyKey?: string
 }
 
-export interface DraftCommandOptions { readonly applicationLabel?: string }
-export interface DraftObserveOptions extends DraftCommandOptions { readonly resultMode?: SqlResultMode }
-
-export type ClientSqlValue = null | boolean | bigint | number | string | Uint8Array | Date | LogicalInput
+/** A JavaScript value bound to a SQL parameter; see `toSqlValue` for the mapping. */
+export type ClientSqlValue = null | undefined | boolean | bigint | number | string | Uint8Array | SqlValue
 export type ClientSqlBindings = readonly ClientSqlValue[] | Readonly<Record<string, ClientSqlValue>>
 
-/** Structural shape emitted by common SQLite query builders. */
+/** One statement of a transaction, in the shape common SQL builders produce. */
 export interface CompiledSqlStatement {
   readonly sql: string
-  readonly parameters?: ClientSqlBindings
+  /** Positional values, or named values keyed with or without their `:`/`@`/`$` prefix. */
+  readonly params?: readonly unknown[] | Readonly<Record<string, unknown>>
 }
 
-export type DecodedSqlValue = null | bigint | number | string | Uint8Array | LogicalValue |
-  Extract<CanonicalSqlValue, { readonly kind: 'registered' }>
-export interface DecodedSqlResult {
-  readonly mode: SqlResultMode
-  readonly columns: readonly CanonicalSqlColumn[]
-  readonly rows: readonly (readonly DecodedSqlValue[])[]
-  readonly raw: CanonicalSqlResult
-}
-
-export class ClientManifestMismatchError extends Error {
-  readonly code = 'CLIENT_EXECUTION_MANIFEST_MISMATCH'
-  constructor(
-    readonly expectedExecutionManifestDigest: string,
-    readonly actualExecutionManifestDigest: string,
-  ) {
-    super('Generated bindings do not match the node execution manifest')
-    this.name = 'ClientManifestMismatchError'
-  }
-}
-
-interface ObservationProvenance {
-  readonly draftId: string
-  readonly generation: number
-  readonly observationId: string
-  readonly observationToken: string
-}
-
-const observationProvenance = new WeakMap<object, ObservationProvenance>()
-
-export class ObservedSqlResult {
-  constructor(
-    readonly statement: CompiledSqlStatement,
-    readonly result: DecodedSqlResult,
-    readonly revision: RevisionMetadata,
-    readonly resultDigest: string,
-    provenance: ObservationProvenance,
-  ) {
-    observationProvenance.set(this, provenance)
-    Object.freeze(this)
-  }
-}
-
-export class DraftStatementHandle {
-  #index: number | null
-  constructor(readonly draftId: string, index: number) { this.#index = index }
-  get statementIndex(): number {
-    if (this.#index === null) throw new TypeError('Draft statement handle is no longer valid')
-    return this.#index
-  }
-  _invalidate(): void { this.#index = null }
-}
-
-export interface TransactionResultSnapshot {
-  readonly revision: RevisionMetadata
-  readonly digest: string
-  readonly envelope: TransactionResultEnvelopeV1
-}
+export type TransactionStatementInput = string | CompiledSqlStatement | SqlStatement
 
 export class TransactionHandle {
   readonly outcome: StreamResource<TransactionOutcome>
   readonly evidence: StreamResource<SettlementEvidence>
-  readonly result: StreamResource<TransactionResultSnapshot | null>
 
   constructor(
     readonly client: ChronologClient,
-    readonly publication: PublishDraftResponse,
-    readonly draftId: string,
+    readonly submission: SubmitTransactionResponse,
   ) {
-    this.outcome = client.transactionOutcome(publication.transactionId)
-    this.evidence = client.settlementEvidence(publication.transactionId)
-    this.result = client.transactionResult(publication.transactionId)
+    this.outcome = client.transactionOutcome(submission.transactionId)
+    this.evidence = client.settlementEvidence(submission.transactionId)
   }
 
-  get transactionId(): string { return this.publication.transactionId }
+  get transactionId(): string { return this.submission.transactionId }
 
-  async getResult(options: { readonly atMaterializedRevision?: string } = {}): Promise<TransactionResultSnapshot> {
-    return this.client.getTransactionResult(this.transactionId, options)
-  }
-
-  statement(snapshot: TransactionResultSnapshot, handle: DraftStatementHandle) {
-    if (handle.draftId !== this.draftId) throw new TypeError('Statement handle belongs to a different transaction draft')
-    const statement = snapshot.envelope.statements[handle.statementIndex]
-    if (statement === undefined) throw new TypeError('Statement handle does not belong to this accepted result')
-    return statement
-  }
-
-  dispose(): void { this.outcome.dispose(); this.evidence.dispose(); this.result.dispose() }
-  [Symbol.dispose](): void { this.dispose() }
-}
-
-export class TransactionDraft {
-  readonly #client: ChronologClient
-  readonly #draft: BeginDraftResponse
-  #tail: Promise<void> = Promise.resolve()
-  #failed: unknown
-  #pinnedRevision: RevisionMetadata
-  #generation = 0
-  #preconditionCount = 0
-  #statementCount = 0
-  readonly #invalidatedObservations = new Set<string>()
-  readonly #handles: DraftStatementHandle[] = []
-
-  constructor(client: ChronologClient, draft: BeginDraftResponse) {
-    this.#client = client
-    this.#draft = draft
-    this.#pinnedRevision = draft.pinnedRevision
-  }
-
-  get id(): string { return this.#draft.draftId }
-  get pinnedRevision(): RevisionMetadata { return this.#pinnedRevision }
-  get reservedAuthorTimestampMs(): bigint { return BigInt(this.#draft.reservedAuthorTimestampMs) }
-  get transactionNonce(): Uint8Array { return fromBase64Url(this.#draft.transactionNonce) }
-
-  observe(sql: string, bindings?: ClientSqlBindings, options?: DraftObserveOptions): Promise<ObservedSqlResult>
-  observe(statement: CompiledSqlStatement, options?: DraftObserveOptions): Promise<ObservedSqlResult>
-  observe(
-    input: string | CompiledSqlStatement,
-    bindingsOrOptions: ClientSqlBindings | DraftObserveOptions = [],
-    inputOptions: DraftObserveOptions = {},
-  ): Promise<ObservedSqlResult> {
-    const compiled = typeof input === 'string'
-      ? { sql: input, parameters: bindingsOrOptions as ClientSqlBindings }
-      : input
-    const options = typeof input === 'string' ? inputOptions : bindingsOrOptions as DraftObserveOptions
-    return this.#enqueueResult(async () => {
-      const response = await this.#client._unary('transaction.observeSql', {
-        groupId: this.#client.groupId,
-        draftId: this.id,
-        requestId: this.#client._requestId(),
-        statement: encodeConsensusStatement(compiled),
-        resultMode: options.resultMode ?? 'ordered',
-        ...(options.applicationLabel === undefined ? {} : { applicationLabel: options.applicationLabel }),
-      })
-      this.#client._assertCompatibility(response.revision)
-      const result = decodeSqlResult(decodeCanonicalSqlResult(fromBase64Url(response.canonicalResult)))
-      return new ObservedSqlResult(
-        {
-          sql: response.statement.sql,
-          ...(compiled.parameters === undefined ? {} : { parameters: compiled.parameters }),
-        },
-        result,
-        response.revision,
-        response.resultDigest,
-        {
-          draftId: this.id,
-          generation: this.#generation,
-          observationId: response.observationId,
-          observationToken: response.observationToken,
-        },
-      )
-    })
-  }
-
-  expect(observed: ObservedSqlResult, options: DraftCommandOptions = {}): this {
-    const provenance = observationProvenance.get(observed)
-    if (provenance === undefined || provenance.draftId !== this.id) throw new TypeError('An observation can only be expected by its originating draft')
-    if (provenance.generation !== this.#generation || this.#invalidatedObservations.has(provenance.observationId)) {
-      throw new TypeError('Observation was invalidated by draft rebase')
+  /** Resolves once the transaction is accepted or rejected at its current position. */
+  async settled(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
+    for await (const outcome of this.outcome) {
+      if (options.signal?.aborted === true) throw options.signal.reason
+      if (outcome.outcome.type !== 'pending') return outcome
     }
-    this.#preconditionCount += 1
-    this.#enqueue(async () => {
-      await this.#client._unary('transaction.addPrecondition', {
-        groupId: this.#client.groupId,
-        draftId: this.id,
-        requestId: this.#client._requestId(),
-        source: { kind: 'observation', observationId: provenance.observationId, observationToken: provenance.observationToken },
-        ...(options.applicationLabel === undefined ? {} : { applicationLabel: options.applicationLabel }),
-      })
-    })
-    return this
+    throw new ChronologRpcError('transport_unavailable', 'Outcome stream ended before the transaction settled')
   }
 
-  assert(sql: string, bindings: ClientSqlBindings = [], options: DraftCommandOptions = {}): this {
-    this.#preconditionCount += 1
-    this.#enqueue(async () => {
-      await this.#client._unary('transaction.addPrecondition', {
-        groupId: this.#client.groupId,
-        draftId: this.id,
-        requestId: this.#client._requestId(),
-        source: { kind: 'assert_true', id: nextClientPreconditionId(), statement: encodeConsensusStatement({ sql, parameters: bindings }) },
-        ...(options.applicationLabel === undefined ? {} : { applicationLabel: options.applicationLabel }),
-      })
-    })
-    return this
-  }
-
-  exec(sql: string, bindings?: ClientSqlBindings): DraftStatementHandle
-  exec(statement: CompiledSqlStatement): DraftStatementHandle
-  exec(statements: readonly CompiledSqlStatement[]): readonly DraftStatementHandle[]
-  exec(
-    input: string | CompiledSqlStatement | readonly CompiledSqlStatement[],
-    bindings: ClientSqlBindings = [],
-  ): DraftStatementHandle | readonly DraftStatementHandle[] {
-    const statements = typeof input === 'string'
-      ? [{ sql: input, parameters: bindings }]
-      : Array.isArray(input) ? input : [input as CompiledSqlStatement]
-    const handles = statements.map((_, offset) => new DraftStatementHandle(this.id, this.#statementCount + offset))
-    this.#handles.push(...handles)
-    this.#statementCount += statements.length
-    this.#enqueue(async () => {
-      await this.#client._unary('transaction.addStatements', {
-        groupId: this.#client.groupId,
-        draftId: this.id,
-        requestId: this.#client._requestId(),
-        statements: statements.map(encodeConsensusStatement),
-      })
-    })
-    return Array.isArray(input) ? handles : handles[0]!
-  }
-
-  validate(): Promise<readonly SqlDiagnostic[]> {
-    return this.#enqueueResult(async () => (await this.#client._unary('transaction.validateDraft', {
-      groupId: this.#client.groupId,
-      draftId: this.id,
-      requestId: this.#client._requestId(),
-    })).diagnostics)
-  }
-
-  rebase(options: { readonly toRevision?: string; readonly refreshObservations?: boolean; readonly renewContext?: boolean } = {}): Promise<RebaseDraftResponse> {
-    return this.#enqueueResult(async () => {
-      const refresh = options.refreshObservations ?? false
-      const response = await this.#client._unary('transaction.rebaseDraft', {
-        groupId: this.#client.groupId,
-        draftId: this.id,
-        requestId: this.#client._requestId(),
-        refreshObservations: refresh,
-        renewContext: options.renewContext ?? false,
-        ...(options.toRevision === undefined ? {} : { toRevision: options.toRevision }),
-      })
-      this.#client._assertCompatibility(response.pinnedRevision)
-      this.#pinnedRevision = response.pinnedRevision
-      for (const id of response.invalidatedObservationIds) this.#invalidatedObservations.add(id)
-      if (!refresh) this.#generation += 1
-      return response
-    })
-  }
-
-  async _flushAndValidate(): Promise<void> {
-    await this.#tail
-    if (this.#failed !== undefined) throw errorFromUnknown(this.#failed)
-    if (this.#preconditionCount === 0) throw new TypeError('Every transaction requires a precondition')
-    if (this.#statementCount === 0) throw new TypeError('Every transaction requires a body statement')
-    const diagnostics = await this.validate()
-    await this.#tail
-    const error = diagnostics.find((diagnostic) => diagnostic.severity === 'error')
-    if (error !== undefined) throw new ChronologRpcError('protocol_rejected', error.code, { details: { code: error.code } })
-  }
-
-  _invalidateHandles(): void { for (const handle of this.#handles) handle._invalidate() }
-
-  #enqueue(operation: () => Promise<void>): void { void this.#enqueueResult(operation).catch(() => undefined) }
-  #enqueueResult<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#tail.then(async () => {
-      if (this.#failed !== undefined) throw errorFromUnknown(this.#failed)
-      return operation()
-    })
-    this.#tail = result.then(() => undefined, (error: unknown) => { if (this.#failed === undefined) this.#failed = error })
-    return result
-  }
+  dispose(): void { this.outcome.dispose(); this.evidence.dispose() }
+  [Symbol.dispose](): void { this.dispose() }
 }
 
 export class ChronologClient {
   readonly groupId: string
   readonly #transport: RpcTransport
-  readonly #bindings?: GeneratedSchemaBindings
   readonly #token?: string
   readonly #idFactory: () => string
   readonly #unaryRetryAttempts: number
@@ -372,7 +121,6 @@ export class ChronologClient {
   constructor(options: ChronologClientOptions) {
     this.groupId = options.groupId
     this.#transport = options.transport
-    if (options.bindings !== undefined) this.#bindings = options.bindings
     if (options.token !== undefined) this.#token = options.token
     this.#idFactory = options.requestId ?? (() => crypto.randomUUID())
     this.#unaryRetryAttempts = options.unaryRetryAttempts ?? 2
@@ -428,87 +176,23 @@ export class ChronologClient {
     }))
   }
 
-  async transaction(build: (draft: TransactionDraft) => void | Promise<void>, options: TransactionOptions = {}): Promise<TransactionHandle> {
-    const begin = await this._unary('transaction.beginDraft', {
+  /**
+   * Submit ordinary SQLite statements as one replicated transaction. Any
+   * failing statement rejects the whole transaction; use
+   * `SELECT chronolog_assert(condition, 'code')` to state assumptions.
+   */
+  async transaction(statements: readonly TransactionStatementInput[], options: TransactionOptions = {}): Promise<TransactionHandle> {
+    const submission = await this._unary('transaction.submit', {
       groupId: this.groupId,
       requestId: this._requestId(),
-      ...(options.atRevision === undefined ? {} : { atRevision: options.atRevision }),
-      ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+      statements: statements.map(encodeTransactionStatement),
+      ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
     }, options.signal === undefined ? {} : { signal: options.signal })
-    this._assertCompatibility(begin.pinnedRevision)
-    const draft = new TransactionDraft(this, begin)
-    try {
-      await build(draft)
-      await draft._flushAndValidate()
-      const publication = await this._unary('transaction.publishDraft', {
-        groupId: this.groupId,
-        draftId: begin.draftId,
-        requestId: this._requestId(),
-        idempotencyKey: options.idempotencyKey ?? this._requestId(),
-      }, options.signal === undefined ? {} : { signal: options.signal })
-      this.#assertManifest(publication.executionManifestDigest)
-      return new TransactionHandle(this, publication, begin.draftId)
-    } catch (error) {
-      draft._invalidateHandles()
-      await this._unary('transaction.cancelDraft', { groupId: this.groupId, draftId: begin.draftId, requestId: this._requestId() }).catch(() => undefined)
-      throw error
-    }
+    return new TransactionHandle(this, submission)
   }
 
   async getTransactionOutcome(transactionId: string): Promise<TransactionOutcome> {
     return this._unary('transaction.getOutcome', { groupId: this.groupId, transactionId, requestId: this._requestId() })
-  }
-
-  async getTransactionResult(transactionId: string, options: { readonly atMaterializedRevision?: string } = {}): Promise<TransactionResultSnapshot> {
-    const response = await this._unary('transaction.getResult', {
-      groupId: this.groupId,
-      transactionId,
-      requestId: this._requestId(),
-      ...(options.atMaterializedRevision === undefined ? {} : { atMaterializedRevision: options.atMaterializedRevision }),
-    })
-    this._assertCompatibility(response.revision)
-    const bytes = fromBase64Url(response.canonicalEnvelope)
-    if (bytes.byteLength !== response.reference.byteLength) {
-      throw new ChronologRpcError('protocol_rejected', 'Transaction result byte length mismatch')
-    }
-    const digest = toBase64Url(await digestTransactionResultEnvelope(bytes))
-    if (digest !== response.reference.digest) {
-      throw new ChronologRpcError('protocol_rejected', 'Transaction result digest mismatch')
-    }
-    return {
-      revision: response.revision,
-      digest: response.reference.digest,
-      envelope: decodeTransactionResultEnvelope(bytes),
-    }
-  }
-
-  transactionResult(transactionId: string): StreamResource<TransactionResultSnapshot | null> {
-    const requestId = this._requestId()
-    let outcomeCursor: string | undefined
-    return this.#track(new StreamResource({
-      open: (cursor, signal) => mapAsyncAwait(
-        this.#transport.stream('transaction.streamOutcome', {
-          groupId: this.groupId,
-          transactionId,
-          requestId,
-          ...(cursor === undefined ? {} : { resumeAfterEventSetRevision: cursor }),
-        }, this.#callOptions(signal)),
-        async (outcome): Promise<TransactionResultSnapshot | null> => {
-          outcomeCursor = outcome.eventSetRevision
-          if (outcome.outcome.type !== 'accepted') return null
-          try {
-            return await this.getTransactionResult(transactionId, { atMaterializedRevision: outcome.materializedRevision })
-          } catch (error) {
-            if (isChronologRpcError(error) && error.code === 'revision_not_retained') return null
-            throw error
-          }
-        },
-      ),
-      // Resume the source outcome stream from the event that was consumed,
-      // including when its accepted result revision was no longer retained.
-      cursor: () => outcomeCursor,
-      ...(this.#streamRetryDelayMs === undefined ? {} : { retryDelayMs: this.#streamRetryDelayMs }),
-    }))
   }
 
   transactionOutcome(transactionId: string): StreamResource<TransactionOutcome> {
@@ -592,7 +276,8 @@ export class ChronologClient {
   }
 
   _requestId(): string { return this.#idFactory() }
-  _assertCompatibility(revision: RevisionMetadata): void { this.#assertManifest(revision.executionManifestDigest) }
+  /** Retained for callers that validate revisions; every manifest is accepted. */
+  _assertCompatibility(_revision: RevisionMetadata): void { /* no generated bindings to check */ }
 
   async _unary<M extends UnaryRpcMethod>(method: M, request: UnaryRequest<M>, options: RpcCallOptions = {}): Promise<UnaryResponse<M>> {
     if (this.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
@@ -604,11 +289,6 @@ export class ChronologClient {
         await delay(Math.min(50 * 2 ** attempt, 500), options.signal)
       }
     }
-  }
-
-  #assertManifest(actual: string): void {
-    const expected = this.#bindings?.executionManifestDigest
-    if (expected !== undefined && expected !== actual) throw new ClientManifestMismatchError(expected, actual)
   }
 
   #revisionStream<T>(open: (cursor: string | undefined, signal: AbortSignal) => AsyncIterable<T>, cursor: (value: T) => string | undefined): StreamResource<T> {
@@ -626,78 +306,43 @@ export class ChronologClient {
   }
 }
 
-export function decodeSqlResult(result: CanonicalSqlResult): DecodedSqlResult {
-  return Object.freeze({
-    mode: result.mode,
-    columns: result.columns,
-    rows: result.rows.map((row) => Object.freeze(row.map(decodeSqlValue))),
-    raw: result,
-  })
-}
-
-export function decodeSqlValue(value: CanonicalSqlValue): DecodedSqlValue {
-  switch (value.kind) {
-    case 'null': return null
-    case 'integer': return value.value
-    case 'real': return new DataView(value.bits.buffer, value.bits.byteOffset, 8).getFloat64(0, false)
-    case 'text': return new TextDecoder('utf-8', { fatal: true }).decode(value.utf8)
-    case 'blob': return Uint8Array.from(value.bytes)
-    case 'logical': return value.value
-    case 'registered': return {
-      kind: 'registered',
-      typeId: value.typeId,
-      implementationDigest: Uint8Array.from(value.implementationDigest),
-      canonicalPayload: Uint8Array.from(value.canonicalPayload),
+function encodeTransactionStatement(input: TransactionStatementInput): RpcSqlStatement {
+  if (typeof input === 'string') return { sql: input, bindings: [] }
+  if ('bindings' in input) {
+    return {
+      sql: input.sql,
+      bindings: input.bindings.map((binding) => ({ parameter: binding.parameter, value: toRpcValue(binding.value) })),
     }
   }
-}
-
-function encodeConsensusStatement(statement: CompiledSqlStatement): RpcSqlStatement {
-  return {
-    sql: statement.sql,
-    bindings: normalizeConsensusBindings(statement.sql, statement.parameters ?? []).map((binding) => ({
-      parameter: binding.parameter,
-      canonicalValue: toBase64Url(encodeSqlBindingValue(toSqlBindingValue(binding.value))),
-    })),
+  const params = input.params ?? []
+  if (isClientSqlValueArray(params)) {
+    return {
+      sql: input.sql,
+      bindings: params.map((value, index) => ({ parameter: { kind: 'index' as const, index: index + 1 }, value: toRpcValue(toSqlValue(value)) })),
+    }
   }
-}
-
-function normalizeConsensusBindings(sql: string, bindings: ClientSqlBindings): readonly {
-  readonly parameter: { readonly kind: 'index'; readonly index: number } | { readonly kind: 'name'; readonly name: string }
-  readonly value: ClientSqlValue
-}[] {
-  if (isClientSqlValueArray(bindings)) {
-    return bindings.map((value, index) => ({ parameter: { kind: 'index' as const, index: index + 1 }, value }))
-  }
-  const named = bindings
-  const parameters = scanNamedParameters(sql)
-  const result: { parameter: { kind: 'name'; name: string }; value: ClientSqlValue }[] = []
   const used = new Set<string>()
-  for (const token of parameters) {
+  const bindings = scanNamedParameters(input.sql).map((token) => {
     const bare = token.slice(1)
-    const exact = Object.hasOwn(named, token) ? token : Object.hasOwn(named, bare) ? bare : undefined
-    if (exact === undefined) throw new TypeError(`Missing SQL binding ${token}`)
-    result.push({ parameter: { kind: 'name', name: token }, value: named[exact]! })
-    used.add(exact)
-  }
-  const unused = Object.keys(named).filter((key) => !used.has(key))
+    const key = Object.hasOwn(params, token) ? token : Object.hasOwn(params, bare) ? bare : undefined
+    if (key === undefined) throw new TypeError(`Missing SQL binding ${token}`)
+    used.add(key)
+    return { parameter: { kind: 'name' as const, name: token }, value: toRpcValue(toSqlValue(params[key])) }
+  })
+  const unused = Object.keys(params).filter((key) => !used.has(key))
   if (unused.length > 0) throw new TypeError(`Unused SQL bindings: ${unused.join(', ')}`)
-  return result
+  return { sql: input.sql, bindings }
 }
 
-function toSqlBindingValue(value: ClientSqlValue): SqlBindingValue {
-  if (typeof value === 'object' && value !== null && 'kind' in value) return value
-  if (value === null) return { kind: 'null' }
-  if (typeof value === 'boolean') return boolean(value)
-  if (typeof value === 'bigint') return int64(value)
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError('Consensus SQL REAL bindings must be finite')
-    return Number.isSafeInteger(value) ? int64(value) : numberToSqlRealBinding(value)
+function toRpcValue(value: SqlValue): LocalSqlValue {
+  if (!isSqlValue(value)) throw new TypeError('Invalid SQL value')
+  switch (value.kind) {
+    case 'null': return { kind: 'null' }
+    case 'integer': return { kind: 'integer', value: value.value.toString(10) }
+    case 'real': return { kind: 'real', value: value.value }
+    case 'text': return { kind: 'text', value: value.value }
+    case 'blob': return { kind: 'blob', value: Uint8Array.from(value.value) }
   }
-  if (typeof value === 'string') return text(value)
-  if (value instanceof Uint8Array) return blob(value)
-  if (value instanceof Date) return timestampMsFromDate(value)
-  throw new TypeError('Unsupported consensus SQL binding')
 }
 
 /** Finds SQLite named parameters while ignoring quoted text, identifiers, and comments. */
@@ -735,17 +380,10 @@ function scanNamedParameters(sql: string): readonly string[] {
   return found
 }
 
-let clientPreconditionId = 0
-function nextClientPreconditionId(): number { clientPreconditionId += 1; return clientPreconditionId }
-function fromBase64Url(value: string): Uint8Array { return Uint8Array.from(Buffer.from(value, 'base64url')) }
 function toBase64Url(value: Uint8Array): string { return Buffer.from(value).toString('base64url') }
 
 async function* mapAsync<A, B>(source: AsyncIterable<A>, map: (value: A) => B): AsyncIterable<B> {
   for await (const value of source) yield map(value)
-}
-
-async function* mapAsyncAwait<A, B>(source: AsyncIterable<A>, map: (value: A) => Promise<B>): AsyncIterable<B> {
-  for await (const value of source) yield await map(value)
 }
 
 function stableClientValue(value: unknown): string {
@@ -760,11 +398,10 @@ function stableClientValue(value: unknown): string {
   return typeof value
 }
 
-function isClientSqlValueArray(value: ClientSqlBindings): value is readonly ClientSqlValue[] {
+function isClientSqlValueArray(value: readonly unknown[] | Readonly<Record<string, unknown>>): value is readonly unknown[] {
   return Array.isArray(value)
 }
 
-function errorFromUnknown(value: unknown): Error { return value instanceof Error ? value : new Error('Queued draft operation failed', { cause: value }) }
 function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted === true) return Promise.reject(signal.reason)
   return new Promise((resolve, reject) => {

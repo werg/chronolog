@@ -1,10 +1,4 @@
-import type {
-  CanonicalSqlResult,
-  SqlResultMode,
-  SqlStatement,
-  SqlTransactionProgram,
-  TransactionResultEnvelopeV1,
-} from '@chronolog/protocol'
+import type { SqlTransactionProgram } from '@chronolog/protocol'
 
 import type {
   GetGovernanceStatusRequest,
@@ -26,15 +20,6 @@ export interface GovernanceRpcAdmin {
   revokeCapabilities(request: RevokeCapabilitiesRequest): Promise<RevokeCapabilitiesResponse>
   rotateEpoch(request: RotateEpochRequest): Promise<RotateEpochResponse>
   grantHistoricalAccess(request: GrantHistoricalAccessRequest): Promise<GrantHistoricalAccessResponse>
-}
-
-export interface SqlObservationExecution {
-  readonly revision: bigint
-  readonly orderLength: number
-  readonly executionManifestDigest: Uint8Array
-  readonly statement: SqlStatement
-  readonly result: CanonicalSqlResult
-  readonly resultDigest: Uint8Array
 }
 
 export interface LocalSqlExecution {
@@ -95,17 +80,9 @@ export interface RpcNodeStatusSnapshot {
 }
 
 export interface RpcMaterializedOutcome {
-  readonly outcome: 'accepted' | 'rejected_precondition' | 'rejected_execution'
+  readonly outcome: 'accepted' | 'rejected'
   readonly rejectionCode: string | null
-  readonly failingPreconditionId: number | null
-  readonly failingPreconditionIndex: number | null
   readonly failingStatementIndex: number | null
-  readonly failurePhase: 'precondition' | 'statement' | 'finalize' | null
-  readonly failingConstraintIdentity: Uint8Array | null
-  readonly failingTriggerIdentity: Uint8Array | null
-  readonly resultEnvelopeVersion: 1 | null
-  readonly resultEnvelope: Uint8Array | null
-  readonly resultDigest: Uint8Array | null
 }
 
 export interface ChronologRpcNodeService {
@@ -132,13 +109,10 @@ export interface ChronologRpcNodeService {
   candidate(txId: Uint8Array): RpcNodeCandidate | null
   candidateCore(txId: Uint8Array): RpcNodeCandidateCore | null
   outcome(txId: Uint8Array): RpcMaterializedOutcome | null
-  transactionResult(txId: Uint8Array): TransactionResultEnvelopeV1 | null
   outcomeChangedByReplay(txId: Uint8Array): boolean
   settlementEvidence(txId: Uint8Array): Promise<RpcNodeSettlementEvidence | null>
   watermark(): Promise<RpcNodeWatermark | null>
   events(afterRevision?: bigint, signal?: AbortSignal): AsyncIterable<unknown>
-  observe(statement: SqlStatement, options: { readonly atRevision?: bigint; readonly resultMode: SqlResultMode }): SqlObservationExecution | Promise<SqlObservationExecution>
   localSql(sql: string, parameters?: readonly LocalSqlValue[], options?: { readonly atRevision?: bigint }): LocalSqlExecution
-  validateStatement(statement: SqlStatement, mode: 'precondition' | 'body'): readonly { readonly code: string; readonly startByte?: number; readonly endByte?: number }[]
   validateProgram(program: SqlTransactionProgram): void
 }

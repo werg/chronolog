@@ -1,4 +1,4 @@
-import { createCoreExecutionManifest } from '@chronolog/compiler-sqlite'
+import { createExecutionManifest } from '@chronolog/protocol'
 import {
   DeterministicMaterializer,
   readNativeEngineInfo,
@@ -16,7 +16,7 @@ const [path, requestedPoint] = process.argv.slice(2)
 if (path === undefined || requestedPoint === undefined) throw new Error('CRASH_FIXTURE_ARGUMENTS_REQUIRED')
 const point = requestedPoint as MaterializerPublicationFaultPoint
 const native = readNativeEngineInfo()
-const manifest = createCoreExecutionManifest({
+const manifest = createExecutionManifest({
   profile: 'chronolog-native-production-v1',
   engine: native.descriptor,
   engineDigest: native.digest,
@@ -39,13 +39,7 @@ const core: TransactionCore = {
   executionManifestDigest: materializer.executionManifestDigest,
   program: {
     version: 1,
-    preconditions: [{
-      id: 1,
-      query: { sql: 'SELECT 1', bindings: [] },
-      resultMode: 'scalar',
-      expectation: { kind: 'assert_true' },
-    }],
-    body: [{ sql: 'CREATE TABLE crash_probe (id INTEGER PRIMARY KEY) STRICT', bindings: [] }],
+    statements: [{ sql: 'CREATE TABLE crash_probe (id INTEGER PRIMARY KEY) STRICT', bindings: [] }],
   },
 }
 const canonicalCandidate = encodeTransactionCore(core)

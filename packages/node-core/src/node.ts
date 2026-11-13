@@ -8,12 +8,10 @@ import {
   type StoredCandidate,
   type WatermarkEvidence,
 } from '@chronolog/control-store'
-import { compileSqlProgram } from '@chronolog/compiler-sqlite'
 import type {
   AdmittedTransaction,
   MaterializedLocalSqlResult,
   MaterializedLocalSqlValue,
-  MaterializedObservationResult,
   MaterializedTransactionOutcome,
 } from '@chronolog/materializer'
 import {
@@ -30,8 +28,7 @@ import {
   utf8,
   type TransactionCore,
   type SqlTransactionProgram,
-  type SqlStatement,
-  type SqlResultMode,
+  assertValidSqlTransactionProgram,
   type ValidatorAttestation,
   type ValidatorHeartbeat,
 } from '@chronolog/protocol'
@@ -179,7 +176,7 @@ export class ChronologNode {
 
   async publish(input: PublishTransactionInput): Promise<PublishedTransaction> {
     this.#assertReady()
-    compileSqlProgram(input.program)
+    assertValidSqlTransactionProgram(input.program)
     const membershipRevision = input.membershipRevision ?? this.membershipRevision
     const validationPolicy = input.validationPolicy ?? this.validationPolicy
     const allocated = input.authorTimestampMs === undefined && input.nonce === undefined
@@ -227,7 +224,7 @@ export class ChronologNode {
   }
 
   validateProgram(program: SqlTransactionProgram): void {
-    compileSqlProgram(program)
+    assertValidSqlTransactionProgram(program)
   }
 
   async publishHeartbeat(): Promise<void> {
@@ -315,13 +312,6 @@ export class ChronologNode {
     })
   }
 
-  observe(
-    statement: SqlStatement,
-    options: { readonly atRevision?: bigint; readonly resultMode: SqlResultMode },
-  ): Promise<MaterializedObservationResult> {
-    return this.#options.materialization.queries.observe(statement, options)
-  }
-
   localSql(
     sql: string,
     parameters: readonly MaterializedLocalSqlValue[] = [],
@@ -330,16 +320,8 @@ export class ChronologNode {
     return this.#materializerLocalSql(sql, parameters, options)
   }
 
-  validateStatement(statement: SqlStatement, mode: 'precondition' | 'body') {
-    return this.#options.materialization.queries.validateStatement(statement, mode)
-  }
-
   outcome(txId: Uint8Array): MaterializedTransactionOutcome | null {
     return this.#options.materialization.queries.outcome(txId)
-  }
-
-  transactionResult(txId: Uint8Array) {
-    return this.#options.materialization.queries.transactionResult(txId)
   }
 
   outcomeChangedByReplay(txId: Uint8Array): boolean {
@@ -495,7 +477,7 @@ export class ChronologNode {
     if (!equalBytes(core.executionManifestDigest, this.executionManifestDigest)) {
       invalid('CANDIDATE_EXECUTION_MANIFEST_DIGEST_MISMATCH')
     }
-    try { compileSqlProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
+    try { assertValidSqlTransactionProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
     const writerContext = {
       groupId: core.groupId,
       membershipRevision: core.membershipRevision,

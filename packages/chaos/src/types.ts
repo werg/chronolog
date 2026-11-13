@@ -24,7 +24,6 @@ export interface WorkloadSpec {
   readonly minimumDelta: number
   readonly maximumDelta: number
   readonly maximumTransfer?: number
-  readonly resultSampleSize?: number
   readonly operationWeights?: Partial<Readonly<Record<WorkloadOperationKind, number>>>
 }
 
@@ -32,7 +31,7 @@ export interface WorkloadExpectation {
   readonly transactionId: string
   readonly operationId: string
   readonly operation: WorkloadOperationKind
-  readonly allowedOutcomes: readonly ('accepted' | 'rejected_precondition' | 'rejected_execution')[]
+  readonly allowedOutcomes: readonly ('accepted' | 'rejected')[]
   readonly rejectionCode?: string
   readonly failingStatementIndex?: number
   readonly migrationPrefix?: string

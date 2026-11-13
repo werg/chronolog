@@ -1,17 +1,8 @@
-import type {
-  CanonicalSqlResult,
-  SqlResultMode,
-  SqlStatement,
-  TransactionOrderKey,
-  TransactionResultEnvelopeV1,
-} from '@chronolog/protocol'
+import type { TransactionOrderKey } from '@chronolog/protocol'
 
 import type { AdmittedTransaction } from './types.js'
 
-export type MaterializedTransactionOutcomeKind =
-  | 'accepted'
-  | 'rejected_precondition'
-  | 'rejected_execution'
+export type MaterializedTransactionOutcomeKind = 'accepted' | 'rejected'
 
 export interface MaterializedTransactionOutcome {
   readonly txId: Uint8Array
@@ -19,15 +10,7 @@ export interface MaterializedTransactionOutcome {
   readonly orderIndex: number
   readonly outcome: MaterializedTransactionOutcomeKind
   readonly rejectionCode: string | null
-  readonly failingPreconditionId: number | null
-  readonly failingPreconditionIndex: number | null
   readonly failingStatementIndex: number | null
-  readonly failurePhase: 'precondition' | 'statement' | 'finalize' | null
-  readonly failingConstraintIdentity: Uint8Array | null
-  readonly failingTriggerIdentity: Uint8Array | null
-  readonly resultEnvelopeVersion: 1 | null
-  readonly resultEnvelope: Uint8Array | null
-  readonly resultDigest: Uint8Array | null
 }
 
 export interface MaterializationOutcomeChange {
@@ -78,20 +61,6 @@ export type MaterializedLocalSqlValue =
   | { readonly kind: 'text'; readonly value: string }
   | { readonly kind: 'blob'; readonly value: Uint8Array }
 
-export interface MaterializedObserveOptions {
-  readonly atRevision?: bigint
-  readonly resultMode: SqlResultMode
-}
-
-export interface MaterializedObservationResult {
-  readonly revision: bigint
-  readonly orderLength: number
-  readonly executionManifestDigest: Uint8Array
-  readonly statement: SqlStatement
-  readonly result: CanonicalSqlResult
-  readonly resultDigest: Uint8Array
-}
-
 export interface MaterializedLocalSqlResult {
   readonly revision: bigint
   readonly orderLength: number
@@ -110,22 +79,13 @@ export interface MaterializedQueryService {
   readonly revision: bigint
   readonly orderLength: number
   readonly executionManifestDigest: Uint8Array
-  observe(statement: SqlStatement, options: MaterializedObserveOptions): Promise<MaterializedObservationResult>
   localSql(
     sql: string,
     parameters?: readonly MaterializedLocalSqlValue[],
     options?: { readonly atRevision?: bigint },
   ): MaterializedLocalSqlResult
-  validateStatement(statement: SqlStatement, mode: 'precondition' | 'body'): readonly MaterializedSqlDiagnostic[]
   outcome(txId: Uint8Array): MaterializedTransactionOutcome | null
-  transactionResult(txId: Uint8Array): TransactionResultEnvelopeV1 | null
   subscribe(subscriber: (revision: MaterializedRevisionSnapshot) => void): () => void
-}
-
-export interface MaterializedSqlDiagnostic {
-  readonly code: string
-  readonly startByte?: number
-  readonly endByte?: number
 }
 
 export interface MaterializationPublicationResult extends MaterializedRevisionSnapshot {

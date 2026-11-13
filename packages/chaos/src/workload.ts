@@ -1,7 +1,7 @@
 import type { ChaosCluster } from './cluster.js'
 import { errorText, type RunArtifacts } from './artifacts.js'
 import type { SeededRandom } from './rng.js'
-import { balanceQuery, balanceUpdate, schemaVersionPrecondition } from './schema.js'
+import { balanceAssertion, balanceQuery, balanceUpdate, schemaVersionAssertion } from './schema.js'
 import {
   WORKLOAD_OPERATION_KINDS,
   type ChaosScenario,
@@ -70,116 +70,18 @@ export async function runWorkload(options: {
       })
       try {
         const expectation = expectationFor(kind, operationId)
-        const handle = await options.cluster.client(node).transaction(async (draft) => {
-          switch (kind) {
-            case 'migration_chain': {
-              const assumption = schemaVersionPrecondition('profiles', 2)
-              draft.assert(assumption.sql, assumption.parameters, { applicationLabel: assumption.applicationLabel })
-              draft.exec(migrationChainStatements(expectation.migrationPrefix!))
-              break
-            }
-            case 'migration_rollback': {
-              const assumption = schemaVersionPrecondition('profiles', 2)
-              draft.assert(assumption.sql, assumption.parameters, { applicationLabel: assumption.applicationLabel })
-              draft.exec(migrationRollbackStatements(expectation.migrationPrefix!))
-              break
-            }
-            case 'legacy_client_write': {
-              const assumption = schemaVersionPrecondition('profiles', 1)
-              draft.assert(assumption.sql, assumption.parameters, { applicationLabel: assumption.applicationLabel })
-              draft.exec({
-                sql: 'INSERT INTO chaos_profiles (profile_id, display_name) VALUES (?, ?) RETURNING profile_id, display_name, schema_version',
-                parameters: [operationId, `legacy-${worker}`],
-              })
-              break
-            }
-            case 'current_client_write': {
-              const assumption = schemaVersionPrecondition('profiles', 2)
-              draft.assert(assumption.sql, assumption.parameters, { applicationLabel: assumption.applicationLabel })
-              draft.exec({
-                sql: 'INSERT INTO chaos_profiles (profile_id, display_name, email, schema_version, metadata) VALUES (?, ?, ?, 2, ?) RETURNING profile_id, display_name, email, schema_version, metadata',
-                parameters: [operationId, `current-${worker}`, `${operationId}@example.test`, random.bytes(random.integer(0, 24))],
-              })
-              break
-            }
-            case 'balance_update': {
-              const query = queries[account]!
-              const observed = await draft.observe(query.sql, query.parameters, { resultMode: 'scalar', applicationLabel: 'chaos.observe_balance' })
-              draft.expect(observed, { applicationLabel: 'chaos.expect_balance' })
-              const balance = observed.result.rows[0]?.[0]
-              if (typeof balance !== 'bigint') throw new Error('CHAOS_BALANCE_RESULT_INVALID')
-              draft.exec([
-                balanceUpdate(account, balance + BigInt(delta)),
-                ledgerInsert(operationId, 0, account, delta, random),
-              ])
-              break
-            }
-            case 'transfer': {
-              const other = distinctAccount(random, account, options.scenario.workload.accounts)
-              const amount = random.integer(1, options.scenario.workload.maximumTransfer ?? Math.max(1, Math.abs(options.scenario.workload.maximumDelta)))
-              const sourceQuery = queries[account]!
-              const targetQuery = queries[other]!
-              const [source, target] = await Promise.all([
-                draft.observe(sourceQuery.sql, sourceQuery.parameters, { resultMode: 'scalar', applicationLabel: 'chaos.observe_transfer_source' }),
-                draft.observe(targetQuery.sql, targetQuery.parameters, { resultMode: 'scalar', applicationLabel: 'chaos.observe_transfer_target' }),
-              ])
-              draft.expect(source, { applicationLabel: 'chaos.expect_transfer_source' })
-              draft.expect(target, { applicationLabel: 'chaos.expect_transfer_target' })
-              const sourceBalance = source.result.rows[0]?.[0]
-              const targetBalance = target.result.rows[0]?.[0]
-              if (typeof sourceBalance !== 'bigint' || typeof targetBalance !== 'bigint') throw new Error('CHAOS_TRANSFER_RESULT_INVALID')
-              draft.exec([
-                balanceUpdate(account, sourceBalance - BigInt(amount)),
-                balanceUpdate(other, targetBalance + BigInt(amount)),
-                ledgerInsert(operationId, 0, account, -amount, random),
-                ledgerInsert(operationId, 1, other, amount, random),
-              ])
-              break
-            }
-            case 'ordered_touch': {
-              draft.assert('SELECT 1', [], { applicationLabel: 'chaos.ordered_touch_true' })
-              const limit = random.integer(1, Math.min(3, options.scenario.workload.accounts))
-              const offset = random.integer(0, Math.max(0, options.scenario.workload.accounts - limit))
-              draft.exec(
-                'UPDATE accounts SET touched = touched + 1 RETURNING id, touched ORDER BY balance DESC LIMIT ? OFFSET ?',
-                [BigInt(limit), BigInt(offset)],
-              )
-              break
-            }
-            case 'empty_returning':
-              draft.assert('SELECT 1', [], { applicationLabel: 'chaos.empty_returning_true' })
-              draft.exec('UPDATE accounts SET touched = touched WHERE id = -1 RETURNING id, touched')
-              break
-            case 'document_insert':
-              draft.assert('SELECT 1', [], { applicationLabel: 'chaos.document_true' })
-              draft.exec({
-                sql: 'INSERT INTO chaos_documents VALUES (?, ?, ?, ?, ?) RETURNING document_id, account_id, title, payload, optional_text',
-                parameters: [operationId, BigInt(account), `title-${delta}`, random.bytes(random.integer(0, 32)), random.integer(0, 1) === 0 ? null : `optional-${worker}`],
-              })
-              break
-            case 'ddl_sequence': {
-              draft.assert('SELECT 1', [], { applicationLabel: 'chaos.ddl_true' })
-              const table = `chaos_ddl_${worker}_${operation}`
-              draft.exec([
-                { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, marker TEXT) STRICT` },
-                { sql: `ALTER TABLE ${table} ADD COLUMN payload BLOB` },
-                { sql: `SELECT name, type FROM pragma_table_info('${table}') ORDER BY cid` },
-              ])
-              break
-            }
-            case 'precondition_rejection':
-              draft.assert('SELECT 0', [], { applicationLabel: 'chaos.intentional_false' })
-              draft.exec('UPDATE accounts SET touched = touched + 1000000 WHERE id = ?', [BigInt(account)])
-              break
-            case 'constraint_rejection':
-              draft.assert('SELECT 1', [], { applicationLabel: 'chaos.constraint_true' })
-              draft.exec([
-                { sql: 'UPDATE accounts SET touched = touched + 1000000 WHERE id = ? RETURNING touched', parameters: [BigInt(account)] },
-                { sql: "INSERT INTO chaos_ledger VALUES ('__reserved_constraint_key__', 0, 0, 0, NULL, X'')" },
-              ])
-              break
-          }
-        }, {
+        const client = options.cluster.client(node)
+        const statements = await workloadStatements(kind, {
+          operationId, worker, operation: operationIndex, account, delta, random, expectation,
+          workload: options.scenario.workload,
+          readBalance: async (target) => {
+            const query = queries[target]!
+            const value = (await client.query(query.sql, [...query.parameters])).result.rows[0]?.[0]
+            if (typeof value !== 'bigint') throw new Error('CHAOS_BALANCE_RESULT_INVALID')
+            return value
+          },
+        })
+        const handle = await client.transaction(statements, {
           idempotencyKey: `${options.random.seed}:${operationId}`,
           signal: AbortSignal.timeout(15_000),
         })
@@ -208,6 +110,97 @@ export async function runWorkload(options: {
   })())
   await Promise.all(workers)
   return { attempted, published, failed, transactionIds, expectations, byKind }
+}
+
+type WorkloadStatement = { readonly sql: string; readonly params?: readonly unknown[] }
+
+/**
+ * Statements for one workload operation. Assumptions about the state the
+ * client read are ordinary `chronolog_assert` statements re-checked at the
+ * transaction's replay position.
+ */
+async function workloadStatements(kind: WorkloadOperationKind, context: {
+  readonly operationId: string
+  readonly worker: number
+  readonly operation: number
+  readonly account: number
+  readonly delta: number
+  readonly random: SeededRandom
+  readonly expectation: Omit<WorkloadExpectation, 'transactionId' | 'operationId' | 'operation'>
+  readonly workload: WorkloadSpec
+  readonly readBalance: (account: number) => Promise<bigint>
+}): Promise<readonly WorkloadStatement[]> {
+  const { operationId, worker, account, delta, random } = context
+  switch (kind) {
+    case 'migration_chain':
+      return [schemaVersionAssertion('profiles', 2), ...migrationChainStatements(context.expectation.migrationPrefix!)]
+    case 'migration_rollback':
+      return [schemaVersionAssertion('profiles', 2), ...migrationRollbackStatements(context.expectation.migrationPrefix!)]
+    case 'legacy_client_write':
+      return [schemaVersionAssertion('profiles', 1), {
+        sql: 'INSERT INTO chaos_profiles (profile_id, display_name) VALUES (?, ?) RETURNING profile_id, display_name, schema_version',
+        params: [operationId, `legacy-${worker}`],
+      }]
+    case 'current_client_write':
+      return [schemaVersionAssertion('profiles', 2), {
+        sql: 'INSERT INTO chaos_profiles (profile_id, display_name, email, schema_version, metadata) VALUES (?, ?, ?, 2, ?) RETURNING profile_id, display_name, email, schema_version, metadata',
+        params: [operationId, `current-${worker}`, `${operationId}@example.test`, random.bytes(random.integer(0, 24))],
+      }]
+    case 'balance_update': {
+      const balance = await context.readBalance(account)
+      return [
+        balanceAssertion(account, balance),
+        balanceUpdate(account, balance + BigInt(delta)),
+        ledgerInsert(operationId, 0, account, delta, random),
+      ]
+    }
+    case 'transfer': {
+      const other = distinctAccount(random, account, context.workload.accounts)
+      const amount = random.integer(1, context.workload.maximumTransfer ?? Math.max(1, Math.abs(context.workload.maximumDelta)))
+      const [sourceBalance, targetBalance] = await Promise.all([context.readBalance(account), context.readBalance(other)])
+      return [
+        balanceAssertion(account, sourceBalance),
+        balanceAssertion(other, targetBalance),
+        balanceUpdate(account, sourceBalance - BigInt(amount)),
+        balanceUpdate(other, targetBalance + BigInt(amount)),
+        ledgerInsert(operationId, 0, account, -amount, random),
+        ledgerInsert(operationId, 1, other, amount, random),
+      ]
+    }
+    case 'ordered_touch': {
+      const limit = random.integer(1, Math.min(3, context.workload.accounts))
+      const offset = random.integer(0, Math.max(0, context.workload.accounts - limit))
+      return [{
+        sql: 'UPDATE accounts SET touched = touched + 1 WHERE id IN (SELECT id FROM accounts ORDER BY balance DESC LIMIT ? OFFSET ?) RETURNING id, touched',
+        params: [BigInt(limit), BigInt(offset)],
+      }]
+    }
+    case 'empty_returning':
+      return [{ sql: 'UPDATE accounts SET touched = touched WHERE id = -1 RETURNING id, touched' }]
+    case 'document_insert':
+      return [{
+        sql: 'INSERT INTO chaos_documents VALUES (?, ?, ?, ?, ?) RETURNING document_id, account_id, title, payload, optional_text',
+        params: [operationId, BigInt(account), `title-${delta}`, random.bytes(random.integer(0, 32)), random.integer(0, 1) === 0 ? null : `optional-${worker}`],
+      }]
+    case 'ddl_sequence': {
+      const table = `chaos_ddl_${worker}_${context.operation}`
+      return [
+        { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, marker TEXT) STRICT` },
+        { sql: `ALTER TABLE ${table} ADD COLUMN payload BLOB` },
+        { sql: `SELECT name, type FROM pragma_table_info('${table}') ORDER BY cid` },
+      ]
+    }
+    case 'precondition_rejection':
+      return [
+        { sql: "SELECT chronolog_assert(0, 'intentional_false')" },
+        { sql: 'UPDATE accounts SET touched = touched + 1000000 WHERE id = ?', params: [BigInt(account)] },
+      ]
+    case 'constraint_rejection':
+      return [
+        { sql: 'UPDATE accounts SET touched = touched + 1000000 WHERE id = ? RETURNING touched', params: [BigInt(account)] },
+        { sql: "INSERT INTO chaos_ledger VALUES ('__reserved_constraint_key__', 0, 0, 0, NULL, X'')" },
+      ]
+  }
 }
 
 export function chooseWorkloadOperation(random: SeededRandom, workload: WorkloadSpec): WorkloadOperationKind {
@@ -264,7 +257,7 @@ function ledgerInsert(
 ) {
   return {
     sql: 'INSERT INTO chaos_ledger VALUES (?, ?, ?, ?, ?, ?) RETURNING operation_id, leg, account_id, delta, note, payload',
-    parameters: [operationId, BigInt(leg), BigInt(account), BigInt(delta), delta % 2 === 0 ? null : `delta-${delta}`, random.bytes(random.integer(0, 16))],
+    params: [operationId, BigInt(leg), BigInt(account), BigInt(delta), delta % 2 === 0 ? null : `delta-${delta}`, random.bytes(random.integer(0, 16))],
   }
 }
 
@@ -277,15 +270,16 @@ function distinctAccount(random: SeededRandom, account: number, accounts: number
 function expectationFor(kind: WorkloadOperationKind, operationId: string): Omit<WorkloadExpectation, 'transactionId' | 'operationId' | 'operation'> {
   switch (kind) {
     case 'balance_update': case 'transfer':
-      return { allowedOutcomes: ['accepted', 'rejected_precondition'] }
+      return { allowedOutcomes: ['accepted', 'rejected'], rejectionCode: 'assert:balance_changed' }
     case 'precondition_rejection':
-      return { allowedOutcomes: ['rejected_precondition'], rejectionCode: 'SQL_ASSERTION_FALSE' }
+      return { allowedOutcomes: ['rejected'], rejectionCode: 'assert:intentional_false', failingStatementIndex: 0 }
     case 'constraint_rejection':
-      return { allowedOutcomes: ['rejected_execution'], rejectionCode: 'SQL_CONSTRAINT_VIOLATION', failingStatementIndex: 1 }
+      return { allowedOutcomes: ['rejected'], rejectionCode: 'constraint', failingStatementIndex: 1 }
     case 'migration_chain':
       return { allowedOutcomes: ['accepted'], migrationPrefix: migrationPrefix('migrate', operationId) }
     case 'migration_rollback':
-      return { allowedOutcomes: ['rejected_execution'], rejectionCode: 'SQL_CONSTRAINT_VIOLATION', failingStatementIndex: 5, migrationPrefix: migrationPrefix('rollback', operationId) }
+      // Statement 0 is the schema assertion; the duplicate history insert is statement 6.
+      return { allowedOutcomes: ['rejected'], rejectionCode: 'constraint', failingStatementIndex: 6, migrationPrefix: migrationPrefix('rollback', operationId) }
     default:
       return { allowedOutcomes: ['accepted'] }
   }
@@ -298,7 +292,7 @@ export function migrationChainStatements(prefix: string) {
   return [
     { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, legacy_name TEXT NOT NULL) STRICT` },
     { sql: `INSERT INTO ${table} VALUES (1, 'Alpha'), (2, 'Beta') RETURNING id, legacy_name` },
-    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 1, ?)', parameters: [prefix, `${prefix}-v1`] },
+    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 1, ?)', params: [prefix, `${prefix}-v1`] },
     { sql: `CREATE INDEX ${prefix}_legacy_idx ON ${table}(legacy_name)` },
     { sql: `CREATE VIEW ${prefix}_legacy_view AS SELECT id, legacy_name FROM ${table}` },
     { sql: `CREATE TABLE ${audit} (item_id INTEGER NOT NULL, normalized_name TEXT NOT NULL) STRICT` },
@@ -312,7 +306,7 @@ export function migrationChainStatements(prefix: string) {
     { sql: `CREATE VIEW ${prefix}_current_view AS SELECT id, normalized_name FROM ${table} WHERE normalized_name IS NOT NULL` },
     { sql: `CREATE TRIGGER ${prefix}_current_trigger AFTER INSERT ON ${table} BEGIN INSERT INTO ${audit} VALUES (NEW.id, COALESCE(NEW.normalized_name, lower(NEW.legacy_name))); END` },
     { sql: `ALTER TABLE ${table} ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 2` },
-    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 2, ?)', parameters: [prefix, `${prefix}-v2`] },
+    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 2, ?)', params: [prefix, `${prefix}-v2`] },
     { sql: `INSERT INTO ${table} (id, legacy_name, normalized_name) VALUES (3, 'Gamma', 'gamma') RETURNING id, normalized_name, schema_version` },
     { sql: `SELECT id, normalized_name, schema_version FROM ${table} ORDER BY id` },
     { sql: `SELECT item_id, normalized_name FROM ${audit} ORDER BY item_id` },
@@ -327,7 +321,7 @@ export function migrationRollbackStatements(prefix: string) {
     { sql: `CREATE INDEX ${prefix}_idx ON ${table}(value)` },
     { sql: `CREATE VIEW ${prefix}_view AS SELECT id, value FROM ${table}` },
     { sql: `CREATE TRIGGER ${prefix}_trigger AFTER INSERT ON ${table} BEGIN SELECT 1; END` },
-    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 1, ?)', parameters: [prefix, `${prefix}-must-rollback`] },
+    { sql: 'INSERT INTO chaos_schema_migrations VALUES (?, 1, ?)', params: [prefix, `${prefix}-must-rollback`] },
     { sql: "INSERT INTO chaos_schema_migrations VALUES ('profiles', 1, 'duplicate-must-fail')" },
   ]
 }

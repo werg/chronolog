@@ -7,7 +7,6 @@
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
     "@chronolog/capabilities": "workspace:*",
-    "@chronolog/compiler-sqlite": "workspace:*",
     "@chronolog/control-store": "workspace:*",
     "@chronolog/crypto": "workspace:*",
     "@chronolog/materializer": "workspace:*",

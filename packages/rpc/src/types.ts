@@ -1,5 +1,3 @@
-import type { CanonicalSchemaIdentity } from '@chronolog/protocol'
-
 /** Chronolog's local RPC API. Consensus codecs are versioned separately. */
 export const RPC_API_VERSION = 'chronolog.rpc' as const
 
@@ -7,10 +5,8 @@ export type RpcApiVersion = typeof RPC_API_VERSION
 export type Revision = string
 export type GroupId = string
 export type TransactionId = string
-export type DraftId = string
 export type RequestId = string
 export type CanonicalBytes = string
-export type ResultModeName = 'scalar' | 'ordered' | 'multiset' | 'set'
 
 export type LocalSqlValue =
   | { readonly kind: 'null' }
@@ -30,8 +26,7 @@ export interface RpcSqlBinding {
   readonly parameter:
     | { readonly kind: 'index'; readonly index: number }
     | { readonly kind: 'name'; readonly name: string }
-  /** Canonical SqlBindingValue CBOR, base64url encoded. */
-  readonly canonicalValue: CanonicalBytes
+  readonly value: LocalSqlValue
 }
 
 export interface RpcSqlStatement {
@@ -46,12 +41,6 @@ export interface RevisionMetadata {
   readonly publishedOrderLength: string
   readonly executionManifestDigest: string
   readonly replaying: boolean
-}
-
-export interface CanonicalSqlResultResponse {
-  readonly resultMode: ResultModeName
-  readonly canonicalResult: CanonicalBytes
-  readonly resultDigest: string
 }
 
 export interface LocalSqlRequest {
@@ -95,111 +84,14 @@ export interface NodeStatus {
 export interface GetStatusRequest { readonly groupId?: GroupId; readonly requestId: RequestId }
 export interface StreamStatusRequest extends GetStatusRequest { readonly resumeAfterEventSetRevision?: Revision }
 
-export interface BeginDraftRequest {
+export interface SubmitTransactionRequest {
   readonly groupId: GroupId
   readonly requestId: RequestId
-  readonly atRevision?: Revision
-  readonly ttlMs?: number
-}
-
-export interface BeginDraftResponse {
-  readonly draftId: DraftId
-  readonly pinnedRevision: RevisionMetadata
-  readonly executionManifestDigest: string
-  readonly reservedAuthorTimestampMs: string
-  readonly transactionNonce: CanonicalBytes
-  readonly expiresAt: string
-}
-
-export interface DraftCommandBase {
-  readonly groupId: GroupId
-  readonly draftId: DraftId
-  readonly requestId: RequestId
-}
-
-export interface ObserveSqlRequest extends DraftCommandBase {
-  readonly statement: RpcSqlStatement
-  readonly resultMode: ResultModeName
-  readonly applicationLabel?: string
-}
-
-export interface ObserveSqlResponse extends CanonicalSqlResultResponse {
-  readonly observationId: string
-  readonly observationToken: string
-  readonly revision: RevisionMetadata
-  readonly statement: RpcSqlStatement
-}
-
-export type SqlPreconditionSource =
-  | { readonly kind: 'observation'; readonly observationId: string; readonly observationToken: string }
-  | {
-      readonly kind: 'inline'
-      readonly id: number
-      readonly statement: RpcSqlStatement
-      readonly resultMode: ResultModeName
-      readonly canonicalResult: CanonicalBytes
-    }
-  | {
-      readonly kind: 'digest'
-      readonly id: number
-      readonly statement: RpcSqlStatement
-      readonly resultMode: ResultModeName
-      readonly digest: string
-    }
-  | { readonly kind: 'assert_true'; readonly id: number; readonly statement: RpcSqlStatement }
-
-export interface AddPreconditionRequest extends DraftCommandBase {
-  readonly source: SqlPreconditionSource
-  readonly applicationLabel?: string
-}
-
-export interface AddStatementsRequest extends DraftCommandBase {
   readonly statements: readonly RpcSqlStatement[]
+  /** Repeating a key with the same statements returns the original submission. */
+  readonly idempotencyKey?: string
 }
-
-export interface ReplaceStatementsRequest extends DraftCommandBase {
-  readonly statements: readonly RpcSqlStatement[]
-}
-
-export interface SqlDiagnostic {
-  readonly code: string
-  readonly severity: 'error' | 'warning'
-  readonly preconditionIndex?: number
-  readonly statementIndex?: number
-  readonly startByte?: number
-  readonly endByte?: number
-  readonly applicationLabel?: string
-}
-
-export interface DraftMutationResponse {
-  readonly draftId: DraftId
-  readonly draftRevision: string
-  readonly preconditionCount: number
-  readonly statementCount: number
-  readonly diagnostics: readonly SqlDiagnostic[]
-  readonly expiresAt: string
-}
-
-export type ValidateDraftRequest = DraftCommandBase
-export type ValidateDraftResponse = DraftMutationResponse
-export interface RebaseDraftRequest extends DraftCommandBase {
-  readonly toRevision?: Revision
-  readonly refreshObservations: boolean
-  readonly renewContext: boolean
-}
-export interface RefreshedObservation extends ObserveSqlResponse { readonly changed: boolean }
-export interface RebaseDraftResponse extends DraftMutationResponse {
-  readonly pinnedRevision: RevisionMetadata
-  readonly executionManifestDigest: string
-  readonly reservedAuthorTimestampMs: string
-  readonly transactionNonce: CanonicalBytes
-  readonly refreshedObservations: readonly RefreshedObservation[]
-  readonly invalidatedObservationIds: readonly string[]
-}
-export type CancelDraftRequest = DraftCommandBase
-export interface CancelDraftResponse { readonly draftId: DraftId; readonly cancelled: boolean }
-export interface PublishDraftRequest extends DraftCommandBase { readonly idempotencyKey: string }
-export interface PublishDraftResponse {
+export interface SubmitTransactionResponse {
   readonly transactionId: TransactionId
   readonly candidateDigest: string
   readonly authorTimestampMs: string
@@ -209,40 +101,17 @@ export interface PublishDraftResponse {
   readonly publishedAt: string
 }
 
-export interface AcceptedResultReference {
-  readonly envelopeVersion: 1
-  readonly digest: string
-  readonly byteLength: number
-}
-
-export interface GetTransactionResultRequest {
-  readonly groupId: GroupId
-  readonly transactionId: TransactionId
-  readonly requestId: RequestId
-  readonly atMaterializedRevision?: Revision
-}
-export interface GetTransactionResultResponse {
-  readonly revision: RevisionMetadata
-  readonly transactionId: TransactionId
-  readonly reference: AcceptedResultReference
-  readonly canonicalEnvelope: CanonicalBytes
-}
-
 export type TransactionPhase = 'candidate_published' | 'collecting_attestations' | 'validation_threshold_met' | 'admissible' | 'replicated' | 'accepted' | 'rejected'
-export interface RejectionAttribution {
-  readonly phase: 'precondition' | 'statement' | 'finalize'
+export interface TransactionRejection {
+  /** `assert:<code>`, `constraint`, `step_limit`, `denied`, … */
   readonly code: string
-  readonly preconditionId: number | null
-  readonly preconditionIndex: number | null
+  /** Index of the failing statement; null for whole-transaction rejections. */
   readonly statementIndex: number | null
-  readonly constraintIdentity: CanonicalSchemaIdentity | null
-  readonly triggerIdentity: CanonicalSchemaIdentity | null
-  readonly applicationLabel?: string
 }
 export type TransactionResult =
   | { readonly type: 'pending' }
-  | { readonly type: 'accepted'; readonly result: AcceptedResultReference }
-  | { readonly type: 'rejected'; readonly attribution: RejectionAttribution }
+  | { readonly type: 'accepted' }
+  | { readonly type: 'rejected'; readonly rejection: TransactionRejection }
 export interface TransactionOutcome {
   readonly transactionId: TransactionId
   readonly phase: TransactionPhase

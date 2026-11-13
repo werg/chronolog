@@ -11,28 +11,21 @@ import type {
   LocalSqlOptions,
   LocalSqlQueryResult,
   LocalSqlValue,
-  MaterializedSqlQueryResult,
   MaterializedRevision,
-  ObserveSqlOptions,
-  SqlDiagnostic,
   TransactionOutcome,
 } from './types.js'
-import type { SqlStatement, TransactionResultEnvelopeV1 } from '@chronolog/protocol'
 
 export interface DoltLiteMaterializerRuntimeBackend {
   readonly revision: bigint
   readonly orderLength: number
   readonly executionManifestDigest: Uint8Array
   materialize(orderedTransactions: readonly AdmittedTransaction[]): Promise<MaterializedRevision | null>
-  observe(statement: SqlStatement, options: ObserveSqlOptions): Promise<MaterializedSqlQueryResult>
   localSql(
     sql: string,
     parameters?: readonly LocalSqlValue[],
     options?: LocalSqlOptions,
   ): LocalSqlQueryResult
-  validateStatement(statement: SqlStatement, mode: 'precondition' | 'body'): readonly SqlDiagnostic[]
   outcome(txId: Uint8Array): TransactionOutcome | null
-  transactionResult(txId: Uint8Array): TransactionResultEnvelopeV1 | null
   subscribe(subscriber: (revision: MaterializedRevision) => void): () => void
   close(): void
 }
@@ -74,11 +67,8 @@ export function createDoltLiteMaterializationRuntime(
       get revision() { return materializer.revision },
       get orderLength() { return materializer.orderLength },
       get executionManifestDigest() { return materializer.executionManifestDigest },
-      observe(statement, options) { return materializer.observe(statement, options) },
       localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
-      validateStatement(statement, mode) { return materializer.validateStatement(statement, mode) },
       outcome(txId) { return materializer.outcome(txId) },
-      transactionResult(txId) { return materializer.transactionResult(txId) },
       subscribe(subscriber) {
         return materializer.subscribe((revision) => subscriber({
           revision: revision.revision,

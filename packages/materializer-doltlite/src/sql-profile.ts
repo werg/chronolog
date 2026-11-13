@@ -1,8 +1,3 @@
-import {
-  DETERMINISTIC_READ_ONLY_PRAGMAS,
-  DETERMINISTIC_SQLITE_COMPILER_FUNCTIONS,
-} from '@chronolog/compiler-sqlite'
-import { isReservedSchemaObjectName } from '@chronolog/ir'
 import { utf8 } from '@chronolog/protocol'
 
 import type {
@@ -93,30 +88,35 @@ export const DEFAULT_SQL_RUNTIME_LIMITS: Readonly<SqlRuntimeLimits> = {
   maxSqlBytes: 1_000_000,
   maxVmSteps: 1_000_000,
   progressGranularity: 1_000,
+  maxValueBytes: 16 * 1024 * 1024,
   maxResultRows: 10_000,
-  maxResultBytes: 16 * 1024 * 1024,
 }
 
 /**
- * Every permitted consensus function is deterministic from its SQL arguments
- * under the pinned SQLite build. Unknown functions fail closed. Time, random,
- * connection state, extension, filesystem and all Dolt functions are absent.
- * Local read SQL deliberately uses the separate denylist below.
+ * Read-only pragmas whose answers depend only on the schema and the pinned
+ * engine build. They are allowed as statements and as table-valued functions.
  */
-export const ALLOWED_DETERMINISTIC_FUNCTIONS: ReadonlySet<string> = new Set([
-  ...DETERMINISTIC_SQLITE_COMPILER_FUNCTIONS,
-  // These functions are deterministic when the compiler has rejected every
-  // ambient time and timezone modifier.
-  'date', 'time', 'datetime', 'julianday', 'strftime', 'unixepoch', 'timediff',
+export const READ_ONLY_PRAGMAS: ReadonlySet<string> = new Set([
+  'collation_list', 'compile_options', 'foreign_key_list', 'function_list',
+  'index_info', 'index_list', 'index_xinfo', 'module_list', 'pragma_list',
+  'table_info', 'table_list', 'table_xinfo',
+  // SQLite runs quick_check itself while executing ALTER TABLE ... ADD COLUMN.
+  'quick_check',
 ])
 
 /**
- * Local SQL is not replayed or signed, so ambient presentation functions such
- * as datetime('now'), random(), JSON1, math and window functions are safe. It
- * still runs on an immutable reader and must not cross an external-effect or
- * Dolt-control boundary. Unknown statically linked read functions are allowed;
- * dynamic extension loading is also disabled at the native connection level.
+ * The consensus block-list: functions whose result depends on connection
+ * history, physical storage, Dolt history or the host. Everything else in
+ * the pinned engine is allowed; the clock and PRNG are pinned per transaction.
  */
+export const CONSENSUS_DENIED_FUNCTIONS: ReadonlySet<string> = new Set([
+  'load_extension', 'total_changes', 'sqlite_offset', 'active_branch',
+])
+
+/** Virtual-table modules that read physical storage rather than SQL state. */
+export const CONSENSUS_DENIED_MODULES: ReadonlySet<string> = new Set(['dbstat', 'sqlite_dbpage', 'sqlite_stmt'])
+
+/** Local SQL is not replayed, so only external effects and Dolt control are denied. */
 export const FORBIDDEN_LOCAL_READ_FUNCTIONS: ReadonlySet<string> = new Set([
   'active_branch',
   'load_extension',
@@ -124,9 +124,15 @@ export const FORBIDDEN_LOCAL_READ_FUNCTIONS: ReadonlySet<string> = new Set([
 
 export type SqlAuthorizationMode =
   | 'internal_bootstrap'
-  | 'consensus_precondition'
-  | 'consensus_body'
+  | 'consensus'
   | 'local_read'
+
+/** Names owned by SQLite, Dolt or Chronolog rather than the application. */
+export function isReservedSchemaObjectName(value: string): boolean {
+  const key = asciiLower(value)
+  return key.startsWith('chronolog_') || key.startsWith('sqlite_') || key.startsWith('dolt_') ||
+    key.startsWith('doltlite_') || key.startsWith('pragma_')
+}
 
 export class SqlProfileError extends Error {
   constructor(readonly code: string) {
@@ -155,7 +161,7 @@ export function configureSqliteLimits(
 ): ReadonlyMap<number, number> {
   const limits = normalizeSqlRuntimeLimits(input)
   const requested = new Map<number, number>([
-    [SQLITE_LIMIT_CATEGORY.LENGTH, limits.maxResultBytes],
+    [SQLITE_LIMIT_CATEGORY.LENGTH, limits.maxValueBytes],
     [SQLITE_LIMIT_CATEGORY.SQL_LENGTH, limits.maxSqlBytes],
     [SQLITE_LIMIT_CATEGORY.COLUMN, 256],
     [SQLITE_LIMIT_CATEGORY.EXPR_DEPTH, 100],
@@ -308,126 +314,82 @@ function withProfileControls<T>(
 }
 
 function createAuthorizer(mode: SqlAuthorizationMode) {
-  let schemaOperation = false
-  let schemaIndexOperation = false
   return (
     action: number,
     arg1: string | null,
     arg2: string | null,
     databaseName: string | null,
-    triggerOrView: string | null,
+    _triggerOrView: string | null,
   ): number => {
     const objectName = asciiLower(arg1)
     const secondaryName = asciiLower(arg2)
     const database = asciiLower(databaseName)
-    const source = asciiLower(triggerOrView)
-
-    if (source !== '' && isReservedSchemaObjectName(source) && !isAllowedPragmaTable(source)) return SQLITE_DENY
-    if (action === ACTION.SELECT) return SQLITE_OK
+    if (mode === 'internal_bootstrap') {
+      return action === ACTION.ATTACH || action === ACTION.DETACH ? SQLITE_DENY : SQLITE_OK
+    }
+    if (action === ACTION.SELECT || action === ACTION.RECURSIVE) return SQLITE_OK
     if (action === ACTION.FUNCTION) {
       const functionName = secondaryName || objectName
-      if (mode === 'local_read') {
-        return isForbiddenLocalReadFunction(functionName) ? SQLITE_DENY : SQLITE_OK
+      if (isDoltName(functionName)) return SQLITE_DENY
+      if (mode === 'local_read') return FORBIDDEN_LOCAL_READ_FUNCTIONS.has(functionName) ? SQLITE_DENY : SQLITE_OK
+      if (functionName.startsWith('pragma_')) {
+        return READ_ONLY_PRAGMAS.has(functionName.slice('pragma_'.length)) ? SQLITE_OK : SQLITE_DENY
       }
-      if (functionName.startsWith('pragma_') &&
-          DETERMINISTIC_READ_ONLY_PRAGMAS.has(functionName.slice('pragma_'.length))) return SQLITE_OK
-      if (schemaOperation && (
-        functionName === 'printf' || functionName === 'substr' || functionName === 'length' ||
-        functionName.startsWith('sqlite_rename_')
-      )) {
-        return SQLITE_OK
-      }
-      return ALLOWED_DETERMINISTIC_FUNCTIONS.has(functionName) ? SQLITE_OK : SQLITE_DENY
+      return CONSENSUS_DENIED_FUNCTIONS.has(functionName) ? SQLITE_DENY : SQLITE_OK
     }
-    if (action === ACTION.PRAGMA) {
-      if (schemaOperation && objectName === 'quick_check') return SQLITE_OK
-      return (mode === 'local_read' || mode === 'consensus_precondition' || mode === 'consensus_body') &&
-        DETERMINISTIC_READ_ONLY_PRAGMAS.has(objectName)
-        ? SQLITE_OK
-        : SQLITE_DENY
-    }
+    if (action === ACTION.PRAGMA) return READ_ONLY_PRAGMAS.has(objectName) ? SQLITE_OK : SQLITE_DENY
     if (action === ACTION.READ) {
-      // SQLite may omit the database name for follow-on READ callbacks emitted
-      // by a prepared statement. A non-empty name must still be the application
-      // database; object-name restrictions below remain in force either way.
-      if (schemaOperation && database === 'temp' && objectName === 'sqlite_temp_master') return SQLITE_OK
-      if (database !== '' && database !== 'main') return SQLITE_DENY
-      if (mode === 'internal_bootstrap') return database === '' || database === 'main' ? SQLITE_OK : SQLITE_DENY
-      if (schemaOperation && objectName === 'pragma_quick_check') return SQLITE_OK
-      if ((mode === 'local_read' || mode === 'consensus_precondition') && objectName === 'chronolog_transactions') return SQLITE_OK
-      if ((mode === 'local_read' || mode === 'consensus_precondition' || mode === 'consensus_body') && isAllowedPragmaTable(objectName)) return SQLITE_OK
-      if (
-        (mode === 'local_read' || mode === 'consensus_precondition' || mode === 'consensus_body') &&
-        (objectName === 'sqlite_master' || objectName === 'sqlite_schema')
-      ) return SQLITE_OK
-      if ((objectName === 'sqlite_master' || objectName === 'sqlite_schema') && isAllowedPragmaTable(source)) return SQLITE_OK
-      // SQLite implements ordinary main-schema DDL by consulting and updating
-      // its own catalog. Consensus body statements may observe that catalog
-      // only as part of the authorized schema operation; Chronolog tables stay
-      // protected by the separate reserved-name checks.
-      return isReservedSchemaObjectName(objectName) ? SQLITE_DENY : SQLITE_OK
-    }
-    if ((mode === 'consensus_body' || mode === 'internal_bootstrap') && (
-      action === ACTION.INSERT || action === ACTION.UPDATE || action === ACTION.DELETE
-    )) {
-      if (schemaOperation && action === ACTION.UPDATE && database === 'temp' && objectName === 'sqlite_temp_master') {
-        return SQLITE_OK
-      }
-      if (database !== 'main') return SQLITE_DENY
-      if (mode !== 'internal_bootstrap' && isReservedSchemaObjectName(objectName) && objectName !== 'sqlite_master' && objectName !== 'sqlite_schema') return SQLITE_DENY
+      // SQLite may omit the database name on follow-on READ callbacks.
+      if (database !== '' && database !== 'main' && database !== 'temp') return SQLITE_DENY
+      // Dolt system tables expose per-replica history (commit hashes, times).
+      if (mode === 'consensus' && isDoltName(objectName)) return SQLITE_DENY
       return SQLITE_OK
     }
-    if ((mode === 'internal_bootstrap' || mode === 'consensus_body') && (
+    if (mode === 'local_read') return SQLITE_DENY
+    // ── consensus writes ──
+    if (action === ACTION.INSERT || action === ACTION.UPDATE || action === ACTION.DELETE) {
+      // SQLite maintains its own catalogs (sqlite_schema, sqlite_sequence,
+      // sqlite_stat1, the temp catalog) while executing DDL and DML.
+      if (objectName.startsWith('sqlite_')) return database === 'main' || database === 'temp' ? SQLITE_OK : SQLITE_DENY
+      if (database !== 'main') return SQLITE_DENY
+      return isReservedSchemaObjectName(objectName) ? SQLITE_DENY : SQLITE_OK
+    }
+    if (
       action === ACTION.CREATE_TABLE || action === ACTION.CREATE_INDEX ||
       action === ACTION.CREATE_VIEW || action === ACTION.CREATE_TRIGGER ||
       action === ACTION.DROP_TABLE || action === ACTION.DROP_INDEX ||
       action === ACTION.DROP_VIEW || action === ACTION.DROP_TRIGGER
-    )) {
-      const implicitAutoIndex = action === ACTION.CREATE_INDEX && objectName.startsWith('sqlite_autoindex_') &&
-        secondaryName !== '' && !isReservedSchemaObjectName(secondaryName)
-      const allowed = database === 'main' && (
-        mode === 'internal_bootstrap' || !isReservedSchemaObjectName(objectName) || implicitAutoIndex
-      )
-      if (allowed) {
-        schemaOperation = true
-        if (action === ACTION.CREATE_INDEX) schemaIndexOperation = true
+    ) {
+      if (database !== 'main') return SQLITE_DENY
+      // The first ANALYZE creates SQLite's own statistics table.
+      if (action === ACTION.CREATE_TABLE && (objectName === 'sqlite_stat1' || objectName === 'sqlite_stat4')) return SQLITE_OK
+      // CREATE INDEX reports the table as arg2; implicit autoindexes are SQLite's own.
+      if (action === ACTION.CREATE_INDEX && objectName.startsWith('sqlite_autoindex_')) {
+        return isReservedSchemaObjectName(secondaryName) ? SQLITE_DENY : SQLITE_OK
       }
-      return allowed ? SQLITE_OK : SQLITE_DENY
+      if (isReservedSchemaObjectName(objectName)) return SQLITE_DENY
+      const onTable = action === ACTION.CREATE_INDEX || action === ACTION.CREATE_TRIGGER ||
+        action === ACTION.DROP_INDEX || action === ACTION.DROP_TRIGGER
+      return onTable && secondaryName !== '' && isReservedSchemaObjectName(secondaryName) ? SQLITE_DENY : SQLITE_OK
     }
-    // SQLITE_ALTER_TABLE reports the database and table through arg1/arg2
-    // rather than through the usual object/database positions.
-    if ((mode === 'internal_bootstrap' || mode === 'consensus_body') && action === ACTION.ALTER_TABLE) {
-      const allowed = objectName === 'main' && (mode === 'internal_bootstrap' || !isReservedSchemaObjectName(secondaryName))
-      if (allowed) schemaOperation = true
-      return allowed ? SQLITE_OK : SQLITE_DENY
+    if (action === ACTION.CREATE_VTABLE || action === ACTION.DROP_VTABLE) {
+      if (database !== 'main' || isReservedSchemaObjectName(objectName)) return SQLITE_DENY
+      return CONSENSUS_DENIED_MODULES.has(secondaryName) ? SQLITE_DENY : SQLITE_OK
     }
-    // SQLite emits SQLITE_REINDEX while preparing CREATE INDEX. A standalone
-    // REINDEX reaches this callback without the preceding CREATE_INDEX action
-    // and remains denied (the compiler also gates it).
-    if (
-      (mode === 'internal_bootstrap' || mode === 'consensus_body') &&
-      action === ACTION.REINDEX && schemaIndexOperation
-    ) return database === 'main' && !isReservedSchemaObjectName(objectName) ? SQLITE_OK : SQLITE_DENY
-    // A recursive CTE is a deterministic query construct and remains bounded
-    // by the same VM-step and result limits as every other statement. Schema
-    // validation, rather than this coarse callback, excludes triggers from the
-    // consensus language.
-    if (action === ACTION.RECURSIVE && mode !== 'internal_bootstrap') return SQLITE_OK
-    // All DDL, transactions, pragmas, attachment, virtual tables, maintenance
-    // commands and unknown future action codes fail closed.
+    // SQLITE_ALTER_TABLE reports the database and table through arg1/arg2.
+    if (action === ACTION.ALTER_TABLE) {
+      return objectName === 'main' && !isReservedSchemaObjectName(secondaryName) ? SQLITE_OK : SQLITE_DENY
+    }
+    // Both only rebuild derived structures (indexes, sqlite_stat1) from table contents.
+    if (action === ACTION.REINDEX || action === ACTION.ANALYZE) return SQLITE_OK
+    // Temporary objects, transaction control, savepoints, ATTACH/DETACH and
+    // unknown future action codes fail closed.
     return SQLITE_DENY
   }
 }
 
-function isAllowedPragmaTable(value: string): boolean {
-  return value.startsWith('pragma_') &&
-    DETERMINISTIC_READ_ONLY_PRAGMAS.has(value.slice('pragma_'.length))
-}
-
-function isForbiddenLocalReadFunction(value: string): boolean {
-  return FORBIDDEN_LOCAL_READ_FUNCTIONS.has(value) ||
-    value.startsWith('dolt_') ||
-    value.startsWith('doltlite_')
+function isDoltName(value: string): boolean {
+  return value.startsWith('dolt_') || value.startsWith('doltlite_')
 }
 
 function asciiLower(value: string | null): string {

@@ -31,186 +31,92 @@ function database(): DatabaseLike {
   return db
 }
 
-function expectProfileViolation(db: DatabaseLike, sql: string, mode: 'local_read' | 'consensus_precondition' | 'consensus_body' = 'consensus_body'): void {
+function expectProfileViolation(db: DatabaseLike, sql: string, mode: 'local_read' | 'consensus' = 'consensus'): void {
   expect(() => prepareProfiledStatement(db, sql, mode)).toThrowError(
     expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_PROFILE_VIOLATION' }),
   )
 }
 
-describe('SQL authorization profile', () => {
-  it('allows deterministic application DML and explicitly approved functions', () => {
+function expectAllowed(db: DatabaseLike, sql: string, mode: 'local_read' | 'consensus' = 'consensus'): void {
+  expect(() => prepareProfiledStatement(db, sql, mode)).not.toThrow()
+}
+
+describe('SQL authorization block-list', () => {
+  it('allows ordinary SQLite in consensus, including formerly gated functions', () => {
     const db = database()
     try {
-      withProfiledStatement(db, "UPDATE accounts SET value = lower(value) WHERE sign(id) = 1", 'consensus_body', (statement) => statement.run())
-      withProfiledStatement(db, 'UPDATE "DoltOn" SET value = upper(value) WHERE id = 1', 'consensus_body', (statement) => statement.run())
-      const result = executeLocalSql(db, 'SELECT count(*), max(value) FROM accounts')
-      expect(result.rows).toHaveLength(1)
-      expect(executeLocalSql(db, 'SELECT value FROM "DoltOn"').rows).toEqual([
-        [{ kind: 'text', value: 'ORDINARY APPLICATION TABLE' }],
-      ])
+      for (const sql of [
+        "UPDATE accounts SET value = lower(value) WHERE sign(id) = 1",
+        'UPDATE "DoltOn" SET value = upper(value) WHERE id = 1',
+        "SELECT random(), randomblob(4), datetime('now'), changes(), last_insert_rowid(), printf('%.2f', 1.5)",
+        'SELECT group_concat(value), sum(id), avg(id), total(id) FROM accounts GROUP BY value COLLATE NOCASE',
+        'SELECT value, row_number() OVER (ORDER BY id) FROM accounts',
+        "SELECT json_group_array(value) FROM accounts",
+        'SELECT tx_id, outcome FROM chronolog_transactions',
+        "SELECT name FROM pragma_table_info('accounts')",
+        "PRAGMA table_info('accounts')",
+        'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)',
+        'CREATE INDEX accounts_value ON accounts (value)',
+        'CREATE VIEW names AS SELECT value FROM accounts',
+        "CREATE TRIGGER accounts_touch AFTER UPDATE ON accounts BEGIN SELECT RAISE(ABORT, 'no'); END",
+        'ALTER TABLE accounts ADD COLUMN extra TEXT',
+        'CREATE VIRTUAL TABLE docs USING fts5(body)',
+        'WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v + 1 FROM n WHERE v < 5) SELECT count(*) FROM n',
+      ]) {
+        try { prepareProfiledStatement(db, sql, 'consensus') } catch (error) { throw new Error(`denied: ${sql}: ${(error as { code?: string }).code ?? String(error)}`, { cause: error }) }
+      }
     } finally {
       db.close()
     }
   })
 
-  it('makes only the public transaction log readable among internal relations', () => {
+  it('allows ANALYZE, which only rebuilds sqlite_stat1 from table contents', () => {
     const db = database()
     try {
-      expect(() => executeLocalSql(db, 'SELECT tx_id, outcome FROM chronolog_transactions')).not.toThrow()
-      expect(() => executeLocalSql(db, "SELECT name FROM pragma_table_info('accounts')")).not.toThrow()
-      expect(() => executeLocalSql(db, "SELECT name FROM sqlite_schema WHERE type = 'table'")).not.toThrow()
-      for (const sql of [
-        'SELECT * FROM chronolog_materializer_metadata',
-        'SELECT * FROM chronolog_checkpoints',
-        'SELECT * FROM dolt_log',
-        'SELECT * FROM dolt_status',
-      ]) expectProfileViolation(db, sql, 'local_read')
+      withProfiledStatement(db, 'ANALYZE', 'consensus', (statement) => statement.run())
     } finally {
       db.close()
     }
   })
 
-  it('denies every mutation of reserved objects', () => {
+  it('denies escapes from the database and the pinned engine', () => {
     const db = database()
     try {
       for (const sql of [
-        "INSERT INTO chronolog_transactions VALUES (x'01', 'accepted')",
-        "UPDATE chronolog_transactions SET outcome = 'accepted'",
-        'DELETE FROM chronolog_transactions',
-        'DROP TABLE chronolog_transactions',
-        'ALTER TABLE chronolog_transactions ADD COLUMN hidden TEXT',
-        'CREATE INDEX chronolog_attack ON accounts(value)',
-        'CREATE TABLE dolt_attack (id INTEGER)',
-        'DELETE FROM sqlite_sequence',
-      ]) expectProfileViolation(db, sql)
-    } finally {
-      db.close()
-    }
-  })
-
-  it('allows application DDL and denies transaction control, attachment, stateful pragmas, maintenance and virtual tables', () => {
-    const db = database()
-    try {
-      expect(() => prepareProfiledStatement(db, 'CREATE TABLE attack (id INTEGER)', 'consensus_body')).not.toThrow()
-      expect(() => prepareProfiledStatement(
-        db,
-        'CREATE TRIGGER attack AFTER INSERT ON accounts BEGIN DELETE FROM accounts; END',
-        'consensus_body',
-      )).not.toThrow()
-      for (const sql of [
-        'CREATE TEMP TABLE attack (id INTEGER)',
+        "ATTACH DATABASE ':memory:' AS other",
+        'DETACH DATABASE other',
         'BEGIN',
-        'SAVEPOINT attack',
-        "ATTACH DATABASE ':memory:' AS attack",
-        'DETACH DATABASE main',
-        'PRAGMA writable_schema = ON',
-        'PRAGMA journal_mode = OFF',
-        'REINDEX',
-        'ANALYZE',
-        'CREATE VIRTUAL TABLE attack USING fts5(value)',
+        'COMMIT',
+        'SAVEPOINT nested',
+        'PRAGMA writable_schema = 1',
+        'PRAGMA foreign_keys = OFF',
+        'CREATE TEMP TABLE scratch (x)',
+        'CREATE TEMP VIEW scratch AS SELECT 1',
+        'SELECT total_changes()',
+        "SELECT load_extension('x')",
+        "SELECT dolt_commit('-m', 'x')",
+        'SELECT * FROM dolt_log',
+        'CREATE VIRTUAL TABLE pages USING dbstat',
+        'DELETE FROM chronolog_transactions',
+        "INSERT INTO chronolog_materializer_metadata VALUES ('a', 'b')",
+        'DROP TABLE chronolog_checkpoints',
+        'CREATE INDEX hijack ON chronolog_transactions (outcome)',
+        'CREATE TABLE chronolog_extra (id INTEGER)',
+        'ALTER TABLE chronolog_transactions ADD COLUMN x',
       ]) expectProfileViolation(db, sql)
     } finally {
       db.close()
     }
   })
 
-  it('uses a positive function allowlist for consensus SQL', () => {
+  it('keeps local reads read-only while allowing ambient functions', () => {
     const db = database()
     try {
-      for (const expression of [
-        'random()',
-        'randomblob(8)',
-        'current_timestamp',
-        'changes()',
-        'last_insert_rowid()',
-        'sqlite_version()',
-        'active_branch()',
-        "dolt_hashof_db('HEAD')",
-        'dolt_version()',
-        "load_extension('/tmp/attack')",
-        "format('%s', 'x')",
-        'round(1)',
-        'sum(1)',
-      ]) expectProfileViolation(db, `SELECT ${expression}`, 'consensus_precondition')
-      expect(withProfiledStatement(
-        db,
-        "SELECT count(*), min(id), max(id), abs(id), sign(max(id)), value GLOB 't*', datetime('2000-01-01'), timediff('2020-01-01', '2019-01-01') FROM accounts GROUP BY value",
-        'consensus_precondition',
-        (statement) => statement.all(),
-      )).toHaveLength(2)
-      expect(withProfiledStatement(db, `
-        SELECT
-          char(65), concat('a', 1), concat_ws('-', 'a', 'b'),
-          if(1, 'yes', 'no'), iif(0, 'yes', 'no'), likely(1), unlikely(0),
-          glob('a*', 'abc'), like('a%', 'abc'), min(2, 1), max(2, 1),
-          quote(x'ab'), typeof(NULL), unhex('ab-cd', '-'), unicode('é'),
-          unistr('A\\u00e9'), unistr_quote(char(1)), zeroblob(3)
-      `, 'consensus_precondition', (statement) => statement.all())).toHaveLength(1)
-    } finally {
-      db.close()
-    }
-  })
-
-  it('allows bounded recursive CTEs in the consensus profile', () => {
-    const db = database()
-    try {
-      const rows = withProfiledStatement(db, `
-        WITH RECURSIVE numbers(value) AS (
-          VALUES(1) UNION ALL SELECT value + 1 FROM numbers WHERE value < 3
-        )
-        SELECT value FROM numbers ORDER BY value
-      `, 'consensus_precondition', (statement) => statement.all())
-      expect(rows).toHaveLength(3)
-    } finally {
-      db.close()
-    }
-  })
-
-  it('allows only the JSON1 functions emitted by the deterministic compiler profile', () => {
-    const db = database()
-    try {
-      const rows = withProfiledStatement(db, `
-        SELECT
-          json('{"key":1}') -> '$.key',
-          json_type(json('{"key":1}'), '$.key'),
-          json_array(1, 2),
-          json_object('key', 1)
-      `, 'consensus_precondition', (statement) => statement.all())
-      expect(rows).toHaveLength(1)
-      expectProfileViolation(db, `SELECT json_extract('{"key":1}', '$.key')`, 'consensus_precondition')
-      expectProfileViolation(db, `SELECT json_valid('{"key":1}')`, 'consensus_precondition')
-    } finally {
-      db.close()
-    }
-  })
-
-  it('allows broad standard SQLite reads locally without weakening the consensus profile', () => {
-    const db = database()
-    try {
-      const result = executeLocalSql(db, `
-        WITH RECURSIVE numbers(value) AS (
-          VALUES(1) UNION ALL SELECT value + 1 FROM numbers WHERE value < 3
-        )
-        SELECT
-          datetime('now'),
-          json_extract('{"value":"ordinary-sql"}', '$.value'),
-          sqlite_version(),
-          random(),
-          sum(value) OVER ()
-        FROM numbers
-        ORDER BY value
-      `)
-      expect(result.rows).toHaveLength(3)
-      expect(result.rows[0]?.[1]).toEqual({ kind: 'text', value: 'ordinary-sql' })
-      expect(result.rows[0]?.[4]).toEqual({ kind: 'integer', value: '6' })
-
-      for (const expression of [
-        "load_extension('/tmp/attack')",
-        'active_branch()',
-        "dolt_hashof_db('HEAD')",
-        'dolt_version()',
-        'doltlite_engine()',
-      ]) expectProfileViolation(db, `SELECT ${expression}`, 'local_read')
+      expectAllowed(db, "SELECT datetime('now'), random(), total_changes()", 'local_read')
+      expectAllowed(db, 'SELECT * FROM chronolog_transactions', 'local_read')
+      for (const sql of ['DELETE FROM accounts', 'CREATE TABLE x (id)', "SELECT load_extension('x')", 'PRAGMA writable_schema = 1']) {
+        expectProfileViolation(db, sql, 'local_read')
+      }
     } finally {
       db.close()
     }
@@ -252,12 +158,10 @@ describe('SQL resource and error boundaries', () => {
     }
   })
 
-  it('enforces deterministic result row and byte ceilings', () => {
+  it('enforces the local result row ceiling', () => {
     const db = database()
     try {
       expect(() => executeLocalSql(db, 'SELECT * FROM accounts ORDER BY id', [], { maxResultRows: 1 }))
-        .toThrowError(expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_RESULT_LIMIT' }))
-      expect(() => executeLocalSql(db, "SELECT zeroblob(1000)", [], { maxResultBytes: 100 }))
         .toThrowError(expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_RESULT_LIMIT' }))
     } finally {
       db.close()
