@@ -2,7 +2,11 @@ import {
   encodePlatformOp,
   isPlatformOp,
   isSqlValue,
+  platformOp,
   toSqlValue,
+  type CollectiveGovernance,
+  type CollectiveRole,
+  type MemberChange,
   type PlatformOp,
   type SqlStatement,
   type SqlValue,
@@ -36,6 +40,14 @@ import {
   type DecodedLocalSqlResult,
   type LocalSqlInput,
 } from './local-sql.js'
+import {
+  TransactionRejectedError,
+  createdObjectId,
+  ownershipSteps,
+  type OfferAllInput,
+  type OfferRowInput,
+  type ShareInput,
+} from './ownership.js'
 import { StreamResource } from './stream-resource.js'
 
 export interface ChronologClientOptions {
@@ -111,6 +123,22 @@ export class TransactionHandle {
     throw new ChronologRpcError('transport_unavailable', 'Outcome stream ended before the transaction settled')
   }
 
+  /**
+   * Resolves once the transaction is accepted; throws `TransactionRejectedError`
+   * (with a parsed `reason`) if it is rejected. Like `settled()`, this is the
+   * outcome at the transaction's current position.
+   */
+  async accepted(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
+    const outcome = await this.settled(options)
+    if (outcome.outcome.type === 'rejected') throw new TransactionRejectedError(this.transactionId, outcome.outcome.rejection)
+    return outcome
+  }
+
+  /** The id of the grant, team or transfer offer created by step `stepIndex` of this transaction. */
+  createdId(stepIndex: number): Promise<Uint8Array> {
+    return createdObjectId(this.transactionId, stepIndex)
+  }
+
   dispose(): void { this.outcome.dispose(); this.evidence.dispose() }
   [Symbol.dispose](): void { this.dispose() }
 }
@@ -123,7 +151,10 @@ export class ChronologClient {
   readonly #unaryRetryAttempts: number
   readonly #streamRetryDelayMs?: (attempt: number) => number
   readonly #resources = new Set<{ dispose(): void }>()
+  #identity: Promise<Uint8Array> | undefined
   #closed = false
+  /** Sharing, teams and transfers of owned rows; each call submits one transaction. */
+  readonly ownership: OwnershipActions = new OwnershipActions(this)
 
   constructor(options: ChronologClientOptions) {
     this.groupId = options.groupId
@@ -272,6 +303,18 @@ export class ChronologClient {
     )
   }
 
+  /**
+   * This node's signing key: the key that signs its transactions and owns the
+   * rows they insert. Compare it with `ownerKeySql()` in local reads.
+   */
+  identity(): Promise<Uint8Array> {
+    this.#identity ??= this.getStatus().then(
+      (status) => Uint8Array.from(Buffer.from(status.nodeId, 'base64url')),
+      (error: unknown) => { this.#identity = undefined; throw error },
+    )
+    return this.#identity
+  }
+
   queryResourceKey(sql: string, bindings: readonly LocalSqlInput[] = []): string {
     return `${sql}\0${stableClientValue(bindings)}`
   }
@@ -312,6 +355,88 @@ export class ChronologClient {
 
   #callOptions(signal?: AbortSignal): RpcCallOptions {
     return { ...(signal === undefined ? {} : { signal }), ...(this.#token === undefined ? {} : { token: this.#token }) }
+  }
+}
+
+/** A submitted ownership change, with the id of the object it created (when it creates one). */
+export interface OwnershipChange<Id extends Uint8Array | undefined = undefined> {
+  readonly handle: TransactionHandle
+  readonly id: Id
+}
+
+/**
+ * Sharing, teams and transfers. Each method submits one transaction whose
+ * only step is the platform operation; await `change.handle.accepted()` for
+ * the result. To combine them with SQL in one transaction, use
+ * `ownershipSteps` or `platformOp` and `TransactionHandle.createdId()`.
+ */
+export class OwnershipActions {
+  constructor(readonly client: ChronologClient) {}
+
+  /** Let `input.with` change your rows of a table (one row, or all of them). */
+  async share(input: ShareInput, options?: TransactionOptions): Promise<OwnershipChange<Uint8Array>> {
+    return this.#create(ownershipSteps.share(input), options)
+  }
+
+  /** End a grant. The grantor (or an admin of a grantor team) revokes; the grantee may renounce. */
+  async revoke(grantId: Uint8Array, options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(platformOp.revokeGrant(grantId), options)
+  }
+
+  /** Create a team administered by you. Invitees join by accepting. */
+  async createTeam(
+    input: { readonly governance?: CollectiveGovernance; readonly invite?: readonly Uint8Array[] } = {},
+    options?: TransactionOptions,
+  ): Promise<OwnershipChange<Uint8Array>> {
+    return this.#create(ownershipSteps.createTeam(input), options)
+  }
+
+  async acceptInvitation(teamId: Uint8Array, options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(platformOp.acceptMembership(teamId), options)
+  }
+
+  async leaveTeam(teamId: Uint8Array, options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(platformOp.leave(teamId), options)
+  }
+
+  /** Invite keys to a team (team admins only); an existing member's role changes instead. */
+  async invite(teamId: Uint8Array, members: readonly Uint8Array[], role: CollectiveRole = 'member', options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(ownershipSteps.invite(teamId, members, role), options)
+  }
+
+  async removeMembers(teamId: Uint8Array, members: readonly Uint8Array[], options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(ownershipSteps.remove(teamId, members), options)
+  }
+
+  /** Any mix of invitations, role changes and removals, applied together. */
+  async setMembers(teamId: Uint8Array, changes: readonly MemberChange[], options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(platformOp.setMembers(teamId, changes), options)
+  }
+
+  /** Offer one row to a new owner; it moves when the recipient accepts. */
+  async offerRow(input: OfferRowInput, options?: TransactionOptions): Promise<OwnershipChange<Uint8Array>> {
+    return this.#create(ownershipSteps.offerRow(input), options)
+  }
+
+  /**
+   * Offer every row you (or a team you administer) own, across all tables:
+   * the key-change path. Rows written before the recipient accepts move too.
+   */
+  async offerAll(input: OfferAllInput, options?: TransactionOptions): Promise<OwnershipChange<Uint8Array>> {
+    return this.#create(ownershipSteps.offerAll(input), options)
+  }
+
+  async acceptOffer(offerId: Uint8Array, options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(platformOp.acceptTransfer(offerId), options)
+  }
+
+  async #submit(step: PlatformOp, options?: TransactionOptions): Promise<OwnershipChange> {
+    return { handle: await this.client.transaction([step], options), id: undefined }
+  }
+
+  async #create(step: PlatformOp, options?: TransactionOptions): Promise<OwnershipChange<Uint8Array>> {
+    const handle = await this.client.transaction([step], options)
+    return { handle, id: await handle.createdId(0) }
   }
 }
 

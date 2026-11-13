@@ -35,6 +35,7 @@
     "snapshot": "tsx apps/chronologd/src/snapshot.ts",
     "group": "tsx apps/chronologd/src/group.ts",
     "demo": "tsx examples/end-to-end.ts",
+    "demo:ownership": "tsx examples/shared-notes.ts",
     "chaos": "tsx packages/chaos/src/cli.ts",
     "chaos:smoke": "tsx packages/chaos/src/cli.ts run smoke",
     "chaos:crash": "tsx packages/chaos/src/cli.ts run crash",
