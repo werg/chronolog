@@ -75,6 +75,7 @@ export class ChronologNode {
   #subscriptionAbort: AbortController | undefined
   #backlogSince: number | undefined
   #backlogAtWindowStart = 0
+  #lastResyncAt: number | undefined
   #lastError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
@@ -1080,7 +1081,17 @@ export class ChronologNode {
     } else if (now - this.#backlogSince >= 20_000) {
       const stalled = backlog * 10 >= this.#backlogAtWindowStart * 9
       this.#backlogSince = undefined
-      if (stalled) await this.#resyncFromHistory()
+      if (stalled) {
+        if (this.#lastResyncAt !== undefined && now - this.#lastResyncAt < 300_000) {
+          // A recent resync did not drain it: the transport's queries are
+          // omitting records it holds (seen under chaos stress after a CPU
+          // stall; a process restart recovers them). Report it as degraded.
+          this.#recordError(new Error('NODE_TRANSPORT_RECORDS_UNDELIVERED'))
+        } else {
+          this.#lastResyncAt = now
+          await this.#resyncFromHistory()
+        }
+      }
     }
   }
 
