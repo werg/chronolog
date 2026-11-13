@@ -334,8 +334,7 @@ async function encodeGovernanceEnvelope(
     groupRoute,
     messageType: type,
     encryptionEpoch: null,
-    payloadDigest: await hashDomain(DOMAINS.envelope, wire),
-    payload: { type: 'inline', bytes: wire },
+    payload: wire,
   })
 }
 
@@ -344,14 +343,11 @@ async function decodeGovernanceEnvelope(
   groupRoute: Uint8Array,
 ): Promise<{ readonly type: GovernanceMessageType; readonly payload: Uint8Array }> {
   const envelope = decodeEnvelope(bytes)
-  if (!equalBytes(envelope.groupRoute, groupRoute) || envelope.encryptionEpoch !== null || envelope.payload.type !== 'inline' ||
+  if (!equalBytes(envelope.groupRoute, groupRoute) || envelope.encryptionEpoch !== null ||
       (envelope.messageType !== 'capability' && envelope.messageType !== 'epoch-manifest')) {
     throw new Error('GOVERNANCE_ENVELOPE_INVALID')
   }
-  if (!equalBytes(await hashDomain(DOMAINS.envelope, envelope.payload.bytes), envelope.payloadDigest)) {
-    throw new Error('GOVERNANCE_ENVELOPE_DIGEST_MISMATCH')
-  }
-  const value = assertCanonicalCbor(envelope.payload.bytes)
+  const value = assertCanonicalCbor(envelope.payload)
   if (!Array.isArray(value) || value.length !== 4 || value[0] !== 1n || !(value[1] instanceof Uint8Array) ||
       !(value[2] instanceof Uint8Array) || !(value[3] instanceof Uint8Array)) throw new Error('GOVERNANCE_ENVELOPE_INVALID')
   const fields = value as readonly CborValue[]

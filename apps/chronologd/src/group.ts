@@ -29,7 +29,7 @@ import {
 } from '@chronolog/materializer-doltlite'
 import { decodeSignedSnapshotManifest, stageSnapshotArchive, type TrustedSnapshotManifest } from '@chronolog/node-core'
 import { equalBytes } from '@chronolog/protocol'
-import { SsbDb2Transport } from '@chronolog/transport-ssb'
+import { FeedTransport } from '@chronolog/transport-ssb'
 
 import { fromBase64, loadOrCreateConfig } from './config.js'
 import { acquireDataDirectoryLock } from './data-lock.js'
@@ -162,7 +162,7 @@ async function initialize(
 ): Promise<{ readonly groupId: string }> {
   const secretStore = daemonSecretStoreFromEnvironment(process.env)
   const { identity } = await loadOrCreateConfig(dataDirectory, secretStore, group)
-  const transport = await SsbDb2Transport.open({ path: join(dataDirectory, 'ssb') })
+  const transport = await FeedTransport.open({ path: join(dataDirectory, 'ssb') })
   const transportAuthor = transport.identity
   await transport.close()
   const executionManifest = createExecutionManifest({ profile: 'chronolog-core-portable', engineDigest: readNativeEngineInfo().digest })

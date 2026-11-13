@@ -217,7 +217,7 @@ export class ChronologNode {
     )) throw new Error('LOCAL_TRANSPORT_AUTHOR_UNAUTHORIZED')
     const canonical = encodeTransactionCore(core)
     const candidateDigest = await transactionDigest(canonical)
-    const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'candidate', canonical, this.#options.identity, this.#options.envelopeCipher, this.#options.blobPayloads)
+    const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'candidate', canonical, this.#options.identity, this.#options.envelopeCipher)
     const record = await this.#options.transport.publish(envelope, { timestampMs: Number(authorTimestampMs) })
     await this.ingest(record)
     return { txId: utf8(record.id), txIdText: record.id, candidateDigest, core }
@@ -257,7 +257,7 @@ export class ChronologNode {
       acceptanceCutoffMs: this.#acceptedAboveMs,
     }
     const payload = encodeValidatorHeartbeat(heartbeat)
-    const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'heartbeat', payload, this.#options.identity, this.#options.envelopeCipher, this.#options.blobPayloads)
+    const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'heartbeat', payload, this.#options.identity, this.#options.envelopeCipher)
     const record = await this.#options.transport.publish(envelope, { timestampMs: now })
     await this.ingest(record)
   }
@@ -556,7 +556,7 @@ export class ChronologNode {
       policyVersion,
     }
     const payload = encodeValidatorAttestation(attestation)
-    const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'attestation', payload, this.#options.identity, this.#options.envelopeCipher, this.#options.blobPayloads)
+    const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'attestation', payload, this.#options.identity, this.#options.envelopeCipher)
     // Publishing before returning is the validator durability rule. The newly
     // appended record is handled by the normal subscription path.
     this.#setConsumerPhase('publishing-attestation')
@@ -836,7 +836,7 @@ export class ChronologNode {
   #clockNow(): number { return this.#options.clock?.now() ?? Date.now() }
   async #decodeRecord(record: TransportRecord): Promise<Awaited<ReturnType<typeof decodeSignedEnvelope>>> {
     try {
-      return await decodeSignedEnvelope(record.payload, this.#groupRoute(), this.#options.envelopeCipher, this.#options.blobPayloads?.store)
+      return await decodeSignedEnvelope(record.payload, this.#groupRoute(), this.#options.envelopeCipher)
     } catch (error) {
       // Not terminal: the epoch key may still arrive (for example, a node that
       // just joined), and the retry loop or history replay will decode it then.
@@ -871,7 +871,7 @@ export class ChronologNode {
     for (const record of history) {
       if (record.author !== this.#options.transport.identity) continue
       try {
-        const wire = await decodeSignedEnvelope(record.payload, this.#groupRoute(), this.#options.envelopeCipher, this.#options.blobPayloads?.store)
+        const wire = await decodeSignedEnvelope(record.payload, this.#groupRoute(), this.#options.envelopeCipher)
         if (!equalBytes(wire.signer, this.identity)) continue
         if (wire.type === 'attestation') {
           const attestation = decodeValidatorAttestation(wire.payload)

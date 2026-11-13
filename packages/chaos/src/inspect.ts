@@ -2,7 +2,7 @@ import { access, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { readControlStoreSnapshot } from '@chronolog/control-store'
-import { SsbDb2Transport } from '@chronolog/transport-ssb'
+import { FeedTransport } from '@chronolog/transport-ssb'
 
 export interface RunInspection {
   readonly format: 'chronolog-chaos-inspection'
@@ -25,7 +25,7 @@ export async function inspectRun(directory: string): Promise<RunInspection> {
     for (const name of names) {
     const directory = join(nodesDirectory, name)
     const uncleanMarker = await exists(join(directory, 'ssb', '.chronolog-ssb-open'))
-    const transport = await SsbDb2Transport.open({ path: join(directory, 'ssb'), network: { reconnect: false } })
+    const transport = await FeedTransport.open({ path: join(directory, 'ssb'), network: { reconnect: false } })
     try {
       const history = await transport.history()
       const feeds = new Map<string, { sequence: number; id: string; previous?: string }[]>()

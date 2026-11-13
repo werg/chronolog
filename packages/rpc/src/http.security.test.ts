@@ -98,19 +98,14 @@ describe('HttpRpcServer authentication', () => {
     expect(calls[0]!.context.method).toBe('node.getStatus')
   })
 
-  it('protects blobs and metrics with the same token while health stays public', async () => {
-    let blobReads = 0
+  it('protects metrics with the token while health stays public', async () => {
     let metricReads = 0
     const url = await start({
       service: recordingService().service,
       token: TOKEN,
-      blob: async () => { blobReads += 1; return Uint8Array.of(1) },
       metrics: () => { metricReads += 1; return 'm 1\n' },
     })
-    const digest = 'ab'.repeat(32)
-    expect((await fetch(`${url}/blobs/${digest}`, { headers: { authorization: `Bearer ${TOKEN}x` } })).status).toBe(401)
     expect((await fetch(`${url}/metrics`, { headers: { authorization: 'Bearer wrong' } })).status).toBe(401)
-    expect(blobReads).toBe(0)
     expect(metricReads).toBe(0)
     const health = await fetch(`${url}/health`)
     expect(health.status).toBe(200)
@@ -203,22 +198,6 @@ describe('HttpRpcServer request validation', () => {
     // Either an explicit 400 or a dropped connection is acceptable; the handler must never run.
     expect([400, -1]).toContain(status)
     expect(calls).toEqual([])
-  })
-
-  it('serves blobs only for lowercase 64-hex digests', async () => {
-    const requested: string[] = []
-    const url = await start({
-      service: recordingService().service,
-      blob: async (digest) => { requested.push(Buffer.from(digest).toString('hex')); return null },
-    })
-    for (const path of ['AB'.repeat(32), 'ab'.repeat(31), 'ab'.repeat(33), `${'ab'.repeat(32)}/x`, '..%2F..%2Fetc%2Fpasswd']) {
-      expect((await fetch(`${url}/blobs/${path}`)).status, path).toBe(404)
-    }
-    expect(requested).toEqual([])
-    const missing = await fetch(`${url}/blobs/${'cd'.repeat(32)}`)
-    expect(missing.status).toBe(404)
-    expect((await errorOf(missing)).code).toBe('not_found')
-    expect(requested).toEqual(['cd'.repeat(32)])
   })
 
   it('maps handler failures to typed error payloads', async () => {

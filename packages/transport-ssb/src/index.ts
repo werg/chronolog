@@ -1,3 +1,4 @@
+export * from './feed-store.js'
+export * from './feed-transport.js'
 export * from './memory.js'
-export * from './ssb-db2.js'
 export * from './types.js'

@@ -11,7 +11,6 @@ export const DOMAINS = {
   attestation: 'chronolog/transaction-attestation/v1',
   heartbeat: 'chronolog/validator-heartbeat/v1',
   envelope: 'chronolog/envelope/v1',
-  payloadChunk: 'chronolog/payload-chunk/v1',
   canonicalResult: 'chronolog/sql-result/v1',
   genesis: 'chronolog/genesis/v1',
   capabilityRevision: 'chronolog/capability-revision/v1',

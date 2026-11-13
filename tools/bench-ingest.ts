@@ -3,7 +3,6 @@
  *
  *   nice pnpm exec tsx tools/bench-ingest.ts [--transport ssb|memory]
  *     [--control file|memory] [--count 40] [--warmup 5]
- *     [--write-timeout <ms>] [--flush-debounce <ms>]
  *
  * One node is writer and validator with threshold 1, which is the daemon's
  * single-node shape. For each candidate it measures, from the start of
@@ -31,7 +30,7 @@ import {
   type MembershipResolver,
 } from '@chronolog/node-core'
 import { equalBytes, generateEd25519KeyPair, type SqlTransactionProgram } from '@chronolog/protocol'
-import { type ChronologTransport, MemoryTransportNetwork, SsbDb2Transport } from '@chronolog/transport-ssb'
+import { type ChronologTransport, MemoryTransportNetwork, FeedTransport } from '@chronolog/transport-ssb'
 
 const { values } = parseArgs({
   options: {
@@ -39,8 +38,6 @@ const { values } = parseArgs({
     control: { type: 'string', default: 'file' },
     count: { type: 'string', default: '40' },
     warmup: { type: 'string', default: '5' },
-    'write-timeout': { type: 'string' },
-    'flush-debounce': { type: 'string' },
   },
 })
 const count = Number(values.count)
@@ -66,15 +63,7 @@ const membership: MembershipResolver = {
 }
 const transport: ChronologTransport = values.transport === 'memory'
   ? new MemoryTransportNetwork().createNode('bench')
-  : await SsbDb2Transport.open({
-    path: join(directory, 'ssb'),
-    config: {
-      db2: {
-        ...(values['write-timeout'] === undefined ? {} : { writeTimeout: Number(values['write-timeout']) }),
-        ...(values['flush-debounce'] === undefined ? {} : { flushDebounce: Number(values['flush-debounce']) }),
-      },
-    },
-  })
+  : await FeedTransport.open({ path: join(directory, 'ssb') })
 const controlStore = values.control === 'file'
   ? new ControlStore(new JsonFileControlStorePersistence(join(directory, 'control.json')))
   : new ControlStore()
@@ -145,8 +134,6 @@ const summarize = (key: keyof Sample, from = 0, to = samples.length) => {
 console.log(JSON.stringify({
   transport: values.transport,
   control: values.control,
-  writeTimeout: values['write-timeout'] ?? 'default',
-  flushDebounce: values['flush-debounce'] ?? 'default',
   candidates: samples.length,
   publishResolvedMs: summarize('publish'),
   admittedMs: summarize('admitted'),

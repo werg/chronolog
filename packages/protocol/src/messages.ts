@@ -1,11 +1,10 @@
 import { hashDomain as hashCanonicalDomain } from '@chronolog/canonical'
 
-import { compareBytes, concatBytes, equalBytes } from './bytes.js'
+import { compareBytes } from './bytes.js'
 import { assertCanonicalCbor, type CborValue, encodeCanonicalCbor } from './cbor.js'
 import { ProtocolError, protocolInvariant } from './errors.js'
-import { DOMAINS, hashDomain } from './primitives.js'
 import {
-  assertKnownIntegerKeys, expectArray, expectBytes, expectMap, expectUint64,
+  assertKnownIntegerKeys, expectBytes, expectMap, expectUint64,
   expectVersion, integerMap, optional, required,
 } from './schema.js'
 import {
@@ -27,15 +26,13 @@ export interface TransactionCore {
   readonly metadata?: ReadonlyMap<string, Uint8Array>
 }
 
-export interface PayloadChunk { readonly digest: Uint8Array; readonly size: bigint }
-export interface PayloadManifest { readonly totalDigest: Uint8Array; readonly totalSize: bigint; readonly chunks: readonly PayloadChunk[] }
 export type EnvelopeMessageType = 'candidate' | 'attestation' | 'heartbeat' | 'capability' | 'epoch-manifest' | 'proof-bundle' | 'snapshot'
 export interface ChronologEnvelope {
   readonly groupRoute: Uint8Array
   readonly messageType: EnvelopeMessageType
   readonly encryptionEpoch: Uint8Array | null
-  readonly payloadDigest: Uint8Array
-  readonly payload: { readonly type: 'inline'; readonly bytes: Uint8Array } | { readonly type: 'manifest'; readonly manifest: PayloadManifest }
+  /** The (possibly encrypted) signed wire message. */
+  readonly payload: Uint8Array
 }
 export interface ValidatorAttestation {
   readonly groupId: Uint8Array; readonly membershipRevision: Uint8Array; readonly validatorCapability: Uint8Array
@@ -99,61 +96,18 @@ export function decodeTransactionCore(bytes: Uint8Array): TransactionCore {
 }
 
 export async function transactionDigest(value: TransactionCore | Uint8Array): Promise<Uint8Array> { return hashCanonicalDomain('transaction', value instanceof Uint8Array ? value : encodeTransactionCore(value)) }
-export async function payloadDigest(bytes: Uint8Array): Promise<Uint8Array> { return hashDomain(DOMAINS.envelope, bytes) }
-export async function payloadChunkDigest(bytes: Uint8Array): Promise<Uint8Array> { return hashDomain(DOMAINS.payloadChunk, bytes) }
-
-export async function createPayloadManifest(chunks: readonly Uint8Array[]): Promise<PayloadManifest> {
-  protocolInvariant(chunks.length > 0, 'SCHEMA_INVALID', 'Payload manifest requires at least one chunk')
-  const total = concatBytes(...chunks)
-  return { totalDigest: await payloadDigest(total), totalSize: BigInt(total.length), chunks: await Promise.all(chunks.map(async (chunk) => ({ digest: await payloadChunkDigest(chunk), size: BigInt(chunk.length) }))) }
-}
-
-export async function verifyPayloadManifest(manifest: PayloadManifest, chunks: readonly Uint8Array[]): Promise<Uint8Array> {
-  protocolInvariant(chunks.length === manifest.chunks.length, 'DIGEST_MISMATCH', 'Payload chunk count differs from manifest')
-  for (let index = 0; index < chunks.length; index += 1) {
-    const chunk = chunks[index]!, expected = manifest.chunks[index]!
-    protocolInvariant(BigInt(chunk.length) === expected.size, 'DIGEST_MISMATCH', 'Payload chunk size differs from manifest', { index })
-    protocolInvariant(equalBytes(await payloadChunkDigest(chunk), expected.digest), 'DIGEST_MISMATCH', 'Payload chunk digest differs from manifest', { index })
-  }
-  const payload = concatBytes(...chunks)
-  protocolInvariant(BigInt(payload.length) === manifest.totalSize, 'DIGEST_MISMATCH', 'Payload total size differs from manifest')
-  protocolInvariant(equalBytes(await payloadDigest(payload), manifest.totalDigest), 'DIGEST_MISMATCH', 'Payload total digest differs from manifest')
-  return payload
-}
-
-export async function resolveEnvelopePayload(envelope: ChronologEnvelope, chunks: readonly Uint8Array[] = []): Promise<Uint8Array> {
-  const payload = envelope.payload.type === 'inline' ? envelope.payload.bytes : await verifyPayloadManifest(envelope.payload.manifest, chunks)
-  protocolInvariant(equalBytes(await payloadDigest(payload), envelope.payloadDigest), 'DIGEST_MISMATCH', 'Envelope payload digest does not match resolved bytes')
-  return payload
-}
-
-function chunkToCbor(chunk: PayloadChunk): CborValue { return integerMap([[0, chunk.digest], [1, chunk.size]]) }
-function manifestToCbor(manifest: PayloadManifest): CborValue { protocolInvariant(manifest.chunks.length > 0, 'SCHEMA_INVALID', 'Payload manifest must contain at least one chunk'); return integerMap([[0, manifest.totalDigest], [1, manifest.totalSize], [2, manifest.chunks.map(chunkToCbor)]]) }
-function manifestFromCbor(value: CborValue): PayloadManifest {
-  const map = expectMap(value, 'payload_manifest'); assertKnownIntegerKeys(map, [0, 1, 2], 'payload_manifest')
-  const chunks = expectArray(required(map, 2, 'payload_manifest.chunks'), 'payload_manifest.chunks').map((item, index) => { const chunk = expectMap(item, `payload_manifest.chunks[${index}]`); assertKnownIntegerKeys(chunk, [0, 1], `payload_manifest.chunks[${index}]`); return { digest: expectBytes(required(chunk, 0, 'chunk.digest'), 'chunk.digest', 32), size: expectUint64(required(chunk, 1, 'chunk.size'), 'chunk.size') } })
-  protocolInvariant(chunks.length > 0, 'SCHEMA_INVALID', 'Payload manifest must contain at least one chunk')
-  const totalSize = expectUint64(required(map, 1, 'payload_manifest.total_size'), 'payload_manifest.total_size')
-  protocolInvariant(chunks.reduce((sum, chunk) => sum + chunk.size, 0n) === totalSize, 'SCHEMA_INVALID', 'Payload chunk sizes do not equal total size')
-  return { totalDigest: expectBytes(required(map, 0, 'payload_manifest.total_digest'), 'payload_manifest.total_digest', 32), totalSize, chunks }
-}
-
 // Wire codes are positions in this list; code 4 (formerly 'recovery') is retired.
 const MESSAGE_TYPES: readonly (EnvelopeMessageType | null)[] = ['candidate', 'attestation', 'heartbeat', 'capability', null, 'epoch-manifest', 'proof-bundle', 'snapshot']
 export function encodeEnvelope(value: ChronologEnvelope): Uint8Array {
   const messageIndex = MESSAGE_TYPES.indexOf(value.messageType); protocolInvariant(messageIndex >= 0, 'SCHEMA_INVALID', 'Unknown envelope message type')
-  const payload = value.payload.type === 'inline' ? [0n, value.payload.bytes] as const : [1n, manifestToCbor(value.payload.manifest)] as const
-  return encodeCanonicalCbor(integerMap([[0, 1n], [1, value.groupRoute], [2, BigInt(messageIndex)], [3, value.encryptionEpoch], [4, value.payloadDigest], [5, payload]]))
+  return encodeCanonicalCbor(integerMap([[0, 1n], [1, value.groupRoute], [2, BigInt(messageIndex)], [3, value.encryptionEpoch], [4, value.payload]]))
 }
 export function decodeEnvelope(bytes: Uint8Array): ChronologEnvelope {
-  const map = expectMap(assertCanonicalCbor(bytes), 'envelope'); assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5], 'envelope'); expectVersion(map, 1n, 'envelope')
+  const map = expectMap(assertCanonicalCbor(bytes), 'envelope'); assertKnownIntegerKeys(map, [0, 1, 2, 3, 4], 'envelope'); expectVersion(map, 1n, 'envelope')
   const typeIndex = expectUint64(required(map, 2, 'envelope.message_type'), 'envelope.message_type'); protocolInvariant(typeIndex < BigInt(MESSAGE_TYPES.length), 'SCHEMA_INVALID', 'Unknown envelope message type')
   const messageType = MESSAGE_TYPES[Number(typeIndex)]; protocolInvariant(messageType !== undefined && messageType !== null, 'SCHEMA_INVALID', 'Unknown envelope message type')
   const epoch = required(map, 3, 'envelope.encryption_epoch'); protocolInvariant(epoch === null || epoch instanceof Uint8Array, 'SCHEMA_INVALID', 'Envelope encryption epoch must be null or bytes')
-  const encodedPayload = expectArray(required(map, 5, 'envelope.payload'), 'envelope.payload'); protocolInvariant(encodedPayload.length === 2, 'SCHEMA_INVALID', 'Envelope payload has invalid arity')
-  const payloadType = expectUint64(encodedPayload[0] ?? null, 'envelope.payload.type')
-  const payload = payloadType === 0n ? { type: 'inline' as const, bytes: expectBytes(encodedPayload[1] ?? null, 'envelope.payload.bytes') } : payloadType === 1n ? { type: 'manifest' as const, manifest: manifestFromCbor(encodedPayload[1] ?? null) } : (() => { throw new ProtocolError('SCHEMA_INVALID', 'Unknown envelope payload type') })()
-  return { groupRoute: expectBytes(required(map, 1, 'envelope.group_route'), 'envelope.group_route'), messageType, encryptionEpoch: epoch, payloadDigest: expectBytes(required(map, 4, 'envelope.payload_digest'), 'envelope.payload_digest', 32), payload }
+  return { groupRoute: expectBytes(required(map, 1, 'envelope.group_route'), 'envelope.group_route'), messageType, encryptionEpoch: epoch, payload: expectBytes(required(map, 4, 'envelope.payload'), 'envelope.payload') }
 }
 
 function attestationToCbor(value: ValidatorAttestation): CborValue {

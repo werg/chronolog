@@ -5,8 +5,6 @@ import {
   encodeCanonicalCbor,
   encodeEnvelope,
   equalBytes,
-  hashDomain,
-  resolveEnvelopePayload,
   signDomain,
   verifyDomain,
   type CborValue,
@@ -16,7 +14,6 @@ import {
 } from '@chronolog/protocol'
 
 import type { EnvelopeCipher, EnvelopeCipherResolver } from './types.js'
-import { loadEnvelopePayload, storeEnvelopePayload, type EnvelopeBlobOptions, type ContentAddressedBlobStore } from './blobs.js'
 
 export interface SignedWireMessage {
   readonly type: Extract<EnvelopeMessageType, 'candidate' | 'attestation' | 'heartbeat'>
@@ -39,7 +36,6 @@ export async function encodeSignedEnvelope(
   payload: Uint8Array,
   signer: Ed25519KeyPair,
   cipher?: EnvelopeCipher | EnvelopeCipherResolver,
-  blobs?: EnvelopeBlobOptions,
 ): Promise<Uint8Array> {
   const activeCipher = cipher === undefined ? undefined : isCipherResolver(cipher) ? cipher.current() : cipher
   const signature = await signDomain(domainFor(type), payload, signer.privateKey)
@@ -54,35 +50,17 @@ export async function encodeSignedEnvelope(
   const envelopePayload = activeCipher === undefined
     ? wire
     : await activeCipher.seal(wire, envelopeAssociatedData(groupRoute, type, activeCipher.epochId))
-  const payloadField = blobs !== undefined && envelopePayload.length > blobs.maxInlineBytes
-    ? { type: 'manifest' as const, manifest: (await storeEnvelopePayload(envelopePayload, blobs)).manifest }
-    : { type: 'inline' as const, bytes: envelopePayload }
-  return encodeEnvelope({
-    groupRoute,
-    messageType: type,
-    encryptionEpoch: epochId,
-    payloadDigest: await hashDomain(DOMAINS.envelope, envelopePayload),
-    payload: payloadField,
-  })
+  return encodeEnvelope({ groupRoute, messageType: type, encryptionEpoch: epochId, payload: envelopePayload })
 }
 
 export async function decodeSignedEnvelope(
   encoded: Uint8Array,
   expectedGroupRoute: Uint8Array,
   cipher?: EnvelopeCipher | EnvelopeCipherResolver,
-  blobStore?: ContentAddressedBlobStore,
 ): Promise<SignedWireMessage> {
   const envelope = decodeEnvelope(encoded)
   if (!equalBytes(envelope.groupRoute, expectedGroupRoute)) throw wireError('WIRE_WRONG_GROUP')
-  let payloadBytes: Uint8Array
-  if (envelope.payload.type === 'inline') payloadBytes = await resolveEnvelopePayload(envelope)
-  else {
-    if (blobStore === undefined) throw wireError('WIRE_BLOB_STORE_REQUIRED')
-    payloadBytes = await loadEnvelopePayload(envelope.payload.manifest, blobStore)
-  }
-  if (!equalBytes(await hashDomain(DOMAINS.envelope, payloadBytes), envelope.payloadDigest)) {
-    throw wireError('WIRE_DIGEST_MISMATCH')
-  }
+  const payloadBytes = envelope.payload
   const activeCipher = envelope.encryptionEpoch === null || cipher === undefined
     ? undefined
     : isCipherResolver(cipher) ? cipher.resolve(envelope.encryptionEpoch) : cipher
