@@ -107,7 +107,6 @@ async function startNode(name: string, identity: Ed25519KeyPair, validator: bool
 function bootstrapProgram(): SqlTransactionProgram {
   return sqlProgram(
     sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
-    platformOp.registerTable('accounts'),
     sqlStatement('INSERT INTO accounts (id, balance) VALUES (?, ?)', [1n, 100n]),
   )
 }

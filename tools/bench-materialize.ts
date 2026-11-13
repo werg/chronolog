@@ -11,7 +11,6 @@
 
 import type { AdmittedTransaction } from '@chronolog/materializer-doltlite'
 import { MaterializerFixture, admitted, testKey } from '@chronolog/materializer-doltlite/testing'
-import { platformOp } from '@chronolog/protocol'
 
 const TXS = Number(process.env.TXS ?? 300)
 const ROWS = Number(process.env.ROWS ?? 20)
@@ -28,7 +27,7 @@ async function add(author: Uint8Array, ...steps: Parameters<typeof admitted>[2])
 }
 
 await add(ROOT, 'CREATE TABLE items (id INTEGER PRIMARY KEY, grp INTEGER NOT NULL, value INTEGER NOT NULL)',
-  'CREATE INDEX items_grp ON items (grp)', platformOp.registerTable('items'))
+  'CREATE INDEX items_grp ON items (grp)')
 await materializer.materialize(transactions)
 
 const cpuMs: Record<string, number> = {}

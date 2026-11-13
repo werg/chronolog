@@ -14,7 +14,6 @@ import {
 import {
   encodeTransactionCore,
   executionManifestArtifacts,
-  platformOp,
   sqlStatement,
   transactionDigest,
   utf8,
@@ -167,10 +166,8 @@ async function runReplayFixture(
       const digest = materializer.executionManifestDigest
       const bootstrap = await transaction(1n, 'bootstrap', [
         sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
-        platformOp.registerTable('accounts'),
         sqlStatement('INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200)'),
         sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY, now TEXT NOT NULL, r INTEGER NOT NULL)'),
-        platformOp.registerTable('probes'),
       ], digest)
       const predecessor = await transaction(10n, 'predecessor', updateProgram(100n, 5n), digest)
       const later = await transaction(20n, 'later', updateProgram(100n, 90n), digest)

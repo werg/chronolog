@@ -47,7 +47,7 @@ describe('snapshot export and import of owner-controlled rows', () => {
       expect(materializer.outcome(transaction.txId)?.outcome).toBe('accepted')
       return transaction.txId
     }
-    await submit(ROOT, 'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)', platformOp.registerTable('notes'))
+    await submit(ROOT, 'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)')
     await submit(ALICE, "INSERT INTO notes (id, body) VALUES (1, 'alice')")
     await submit(BOB, "INSERT INTO notes (id, body) VALUES (2, 'bob')")
     const team = await submit(ALICE, platformOp.createCollective({ governance: { insert: 'member', update: 'member', delete: 'admin' }, invitees: [BOB] }),

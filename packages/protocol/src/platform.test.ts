@@ -19,7 +19,6 @@ import {
 const key = (fill: number): Uint8Array => new Uint8Array(32).fill(fill)
 
 const everyOperation: readonly PlatformOp[] = [
-  platformOp.registerTable('notes'),
   platformOp.grant({ table: 'notes', grantee: key(2), operations: ['insert', 'update', 'delete'] }),
   platformOp.grant({ table: 'notes', grantee: key(2), grantor: key(4), operations: ['update'], rowKey: [1n, sqlValue.real(2), 'x', new Uint8Array([1])], columns: ['body', 'title'] }),
   platformOp.revokeGrant(key(3)),
@@ -48,15 +47,15 @@ describe('platform operations', () => {
   })
 
   it('mixes SQL statements and platform operations in one program', () => {
-    const program = sqlProgram('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)', platformOp.registerTable('notes'))
+    const program = sqlProgram('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)')
     const decoded = decodeSqlTransactionProgram(encodeSqlTransactionProgram(program))
     expect(decoded).toEqual(program)
-    expect(decoded.steps.map(isSqlStatementStep)).toEqual([true, false])
+    expect(decoded.steps.map(isSqlStatementStep)).toEqual([true])
   })
 
   it('rejects malformed operations', () => {
-    expect(() => platformOp.registerTable('')).toThrow()
-    expect(() => platformOp.registerTable('x'.repeat(129))).toThrow()
+    expect(() => platformOp.grant({ table: '', grantee: key(1), operations: ['update'] })).toThrow()
+    expect(() => platformOp.grant({ table: 'x'.repeat(129), grantee: key(1), operations: ['update'] })).toThrow()
     expect(() => platformOp.grant({ table: 't', grantee: key(1), operations: [] })).toThrow()
     expect(() => platformOp.grant({ table: 't', grantee: key(1), operations: ['update', 'update'] })).toThrow()
     expect(() => platformOp.grant({ table: 't', grantee: key(1), operations: ['delete', 'update'] })).toThrow()

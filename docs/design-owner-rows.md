@@ -145,15 +145,22 @@ chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id())   -- principal i
     `ALTER TABLE ADD COLUMN` on an *empty* table.
   - On a non-empty table both refuse with "Cannot add a column with
     non-constant default".
-  - So a table is registered in the transaction that creates it, and
-    registering an existing populated table means rebuilding it.
+  - So a table is registered (put under owner checks) by the statement that
+    creates it, while it is still empty.
 - **Row identity.** Grants and transfers name a row by its primary key, as
   `quote(pk1) || ',' || quote(pk2) …` (the `rowKey` of an operation is the
   key's values). So a registered table needs a declared primary key.
-- **Unregistered tables are rejected.** Reconciliation runs at the end of every
-  transaction that changed the schema. The transaction fails with
-  `schema_unregistered` when:
-  - a main-schema table is not registered;
+- **Every table is registered automatically.** There is no registration
+  step. Reconciliation runs right after every statement that changed the
+  schema, so a new table is owner-checked from the next statement on. It
+  registers each new application table: it adds the owner column if missing,
+  lints the foreign keys, checks that existing rows are ones the signer could
+  have inserted, and generates the platform triggers. A table that cannot be
+  owner-checked fails the transaction: `platform:no_primary_key` (for example
+  `CREATE TABLE … AS SELECT`), `platform:table_not_empty` (rows but no owner
+  column), `platform:owner_column_invalid`,
+  `platform:fk_action` or `platform:foreign_owner`. The transaction also
+  fails with `schema_unregistered` when:
   - a registered table is missing its platform triggers, its owner column or
     its primary key;
   - a `chronolog_*` trigger or view is not the platform's own.
@@ -175,7 +182,9 @@ chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id())   -- principal i
     when its columns changed (an admin's `ADD`, `RENAME` or `DROP COLUMN`),
     because the update trigger lists the columns for grant caps. Dropping a
     registered table unregisters it, revokes its grants and cancels its open
-    offers. Renaming one leaves the new name unregistered, so it is refused.
+    offers. Renaming one moves its registration, grants and open offers to
+    the new name and regenerates its triggers (SQLite moves the triggers with
+    the table, which is how a rename is recognized).
 
 **Platform tables.** These are replicated, readable by transactions, and
 writable only by platform operations:
@@ -212,7 +221,8 @@ materializer is opened with the group's root administrator key (from the
 genesis, or `rootAdministrator` in a static membership file), stores it in
 `chronolog_platform`, and refuses to reopen the database with another. Its
 admins are the schema administrators.
-They may run DDL, including creating app triggers, and register tables.
+They may run DDL, including creating tables (registered automatically) and app
+triggers.
 
 - `team` collectives are optional shared owners. A member creates one, and
   others join by accepting.
@@ -299,7 +309,7 @@ policy, and with a `SET NULL` child it aborts with the child's update policy.
 An owner-composite FK refuses a child whose owner differs from the parent's,
 and cascades through Alice's own children.
 
-- `RegisterTable` and reconciliation lint `pragma_foreign_key_list`
+- Reconciliation lints `pragma_foreign_key_list`
   (`platform:fk_action`). An owner-composite FK, for example
   `FOREIGN KEY (parent_id, chronolog_owner) REFERENCES parent(id, chronolog_owner)`,
   must be `ON UPDATE CASCADE`, so a transfer carries the child, and may be
@@ -442,7 +452,6 @@ becomes:
 SqlTransactionProgram { version: 2, steps: Step[] }       // 1..256
 Step = SqlStatement | PlatformOp
 PlatformOp =
-  | RegisterTable    { table }
   | Grant            { table, grantee, grantor?, rowKey?, operations, columns? } | RevokeGrant { grantId }
   | CreateCollective { governance, invitees } | AcceptMembership { collectiveId } | Leave { collectiveId }
   | SetMembers       { collectiveId, changes }                // admins; new keys are invited
@@ -642,8 +651,9 @@ Findings that change the plan:
 
 - **Platform tables and the `group` collective.** Create the platform tables,
   and seed the `group` collective with the root administrator's key at genesis.
-- **`RegisterTable`.** It adds or checks the owner column, lints FK actions,
-  and generates the three platform triggers and the lookup views.
+- **Registration** (automatic since 2026-11-13; §11). It adds or checks the
+  owner column, lints FK actions, and generates the three platform triggers
+  and the lookup views.
 - **Authorizer.** All DDL is limited to `group` admins, and `chronolog_*`
   triggers, views and the owner column are protected.
 - **Tests:**
@@ -920,3 +930,12 @@ changed.
   - **Bulk transfers (low, doc).** Grants the old key received do not move
     (the recipient need not be the same person), and an open `scope: all`
     offer also sweeps rows written after it was made. §6 changed.
+- **2026-11-13, registration is automatic** (owner's request). The
+  `RegisterTable` operation is removed. Reconciliation runs after every
+  statement that changed the schema and registers each new application table
+  with the same checks (primary key, owner column added only to an empty
+  table, FK lint, foreign owners); DDL is still admin-only. A rename is
+  recognized by the platform trigger SQLite carried to the new table, and
+  moves the registration, grants and open offers. Fork-seed plan
+  `chronolog-fork-seed-v5` (no registration steps); platform code version
+  bumped. §3, §4, §6 and Step 4 changed.

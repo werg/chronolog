@@ -55,7 +55,6 @@ export type TransferScope =
   | { readonly kind: 'all' }
 
 export type PlatformOp =
-  | { readonly op: 'register_table'; readonly table: string }
   | {
     readonly op: 'grant'
     readonly table: string
@@ -96,7 +95,7 @@ export type PlatformOp =
 export type PlatformOpName = PlatformOp['op']
 
 const OP_CODES: readonly PlatformOpName[] = [
-  'register_table', 'grant', 'revoke_grant', 'create_collective', 'accept_membership',
+  'grant', 'revoke_grant', 'create_collective', 'accept_membership',
   'leave', 'set_members', 'transfer_offer', 'transfer_accept', 'seed_rows', 'end_seeding',
 ]
 const OPERATION_BITS: Readonly<Record<GrantOperation, bigint>> = { insert: 1n, update: 2n, delete: 4n }
@@ -114,7 +113,6 @@ const rowKey = (values: readonly unknown[]): SqlValue[] => values.map(toSqlValue
 
 /** Typed builders for every platform operation; each validates its input. */
 export const platformOp = Object.freeze({
-  registerTable: (table: string): PlatformOp => checked({ op: 'register_table', table }),
   grant: (input: {
     readonly table: string
     readonly grantee: Uint8Array
@@ -225,9 +223,6 @@ export function platformOpToCanonicalCbor(op: PlatformOp): CborValue {
   protocolInvariant(code >= 0, 'SCHEMA_INVALID', 'Unknown platform operation')
   const entries: (readonly [number, CborValue | undefined])[] = [[0, BigInt(code)]]
   switch (op.op) {
-    case 'register_table':
-      entries.push([1, nameToCbor(op.table, 'register_table.table')])
-      break
     case 'grant': {
       protocolInvariant(isList(op.operations) && op.operations.length > 0, 'SCHEMA_INVALID', 'grant.operations cannot be empty')
       uniqueBy(op.operations, (value) => value, 'grant.operations')
@@ -319,7 +314,6 @@ export function platformOpToCanonicalCbor(op: PlatformOp): CborValue {
 }
 
 const KNOWN_KEYS: Readonly<Record<PlatformOpName, readonly number[]>> = {
-  register_table: [0, 1],
   grant: [0, 1, 2, 3, 4, 5, 6],
   revoke_grant: [0, 1],
   create_collective: [0, 1, 2],
@@ -349,9 +343,6 @@ export function platformOpFromCanonicalCbor(value: CborValue, name = 'platform_o
     expectArray(entry, field).map((item, index) => sqlValueFromCanonicalCbor(item, `${field}[${index}]`))
   let op: PlatformOp
   switch (kind) {
-    case 'register_table':
-      op = { op: kind, table: text(1, 'table') }
-      break
     case 'grant': {
       const mask = expectUint64(required(map, 3, `${name}.operations`), `${name}.operations`)
       protocolInvariant(mask >= 1n && mask <= 7n, 'SCHEMA_INVALID', `${name}.operations is invalid`)

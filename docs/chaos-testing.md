@@ -106,7 +106,7 @@ ordinary `chronolog_assert` statement at the top of the transaction:
    `policy:chaos_profiles:update` (never a partial update).
 
 Writes come from mixed authors under owner-controlled rows. The first node is
-the root administrator: it creates and registers the schema, owns the shared
+the root administrator: it creates the schema, owns the shared
 `accounts` rows and grants every other node `update` on them. DDL operations
 (migrations and `ddl_sequence`) are always submitted through it; every other
 operation goes to a random node, which owns the ledger, document and profile

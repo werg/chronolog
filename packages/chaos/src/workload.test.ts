@@ -76,7 +76,7 @@ describe('chaos mixed workload selection', () => {
 describe('chaos migration workload builders', () => {
   it('builds an inspectable v1-to-v2 lifecycle with backfill and catalog replacement', () => {
     const statements = migrationChainStatements('chaos_migrate_test')
-    expect(statements).toHaveLength(22)
+    expect(statements).toHaveLength(20)
     expect(statements.map((statement) => 'sql' in statement ? statement.sql : statement.op)).toEqual(expect.arrayContaining([
       expect.stringContaining('ALTER TABLE chaos_migrate_test_items ADD COLUMN normalized_name'),
       expect.stringContaining('UPDATE chaos_migrate_test_items SET normalized_name'),
@@ -89,7 +89,7 @@ describe('chaos migration workload builders', () => {
 
   it('builds a failing migration whose last statement collides with migration history', () => {
     const statements = migrationRollbackStatements('chaos_rollback_test')
-    expect(statements).toHaveLength(7)
+    expect(statements).toHaveLength(6)
     const last = statements.at(-1)
     expect(last !== undefined && 'sql' in last ? last.sql : '').toContain("VALUES ('profiles', 1")
   })

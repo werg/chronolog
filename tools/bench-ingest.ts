@@ -28,7 +28,7 @@ import {
   SqliteFeedForkPersistence,
   type MembershipResolver,
 } from '@chronolog/node-core'
-import { equalBytes, generateEd25519KeyPair, platformOp, type SqlTransactionProgram } from '@chronolog/protocol'
+import { equalBytes, generateEd25519KeyPair, type SqlTransactionProgram } from '@chronolog/protocol'
 import { type ChronologTransport, MemoryTransportNetwork, FeedTransport } from '@chronolog/transport-ssb'
 
 const { values } = parseArgs({
@@ -146,7 +146,7 @@ function bytes32(seed: number): Uint8Array { return Uint8Array.from({ length: 32
 function createProgram(): SqlTransactionProgram {
   return {
     version: 2,
-    steps: [{ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT', bindings: [] }, platformOp.registerTable('items')],
+    steps: [{ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT', bindings: [] }],
   }
 }
 function insertProgram(id: number): SqlTransactionProgram {

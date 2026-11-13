@@ -54,8 +54,7 @@ SqlTransactionProgram { version: 2, steps: Step[] }        // 1..256
 Step                  = SqlStatement | PlatformOp
 SqlStatement          { sql: text, bindings: SqlBinding[] }
 SqlBinding            { parameter: index (1-based) | name, value: SqlValue }
-PlatformOp            = RegisterTable { table }
-                      | Grant { table, grantee, grantor?, rowKey?, operations, columns? }
+PlatformOp            = Grant { table, grantee, grantor?, rowKey?, operations, columns? }
                       | RevokeGrant { grantId }
                       | CreateCollective { governance, invitees } | AcceptMembership { collectiveId }
                       | Leave { collectiveId } | SetMembers { collectiveId, changes }
@@ -163,8 +162,9 @@ Math functions (`sin`, `exp`, …) are not compiled into the engine.
 ## 6. Owner-controlled rows
 
 Every ordinary table in the main schema, except Chronolog's, SQLite's and
-Dolt's own, must be **registered** (`RegisterTable`) in the transaction that
-creates it. A registered table has a declared primary key and the column
+Dolt's own, is **registered** (put under owner checks) automatically, right
+after the statement that creates it. A registered table has a declared
+primary key and the column
 
 ```sql
 chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id())
@@ -203,14 +203,18 @@ Generated lookup views, readable by any SQL: `chronolog_my_owner_ids_insert`,
 `_update`, `_delete` (the signer plus the collectives it may act for) and
 `chronolog_grants_to_me_insert`, `_update`, `_delete`.
 
-**Reconciliation** runs at the end of every transaction that changed the
-schema. It unregisters dropped tables (revoking their grants and cancelling
-their offers), regenerates platform triggers whose table's columns changed,
-and rejects the transaction when:
+**Reconciliation** runs right after every statement that changed the schema.
+It registers new tables (adding the owner column to an empty table if missing,
+generating the triggers), follows renamed tables (moving their registration,
+grants and open offers), unregisters dropped tables (revoking their grants and
+cancelling their offers), regenerates platform triggers whose table's columns
+changed, and rejects the transaction when:
 
-- an ordinary table is unregistered (`schema_unregistered`). Virtual tables,
-  their shadow tables and sqlite-vec's `<table>_vector_chunksNN` tables are
-  exempt. Virtual tables and chunk tables carry no owner checks, so app SQL
+- a new table cannot be owner-checked: `platform:no_primary_key`,
+  `platform:table_not_empty`, `platform:owner_column_invalid`, or
+  `platform:foreign_owner` for rows the signer could not have inserted.
+  Virtual tables, their shadow tables and sqlite-vec's
+  `<table>_vector_chunksNN` tables are not registered. Virtual tables and chunk tables carry no owner checks, so app SQL
   may write them only from app triggers (top-level writes are `denied`);
 - a registered table lost its owner column, its primary key or a platform
   trigger, or a `chronolog_*` trigger or view is not the platform's own
@@ -238,7 +242,6 @@ between steps).
 
 | Operation | Authority and effect | Refusals (`platform:…`) |
 | --- | --- | --- |
-| `RegisterTable` | `group` admin. Adds the owner column to an empty table if missing, generates the triggers. Rows already in the table must be ones the signer could insert. | `not_schema_admin`, `no_such_table`, `reserved_table`, `already_registered`, `no_primary_key`, `table_not_empty`, `owner_column_invalid`, `fk_action`, `foreign_owner` |
 | `Grant` | The grantor (default: the signer; for a row grant, the row's owner) is the signer or a collective it administers. `columns` require `update`; row grants cannot include `insert`. | `unregistered_table`, `no_such_row`, `row_key_arity`, `unknown_column`, `invalid_grant`, `not_owner` |
 | `RevokeGrant` | The grantor (or an admin of a grantor collective), or the grantee. Effective from the next step in the order. | `no_such_grant`, `grant_revoked`, `not_owner` |
 | `CreateCollective` | Any writer; creates a `team` with the signer as active admin and invitees invited. Governance names the least role (`member` or `admin`) for insert, update and delete. | `invalid_member` |

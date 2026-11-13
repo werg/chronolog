@@ -1,5 +1,4 @@
 import {
-  platformOp,
   sqlStatement,
   sqlValue,
   utf8,
@@ -21,7 +20,6 @@ describe('replicated SQL materialization', () => {
     let materializer = await open(path, manifest, 1)
     const bootstrap = await transaction(1n, 'bootstrap', [
       sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT'),
-      platformOp.registerTable('accounts'),
       sqlStatement('INSERT INTO accounts (id, value) VALUES (?, ?) RETURNING id', [2n, 'two']),
       sqlStatement('SELECT id, value FROM accounts ORDER BY id'),
     ], materializer.executionManifestDigest)
@@ -40,14 +38,12 @@ describe('replicated SQL materialization', () => {
     const digest = materializer.executionManifestDigest
     const setup = await transaction(1n, 'setup', [
       sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
-      platformOp.registerTable('accounts'),
       sqlStatement('INSERT INTO accounts (id, balance) VALUES (1, 10)'),
     ], digest)
     const withdraw = await transaction(5n, 'withdraw', [
       sqlStatement('CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)'),
       sqlStatement("SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = 1) >= :amount, 'insufficient_funds')", { amount: 50n }),
       sqlStatement('UPDATE accounts SET balance = balance - 50 WHERE id = 1'),
-      platformOp.registerTable('audit'),
     ], digest)
     await materializer.materialize([setup, withdraw])
     expect(materializer.outcome(withdraw.txId)).toMatchObject({
@@ -73,10 +69,9 @@ describe('replicated SQL materialization', () => {
     const digest = incremental.executionManifestDigest
     const setup = await transaction(1n, 'setup', [
       sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY, now TEXT, local TEXT, r INTEGER, blob BLOB, last_rowid INTEGER, changed INTEGER)'),
-      platformOp.registerTable('probes'),
     ], digest)
     const late = await transaction(2n, 'late', [
-      sqlStatement('CREATE TABLE marker (id INTEGER PRIMARY KEY)'), platformOp.registerTable('marker'), sqlStatement('INSERT INTO marker (id) VALUES (7)'),
+      sqlStatement('CREATE TABLE marker (id INTEGER PRIMARY KEY)'), sqlStatement('INSERT INTO marker (id) VALUES (7)'),
     ], digest)
     const probe = await transaction(1_700_000_000_000n, 'probe', program, digest)
     await incremental.materialize([setup, probe])
@@ -103,14 +98,11 @@ describe('replicated SQL materialization', () => {
     const digest = materializer.executionManifestDigest
     const tx = await transaction(1n, 'ordinary', [
       sqlStatement('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, price REAL, doubled REAL GENERATED ALWAYS AS (price * 2))'),
-      platformOp.registerTable('items'),
       sqlStatement("INSERT INTO items (name, price) VALUES ('a', 1.5), ('A', 2.25), ('b', 3)"),
       sqlStatement('CREATE TABLE totals (name TEXT PRIMARY KEY, total REAL, names TEXT, rank INTEGER)'),
-      platformOp.registerTable('totals'),
       sqlStatement(`INSERT INTO totals (name, total, names, rank) SELECT name, sum(price), group_concat(name), rank() OVER (ORDER BY sum(price) DESC)
         FROM items GROUP BY name`),
       sqlStatement('CREATE TABLE log (id INTEGER PRIMARY KEY, message TEXT)'),
-      platformOp.registerTable('log'),
       sqlStatement("CREATE TRIGGER items_log AFTER INSERT ON items BEGIN INSERT INTO log (message) VALUES ('added ' || NEW.name); END"),
       sqlStatement("CREATE VIEW cheap AS SELECT name FROM items WHERE price < 2"),
       sqlStatement('ALTER TABLE items ADD COLUMN note TEXT'),
@@ -128,7 +120,7 @@ describe('replicated SQL materialization', () => {
     const { path, manifest } = await fixture({ maxVmSteps: 5_000 })
     const materializer = await open(path, manifest)
     const digest = materializer.executionManifestDigest
-    const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)'), platformOp.registerTable('t')], digest)
+    const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)')], digest)
     const cases: [string, ProgramStep, string][] = [
       ['attach', sqlStatement("ATTACH DATABASE ':memory:' AS other"), 'denied'],
       ['pragma', sqlStatement('PRAGMA writable_schema = 1'), 'denied'],
@@ -160,7 +152,7 @@ describe('replicated SQL materialization', () => {
     const { path, manifest } = await fixture()
     const materializer = await open(path, manifest)
     const digest = materializer.executionManifestDigest
-    const first = await transaction(1n, 'first', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)'), platformOp.registerTable('t')], digest)
+    const first = await transaction(1n, 'first', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)')], digest)
     const second = await transaction(2n, 'second', [
       sqlStatement("SELECT chronolog_assert(EXISTS (SELECT 1 FROM chronolog_transactions WHERE tx_id = ? AND outcome = 'accepted'), 'needs_first')", [utf8('first')]),
       sqlStatement('INSERT INTO t (id) VALUES (1)'),
@@ -179,7 +171,6 @@ describe('replicated SQL materialization', () => {
     const materializer = await open(path, manifest)
     const tx = await transaction(1n, 'values', [
       sqlStatement('CREATE TABLE v (id INTEGER PRIMARY KEY, a ANY, b ANY, c ANY, d ANY) STRICT'),
-      platformOp.registerTable('v'),
       sqlStatement('INSERT INTO v (a, b, c, d) VALUES (:real, :int, :blob, :text)', {
         real: sqlValue.real(1), int: 1n, blob: new Uint8Array(0), text: 'é',
       }),

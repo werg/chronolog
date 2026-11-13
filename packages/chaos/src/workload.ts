@@ -1,4 +1,4 @@
-import { platformOp, type PlatformOp } from '@chronolog/protocol'
+import type { PlatformOp } from '@chronolog/protocol'
 
 import type { ChaosCluster } from './cluster.js'
 import { errorText, type RunArtifacts } from './artifacts.js'
@@ -193,7 +193,6 @@ async function workloadStatements(kind: WorkloadOperationKind, context: {
       const table = `chaos_ddl_${worker}_${context.operation}`
       return [
         { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, marker TEXT) STRICT` },
-        platformOp.registerTable(table),
         { sql: `ALTER TABLE ${table} ADD COLUMN payload BLOB` },
         { sql: `SELECT name, type FROM pragma_table_info('${table}') ORDER BY cid` },
       ]
@@ -292,7 +291,7 @@ function expectationFor(kind: WorkloadOperationKind, operationId: string): Omit<
       return { allowedOutcomes: ['accepted'], migrationPrefix: migrationPrefix('migrate', operationId) }
     case 'migration_rollback':
       // Step 0 is the schema assertion; the duplicate history insert is step 7.
-      return { allowedOutcomes: ['rejected'], rejectionCode: 'constraint', failingStatementIndex: 7, migrationPrefix: migrationPrefix('rollback', operationId) }
+      return { allowedOutcomes: ['rejected'], rejectionCode: 'constraint', failingStatementIndex: 6, migrationPrefix: migrationPrefix('rollback', operationId) }
     case 'owner_probe':
       return { allowedOutcomes: ['accepted', 'rejected'], rejectionCode: 'policy:chaos_profiles:update', failingStatementIndex: 0 }
     default:
@@ -306,13 +305,11 @@ export function migrationChainStatements(prefix: string): WorkloadStatement[] {
   const audit = `${prefix}_audit`
   return [
     { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, legacy_name TEXT NOT NULL) STRICT` },
-    platformOp.registerTable(table),
     { sql: `INSERT INTO ${table} (id, legacy_name) VALUES (1, 'Alpha'), (2, 'Beta') RETURNING id, legacy_name` },
     { sql: 'INSERT INTO chaos_schema_migrations (component, version, checksum) VALUES (?, 1, ?)', params: [prefix, `${prefix}-v1`] },
     { sql: `CREATE INDEX ${prefix}_legacy_idx ON ${table}(legacy_name)` },
     { sql: `CREATE VIEW ${prefix}_legacy_view AS SELECT id, legacy_name FROM ${table}` },
     { sql: `CREATE TABLE ${audit} (item_id INTEGER PRIMARY KEY NOT NULL, normalized_name TEXT NOT NULL) STRICT` },
-    platformOp.registerTable(audit),
     { sql: `CREATE TRIGGER ${prefix}_legacy_trigger AFTER INSERT ON ${table} BEGIN INSERT INTO ${audit} (item_id, normalized_name) VALUES (NEW.id, NEW.legacy_name); END` },
     { sql: `ALTER TABLE ${table} ADD COLUMN normalized_name TEXT` },
     { sql: `UPDATE ${table} SET normalized_name = lower(legacy_name) RETURNING id, normalized_name` },
@@ -335,7 +332,6 @@ export function migrationRollbackStatements(prefix: string): WorkloadStatement[]
   const table = `${prefix}_items`
   return [
     { sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT` },
-    platformOp.registerTable(table),
     { sql: `CREATE INDEX ${prefix}_idx ON ${table}(value)` },
     { sql: `CREATE VIEW ${prefix}_view AS SELECT id, value FROM ${table}` },
     { sql: `CREATE TRIGGER ${prefix}_trigger AFTER INSERT ON ${table} BEGIN SELECT 1; END` },

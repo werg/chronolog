@@ -30,7 +30,7 @@ Implemented and covered by executable tests:
   tables with a `chronolog_owner` column stamped from the signer, generated
   insert/update/delete triggers, lookup views, schema reconciliation
   (unregistered tables, foreign `chronolog_*` objects, cross-owner FK
-  cascades, `RAISE(IGNORE)`), and the platform operations `RegisterTable`,
+  cascades, `RAISE(IGNORE)`), automatic table registration, and the platform operations
   `Grant`/`RevokeGrant` (row scope, column caps), `team` collectives
   (`CreateCollective`, `AcceptMembership`, `Leave`, `SetMembers`),
   `TransferOffer`/`TransferAccept` (row with dependents, or every row for a key

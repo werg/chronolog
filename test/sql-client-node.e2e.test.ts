@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { ChronologClient, platformOp, sqlValue } from '@chronolog/client'
+import { ChronologClient, sqlValue } from '@chronolog/client'
 import {
   DeterministicMaterializer,
   createDoltLiteExecutionManifest,
@@ -25,7 +25,6 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client, node } = await runtime()
     const bootstrap = await client.transaction([
       'CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT',
-      platformOp.registerTable('accounts'),
       { sql: 'INSERT INTO accounts (id, balance) VALUES (:id, :balance)', params: { id: 1n, balance: 100n } },
     ])
     expect((await terminal(client, bootstrap.transactionId)).outcome.type).toBe('accepted')
@@ -50,7 +49,6 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client } = await runtime()
     await terminal(client, (await client.transaction([
       'CREATE TABLE guarded_values (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT',
-      platformOp.registerTable('guarded_values'),
       'INSERT INTO guarded_values (id, value) VALUES (1, 10)',
     ])).transactionId)
 
@@ -82,7 +80,6 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client } = await runtime()
     const transaction = await client.transaction([
       'CREATE TABLE dynamic_values (id INTEGER PRIMARY KEY, value)',
-      platformOp.registerTable('dynamic_values'),
       {
         sql: 'INSERT INTO dynamic_values (value) VALUES (?), (?), (?), (?), (?), (?), (?)',
         params: [null, 42, 1.5, sqlValue.real(2), 'Grüße', Uint8Array.of(0, 255), new Uint8Array(0)],
@@ -103,7 +100,6 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client, node } = await runtime()
     const transaction = await client.transaction([
       'CREATE TABLE stamped (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, noise INTEGER NOT NULL)',
-      platformOp.registerTable('stamped'),
       "INSERT INTO stamped (at, noise) VALUES (unixepoch('now', 'subsec') * 1000, random())",
     ])
     expect((await terminal(client, transaction.transactionId)).outcome.type).toBe('accepted')
@@ -148,7 +144,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const rollback = await client.transaction([schemaVersionAssertion('profiles', 2), ...migrationRollbackStatements(rollbackPrefix)])
     expect((await terminal(client, rollback.transactionId)).outcome).toEqual({
       type: 'rejected',
-      rejection: { code: 'constraint', statementIndex: 7 },
+      rejection: { code: 'constraint', statementIndex: 6 },
     })
     expect((await client.query('SELECT name FROM sqlite_schema WHERE name LIKE ?', [`${rollbackPrefix}%`])).result.rows).toEqual([])
     expect((await client.query('SELECT version FROM chaos_schema_migrations WHERE component = ?', [rollbackPrefix])).result.rows).toEqual([])
@@ -159,7 +155,6 @@ describe('SQL client → RPC → node → reducer', () => {
     const { client, node } = await runtime({ clockNow: () => now })
     const bootstrap = await client.transaction([
       'CREATE TABLE replay_accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT',
-      platformOp.registerTable('replay_accounts'),
       'INSERT INTO replay_accounts (id, balance) VALUES (1, 100)',
     ])
     await terminal(client, bootstrap.transactionId)

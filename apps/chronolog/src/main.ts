@@ -24,7 +24,6 @@ interface SqlSpec {
 /**
  * A platform operation in JSON. Keys and ids are base64url; `group` names the
  * group collective. Row keys are primary-key values, like SQL bindings.
- *   {"platform":"register_table","table":"notes"}
  *   {"platform":"grant","table":"notes","grantee":KEY,"operations":["update"],"rowKey":[1],"columns":["status"],"grantor":ID?}
  *   {"platform":"revoke_grant","grantId":ID}
  *   {"platform":"create_collective","governance":{"insert":"member","update":"member","delete":"admin"},"invitees":[KEY]}
@@ -51,11 +50,10 @@ type SeedValue =
   | { readonly kind: 'blob'; readonly value: string }
 type SeedStep =
   | { readonly sql: string; readonly bindings: readonly SeedValue[] }
-  | { readonly platform: 'register_table'; readonly table: string }
   | { readonly platform: 'seed_rows'; readonly table: string; readonly columns: readonly string[]; readonly rows: readonly (readonly SeedValue[])[] }
   | { readonly platform: 'end_seeding' }
 interface SeedPlan {
-  readonly format: 'chronolog-fork-seed-v4'
+  readonly format: 'chronolog-fork-seed-v5'
   readonly batches: readonly {
     readonly batch: number
     readonly label: string
@@ -165,13 +163,12 @@ try {
       // rerun after an interruption skips finished batches.
       const plan = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'seed @fork-seed.json'))) as SeedPlan
       const batches: SeedPlan['batches'] = plan.batches
-      if (plan.format !== 'chronolog-fork-seed-v4' || !(batches as unknown instanceof Array)) throw new Error('Not a fork seed plan')
+      if (plan.format !== 'chronolog-fork-seed-v5' || !(batches as unknown instanceof Array)) throw new Error('Not a fork seed plan')
       let applied = 0
       let skipped = 0
       for (const batch of batches) {
         const handle = await client.transaction(batch.steps.map((step): TransactionStepInput => {
           if ('sql' in step) return { sql: step.sql, params: step.bindings.map(seedValue) }
-          if (step.platform === 'register_table') return platformOp.registerTable(step.table)
           if (step.platform === 'end_seeding') return platformOp.endSeeding()
           return platformOp.seedRows(step.table, step.columns, step.rows.map((row) => row.map(seedValue)))
         }))
@@ -234,7 +231,6 @@ function jsonPlatformOp(spec: PlatformSpec): PlatformOp {
   const rowKey = (): ClientSqlValue[] => list('rowKey').map(jsonValue)
   const keyList = (name: string): Uint8Array[] => list(name).map((value, index) => key(value, `${name}[${index}]`))
   switch (spec.platform) {
-    case 'register_table': return platformOp.registerTable(text('table'))
     case 'grant': {
       const grantor = optionalId('grantor')
       return platformOp.grant({

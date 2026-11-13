@@ -12,7 +12,7 @@ replay from where it belongs. Validators never sign database states.
   dialect or migration system. Assumptions are SQL statements, usually
   `SELECT chronolog_assert(condition, 'code')`; a failing statement rejects the
   whole transaction.
-- **Owner-controlled rows.** Every application table is registered and gets a
+- **Owner-controlled rows.** Every application table automatically gets a
   `chronolog_owner` column stamped with the signer of the insert, stored as a
   small integer id (`chronolog_principals` maps ids to keys).
   Generated triggers let only the owner, a collective it belongs to, or a key
@@ -63,13 +63,13 @@ A transaction file lists steps: SQL statements and platform operations.
 Bindings are JSON scalars or tagged values
 (`{"kind":"integer","value":"9007199254740993"}`, `{"kind":"real","value":1}`,
 `{"kind":"blob","value":"BASE64URL"}`). The daemon's own node is the group's
-root administrator, so it may create and register a table:
+root administrator, so it may create a table (it is owner-checked from the
+next statement on):
 
 ```json
 {
   "steps": [
     { "sql": "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT" },
-    { "platform": "register_table", "table": "accounts" },
     { "sql": "INSERT INTO accounts (id, balance) VALUES (?, ?)", "bindings": [1, 100] }
   ],
   "wait": true

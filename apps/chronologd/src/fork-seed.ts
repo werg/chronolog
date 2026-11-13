@@ -29,7 +29,6 @@ export interface SeedStatement {
 
 /** A platform operation step, in readable JSON. */
 export type SeedPlatformStep =
-  | { readonly platform: 'register_table'; readonly table: string }
   | {
     readonly platform: 'seed_rows'
     readonly table: string
@@ -53,7 +52,7 @@ export interface SeedBatch {
 export const FORK_SEED_APPLIED_CODE = 'fork_seed_applied'
 
 
-export const FORK_SEED_FORMAT = 'chronolog-fork-seed-v4'
+export const FORK_SEED_FORMAT = 'chronolog-fork-seed-v5'
 
 export interface ForkSeedPlan {
   readonly format: typeof FORK_SEED_FORMAT
@@ -110,15 +109,10 @@ export function buildForkSeedPlan(
   const notApplied = (batch: number): SeedStatement =>
     guard(`NOT EXISTS (SELECT 1 FROM ${FORK_SEED_TABLE} WHERE batch = ${batch})`)
 
-  // Tables are created and registered together: reconciliation refuses an
-  // unregistered table at the end of the transaction that created it.
+  // Every table is registered (put under owner checks) as it is created.
   const schemaSteps: SeedStep[] = [
     { sql: `CREATE TABLE ${FORK_SEED_TABLE} (batch INTEGER PRIMARY KEY, label TEXT NOT NULL) STRICT`, bindings: [] },
-    { platform: 'register_table', table: FORK_SEED_TABLE },
-    ...objects.filter((object) => object.type === 'table').flatMap((object): SeedStep[] => [
-      { sql: object.sql, bindings: [] },
-      { platform: 'register_table', table: object.name },
-    ]),
+    ...objects.filter((object) => object.type === 'table').map((object): SeedStep => ({ sql: object.sql, bindings: [] })),
   ]
   if (schemaSteps.length > MAX_SCHEMA_STEPS) throw new Error('FORK_SEED_TOO_MANY_TABLES')
   batches.push({
@@ -211,7 +205,6 @@ export function platformTableDigests(database: ReadableDatabase): Record<string,
 /** A plan step as a transaction program step. */
 export function seedStepToProgramStep(step: SeedStep): ProgramStep {
   if ('sql' in step) return sqlStatement(step.sql, step.bindings.map(seedSqlValue))
-  if (step.platform === 'register_table') return platformOp.registerTable(step.table)
   if (step.platform === 'end_seeding') return platformOp.endSeeding()
   return platformOp.seedRows(step.table, step.columns, step.rows.map((row) => row.map(seedSqlValue)))
 }

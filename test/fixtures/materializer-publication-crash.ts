@@ -6,7 +6,6 @@ import {
 } from '@chronolog/materializer-doltlite'
 import {
   encodeTransactionCore,
-  platformOp,
   transactionDigest,
   utf8,
   type TransactionCore,
@@ -36,7 +35,7 @@ const core: TransactionCore = {
   executionManifestDigest: materializer.executionManifestDigest,
   program: {
     version: 2,
-    steps: [{ sql: 'CREATE TABLE crash_probe (id INTEGER PRIMARY KEY) STRICT', bindings: [] }, platformOp.registerTable('crash_probe')],
+    steps: [{ sql: 'CREATE TABLE crash_probe (id INTEGER PRIMARY KEY) STRICT', bindings: [] }],
   },
 }
 const canonicalCandidate = encodeTransactionCore(core)

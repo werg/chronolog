@@ -67,7 +67,7 @@ do to the database's rows is decided inside the database
   file.
 - Active admins of the `group` collective are the **schema administrators**.
   Only they may run DDL (tables, indexes, views, app triggers, `ALTER TABLE`)
-  and register tables. A group admin adds another with a `set_members` step
+  (tables are owner-checked automatically). A group admin adds another with a `set_members` step
   (`{"platform":"set_members","collectiveId":"group","changes":[{"member":KEY,"role":"admin"}]}`);
   the new admin joins by submitting `accept_membership` for `group`.
 - Schema administrators are not data owners. They cannot update or delete
@@ -129,7 +129,7 @@ CHRONOLOG_DATA_DIR=/var/lib/fork pnpm group verify-fork /secure/snapshot-r120
 `fork` verifies the archive exactly like a snapshot import (file evidence, the
 operator-chosen signer, execution manifest, materialized evidence) and makes
 this node the fork's root administrator. It writes `fork-seed.json`
-(`chronolog-fork-seed-v4`): transactions that recreate and register the
+(`chronolog-fork-seed-v5`): transactions that recreate the
 snapshot's application tables, then write their rows with the `seed_rows`
 platform operation, in foreign-key order and keeping every row's
 `chronolog_owner`, then the teams, memberships, grants and open transfer

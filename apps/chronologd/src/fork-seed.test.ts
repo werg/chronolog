@@ -49,15 +49,12 @@ async function sourceGroup(): Promise<string> {
   const writer = new Writer(materializer)
   await writer.accepted(SOURCE_ROOT,
     'CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id), label TEXT NOT NULL) STRICT',
-    platformOp.registerTable('nodes'),
     `CREATE TABLE measurements (
       node INTEGER NOT NULL REFERENCES nodes(id), at INTEGER NOT NULL, value REAL, raw BLOB, note ANY,
       doubled REAL GENERATED ALWAYS AS (value * 2) VIRTUAL,
       PRIMARY KEY (node, at)
     ) STRICT`,
-    platformOp.registerTable('measurements'),
     'CREATE TABLE audit (id INTEGER PRIMARY KEY, message TEXT NOT NULL) STRICT',
-    platformOp.registerTable('audit'),
     'CREATE INDEX measurements_value ON measurements (value)',
     'CREATE VIEW leaf_labels AS SELECT label FROM nodes WHERE id NOT IN (SELECT parent FROM nodes WHERE parent IS NOT NULL)',
     "CREATE TRIGGER nodes_audit AFTER INSERT ON nodes BEGIN INSERT INTO audit (id, message) VALUES (NEW.id, 'node ' || NEW.label); END")
@@ -95,7 +92,7 @@ describe('fork seed plan', () => {
   it('recreates tables, rows, owners, teams and grants exactly, and is idempotent', async () => {
     const sourcePath = await sourceGroup()
     const plan = readOnly(sourcePath, (database) => buildForkSeedPlan(database, ORIGIN))
-    expect(plan.format).toBe('chronolog-fork-seed-v4')
+    expect(plan.format).toBe('chronolog-fork-seed-v5')
     const { materializer, path: forkPath } = await fixtures.open({ rootAdministrator: FORK_ROOT, forkSeeding: true })
     const writer = new Writer(materializer)
     expect(await seed(writer, plan)).toEqual(plan.batches.map(() => 'accepted'))
@@ -125,7 +122,7 @@ describe('fork seed plan', () => {
   it('splits large tables into batches that fit one transaction', async () => {
     const { materializer, path } = await fixtures.open({ rootAdministrator: SOURCE_ROOT })
     const writer = new Writer(materializer)
-    await writer.accepted(SOURCE_ROOT, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT', platformOp.registerTable('t'),
+    await writer.accepted(SOURCE_ROOT, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT',
       sqlStatement("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 501) INSERT INTO t (id, v) SELECT i, 'v' || i FROM n"))
     materializer.close()
     const plan = readOnly(path, (database) => buildForkSeedPlan(database, ORIGIN))

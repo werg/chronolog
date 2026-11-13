@@ -44,7 +44,7 @@ A transaction candidate is signed by its author and carries:
 - `author_timestamp_ms`, fixed by the author;
 - the execution manifest digest (engine build, platform code and limits);
 - a program: an ordered list of steps, each a SQLite statement with bindings
-  or a typed platform operation (register a table, grant, collective,
+  or a typed platform operation (grant, collective,
   transfer).
 
 Values are SQLite's own storage classes (NULL, INTEGER, REAL, TEXT, BLOB).
@@ -61,7 +61,8 @@ returned by statements are not replicated.
 
 ## 3a. Owner-controlled rows
 
-Every application table is registered and has a `chronolog_owner` column,
+Every application table is put under owner checks when it is created (no
+extra step) and has a `chronolog_owner` column,
 stamped with the signer of the transaction that inserted the row (stored as
 a small integer id; `chronolog_principals` maps ids to keys).
 Platform-generated triggers, enforced by the pinned engine on every replica,

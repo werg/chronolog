@@ -18,6 +18,7 @@ import {
   hasValidOwnerColumn,
   isOwnerComposite,
   ownerColumn,
+  platformTriggerName,
   platformTriggers,
   quoteIdentifier,
   resolveTable,
@@ -110,7 +111,6 @@ export class PlatformSession {
 
   execute(op: PlatformOp, stepIndex: number): void {
     switch (op.op) {
-      case 'register_table': return this.#registerTable(op.table)
       case 'grant': return this.#grant(op, stepIndex)
       case 'revoke_grant': return this.#revokeGrant(op.grantId)
       case 'create_collective': return this.#createCollective(op, stepIndex)
@@ -126,11 +126,13 @@ export class PlatformSession {
 
   // ── tables ────────────────────────────────────────────────────────────────
 
-  #registerTable(requested: string): void {
-    if (!this.isSchemaAdmin()) reject('not_schema_admin')
-    const name = resolveTable(this.#database, requested) ?? reject('no_such_table')
-    if (isReservedSchemaObjectName(name)) reject('reserved_table')
-    if (this.#isRegistered(name)) reject('already_registered')
+  /**
+   * Put a new application table under owner checks: add the owner column
+   * (to an empty table), lint its foreign keys, and generate its triggers.
+   * Run by reconciliation right after the statement that created the table;
+   * only schema administrators can create tables.
+   */
+  #registerTable(name: string): void {
     let shape = tableShape(this.#database, name)
     if (shape.primaryKey.length === 0) reject('no_primary_key')
     if (ownerColumn(shape) === undefined) {
@@ -554,18 +556,35 @@ export class PlatformSession {
     const registered = this.#registeredTables()
     const registeredKeys = new Set(registered.map((name) => name.toLowerCase()))
 
-    // Dropping a registered table unregisters it and ends its grants and offers.
     for (const name of registered) {
       if (tables.has(name.toLowerCase())) continue
+      // A renamed table takes its triggers along (SQLite rewrites their table),
+      // so its insert trigger now names the new table: move the registration,
+      // grants and open offers, and regenerate the triggers under the new name.
+      const moved = this.#get(`SELECT tbl_name FROM sqlite_schema WHERE type = 'trigger' AND name = ?`, platformTriggerName(name, 'ins'))
+      const renamedTo = moved === undefined ? undefined : tables.get(String(moved.tbl_name).toLowerCase())
+      if (renamedTo !== undefined && !registeredKeys.has(renamedTo.toLowerCase())) {
+        for (const event of ['ins', 'upd', 'del'] as const) this.#run(`DROP TRIGGER IF EXISTS ${quoteIdentifier(platformTriggerName(name, event))}`)
+        for (const trigger of platformTriggers(tableShape(this.#database, renamedTo))) this.#run(trigger.sql)
+        this.#run('UPDATE chronolog_tables SET name = ? WHERE name = ?', renamedTo, name)
+        this.#run('UPDATE chronolog_grants SET tbl = ? WHERE tbl = ?', renamedTo, name)
+        this.#run('UPDATE chronolog_transfers SET tbl = ? WHERE tbl = ?', renamedTo, name)
+        registeredKeys.delete(name.toLowerCase())
+        registeredKeys.add(renamedTo.toLowerCase())
+        continue
+      }
+      // Dropping a registered table unregisters it and ends its grants and offers.
       this.#run('DELETE FROM chronolog_tables WHERE name = ?', name)
       this.#run('UPDATE chronolog_grants SET revoked_tx = ? WHERE tbl = ? AND revoked_tx IS NULL', this.#context.txId, name)
       this.#run(`UPDATE chronolog_transfers SET state = 'cancelled', closed_tx = ? WHERE tbl = ? AND state = 'open'`, this.#context.txId, name)
       registeredKeys.delete(name.toLowerCase())
     }
 
+    // Every new application table is registered at once.
     for (const [key, name] of tables) {
       if (registeredKeys.has(key) || isReservedSchemaObjectName(name) || isVecChunkTable(this.#database, name, vecTables)) continue
-      throw new PlatformRejection('schema_unregistered')
+      this.#registerTable(name)
+      registeredKeys.add(key)
     }
 
     const expected = new Set<string>(PLATFORM_VIEW_NAMES)

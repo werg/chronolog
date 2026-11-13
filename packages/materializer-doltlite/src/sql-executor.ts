@@ -54,6 +54,18 @@ export function executeTransactionProgram(
   try {
     resetChangeCounter(database)
     let schemaAdmin = signerIsSchemaAdmin
+    // Reconcile right after every statement that changed the schema, so a new
+    // table is owner-checked from the next statement on (§3).
+    let reconciledVersion = schemaBefore
+    const reconcileIfChanged = (index: number | null): void => {
+      if (schemaVersion(database) === reconciledVersion) return
+      try {
+        platform.reconcile()
+      } catch (error) {
+        throw rejectionFor(error, index)
+      }
+      reconciledVersion = schemaVersion(database)
+    }
     for (const [index, step] of program.steps.entries()) {
       if (isPlatformOp(step)) {
         try {
@@ -65,14 +77,9 @@ export function executeTransactionProgram(
       } else {
         executeStatement(database, step, index, limits, { schemaAdmin, writeProtectedTables: writeProtectedTables(database) })
       }
+      reconcileIfChanged(index)
     }
-    if (schemaVersion(database) !== schemaBefore) {
-      try {
-        platform.reconcile()
-      } catch (error) {
-        throw rejectionFor(error, null)
-      }
-    }
+    reconcileIfChanged(null)
   } finally {
     database.clearDeterministicContext()
   }

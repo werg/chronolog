@@ -15,7 +15,6 @@ const fixture: SqlTransactionProgram = {
   steps: [
     sqlStatement("SELECT chronolog_assert(? > 0, 'positive')", [7n]),
     sqlStatement('INSERT INTO t VALUES (:a, :b, :c, :d)', { a: sqlValue.real(1.5), b: 'text', c: new Uint8Array([1, 2]), d: null }),
-    platformOp.registerTable('t'),
     platformOp.grant({ table: 't', grantee: key(2), operations: ['update', 'delete'], rowKey: [7n, 'k'], columns: ['b'] }),
     platformOp.createCollective({ governance: { insert: 'member', update: 'member', delete: 'admin' }, invitees: [key(3)] }),
     platformOp.setMembers(key(4), [{ member: key(5), role: 'admin' }, { member: key(6), role: 'remove' }]),

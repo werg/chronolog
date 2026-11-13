@@ -13,7 +13,6 @@ import {
 import {
   encodeTransactionCore,
   transactionDigest,
-  platformOp,
   sqlProgram,
   sqlStatement,
   utf8,
@@ -157,7 +156,6 @@ async function requireRevision(
 function bootstrapProgram(): SqlTransactionProgram {
   return sqlProgram(
     sqlStatement('CREATE TABLE release_events (id INTEGER PRIMARY KEY, iteration INTEGER NOT NULL, kind TEXT NOT NULL) STRICT'),
-    platformOp.registerTable('release_events'),
   )
 }
 

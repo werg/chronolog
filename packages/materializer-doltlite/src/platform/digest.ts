@@ -8,7 +8,7 @@ import { platformTriggers, type TableShape } from './tables.js'
  * any change to what an operation checks or writes: the platform code decides
  * replicated state, so replicas must run the same version.
  */
-export const PLATFORM_CODE_VERSION = 'chronolog-platform-ops-v4'
+export const PLATFORM_CODE_VERSION = 'chronolog-platform-ops-v5'
 
 /** A fixed table that exercises the trigger generator (composite key, odd names, a cap column). */
 const REFERENCE_TABLE: TableShape = {

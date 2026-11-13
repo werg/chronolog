@@ -21,7 +21,6 @@ export function chaosBootstrapStatements(accountCount: number, writers: readonly
     { sql: 'CREATE TABLE chaos_schema_migrations (component TEXT NOT NULL, version INTEGER NOT NULL, checksum TEXT NOT NULL, PRIMARY KEY (component, version)) WITHOUT ROWID, STRICT' },
     { sql: 'CREATE TABLE chaos_profiles (profile_id TEXT PRIMARY KEY NOT NULL, display_name TEXT NOT NULL, email TEXT, schema_version INTEGER NOT NULL DEFAULT 2, metadata BLOB) STRICT' },
     { sql: 'CREATE TABLE chaos_profile_audit (profile_id TEXT PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL, email_seen INTEGER NOT NULL) WITHOUT ROWID, STRICT' },
-    ...CHAOS_TABLES.map((table) => platformOp.registerTable(table)),
     { sql: 'CREATE INDEX chaos_profiles_display_name_idx ON chaos_profiles(display_name)' },
     { sql: 'CREATE VIEW chaos_profiles_current AS SELECT profile_id, display_name, email, metadata FROM chaos_profiles WHERE schema_version = 2' },
     { sql: 'CREATE TRIGGER chaos_profiles_insert_audit AFTER INSERT ON chaos_profiles BEGIN INSERT INTO chaos_profile_audit (profile_id, schema_version, email_seen) VALUES (NEW.profile_id, NEW.schema_version, NEW.email IS NOT NULL); END' },
