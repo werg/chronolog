@@ -37,12 +37,8 @@ interface CapabilitySpec {
   readonly subjectId: string
   readonly signingPublicKey: string
   readonly transportAuthor?: string
-  readonly role: 'reader' | 'writer' | 'validator' | 'administrator' | 'schema-administrator'
-  readonly validUntilRevision?: string
-  readonly organization?: string
-  readonly validatorClass?: string
+  readonly role: 'reader' | 'writer' | 'validator' | 'administrator'
   readonly minimumAuthorTimestampMs?: string
-  readonly readerScope?: 'snapshot' | 'audit'
   readonly hpkePublicKey?: string
 }
 

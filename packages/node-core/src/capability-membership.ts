@@ -128,8 +128,6 @@ export class CapabilityMembershipResolver implements MembershipResolver {
         evidence: {
           capabilityId: capability.id,
           validatorId: attestation.validatorId,
-          ...(capability.grant.organization === undefined ? {} : { organization: capability.grant.organization }),
-          ...(capability.grant.validatorClass === undefined ? {} : { validatorClass: capability.grant.validatorClass }),
         },
         attestation,
       })
@@ -153,18 +151,14 @@ export class CapabilityMembershipResolver implements MembershipResolver {
       .filter((capability) => this.#activeRole(capability, snapshot, 'validator'))
     if (validators.length > this.#maximumWatermarkValidators) return null
     const policyId = bytesToHex(effective.id)
-    if (effective.policy.classMinimums.size === 0 && effective.policy.requiredOrganizations.length === 0) {
-      const threshold = Number(effective.policy.minimumValidators)
-      if (!Number.isSafeInteger(threshold)) return null
-      return {
-        kind: 'threshold',
-        policyId,
-        validatorIds: validators.map((capability) => capability.grant.signingPublicKey),
-        threshold,
-      }
+    const threshold = Number(effective.policy.minimumValidators)
+    if (!Number.isSafeInteger(threshold)) return null
+    return {
+      kind: 'threshold',
+      policyId,
+      validatorIds: validators.map((capability) => capability.grant.signingPublicKey),
+      threshold,
     }
-    const proofs = minimalProofs(effective.policy, validators)
-    return proofs.length === 0 ? null : { kind: 'proof-alternatives', policyId, minimalProofs: proofs }
   }
 
   async #snapshot(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): Promise<CapabilitySnapshot | null> {
@@ -181,29 +175,3 @@ export class CapabilityMembershipResolver implements MembershipResolver {
   }
 }
 
-function minimalProofs(
-  policy: CapabilitySnapshot['policies'] extends ReadonlyMap<string, infer P>
-    ? P extends { readonly policy: infer V } ? V : never
-    : never,
-  validators: readonly EffectiveCapability[],
-): readonly (readonly Uint8Array[])[] {
-  const results: Uint8Array[][] = []
-  const visit = (index: number, selected: EffectiveCapability[]): void => {
-    if (index === validators.length) {
-      const evidence: ValidatorEvidence[] = selected.map((capability) => ({
-        capabilityId: capability.id,
-        validatorId: capability.grant.signingPublicKey,
-        ...(capability.grant.organization === undefined ? {} : { organization: capability.grant.organization }),
-        ...(capability.grant.validatorClass === undefined ? {} : { validatorClass: capability.grant.validatorClass }),
-      }))
-      if (!evaluateValidationPolicy(policy, evidence).satisfied) return
-      if (results.some((proof) => proof.every((id) => selected.some((candidate) => equalBytes(candidate.grant.signingPublicKey, id))))) return
-      results.push(selected.map((capability) => capability.grant.signingPublicKey))
-      return
-    }
-    visit(index + 1, selected)
-    visit(index + 1, [...selected, validators[index]!])
-  }
-  visit(0, [])
-  return results
-}

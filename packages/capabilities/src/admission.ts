@@ -62,8 +62,6 @@ export function validatorEvidenceForAttestation(
   return {
     capabilityId: capability.id,
     validatorId: attestation.validatorId,
-    ...(capability.grant.organization === undefined ? {} : { organization: capability.grant.organization }),
-    ...(capability.grant.validatorClass === undefined ? {} : { validatorClass: capability.grant.validatorClass }),
   }
 }
 
@@ -99,7 +97,6 @@ export function assembleAdmissionProof(
 
 export function canReaderAccessRevision(capability: EffectiveCapability, membershipRevision: bigint): boolean {
   if (capability.grant.role !== 'reader') return false
-  if (capability.grant.readerScope === 'audit') return true
   return membershipRevision >= capability.grant.validFromRevision
 }
 

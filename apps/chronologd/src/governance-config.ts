@@ -118,8 +118,6 @@ async function createGenesis(
   const policy: ValidationPolicy = {
     version: 1n,
     minimumValidators: 1n,
-    classMinimums: new Map(),
-    requiredOrganizations: [],
   }
   const common = {
     subjectId: options.identity.publicKeyBytes,
@@ -134,10 +132,9 @@ async function createGenesis(
     capabilityLogFeed: new TextEncoder().encode(options.transportAuthor),
     initialCapabilities: [
       { ...common, role: 'administrator' },
-      { ...common, role: 'schema-administrator' },
       { ...common, role: 'writer' },
       { ...common, role: 'validator', minimumAuthorTimestampMs: 0n },
-      { ...common, role: 'reader', readerScope: 'audit', hpkePublicKey: recipientPublicKey },
+      { ...common, role: 'reader', hpkePublicKey: recipientPublicKey },
     ],
     validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 60_000n, heartbeatIntervalMs: 30_000n },

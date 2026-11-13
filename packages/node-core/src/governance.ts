@@ -186,9 +186,9 @@ export class GovernanceControlPlane {
   async grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey): Promise<number> {
     this.#assertCapabilityFeedOwner()
     const reader = [...this.#snapshot.capabilities.values()].find((capability) =>
-      capability.grant.role === 'reader' && capability.grant.readerScope === 'audit' &&
+      capability.grant.role === 'reader' &&
       equalBytes(capability.grant.subjectId, subjectId) && isCapabilityActive(capability, this.#snapshot.revision))
-    if (reader === undefined) throw new Error('GOVERNANCE_AUDIT_READER_REQUIRED')
+    if (reader === undefined) throw new Error('GOVERNANCE_READER_REQUIRED')
     let published = 0
     for (const [epoch, key] of [...this.#contentKeys].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
       const original = this.#epochManifests.get(epoch)
@@ -302,6 +302,14 @@ export class GovernanceControlPlane {
 
   #rememberSnapshot(snapshot: CapabilitySnapshot): void {
     this.#snapshots.set(bytesToHex(snapshot.revisionDigest), structuredClone(snapshot))
+    // Replicate the administration feed and every feed a grant ever named:
+    // records written before a revocation remain part of history.
+    const request = this.#options.transport.requestFeed?.bind(this.#options.transport)
+    if (request === undefined) return
+    request(feedAuthor(snapshot.capabilityLogFeed))
+    for (const capability of snapshot.capabilities.values()) {
+      if (capability.grant.transportAuthor !== undefined) request(capability.grant.transportAuthor)
+    }
   }
 
   #assertCapabilityFeedOwner(): void {

@@ -51,19 +51,13 @@ export interface ValidatorHeartbeat {
   readonly feedContiguous: boolean
 }
 
-export type WatermarkPolicy =
-  | {
-      readonly kind: 'threshold'
-      readonly policyId: string
-      readonly validatorIds: readonly Uint8Array[]
-      readonly threshold: number
-    }
-  | {
-      readonly kind: 'proof-alternatives'
-      readonly policyId: string
-      /** Every entry is a minimal validator set that could satisfy the policy. */
-      readonly minimalProofs: readonly (readonly Uint8Array[])[]
-    }
+/** The watermark is the cutoff that `threshold` of these validators have all passed. */
+export interface WatermarkPolicy {
+  readonly kind: 'threshold'
+  readonly policyId: string
+  readonly validatorIds: readonly Uint8Array[]
+  readonly threshold: number
+}
 
 export interface WatermarkEvidence {
   readonly policyId: string

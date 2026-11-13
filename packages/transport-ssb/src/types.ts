@@ -53,6 +53,8 @@ export interface ChronologTransport {
    * entry, but must be cheap enough to call once per ingested record.
    */
   feedContiguousThrough?(feedId: string): Promise<bigint>
+  /** Replicate `feedId` from connected peers (membership tells the node which feeds matter). */
+  requestFeed?(feedId: string): void
   close(): Promise<void>
 }
 

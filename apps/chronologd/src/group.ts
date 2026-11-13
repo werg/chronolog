@@ -192,7 +192,7 @@ async function initialize(
       // on the administrator node, then `chronolog governance rotate` so the new
       // reader receives the current epoch key. Validator floors default to grant time.
       suggestedGrants: {
-        reader: grant('reader', { readerScope: 'snapshot', hpkePublicKey: b64(loaded.recipientPublicKey) }),
+        reader: grant('reader', { hpkePublicKey: b64(loaded.recipientPublicKey) }),
         writer: grant('writer'),
         validator: grant('validator'),
       },

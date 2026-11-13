@@ -21,15 +21,14 @@ import type {
   ClockPolicy,
   ForkOrigin,
   GenesisManifest,
-  ReaderHistoryScope,
   ResourcePolicy,
   SignedCapabilityRevision,
   SignedGenesis,
   ValidationPolicy,
 } from './types.js'
 
-const ROLES = ['reader', 'writer', 'validator', 'administrator', 'schema-administrator'] as const
-const SCOPES = ['snapshot', 'audit'] as const
+// Wire codes are positions in this list; code 4 (formerly 'schema-administrator') is retired.
+const ROLES = ['reader', 'writer', 'validator', 'administrator'] as const
 
 function roleIndex(role: CapabilityGrant['role']): bigint {
   const index = ROLES.indexOf(role)
@@ -40,44 +39,36 @@ function roleIndex(role: CapabilityGrant['role']): bigint {
 function grantToCbor(grant: CapabilityGrant): CborValue {
   protocolInvariant(grant.signingPublicKey.length === 32, 'SCHEMA_INVALID', 'Capability signing key must contain 32 bytes')
   protocolInvariant(grant.validFromRevision >= 0n, 'INTEGER_OUT_OF_RANGE', 'Capability revision cannot be negative')
-  if (grant.validUntilRevision !== undefined) {
-    protocolInvariant(grant.validUntilRevision >= grant.validFromRevision, 'SCHEMA_INVALID', 'Capability validity interval is inverted')
-  }
   if (grant.role === 'validator') {
     protocolInvariant(grant.minimumAuthorTimestampMs !== undefined, 'SCHEMA_INVALID', 'Validator capability requires a timestamp floor')
   } else {
-    protocolInvariant(grant.validatorClass === undefined && grant.minimumAuthorTimestampMs === undefined, 'SCHEMA_INVALID', 'Only validators may carry validator fields')
+    protocolInvariant(grant.minimumAuthorTimestampMs === undefined, 'SCHEMA_INVALID', 'Only validators may carry validator fields')
   }
   if (grant.role === 'reader') {
-    protocolInvariant(grant.readerScope !== undefined && grant.hpkePublicKey !== undefined, 'SCHEMA_INVALID', 'Reader capability requires scope and HPKE key')
+    protocolInvariant(grant.hpkePublicKey !== undefined, 'SCHEMA_INVALID', 'Reader capability requires an HPKE key')
     protocolInvariant(grant.hpkePublicKey.length === 32, 'SCHEMA_INVALID', 'Reader HPKE key must contain 32 bytes')
   } else {
-    protocolInvariant(grant.readerScope === undefined && grant.hpkePublicKey === undefined, 'SCHEMA_INVALID', 'Only readers may carry reader fields')
+    protocolInvariant(grant.hpkePublicKey === undefined, 'SCHEMA_INVALID', 'Only readers may carry reader fields')
   }
   if (grant.transportAuthor !== undefined) {
     protocolInvariant(grant.transportAuthor.length > 0, 'SCHEMA_INVALID', 'Capability transport author must not be empty')
   }
-  const scope = grant.readerScope === undefined ? undefined : BigInt(SCOPES.indexOf(grant.readerScope))
+  // Keys 4 (valid until), 5 (organization), 6 (validator class) and 8 (reader scope) are retired.
   return integerMap([
     [0, grant.subjectId], [1, grant.signingPublicKey], [2, roleIndex(grant.role)],
-    [3, grant.validFromRevision], [4, grant.validUntilRevision], [5, grant.organization],
-    [6, grant.validatorClass], [7, grant.minimumAuthorTimestampMs], [8, scope], [9, grant.hpkePublicKey],
+    [3, grant.validFromRevision], [7, grant.minimumAuthorTimestampMs], [9, grant.hpkePublicKey],
     [10, grant.transportAuthor],
   ])
 }
 
 function grantFromCbor(value: CborValue, field: string): CapabilityGrant {
   const map = expectMap(value, field)
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], field)
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 7, 9, 10], field)
   const roleValue = expectUint64(required(map, 2, `${field}.role`), `${field}.role`)
   protocolInvariant(roleValue < BigInt(ROLES.length), 'SCHEMA_INVALID', `${field}.role is unknown`)
   const role = ROLES[Number(roleValue)]
   protocolInvariant(role !== undefined, 'SCHEMA_INVALID', `${field}.role is unknown`)
-  const until = optional(map, 4)
-  const organization = optional(map, 5)
-  const validatorClass = optional(map, 6)
   const floor = optional(map, 7)
-  const scopeValue = optional(map, 8)
   const hpkeKey = optional(map, 9)
   const transportAuthor = optional(map, 10)
   const grant: CapabilityGrant = {
@@ -85,17 +76,7 @@ function grantFromCbor(value: CborValue, field: string): CapabilityGrant {
     signingPublicKey: expectBytes(required(map, 1, `${field}.signing_key`), `${field}.signing_key`, 32),
     role,
     validFromRevision: expectUint64(required(map, 3, `${field}.valid_from`), `${field}.valid_from`),
-    ...(until === undefined ? {} : { validUntilRevision: expectUint64(until, `${field}.valid_until`) }),
-    ...(organization === undefined ? {} : { organization: expectString(organization, `${field}.organization`) }),
-    ...(validatorClass === undefined ? {} : { validatorClass: expectString(validatorClass, `${field}.validator_class`) }),
     ...(floor === undefined ? {} : { minimumAuthorTimestampMs: expectUint64(floor, `${field}.minimum_timestamp`) }),
-    ...(scopeValue === undefined ? {} : {
-      readerScope: (() => {
-        const index = expectUint64(scopeValue, `${field}.reader_scope`)
-        protocolInvariant(index < BigInt(SCOPES.length), 'SCHEMA_INVALID', `${field}.reader_scope is unknown`)
-        return SCOPES[Number(index)] as ReaderHistoryScope
-      })(),
-    }),
     ...(hpkeKey === undefined ? {} : { hpkePublicKey: expectBytes(hpkeKey, `${field}.hpke_key`, 32) }),
     ...(transportAuthor === undefined ? {} : { transportAuthor: expectString(transportAuthor, `${field}.transport_author`) }),
   }
@@ -105,32 +86,16 @@ function grantFromCbor(value: CborValue, field: string): CapabilityGrant {
 
 function policyToCbor(policy: ValidationPolicy): CborValue {
   protocolInvariant(policy.minimumValidators > 0n, 'SCHEMA_INVALID', 'Validation threshold must be positive')
-  const classes = new Map<string, CborValue>()
-  for (const [name, minimum] of policy.classMinimums) {
-    protocolInvariant(name.length > 0 && minimum > 0n, 'SCHEMA_INVALID', 'Class requirements must be named and positive')
-    classes.set(name, minimum)
-  }
-  const organizations = [...new Set(policy.requiredOrganizations)]
-  protocolInvariant(organizations.length === policy.requiredOrganizations.length, 'SCHEMA_INVALID', 'Required organizations must be unique')
-  protocolInvariant(organizations.every((organization) => organization.length > 0), 'SCHEMA_INVALID', 'Required organizations must not be empty')
-  return integerMap([[0, policy.version], [1, policy.minimumValidators], [2, classes], [3, organizations]])
+  // Keys 2 (class minimums) and 3 (required organizations) are retired.
+  return integerMap([[0, policy.version], [1, policy.minimumValidators]])
 }
 
 function policyFromCbor(value: CborValue, field: string): ValidationPolicy {
   const map = expectMap(value, field)
-  assertKnownIntegerKeys(map, [0, 1, 2, 3], field)
-  const encodedClasses = expectMap(required(map, 2, `${field}.classes`), `${field}.classes`)
-  const classes = new Map<string, bigint>()
-  for (const [name, minimum] of encodedClasses) {
-    protocolInvariant(typeof name === 'string', 'SCHEMA_INVALID', `${field}.classes keys must be text`)
-    classes.set(name, expectUint64(minimum, `${field}.classes.${name}`))
-  }
+  assertKnownIntegerKeys(map, [0, 1], field)
   const policy = {
     version: expectUint64(required(map, 0, `${field}.version`), `${field}.version`),
     minimumValidators: expectUint64(required(map, 1, `${field}.minimum`), `${field}.minimum`),
-    classMinimums: classes,
-    requiredOrganizations: expectArray(required(map, 3, `${field}.organizations`), `${field}.organizations`)
-      .map((item, index) => expectString(item, `${field}.organizations[${index}]`)),
   }
   policyToCbor(policy)
   return policy

@@ -38,7 +38,6 @@ describe('governance admin RPC adapter', () => {
       signingPublicKey: b64(bytes(21)),
       transportAuthor: 'new-node-feed',
       role: 'validator',
-      organization: 'pilot-a',
     })
     expect(response.revision).toBe('4')
     expect(Buffer.from(response.capabilityId, 'base64url')).toHaveLength(32)
@@ -48,7 +47,7 @@ describe('governance admin RPC adapter', () => {
     })] }, expect.anything())
   })
 
-  it('rejects ambiguous keys, invalid reader grants, and non-future expiry', async () => {
+  it('rejects ambiguous keys and invalid reader grants', async () => {
     const governance = { snapshot: capabilitySnapshot(), currentEpoch: null } as unknown as GovernanceControlPlane
     const admin = createGovernanceRpcAdmin({ governance, rootPrivateKey: {} as CryptoKey })
     const base = { groupId: b64(governance.snapshot.groupId), requestId: 'grant' }
@@ -56,7 +55,7 @@ describe('governance admin RPC adapter', () => {
 
     await expect(admin.grantCapability({ ...common, role: 'reader' })).rejects.toMatchObject({ code: 'invalid_argument' })
     await expect(admin.grantCapability({ ...common, role: 'writer', signingPublicKey: 'not base64!' })).rejects.toMatchObject({ code: 'invalid_argument' })
-    await expect(admin.grantCapability({ ...common, role: 'writer', validUntilRevision: '3' })).rejects.toMatchObject({ code: 'invalid_argument' })
+    await expect(admin.grantCapability({ ...common, role: 'writer', hpkePublicKey: b64(bytes(22)) })).rejects.toMatchObject({ code: 'invalid_argument' })
   })
 })
 

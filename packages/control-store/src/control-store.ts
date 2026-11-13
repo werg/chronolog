@@ -323,54 +323,7 @@ export class ControlStore {
   }
 
   watermark(policy: WatermarkPolicy, membershipRevision?: Uint8Array): WatermarkEvidence {
-    if (policy.kind === 'threshold') return this.#thresholdWatermark(policy, membershipRevision)
-    const proofs = policy.minimalProofs
-    if (proofs.length === 0 || proofs.some((proof) => proof.length === 0)) {
-      return {
-        policyId: policy.policyId,
-        cutoffMs: null,
-        blockingValidatorIds: [],
-        heartbeatIds: [],
-        explanation: 'invalid_policy',
-      }
-    }
-
-    let cutoff: bigint | null = null
-    const selected = new Map<string, ValidatorHeartbeat>()
-    for (const proof of proofs) {
-      let best: ValidatorHeartbeat | null = null
-      for (const validatorId of proof) {
-        const heartbeat = this.#heartbeatFor(validatorId, membershipRevision)
-        if (
-          heartbeat?.feedContiguous === true &&
-          (best === null || heartbeat.acceptanceCutoffMs > best.acceptanceCutoffMs)
-        ) {
-          best = heartbeat
-        }
-      }
-      if (best === null) {
-        return {
-          policyId: policy.policyId,
-          cutoffMs: null,
-          blockingValidatorIds: [],
-          heartbeatIds: [],
-          explanation: 'insufficient_contiguous_heartbeats',
-        }
-      }
-      if (cutoff === null || best.acceptanceCutoffMs < cutoff) cutoff = best.acceptanceCutoffMs
-      selected.set(idKey(best.validatorId), best)
-    }
-
-    const atCutoff = [...selected.values()].filter(
-      (heartbeat) => heartbeat.acceptanceCutoffMs >= cutoff!,
-    )
-    return {
-      policyId: policy.policyId,
-      cutoffMs: cutoff,
-      blockingValidatorIds: atCutoff.map((heartbeat) => copyBytes(heartbeat.validatorId)),
-      heartbeatIds: atCutoff.map((heartbeat) => copyBytes(heartbeat.heartbeatId)),
-      explanation: 'established',
-    }
+    return this.#thresholdWatermark(policy, membershipRevision)
   }
 
   #thresholdWatermark(

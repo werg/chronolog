@@ -32,14 +32,12 @@ const candidateDigest = bytes(71)
 const policy: ValidationPolicy = {
   version: 3n,
   minimumValidators: 2n,
-  classMinimums: new Map(),
-  requiredOrganizations: ['A', 'B'],
 }
 
-function validator(subject: number, organization: string, floor = 1_000n): CapabilityGrant {
+function validator(subject: number, _label: string, floor = 1_000n): CapabilityGrant {
   return {
     subjectId: bytes(subject), signingPublicKey: bytes(subject), role: 'validator', validFromRevision: 0n,
-    organization, validatorClass: 'general', minimumAuthorTimestampMs: floor,
+    minimumAuthorTimestampMs: floor,
   }
 }
 
@@ -117,7 +115,7 @@ describe('validator attestation evidence', () => {
     const f = await fixture()
     const core = coreFor(f.snapshot, f.policyId)
     const good = await attestationFor(f.snapshot, 21)
-    expect(validatorEvidenceForAttestation(f.snapshot, good, core, txId, candidateDigest)).toMatchObject({ organization: 'A' })
+    expect(validatorEvidenceForAttestation(f.snapshot, good, core, txId, candidateDigest)).toMatchObject({ validatorId: bytes(21) })
 
     const rejected: readonly [string, Partial<ValidatorAttestation>][] = [
       ['group', { groupId: bytes(98) }],
@@ -170,7 +168,7 @@ describe('validator attestation evidence', () => {
 })
 
 describe('admission proof assembly', () => {
-  it('satisfies the policy only with all required organizations', async () => {
+  it('satisfies the policy only with the threshold of distinct validators', async () => {
     const f = await fixture()
     const core = coreFor(f.snapshot, f.policyId)
     const a = await attestationFor(f.snapshot, 21)
@@ -180,7 +178,7 @@ describe('admission proof assembly', () => {
 
     const short = assembleAdmissionProof(f.snapshot, core, txId, candidateDigest, [a])
     expect(short.satisfied).toBe(false)
-    expect(short.missing).toContain('organization:B')
+    expect(short.missing).toEqual(['validators:1'])
   })
 
   it('does not let one validator satisfy a multi-validator policy by repeating itself', async () => {
@@ -219,22 +217,21 @@ describe('reader recipients', () => {
   it('keeps prospective readers out of earlier revisions and de-duplicates recipients', async () => {
     const readerA: CapabilityGrant = {
       subjectId: bytes(40), signingPublicKey: bytes(40), role: 'reader', validFromRevision: 0n,
-      readerScope: 'snapshot', hpkePublicKey: bytes(41),
+      hpkePublicKey: bytes(41),
     }
     const duplicateKey: CapabilityGrant = { ...readerA, hpkePublicKey: bytes(42) }
     const f = await fixture([readerA, duplicateKey])
     const later: CapabilityGrant = {
       subjectId: bytes(43), signingPublicKey: bytes(43), role: 'reader', validFromRevision: 1n,
-      readerScope: 'snapshot', hpkePublicKey: bytes(44),
+      hpkePublicKey: bytes(44),
     }
-    const audit: CapabilityGrant = { ...later, subjectId: bytes(45), signingPublicKey: bytes(45), readerScope: 'audit', hpkePublicKey: bytes(46) }
-    const next = await advance(f, f.snapshot, { grants: [later, audit] })
+    const next = await advance(f, f.snapshot, { grants: [later] })
 
     const atZero = readerRecipientsForRevision(next, 0n).map((entry) => entry.recipientId[0])
-    expect(atZero).toEqual([40, 45])
+    expect(atZero).toEqual([40])
     // Later duplicate subject wins the map slot, never producing two recipients for one subject.
     expect(readerRecipientsForRevision(next, 0n).find((entry) => entry.recipientId[0] === 40)?.publicKey[0]).toBe(42)
-    expect(readerRecipientsForRevision(next, 1n).map((entry) => entry.recipientId[0])).toEqual([40, 43, 45])
+    expect(readerRecipientsForRevision(next, 1n).map((entry) => entry.recipientId[0])).toEqual([40, 43])
   })
 
   it('never lets a non-reader role read history', async () => {

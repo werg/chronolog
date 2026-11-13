@@ -152,7 +152,6 @@ export async function applyCapabilityRevision(
 
 export function isCapabilityActive(capability: EffectiveCapability, revision: bigint): boolean {
   return capability.grant.validFromRevision <= revision
-    && (capability.grant.validUntilRevision === undefined || revision <= capability.grant.validUntilRevision)
     && (capability.revokedAtRevision === undefined || revision < capability.revokedAtRevision)
 }
 

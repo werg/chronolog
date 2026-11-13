@@ -156,7 +156,6 @@ export type GovernanceCapabilityRole =
   | 'writer'
   | 'validator'
   | 'administrator'
-  | 'schema-administrator'
 
 export interface GovernanceCapabilityStatus {
   readonly capabilityId: string
@@ -165,12 +164,8 @@ export interface GovernanceCapabilityStatus {
   readonly transportAuthor?: string
   readonly role: GovernanceCapabilityRole
   readonly validFromRevision: string
-  readonly validUntilRevision?: string
   readonly revokedAtRevision?: string
   readonly active: boolean
-  readonly organization?: string
-  readonly validatorClass?: string
-  readonly readerScope?: 'snapshot' | 'audit'
   readonly hpkePublicKey?: string
 }
 
@@ -190,11 +185,7 @@ export interface GrantCapabilityRequest extends GetGovernanceStatusRequest {
   readonly signingPublicKey: string
   readonly transportAuthor?: string
   readonly role: GovernanceCapabilityRole
-  readonly validUntilRevision?: string
-  readonly organization?: string
-  readonly validatorClass?: string
   readonly minimumAuthorTimestampMs?: string
-  readonly readerScope?: 'snapshot' | 'audit'
   readonly hpkePublicKey?: string
 }
 export interface GrantCapabilityResponse { readonly revision: string; readonly capabilityId: string }

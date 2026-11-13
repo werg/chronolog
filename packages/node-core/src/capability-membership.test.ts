@@ -23,7 +23,6 @@ const REVISION = 5n
 
 const writerKey = bytes(0x30)
 const revokedWriterKey = bytes(0x31)
-const expiredWriterKey = bytes(0x32)
 const futureWriterKey = bytes(0x33)
 const validatorKeys = [bytes(0x40), bytes(0x41), bytes(0x42)] as const
 const revokedValidatorKey = bytes(0x43)
@@ -45,18 +44,17 @@ function capability(
 const capabilities = {
   writer: capability(0x60, { role: 'writer', signingPublicKey: writerKey, transportAuthor: '@writer.feed' }),
   revokedWriter: capability(0x61, { role: 'writer', signingPublicKey: revokedWriterKey, transportAuthor: '@revoked.feed' }, { revokedAtRevision: REVISION }),
-  expiredWriter: capability(0x62, { role: 'writer', signingPublicKey: expiredWriterKey, validUntilRevision: REVISION - 1n }),
   futureWriter: capability(0x63, { role: 'writer', signingPublicKey: futureWriterKey, validFromRevision: REVISION + 1n }),
-  validator0: capability(0x70, { role: 'validator', signingPublicKey: validatorKeys[0], organization: 'org-a', validatorClass: 'bank', transportAuthor: '@v0.feed' }),
-  validator1: capability(0x71, { role: 'validator', signingPublicKey: validatorKeys[1], organization: 'org-b', validatorClass: 'auditor', minimumAuthorTimestampMs: 1_000n }),
-  validator2: capability(0x72, { role: 'validator', signingPublicKey: validatorKeys[2], organization: 'org-c', validatorClass: 'bank' }),
-  revokedValidator: capability(0x73, { role: 'validator', signingPublicKey: revokedValidatorKey, organization: 'org-a' }, { revokedAtRevision: REVISION - 2n }),
+  validator0: capability(0x70, { role: 'validator', signingPublicKey: validatorKeys[0], transportAuthor: '@v0.feed' }),
+  validator1: capability(0x71, { role: 'validator', signingPublicKey: validatorKeys[1], minimumAuthorTimestampMs: 1_000n }),
+  validator2: capability(0x72, { role: 'validator', signingPublicKey: validatorKeys[2] }),
+  revokedValidator: capability(0x73, { role: 'validator', signingPublicKey: revokedValidatorKey }, { revokedAtRevision: REVISION - 2n }),
   // A reader capability for a key that also must not acquire writer or validator rights from it.
   reader: capability(0x80, { role: 'reader', signingPublicKey: outsiderKey }),
 }
 
 function policy(overrides: Partial<ValidationPolicy> = {}): ValidationPolicy {
-  return { version: 3n, minimumValidators: 2n, classMinimums: new Map(), requiredOrganizations: [], ...overrides }
+  return { version: 3n, minimumValidators: 2n, ...overrides }
 }
 
 function snapshot(
@@ -168,7 +166,7 @@ describe('CapabilityMembershipResolver writer authority', () => {
   })
 
   it('denies revoked, expired, not-yet-valid, unknown and non-writer keys', async () => {
-    for (const writerId of [revokedWriterKey, expiredWriterKey, futureWriterKey, outsiderKey, validatorKeys[0]]) {
+    for (const writerId of [revokedWriterKey, futureWriterKey, outsiderKey, validatorKeys[0]]) {
       expect(await resolver.canWrite(context({ writerId }))).toBe(false)
     }
   })
@@ -316,22 +314,6 @@ describe('CapabilityMembershipResolver admission selection', () => {
     expect(selected).toHaveLength(2)
     expect(selected).toContain(first)
   })
-
-  it('enforces class minimums and required organizations', async () => {
-    const strict = resolverFor(snapshot(policy({
-      minimumValidators: 2n,
-      classMinimums: new Map([['auditor', 1n]]),
-      requiredOrganizations: ['org-a'],
-    })))
-    // Two banks, no auditor.
-    expect(await strict.selectAdmission(context(), [attestation(capabilities.validator0), attestation(capabilities.validator2)])).toEqual([])
-    // Auditor present but org-a missing.
-    expect(await strict.selectAdmission(context(), [attestation(capabilities.validator1), attestation(capabilities.validator2)])).toEqual([])
-    const selected = await strict.selectAdmission(context(), [
-      attestation(capabilities.validator0), attestation(capabilities.validator1), attestation(capabilities.validator2),
-    ])
-    expect(ids(selected)).toEqual([bytesToHex(capabilities.validator0.id), bytesToHex(capabilities.validator1.id)])
-  })
 })
 
 describe('CapabilityMembershipResolver watermark policy', () => {
@@ -350,27 +332,5 @@ describe('CapabilityMembershipResolver watermark policy', () => {
     const unsafe = resolverFor(snapshot(policy({ minimumValidators: BigInt(Number.MAX_SAFE_INTEGER) + 1n })))
     expect(await unsafe.watermarkPolicy(core())).toBeNull()
     expect(await resolverFor(snapshot(), { maximumWatermarkValidators: 2 }).watermarkPolicy(core())).toBeNull()
-  })
-
-  it('enumerates minimal proof alternatives for constrained policies', async () => {
-    const constrained = resolverFor(snapshot(policy({
-      minimumValidators: 2n,
-      classMinimums: new Map([['bank', 1n]]),
-      requiredOrganizations: ['org-b'],
-    })))
-    const watermark = await constrained.watermarkPolicy(core())
-    expect(watermark?.kind).toBe('proof-alternatives')
-    if (watermark?.kind !== 'proof-alternatives') return
-    const proofs = watermark.minimalProofs.map((proof) => proof.map(bytesToHex).sort())
-    expect(proofs).toHaveLength(2)
-    expect(proofs).toContainEqual([bytesToHex(validatorKeys[0]), bytesToHex(validatorKeys[1])].sort())
-    expect(proofs).toContainEqual([bytesToHex(validatorKeys[1]), bytesToHex(validatorKeys[2])].sort())
-    // The revoked org-a validator must never appear in a proof.
-    expect(proofs.flat()).not.toContain(bytesToHex(revokedValidatorKey))
-  })
-
-  it('returns null when no active validator set can satisfy the policy', async () => {
-    const impossible = resolverFor(snapshot(policy({ minimumValidators: 1n, requiredOrganizations: ['org-missing'] })))
-    expect(await impossible.watermarkPolicy(core())).toBeNull()
   })
 })

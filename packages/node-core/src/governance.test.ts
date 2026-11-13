@@ -34,7 +34,7 @@ describe('replicated governance control plane', () => {
     await participant.start()
 
     await fixture.admin.publishCapabilityChange({ grants: [
-      grant(participantSigning.publicKeyBytes, 'reader', { readerScope: 'snapshot', hpkePublicKey: participantHpke.publicKeyBytes, transportAuthor: 'participant' }),
+      grant(participantSigning.publicKeyBytes, 'reader', { hpkePublicKey: participantHpke.publicKeyBytes, transportAuthor: 'participant' }),
       grant(participantSigning.publicKeyBytes, 'writer', { transportAuthor: 'participant' }),
       grant(participantSigning.publicKeyBytes, 'validator', { minimumAuthorTimestampMs: 0n, transportAuthor: 'participant' }),
     ] }, fixture.root.privateKey)
@@ -95,7 +95,7 @@ describe('replicated governance control plane', () => {
     controllers.push(auditor)
     await auditor.start()
     await fixture.admin.publishCapabilityChange({ grants: [
-      grant(auditorSigning.publicKeyBytes, 'reader', { readerScope: 'audit', hpkePublicKey: auditorHpke.publicKeyBytes, transportAuthor: 'auditor' }),
+      grant(auditorSigning.publicKeyBytes, 'reader', { hpkePublicKey: auditorHpke.publicKeyBytes, transportAuthor: 'auditor' }),
     ] }, fixture.root.privateKey)
     await waitFor(() => auditor.snapshot.revision === 3n)
     expect(await fixture.admin.grantHistoricalAccess(auditorSigning.publicKeyBytes, fixture.root.privateKey)).toBe(2)
@@ -111,7 +111,7 @@ async function governanceFixture() {
   const rootHpke = await generateX25519KeyPair()
   const groupId = bytes32(1)
   const groupRoute = bytes32(2)
-  const policy: ValidationPolicy = { version: 1n, minimumValidators: 1n, classMinimums: new Map(), requiredOrganizations: [] }
+  const policy: ValidationPolicy = { version: 1n, minimumValidators: 1n }
   const manifest: GenesisManifest = {
     groupId,
     schemaId: bytes32(3),
@@ -121,7 +121,7 @@ async function governanceFixture() {
       { ...grant(root.publicKeyBytes, 'administrator', { transportAuthor: 'admin' }), validFromRevision: 0n },
       { ...grant(root.publicKeyBytes, 'writer', { transportAuthor: 'admin' }), validFromRevision: 0n },
       { ...grant(root.publicKeyBytes, 'validator', { minimumAuthorTimestampMs: 0n, transportAuthor: 'admin' }), validFromRevision: 0n },
-      { ...grant(root.publicKeyBytes, 'reader', { readerScope: 'audit', hpkePublicKey: rootHpke.publicKeyBytes, transportAuthor: 'admin' }), validFromRevision: 0n },
+      { ...grant(root.publicKeyBytes, 'reader', { hpkePublicKey: rootHpke.publicKeyBytes, transportAuthor: 'admin' }), validFromRevision: 0n },
     ],
     validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 1_000n, heartbeatIntervalMs: 1_000n },

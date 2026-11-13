@@ -22,18 +22,16 @@ import {
 
 const bytes = (value: number, length = 32) => new Uint8Array(length).fill(value)
 
-function validator(subject: number, revision: bigint, floor: bigint, organization: string, validatorClass = 'general'): CapabilityGrant {
+function validator(subject: number, revision: bigint, floor: bigint, _label = ''): CapabilityGrant {
   return {
     subjectId: bytes(subject), signingPublicKey: bytes(subject), role: 'validator', validFromRevision: revision,
-    organization, validatorClass, minimumAuthorTimestampMs: floor,
+    minimumAuthorTimestampMs: floor,
   }
 }
 
 const policy: ValidationPolicy = {
   version: 1n,
   minimumValidators: 3n,
-  classMinimums: new Map([['auditor', 1n]]),
-  requiredOrganizations: ['A', 'B'],
 }
 
 async function fixture() {
@@ -41,7 +39,7 @@ async function fixture() {
   const writer: CapabilityGrant = {
     subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', validFromRevision: 0n,
   }
-  const initialValidator = validator(21, 0n, 1_000n, 'A', 'auditor')
+  const initialValidator = validator(21, 0n, 1_000n)
   const manifest: GenesisManifest = {
     groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes,
     capabilityLogFeed: bytes(3),
@@ -88,31 +86,30 @@ describe('capability chain', () => {
 })
 
 describe('validation policy', () => {
-  it('selects a deterministic minimum proof under class and organization constraints', () => {
+  it('selects the smallest distinct capability ids, independent of evidence order', () => {
     const evidence: ValidatorEvidence[] = [
-      { capabilityId: bytes(4), validatorId: bytes(14), organization: 'C', validatorClass: 'general' },
-      { capabilityId: bytes(3), validatorId: bytes(13), organization: 'B', validatorClass: 'general' },
-      { capabilityId: bytes(2), validatorId: bytes(12), organization: 'A', validatorClass: 'auditor' },
-      { capabilityId: bytes(1), validatorId: bytes(11), organization: 'A', validatorClass: 'general' },
+      { capabilityId: bytes(4), validatorId: bytes(14) },
+      { capabilityId: bytes(3), validatorId: bytes(13) },
+      { capabilityId: bytes(2), validatorId: bytes(12) },
+      { capabilityId: bytes(1), validatorId: bytes(11) },
+      { capabilityId: bytes(1), validatorId: bytes(11) },
     ]
     const result = evaluateValidationPolicy(policy, evidence)
     expect(result.satisfied).toBe(true)
-    expect(result.selected).toHaveLength(3)
     expect(result.selected.map((item) => item.capabilityId[0])).toEqual([1, 2, 3])
     expect(evaluateValidationPolicy(policy, [...evidence].reverse()).selected).toEqual(result.selected)
   })
 
-  it('reports exact missing policy dimensions', () => {
-    const result = evaluateValidationPolicy(policy, [{ capabilityId: bytes(1), validatorId: bytes(11), organization: 'A' }])
+  it('counts distinct capabilities against the threshold', () => {
+    const duplicate = { capabilityId: bytes(1), validatorId: bytes(11) }
+    const result = evaluateValidationPolicy(policy, [duplicate, duplicate, duplicate])
     expect(result.satisfied).toBe(false)
-    expect(result.missing).toContain('validators:2')
-    expect(result.missing).toContain('class:auditor:1')
-    expect(result.missing).toContain('organization:B')
+    expect(result.missing).toEqual(['validators:2'])
   })
 })
 
-describe('reader history scopes', () => {
-  it('keeps snapshot readers prospective while audit readers may access history', () => {
+describe('reader access', () => {
+  it('keeps readers prospective from the revision that granted them', () => {
     const base = {
       id: bytes(1),
       grantedAtRevision: 5n,
@@ -121,8 +118,7 @@ describe('reader history scopes', () => {
         validFromRevision: 5n, hpkePublicKey: bytes(3),
       },
     }
-    expect(canReaderAccessRevision({ ...base, grant: { ...base.grant, readerScope: 'snapshot' } }, 4n)).toBe(false)
-    expect(canReaderAccessRevision({ ...base, grant: { ...base.grant, readerScope: 'snapshot' } }, 5n)).toBe(true)
-    expect(canReaderAccessRevision({ ...base, grant: { ...base.grant, readerScope: 'audit' } }, 0n)).toBe(true)
+    expect(canReaderAccessRevision(base, 4n)).toBe(false)
+    expect(canReaderAccessRevision(base, 5n)).toBe(true)
   })
 })

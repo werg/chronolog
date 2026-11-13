@@ -3,9 +3,6 @@ export type CapabilityRole =
   | 'writer'
   | 'validator'
   | 'administrator'
-  | 'schema-administrator'
-
-export type ReaderHistoryScope = 'snapshot' | 'audit'
 
 export interface CapabilityGrant {
   readonly subjectId: Uint8Array
@@ -14,19 +11,14 @@ export interface CapabilityGrant {
   readonly transportAuthor?: string
   readonly role: CapabilityRole
   readonly validFromRevision: bigint
-  readonly validUntilRevision?: bigint
-  readonly organization?: string
-  readonly validatorClass?: string
   readonly minimumAuthorTimestampMs?: bigint
-  readonly readerScope?: ReaderHistoryScope
   readonly hpkePublicKey?: Uint8Array
 }
 
 export interface ValidationPolicy {
   readonly version: bigint
+  /** Distinct authorized validators whose attestations admit a candidate. */
   readonly minimumValidators: bigint
-  readonly classMinimums: ReadonlyMap<string, bigint>
-  readonly requiredOrganizations: readonly string[]
 }
 
 export interface ClockPolicy {
@@ -109,7 +101,7 @@ export interface CapabilitySnapshot {
   readonly policies: ReadonlyMap<string, EffectivePolicy>
   /**
    * Highest minimum author timestamp ever granted to a validator. It only rises:
-   * revoking or expiring validators never lowers it, so closed history cannot be
+   * revoking validators never lowers it, so closed history cannot be
    * reopened by membership changes. Admitting older history requires a fork.
    */
   readonly validatorFloorMs: bigint
@@ -118,8 +110,6 @@ export interface CapabilitySnapshot {
 export interface ValidatorEvidence {
   readonly capabilityId: Uint8Array
   readonly validatorId: Uint8Array
-  readonly organization?: string
-  readonly validatorClass?: string
 }
 
 export interface PolicyEvaluation {

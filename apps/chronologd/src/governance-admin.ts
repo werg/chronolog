@@ -27,12 +27,8 @@ export function createGovernanceRpcAdmin(options: {
           ...(item.grant.transportAuthor === undefined ? {} : { transportAuthor: item.grant.transportAuthor }),
           role: item.grant.role,
           validFromRevision: item.grant.validFromRevision.toString(10),
-          ...(item.grant.validUntilRevision === undefined ? {} : { validUntilRevision: item.grant.validUntilRevision.toString(10) }),
           ...(item.revokedAtRevision === undefined ? {} : { revokedAtRevision: item.revokedAtRevision.toString(10) }),
           active: isCapabilityActive(item, snapshot.revision),
-          ...(item.grant.organization === undefined ? {} : { organization: item.grant.organization }),
-          ...(item.grant.validatorClass === undefined ? {} : { validatorClass: item.grant.validatorClass }),
-          ...(item.grant.readerScope === undefined ? {} : { readerScope: item.grant.readerScope }),
           ...(item.grant.hpkePublicKey === undefined ? {} : { hpkePublicKey: base64url(item.grant.hpkePublicKey) }),
         }))
         .sort((left, right) => left.role.localeCompare(right.role) || left.capabilityId.localeCompare(right.capabilityId))
@@ -48,29 +44,21 @@ export function createGovernanceRpcAdmin(options: {
     },
 
     async grantCapability(request) {
-      const snapshot = options.governance.snapshot
       const grant: Omit<CapabilityGrant, 'validFromRevision'> = {
         subjectId: publicKey(request.subjectId, 'subjectId'),
         signingPublicKey: publicKey(request.signingPublicKey, 'signingPublicKey'),
         role: request.role,
         ...(request.transportAuthor === undefined ? {} : { transportAuthor: boundedText(request.transportAuthor, 'transportAuthor') }),
-        ...(request.validUntilRevision === undefined ? {} : { validUntilRevision: decimal(request.validUntilRevision, 'validUntilRevision') }),
-        ...(request.organization === undefined ? {} : { organization: boundedText(request.organization, 'organization') }),
-        ...(request.validatorClass === undefined ? {} : { validatorClass: boundedText(request.validatorClass, 'validatorClass') }),
         ...(request.minimumAuthorTimestampMs === undefined
           ? request.role === 'validator' ? { minimumAuthorTimestampMs: BigInt(Math.trunc(now())) } : {}
           : { minimumAuthorTimestampMs: decimal(request.minimumAuthorTimestampMs, 'minimumAuthorTimestampMs') }),
-        ...(request.readerScope === undefined ? {} : { readerScope: request.readerScope }),
         ...(request.hpkePublicKey === undefined ? {} : { hpkePublicKey: publicKey(request.hpkePublicKey, 'hpkePublicKey') }),
       }
-      if (grant.validUntilRevision !== undefined && grant.validUntilRevision <= snapshot.revision) {
-        throw invalid('validUntilRevision must be later than the current governance revision')
+      if (grant.role === 'reader' && grant.hpkePublicKey === undefined) {
+        throw invalid('reader grants require hpkePublicKey')
       }
-      if (grant.role === 'reader' && (grant.readerScope === undefined || grant.hpkePublicKey === undefined)) {
-        throw invalid('reader grants require readerScope and hpkePublicKey')
-      }
-      if (grant.role !== 'reader' && (grant.readerScope !== undefined || grant.hpkePublicKey !== undefined)) {
-        throw invalid('readerScope and hpkePublicKey are valid only for reader grants')
+      if (grant.role !== 'reader' && grant.hpkePublicKey !== undefined) {
+        throw invalid('hpkePublicKey is valid only for reader grants')
       }
       const signed = await operation(() => options.governance.publishCapabilityChange({ grants: [grant] }, options.rootPrivateKey))
       return {

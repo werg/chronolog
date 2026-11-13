@@ -17,11 +17,11 @@ import {
 
 const bytes = (value: number, length = 32) => new Uint8Array(length).fill(value)
 
-const policy: ValidationPolicy = { version: 1n, minimumValidators: 1n, classMinimums: new Map(), requiredOrganizations: [] }
+const policy: ValidationPolicy = { version: 1n, minimumValidators: 1n }
 const writer: CapabilityGrant = { subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', validFromRevision: 0n }
 const validatorAt = (subject: number, revision: bigint, floor: bigint): CapabilityGrant => ({
   subjectId: bytes(subject), signingPublicKey: bytes(subject), role: 'validator', validFromRevision: revision,
-  organization: 'A', validatorClass: 'general', minimumAuthorTimestampMs: floor,
+  minimumAuthorTimestampMs: floor,
 })
 
 async function fixture(overrides: Partial<GenesisManifest> = {}) {
@@ -182,13 +182,12 @@ describe('capability revision chain', () => {
 })
 
 describe('capability validity windows', () => {
-  it('honors start, end and revocation boundaries inclusively where the grant says so', () => {
+  it('is active from its start revision until revoked', () => {
     const base = { id: bytes(1), grantedAtRevision: 2n }
-    const grant: CapabilityGrant = { ...writer, validFromRevision: 2n, validUntilRevision: 4n }
+    const grant: CapabilityGrant = { ...writer, validFromRevision: 2n }
     expect(isCapabilityActive({ ...base, grant }, 1n)).toBe(false)
     expect(isCapabilityActive({ ...base, grant }, 2n)).toBe(true)
-    expect(isCapabilityActive({ ...base, grant }, 4n)).toBe(true)
-    expect(isCapabilityActive({ ...base, grant }, 5n)).toBe(false)
+    expect(isCapabilityActive({ ...base, grant }, 50n)).toBe(true)
     expect(isCapabilityActive({ ...base, grant, revokedAtRevision: 3n }, 2n)).toBe(true)
     expect(isCapabilityActive({ ...base, grant, revokedAtRevision: 3n }, 3n)).toBe(false)
   })
