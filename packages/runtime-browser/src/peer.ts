@@ -4,16 +4,17 @@ import {
   type MaterializerOptions,
 } from '@chronolog/materializer-doltlite/browser'
 import {
-  ChronologNode, createGovernedNode, createEnrollmentService, loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity,
+  ChronologNode, createGovernedNode, createEnrollmentService,
   type ChronologNodeOptions, type EnrollmentIdentity, type GovernedNodeOptions,
 } from '@chronolog/node-core/browser'
 import {
-  DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner,
+  PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner,
   type AtomicBytesStore, type ChronologTransport,
 } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService, type GovernanceRpcAdmin } from '@chronolog/rpc/browser'
 
 import { BrowserControlPersistence } from './control-persistence.js'
+import { openBrowserDeviceRecords } from './device-records.js'
 import { acquireBrowserStorage } from './opfs.js'
 import { loadBrowserEngine, type LoadedBrowserEngine } from './load-engine.js'
 import { createWasmEngineFactory, type OpfsSqlitePool } from './wasm-engine.js'
@@ -78,10 +79,9 @@ export async function openBrowserPeer(options: {
   let configuration: BrowserPeerConfiguration | undefined
   let sqlStorage: OpfsSqlitePool | undefined
   try {
-    const identity = await (options.createIdentity === true ? loadOrCreateEnrollmentIdentity : loadEnrollmentIdentity)(storage.bytes, 'peer')
-    const engine = await loadBrowserEngine(options.engineUrl)
-    const records = await DurableFeedStore.open(storage.bytes, webFeedCrypto)
+    const { identity, records } = await openBrowserDeviceRecords(storage.bytes, options.createIdentity)
     transport = new PortableFeedTransport({ store: records, signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey), crypto: webFeedCrypto })
+    const engine = await loadBrowserEngine(options.engineUrl)
     configuration = await options.configure({ identity, operations: storage.bytes, transport, engine })
     const directory = `/chronolog-${options.name}`
     if (engine.module.installOpfsSAHPoolVfs === undefined) throw new Error('BROWSER_SQLITE_OPFS_POOL_UNAVAILABLE')

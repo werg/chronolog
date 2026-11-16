@@ -171,8 +171,11 @@ try {
   const cdp = await context.newCDPSession(page), origin = new URL(page.url()).origin
   const usageBefore = await cdp.send('Storage.getUsageAndQuota', { origin })
   let rejectedSubmission: string | undefined
+  let appliedQuota: typeof usageBefore | undefined
   await cdp.send('Storage.overrideQuotaForOrigin', { origin, quotaSize: 1 })
   try {
+    appliedQuota = await cdp.send('Storage.getUsageAndQuota', { origin })
+    assert.equal(appliedQuota.quota, 1)
     await assert.rejects(page.evaluate(({ next }) => (globalThis as unknown as TestWindow).chronologEventTest.checkpoint('cutoff-reopened',
       { ...next, state: 'full'.repeat(262_144) }), { next }), /QuotaExceeded|quota|space/iu)
     assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.checkpointState('cutoff-reopened')), next)
@@ -194,12 +197,32 @@ try {
   const afterQuota = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.publish('quota-reopened',
     [{ topic: 'chat', payload: { message: 'quota refuses durable preparation' } }], 'browser-quota-operation'))
   assert.equal(afterQuota.outcome.outcome.type, 'accepted')
-  deviceEvidence.quota = { usageBefore, quotaBytes: 1, failedPreparationLeftNoOperation: true,
+  deviceEvidence.quota = { usageBefore, appliedQuota, quotaBytes: 1, failedPreparationLeftNoOperation: true,
     preservedCheckpoint: next, originalProposalId: published.proposalId, retryProposalId: acceptedRetry.proposalId,
     restoredPublication: afterQuota.proposalId, failure: rejectedSubmission }
   passed('actual browser quota failure preserves the prior atomic checkpoint and submits no operation; restored space and reopen retain exact accepted retries')
 
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.close('quota-reopened'))
+  const partialLossHead = (await native.transport.history()).length
+  const backup = await page.evaluate((name) => (globalThis as unknown as TestWindow).chronologEventTest.removeManifest(name), name)
+  assert.equal(backup.identity, identity.identity)
+  await assert.rejects(page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('partial-loss', name, bootstrap), { name, bootstrap }), /BROWSER_FEED_MANIFEST_MISSING/u)
+  assert.equal((await native.transport.history()).length, partialLossHead)
+  await page.evaluate(({ name, manifest }) => (globalThis as unknown as TestWindow).chronologEventTest.restoreManifest(name, manifest), { name, manifest: backup.manifest })
+  const partialRestored = await page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('partial-restored', name, bootstrap), { name, bootstrap })
+  assert.equal(partialRestored.identity, identity.identity)
+  const partialRetry = await page.evaluate(({ events }) => (globalThis as unknown as TestWindow).chronologEventTest.publish('partial-restored', events, 'browser-atomic-1'), { events })
+  assert.equal(partialRetry.proposalId, published.proposalId)
+  assert.equal((await native.transport.history()).length, partialLossHead)
+  const afterPartialRestore = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.publish('partial-restored',
+    [{ topic: 'chat', payload: { message: 'continues the original signed feed' } }], 'browser-after-manifest-restore'))
+  assert.equal(afterPartialRestore.outcome.outcome.type, 'accepted')
+  assert.notEqual(afterPartialRestore.proposalId, published.proposalId)
+  deviceEvidence.partialStorageLoss = { deleted: 'feed/manifest', identityRetained: true, error: 'BROWSER_FEED_MANIFEST_MISSING',
+    exactManifestRestored: true, originalRetryProposalId: partialRetry.proposalId, exactRetryAddedRecords: 0,
+    nextPublication: afterPartialRestore.proposalId }
+  passed('selective OPFS feed-manifest loss with surviving keys fails closed; restoring the exact saved manifest retains original proposals without position reuse')
+  await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.close('partial-restored'))
   const nativeRecordsBeforeLoss = (await native.transport.history()).length
   await cdp.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' })
   await assert.rejects(page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('lost-device', name, bootstrap), { name, bootstrap }), /ENROLLMENT_IDENTITY_MISSING/u)

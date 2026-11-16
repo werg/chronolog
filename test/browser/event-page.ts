@@ -71,6 +71,16 @@ const api = {
     try { return await peer.command('prepare', { name }) as BrowserEventIdentity }
     finally { peer.worker.terminate() }
   },
+  async removeManifest(name: string) {
+    const peer = new EventPeer()
+    try { return await peer.command('removeManifest', { name }) as { manifest: string; identity: string } }
+    finally { peer.worker.terminate() }
+  },
+  async restoreManifest(name: string, manifest: string) {
+    const peer = new EventPeer()
+    try { await peer.command('restoreManifest', { name, manifest }) }
+    finally { peer.worker.terminate() }
+  },
   async open(id: string, name: string, bootstrap: BrowserEventBootstrap) {
     const peer = new EventPeer()
     try { const result = await peer.open(name, bootstrap); peers.set(id, peer); return result }

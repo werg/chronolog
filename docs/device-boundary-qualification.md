@@ -30,6 +30,7 @@ code to establish that this profile loads no SQL/WASM implementation.
 | Independent devices | Open the same peer name in an isolated browser context. | Existing keys are absent, implicit opening fails, and explicit setup creates independent public keys. |
 | Actual quota failure | Set the origin quota to one byte through Chromium DevTools, then replace a checkpoint and submit application work through the real OPFS Worker. | OPFS rejects the writes, the old checkpoint survives, and failed preparation creates neither a local operation nor a native record. |
 | Quota recovery | Restore the origin quota and reopen the Worker. | Original identity/checkpoint remain, an accepted exact retry adds no records, and the previously unprepared operation can be deliberately submitted. |
+| Partial storage loss | Delete only the real OPFS feed manifest while retaining device keys and the initialization marker. | Opening fails with `BROWSER_FEED_MANIFEST_MISSING`; restoring the exact saved manifest retains the original identity/proposal without a new native record. |
 | Storage loss | Close the Worker and clear origin storage through Chromium DevTools. | Opening fails with `ENROLLMENT_IDENTITY_MISSING`; explicit replacement uses new keys with no inherited grants. Native history remains intact. |
 
 Quota enforcement uses Chromium's actual storage implementation with a controlled

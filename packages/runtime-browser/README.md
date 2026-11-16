@@ -125,6 +125,12 @@ identity. A new identity has no inherited grants or local operation journal.
 Use a new peer name when enrolling a replacement device; revoke the lost device
 through the administrator. A surviving replica can supply authorized history,
 but cannot reconstruct that device's erased private keys or unpublished drafts.
+An identity-bound feed initialization marker also makes selective loss of
+`feed/manifest` fail with `BROWSER_FEED_MANIFEST_MISSING`; surviving keys must not
+start another feed at sequence one. Explicit creation cannot bypass initialized
+feed state. Restore the exact verified store or enroll under a new device name.
+The marker detects this missing-file case; it does not prove that an arbitrary
+backup is current or that independently copied stores have one active writer.
 The [device boundary runbook](../../docs/device-boundary-qualification.md) records
 actual Chromium quota/storage-clear scenarios, protocol authorization checks and
 the physical-device/deployed-authentication work that remains separate.

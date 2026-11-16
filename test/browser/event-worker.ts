@@ -1,7 +1,7 @@
 import { CheckpointStore } from '@chronolog/agent-service/workers'
 import { decodeSignedGenesis } from '@chronolog/capabilities'
-import { loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
-import { base64UrlToBytes, bytesToBase64Url, utf8 } from '@chronolog/protocol'
+import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
+import { base64UrlToBytes, bytesToBase64Url, bytesToHex, utf8 } from '@chronolog/protocol'
 import { feedIdFromPublicKey, type AtomicBytesStore } from '@chronolog/records'
 import { openBrowserEventPeer, serveBrowserEventPeer, type BrowserEventPeer } from '@chronolog/runtime-browser/events'
 
@@ -25,7 +25,7 @@ const checkpoint = () => new CheckpointStore(operations!, { id: 'browser-project
 
 endpoint.addEventListener('message', (event) => {
   const request = event.data as { fixture?: string; id?: number; name?: string; bootstrap?: BrowserEventBootstrap;
-    cutoff?: string; pause?: 'before' | 'after'; cursor?: string; revision?: string; state?: string }
+    cutoff?: string; pause?: 'before' | 'after'; cursor?: string; revision?: string; state?: string; manifest?: string }
   if (request.fixture === undefined) return
   const run = async (): Promise<unknown> => {
     switch (request.fixture) {
@@ -36,6 +36,23 @@ endpoint.addEventListener('message', (event) => {
           const value: BrowserEventIdentity = { identity: bytesToBase64Url(prepared.signing.publicKeyBytes),
             readerKey: bytesToBase64Url(prepared.reader.publicKeyBytes), transportAuthor: feedIdFromPublicKey(prepared.signing.publicKeyBytes) }
           return value
+        } finally { await storage.close() }
+      }
+      case 'removeManifest':
+      case 'restoreManifest': {
+        const storage = await acquireBrowserStorage(request.name!)
+        try {
+          const device = await loadEnrollmentIdentity(storage.bytes, 'peer')
+          if (request.fixture === 'restoreManifest') {
+            await storage.bytes.put('feed/manifest', base64UrlToBytes(request.manifest!))
+            return null
+          }
+          const manifest = await storage.bytes.get('feed/manifest')
+          if (manifest === null) throw new Error('FIXTURE_MANIFEST_MISSING')
+          // Deliberate one-file loss under the real store's exclusive lock.
+          const fileHash = new Uint8Array(await crypto.subtle.digest('SHA-256', utf8('feed/manifest').slice().buffer))
+          await storage.directory.removeEntry(`value-${bytesToHex(fileHash)}`)
+          return { manifest: bytesToBase64Url(manifest), identity: bytesToBase64Url(device.signing.publicKeyBytes) }
         } finally { await storage.close() }
       }
       case 'open': {

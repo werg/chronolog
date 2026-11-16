@@ -1,12 +1,13 @@
 import { ControlStore } from '@chronolog/control-store/browser'
 import { createEventMaterializationRuntime, type ChronologMaterializationRuntime } from '@chronolog/materializer'
 import {
-  ChronologNode, createGovernedNode, createEnrollmentService, loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity,
+  ChronologNode, createGovernedNode, createEnrollmentService,
   type ChronologNodeOptions, type EnrollmentIdentity, type GovernedNodeOptions,
 } from '@chronolog/node-core/browser'
-import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type AtomicBytesStore, type ChronologTransport } from '@chronolog/records'
+import { PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type AtomicBytesStore, type ChronologTransport } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService, type GovernanceRpcAdmin } from '@chronolog/rpc/browser'
 import { acquireBrowserStorage } from './opfs.js'
+import { openBrowserDeviceRecords } from './device-records.js'
 import { openSyncControl, type SyncControlPersistence } from './sync-control.js'
 import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'
 export { WorkerRpcTransport } from './worker-rpc.js'
@@ -47,8 +48,7 @@ export async function openBrowserEventPeer(options: {
   let configuration: BrowserEventPeerConfiguration | undefined
   let service: NodeRpcService | undefined
   try {
-    const identity = await (options.createIdentity === true ? loadOrCreateEnrollmentIdentity : loadEnrollmentIdentity)(storage.bytes, 'peer')
-    const records = await DurableFeedStore.open(storage.bytes, webFeedCrypto)
+    const { identity, records } = await openBrowserDeviceRecords(storage.bytes, options.createIdentity)
     transport = new PortableFeedTransport({ store: records,
       signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey), crypto: webFeedCrypto })
     runtime = await createEventMaterializationRuntime({ store: storage.bytes, namespace: 'application',
