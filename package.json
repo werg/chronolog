@@ -45,8 +45,12 @@
     "package:membership": "node tools/package-membership.mjs"
   },
   "devDependencies": {
+    "@chronolog/agent-service": "workspace:*",
+    "@chronolog/capabilities": "workspace:*",
     "@chronolog/client": "workspace:*",
+    "@chronolog/control-store": "workspace:*",
     "@chronolog/crypto": "workspace:*",
+    "@chronolog/materializer": "workspace:*",
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/node-core": "workspace:*",
     "@chronolog/protocol": "workspace:*",
@@ -60,20 +64,19 @@
     "@playwright/test": "1.65.0",
     "@tendriller/core": "file:./test/artifacts/tendriller-sdk-283f210c.tgz",
     "@types/node": "^24.0.0",
+    "@types/ws": "8.18.1",
     "@vitest/coverage-v8": "^3.2.4",
     "esbuild": "0.28.2",
     "eslint": "^10.7.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "husky": "^9.1.7",
+    "miniflare": "5.20261110.2-beta",
     "node-gyp": "11.5.0",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.64.0",
     "vitest": "^3.2.4",
-    "@chronolog/agent-service": "workspace:*",
-    "@chronolog/control-store": "workspace:*",
-    "@chronolog/materializer": "workspace:*",
-    "@chronolog/capabilities": "workspace:*"
+    "ws": "8.21.0"
   },
   "pnpm": {
     "ignoredBuiltDependencies": [

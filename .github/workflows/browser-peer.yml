@@ -69,6 +69,7 @@ jobs:
           node --import tsx tools/application-pilot.ts \
             --contrib artifacts/pilot-source/contrib \
             --tendriller-runtime artifacts/pilot-source/tendriller/dist/runtime \
+            --tendriller-engine artifacts/pilot-source/tendriller/dist/engine \
             --wasm artifacts/wasm \
             --output artifacts/application-pilot/ci
       - name: Qualify thin Cloudflare membership with a separate native authority and browser device
@@ -91,6 +92,7 @@ jobs:
             artifacts/browser-events/bundle.json
             artifacts/application-pilot/ci/report.json
             artifacts/application-pilot/ci/bundles.json
+            artifacts/application-pilot/ci/route-trace.ndjson
             artifacts/application-pilot/ci/*.png
             artifacts/application-pilot/ci/pages/specimen-manifest.json
             artifacts/thin-membership/ci/report.json

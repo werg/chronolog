@@ -18,6 +18,8 @@ export interface PilotDiagnostics {
   releaseSubmission(): void
   disconnect(): Promise<void>
   reconnect(): Promise<void>
+  setRoute(connection: NonNullable<BrowserEventBootstrap['connection']>): Promise<void>
+  routeStats(): Promise<readonly { readonly route: string; readonly authenticatedMs: number; readonly sentBytes?: number; readonly receivedBytes?: number; readonly queuedBytes?: number }[]>
   sync(): Promise<void>
   events(): Promise<EventBatch>
   operation(operationId: string): Promise<ApplicationOperation | null>

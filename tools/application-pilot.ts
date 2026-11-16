@@ -11,7 +11,7 @@ import { parseArgs } from 'node:util'
 import type { AgentApplicationModule } from '@chronolog/agent-service'
 import { OWNER_FOR_KEY_SQL, type TransactionHandle } from '@chronolog/client'
 import { DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite'
-import { base64UrlToBytes, bytesToBase64Url, program, sqlStatement, type EffectiveEvent } from '@chronolog/protocol'
+import { base64UrlToBytes, bytesToBase64Url, program, sqlStatement, type EffectiveEvent, type EventBatch } from '@chronolog/protocol'
 import { chromium, expect, type Browser, type Page } from '@playwright/test'
 import { build } from 'esbuild'
 
@@ -19,12 +19,14 @@ import { createAgent } from '../examples/resident-agent.js'
 import type { PilotBootstrap, PilotRegistration, PilotWindow } from '../test/application-pilot/contract.js'
 import { createNativeBrowserFixture, type NativeBrowserFixture } from './browser-event-fixture.js'
 import { qualifyApplicationScope } from './lib/application-scope.js'
+import { createPeerRouteFixture } from './lib/peer-route-fixture.js'
 
 /** Real public runtime + independent OPFS replicas + native final-intent worker. */
 const workspace = resolve(import.meta.dirname, '..')
 const { values } = parseArgs({ options: {
   contrib: { type: 'string' }, 'tendriller-runtime': { type: 'string' }, wasm: { type: 'string' },
   output: { type: 'string' }, browser: { type: 'string' }, 'build-only': { type: 'boolean', default: false },
+  'tendriller-engine': { type: 'string' },
 } })
 if (values.contrib === undefined || values['tendriller-runtime'] === undefined) {
   throw new Error('Usage: application-pilot.ts --contrib /checkout --tendriller-runtime /packaged/runtime [--wasm /engine] [--output /new/directory] [--browser /chromium] [--build-only]')
@@ -44,6 +46,7 @@ const report = { format: 'chronolog-application-pilot/v1', status: 'building', p
 const record = async () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
 const passed = (check: string) => { report.checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
 let native: NativeBrowserFixture | undefined, browser: Browser | undefined, directory: string | undefined
+let routes: Awaited<ReturnType<typeof createPeerRouteFixture>> | undefined
 let closeServer: (() => Promise<void>) | undefined
 let deadline: ReturnType<typeof setTimeout> | undefined
 const observedPages: Page[] = []
@@ -110,6 +113,7 @@ try {
       await accepted(team.handle)
       await accepted(await native.client.submit(program(sqlStatement(`INSERT INTO tasks (id, title, claimed_by, status, chronolog_owner) VALUES (?, ?, NULL, 'open', ${OWNER_FOR_KEY_SQL})`,
         ['task-1', 'Review the shared inspection evidence', team.id])), { operationId: 'pilot-task' }))
+      if (values['tendriller-engine'] !== undefined) routes = await createPeerRouteFixture({ native, directory: join(nativeDirectory, 'routes'), engine: resolve(values['tendriller-engine']) })
       return { peer: native.bootstrap, teamId: bytesToBase64Url(team.id), applicationId: `inspection-${bytesToBase64Url(native.node.groupId)}` }
     }
     const files = await staticFiles(pages)
@@ -120,6 +124,10 @@ try {
       response.setHeader('X-Content-Type-Options', 'nosniff')
       const run = async () => {
         const path = new URL(request.url ?? '/', 'http://localhost').pathname
+        if (path === '/pilot/registered' && request.method === 'GET') {
+          const device = new URL(request.url!, 'http://localhost').searchParams.get('device')
+          response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ registered: device !== null && registrations.has(device) })); return
+        }
         if (path === '/pilot/register' && request.method === 'POST') {
           const registration = validateRegistration(await jsonBody(request))
           const prior = registrations.get(registration.device)
@@ -127,7 +135,9 @@ try {
           registrations.set(registration.device, registration)
           if (registrations.size === 2 && !starting) { starting = true; void startNative().then(resolveBootstrap, rejectBootstrap) }
           const bootstrap = await bootstrapped
-          response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(bootstrap)); return
+          const selected = routes === undefined ? bootstrap : { ...bootstrap, peer: { ...bootstrap.peer,
+            connection: routes.endpoint(registration.device === 'board' ? 'direct' : 'relay') } }
+          response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(selected)); return
         }
         if (path.startsWith('/host/')) {
           if (request.method !== 'GET' && request.method !== 'HEAD') report.counts.hostApplicationWrites++
@@ -149,7 +159,8 @@ try {
     const address = server.address()
     if (address === null || typeof address === 'string') throw new Error('PILOT_SERVER_ADDRESS_UNAVAILABLE')
     const base = `http://127.0.0.1:${address.port}`
-    const contexts = await Promise.all([browser.newContext({ viewport: { width: 1365, height: 1000 } }), browser.newContext({ viewport: { width: 430, height: 932 } })])
+    const contexts = await Promise.all([browser.newContext({ viewport: { width: 1365, height: 1000 }, ignoreHTTPSErrors: true }),
+      browser.newContext({ viewport: { width: 430, height: 932 }, ignoreHTTPSErrors: true })])
     const [board, compact] = await Promise.all(contexts.map(context => context.newPage())) as [Page, Page]
     const all = [board, compact]
     observedPages.push(...all)
@@ -159,8 +170,10 @@ try {
     }
     deadline = setTimeout(() => { void browser?.close() }, 240_000)
     report.status = 'real browser scenarios'
+    const coldStart = performance.now()
     await Promise.all([board.goto(`${base}/board.html?device=board`), compact.goto(`${base}/compact.html?device=compact`)])
     await Promise.all(all.map(ready))
+    report.timingsMs.coldBootstrap = performance.now() - coldStart
     assert(native !== undefined)
     const identities = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.identity)))
     assert.notEqual(identities[0], identities[1])
@@ -284,6 +297,64 @@ try {
     assertResultOrigins(events)
     await Promise.all([board.screenshot({ path: join(output, 'board.png'), fullPage: true }), compact.screenshot({ path: join(output, 'compact.png'), fullPage: true })])
     passed('both layouts rebuild from retained final events without redispatching the worker or writing host application state')
+    if (routes !== undefined) {
+      const beforeRoutes = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.events())))
+      assert.deepEqual(sharedHistory(beforeRoutes[0]!), sharedHistory(beforeRoutes[1]!), 'direct and actual workerd-relayed replicas must expose the identical final history')
+      const authoredIds = [[claimIds[0]!, delayed.operationId, interrupted.operationId], [claimIds[1]!]]
+      const capturedOutcomes = await Promise.all(all.map((page, index) => page.evaluate(async ids => Promise.all(ids.map(id =>
+        (globalThis as unknown as PilotWindow).applicationPilot.operation(id))), authoredIds[index]!)))
+      assert(capturedOutcomes.every(outcomes => outcomes.every(outcome => outcome !== null)))
+      passed('independent replicas receive identical task/chat final events over direct WSS and the packaged workerd relay')
+
+      await Promise.all(all.map(page => page.evaluate(connection => (globalThis as unknown as PilotWindow).applicationPilot.setRoute(connection), routes!.endpoint('direct'))))
+      await routes.disableRelay()
+      await board.locator('#message').fill('Warm direct session with relay unavailable')
+      await board.locator('#send').click()
+      await expect(compact.locator('#conversation')).toContainText('Warm direct session with relay unavailable', { timeout: 40_000 })
+      const directHistory = await native.client.events.read()
+      const warmProposal = directHistory.transactions.find(transaction => transaction.events.some(event =>
+        JSON.stringify(event.payload).includes('Warm direct session with relay unavailable')))?.proposalId
+      assert(warmProposal !== undefined)
+      await Promise.all(all.map(page => browserHasProposal(page, warmProposal)))
+      assert.equal(report.counts.hostApplicationWrites, 0)
+      passed('warm authenticated direct WSS sessions continue final task/chat work while the relay and host application persistence are unavailable')
+
+      await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.disconnect())))
+      routes.enableRelay()
+      const catchUp = await native.client.events.publish('conversation', { type: 'message.posted', version: 1, messageId: 'route-catchup-message', text: 'History added during a route interruption' }, { operationId: 'route-catchup-message' })
+      await accepted(catchUp)
+      const bodySize = 192 * 1024, bodyCount = 4
+      for (let i = 0; i < bodyCount; i++) await accepted(await native.client.events.publish('route-benchmark',
+        { sample: i, body: 'x'.repeat(bodySize) }, { operationId: `route-catchup-body-${i}` }))
+      const resumeStarted = performance.now()
+      await Promise.all(all.map((page, index) => page.evaluate(connection => (globalThis as unknown as PilotWindow).applicationPilot.setRoute(connection), routes!.endpoint(index === 0 ? 'relay' : 'direct'))))
+      const finalNative = await native.client.events.read()
+      const lastProposal = finalNative.transactions.at(-1)!.proposalId
+      await Promise.all(all.map(page => browserHasProposal(page, lastProposal)))
+      report.timingsMs.routeReconnectCatchUp = performance.now() - resumeStarted
+      const finalViews = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.events())))
+      assert.deepEqual(sharedHistory(finalViews[0]!), sharedHistory(finalViews[1]!))
+      assert.deepEqual(sharedHistory(finalViews[0]!), sharedHistory(finalNative))
+      const finalOperations = await Promise.all(all.map((page, index) => page.evaluate(async ids => Promise.all(ids.map(id =>
+        (globalThis as unknown as PilotWindow).applicationPilot.operation(id))), authoredIds[index]!)))
+      assert.deepEqual(finalOperations, capturedOutcomes, 'changing the selected byte route cannot change original operation outcomes')
+      const routeStats = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeStats())))
+      const memory = await Promise.all(all.map(async page => {
+        const session = await page.context().newCDPSession(page)
+        try { await session.send('Performance.enable'); return await session.send('Performance.getMetrics') }
+        finally { await session.detach() }
+      }))
+      report.diagnostics.routes = { ...routes.snapshot(), browserSessions: routeStats, pagePerformanceMetrics: memory,
+        catchUp: { applicationStringBytes: bodySize * bodyCount, elapsedMs: report.timingsMs.routeReconnectCatchUp,
+          applicationBytesPerSecond: bodySize * bodyCount * 1000 / report.timingsMs.routeReconnectCatchUp },
+        nativeHarnessPeakRssBytes: process.resourceUsage().maxRSS * 1024, finalEventDigest: createHash('sha256').update(JSON.stringify(sharedHistory(finalNative))).digest('hex'),
+        notes: ['Page JS heap snapshots exclude Worker/WASM memory; native peak RSS includes this qualification harness and excludes workerd/browser child processes.',
+          'Routes use loopback TLS and synthetic host accounts; production browser authentication and Internet route selection remain unqualified.'] }
+      await routes.saveTrace(join(output, 'route-trace.ndjson'))
+      assert.deepEqual(routes.snapshot().failures, [])
+      assert(routes.snapshot().sessions.every(session => session.sampledPeakQueuedBytes <= 2 * 4 * 1024 * 1024))
+      passed('route interruption and an explicit direct/relay switch recover the same signed history and exact outcomes with measured session bytes and sampled queue sizes')
+    }
     await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.close())))
     report.status = 'passed'; report.passed = true
     await record()
@@ -311,12 +382,14 @@ try {
     report.diagnostics.nativeRevision = native.node.revision.toString()
     report.diagnostics.nativeFinalEvents = await bounded(native.client.events.read(), 5_000).catch((error: unknown) => String(error))
   }
+  if (routes !== undefined) { report.diagnostics.routes = routes.snapshot(); await routes.saveTrace(join(output, 'route-trace.ndjson')) }
   await record()
   process.stderr.write(`Pilot diagnostics: ${JSON.stringify(report.diagnostics)}\n`)
   throw error
 } finally {
   if (deadline !== undefined) clearTimeout(deadline)
   await browser?.close()
+  await routes?.close()
   await native?.close()
   await closeServer?.()
   if (directory !== undefined) await rm(directory, { recursive: true, force: true })
@@ -328,6 +401,10 @@ function gitState(directory: string) {
   catch { return { head: 'not-a-git-checkout', dirty: true } }
 }
 async function sha256(file: string) { return createHash('sha256').update(await readFile(file)).digest('hex') }
+function sharedHistory(batch: EventBatch) {
+  // A replica's local publication revision is intentionally not a shared hash.
+  return { transactions: batch.transactions, scannedThrough: batch.scannedThrough, hasMore: batch.hasMore }
+}
 async function accepted(handle: TransactionHandle) {
   try { assert.equal((await handle.final({ signal: AbortSignal.timeout(30_000) })).outcome.type, 'accepted') }
   finally { handle.dispose() }

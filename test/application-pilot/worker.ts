@@ -1,6 +1,6 @@
 import { EphemeralChannel, type EphemeralSignal } from '@chronolog/agent-service/signals'
 import { decodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
-import { loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
+import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToBase64Url, bytesToHex, decodeExecutionManifest, equalBytes, type EventPayload } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { acquireBrowserStorage, openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
@@ -12,6 +12,7 @@ const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined, identity: EnrollmentIdentity | undefined, signals: EphemeralChannel | undefined
 let connection: Awaited<ReturnType<typeof connectGovernedBrowserPeer>> | undefined
 let bootstrap: BrowserEventBootstrap | undefined, connected = false
+const connectionHistory: ReturnType<Awaited<ReturnType<typeof connectGovernedBrowserPeer>>['stats']>[] = []
 const subscriptions = new Map<string, { readonly abort: AbortController; readonly iterator: AsyncIterator<EphemeralSignal> }>()
 
 async function connect(): Promise<void> {
@@ -33,18 +34,20 @@ async function disconnect(): Promise<void> {
   const previous = connection
   connection = undefined
   await previous?.close()
+  if (previous !== undefined) connectionHistory.push(previous.stats())
 }
 
 endpoint.addEventListener('message', (event) => {
   const request = event.data as { pilot?: string; id?: number; name?: string; bootstrap?: BrowserEventBootstrap;
-    subscriptionId?: string; topics?: readonly string[]; topic?: string; payload?: EventPayload; ttlMs?: number }
+    subscriptionId?: string; topics?: readonly string[]; topic?: string; payload?: EventPayload; ttlMs?: number; createIdentity?: boolean;
+    connection?: NonNullable<BrowserEventBootstrap['connection']> }
   if (request.pilot === undefined) return
   const run = async (): Promise<unknown> => {
     switch (request.pilot) {
       case 'prepare': {
         const storage = await acquireBrowserStorage(request.name!)
         try {
-          const prepared = await loadOrCreateEnrollmentIdentity(storage.bytes, 'peer')
+          const prepared = request.createIdentity === true ? await loadOrCreateEnrollmentIdentity(storage.bytes, 'peer') : await loadEnrollmentIdentity(storage.bytes, 'peer')
           return { identity: bytesToBase64Url(prepared.signing.publicKeyBytes), readerKey: bytesToBase64Url(prepared.reader.publicKeyBytes),
             transportAuthor: feedIdFromPublicKey(prepared.signing.publicKeyBytes) } satisfies BrowserEventIdentity
         } finally { await storage.close() }
@@ -80,6 +83,8 @@ endpoint.addEventListener('message', (event) => {
       case 'sync': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return null
       case 'disconnect': await disconnect(); return null
       case 'reconnect': await connect(); return null
+      case 'routeStats': return [...connectionHistory, ...(connection === undefined ? [] : [connection.stats()])]
+      case 'setRoute': await disconnect(); bootstrap = { ...bootstrap!, connection: request.connection! }; await connect(); return null
       case 'signalPublish': return signals!.publish(request.topic!, request.payload!, { ttlMs: request.ttlMs ?? 2500 })
       case 'signalNext': {
         const id = request.subscriptionId!

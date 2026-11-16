@@ -38,7 +38,10 @@ const command = (pilot: string, fields: Record<string, unknown> = {}, timeoutMs 
     worker.postMessage({ pilot, id, ...fields })
   })
 }
-const prepared = await command('prepare', { name }) as BrowserEventIdentity
+const registration = await fetch(`/pilot/registered?device=${device}`)
+if (!registration.ok) throw new Error(`PILOT_REGISTRATION_CHECK_FAILED: ${registration.status}`)
+const registered = await registration.json() as { registered: boolean }
+const prepared = await command('prepare', { name, createIdentity: !registered.registered }) as BrowserEventIdentity
 const response = await fetch('/pilot/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, identity: prepared }) })
 if (!response.ok) throw new Error(`PILOT_BOOTSTRAP_FAILED: ${response.status}`)
 const bootstrap = await response.json() as PilotBootstrap
@@ -105,6 +108,8 @@ target.applicationPilot = {
   heldSubmission: () => hold?.receipt ?? null,
   releaseSubmission() { const previous = hold; hold = null; previous?.release() },
   async disconnect() { await command('disconnect') }, async reconnect() { await command('reconnect') }, async sync() { await command('sync') },
+  async setRoute(connection) { await command('setRoute', { connection }) },
+  routeStats: () => command('routeStats') as ReturnType<PilotWindow['applicationPilot']['routeStats']>,
   events: () => client.events.read(), operation: async operationId => backend.operations.get(operationId),
   async close() {
     if (closed) return
