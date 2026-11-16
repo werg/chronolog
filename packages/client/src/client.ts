@@ -1,4 +1,6 @@
 import {
+  base64UrlToBytes,
+  bytesToBase64Url as toBase64Url,
   encodePlatformOp,
   isPlatformOp,
   isSqlValue,
@@ -14,6 +16,10 @@ import {
 import {
   ChronologRpcError,
   isChronologRpcError,
+  type ApproveEnrollmentResponse,
+  type CreateEnrollmentResponse,
+  type EnrollmentRole,
+  type EnrollmentStatus,
   type LiveSqlEvent,
   type LocalSqlValue,
   type NodeStatus,
@@ -24,6 +30,7 @@ import {
   type RpcSqlStatement,
   type RpcTransport,
   type SettlementEvidence,
+  type SqlView,
   type SubmitTransactionResponse,
   type TransactionOutcome,
   type UnaryRequest,
@@ -63,6 +70,8 @@ export interface QueryOptions {
   readonly signal?: AbortSignal
   readonly maxRows?: number
   readonly atRevision?: string
+  /** local is speculative; final selects the applied immutable SQL prefix. */
+  readonly view?: SqlView
 }
 
 export interface LocalSqlQueryResponse {
@@ -114,13 +123,14 @@ export class TransactionHandle {
 
   get transactionId(): string { return this.submission.transactionId }
 
-  /** Resolves once the transaction is accepted or rejected at its current position. */
-  async settled(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
-    for await (const outcome of this.outcome) {
-      if (options.signal?.aborted === true) throw options.signal.reason
-      if (outcome.outcome.type !== 'pending') return outcome
-    }
-    throw new ChronologRpcError('transport_unavailable', 'Outcome stream ended before the transaction settled')
+  /** The current speculative result. Replay can change this until final() resolves. */
+  settled(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
+    return this.#waitForOutcome((value) => value.outcome.type !== 'pending', options.signal)
+  }
+
+  /** Resolves only when the accepted or rejected result is applied in the immutable prefix. */
+  final(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
+    return this.#waitForOutcome((value) => value.final && value.outcome.type !== 'pending', options.signal)
   }
 
   /**
@@ -132,6 +142,37 @@ export class TransactionHandle {
     const outcome = await this.settled(options)
     if (outcome.outcome.type === 'rejected') throw new TransactionRejectedError(this.transactionId, outcome.outcome.rejection)
     return outcome
+  }
+
+  #waitForOutcome(predicate: (value: TransactionOutcome) => boolean, signal?: AbortSignal): Promise<TransactionOutcome> {
+    if (signal?.aborted === true) return Promise.reject(signal.reason)
+    return new Promise((resolve, reject) => {
+      let finished = false
+      let unsubscribe = () => undefined as void
+      const finish = (value?: TransactionOutcome, error?: unknown) => {
+        if (finished) return
+        finished = true
+        signal?.removeEventListener('abort', abort)
+        unsubscribe()
+        if (value !== undefined) resolve(value)
+        else reject(error)
+      }
+      const abort = () => finish(undefined, signal?.reason)
+      const check = () => {
+        const snapshot = this.outcome.getSnapshot()
+        if (snapshot.value !== undefined && predicate(snapshot.value)) finish(snapshot.value)
+        else if (snapshot.status === 'error') finish(undefined, snapshot.error)
+        else if (snapshot.status === 'closed') finish(undefined,
+          new ChronologRpcError('transport_unavailable', 'Outcome stream closed before the requested result was available'))
+      }
+      signal?.addEventListener('abort', abort, { once: true })
+      unsubscribe = this.outcome.subscribe(check)
+      // subscribe can synchronously publish a cached snapshot before returning
+      // its cleanup. Detach only this waiter; other stream consumers stay live.
+      if (finished) unsubscribe()
+      else if (signal?.aborted === true) abort()
+      else check()
+    })
   }
 
   /** The id of the grant, team or transfer offer created by step `stepIndex` of this transaction. */
@@ -155,6 +196,7 @@ export class ChronologClient {
   #closed = false
   /** Sharing, teams and transfers of owned rows; each call submits one transaction. */
   readonly ownership: OwnershipActions = new OwnershipActions(this)
+  readonly enrollment: EnrollmentActions = new EnrollmentActions(this)
 
   constructor(options: ChronologClientOptions) {
     this.groupId = options.groupId
@@ -171,6 +213,7 @@ export class ChronologClient {
       requestId: this._requestId(),
       sql,
       parameters: encodeLocalSqlParameters(bindings),
+      view: options.view ?? 'local',
       ...(options.maxRows === undefined ? {} : { maxRows: options.maxRows }),
       ...(options.atRevision === undefined ? {} : { atRevision: options.atRevision }),
     }, options.signal === undefined ? {} : { signal: options.signal })
@@ -194,9 +237,10 @@ export class ChronologClient {
           requestId,
           sql,
           parameters,
+          view: options.view ?? 'local',
           ...(options.maxRows === undefined ? {} : { maxRows: options.maxRows }),
           ...(cursor === undefined || queryDigest === undefined ? {} : { resume: { groupId: this.groupId, queryDigest, eventSetRevision: cursor } }),
-        }, this.#callOptions(signal)),
+        }, this.#callOptions(options.signal === undefined ? signal : AbortSignal.any([signal, options.signal]))),
         (event): LiveQueryValue => {
           this._assertCompatibility(event.revision)
           queryDigest = event.queryDigest
@@ -309,14 +353,14 @@ export class ChronologClient {
    */
   identity(): Promise<Uint8Array> {
     this.#identity ??= this.getStatus().then(
-      (status) => Uint8Array.from(Buffer.from(status.nodeId, 'base64url')),
+      (status) => base64UrlToBytes(status.nodeId),
       (error: unknown) => { this.#identity = undefined; throw error },
     )
     return this.#identity
   }
 
-  queryResourceKey(sql: string, bindings: readonly LocalSqlInput[] = []): string {
-    return `${sql}\0${stableClientValue(bindings)}`
+  queryResourceKey(sql: string, bindings: readonly LocalSqlInput[] = [], view: SqlView = 'local'): string {
+    return `${view}\0${sql}\0${stableClientValue(bindings)}`
   }
 
   async close(): Promise<void> {
@@ -358,6 +402,40 @@ export class ChronologClient {
   }
 }
 
+/** Signed, resumable reader/writer enrollment for the current replica. */
+export class EnrollmentActions {
+  constructor(readonly client: ChronologClient) {}
+
+  /** The caller keeps requestId so a reopened device resumes the same request and keys. */
+  async createRequest(input: {
+    readonly requestId: string
+    readonly roles: readonly EnrollmentRole[]
+  }, options: RpcCallOptions = {}): Promise<CreateEnrollmentResponse> {
+    return this.client._unary('enrollment.createRequest', { groupId: this.client.groupId, ...input }, options)
+  }
+
+  /** An issuer's stable operationId makes an interrupted multi-step approval resumable. */
+  async approveRequest(input: {
+    readonly operationId: string
+    readonly signedRequest: string
+    readonly roles: readonly EnrollmentRole[]
+    readonly grantFullHistory: boolean
+  }, options: RpcCallOptions = {}): Promise<ApproveEnrollmentResponse> {
+    return this.client._unary('enrollment.approveRequest', {
+      groupId: this.client.groupId, requestId: input.operationId, signedRequest: input.signedRequest,
+      roles: input.roles, grantFullHistory: input.grantFullHistory,
+    }, options)
+  }
+
+  /** Applying a receipt does not report ready until grants, keys, engine and final history are usable. */
+  async getStatus(requestId: string, options: RpcCallOptions & { readonly signedApproval?: string } = {}): Promise<EnrollmentStatus> {
+    const { signedApproval, ...call } = options
+    return this.client._unary('enrollment.getStatus', {
+      groupId: this.client.groupId, requestId, ...(signedApproval === undefined ? {} : { signedApproval }),
+    }, call)
+  }
+}
+
 /** A submitted ownership change, with the id of the object it created (when it creates one). */
 export interface OwnershipChange<Id extends Uint8Array | undefined = undefined> {
   readonly handle: TransactionHandle
@@ -366,8 +444,8 @@ export interface OwnershipChange<Id extends Uint8Array | undefined = undefined> 
 
 /**
  * Sharing, teams and transfers. Each method submits one transaction whose
- * only step is the platform operation; await `change.handle.accepted()` for
- * the result. To combine them with SQL in one transaction, use
+ * only step is the platform operation; await `change.handle.final()` and
+ * inspect its outcome before depending on the change. To combine with SQL, use
  * `ownershipSteps` or `platformOp` and `TransactionHandle.createdId()`.
  */
 export class OwnershipActions {
@@ -517,8 +595,6 @@ function scanNamedParameters(sql: string): readonly string[] {
   }
   return found
 }
-
-function toBase64Url(value: Uint8Array): string { return Buffer.from(value).toString('base64url') }
 
 async function* mapAsync<A, B>(source: AsyncIterable<A>, map: (value: A) => B): AsyncIterable<B> {
   for await (const value of source) yield map(value)

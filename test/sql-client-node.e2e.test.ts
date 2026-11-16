@@ -21,6 +21,39 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 describe('SQL client → RPC → node → reducer', () => {
+  it('keeps speculative SQL out of final reads and resolves final() only after a complete watermark', async () => {
+    let now = 10_000
+    const { client, node } = await runtime({ clockNow: () => now, watermark: true })
+    const created = await client.transaction(['CREATE TABLE final_values (value INTEGER PRIMARY KEY)', 'INSERT INTO final_values (value) VALUES (1)'])
+    expect(await terminal(client, created.transactionId)).toMatchObject({ final: false, outcome: { type: 'accepted' } })
+    expect((await client.query("SELECT name FROM sqlite_schema WHERE name = 'final_values'", [], { view: 'final' })).result.rows).toEqual([])
+    expect((await client.query('SELECT value FROM final_values')).result.rows).toEqual([[1n]])
+
+    const firstFinal = created.final({ signal: AbortSignal.timeout(5_000) })
+    now += 1_000
+    await node.publishHeartbeat()
+    expect((await firstFinal).final).toBe(true)
+    const final = await client.query('SELECT value FROM final_values', [], { view: 'final' })
+    expect(final.result.rows).toEqual([[1n]])
+    expect(final.revision).toMatchObject({ view: 'final', publishedOrderLength: '1', finalOrderLength: '1' })
+
+    const live = client.liveQuery('SELECT value FROM final_values ORDER BY value', [], { view: 'final' })
+    const unsubscribe = live.subscribe(() => undefined)
+    await waitFor(() => live.getSnapshot().value?.result?.rows.length === 1)
+    const next = await client.transaction(['INSERT INTO final_values (value) VALUES (2)'])
+    expect(await terminal(client, next.transactionId)).toMatchObject({ final: false, outcome: { type: 'accepted' } })
+    expect((await client.query('SELECT value FROM final_values ORDER BY value')).result.rows).toEqual([[1n], [2n]])
+    expect((await client.query('SELECT value FROM final_values ORDER BY value', [], { view: 'final' })).result.rows).toEqual([[1n]])
+    expect(live.getSnapshot().value?.result?.rows).toEqual([[1n]])
+    const nextFinal = next.final({ signal: AbortSignal.timeout(5_000) })
+    now += 1_000
+    await node.publishHeartbeat()
+    expect((await nextFinal).final).toBe(true)
+    await waitFor(() => live.getSnapshot().value?.result?.rows.length === 2)
+    expect(live.getSnapshot().value?.revision).toMatchObject({ view: 'final', finalOrderLength: '2' })
+    unsubscribe()
+  })
+
   it('submits plain SQL with named and positional bindings and records the signed source', async () => {
     const { client, node } = await runtime()
     const bootstrap = await client.transaction([
@@ -163,7 +196,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const unsubscribeLive = live.subscribe(() => undefined)
     await waitFor(() => live.getSnapshot().value?.result?.rows[0]?.[0] === 100n)
 
-    now += 1
+    now += 2
     const later = await client.transaction([
       "SELECT chronolog_assert((SELECT balance FROM replay_accounts WHERE id = 1) = 100, 'balance_changed')",
       'UPDATE replay_accounts SET balance = 90 WHERE id = 1',
@@ -177,7 +210,7 @@ describe('SQL client → RPC → node → reducer', () => {
 
     const bootstrapTimestamp = node.candidateCore(new TextEncoder().encode(bootstrap.transactionId))!.authorTimestampMs
     const predecessor = await node.publish({
-      authorTimestampMs: bootstrapTimestamp,
+      authorTimestampMs: bootstrapTimestamp + 1n,
       program: { version: 2, steps: [sqlStatement('UPDATE replay_accounts SET balance = 80 WHERE id = 1')] },
     })
     expect((await terminal(client, predecessor.txIdText)).outcome.type).toBe('accepted')
@@ -212,7 +245,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
   }
 }
 
-async function runtime(options: { readonly clockNow?: () => number } = {}) {
+async function runtime(options: { readonly clockNow?: () => number; readonly watermark?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-sql-client-'))
   const identity = await generateEd25519KeyPair()
   const groupId = bytes32(1)
@@ -229,6 +262,7 @@ async function runtime(options: { readonly clockNow?: () => number } = {}) {
     canWrite: ({ writerId }) => equalBytes(writerId, identity.publicKeyBytes),
     canValidate: ({ validatorId, validatorCapability }) => equalBytes(validatorId, identity.publicKeyBytes) && equalBytes(validatorCapability, capability),
     threshold: () => 1,
+    ...(options.watermark === true ? { watermarkPolicy: () => ({ kind: 'threshold' as const, policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }) } : {}),
   }
   const node = new ChronologNode({
     groupId, membershipRevision, validationPolicy, identity,
@@ -236,7 +270,7 @@ async function runtime(options: { readonly clockNow?: () => number } = {}) {
     materialization: createDoltLiteMaterializationRuntime(materializer),
     membership,
     ...(options.clockNow === undefined ? {} : { clock: { now: options.clockNow } }),
-    validator: { capabilityId: capability, cutoffLagMs: Number.MAX_SAFE_INTEGER },
+    validator: { capabilityId: capability, cutoffLagMs: options.watermark === true ? 100 : Number.MAX_SAFE_INTEGER },
   })
   await node.start()
   const client = new ChronologClient({

@@ -277,8 +277,10 @@ export class NodeRpcService implements ChronologRpcService {
     const txId = utf8(request.transactionId)
     const candidate = this.#node.candidate(txId)
     if (candidate === null) throw new ChronologRpcError('not_found', 'Unknown transaction')
+    // Read the outcome and its finality in one synchronous replica snapshot.
+    // Awaiting transport status between them could label an earlier speculative
+    // result final after a replay changed the transaction while we waited.
     const outcome = this.#node.outcome(txId)
-    const status = await this.#node.status()
     const phase = outcome === null
       ? candidate.state === 'admissible' ? 'admissible' : 'collecting_attestations'
       : outcome.outcome === 'accepted' ? 'accepted' : 'rejected'
@@ -294,7 +296,7 @@ export class NodeRpcService implements ChronologRpcService {
               rejection: { code: outcome.rejectionCode ?? 'rejected', statementIndex: outcome.failingStatementIndex },
             },
       eventSetRevision: this.#node.revision.toString(10),
-      materializedRevision: status.materializedRevision.toString(10),
+      materializedRevision: this.#node.materializedRevision.toString(10),
       orderKey: orderKeyText(candidate.orderKey),
       changedByReplay: this.#node.outcomeChangedByReplay(txId),
       admissible: candidate.state === 'admissible',

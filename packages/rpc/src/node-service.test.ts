@@ -23,6 +23,27 @@ function readerNode(): ChronologRpcNodeService {
 }
 
 describe('NodeRpcService policy views and enrollment', () => {
+  it('does not label a stale speculative result final across an asynchronous status refresh', async () => {
+    let finalized = false
+    const node = readerNode()
+    const service = new NodeRpcService({ node: {
+      ...node,
+      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, authorFeedSequence: 1n, txId: groupId } }),
+      outcome: () => ({ outcome: finalized ? 'rejected' : 'accepted', rejectionCode: finalized ? 'constraint' : null, failingStatementIndex: finalized ? 0 : null }),
+      isFinal: () => finalized,
+      outcomeChangedByReplay: () => finalized,
+      async status() {
+        // A slow status read can overlap a replay and final-prefix publication.
+        await Promise.resolve()
+        finalized = true
+        return { started: true, materializedRevision: 7n, orderLength: 3, validating: false,
+          processedTransportRecords: 1, materializationPending: false, quarantinedFeeds: [], transport: { records: 1, peers: [] } }
+      },
+    } })
+    const value = await service.getOutcome({ groupId: group, requestId: 'outcome', transactionId: 'tx-1' }, { method: 'transaction.getOutcome' })
+    expect(value.outcome.type === 'accepted' && value.final).toBe(false)
+  })
+
   it('selects the actual SQL reader and labels its revision and immutable prefix', async () => {
     const transport = new InProcessRpcTransport(new NodeRpcService({ node: readerNode() }))
     const request = { groupId: group, requestId: 'query', sql: 'SELECT value FROM t', parameters: [] }

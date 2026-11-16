@@ -69,3 +69,37 @@ describe('ChronologClient.transaction', () => {
     await client.close()
   })
 })
+
+describe('ChronologClient policy views and enrollment', () => {
+  it('keeps final/local query identities distinct and forwards durable enrollment identities', async () => {
+    const calls: Array<{ readonly method: string; readonly request: unknown }> = []
+    const transport = {
+      async unary(method: string, request: unknown) {
+        calls.push({ method, request })
+        if (method === 'query.localSql') return {
+          revision: { groupId: 'group', view: 'final', eventSetRevision: '4', materializedRevision: '2',
+            publishedOrderLength: '1', finalRevision: '2', finalOrderLength: '1', executionManifestDigest: 'manifest', replaying: false },
+          result: { columns: [{ name: 'answer' }], rows: [[{ kind: 'integer', value: '42' }]], truncated: false, consensusSafe: false },
+        }
+        if (method === 'enrollment.createRequest') return { signedRequest: 'signed-request' }
+        if (method === 'enrollment.approveRequest') return { signedApproval: 'signed-approval' }
+        if (method === 'enrollment.getStatus') return { requestId: 'device-join', state: 'awaiting-history', missingEpochs: [], roles: ['reader'] }
+        throw new Error(`unexpected ${method}`)
+      },
+    } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group', requestId: () => 'query-id' })
+    expect((await client.query('SELECT 42', [], { view: 'final' })).result.rows).toEqual([[42n]])
+    expect(client.queryResourceKey('SELECT 42', [], 'local')).not.toBe(client.queryResourceKey('SELECT 42', [], 'final'))
+    expect(await client.enrollment.createRequest({ requestId: 'device-join', roles: ['reader'] })).toEqual({ signedRequest: 'signed-request' })
+    expect(await client.enrollment.approveRequest({ operationId: 'approve-join', signedRequest: 'signed-request', roles: ['reader'], grantFullHistory: true }))
+      .toEqual({ signedApproval: 'signed-approval' })
+    expect(await client.enrollment.getStatus('device-join', { signedApproval: 'signed-approval' })).toMatchObject({ state: 'awaiting-history' })
+    expect(calls).toEqual([
+      { method: 'query.localSql', request: { groupId: 'group', requestId: 'query-id', sql: 'SELECT 42', parameters: [], view: 'final' } },
+      { method: 'enrollment.createRequest', request: { groupId: 'group', requestId: 'device-join', roles: ['reader'] } },
+      { method: 'enrollment.approveRequest', request: { groupId: 'group', requestId: 'approve-join', signedRequest: 'signed-request', roles: ['reader'], grantFullHistory: true } },
+      { method: 'enrollment.getStatus', request: { groupId: 'group', requestId: 'device-join', signedApproval: 'signed-approval' } },
+    ])
+    await client.close()
+  })
+})

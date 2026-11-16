@@ -77,12 +77,13 @@ export function useChronologQuery(
   options: UseChronologQueryOptions = {},
 ): ChronologQueryState {
   const client = useChronologClient(options.client)
-  const identity = client.queryResourceKey(sql, parameters)
+  const identity = client.queryResourceKey(sql, parameters, options.view)
   const resource = useOwnedResource(
     () => options.enabled === false
       ? undefined
       : client.liveQuery(sql, parameters, {
           ...(options.maxRows === undefined ? {} : { maxRows: options.maxRows }),
+          ...(options.view === undefined ? {} : { view: options.view }),
         }),
     // Canonical query/parameter identity deliberately replaces JavaScript object identity.
     [client, identity, options.maxRows, options.enabled],
