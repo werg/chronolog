@@ -19,6 +19,12 @@ importers:
       '@chronolog/client':
         specifier: workspace:*
         version: link:packages/client
+      '@chronolog/control-store':
+        specifier: workspace:*
+        version: link:packages/control-store
+      '@chronolog/materializer':
+        specifier: workspace:*
+        version: link:packages/materializer
       '@chronolog/materializer-doltlite':
         specifier: workspace:*
         version: link:packages/materializer-doltlite
@@ -53,8 +59,8 @@ importers:
         specifier: 1.65.0
         version: 1.65.0
       '@tendriller/core':
-        specifier: file:./test/artifacts/tendriller-sdk-0200f3b7.tgz
-        version: file:test/artifacts/tendriller-sdk-0200f3b7.tgz
+        specifier: file:./test/artifacts/tendriller-sdk-9b8e34f3.tgz
+        version: file:test/artifacts/tendriller-sdk-9b8e34f3.tgz
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
@@ -167,6 +173,10 @@ importers:
       '@chronolog/records':
         specifier: workspace:*
         version: link:../records
+    devDependencies:
+      '@chronolog/transport-ssb':
+        specifier: workspace:*
+        version: link:../transport-ssb
 
   packages/canonical:
     dependencies:
@@ -355,6 +365,9 @@ importers:
       '@chronolog/control-store':
         specifier: workspace:*
         version: link:../control-store
+      '@chronolog/materializer':
+        specifier: workspace:*
+        version: link:../materializer
       '@chronolog/materializer-doltlite':
         specifier: workspace:*
         version: link:../materializer-doltlite
@@ -419,6 +432,12 @@ importers:
 
   packages/transport-tendriller:
     dependencies:
+      '@chronolog/agent-service':
+        specifier: workspace:*
+        version: link:../agent-service
+      '@chronolog/client':
+        specifier: workspace:*
+        version: link:../client
       '@chronolog/node-core':
         specifier: workspace:*
         version: link:../node-core
@@ -429,9 +448,6 @@ importers:
         specifier: workspace:*
         version: link:../records
     devDependencies:
-      '@chronolog/client':
-        specifier: workspace:*
-        version: link:../client
       '@chronolog/materializer-doltlite':
         specifier: workspace:*
         version: link:../materializer-doltlite
@@ -439,11 +455,11 @@ importers:
         specifier: workspace:*
         version: link:../rpc
       '@tendriller/core':
-        specifier: file:../../test/artifacts/tendriller-sdk-0200f3b7.tgz
-        version: file:test/artifacts/tendriller-sdk-0200f3b7.tgz
+        specifier: file:../../test/artifacts/tendriller-sdk-9b8e34f3.tgz
+        version: file:test/artifacts/tendriller-sdk-9b8e34f3.tgz
       '@tendriller/engine':
-        specifier: file:../../test/artifacts/tendriller-engine-0200f3b7.tgz
-        version: file:test/artifacts/tendriller-engine-0200f3b7.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-0200f3b7.tgz)
+        specifier: file:../../test/artifacts/tendriller-engine-9b8e34f3.tgz
+        version: file:test/artifacts/tendriller-engine-9b8e34f3.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-9b8e34f3.tgz)
 
 packages:
 
@@ -968,15 +984,15 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@tendriller/core@file:test/artifacts/tendriller-sdk-0200f3b7.tgz':
-    resolution: {integrity: sha512-lFpiQJsxMrEhy9yuIea33cvu4+FAw3Gxtd4wZJCpWyZZqZJfSHsna3wIE75ID7vO8XrHp0QIjbuu65t7zyzhmA==, tarball: file:test/artifacts/tendriller-sdk-0200f3b7.tgz}
-    version: 0.3.0-rc.8
+  '@tendriller/core@file:test/artifacts/tendriller-sdk-9b8e34f3.tgz':
+    resolution: {integrity: sha512-kfQHFK+AbE+z4gECk705EcVIn2h8eO19XlLhTuUGPmkzcUrJaCyilxyGIQP/DHgwgeEuK9ougB3E/3Lupm7biA==, tarball: file:test/artifacts/tendriller-sdk-9b8e34f3.tgz}
+    version: 0.3.0-rc.9
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-0200f3b7.tgz':
-    resolution: {integrity: sha512-ufG9iUCgflQqErFb3ZwZ109x86zDBfrG3R/KjxrbqOGzUQTDPAruhiKSnWHAuTXAUmfaWh7Fj67hwtY8Wj5jjQ==, tarball: file:test/artifacts/tendriller-engine-0200f3b7.tgz}
-    version: 0.3.0-rc.8
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-9b8e34f3.tgz':
+    resolution: {integrity: sha512-bCerCNIY39LHvKOm2TTUApVWlukNqKf3EIMfKZShqkdOqO5/iLLqMc8huQ6jUKgWDJCDVCpwv0ekuf+Anezp+A==, tarball: file:test/artifacts/tendriller-engine-9b8e34f3.tgz}
+    version: 0.3.0-rc.9
     peerDependencies:
-      '@tendriller/core': 0.3.0-rc.8
+      '@tendriller/core': 0.3.0-rc.9
 
   '@testcontainers/toxiproxy@12.0.4':
     resolution: {integrity: sha512-Ohku9bnXkwDCj7Ze2fXtADwig924tDSqTeVnowNhdit28/6Tt3zJHjNYJ6A+MWNLdYtJmtwzPryo3cQpGYlO2g==}
@@ -3069,12 +3085,12 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.62.2':
     optional: true
 
-  '@tendriller/core@file:test/artifacts/tendriller-sdk-0200f3b7.tgz': {}
+  '@tendriller/core@file:test/artifacts/tendriller-sdk-9b8e34f3.tgz': {}
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-0200f3b7.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-0200f3b7.tgz)':
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-9b8e34f3.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-9b8e34f3.tgz)':
     dependencies:
       '@cloudflare/workers-types': 5.20261113.1
-      '@tendriller/core': file:test/artifacts/tendriller-sdk-0200f3b7.tgz
+      '@tendriller/core': file:test/artifacts/tendriller-sdk-9b8e34f3.tgz
 
   '@testcontainers/toxiproxy@12.0.4':
     dependencies:

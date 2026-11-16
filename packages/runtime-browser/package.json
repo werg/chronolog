@@ -3,7 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./events": "./src/event-peer.ts"
+  },
   "dependencies": {
     "@chronolog/rpc": "workspace:*",
     "@chronolog/materializer-doltlite": "workspace:*",
@@ -11,6 +14,7 @@
     "@chronolog/protocol": "workspace:*",
     "@chronolog/control-store": "workspace:*",
     "@chronolog/canonical": "workspace:*",
-    "@chronolog/records": "workspace:*"
+    "@chronolog/records": "workspace:*",
+    "@chronolog/materializer": "workspace:*"
   }
 }

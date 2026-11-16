@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "9b8e34f3086b5ab857992c7db76cee3033246dd6",
+  "sourceTree": "bd5be30818aa0efbf05d133d3c36a36f2538cbb5",
+  "buildCommand": "npm ci && npm run build",
+  "package": "@tendriller/engine",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-engine-9b8e34f3.tgz",
+  "sha256": "d2cb579e81c3aa3adff40160b5dd00bd03d593d607d552bb73427fd2ee63a40b",
+  "purpose": "Pinned public artifact for application/peer/record-log contract qualification; no private Tendriller source imports."
+}

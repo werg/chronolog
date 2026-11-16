@@ -90,6 +90,18 @@
       ],
       "@chronolog/agent-service/signals": [
         "packages/agent-service/src/signals.ts"
+      ],
+      "@chronolog/agent-service/framing": [
+        "packages/agent-service/src/framing.ts"
+      ],
+      "@chronolog/agent-service/peer-link": [
+        "packages/agent-service/src/peer-link.ts"
+      ],
+      "@chronolog/agent-service/workers": [
+        "packages/agent-service/src/workers.ts"
+      ],
+      "@chronolog/runtime-browser/events": [
+        "packages/runtime-browser/src/event-peer.ts"
       ]
     }
   }
