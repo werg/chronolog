@@ -90,7 +90,7 @@ export function decodeTransactionCore(bytes: Uint8Array): TransactionCore {
   assertValidChangeProgram(program)
   const metadata = optional(map, 9)
   const writerCapability = optional(map, 10)
-  return {
+  const core: TransactionCore = {
     operationId: expectString(required(map, 11, 'transaction.operation_id'), 'transaction.operation_id'),
     groupId: expectBytes(required(map, 1, 'transaction.group_id'), 'transaction.group_id', 32),
     membershipRevision: expectBytes(required(map, 2, 'transaction.membership_revision'), 'transaction.membership_revision', 32),
@@ -102,6 +102,8 @@ export function decodeTransactionCore(bytes: Uint8Array): TransactionCore {
     ...(metadata === undefined ? {} : { metadata: metadataFromCbor(metadata) }),
     ...(writerCapability === undefined ? {} : { writerCapability: expectBytes(writerCapability, 'transaction.writer_capability', 32) }),
   }
+  transactionToCbor(core)
+  return core
 }
 
 export async function transactionDigest(value: TransactionCore | Uint8Array): Promise<Uint8Array> { return hashCanonicalDomain('transaction', value instanceof Uint8Array ? value : encodeTransactionCore(value)) }

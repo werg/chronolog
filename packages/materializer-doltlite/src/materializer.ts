@@ -152,6 +152,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       verifyPublishedLog(published, log)
       const checkpoints = validateCheckpointRefs(opened.database, published, log, artifacts)
       cleanupOrphanBranches(opened.database, published, checkpoints)
+      // Read leases are process-owned. No lease can survive reopening the sole
+      // storage owner, so crash leftovers can be reclaimed before new readers.
+      for (const branch of opened.database.doltBranches()) {
+        if (branch.name.startsWith('chronolog_read_')) opened.database.doltDeleteBranch(branch.name)
+      }
 
       const readerOpened = openDatabase(options)
       reader = readerOpened.database
@@ -260,16 +265,15 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     const finalOrderLength = this.finalOrderLength
     const branch = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
     this.#writer.doltBranch(branch, published.doltCommitHash)
-    let reader: DatabaseLike
+    let reader: DatabaseLike | undefined
     try { reader = openDatabase(this.#sourceOptions).database; reader.doltCheckout(branch) }
-    catch (error) { removeBranchIfPresent(this.#writer, branch); throw error }
+    catch (error) { try { reader?.close() } finally { removeBranchIfPresent(this.#writer, branch) }; throw error }
     let released = false
     const release = (): void => {
       if (released) return
       released = true
-      reader.close()
-      removeBranchIfPresent(this.#writer, branch)
-      this.#readLeases.delete(release)
+      try { reader!.close() }
+      finally { try { removeBranchIfPresent(this.#writer, branch) } finally { this.#readLeases.delete(release) } }
     }
     this.#readLeases.add(release)
     return { revision, orderLength, finalOrderLength, view,

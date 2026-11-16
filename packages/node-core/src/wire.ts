@@ -37,15 +37,25 @@ export async function encodeSignedEnvelope(
   signer: Ed25519KeyPair,
   cipher?: EnvelopeCipher | EnvelopeCipherResolver,
 ): Promise<Uint8Array> {
-  const activeCipher = cipher === undefined ? undefined : isCipherResolver(cipher) ? cipher.current() : cipher
+  return sealSignedMessage(groupRoute, await signWireMessage(type, payload, signer), cipher)
+}
+
+/** A publisher signs without knowing any reader key or retaining group history. */
+export async function signWireMessage(type: SignedWireMessage['type'], payload: Uint8Array, signer: Ed25519KeyPair): Promise<Uint8Array> {
   const signature = await signDomain(domainFor(type), payload, signer.privateKey)
-  const wire = encodeCanonicalCbor([
+  return encodeCanonicalCbor([
     1n,
     BigInt(WIRE_TYPES.indexOf(type)),
     payload,
     signer.publicKeyBytes,
     signature,
   ])
+}
+
+/** Wrap the original signed bytes in the group's current encryption epoch. */
+export async function sealSignedMessage(groupRoute: Uint8Array, wire: Uint8Array, cipher?: EnvelopeCipher | EnvelopeCipherResolver): Promise<Uint8Array> {
+  const { type } = await decodeSignedMessage(wire)
+  const activeCipher = cipher === undefined ? undefined : isCipherResolver(cipher) ? cipher.current() : cipher
   const epochId = activeCipher?.epochId ?? null
   const envelopePayload = activeCipher === undefined
     ? wire
@@ -79,7 +89,13 @@ export async function decodeSignedEnvelope(
       payloadBytes,
       envelopeAssociatedData(expectedGroupRoute, envelope.messageType as SignedWireMessage['type'], envelope.encryptionEpoch!),
     )
-  const value = assertCanonicalCbor(wireBytes)
+  const message = await decodeSignedMessage(wireBytes)
+  if (message.type !== envelope.messageType) throw wireError('WIRE_TYPE_MISMATCH')
+  return message
+}
+
+export async function decodeSignedMessage(wireBytes: Uint8Array): Promise<SignedWireMessage> {
+  const value = assertCanonicalCbor(wireBytes, { maxBytes: 2 * 1024 * 1024 })
   if (!Array.isArray(value) || value.length !== 5 || value[0] !== 1n) {
     throw wireError('WIRE_SCHEMA_INVALID')
   }
@@ -97,7 +113,7 @@ export async function decodeSignedEnvelope(
     !(signature instanceof Uint8Array)
   ) throw wireError('WIRE_SCHEMA_INVALID')
   const type = WIRE_TYPES[Number(typeIndex)]
-  if (type === undefined || type !== envelope.messageType) throw wireError('WIRE_TYPE_MISMATCH')
+  if (type === undefined) throw wireError('WIRE_TYPE_MISMATCH')
   if (!await verifyDomain(domainFor(type), payload, signature, signer)) {
     throw wireError('WIRE_SIGNATURE_INVALID')
   }
@@ -124,7 +140,7 @@ function wireError(code: string): Error {
   return error
 }
 
-/** Public for compatibility vectors and transport adapters. */
+/** Public canonical encoding for protocol vectors and transport adapters. */
 export function signedWireToCanonicalValue(message: SignedWireMessage): CborValue {
   return [
     1n,

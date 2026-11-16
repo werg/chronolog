@@ -75,7 +75,8 @@ export async function createEventMaterializationRuntime(options: {
   }
   const persisted = await options.store.get(key)
   if (persisted !== null) {
-    const value = assertCanonicalCbor(persisted)
+    if (persisted.length > quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
+    const value = assertCanonicalCbor(persisted, { maxBytes: quota, maxByteStringBytes: quota, maxItems: quota })
     if (!Array.isArray(value) || value.length !== 6 || value[0] !== 'chronolog/event-execution/v1' ||
         !(value[1] instanceof Uint8Array) || !equalBytes(value[1], digest) || typeof value[2] !== 'bigint' ||
         typeof value[3] !== 'bigint' || typeof value[4] !== 'bigint' || !Array.isArray(value[5]) ||

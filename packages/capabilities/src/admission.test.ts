@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   generateEd25519KeyPair,
+  program,
+  emit,
   type TransactionCore,
   type ValidatorAttestation,
 } from '@chronolog/protocol'
@@ -63,7 +65,8 @@ function coreFor(snapshot: CapabilitySnapshot, policyId: Uint8Array, overrides: 
     operationId: 'test-operation',
     groupId: snapshot.groupId, membershipRevision: snapshot.revisionDigest, validationPolicy: policyId,
     authorId: bytes(20), authorTimestampMs: 5_000n, nonce: bytes(9), executionManifestDigest: bytes(10),
-    program: {} as TransactionCore['program'], ...overrides,
+    writerCapability: [...snapshot.capabilities.values()].find((entry) => entry.grant.role === 'writer' && entry.grant.signingPublicKey[0] === 20)!.id,
+    program: program('SELECT 1'), ...overrides,
   }
 }
 
@@ -74,7 +77,6 @@ async function attestationFor(
 ): Promise<ValidatorAttestation> {
   const capability = [...snapshot.capabilities.values()].find((entry) => entry.grant.subjectId[0] === subject)!
   return {
-    operationId: 'test-operation',
     groupId: snapshot.groupId, membershipRevision: snapshot.revisionDigest, validatorCapability: capability.id,
     txId, validatorId: bytes(subject), authorTimestampMs: 5_000n, acceptedAboveMs: 4_000n,
     candidateDigest, decision: 'admit', policyVersion: policy.version, ...overrides,
@@ -109,6 +111,18 @@ describe('writer authorization', () => {
     const f = await fixture()
     const next = await advance(f, f.snapshot, { revocations: [await capabilityId(writer)] })
     expect(canAuthorTransaction(next, coreFor(next, f.policyId))).toBe(false)
+  })
+
+  it('requires one exact grant and does not inherit topic publication from SQL writing', async () => {
+    const f = await fixture()
+    expect(canAuthorTransaction(f.snapshot, coreFor(f.snapshot, f.policyId, { writerCapability: bytes(99) }))).toBe(false)
+    expect(canAuthorTransaction(f.snapshot, coreFor(f.snapshot, f.policyId, { program: program(emit('chat', null)) }))).toBe(false)
+    const scoped = await advance(f, f.snapshot, { grants: [{ ...writer, validFromRevision: 1n,
+      program: { sql: false, topics: ['chat'], signals: ['typing'], forwarded: true } }] })
+    const id = [...scoped.capabilities.values()].find((entry) => entry.grant.program !== undefined)!.id
+    expect(canAuthorTransaction(scoped, coreFor(scoped, f.policyId, { writerCapability: id, program: program(emit('chat', null)) }))).toBe(true)
+    expect(canAuthorTransaction(scoped, coreFor(scoped, f.policyId, { writerCapability: id, program: program(emit('chat', null), 'SELECT 1') }))).toBe(false)
+    expect(canAuthorTransaction(scoped, coreFor(scoped, f.policyId, { writerCapability: id, program: program(emit('typing', null)) }))).toBe(false)
   })
 })
 

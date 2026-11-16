@@ -52,7 +52,7 @@ import type {
   PublishedTransaction,
   ReservedTransactionContext,
 } from './types.js'
-import { WIRE_ENCRYPTION_EPOCH_UNAVAILABLE, decodeSignedEnvelope, encodeSignedEnvelope } from './wire.js'
+import { WIRE_ENCRYPTION_EPOCH_UNAVAILABLE, decodeSignedEnvelope, encodeSignedEnvelope, decodeSignedMessage, sealSignedMessage } from './wire.js'
 import { FeedForkRegistry } from './feed-forks.js'
 import { ValidatorRevisionClosures } from './validator-closures.js'
 
@@ -60,6 +60,7 @@ export class ChronologNode {
   readonly #options: ChronologNodeOptions
   readonly #control: ControlStore
   readonly #operations: DurableOperationJournal
+  readonly #ingressOperations: DurableOperationJournal
   readonly #validatorClosures: ValidatorRevisionClosures
   #evidenceTask: Promise<void> | null = null
   #coordinatedProcessed = 0
@@ -117,6 +118,7 @@ export class ChronologNode {
     if (this.#control.orderPolicy !== policy) throw new Error('NODE_HISTORY_POLICY_MISMATCH')
     const operationStore = options.operationStore ?? new MemoryOperationStore()
     this.#operations = new DurableOperationJournal(operationStore, `transactions/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
+    this.#ingressOperations = new DurableOperationJournal(operationStore, `ingress/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
     this.#validatorClosures = new ValidatorRevisionClosures({
       groupId: options.groupId, groupRoute: options.groupRoute ?? options.groupId,
       identity: options.identity, transport: options.transport, store: operationStore,
@@ -196,6 +198,7 @@ export class ChronologNode {
     this.#stallWatchdog.unref?.()
     await this.#drainHistory(history)
     await this.#operations.recover(async (bytes) => { await this.#applyPreparedTransaction(bytes) })
+    await this.#ingressOperations.recover(async (bytes) => { await this.#applyPreparedTransaction(bytes) })
     if (this.#options.historyPolicy?.kind === 'coordinated') {
       for (const evidence of await this.#options.transport.evidenceHistory?.() ?? []) {
         await this.#ingestSharedEvidence(evidence.bytes)
@@ -252,6 +255,38 @@ export class ChronologNode {
     return { txId: utf8(txIdText), txIdText, candidateDigest, core }
   }
 
+
+  /**
+   * Accept an original signed proposal through an enrolled ingress feed. The
+   * ingress encrypts and retains it without acquiring the publisher's identity.
+   * Exact retries return the prepared proposal even after its grant is revoked.
+   */
+  async submitSigned(signed: Uint8Array): Promise<PublishedTransaction> {
+    this.#assertReady()
+    const wire = await decodeSignedMessage(signed)
+    if (wire.type !== 'candidate') throw new Error('INGRESS_CANDIDATE_REQUIRED')
+    const core = decodeTransactionCore(wire.payload)
+    if (!equalBytes(core.authorId, wire.signer) || !equalBytes(core.groupId, this.groupId) ||
+        !equalBytes(core.executionManifestDigest, this.executionManifestDigest)) throw new Error('INGRESS_CONTEXT_MISMATCH')
+    const operationId = bytesToHex(await sha256(encodeCanonicalCbor([core.authorId, core.operationId])))
+    const prepared = await this.#ingressOperations.run({ operationId, fingerprint: signed,
+      prepare: async () => {
+        if (!await this.#options.membership.canWrite({ groupId: core.groupId, membershipRevision: core.membershipRevision,
+          validationPolicy: core.validationPolicy, writerId: core.authorId, program: core.program,
+          authorTimestampMs: core.authorTimestampMs,
+          ...(core.writerCapability === undefined ? {} : { writerCapability: core.writerCapability }),
+        })) throw new Error('WRITER_UNAUTHORIZED')
+        if (!await this.#membershipAllowsTransportAuthor(this.#options.transport.identity, 'writer', core.authorId,
+          core.membershipRevision, undefined, core.writerCapability)) throw new Error('INGRESS_FORWARDING_UNAUTHORIZED')
+        return encodeCanonicalCbor([wire.payload, await sealSignedMessage(this.#groupRoute(), signed, this.#options.envelopeCipher)])
+      },
+      apply: (bytes) => this.#applyPreparedTransaction(bytes),
+    })
+    const { canonical } = this.#decodePreparedTransaction(prepared)
+    const candidateDigest = await transactionDigest(canonical)
+    const txIdText = `tx_${bytesToHex(candidateDigest)}`
+    return { txId: utf8(txIdText), txIdText, candidateDigest, core: decodeTransactionCore(canonical) }
+  }
 
   async operation(operationId: string): Promise<{
     readonly operationId: string; readonly proposalId: string; readonly final: boolean;

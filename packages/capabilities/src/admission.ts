@@ -6,6 +6,7 @@ import {
 } from '@chronolog/protocol'
 import { evaluateValidationPolicy } from './policy.js'
 import { isCapabilityActive } from './reducer.js'
+import { programAllowed } from './program-rights.js'
 import type {
   CapabilitySnapshot,
   EffectiveCapability,
@@ -34,10 +35,10 @@ export function policyById(snapshot: CapabilitySnapshot, id: Uint8Array): Valida
 
 export function canAuthorTransaction(snapshot: CapabilitySnapshot, core: TransactionCore): boolean {
   if (!equalBytes(snapshot.groupId, core.groupId) || !equalBytes(snapshot.revisionDigest, core.membershipRevision)) return false
-  return [...snapshot.capabilities.values()].some((capability) =>
-    capability.grant.role === 'writer'
-    && equalBytes(capability.grant.signingPublicKey, core.authorId)
-    && isCapabilityActive(capability, snapshot.revision))
+  if (core.writerCapability === undefined) return false
+  const capability = activeCapabilityById(snapshot, core.writerCapability)
+  return capability !== undefined && equalBytes(capability.grant.signingPublicKey, core.authorId) &&
+    programAllowed(capability.grant, core.program)
 }
 
 export function validatorEvidenceForAttestation(
