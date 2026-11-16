@@ -1,12 +1,13 @@
 import { EphemeralChannel, type EphemeralSignal } from '@chronolog/agent-service/signals'
 import { decodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
-import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
+import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToBase64Url, bytesToHex, decodeExecutionManifest, equalBytes, type EventPayload } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
-import { acquireBrowserStorage, openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
+import { prepareBrowserIdentity, openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
 
 import { connectGovernedBrowserPeer } from '../browser/event-connection.js'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from '../browser/event-contract.js'
+import { routeState } from './route-state.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined, identity: EnrollmentIdentity | undefined, signals: EphemeralChannel | undefined
@@ -45,12 +46,9 @@ endpoint.addEventListener('message', (event) => {
   const run = async (): Promise<unknown> => {
     switch (request.pilot) {
       case 'prepare': {
-        const storage = await acquireBrowserStorage(request.name!)
-        try {
-          const prepared = request.createIdentity === true ? await loadOrCreateEnrollmentIdentity(storage.bytes, 'peer') : await loadEnrollmentIdentity(storage.bytes, 'peer')
-          return { identity: bytesToBase64Url(prepared.signing.publicKeyBytes), readerKey: bytesToBase64Url(prepared.reader.publicKeyBytes),
-            transportAuthor: feedIdFromPublicKey(prepared.signing.publicKeyBytes) } satisfies BrowserEventIdentity
-        } finally { await storage.close() }
+        const prepared = await prepareBrowserIdentity(request.name!, request.createIdentity === true ? true : undefined)
+        return { identity: bytesToBase64Url(prepared.signing.publicKeyBytes), readerKey: bytesToBase64Url(prepared.reader.publicKeyBytes),
+          transportAuthor: feedIdFromPublicKey(prepared.signing.publicKeyBytes) } satisfies BrowserEventIdentity
       }
       case 'open': {
         bootstrap = request.bootstrap!
@@ -84,6 +82,7 @@ endpoint.addEventListener('message', (event) => {
       case 'disconnect': await disconnect(); return null
       case 'reconnect': await connect(); return null
       case 'routeStats': return [...connectionHistory, ...(connection === undefined ? [] : [connection.stats()])]
+      case 'routeState': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return routeState(peer!.transport, peer!.governed!.activeSnapshot, peer!.node.finalThrough)
       case 'setRoute': await disconnect(); bootstrap = { ...bootstrap!, connection: request.connection! }; await connect(); return null
       case 'signalPublish': return signals!.publish(request.topic!, request.payload!, { ttlMs: request.ttlMs ?? 2500 })
       case 'signalNext': {

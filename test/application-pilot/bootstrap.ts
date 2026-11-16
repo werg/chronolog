@@ -110,6 +110,7 @@ target.applicationPilot = {
   async disconnect() { await command('disconnect') }, async reconnect() { await command('reconnect') }, async sync() { await command('sync') },
   async setRoute(connection) { await command('setRoute', { connection }) },
   routeStats: () => command('routeStats') as ReturnType<PilotWindow['applicationPilot']['routeStats']>,
+  routeState: () => command('routeState') as ReturnType<PilotWindow['applicationPilot']['routeState']>,
   events: () => client.events.read(), operation: async operationId => backend.operations.get(operationId),
   async close() {
     if (closed) return

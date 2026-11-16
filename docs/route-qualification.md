@@ -51,6 +51,9 @@ Both replicas must expose identical effective event transactions and durable
 scan cursors. Their local publication revision tokens need not match. Original
 operation receipts are compared on their authoring devices; another replica's
 effective history does not create a second author outbox.
+After reconnection, both signed-record content digests, active capability snapshot
+digests and final ordered positions must also match the native replica. Arrival
+timestamps are local observations and do not participate in the comparison.
 
 The gate then selects direct WSS for both replicas and disables relay admission.
 A warm direct session must still finalize a new chat message. This checks loss

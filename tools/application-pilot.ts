@@ -20,6 +20,7 @@ import type { PilotBootstrap, PilotRegistration, PilotWindow } from '../test/app
 import { createNativeBrowserFixture, type NativeBrowserFixture } from './browser-event-fixture.js'
 import { qualifyApplicationScope } from './lib/application-scope.js'
 import { createPeerRouteFixture } from './lib/peer-route-fixture.js'
+import { routeState } from '../test/application-pilot/route-state.js'
 
 /** Real public runtime + independent OPFS replicas + native final-intent worker. */
 const workspace = resolve(import.meta.dirname, '..')
@@ -338,13 +339,17 @@ try {
       const finalOperations = await Promise.all(all.map((page, index) => page.evaluate(async ids => Promise.all(ids.map(id =>
         (globalThis as unknown as PilotWindow).applicationPilot.operation(id))), authoredIds[index]!)))
       assert.deepEqual(finalOperations, capturedOutcomes, 'changing the selected byte route cannot change original operation outcomes')
+      const replicaStates = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeState())))
+      const nativeState = await routeState(native.transport, native.governed.activeSnapshot, native.node.finalThrough)
+      assert.deepEqual(replicaStates[0], nativeState)
+      assert.deepEqual(replicaStates[1], nativeState)
       const routeStats = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeStats())))
       const memory = await Promise.all(all.map(async page => {
         const session = await page.context().newCDPSession(page)
         try { await session.send('Performance.enable'); return await session.send('Performance.getMetrics') }
         finally { await session.detach() }
       }))
-      report.diagnostics.routes = { ...routes.snapshot(), browserSessions: routeStats, pagePerformanceMetrics: memory,
+      report.diagnostics.routes = { ...routes.snapshot(), browserSessions: routeStats, pagePerformanceMetrics: memory, replicaStates, nativeState,
         catchUp: { applicationStringBytes: bodySize * bodyCount, elapsedMs: report.timingsMs.routeReconnectCatchUp,
           applicationBytesPerSecond: bodySize * bodyCount * 1000 / report.timingsMs.routeReconnectCatchUp },
         nativeHarnessPeakRssBytes: process.resourceUsage().maxRSS * 1024, finalEventDigest: createHash('sha256').update(JSON.stringify(sharedHistory(finalNative))).digest('hex'),

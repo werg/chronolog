@@ -31,20 +31,28 @@ jobs:
           "$RUNNER_TEMP/chronolog-emsdk/emsdk" install 4.0.20
           "$RUNNER_TEMP/chronolog-emsdk/emsdk" activate 4.0.20
       - name: Build the real pinned SQL engine
+        id: sql_engine
         run: node tools/build-wasm-engine.mjs --emsdk "$RUNNER_TEMP/chronolog-emsdk"
       - name: Compare native and WASM execution
         env:
           CHRONOLOG_REQUIRE_WASM: '1'
         run: pnpm exec vitest run packages/runtime-browser/src/wasm-conformance.test.ts
       - name: Install real Chromium with platform dependencies
+        id: chromium
+        if: ${{ !cancelled() && steps.sql_engine.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
       - name: Qualify SQL-free events, native framed authority and abrupt OPFS checkpoints
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: node --import tsx tools/test-browser-events.ts
       - name: Qualify Worker ownership, OPFS recovery and the public client
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: node --import tsx tools/test-browser-peer.ts
       - name: Qualify enrolled browser and native agents claiming one shared task
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: node --import tsx tools/test-browser-bridge.ts
       - name: Check out the exact public Tendriller runtime source
+        id: tendriller_source
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller
@@ -52,6 +60,8 @@ jobs:
           path: artifacts/pilot-source/tendriller
           persist-credentials: false
       - name: Check out the exact contrib application specimens
+        id: contrib_source
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
@@ -60,11 +70,13 @@ jobs:
           persist-credentials: false
       - name: Build the packaged public Tendriller SDK, runtime and engine
         id: public_artifacts
+        if: ${{ !cancelled() && steps.tendriller_source.outcome == 'success' }}
         working-directory: artifacts/pilot-source/tendriller
         run: |
           npm ci
           npm run build
       - name: Qualify both contrib layouts with native agents and independent browser peers
+        if: ${{ !cancelled() && steps.public_artifacts.outcome == 'success' && steps.contrib_source.outcome == 'success' }}
         run: |
           node --import tsx tools/application-pilot.ts \
             --contrib artifacts/pilot-source/contrib \
