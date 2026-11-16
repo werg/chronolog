@@ -1,6 +1,6 @@
 import { isPlatformOp, type SqlStatement, type SqlTransactionProgram } from '@chronolog/protocol'
 
-import { cachedInternalStatement, PlatformRejection, PlatformSession, toDatabaseValue, writeProtectedTables } from './platform/session.js'
+import { cachedInternalStatement, PlatformRejection, PlatformSession, toDatabaseValue, writeProtectedTables, lifecycleTriggerNames } from './platform/session.js'
 import { isOperationalSqliteError, SqlProfileError, sqlitePrimaryCode, withProfiledStatement, type SqlAuthorizationOptions } from './sql-profile.js'
 import type { DatabaseLike, SqlRuntimeLimits, StatementLike } from './types.js'
 
@@ -22,6 +22,8 @@ export interface DeterministicContext {
   readonly txId: Uint8Array
   /** The signing key: chronolog_actor() and the owner of new rows. */
   readonly actor: Uint8Array
+  /** Binds sealed ciphertext to this replication group. */
+  readonly groupId: Uint8Array
 }
 
 const SQLITE_CONSTRAINT = 19
@@ -46,11 +48,11 @@ export function executeTransactionProgram(
   context: DeterministicContext,
   limits: Partial<SqlRuntimeLimits> = {},
 ): void {
-  const platform = new PlatformSession(database, { actor: context.actor, txId: context.txId, limits })
+  const platform = new PlatformSession(database, { actor: context.actor, txId: context.txId, groupId: context.groupId, limits })
   // Before the context: it assigns a first-time signer its principal id, which
   // the context pins as chronolog_actor_id().
   const { actorId, schemaAdmin: signerIsSchemaAdmin, schemaVersion: schemaBefore } = platform.begin()
-  database.setDeterministicContext(context.authorTimestampMs, prngSeed(context.txId), context.actor, actorId)
+  database.setDeterministicContext(context.authorTimestampMs, prngSeed(context.txId), context.actor, actorId, context.txId)
   try {
     resetChangeCounter(database)
     let schemaAdmin = signerIsSchemaAdmin
@@ -75,7 +77,7 @@ export function executeTransactionProgram(
         }
         schemaAdmin = platform.isSchemaAdmin()
       } else {
-        executeStatement(database, step, index, limits, { schemaAdmin, writeProtectedTables: writeProtectedTables(database) })
+        executeStatement(database, step, index, limits, { schemaAdmin, writeProtectedTables: writeProtectedTables(database), lifecycleTriggers: lifecycleTriggerNames(database) })
       }
       reconcileIfChanged(index)
     }

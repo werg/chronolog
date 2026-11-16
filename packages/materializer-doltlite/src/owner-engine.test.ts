@@ -1,4 +1,5 @@
 import { DatabaseSync, chronologTriggerUsesIgnore } from '@dolthub/doltlite'
+import { encodeRowKey, sqlValue } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
 import { PLATFORM_TABLES_SQL, PLATFORM_VIEWS_SQL } from './platform/schema.js'
@@ -23,7 +24,7 @@ function database(): DatabaseLike {
 }
 
 function withActor<T>(db: DatabaseLike, actor: Uint8Array | null, operation: () => T, actorId: bigint | null = null): T {
-  db.setDeterministicContext(1_700_000_000_000n, 1, actor, actorId)
+  db.setDeterministicContext(1_700_000_000_000n, 1, actor, actorId, Uint8Array.of(1))
   try { return operation() } finally { db.clearDeterministicContext() }
 }
 
@@ -183,16 +184,59 @@ describe('generated platform triggers', () => {
 })
 
 describe('row keys', () => {
-  it('parse back to the primary-key values quote() produced', () => {
+  it('uses stable owner keys in owner-composite identities and resolves local ids for lookup', () => {
+    const db = database()
+    try {
+      db.exec('CREATE TABLE chronolog_principals(id INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE)')
+      db.prepare('INSERT INTO chronolog_principals VALUES (7, ?)').run(ALICE)
+      db.exec('CREATE TABLE owned(id INTEGER NOT NULL, chronolog_owner INTEGER NOT NULL, PRIMARY KEY(id, chronolog_owner)) WITHOUT ROWID')
+      db.exec('INSERT INTO owned VALUES (3, 7)')
+      const columns = ['id', 'chronolog_owner']
+      const key = (db.prepare(`SELECT ${rowKeyExpression('owned', columns)} AS k FROM owned`).get() as { k: string }).k
+      expect(key).toBe(encodeRowKey([3n, ALICE]))
+      expect(db.prepare(`SELECT id FROM owned WHERE ${rowKeyFilter('owned', columns)}`).get(...rowKeyBindings(key, columns))).toEqual({ id: 3 })
+      db.exec('UPDATE chronolog_principals SET id = 11 WHERE id = 7; UPDATE owned SET chronolog_owner = 11')
+      expect((db.prepare(`SELECT ${rowKeyExpression('owned', columns)} AS k FROM owned`).get() as { k: string }).k).toBe(key)
+      expect(db.prepare(`SELECT id FROM owned WHERE ${rowKeyFilter('owned', columns)}`).get(...rowKeyBindings(key, columns))).toEqual({ id: 3 })
+    } finally { db.close() }
+  })
+
+  it('keeps NUL text, BLOBs and adjacent REAL values distinct on the native engine', () => {
+    const db = database()
+    try {
+      for (const value of ['a\0one', 'a\0two', new Uint8Array([97, 0, 111, 110, 101]), -42n, sqlValue.real(1.5), sqlValue.real(1.5000000000000002)]) {
+        const input = typeof value === 'object' && 'kind' in value && value.kind === 'real' ? Float64Array.of(value.value) : value
+        expect((db.prepare('SELECT chronolog_row_key(?) AS k').get(input) as { k: string }).k).toBe(encodeRowKey([value]))
+      }
+      db.exec('CREATE TABLE exact (id TEXT NOT NULL PRIMARY KEY)')
+      db.exec("INSERT INTO exact VALUES (CAST(x'61ff00' AS TEXT))")
+      const key = (db.prepare(`SELECT ${rowKeyExpression('exact', ['id'])} AS k FROM exact`).get() as { k: string }).k
+      expect(db.prepare(`SELECT hex(id) AS h FROM exact WHERE ${rowKeyFilter('exact', ['id'])}`).get(...rowKeyBindings(key, ['id'])))
+        .toEqual({ h: '61FF00' })
+    } finally { db.close() }
+  })
+
+  it('compares stored values without collation or numeric coercion', () => {
+    const db = database()
+    try {
+      db.exec('CREATE TABLE c (body TEXT COLLATE NOCASE); INSERT INTO c VALUES (\'secret\')')
+      expect(db.prepare("SELECT chronolog_value_equal(body, 'SECRET') AS same FROM c").get()).toEqual({ same: 0 })
+      expect(db.prepare('SELECT chronolog_value_equal(1, 1.0) AS same').get()).toEqual({ same: 0 })
+      expect(db.prepare("SELECT chronolog_value_equal(x'31', '1') AS same").get()).toEqual({ same: 0 })
+      expect(db.prepare('SELECT chronolog_value_equal(NULL, NULL) AS same').get()).toEqual({ same: 1 })
+    } finally { db.close() }
+  })
+
+  it('round-trips typed primary-key values through indexed exact lookups', () => {
     const db = database()
     try {
       db.exec("CREATE TABLE k (a, b, c, d, PRIMARY KEY (a, b, c, d))")
       db.prepare('INSERT INTO k VALUES (?, ?, ?, ?)').run(-42n, "it's, odd", Buffer.from([0, 255]), Float64Array.of(1.5))
       const key = String((db.prepare(`SELECT ${rowKeyExpression('k', ['a', 'b', 'c', 'd'])} AS key FROM k`).get() as { key: unknown }).key)
-      expect(parseRowKey(key)).toEqual([-42n, "it's, odd", Buffer.from([0, 255]), Float64Array.of(1.5)])
+      expect(key).toBe(encodeRowKey([-42n, "it's, odd", Buffer.from([0, 255]), sqlValue.real(1.5)]))
       expect(db.prepare(`SELECT count(*) AS n FROM k WHERE ${rowKeyFilter('k', ['a', 'b', 'c', 'd'])}`).get(...rowKeyBindings(key, ['a', 'b', 'c', 'd'])))
         .toEqual({ n: 1 })
-      expect(parseRowKey('NULL,7')).toEqual([null, 7n])
+      expect(parseRowKey(encodeRowKey([null, 7n]))).toEqual([{ kind: 'null' }, { kind: 'integer', value: 7n }])
       expect(() => parseRowKey("1; DROP TABLE k")).toThrow('MATERIALIZER_ROW_KEY_INVALID')
     } finally {
       db.close()

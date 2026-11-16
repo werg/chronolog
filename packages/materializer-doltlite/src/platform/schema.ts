@@ -1,6 +1,7 @@
 import { GROUP_COLLECTIVE_ID } from '@chronolog/protocol'
 
 import type { DatabaseLike } from '../types.js'
+import { SEALED_TABLES_SQL } from './sealed.js'
 
 /**
  * Replicated platform state for owner-controlled rows
@@ -57,6 +58,8 @@ export const PLATFORM_TABLES_SQL: readonly string[] = [
     CHECK (row_key IS NULL OR op_insert = 0)
   ) STRICT`,
   `CREATE INDEX chronolog_grants_by_grantee ON chronolog_grants (grantee_key, tbl)`,
+  `CREATE INDEX chronolog_live_grants_by_row ON chronolog_grants (tbl, row_key)
+    WHERE revoked_tx IS NULL AND row_key IS NOT NULL`,
   `CREATE TABLE chronolog_transfers (
     offer_id BLOB PRIMARY KEY NOT NULL CHECK (length(offer_id) = 32),
     tbl TEXT,
@@ -64,11 +67,21 @@ export const PLATFORM_TABLES_SQL: readonly string[] = [
     from_owner BLOB NOT NULL CHECK (length(from_owner) = 32),
     to_owner BLOB NOT NULL CHECK (length(to_owner) = 32),
     carry INTEGER NOT NULL CHECK (carry IN (0, 1)),
+    scope_digest BLOB NOT NULL CHECK (length(scope_digest) = 32),
     state TEXT NOT NULL CHECK (state IN ('open', 'accepted', 'cancelled')),
     created_tx BLOB NOT NULL,
     closed_tx BLOB,
     CHECK ((tbl IS NULL) = (row_key IS NULL))
   ) STRICT`,
+  `CREATE INDEX chronolog_open_transfers_by_owner ON chronolog_transfers (tbl, from_owner)
+    WHERE state = 'open'`,
+  `CREATE TABLE chronolog_transfer_scope (
+    offer_id BLOB NOT NULL REFERENCES chronolog_transfers (offer_id),
+    tbl TEXT NOT NULL,
+    row_key TEXT NOT NULL,
+    PRIMARY KEY (offer_id, tbl, row_key)
+  ) STRICT`,
+  `CREATE INDEX chronolog_transfer_scope_by_row ON chronolog_transfer_scope (tbl, row_key)`,
   // Written and emptied inside one platform operation; always empty between steps.
   `CREATE TABLE chronolog_exemptions (
     kind TEXT NOT NULL CHECK (kind IN ('transfer', 'seed')),
@@ -77,6 +90,7 @@ export const PLATFORM_TABLES_SQL: readonly string[] = [
     from_owner INTEGER,
     to_owner INTEGER
   ) STRICT`,
+  ...SEALED_TABLES_SQL,
 ]
 
 export type OwnerOperation = 'insert' | 'update' | 'delete'

@@ -1,6 +1,7 @@
 export * from './client.js'
 export * from './local-sql.js'
 export * from './ownership.js'
+export * from './sealed.js'
 export * from './stream-resource.js'
 export * from './values.js'
 

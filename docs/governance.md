@@ -73,9 +73,10 @@ do to the database's rows is decided inside the database
 - Schema administrators are not data owners. They cannot update or delete
   other keys' rows, or re-own them; they can only narrow access with app
   triggers.
-- Revoking a node's `writer` capability stops its new transactions. Rows it
-  owns stay owned by its key; a planned key change is a bulk transfer signed by
-  the old key and accepted by the new one.
+- Revoking a node's `writer` capability prevents authoring at the new
+  membership revision. Rows it owns stay owned by its key; a planned key
+  change is a bulk transfer signed by the old key and accepted by the new one.
+  See the revision and finality distinction below.
 
 ## Joining a group
 
@@ -153,6 +154,14 @@ the old group are not carried over. `verify-fork` compares every application
 table, including owners, and the ownership state: registered tables, teams,
 memberships, grants and transfer offers.
 
+A snapshot containing any sealed reader-policy generation, including a closed
+one, cannot currently be forked. Seed-plan creation fails with
+`SEALED_DATA_REQUIRES_EXPLICIT_REENCRYPTION`: sealed envelopes authenticate the
+source group, policy generation and version, so copying them into a new group
+would not preserve their meaning. A future cross-group workflow must explicitly
+decrypt and re-encrypt through authorized readers. Same-group snapshot restore
+continues to preserve the complete database and its sealed metadata.
+
 ## Live operations
 
 The daemon exposes the control plane through authenticated `governance.*` RPC
@@ -218,6 +227,33 @@ The capability snapshot records the highest timestamp floor ever granted to a
 validator. It only rises, so a new validator's floor may not be lower even
 after every earlier validator has been revoked. Admitting
 history below that floor requires a fork.
+
+### Row-grant revocation and finality
+
+Row grants are revoked by ordinary ordered transactions. A write ordered after
+a row-grant revoke sees the revoked grant. While the order is provisional,
+late transactions can still be inserted earlier and cause a suffix to replay.
+Once a blocking set of validators has closed the relevant timestamp prefix,
+a newly admitted backdated write cannot be inserted before that revoke. This
+is the existing finality mechanism; historical writes remain part of history.
+
+`TransactionHandle.accepted()` and `settled()` report the materialized outcome
+at the transaction's **current position**. Neither waits for finality. For an
+irreversible decision, inspect settlement evidence: the relevant policy
+watermark must cover the transaction (`confidence: 'policy_watermark_reached'`),
+and unresolved referenced records must be accounted for. An accepted outcome
+alone does not establish that its preceding history is closed.
+
+Group capability revocations use the separate administration log. The node
+normally authors against its latest membership revision; historical snapshots
+remain available for replay. The current implementation can still admit a
+fresh transaction explicitly pinned to an older membership revision when that
+revision authorizes the signer and enough validators. Such a transaction can
+reach provisional materialized state. Once honest validators move to the newer
+revision, their new heartbeats do not advance the old revision's watermark, so
+that fresh transaction does not become final through those heartbeats. This
+revision-lifecycle boundary is distinct from rewriting an already closed
+timestamp prefix or bypassing an ordered row-grant revoke.
 
 ## Static override
 

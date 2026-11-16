@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
+    "@chronolog/crypto": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/rpc": "workspace:*"
   }

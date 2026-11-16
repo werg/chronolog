@@ -3,6 +3,7 @@ import {
   platformObjectId,
   platformOp,
   sqlStatement,
+  sqlValue,
   type ProgramStep,
 } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -269,6 +270,81 @@ describe('owner-controlled rows: foreign keys, app triggers and recursion', () =
 })
 
 describe('owner-controlled rows: grants', () => {
+  it('does not confuse NUL-containing TEXT keys, BLOB keys or adjacent REAL keys', async () => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY, 'CREATE TABLE keyed (id ANY PRIMARY KEY NOT NULL, body TEXT, status TEXT) STRICT')
+    const keys = ['a\0one', 'a\0two', new Uint8Array([97, 0, 111, 110, 101]), sqlValue.real(1.5), sqlValue.real(1.5000000000000002)]
+    for (const key of keys) await book.expectOutcome('accepted', ALICE, sqlStatement('INSERT INTO keyed (id, body) VALUES (?, ?)', [key, 'original']))
+    await book.expectOutcome('accepted', ALICE, platformOp.grant({ table: 'keyed', grantee: BOB, rowKey: [keys[0]], operations: ['update', 'delete'] }))
+    await book.expectOutcome('accepted', BOB, sqlStatement('UPDATE keyed SET status = ? WHERE id = ?', ['ok', keys[0]]))
+    for (const key of keys.slice(1)) {
+      await book.expectOutcome('policy:keyed:update', BOB, sqlStatement('UPDATE keyed SET status = ? WHERE id = ?', ['no', key]))
+      await book.expectOutcome('policy:keyed:delete', BOB, sqlStatement('DELETE FROM keyed WHERE id = ?', [key]))
+    }
+    await book.expectOutcome('accepted', ALICE, platformOp.grant({ table: 'keyed', grantee: BOB, rowKey: [keys[3]], operations: ['update'] }))
+    await book.expectOutcome('accepted', BOB, sqlStatement('UPDATE keyed SET status = ? WHERE id = ?', ['real ok', keys[3]]))
+    await book.expectOutcome('policy:keyed:update', BOB, sqlStatement('UPDATE keyed SET status = ? WHERE id = ?', ['no', keys[4]]))
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'keyed', rowKey: [keys[0]], toOwner: BOB }))
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(await platformObjectId(offer, 0)))
+    await book.expectOutcome('accepted', BOB, sqlStatement('UPDATE keyed SET body = ? WHERE id = ?', ['new owner', keys[0]]))
+  })
+
+  it('requires actual non-NULL primary keys instead of sharing authority across ambiguous rows', async () => {
+    const book = await ledger()
+    // DoltLite makes these PKs NOT NULL even when the SQL omits the clause.
+    // Registration checks actual metadata rather than guessing from SQL text.
+    await book.expectOutcome('accepted', ROOT_KEY, 'CREATE TABLE text_keys (id TEXT PRIMARY KEY, body TEXT)',
+      'CREATE TABLE composite_keys (a INTEGER, b TEXT, PRIMARY KEY(a, b))',
+      'CREATE TABLE descending_keys (id INTEGER PRIMARY KEY DESC)')
+    await book.expectOutcome('constraint', ALICE, 'INSERT INTO text_keys(id) VALUES(NULL)')
+    await book.expectOutcome('constraint', ALICE, "INSERT INTO composite_keys(a,b) VALUES(NULL,'x')")
+    await book.expectOutcome('constraint', ALICE, 'INSERT INTO descending_keys(id) VALUES(NULL)')
+  })
+
+  it('treats case, storage type and exact numeric changes as changes outside column caps', async () => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY, 'CREATE TABLE capped (id INTEGER PRIMARY KEY, body TEXT COLLATE NOCASE, n ANY, status TEXT) STRICT')
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO capped (id, body, n) VALUES (1, 'secret', 1)",
+      platformOp.grant({ table: 'capped', grantee: BOB, operations: ['update'], columns: ['status'] }))
+    await book.expectOutcome('policy:capped:update', BOB, "UPDATE capped SET body = 'SECRET', status = 'done' WHERE id = 1")
+    await book.expectOutcome('policy:capped:update', BOB, 'UPDATE capped SET n = 1.0 WHERE id = 1')
+    await book.expectOutcome('accepted', BOB, "UPDATE capped SET body = 'secret', n = 1, status = 'done' WHERE id = 1")
+    expect(rows(book.materializer, 'SELECT body, typeof(n), status FROM capped')).toEqual([['secret', 'integer', 'done']])
+  })
+
+  it('revokes grants when rows are deleted, replaced or re-keyed, including inside application triggers', async () => {
+    const book = await notesLedger()
+    await book.expectOutcome('accepted', ALICE, platformOp.grant({ table: 'notes', grantee: BOB, rowKey: [1n], operations: ['update', 'delete'] }))
+    await book.expectOutcome('accepted', ALICE, 'DELETE FROM notes WHERE id = 1', "INSERT INTO notes (id, body) VALUES (1, 'replacement')")
+    await book.expectOutcome('policy:notes:update', BOB, "UPDATE notes SET body = 'old grant' WHERE id = 1")
+    await book.expectOutcome('accepted', ALICE, platformOp.grant({ table: 'notes', grantee: BOB, rowKey: [1n], operations: ['update'] }))
+    await book.expectOutcome('accepted', ALICE, 'UPDATE notes SET id = 3 WHERE id = 1', "INSERT INTO notes (id, body) VALUES (1, 'another replacement')")
+    await book.expectOutcome('policy:notes:update', BOB, "UPDATE notes SET body = 'old grant' WHERE id IN (1, 3)")
+
+    // An AFTER DELETE trigger must not reuse a still-live old row grant on a
+    // replacement it creates during the same SQL statement.
+    await book.expectOutcome('accepted', ALICE,
+      platformOp.grant({ table: 'notes', grantee: BOB, operations: ['insert'] }),
+      platformOp.grant({ table: 'notes', grantee: BOB, rowKey: [1n], operations: ['update', 'delete'] }))
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER replace_deleted AFTER DELETE ON notes WHEN OLD.id = 1 BEGIN
+      INSERT INTO notes (id, body, chronolog_owner) VALUES (OLD.id, 'trigger replacement', OLD.chronolog_owner);
+      UPDATE notes SET body = 'must fail' WHERE id = OLD.id;
+    END`)
+    await book.expectOutcome('policy:notes:update', BOB, 'DELETE FROM notes WHERE id = 1')
+    expect(rows(book.materializer, 'SELECT body FROM notes WHERE id = 1')).toEqual([['another replacement']])
+  })
+
+  it('does not expose lifecycle metadata privileges to direct SQL or application triggers', async () => {
+    const book = await notesLedger()
+    await book.expectOutcome('denied', ALICE, 'UPDATE chronolog_grants SET revoked_tx = NULL')
+    await book.expectOutcome('accepted', ROOT_KEY,
+      'CREATE TRIGGER resurrect_grants AFTER UPDATE ON notes BEGIN UPDATE chronolog_grants SET revoked_tx = NULL; END')
+    await book.expectOutcome('denied', ALICE, "UPDATE notes SET body = 'trigger' WHERE id = 1")
+    await book.expectOutcome('accepted', ROOT_KEY, 'DROP TRIGGER resurrect_grants',
+      "CREATE TRIGGER forge_offer AFTER UPDATE ON notes BEGIN UPDATE chronolog_transfers SET state = 'open'; END")
+    await book.expectOutcome('denied', ALICE, "UPDATE notes SET body = 'trigger' WHERE id = 1")
+  })
+
   it('limits grantees to the granted operations, rows and columns, and revocation applies in order', async () => {
     const book = await notesLedger()
     const grantTx = await book.expectOutcome('accepted', ALICE,
@@ -331,6 +407,100 @@ describe('owner-controlled rows: collectives', () => {
 })
 
 describe('owner-controlled rows: transfer', () => {
+  it('finds dependents using parent FK collation and affinity, excluding NULL references', async () => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY,
+      'CREATE TABLE parents (id INTEGER PRIMARY KEY, code TEXT COLLATE NOCASE, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), UNIQUE(code, chronolog_owner))',
+      'CREATE TABLE children (id INTEGER PRIMARY KEY, code TEXT COLLATE BINARY, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), FOREIGN KEY(code, chronolog_owner) REFERENCES parents(code, chronolog_owner) ON UPDATE CASCADE)')
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO parents (id, code) VALUES (1, 'A'), (2, NULL)",
+      "INSERT INTO children (id, code) VALUES (1, 'a'), (2, NULL)")
+    const carry = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'parents', rowKey: [1n], toOwner: BOB, carry: true }))
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(await platformObjectId(carry, 0)))
+    expect(rows(book.materializer, 'SELECT id, hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM children ORDER BY id'))
+      .toEqual([['1', hex(BOB)], ['2', hex(ALICE)]])
+    // The NULL child is not a reference to the NULL-valued parent.
+    const noReference = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'parents', rowKey: [2n], toOwner: BOB }))
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(await platformObjectId(noReference, 0)))
+
+    await book.expectOutcome('accepted', ROOT_KEY,
+      'CREATE TABLE exact_parents (id INTEGER PRIMARY KEY, code TEXT COLLATE BINARY NOT NULL, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), UNIQUE(code, chronolog_owner))',
+      'CREATE TABLE case_children (id INTEGER PRIMARY KEY, code TEXT COLLATE NOCASE, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), FOREIGN KEY(code, chronolog_owner) REFERENCES exact_parents(code, chronolog_owner) ON UPDATE CASCADE)',
+      'CREATE TABLE numeric_children (id INTEGER PRIMARY KEY, code INTEGER, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), FOREIGN KEY(code, chronolog_owner) REFERENCES exact_parents(code, chronolog_owner) ON UPDATE CASCADE)')
+    await book.expectOutcome('accepted', ALICE,
+      "INSERT INTO exact_parents (id, code) VALUES (1, 'a'), (2, 'A'), (3, '1'), (4, '01')",
+      "INSERT INTO case_children (id, code) VALUES (1, 'a')", 'INSERT INTO numeric_children (id, code) VALUES (1, 1)')
+    // 'A' has no dependent despite the child's NOCASE collation.
+    const upper = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'exact_parents', rowKey: [2n], toOwner: BOB }))
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(await platformObjectId(upper, 0)))
+    // Parent TEXT '01' has no FK reference from INTEGER 1. SQLite's generated
+    // cascade nevertheless attempts to change that numeric child. Do not
+    // broaden transfer exemptions to compensate: reject and roll back.
+    const numeric = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'exact_parents', rowKey: [4n], toOwner: BOB }))
+    await book.expectOutcome('policy:numeric_children:update', BOB, platformOp.acceptTransfer(await platformObjectId(numeric, 0)))
+    expect(rows(book.materializer, 'SELECT hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM case_children'))
+      .toEqual([[hex(ALICE)]])
+    expect(rows(book.materializer, 'SELECT hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM numeric_children'))
+      .toEqual([[hex(ALICE)]])
+  })
+
+  it('lets either endpoint cancel, rejects other callers, and never revives cancelled offers', async () => {
+    const book = await notesLedger()
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: BOB }))
+    const id = await platformObjectId(offer, 0)
+    await book.expectOutcome('platform:not_owner', CAROL, platformOp.cancelTransfer(id))
+    await book.expectOutcome('accepted', ALICE, platformOp.cancelTransfer(id))
+    await book.expectOutcome('platform:offer_closed', BOB, platformOp.acceptTransfer(id))
+    const declined = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: BOB }))
+    await book.expectOutcome('accepted', BOB, platformOp.cancelTransfer(await platformObjectId(declined, 0)))
+  })
+
+  it('closes offers on content changes, delete/recreate, and ownership ABA', async () => {
+    const book = await notesLedger()
+    const changed = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: BOB }))
+    await book.expectOutcome('accepted', ALICE, "UPDATE notes SET body = 'changed' WHERE id = 1")
+    await book.expectOutcome('platform:offer_closed', BOB, platformOp.acceptTransfer(await platformObjectId(changed, 0)))
+    const deleted = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: BOB }))
+    await book.expectOutcome('accepted', ALICE, 'DELETE FROM notes WHERE id = 1', "INSERT INTO notes (id, body) VALUES (1, 'changed')")
+    await book.expectOutcome('platform:offer_closed', BOB, platformOp.acceptTransfer(await platformObjectId(deleted, 0)))
+    const oldOffer = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: BOB }))
+    const toCarol = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: CAROL }))
+    await book.expectOutcome('accepted', CAROL, platformOp.acceptTransfer(await platformObjectId(toCarol, 0)))
+    const back = await book.expectOutcome('accepted', CAROL, platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: ALICE }))
+    await book.expectOutcome('accepted', ALICE, platformOp.acceptTransfer(await platformObjectId(back, 0)))
+    await book.expectOutcome('platform:offer_closed', BOB, platformOp.acceptTransfer(await platformObjectId(oldOffer, 0)))
+  })
+
+  it('binds bulk offers to the offered snapshot and carry offers to their dependent set', async () => {
+    const book = await notesLedger()
+    const all = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO notes (id, body) VALUES (3, 'acquired later')")
+    await book.expectOutcome('platform:offer_closed', BOB, platformOp.acceptTransfer(await platformObjectId(all, 0)))
+    await book.expectOutcome('accepted', ROOT_KEY,
+      'CREATE TABLE parents (id INTEGER PRIMARY KEY, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), UNIQUE (id, chronolog_owner))',
+      'CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), FOREIGN KEY (parent_id, chronolog_owner) REFERENCES parents (id, chronolog_owner) ON UPDATE CASCADE ON DELETE CASCADE)')
+    await book.expectOutcome('accepted', ALICE, 'INSERT INTO parents(id) VALUES (1)', 'INSERT INTO children(id,parent_id) VALUES (1,1)')
+    const carry = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'parents', rowKey: [1n], toOwner: BOB, carry: true }))
+    await book.expectOutcome('accepted', ALICE, 'INSERT INTO children(id,parent_id) VALUES (2,1)')
+    await book.expectOutcome('platform:offer_stale', BOB, platformOp.acceptTransfer(await platformObjectId(carry, 0)))
+    const fresh = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'parents', rowKey: [1n], toOwner: BOB, carry: true }))
+    await book.expectOutcome('accepted', ALICE, 'DELETE FROM children WHERE id = 1', 'INSERT INTO children(id,parent_id) VALUES (1,1)')
+    await book.expectOutcome('platform:offer_closed', BOB, platformOp.acceptTransfer(await platformObjectId(fresh, 0)))
+  })
+
+  it('does not widen a bulk transfer to rows inserted by an application trigger during acceptance', async () => {
+    const book = await notesLedger()
+    await book.expectOutcome('accepted', ROOT_KEY, 'CREATE TABLE tags (id INTEGER PRIMARY KEY, body TEXT)')
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO tags (id, body) VALUES (1, 'offered')",
+      platformOp.grant({ table: 'tags', grantee: BOB, operations: ['insert'] }))
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER add_during_move AFTER UPDATE OF chronolog_owner ON notes WHEN OLD.id = 1 BEGIN
+      INSERT INTO tags (id, body, chronolog_owner) VALUES (2, 'not offered', OLD.chronolog_owner);
+    END`)
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(await platformObjectId(offer, 0)))
+    expect(rows(book.materializer, 'SELECT id, hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM tags ORDER BY id'))
+      .toEqual([['1', hex(BOB)], ['2', hex(ALICE)]])
+  })
+
   it('needs the recipient to accept, carries owner-composite dependents and gives app triggers no extra rights', async () => {
     const book = await ledger()
     await book.expectOutcome('accepted', ROOT_KEY,

@@ -147,9 +147,27 @@ chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id())   -- principal i
     non-constant default".
   - So a table is registered (put under owner checks) by the statement that
     creates it, while it is still empty.
-- **Row identity.** Grants and transfers name a row by its primary key, as
-  `quote(pk1) || ',' || quote(pk2) …` (the `rowKey` of an operation is the
-  key's values). So a registered table needs a declared primary key.
+- **Row identity.** Grants and transfers name a row by its primary key. The
+  stored key is the native `chronolog_row_key(...)` encoding: `rk1:` followed
+  by hex of a big-endian uint16 arity and tagged values. NULL has no payload;
+  INTEGER has signed int64 bits; REAL has exact IEEE754 binary64 bits; TEXT
+  and BLOB have a uint32 byte length followed by exact bytes. Type tags are
+  0 through 4 in that order. Embedded NUL and non-UTF-8 SQLite text remain
+  distinct. Owner-column key components encode the owner's stable 32-byte
+  key instead of its local principal id, preserving fork identities.
+  Operation `rowKey` inputs still name the actual SQL primary-key values.
+  A registered table needs a non-NULL primary key of at most 64 columns;
+  SQLite's implicit non-NULL INTEGER PRIMARY KEY rowid alias is accepted.
+  The former `quote()` representation is not accepted by the new profile.
+- **Row lifetimes.** Deleting/replacing a row or changing its primary key
+  revokes row grants and cancels offers that include it. Ownership changes
+  revoke row grants and cancel competing offers. Recreating the same key or
+  transferring back to a former owner never revives that authority. Cleanup
+  runs inside the generated BEFORE policy trigger, after authorization but
+  before a replacement can be reached by an application AFTER trigger.
+  Consequently an authorized identity-changing attempt later suppressed by
+  SQLite `OR IGNORE` can conservatively invalidate old authority even if the
+  row is retained; transaction rejection rolls the invalidation back.
 - **Every table is registered automatically.** There is no registration
   step. Reconciliation runs right after every statement that changed the
   schema, so a new table is owner-checked from the next statement on. It
@@ -195,7 +213,8 @@ chronolog_tables             (name, registered_at_tx)
 chronolog_collectives        (collective_id, kind: group|team, insert_role, update_role, delete_role, created_tx)
 chronolog_collective_members (collective_id, member_key, role: admin|member, state: invited|active|left, joined_tx, left_tx)
 chronolog_grants             (grant_id, tbl, grantor, grantee_key, row_key NULL, op_insert, op_update, op_delete, columns NULL, created_tx, revoked_tx)
-chronolog_transfers          (offer_id, tbl NULL, row_key NULL, from_owner, to_owner, carry, state: open|accepted|cancelled, created_tx, closed_tx)
+chronolog_transfers          (offer_id, tbl NULL, row_key NULL, from_owner, to_owner, carry, scope_digest, state: open|accepted|cancelled, created_tx, closed_tx)
+chronolog_transfer_scope     (offer_id, tbl, row_key) -- exact rows covered by each offer
 chronolog_exemptions         (kind, tbl, row_key, from_owner, to_owner)   -- empty between steps
 ```
 
@@ -488,7 +507,10 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
   `grantor` names a collective the signer administers.
 - The grantor (or an admin of a grantor collective) revokes; the grantee may
   renounce. Revocation takes effect from the next step in the order.
-- A row grant ends when the row is transferred.
+- A row grant ends when the row is deleted, replaced, re-keyed or transferred.
+- Column caps compare exact stored types and values with native
+  `chronolog_value_equal`, independent of SQL collation and numeric coercion.
+  A NOCASE case change or INTEGER-to-REAL change is still a change.
 
 **Transfer** is an offer by the owner plus acceptance by the recipient.
 
@@ -497,11 +519,18 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
   such dependents cannot be transferred (`platform:has_dependents`). At
   acceptance the row must still belong to the offer's owner
   (`platform:offer_stale`).
-- `scope: all` transfers every row the old key owns *when the offer is
-  accepted*, across all registered tables, parent tables first, including
-  rows written after the offer was made. It re-points the live grants the old
-  key **gave** (it is their grantor) to the new key. This is the key-change
-  path (§2).
+- Every offer records its concrete row scope and a digest of exact content,
+  column shape and dependent set. Acceptance requires that snapshot to match.
+  Content changes cancel offers containing the affected row. Changes to the
+  dependent set or schema are detected by the digest. No-op writes preserve
+  offers. There is no wall-clock timeout: the source or recipient (including
+  collective administrators) can explicitly `TransferCancel`/`cancelTransfer`.
+- `scope: all` snapshots every row the old key owns *when offered*, across all
+  registered tables. Acquiring another row cancels an open bulk offer.
+  Acceptance moves only the captured rows, parent tables first; rows an app
+  trigger inserts during acceptance are never silently added. Live whole-table
+  grants the old key **gave** are re-pointed to the new key; row grants end on
+  transfer. This is the key-change path (§2).
   - Grants the old key **received** do not move: the recipient of a bulk
     transfer need not be the same person, and moving them would give it
     rights their grantors never gave. Grantors grant the new key again.
@@ -527,7 +556,7 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
     comes first. After that not even the root can seed. In every other group
     seeding is never open.
   - It also seeds `chronolog_collectives`, `chronolog_collective_members`,
-    `chronolog_grants` and `chronolog_transfers` verbatim, except the `group`
+    `chronolog_grants`, `chronolog_transfers` and `chronolog_transfer_scope` verbatim, except the `group`
     collective, which the fork's root administers.
   - App triggers are created after the rows are seeded, as fork-seed already
     orders views and triggers after data.
@@ -544,21 +573,26 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
 - **RPC, client and React** gain typed builders for platform operations.
   Reads are unchanged.
 
-## 8. Out of scope: confidentiality between nodes
+## 8. Confidentiality between nodes
 
-Hiding an owned row from another reader node requires encrypting it to its
-audience. Two candidate approaches:
+[Sealed data](sealed-data.md) adds explicit reader policies to owned rows and
+client-encrypted BLOB columns. The row owner or owning collective's admin
+controls the reader policy; ordinary row/column permissions still control
+writes. Ownership never implicitly grants decryption. Policies snapshot
+reader encryption keys, and each new value has a fresh key wrapped to exactly
+that policy's readers.
 
-- per-collective subgroups with their own epochs;
-- sealed columns, which are opaque to SQL.
-
-Either needs a separate design if it is ever wanted.
+SQL sees ciphertext and public policy metadata. There is no SELECT filtering
+or SQL evaluation over the encrypted plaintext. Reader removal affects
+future values, not previously disclosed values or replicated candidate wraps.
+The sealed-data guide specifies policy generations, finality preflight,
+concurrent changes, and cross-group fork limits.
 
 ## 9. Differences from Namlu
 
 | Namlu | Here | Why |
 | --- | --- | --- |
-| Reads filtered by RLS | No read policies | Every node holds every row (§0) |
+| Reads filtered by RLS | Explicit encrypted-reader policies for sealed columns; no SELECT filtering | Every node holds every row's public fields and ciphertext (§8) |
 | `USING`-filtered `UPDATE`/`DELETE` (silent skip) | Abort on any non-writable target row | No silent skips (Namlu should follow, keeping invisible rows excluded) |
 | No app triggers; restrictive policies and declarative integrity | App triggers by schema admins, minus `RAISE(IGNORE)` | Every write is checked as the signer, so triggers can only narrow |
 | Owner floor | None | Narrowing by schema admins is accepted |
@@ -939,3 +973,21 @@ changed.
   moves the registration, grants and open offers. Fork-seed plan
   `chronolog-fork-seed-v5` (no registration steps); platform code version
   bumped. §3, §4, §6 and Step 4 changed.
+
+
+### Authorization hardening profile
+
+The `rk1` keys, exact-value comparisons, transaction-id function, lifecycle
+triggers and snapshot-bound offers change consensus execution. They bump the
+native engine descriptor and platform code version. Existing materializations
+with the former manifest must not be mixed with this profile; use a coordinated
+new genesis/replay or an explicit migration design rather than editing live
+platform tables. Historical spike notes above describe the earlier quoted-key
+implementation, not the current key format.
+
+Dependent discovery uses the parent foreign-key column's affinity and collation,
+with NULL child components excluded. Some mixed-affinity SQLite cascades can
+attempt to update rows outside that reference set (for example parent TEXT
+`'01'` and child INTEGER `1`). Such a transfer rejects and rolls back; platform
+exemptions are never widened to accommodate the engine's broader cascade. Use
+matching parent/child key affinities for predictable owner-cascade transfers.

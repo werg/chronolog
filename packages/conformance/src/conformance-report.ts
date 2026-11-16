@@ -167,7 +167,7 @@ async function runReplayFixture(
       const bootstrap = await transaction(1n, 'bootstrap', [
         sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
         sqlStatement('INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200)'),
-        sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY, now TEXT NOT NULL, r INTEGER NOT NULL)'),
+        sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY NOT NULL, now TEXT NOT NULL, r INTEGER NOT NULL)'),
       ], digest)
       const predecessor = await transaction(10n, 'predecessor', updateProgram(100n, 5n), digest)
       const later = await transaction(20n, 'later', updateProgram(100n, 90n), digest)

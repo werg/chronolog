@@ -94,6 +94,16 @@ export function buildForkSeedPlan(
   source: ReadableDatabase,
   origin: { readonly sourceGroupId: string; readonly snapshotManifestSha256: string; readonly sourceRevision: bigint },
 ): ForkSeedPlan {
+  // Sealed envelopes authenticate their source group and reader-policy
+  // generation. Relabeling those bytes as a new group cannot preserve that
+  // binding, and copying only application rows would lose the policy state.
+  // Refuse active and closed generations until an explicit reader-authorized
+  // re-encryption workflow exists. Same-group snapshot restore is unaffected.
+  const hasReaderPolicies = query(source, `SELECT 1 FROM sqlite_schema
+    WHERE type = 'table' AND name = 'chronolog_reader_policies' COLLATE NOCASE`).length > 0
+  if (hasReaderPolicies && query(source, 'SELECT 1 FROM chronolog_reader_policies LIMIT 1').length > 0) {
+    throw new Error('SEALED_DATA_REQUIRES_EXPLICIT_REENCRYPTION')
+  }
   const objects = applicationSchema(source)
   const tables = objects.filter((object) => object.type === 'table').map((object) => tableShape(source, object.name))
   const ordered = insertionOrder(tables)

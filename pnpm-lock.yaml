@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@dolthub/doltlite@0.11.29':
-    hash: b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a
+    hash: 5eab7980053e68d3e6749d6011cc145d361649d678b1823735c00ac1a96e5fa2
     path: patches/@dolthub__doltlite@0.11.29.patch
 
 importers:
@@ -16,6 +16,9 @@ importers:
       '@chronolog/client':
         specifier: workspace:*
         version: link:packages/client
+      '@chronolog/crypto':
+        specifier: workspace:*
+        version: link:packages/crypto
       '@chronolog/materializer-doltlite':
         specifier: workspace:*
         version: link:packages/materializer-doltlite
@@ -112,7 +115,7 @@ importers:
     devDependencies:
       '@dolthub/doltlite':
         specifier: 0.11.29
-        version: 0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)
+        version: 0.11.29(patch_hash=5eab7980053e68d3e6749d6011cc145d361649d678b1823735c00ac1a96e5fa2)
 
   apps/distribution:
     dependencies:
@@ -169,6 +172,9 @@ importers:
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
+      '@chronolog/crypto':
+        specifier: workspace:*
+        version: link:../crypto
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
@@ -186,7 +192,7 @@ importers:
         version: link:../protocol
       '@dolthub/doltlite':
         specifier: 0.11.29
-        version: 0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)
+        version: 0.11.29(patch_hash=5eab7980053e68d3e6749d6011cc145d361649d678b1823735c00ac1a96e5fa2)
 
   packages/control-store:
     dependencies:
@@ -222,7 +228,11 @@ importers:
         version: link:../protocol
       '@dolthub/doltlite':
         specifier: 0.11.29
-        version: 0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)
+        version: 0.11.29(patch_hash=5eab7980053e68d3e6749d6011cc145d361649d678b1823735c00ac1a96e5fa2)
+    devDependencies:
+      '@chronolog/crypto':
+        specifier: workspace:*
+        version: link:../crypto
 
   packages/node-core:
     dependencies:
@@ -2608,7 +2618,7 @@ snapshots:
 
   '@bcoe/v8-coverage@1.0.2': {}
 
-  '@dolthub/doltlite@0.11.29(patch_hash=b6fc1c59f402e3f6993c7528a1928013a07f5f95b3cc914d40087c39488cdf9a)':
+  '@dolthub/doltlite@0.11.29(patch_hash=5eab7980053e68d3e6749d6011cc145d361649d678b1823735c00ac1a96e5fa2)':
     dependencies:
       node-addon-api: 8.9.0
 

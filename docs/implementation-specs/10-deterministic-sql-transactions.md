@@ -196,8 +196,19 @@ by platform operations. A statement that would touch any row the signer may
 not write aborts the transaction; rows are never skipped. `INSERT OR IGNORE`
 and `ON CONFLICT DO NOTHING` remain explicit conflict handling.
 
-A row's identity for grants and transfers is
-`quote(pk1) || ',' || quote(pk2) …` over its primary key.
+A row's identity for grants, transfers and reader policies is the native
+`chronolog_row_key(pk1, pk2, …)` typed binary tuple, exposed as `rk1:` plus
+lowercase hex. It encodes the tuple length, each storage-class tag, exact
+integer/IEEE-754 value or length-prefixed TEXT/BLOB bytes. An owner component
+uses its stable 32-byte key instead of the replica's principal id. Nullable
+primary-key columns are refused (the `INTEGER PRIMARY KEY` rowid alias is
+implicitly non-null). Column caps use `chronolog_value_equal`, comparing exact
+storage types and values independently of collation or numeric coercion.
+
+The UPDATE/DELETE kernel invalidates row grants and impacted offers before a
+replacement row can be observed by application triggers. An AFTER INSERT
+lifecycle trigger invalidates bulk offers whose captured set has grown.
+Table-wide grants retain their explicit meaning over future grantor-owned rows.
 
 Generated lookup views, readable by any SQL: `chronolog_my_owner_ids_insert`,
 `_update`, `_delete` (the signer plus the collectives it may act for) and
@@ -211,7 +222,7 @@ cancelling their offers), regenerates platform triggers whose table's columns
 changed, and rejects the transaction when:
 
 - a new table cannot be owner-checked: `platform:no_primary_key`,
-  `platform:table_not_empty`, `platform:owner_column_invalid`, or
+  `platform:nullable_primary_key`, `platform:table_not_empty`, `platform:owner_column_invalid`, or
   `platform:foreign_owner` for rows the signer could not have inserted.
   Virtual tables, their shadow tables and sqlite-vec's
   `<table>_vector_chunksNN` tables are not registered. Virtual tables and chunk tables carry no owner checks, so app SQL
@@ -237,8 +248,13 @@ trigger they fire is checked as the signer.
 Platform tables (readable by transactions, written only by platform
 operations): `chronolog_platform` (root administrator, seeding window),
 `chronolog_tables`, `chronolog_collectives`, `chronolog_collective_members`,
-`chronolog_grants`, `chronolog_transfers`, and `chronolog_exemptions` (empty
-between steps).
+`chronolog_grants`, `chronolog_transfers`, `chronolog_transfer_scope`,
+`chronolog_reader_keys`, `chronolog_reader_policies`,
+`chronolog_policy_readers`, and `chronolog_sealed_values`.
+`chronolog_exemptions` and `chronolog_sealed_write_exemptions` are empty
+between steps. Exact generated lifecycle triggers also have column-scoped
+permission to invalidate grants/offers and close or migrate policy bindings;
+application triggers never inherit that metadata privilege.
 
 | Operation | Authority and effect | Refusals (`platform:…`) |
 | --- | --- | --- |
@@ -248,13 +264,26 @@ between steps).
 | `AcceptMembership` | The invitee. | `not_invited` |
 | `Leave` | A member or invitee; a collective keeps at least one active admin. | `not_member`, `last_admin` |
 | `SetMembers` | An active admin. New keys are invited and join by accepting; existing members change role or are removed. | `no_such_collective`, `not_collective_admin`, `not_member`, `last_admin` |
-| `TransferOffer` | The owner (or an admin of an owner collective). `all` covers every row the owner holds in every registered table. | `unregistered_table`, `no_such_row`, `not_owner`, `invalid_transfer` |
-| `TransferAccept` | The recipient (or an admin of a recipient collective). Moves the row and, with `carry`, its same-owner dependents through owner-composite FKs; a row offer revokes the row's grants. `all` moves rows parent tables first and re-points the old owner's grants. | `no_such_offer`, `offer_closed`, `not_recipient`, `offer_stale`, `has_dependents`, `fk_cycle` |
+| `TransferOffer` | The owner (or an admin of an owner collective). Captures exact rows, dependents, content/schema and reader-policy state. `all` snapshots every currently owned row. | `unregistered_table`, `no_such_row`, `not_owner`, `invalid_transfer` |
+| `TransferAccept` | The recipient (or an admin of a recipient collective). Requires the captured state still to match. Moves only the captured rows, revokes row grants and closes competing offers; `all` moves parent tables first and re-points whole-table grants. | `no_such_offer`, `offer_closed`, `not_recipient`, `offer_stale`, `has_dependents`, `fk_cycle` |
+| `TransferCancel` | The sender or recipient, or an administrator of either owning collective. Closes an open offer permanently. | `no_such_offer`, `offer_closed`, `not_owner` |
+| `RegisterReaderKey` | The signer registers/replaces its own public X25519 key. Existing reader-policy snapshots do not change. | Normal writer admission applies |
+| `ReaderPolicy` | The row owner or owning collective's admin creates or replaces the explicit reader list with generation/version CAS; keys must already be registered. | `not_owner`, `no_such_row`, `reader_key_missing`, `reader_policy_stale`, `reader_policy_version_exhausted` |
+| `SealedPut` | Ordinary row/column update authority; policy/data CAS, exact recipient/key set and authenticated group/policy/column/version context. Writes an actual mutable BLOB column and verifies the result after app triggers. | `reader_policy_closed`, `reader_policy_stale`, `sealed_value_stale`, `sealed_column_invalid`, `sealed_context_mismatch`, `sealed_readers_mismatch`, `sealed_no_readers`, `sealed_write_changed`, `sealed_value_version_exhausted`, plus ordinary row/app-trigger rejections |
 | `SeedRows` | The genesis root administrator of a fork (a genesis with `forkedFrom`), before the first accepted transaction by any other author; never in other groups. Writes rows with their owners verbatim, without app triggers; also seeds `chronolog_collectives`, `_collective_members`, `_grants` and `_transfers` (never the `group` collective). | `not_root`, `seed_closed`, `unregistered_table`, `unknown_column`, `invalid_seed` |
 
 The `group` collective (all-zero id) exists from genesis with the root
 administrator as its admin and admin-only governance. Its active admins are
 the schema administrators.
+
+Sealed operation codes are 64–66; ownership codes retain their positions and
+`TransferCancel` appends code 10. Reader-policy and value versions are positive
+signed-int64 values. Policy IDs derive from the creating transaction ID and
+step index. DELETE/rekey closes a policy generation; an ownership-only transfer
+preserves its ID and explicit readers, including when the owner is part of the
+PK. Table rename moves the binding; removing/renaming a sealed column closes its
+generation. The [sealed-data contract](../sealed-data.md) specifies encryption,
+client finality preflight and the limits of revocation after disclosure.
 
 ## 8. Transaction log
 

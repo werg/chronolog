@@ -1,6 +1,9 @@
+import { decodeRowKey, type RowKeyPart } from '@chronolog/protocol'
+
 import { OWNER_COLUMN, POLICY_VIOLATION_FUNCTION } from '../sql-profile.js'
 import type { DatabaseLike } from '../types.js'
 import { grantsToMeView, ownerIdsView, type OwnerOperation } from './schema.js'
+import { closeReaderPolicySql, sealedWriteGuard } from './sealed.js'
 
 /** The declaration every registered table's owner column must have. */
 export const OWNER_COLUMN_TYPE = 'INTEGER'
@@ -31,6 +34,8 @@ export interface TableShape {
   readonly columns: readonly ColumnShape[]
   readonly primaryKey: readonly string[]
   readonly foreignKeys: readonly ForeignKeyShape[]
+  /** SQLite's INTEGER PRIMARY KEY alias; its implicit NOT NULL is not in table_xinfo. */
+  readonly rowidPrimaryKey?: string
 }
 
 export function quoteIdentifier(name: string): string {
@@ -76,7 +81,10 @@ export function tableShape(database: DatabaseLike, name: string): TableShape {
     entry.to.push(typeof row.to === 'string' ? row.to : null)
     grouped.set(id, entry)
   }
-  return { name, columns, primaryKey, foreignKeys: [...grouped.values()] }
+  const singleIntegerKey = primaryKey.length === 1 && columns.find((column) => column.name === primaryKey[0])?.type.toUpperCase() === 'INTEGER'
+  const rowidPrimaryKey = singleIntegerKey && !rows(database, 'SELECT origin FROM pragma_index_list(?)', name).some((row) => row.origin === 'pk')
+    ? primaryKey[0] : undefined
+  return { name, columns, primaryKey, foreignKeys: [...grouped.values()], ...(rowidPrimaryKey === undefined ? {} : { rowidPrimaryKey }) }
 }
 
 export function ownerColumn(shape: TableShape): ColumnShape | undefined {
@@ -122,53 +130,52 @@ export function foreignKeyViolation(shape: TableShape): string | null {
   return null
 }
 
+/** Every row must have one unambiguous, non-NULL primary-key tuple. */
+export function hasNonNullPrimaryKey(shape: TableShape): boolean {
+  return shape.primaryKey.length > 0 && shape.primaryKey.length <= 64 && shape.primaryKey.every((name) =>
+    shape.rowidPrimaryKey === name || shape.columns.find((column) => column.name === name)?.notNull === true)
+}
+
 /**
- * A row's identity for grants and transfers: its primary-key values as SQL
- * literals, comma-separated. quote() makes the text unambiguous.
+ * Lossless typed primary-key tuple. Owner components use stable owner keys,
+ * never this materializer's principal ids, so fork remapping preserves keys.
  */
 export function rowKeyExpression(alias: string, primaryKey: readonly string[]): string {
-  return primaryKey.map((column) => `quote(${alias}.${quoteIdentifier(column)})`).join(` || ',' || `)
+  return `chronolog_row_key(${primaryKey.map((column) => column.toLowerCase() === OWNER_COLUMN
+    ? `(SELECT key FROM chronolog_principals WHERE id = ${alias}.${quoteIdentifier(column)})`
+    : `${alias}.${quoteIdentifier(column)}`).join(', ')})`
 }
 
-/**
- * The primary-key values of a row key (`quote()` literals joined by commas),
- * for indexed lookups. Throws on anything quote() does not produce. Callers
- * still compare the row key itself, so a lossy REAL literal cannot match a
- * different row.
- */
-export function parseRowKey(key: string): unknown[] {
-  const values: unknown[] = []
-  let rest = key
-  for (;;) {
-    let match: RegExpExecArray | null
-    if ((match = /^NULL/u.exec(rest)) !== null) values.push(null)
-    else if ((match = /^'((?:[^']|'')*)'/u.exec(rest)) !== null) values.push(match[1]!.replaceAll("''", "'"))
-    else if ((match = /^X'([0-9A-Fa-f]*)'/u.exec(rest)) !== null) values.push(Buffer.from(match[1]!, 'hex'))
-    else if ((match = /^-?\d+(?![.eE\d])/u.exec(rest)) !== null) values.push(BigInt(match[0]))
-    else if ((match = /^-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|Inf)/u.exec(rest)) !== null) values.push(Float64Array.of(Number(match[0].replace('Inf', 'Infinity'))))
-    else throw new Error('MATERIALIZER_ROW_KEY_INVALID')
-    rest = rest.slice(match[0].length)
-    if (rest === '') return values
-    if (!rest.startsWith(',')) throw new Error('MATERIALIZER_ROW_KEY_INVALID')
-    rest = rest.slice(1)
-  }
+/** Decode raw storage values; TEXT remains bytes, including embedded NUL/invalid UTF-8. */
+export function parseRowKey(key: string): readonly RowKeyPart[] {
+  try { return decodeRowKey(key) } catch { throw new Error('MATERIALIZER_ROW_KEY_INVALID') }
 }
 
-/** `WHERE` text matching one row by its row key, using the primary-key index; bind `rowKeyBindings(key)`. */
+/** Indexed tuple lookup plus an exact typed-key check independent of collation. */
 export function rowKeyFilter(alias: string, primaryKey: readonly string[]): string {
-  return `${primaryKey.map((column) => `${alias}.${quoteIdentifier(column)} IS ?`).join(' AND ')} AND ${rowKeyExpression(alias, primaryKey)} = ?`
+  const columns = primaryKey.map((column) => {
+    const value = 'CASE WHEN ? THEN CAST(? AS TEXT) ELSE ? END'
+    return `${alias}.${quoteIdentifier(column)} IS ${column.toLowerCase() === OWNER_COLUMN
+      ? `(SELECT id FROM chronolog_principals WHERE key = (${value}))` : `(${value})`}`
+  })
+  return `${columns.join(' AND ')} AND ${rowKeyExpression(alias, primaryKey)} = ?`
 }
 
 export function rowKeyBindings(key: string, primaryKey: readonly string[]): unknown[] {
   const values = parseRowKey(key)
   if (values.length !== primaryKey.length) throw new Error('MATERIALIZER_ROW_KEY_INVALID')
-  return [...values, key]
+  return [...values.flatMap((part) => {
+    const value = part.kind === 'null' ? null : part.kind === 'real' ? Float64Array.of(part.value)
+      : part.kind === 'text' || part.kind === 'blob' ? Buffer.from(part.value) : part.value
+    return [part.kind === 'text' ? 1 : 0, value, value]
+  }), key]
 }
 
-export type TriggerEvent = 'ins' | 'upd' | 'del'
+export type TriggerEvent = 'ins' | 'upd' | 'del' | 'life_ins'
+export const PLATFORM_TRIGGER_EVENTS: readonly TriggerEvent[] = ['ins', 'upd', 'del', 'life_ins']
 
 export function platformTriggerName(table: string, event: TriggerEvent): string {
-  return `chronolog_k_${table}_${event}`
+  return event.startsWith('life_') ? `chronolog_l_${table}_${event.slice(5)}` : `chronolog_k_${table}_${event}`
 }
 
 export interface PlatformTrigger {
@@ -182,6 +189,7 @@ export function platformTriggers(shape: TableShape): readonly PlatformTrigger[] 
   const tableText = quoteText(table)
   const owner = quoteIdentifier(OWNER_COLUMN)
   const oldKey = rowKeyExpression('OLD', shape.primaryKey)
+  const newKey = rowKeyExpression('NEW', shape.primaryKey)
   const violation = (command: string): string => `SELECT ${POLICY_VIOLATION_FUNCTION}(${tableText}, '${command}')`
   const header = (event: TriggerEvent, timing: string): string =>
     `CREATE TRIGGER ${quoteIdentifier(platformTriggerName(table, event))} BEFORE ${timing} ON ${quoteIdentifier(table)} FOR EACH ROW BEGIN`
@@ -189,7 +197,7 @@ export function platformTriggers(shape: TableShape): readonly PlatformTrigger[] 
   const changed = capColumns.length === 0
     ? '0'
     : `EXISTS (SELECT 1 FROM (VALUES ${capColumns.map((column) =>
-      `(${quoteText(column.name)}, OLD.${quoteIdentifier(column.name)} IS NOT NEW.${quoteIdentifier(column.name)})`).join(', ')}) ` +
+      `(${quoteText(column.name)}, NOT chronolog_value_equal(OLD.${quoteIdentifier(column.name)}, NEW.${quoteIdentifier(column.name)}))`).join(', ')}) ` +
       `WHERE column2 AND column1 NOT IN (SELECT value FROM json_each(g.columns)))`
 
   // Each trigger is a CASE chain: SQLite evaluates the WHEN arms in order and
@@ -225,9 +233,35 @@ END`
       AND (g.row_key IS NULL OR g.row_key = ${oldKey})) THEN 0
     ELSE 1 END;
 END`
+  // Invalidate before a DELETE/key/owner change can expose a replacement row
+  // to application AFTER triggers. Only these exact generated callers have
+  // column-scoped metadata privileges; application triggers never inherit them.
+  const ownerKey = (alias: string): string => `(SELECT key FROM chronolog_principals WHERE id = ${alias}.${owner})`
+  const revoke = `UPDATE chronolog_grants SET revoked_tx = chronolog_transaction_id()
+    WHERE tbl = ${tableText} AND row_key = ${oldKey} AND revoked_tx IS NULL;`
+  const cancel = (existing: boolean, next: boolean, condition = '1'): string => `UPDATE chronolog_transfers
+    SET state = 'cancelled', closed_tx = chronolog_transaction_id() WHERE state = 'open' AND (
+      ${existing ? `offer_id IN (SELECT offer_id FROM chronolog_transfer_scope WHERE tbl = ${tableText} AND row_key = ${oldKey}) OR` : ''}
+      (tbl IS NULL AND from_owner IN (${[...(existing ? [ownerKey('OLD')] : []), ...(next ? [ownerKey('NEW')] : [])].join(', ')}))) AND (${condition});`
+  const anyChange = `EXISTS (SELECT 1 FROM (VALUES ${shape.columns.filter((column) => column.hidden === 0).map((column) =>
+    `(NOT chronolog_value_equal(OLD.${quoteIdentifier(column.name)}, NEW.${quoteIdentifier(column.name)}))`).join(', ')}) WHERE column1)`
+  // A transfer may change an owner component of the PK without creating a
+  // new row generation. Preserve its policy ID and explicit reader list.
+  const ownershipOnly = `OLD.${owner} IS NOT NEW.${owner}${shape.primaryKey.filter((column) => column.toLowerCase() !== OWNER_COLUMN)
+    .map((column) => ` AND chronolog_value_equal(OLD.${quoteIdentifier(column)}, NEW.${quoteIdentifier(column)})`).join('')}`
+  const movePolicy = `UPDATE chronolog_reader_policies SET row_key = ${newKey}
+    WHERE tbl = ${tableText} AND row_key = ${oldKey} AND closed_tx IS NULL AND (${oldKey} <> ${newKey}) AND (${ownershipOnly});`
+  const updatePolicy = `${closeReaderPolicySql(table, oldKey, `${oldKey} <> ${newKey} AND NOT (${ownershipOnly})`)}\n    ${movePolicy}`
+  const lifecycle = (event: TriggerEvent, timing: string, when: string, body: string): PlatformTrigger => ({
+    name: platformTriggerName(table, event),
+    sql: `CREATE TRIGGER ${quoteIdentifier(platformTriggerName(table, event))} AFTER ${timing} ON ${quoteIdentifier(table)} FOR EACH ROW WHEN ${when} BEGIN
+    ${body}
+END`,
+  })
   return [
     { name: platformTriggerName(table, 'ins'), sql: insert },
-    { name: platformTriggerName(table, 'upd'), sql: update },
-    { name: platformTriggerName(table, 'del'), sql: remove },
+    { name: platformTriggerName(table, 'upd'), sql: update.replace('\nEND', `\n    ${sealedWriteGuard(shape, oldKey)}\n    ${updatePolicy}\n    ${revoke.replace(' AND revoked_tx IS NULL;', ` AND revoked_tx IS NULL AND (${oldKey} <> ${newKey} OR OLD.${owner} IS NOT NEW.${owner});`)}\n    ${cancel(true, true, anyChange)}\nEND`) },
+    { name: platformTriggerName(table, 'del'), sql: remove.replace('\nEND', `\n    ${closeReaderPolicySql(table, oldKey)}\n    ${revoke}\n    ${cancel(true, false)}\nEND`) },
+    lifecycle('life_ins', 'INSERT', `NOT EXISTS (SELECT 1 FROM chronolog_exemptions WHERE kind = 'seed' AND tbl = ${tableText})`, cancel(false, true)),
   ]
 }
