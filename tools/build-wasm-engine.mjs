@@ -71,6 +71,8 @@ if (settings.length !== 12) throw new Error('WASM_SECURITY_SOURCE_ANCHOR_MISSING
 const security = settings.map((match) => `  { int applied = -1; int rc = sqlite3_db_config(db, ${match[1]}, ${match[2]}, &applied); if(rc != SQLITE_OK || applied != ${match[2]}) return rc == SQLITE_OK ? SQLITE_ERROR : rc; }`).join('\n')
 const shim = `#include "sqlite3.h"
 #include <emscripten/emscripten.h>
+#include <cstdint>
+#include <limits>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -112,8 +114,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE int chronolog_wasm_security(sqlite3* db) {
 ${security}
   return sqlite3_extended_result_codes(db, 1);
 }
-extern "C" EMSCRIPTEN_KEEPALIVE void chronolog_wasm_context(sqlite3* db, sqlite3_int64 time, unsigned seed, const unsigned char* actor, int length, int hasActorId, sqlite3_int64 actorId) {
-  chronologSetDeterministicContext(time, seed, actor, length, hasActorId, actorId);
+extern "C" EMSCRIPTEN_KEEPALIVE void chronolog_wasm_context(sqlite3* db, sqlite3_int64 time, unsigned seed, const unsigned char* actor, int length, int hasActorId, sqlite3_int64 actorId, const unsigned char* transactionId, int transactionIdLength) {
+  chronologSetDeterministicContext(time, seed, actor, length, hasActorId, actorId, transactionId, transactionIdLength);
   sqlite3_set_last_insert_rowid(db, 0);
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void chronolog_wasm_clear(void) { chronologClearDeterministicContext(); }

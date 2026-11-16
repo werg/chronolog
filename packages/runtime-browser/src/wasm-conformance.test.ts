@@ -6,10 +6,11 @@ import { pathToFileURL } from 'node:url'
 
 import { DeterministicMaterializer as NativeMaterializer, createDoltLiteExecutionManifest } from '@chronolog/materializer-doltlite'
 import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/browser'
-import { emit, sqlStatement, sqlValue } from '@chronolog/protocol'
+import { emit, encodeRowKey, encodeSealedEnvelope, platformObjectId, sealedOp, sqlStatement, sqlValue, utf8 } from '@chronolog/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { admitted, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
+import { generateX25519KeyPair, sealSealedValue } from '../../crypto/src/index.js'
 import { openDatabase as openNativeDatabase } from '../../materializer-doltlite/src/driver.js'
 import { CONSENSUS_DENIED_FUNCTIONS } from '../../materializer-doltlite/src/sql-profile.js'
 import { createWasmEngineFactory, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
@@ -52,7 +53,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       const setup = await admitted(1n, 'setup', [
         'CREATE TABLE balances (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)',
         'INSERT INTO balances (id, balance) VALUES (1, 10)',
-        'CREATE TABLE probes (id INTEGER PRIMARY KEY, now TEXT, local TEXT, random INTEGER, blob BLOB, real REAL, integer INTEGER, empty BLOB, last_rowid INTEGER, changed INTEGER, vector_distance REAL)',
+        'CREATE TABLE probes (id INTEGER PRIMARY KEY, now TEXT, local TEXT, random INTEGER, blob BLOB, real REAL, integer INTEGER, empty BLOB, last_rowid INTEGER, changed INTEGER, vector_distance REAL, transaction_id BLOB)',
       ], digest)
       const late = await admitted(3n, 'late', ['UPDATE balances SET balance = balance + 100 WHERE id = 1'], digest)
       const spend = await admitted(5n, 'spend', [
@@ -60,7 +61,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         'UPDATE balances SET balance=balance-50 WHERE id=1',
       ], digest)
       const probe = await admitted(1_700_000_000_000n, 'probe', [sqlStatement(
-        "INSERT INTO probes (id,now,local,random,blob,real,integer,empty,last_rowid,changed,vector_distance) VALUES (1,datetime('now'),datetime('now','localtime'),random(),randomblob(12),?,?,?,last_insert_rowid(),changes(),vec_distance_L2('[1.2,3.4]','[5.6,7.8]'))",
+        "INSERT INTO probes (id,now,local,random,blob,real,integer,empty,last_rowid,changed,vector_distance,transaction_id) VALUES (1,datetime('now'),datetime('now','localtime'),random(),randomblob(12),?,?,?,last_insert_rowid(),changes(),vec_distance_L2('[1.2,3.4]','[5.6,7.8]'),chronolog_transaction_id())",
         [sqlValue.real(1), 9_223_372_036_854_775_807n, new Uint8Array()],
       )], digest)
       for (const history of [[setup, spend, probe], [setup, late, spend, probe]]) {
@@ -69,9 +70,11 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         expect(w?.outcomeChanges).toEqual(n?.outcomeChanges)
         expect(browser.transactionLog()).toEqual(native.transactionLog())
         expect(browser.databaseContentHash).toBe(native.databaseContentHash)
-        for (const query of ['SELECT * FROM balances', 'SELECT id,now,local,random,hex(blob),typeof(real),integer,typeof(empty),length(empty),last_rowid,changed,vector_distance FROM probes']) {
+        for (const query of ['SELECT * FROM balances', 'SELECT id,now,local,random,hex(blob),typeof(real),integer,typeof(empty),length(empty),last_rowid,changed,vector_distance,hex(transaction_id) FROM probes']) {
           expect(browser.localSql(query).rows).toEqual(native.localSql(query).rows)
         }
+        expect(browser.localSql('SELECT hex(transaction_id) FROM probes').rows)
+          .toEqual([[{ kind: 'text', value: Buffer.from(probe.txId).toString('hex').toUpperCase() }]])
       }
       const hash = browser.databaseContentHash
       browser.close()
@@ -163,6 +166,91 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       const n = native.prepare(sql); const w = browser.prepare(sql)
       try { expect(w.get(...vectors, ...vectors)).toEqual(n.get(...vectors, ...vectors)) }
       finally { n.finalize?.(); w.finalize?.() }
+    } finally { native.close(); browser.close() }
+  })
+
+  it('preserves exact row keys, storage-class comparisons and transaction context across engines', () => {
+    const native = openNativeDatabase({ path: join(nativeDirectory, 'row-keys.db') }).database
+    const browser = factory({ path: '/row-keys.db' }).database
+    try {
+      for (const database of [native, browser]) {
+        const key = database.prepare('SELECT chronolog_row_key(?) AS value')
+        try {
+          for (const value of [null, -(1n << 63n), (1n << 63n) - 1n, 'a\0one', 'a\0two', Uint8Array.of(97, 0, 255),
+            sqlValue.real(1.5), sqlValue.real(1.5000000000000002)]) {
+            const input = value !== null && typeof value === 'object' && 'kind' in value && value.kind === 'real'
+              ? Float64Array.of(value.value) : value
+            expect(key.get(input)).toEqual({ value: encodeRowKey([value]) })
+          }
+        } finally { key.finalize?.() }
+        const exact = database.prepare("SELECT chronolog_value_equal('a' COLLATE NOCASE, 'A') AS collation, chronolog_value_equal(1, 1.0) AS numeric, chronolog_value_equal(x'31', '1') AS storage, chronolog_value_equal(NULL, NULL) AS nil")
+        try { expect(exact.get()).toEqual({ collation: 0, numeric: 0, storage: 0, nil: 1 }) }
+        finally { exact.finalize?.() }
+        const transaction = database.prepare('SELECT hex(chronolog_transaction_id()) AS id')
+        try {
+          const bytes = Uint8Array.of(99, 0, 255, 1, 99).subarray(1, 4)
+          database.setDeterministicContext(1n, 7, null, null, bytes)
+          expect(transaction.get()).toEqual({ id: '00FF01' })
+          database.clearDeterministicContext()
+          expect(transaction.get()).toEqual({ id: '' })
+          expect(() => database.setDeterministicContext(1n, 7, null, null, new Uint8Array())).toThrow()
+        } finally { database.clearDeterministicContext(); transaction.finalize?.() }
+      }
+    } finally { native.close(); browser.close() }
+  })
+
+  it('enforces sealed writes and closes a deleted row policy identically across engines', async () => {
+    const executionManifest = createDoltLiteExecutionManifest()
+    const options = { executionManifest, rootAdministrator: ROOT_KEY }
+    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'sealed-lifecycle.db') })
+    const browser = await DeterministicMaterializer.open({ ...options, path: '/sealed-lifecycle.db', openDatabase: factory })
+    try {
+      const digest = native.executionManifestDigest
+      const reader = await generateX25519KeyPair()
+      const rowKey = Uint8Array.of(0, 255, 1)
+      const setup = await admitted(1n, 'sealed-schema', [
+        'CREATE TABLE sealed_docs (id BLOB NOT NULL PRIMARY KEY, body BLOB) STRICT',
+        sqlStatement('INSERT INTO sealed_docs (id) VALUES (?)', [rowKey]), sealedOp.registerReaderKey(reader.publicKeyBytes),
+      ], digest)
+      const policy = await admitted(2n, 'sealed-policy', [sealedOp.readerPolicy({
+        table: 'sealed_docs', rowKey: [rowKey], expectedVersion: 0n, readers: [ROOT_KEY],
+      })], digest)
+      const policyId = await platformObjectId(policy.txId, 0)
+      const envelopes = await Promise.all([1n, 2n].map(dataVersion => sealSealedValue({
+        context: { groupId: setup.core.groupId, policyId, policyVersion: 1n, slot: 'body', dataVersion },
+        plaintext: utf8('sealed body'), recipients: [{ readerId: ROOT_KEY, publicKey: reader.publicKeyBytes }],
+      })))
+      const write = await admitted(3n, 'sealed-write', [sealedOp.put({ policyId, expectedPolicyVersion: 1n,
+        expectedDataVersion: 0n, slot: 'body', envelope: envelopes[0]!,
+      })], digest)
+      const overwrite = await admitted(4n, 'sealed-overwrite', ["UPDATE sealed_docs SET body = x'00'"], digest)
+      const recreate = await admitted(5n, 'sealed-recreate', [
+        'DELETE FROM sealed_docs', sqlStatement('INSERT INTO sealed_docs (id) VALUES (?)', [rowKey]),
+      ], digest)
+      const stale = await admitted(6n, 'sealed-closed', [sealedOp.put({ policyId, expectedPolicyVersion: 1n,
+        expectedDataVersion: 1n, slot: 'body', envelope: envelopes[1]!,
+      })], digest)
+      const history: typeof setup[] = []
+      for (const [transaction, rejection] of [[setup, null], [policy, null], [write, null],
+        [overwrite, 'policy:sealed_docs:update'], [recreate, null], [stale, 'platform:reader_policy_closed']] as const) {
+        history.push(transaction)
+        for (const engine of [native, browser]) {
+          await engine.materialize(history)
+          expect(engine.outcome(transaction.txId)?.outcome).toBe(rejection === null ? 'accepted' : 'rejected')
+          expect(engine.outcome(transaction.txId)?.rejectionCode ?? null).toBe(rejection)
+          if (transaction === write || transaction === overwrite) {
+            expect(engine.localSql('SELECT body FROM sealed_docs').rows)
+              .toEqual([[{ kind: 'blob', value: encodeSealedEnvelope(envelopes[0]!) }]])
+          }
+        }
+        expect(browser.transactionLog()).toEqual(native.transactionLog())
+        expect(browser.databaseContentHash).toBe(native.databaseContentHash)
+      }
+      for (const engine of [native, browser]) {
+        expect(engine.localSql('SELECT body FROM sealed_docs').rows).toEqual([[{ kind: 'null' }]])
+        expect(engine.localSql('SELECT hex(closed_tx) FROM chronolog_reader_policies').rows)
+          .toEqual([[{ kind: 'text', value: Buffer.from(recreate.txId).toString('hex').toUpperCase() }]])
+      }
     } finally { native.close(); browser.close() }
   })
 

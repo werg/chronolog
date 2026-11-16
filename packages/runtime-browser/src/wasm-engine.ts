@@ -81,6 +81,9 @@ const SECURITY: NativeSecurityConfiguration = {
   attachCreate: true, attachWrite: true, reverseScanOrder: true, fpDigits: true,
 }
 
+const PATCH_PROFILE = 'authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-' +
+  'deterministic-context-assert-parameters-actor-policy-trigger-lint-actor-id-vec-innocuous-row-key-exact-values-tx-id-v8'
+
 /** Verify the actual module bytes before instantiation; unavailable profiles fail closed. */
 export function verifyWasmBuild(bytes: Uint8Array, manifest: WasmBuildManifest): void {
   if (manifest.format !== 1 || manifest.toolchain !== 'emscripten-4.0.20' || bytes.length !== manifest.wasmBytes ||
@@ -90,7 +93,7 @@ export function verifyWasmBuild(bytes: Uint8Array, manifest: WasmBuildManifest):
     throw new Error('WASM_ENGINE_PORTABILITY_PROFILE_UNSUPPORTED')
   }
   if (manifest.nativeManifest.doltliteVersion !== '0.11.29' || manifest.nativeManifest.sqliteVecVersion !== '0.1.9' ||
-      !manifest.nativeManifest.chronologPatchProfile.endsWith('v7')) throw new Error('WASM_ENGINE_PROFILE_UNSUPPORTED')
+      manifest.nativeManifest.chronologPatchProfile !== PATCH_PROFILE) throw new Error('WASM_ENGINE_PROFILE_UNSUPPORTED')
 }
 
 /** Create a synchronous engine factory after the Worker has loaded its one WASM instance. */
@@ -169,12 +172,20 @@ export class WasmDatabase implements DatabaseLike {
   }
   setLimit(category: number, value: number): number { return this.module.capi.sqlite3_limit(this.pointer, category, value) }
   interrupt(): void { this.module.capi.sqlite3_interrupt(this.pointer) }
-  setDeterministicContext(unixMs: bigint, seed: number, actor: Uint8Array | null = null, actorId: bigint | null = null): void {
+  setDeterministicContext(unixMs: bigint, seed: number, actor: Uint8Array | null = null, actorId: bigint | null = null, transactionId: Uint8Array | null = null): void {
     if (unixMs < 0n || unixMs > 253402300799999n || (actor !== null && (actor.length < 1 || actor.length > 64)) ||
-        (actorId !== null && (actorId < 1n || actorId > (1n << 63n) - 1n))) throw new Error('WASM_DETERMINISTIC_CONTEXT_INVALID')
-    const apply = (pointer: number): void => { this.module.wasm.xCall('chronolog_wasm_context', this.pointer, unixMs, seed >>> 0, pointer, actor?.length ?? 0, actorId === null ? 0 : 1, actorId ?? 0n) }
-    if (actor === null) apply(0)
-    else withBytes(this.module.wasm, actor, apply)
+        (actorId !== null && (actorId < 1n || actorId > (1n << 63n) - 1n)) ||
+        (transactionId !== null && transactionId.length === 0)) throw new Error('WASM_DETERMINISTIC_CONTEXT_INVALID')
+    const withActor = (actorPointer: number): void => {
+      const apply = (transactionPointer: number): void => {
+        this.module.wasm.xCall('chronolog_wasm_context', this.pointer, unixMs, seed >>> 0, actorPointer, actor?.length ?? 0,
+          actorId === null ? 0 : 1, actorId ?? 0n, transactionPointer, transactionId?.length ?? 0)
+      }
+      if (transactionId === null) apply(0)
+      else withBytes(this.module.wasm, transactionId, apply)
+    }
+    if (actor === null) withActor(0)
+    else withBytes(this.module.wasm, actor, withActor)
   }
   clearDeterministicContext(): void { this.module.wasm.xCall('chronolog_wasm_clear') }
   doltCommit(message: string): string { return String(this.scalar("SELECT dolt_commit('-A', '-m', ?)", message)) }
