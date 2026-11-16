@@ -10,6 +10,7 @@ import { openSyncControl } from '../../packages/runtime-browser/src/sync-control
 import type { WorkerEndpoint } from '../../packages/runtime-browser/src/worker-rpc.js'
 import { connectGovernedBrowserPeer } from './event-connection.js'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contract.js'
+import { qualifyStorageQuota } from './storage-quota.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserEventPeer | undefined, identity: EnrollmentIdentity | undefined, operations: AtomicBytesStore | undefined
@@ -25,7 +26,7 @@ const checkpoint = () => new CheckpointStore(operations!, { id: 'browser-project
 
 endpoint.addEventListener('message', (event) => {
   const request = event.data as { fixture?: string; id?: number; name?: string; bootstrap?: BrowserEventBootstrap;
-    cutoff?: string; pause?: 'before' | 'after'; cursor?: string; revision?: string; state?: string; manifest?: string }
+    cutoff?: string; pause?: 'before' | 'after'; cursor?: string; revision?: string; state?: string; manifest?: string; binding?: string }
   if (request.fixture === undefined) return
   const run = async (): Promise<unknown> => {
     switch (request.fixture) {
@@ -35,21 +36,24 @@ endpoint.addEventListener('message', (event) => {
           readerKey: bytesToBase64Url(prepared.reader.publicKeyBytes), transportAuthor: feedIdFromPublicKey(prepared.signing.publicKeyBytes) }
         return value
       }
-      case 'removeManifest':
-      case 'restoreManifest': {
+      case 'removeFeedMetadata':
+      case 'restoreFeedMetadata': {
         const storage = await acquireBrowserStorage(request.name!)
         try {
           const device = await loadEnrollmentIdentity(storage.bytes, 'peer')
-          if (request.fixture === 'restoreManifest') {
+          if (request.fixture === 'restoreFeedMetadata') {
             await storage.bytes.put('feed/manifest', base64UrlToBytes(request.manifest!))
+            await storage.bytes.put('browser/feed-initialized', base64UrlToBytes(request.binding!))
             return null
           }
-          const manifest = await storage.bytes.get('feed/manifest')
-          if (manifest === null) throw new Error('FIXTURE_MANIFEST_MISSING')
-          // Deliberate one-file loss under the real store's exclusive lock.
-          const fileHash = new Uint8Array(await crypto.subtle.digest('SHA-256', utf8('feed/manifest').slice().buffer))
-          await storage.directory.removeEntry(`value-${bytesToHex(fileHash)}`)
-          return { manifest: bytesToBase64Url(manifest), identity: bytesToBase64Url(device.signing.publicKeyBytes) }
+          const manifest = await storage.bytes.get('feed/manifest'), binding = await storage.bytes.get('browser/feed-initialized')
+          if (manifest === null || binding === null) throw new Error('FIXTURE_FEED_METADATA_MISSING')
+          // Lose both feed metadata files while retaining the original signer.
+          for (const key of ['feed/manifest', 'browser/feed-initialized']) {
+            const fileHash = new Uint8Array(await crypto.subtle.digest('SHA-256', utf8(key).slice().buffer))
+            await storage.directory.removeEntry(`value-${bytesToHex(fileHash)}`)
+          }
+          return { manifest: bytesToBase64Url(manifest), binding: bytesToBase64Url(binding), identity: bytesToBase64Url(device.signing.publicKeyBytes) }
         } finally { await storage.close() }
       }
       case 'open': {
@@ -98,6 +102,7 @@ endpoint.addEventListener('message', (event) => {
         const value = await operations!.get(key)
         return value === null ? null : new TextDecoder().decode(value)
       }
+      case 'quota': return qualifyStorageQuota()
       case 'privateCutoff':
       case 'crashCutoff': {
         const root = await navigator.storage.getDirectory()

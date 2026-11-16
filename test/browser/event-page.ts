@@ -3,6 +3,7 @@ import { emit, program, type EventPayload, type EventReadOptions } from '@chrono
 import { WorkerRpcTransport } from '@chronolog/runtime-browser/events'
 
 import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contract.js'
+import type { qualifyStorageQuota } from './storage-quota.js'
 
 class EventPeer {
   readonly worker = new Worker('/event-worker.js', { type: 'module' })
@@ -71,14 +72,14 @@ const api = {
     try { return await peer.command('prepare', { name }) as BrowserEventIdentity }
     finally { peer.worker.terminate() }
   },
-  async removeManifest(name: string) {
+  async removeFeedMetadata(name: string) {
     const peer = new EventPeer()
-    try { return await peer.command('removeManifest', { name }) as { manifest: string; identity: string } }
+    try { return await peer.command('removeFeedMetadata', { name }) as { manifest: string; binding: string; identity: string } }
     finally { peer.worker.terminate() }
   },
-  async restoreManifest(name: string, manifest: string) {
+  async restoreFeedMetadata(name: string, manifest: string, binding: string) {
     const peer = new EventPeer()
-    try { await peer.command('restoreManifest', { name, manifest }) }
+    try { await peer.command('restoreFeedMetadata', { name, manifest, binding }) }
     finally { peer.worker.terminate() }
   },
   async open(id: string, name: string, bootstrap: BrowserEventBootstrap) {
@@ -90,6 +91,7 @@ const api = {
   read(id: string, options: EventReadOptions = {}) { return peers.get(id)!.client.events.read(options) },
   operation(id: string, operationId: string) { return peers.get(id)!.client.operations.get(operationId) },
   privateValue(id: string, value?: string) { return peers.get(id)!.command('privateValue', value === undefined ? {} : { state: value }) },
+  quota(id: string) { return peers.get(id)!.command('quota') as ReturnType<typeof qualifyStorageQuota> },
   async readNext(id: string, options: EventReadOptions) {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 20_000)

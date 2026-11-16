@@ -17,7 +17,7 @@ node --import tsx tools/test-browser-events.ts
 ```
 
 `artifacts/browser-events/report.json` includes the exact browser version,
-assertions, quota method, original/replacement public identities, original and
+assertions, named-bucket quota method, original/replacement public identities, original and
 retried proposal IDs, preserved checkpoint, and the distinction between browser
 storage loss and missing native history. `bundle.json` audits the emitted Worker
 code to establish that this profile loads no SQL/WASM implementation.
@@ -28,14 +28,19 @@ code to establish that this profile loads no SQL/WASM implementation.
 | Durable restart | Terminate the Worker before/after checkpoint publication and after a private cutoff flush. | Each reopened state/cursor pair is atomic; original accepted operations retain their exact proposal. |
 | Private stores | Save distinct native-agent and browser-device markers under the same private key. | Values remain local; record/event counts do not change. This is a synthetic isolation check, not a review of a deployed agent's data classification. |
 | Independent devices | Open the same peer name in an isolated browser context. | Existing keys are absent, implicit opening fails, and explicit setup creates independent public keys. |
-| Actual quota failure | Set the origin quota to one byte through Chromium DevTools, then replace a checkpoint and submit application work through the real OPFS Worker. | OPFS rejects the writes, the old checkpoint survives, and failed preparation creates neither a local operation nor a native record. |
-| Quota recovery | Restore the origin quota and reopen the Worker. | Original identity/checkpoint remain, an accepted exact retry adds no records, and the previously unprepared operation can be deliberately submitted. |
-| Partial storage loss | Delete only the real OPFS feed manifest while retaining device keys and the initialization marker. | Opening fails with `BROWSER_FEED_MANIFEST_MISSING`; restoring the exact saved manifest retains the original identity/proposal without a new native record. |
+| Actual quota failure | Open a real Chromium Storage Bucket with a 64 KiB quota and use the production `OpfsBytesStore`, `CheckpointStore` and `DurableOperationJournal` in the Worker. Attempt a 1 MiB replacement/preparation. | Actual `QuotaExceededError` leaves the old checkpoint intact, no new operation, and no application callback for the failed preparation. |
+| Quota recovery | Reopen those production stores in the same bucket, retry an earlier accepted operation exactly, then deliberately issue new small work. | Original checkpoint and accepted bytes remain; retry invokes no new callback; small writes succeed after the failed writable has been aborted. |
+| Partial storage loss | Delete both the real OPFS feed manifest and identity-binding file while retaining device keys. | Opening fails with `BROWSER_FEED_MANIFEST_MISSING`; verified restoration of the exact metadata retains the original proposal without a new record, and a new publication continues the signed feed. |
 | Storage loss | Close the Worker and clear origin storage through Chromium DevTools. | Opening fails with `ENROLLMENT_IDENTITY_MISSING`; explicit replacement uses new keys with no inherited grants. Native history remains intact. |
 
-Quota enforcement uses Chromium's actual storage implementation with a controlled
-quota. It does not reproduce filesystem exhaustion, operating-system eviction,
-mobile power management, or another browser's storage policy. Browser contexts
+Quota enforcement uses Chromium's actual named-bucket storage implementation
+with a controlled quota. It proves the production storage/checkpoint/journal
+boundary, not quota enforcement for `openBrowserPeer` or `openBrowserEventPeer`
+in the default bucket. In [run 43967265774](https://github.com/werg/chronolog-db/actions/runs/43967265774),
+Chromium 158.0.8127.18 reported a one-byte DevTools quota override but still
+allowed the OPFS replacement; that attempted control was not valid quota evidence.
+The named-bucket gate does not reproduce filesystem exhaustion, operating-system
+eviction, mobile power management, or another browser's storage policy. Browser contexts
 provide isolated profiles, not physically independent devices. The native peer
 and browser use authenticated loopback framing; no public network is claimed.
 
