@@ -4,7 +4,7 @@ import {
 import type { Ed25519KeyPair, EventPayload } from '@chronolog/protocol'
 
 const SIGNAL_DOMAIN = 'chronolog/ephemeral/v1'
-export const MAX_SIGNAL_BYTES = 32_768
+export const MAX_SIGNAL_BYTES = 16_384
 
 export interface SignalAuthorization {
   readonly authorId: Uint8Array

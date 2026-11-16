@@ -77,11 +77,11 @@ import type { AgentApplication } from '@chronolog/agent-service'
 export function createAgent(): AgentApplication {
   return {
     effects: [{
-      resultTopic: 'jobs.results',
+      resultTopic: 'job-results',
       handler: {
         id: 'job-provider',
         version: '1',
-        topics: ['jobs.requested'],
+        topics: ['job-requests'],
         recovery: 'idempotent',
         async dispatch({ event, idempotencyKey }) {
           return provider.perform(event.payload, { idempotencyKey })
@@ -93,8 +93,12 @@ export function createAgent(): AgentApplication {
 ```
 
 `provider` in this sketch is an application-owned integration. The runnable
-`examples/resident-agent.ts` module uses a deterministic echo handler instead of
-an external provider.
+`examples/resident-agent.ts` module reads shared final task rows and formats a
+bounded `job.completed`/`job.failed` result without an external provider. It is
+the handler used by the contrib task-board vocabulary. The worker publishes
+`effect.completed` on `job-results`, with the returned value in `result` and the
+stable request event in `originEventId`. Browser grants allow `job-requests`;
+only the designated native worker receives `job-results` publication rights.
 
 The context supplies the public node, atomic private store, final event
 publisher, optional authority, grant-checked signal setup, and authenticated

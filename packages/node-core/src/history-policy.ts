@@ -55,6 +55,15 @@ export interface CoordinatedProgress {
 
 const LOG_DOMAIN = 'record-log/v1'
 const CERTIFICATE_DOMAIN = 'chronolog/prefix-certificate/v1\0'
+/** Local retained-state bounds are independent from the smaller wire decoder. */
+export const MAX_RETAINED_HISTORY_ENTRIES = 65_536
+const MAX_RETAINED_EVIDENCE = MAX_RETAINED_HISTORY_ENTRIES * 2
+const DEFAULT_EVIDENCE_QUOTA_BYTES = 128 * 1024 * 1024
+const MAX_LOCAL_HISTORY_BYTES = 512 * 1024 * 1024
+
+export interface CoordinatedHistoryStorageOptions {
+  readonly quotaBytes?: number
+}
 
 export function encodeHistoryConfiguration(configuration: HistoryConfiguration): Uint8Array {
   for (const bytes of [configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest]) {
@@ -193,6 +202,7 @@ export class CoordinatedHistoryPolicy {
   readonly #configuration: CoordinatedHistoryConfiguration
   readonly #store: DurableOperationStore
   readonly #key: string
+  readonly #quotaBytes: number
   readonly #mutex = new Mutex()
   // Entry roots authenticate bytes, not the authority's choice of position.
   // Retain competing untrusted alternatives until a certificate selects one.
@@ -201,19 +211,24 @@ export class CoordinatedHistoryPolicy {
   #certificates = new Map<number, PrefixCertificate>()
   #progress: CoordinatedProgress
 
-  private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, root: string) {
+  private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, root: string, quotaBytes: number) {
     this.#configuration = structuredClone(configuration)
     this.#store = store
     this.#key = `history/${bytesToHex(configuration.groupId)}/coordinated`
+    this.#quotaBytes = quotaBytes
     this.#progress = { receivedThrough: 0, verifiedThrough: 0, certifiedThrough: 0, finalThrough: 0, root, missing: [] }
   }
 
-  static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore): Promise<CoordinatedHistoryPolicy> {
+  static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore,
+    options: CoordinatedHistoryStorageOptions = {}): Promise<CoordinatedHistoryPolicy> {
     encodeHistoryConfiguration(configuration)
-    const policy = new CoordinatedHistoryPolicy(configuration, store, await orderedGenesisRoot(configuration.historyId))
+    const quotaBytes = options.quotaBytes ?? DEFAULT_EVIDENCE_QUOTA_BYTES
+    if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1024 || quotaBytes > MAX_LOCAL_HISTORY_BYTES) throw new Error('HISTORY_STORAGE_QUOTA_INVALID')
+    const policy = new CoordinatedHistoryPolicy(configuration, store, await orderedGenesisRoot(configuration.historyId), quotaBytes)
     const saved = await store.get(policy.#key)
     if (saved !== null) {
-      const decoded = assertCanonicalCbor(saved)
+      if (saved.length > quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
+      const decoded = decodeRetainedHistory(saved, quotaBytes, MAX_RETAINED_EVIDENCE)
       if (!Array.isArray(decoded) || decoded.length !== 3 || decoded[0] !== 1n ||
           !(decoded[1] instanceof Uint8Array) || !equalBytes(decoded[1], encodeHistoryConfiguration(configuration)) ||
           !Array.isArray(decoded[2])) throw new Error('HISTORY_STORED_CONFIGURATION_MISMATCH')
@@ -257,9 +272,12 @@ export class CoordinatedHistoryPolicy {
         ...allEntries(entries).map((entry): OrderingEvidence => ({ kind: 'ordered-entry', entry })),
         ...[...certificates.values()].map((certificate): OrderingEvidence => ({ kind: 'prefix-certificate', certificate })),
       ]
-      await this.#store.put(this.#key, encodeCanonicalCbor([
+      if (all.length > MAX_RETAINED_EVIDENCE) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
+      const persisted = encodeCanonicalCbor([
         1n, encodeHistoryConfiguration(this.#configuration), all.map(encodeOrderingEvidence),
-      ]))
+      ])
+      if (persisted.length > this.#quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
+      await this.#store.put(this.#key, persisted)
       this.#entries = entries
       this.#certificates = certificates
       this.#selectedEntries = selectedEntries
@@ -382,7 +400,9 @@ export class ReferenceRecordLog {
 
   static async open(historyId: string, store: DurableOperationStore, quotaBytes = 64 * 1024 * 1024): Promise<ReferenceRecordLog> {
     assertHistoryId(historyId)
-    if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1) throw new Error('RECORD_LOG_QUOTA_INVALID')
+    if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1 || quotaBytes > MAX_LOCAL_HISTORY_BYTES - MAX_RETAINED_HISTORY_ENTRIES * 512) {
+      throw new Error('RECORD_LOG_QUOTA_INVALID')
+    }
     const log = new ReferenceRecordLog(historyId, store, quotaBytes)
     await log.read()
     return log
@@ -391,7 +411,12 @@ export class ReferenceRecordLog {
   async read(): Promise<readonly OrderedRecordEntry[]> {
     const bytes = await this.store.get(`record-log/${this.historyId}`)
     if (bytes === null) return []
-    const decoded = assertCanonicalCbor(bytes)
+    // The public log quota counts proposal bytes. Reserve a fixed bounded
+    // allowance for the hash-chain/index encoding instead of using wire limits
+    // that can make an already committed >16 MiB history impossible to reopen.
+    const storedLimit = this.quotaBytes + MAX_RETAINED_HISTORY_ENTRIES * 512
+    if (bytes.length > storedLimit) throw new Error('RECORD_LOG_QUOTA_EXCEEDED')
+    const decoded = decodeRetainedHistory(bytes, storedLimit, MAX_RETAINED_HISTORY_ENTRIES)
     if (!Array.isArray(decoded)) throw new Error('RECORD_LOG_STORAGE_INVALID')
     const entries: OrderedRecordEntry[] = []
     let root = await orderedGenesisRoot(this.historyId)
@@ -421,7 +446,8 @@ export class ReferenceRecordLog {
       const recordId = await orderedRecordId(exact)
       const previous = entries.find((entry) => entry.recordId === recordId)
       if (previous !== undefined) return structuredClone(previous)
-      if (entries.reduce((size, entry) => size + entry.bytes.byteLength, 0) + exact.byteLength > this.quotaBytes) {
+      if (entries.length >= MAX_RETAINED_HISTORY_ENTRIES ||
+          entries.reduce((size, entry) => size + entry.bytes.byteLength, 0) + exact.byteLength > this.quotaBytes) {
         throw new Error('RECORD_LOG_QUOTA_EXCEEDED')
       }
       const fields = { historyId: this.historyId, position: entries.length + 1, recordId, previousRoot: entries.at(-1)?.root ?? await orderedGenesisRoot(this.historyId) }
@@ -433,6 +459,11 @@ export class ReferenceRecordLog {
       return structuredClone(entry)
     })
   }
+}
+
+function decodeRetainedHistory(bytes: Uint8Array, maxBytes: number, maxItems: number) {
+  return assertCanonicalCbor(bytes, { maxBytes, maxItems, maxDepth: 4,
+    maxTextBytes: 1024, maxByteStringBytes: 1_048_576 + 2048 })
 }
 
 function assertHistoryId(value: string): void {
