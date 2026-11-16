@@ -43,7 +43,7 @@ export class CheckpointStore {
         (value[2] !== null && typeof value[2] !== 'string') || (value[3] !== null && typeof value[3] !== 'string') ||
         !(value[4] instanceof Uint8Array) || value[4].length > this.#maxStateBytes) throw new Error('CHECKPOINT_INVALID')
     if (!equalBytes(value[1], this.#binding)) throw new Error('CHECKPOINT_BINDING_MISMATCH')
-    return { cursor: value[2], revision: value[3], state: value[4].slice() }
+    return { cursor: value[2] as string | null, revision: value[3] as string | null, state: value[4].slice() }
   }
 
   async commit(checkpoint: ConsumerCheckpoint): Promise<void> {

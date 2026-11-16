@@ -57,6 +57,8 @@ export async function loadOrCreateGovernanceBootstrap(options: {
   readonly transportAuthor: string
   readonly now?: () => number
   readonly secretStore?: DaemonSecretStore
+  /** Immutable selection for a new group; changing an existing group is rejected. */
+  readonly historyPolicy?: 'peer' | 'coordinated'
   /**
    * Used only when `governance.json` does not exist yet. By default a new
    * genesis is created with this node as root. `adopt` joins an existing
@@ -95,6 +97,12 @@ export async function loadOrCreateGovernanceBootstrap(options: {
   const resolved = await resolveDocument(document, options.secretStore)
   const genesis = decodeSignedGenesis(unbase64(resolved.signedGenesis))
   if (!sameBytes(genesis.manifest.groupId, options.groupId)) throw new Error('GOVERNANCE_GROUP_MISMATCH')
+  if (options.historyPolicy !== undefined && genesis.manifest.historyPolicy?.kind !== options.historyPolicy) {
+    throw new Error('GOVERNANCE_HISTORY_POLICY_MISMATCH')
+  }
+  if (!sameBytes(genesis.manifest.historyPolicy?.executionManifestDigest ?? genesis.manifest.schemaId, options.schemaId)) {
+    throw new Error('GOVERNANCE_EXECUTION_PROFILE_MISMATCH')
+  }
   return {
     genesis,
     validationPolicyId: await validationPolicyId(genesis.manifest.validationPolicies[0]!),
@@ -111,6 +119,7 @@ async function createGenesis(
     readonly identity: Ed25519KeyPair
     readonly transportAuthor: string
     readonly now?: () => number
+    readonly historyPolicy?: 'peer' | 'coordinated'
   },
   recipientPublicKey: Uint8Array,
   forkedFrom: ForkOrigin | undefined,
@@ -128,12 +137,18 @@ async function createGenesis(
   const manifest: GenesisManifest = {
     groupId: options.groupId,
     schemaId: options.schemaId,
-    historyPolicy: { kind: 'peer', executionManifestDigest: options.schemaId },
+    historyPolicy: options.historyPolicy === 'coordinated'
+      ? { kind: 'coordinated', executionManifestDigest: options.schemaId,
+        historyId: `h_${Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex')}`,
+        authorityPublicKey: options.identity.publicKeyBytes }
+      : { kind: 'peer', executionManifestDigest: options.schemaId },
     rootAdminPublicKey: options.identity.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode(options.transportAuthor),
     initialCapabilities: [
       { ...common, role: 'administrator' },
-      { ...common, role: 'writer' },
+      // This is an explicit trusted owner grant. Other devices receive only the
+      // SQL, event-topic and ephemeral rights selected during their enrollment.
+      { ...common, role: 'writer', program: { sql: true, topics: ['*'], signals: ['*'] } },
       { ...common, role: 'validator', minimumAuthorTimestampMs: 0n },
       { ...common, role: 'reader', hpkePublicKey: recipientPublicKey },
     ],

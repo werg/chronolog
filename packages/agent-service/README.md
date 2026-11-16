@@ -1,0 +1,211 @@
+# Native application agent service
+
+This package runs the fixed coordinating authority, durable event consumers,
+timers, and peer connections alongside an application agent. The loops do not
+depend on model turns. Provider calls stay in trusted application modules;
+Chronolog's execution and UI replay never call them.
+
+## Run the native profile
+
+For a new durable native history:
+
+```sh
+CHRONOLOG_DATA_DIR=/persistent/chronolog-agent \
+CHRONOLOG_HISTORY_POLICY=coordinated \
+CHRONOLOG_EXECUTION_PROFILE=events \
+pnpm dev
+```
+
+Use `CHRONOLOG_EXECUTION_PROFILE=sql` for a mixed SQL/event group. The `events`
+profile dynamically avoids importing the application SQL adapter. A stored
+genesis pins the execution profile and history policy; changing either on a
+continuing history is an error. `peer` remains a separately selected native
+policy. Leaving `CHRONOLOG_HISTORY_POLICY` unset uses an existing genesis, or
+creates the ordinary peer profile for a new daemon.
+
+The coordinated genesis records one history ID and the daemon's persistent
+signing key as authority. Another enrolled node does not become an authority
+unless its key is the one that genesis explicitly names. The daemon uses its
+existing fenced data directory and FULL-synchronous SQLite operation store.
+`CHRONOLOG_AUTHORITY_QUOTA_BYTES` bounds retained proposal bytes (64 MiB by
+default). Exhaustion is a visible refusal; no record is silently trimmed.
+
+The daemon's ready output includes the selected policy, execution profile,
+resident task IDs, and whether it hosts the native authority. Task failures stop
+the resident service and are reported as `chronologd.agent_failed`.
+
+## Authority storage and recovery
+
+`NativeAuthority` composes the public `ReferenceRecordLog` and prefix certificate
+implementation. Exact bytes, deduplication, ordered entries, and the rolling head
+are one atomic record-store update before append acknowledgment. Certificates
+come only from the committed local head and remain outside the history they
+certify. `serve(transport)` recovers retained evidence and orders eligible signed
+wire records from the transport's durable subscription. SQL acceptance remains a
+replica decision.
+
+`NativeAgentStore` supplies the same atomic bytes port for embedded native hosts.
+It holds SQLite's exclusive owner fence for the lifetime of the connection and
+can back `DurableFeedStore`, authoring state, the authority, and checkpoints.
+The existing daemon instead shares its already fenced node-state database.
+
+A persistent volume is required. A certificate proves order, not a second
+durable copy or an external backup. An unavailable authority pauses new finality;
+peers retain local reads and already certified history. There is no automatic
+authority or policy failover.
+
+After restoring a volume, establish continuity independently before continuing
+the same authority/history. `NativeAuthority.open({ continuity })` and
+`CHRONOLOG_AUTHORITY_CONTINUITY_FILE` accept a trusted `{historyId, position,
+root}` checkpoint and refuse an older or conflicting retained prefix. A
+checkpoint copied from the same old backup cannot detect rollback. Without
+established continuity, create an explicit new history lineage. Neither this
+package nor a missing newer peer certificate proves that a restored backup was
+the latest acknowledged state.
+
+## Trusted application modules
+
+Set `CHRONOLOG_AGENT_MODULE` to a local module exporting `createAgent(context)`.
+The public `AgentApplicationModule` and `AgentApplicationContext` types are
+exported from `@chronolog/agent-service`. A factory describes its workers and
+long-lived connection tasks; it should not wait for final publication during
+configuration, before the resident loops start.
+
+```ts
+import type { AgentApplication } from '@chronolog/agent-service'
+
+export function createAgent(): AgentApplication {
+  return {
+    effects: [{
+      resultTopic: 'jobs.results',
+      handler: {
+        id: 'job-provider',
+        version: '1',
+        topics: ['jobs.requested'],
+        recovery: 'idempotent',
+        async dispatch({ event, idempotencyKey }) {
+          return provider.perform(event.payload, { idempotencyKey })
+        },
+      },
+    }],
+  }
+}
+```
+
+`provider` in this sketch is an application-owned integration. The runnable
+`examples/resident-agent.ts` module uses a deterministic echo handler instead of
+an external provider.
+
+The context supplies the public node, atomic private store, final event
+publisher, optional authority, grant-checked signal setup, and authenticated
+peer connection setup. The module is trusted native code. Keep credentials,
+private model context, and private workflow state in its local store or another
+explicitly authorized group; topic filtering is not confidentiality.
+
+## Final-intent processing
+
+`DurableEffectWorker` uses a distinct durable event source, never a coalescing
+snapshot subscription. It keeps the pending bounded batch, dispatch state, and
+processed cursor together. Individual programs and the source batch are bounded;
+slow workers resume from storage.
+
+For each event it:
+
+1. Derives a stable effect ID from source/history, event ID, handler ID, and version.
+2. Commits dispatch intent before calling the provider.
+3. Commits the provider result before publishing a result event.
+4. Retries result publication with the same operation ID and bytes.
+5. Advances durable processing only after final accepted result publication.
+
+The provider's recovery policy is explicit:
+
+| Mode | Recovery after a possible provider call |
+| --- | --- |
+| `idempotent` | Call again with the same provider idempotency key. The provider must guarantee deduplication. |
+| `reconcile` | Ask the provider whether the call completed, did not happen, or remains uncertain. |
+| `manual` | Leave the effect in `dispatching` and raise `EFFECT_OUTCOME_UNCERTAIN`. |
+
+`resolve(effectId, result)` records an explicit recovered completion or a verified
+`not-performed` decision. A local retry key does not manufacture exactly-once
+external effects. Result payloads and their metadata must fit the bounded event
+contract; store large provider outputs as explicit blob references.
+
+One designated worker owns each handler. A changed handler version, topic filter,
+or source cannot silently reuse its checkpoint. Pure UI caches may rebuild;
+discarding an external-effect checkpoint can repeat actions and requires an
+intentional application recovery decision.
+
+`CheckpointStore` also exposes a small general state/cursor pair for pure local
+projections. Its binding identifies group/history, filter/version, and reducer
+version. One `commit` atomically replaces state, revision, and processed cursor.
+
+## Timers and cancellation
+
+`DurableTimerScheduler` consumes final configuration events:
+
+```ts
+{ type: 'timer.scheduled', timerId, dueAtMs, intervalMs, payload }
+{ type: 'timer.cancelled', timerId, scheduleEventId }
+```
+
+The schedule event ID is the generation. Cancellation of an older generation
+cannot cancel its replacement. Recurring occurrences derive from scheduled time,
+so late processing does not drift the schedule. Catch-up is bounded per turn.
+Occurrence ID, scheduled time, and observed time are persisted before publication
+and reused after a lost response or restart.
+
+The application's `TimerOccurrencePublisher` must validate that the generation
+is still active and publish the occurrence at one canonical boundary, returning
+a final `accepted` or `cancelled` result. An SQL assertion plus `emit` is one
+implementation. This explicit port prevents a local clock check from being
+mistaken for fencing against a concurrent cancellation. Accepted exact retries
+keep their original result even after later cancellation. Timers publish intent;
+effect workers perform any outside action.
+
+## Direct and relayed connections
+
+`framePeerStream` adapts a reliable `ReadableStream`/`WritableStream` pair to
+bounded length-prefixed frames, backpressure, cancellation, and truncated-frame
+errors. Use an appropriate encrypted production transport such as WSS/QUIC; the
+framing code is not a replacement for transport security or a NAT traversal
+implementation.
+
+`openAuthenticatedPeerLink` adds a mutual nonce/signature handshake bound to
+group identity and each participant's active read grant. It creates an ordinary
+`FeedLink` for the existing retained feed/evidence pull protocol. It never trusts
+rendezvous hints or a relay login as database membership. Every range request
+rechecks the receiver's known active grant. A connection can carry records by
+other original authors; endpoint and record identities remain distinct.
+
+The native `FeedTransport` exports `asLink()`, `connectLink()`,
+`disconnectLink()`, and `catchUpLinks()`. Its native SSB adapter and framed
+connections share the same signed record store. The portable browser transport
+uses `asLink()` and `connect()`. The daemon module context's `connectPeer()`
+performs active reader authorization and attaches a framed session to the native
+transport.
+
+Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
+use `chronolog/ephemeral/v1`. The session multiplexes bounded range responses,
+change hints, and replaceable signals. Signals cannot hold up retained range
+handling. There are at most four pending requests in either direction and each
+range is bounded to 64 records / 64 MiB. The event program limit normally makes
+actual batches considerably smaller. Connections require deployment measurement
+before making direct-connect, relay-bandwidth, or cost claims.
+
+`EphemeralChannel` signs group/topic/grant/session/sequence/expiry and checks the
+receiver's current capabilities. It bounds active replay sessions, send/receive
+work, and subscriber queues. Slow subscribers receive latest replaceable values.
+No signal advances a durable event cursor. An offline receiver cannot know about
+a revocation it has not received.
+
+## Verification scope
+
+Focused tests cover native fencing/reopen, lost append responses, visible quotas,
+continuity refusal, peer evidence relay, worker crash ambiguity and reconciliation,
+checkpoint atomicity, timer generations and lost responses, signed signal replay,
+framing/backpressure, and native/portable framed range exchange. The daemon
+composition test runs the actual governed event-only core, authority and worker.
+The framed native test uses no SSB listener/NAT and stubs only optional host
+interface discovery. These tests do not qualify home/mobile/corporate networks,
+browser suspension, provider-specific idempotency, or production relay byte
+routes; those need deployment-specific evidence.

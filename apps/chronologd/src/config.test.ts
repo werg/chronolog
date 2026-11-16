@@ -84,4 +84,16 @@ describe('daemon configuration', () => {
     expect(parseDaemonRuntimeConfig({ CHRONOLOG_NAT_VERIFICATION_URL: 'https://probe.example/ssb' }))
       .toMatchObject({ natVerificationUrl: 'https://probe.example/ssb' })
   })
+
+  it('selects explicit resident authority and SQL-absent profiles without implicit failover', () => {
+    expect(parseDaemonRuntimeConfig({ CHRONOLOG_HISTORY_POLICY: 'coordinated', CHRONOLOG_EXECUTION_PROFILE: 'events',
+      CHRONOLOG_AGENT_MODULE: './agent.mjs', CHRONOLOG_AUTHORITY_QUOTA_BYTES: '4096' })).toMatchObject({
+      historyPolicy: 'coordinated', executionProfile: 'events', agentModule: './agent.mjs', authorityQuotaBytes: 4096,
+    })
+    expect(parseDaemonRuntimeConfig({}).historyPolicy).toBeUndefined()
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_HISTORY_POLICY: 'automatic' })).toThrow('CHRONOLOG_HISTORY_POLICY_INVALID')
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_EXECUTION_PROFILE: 'guess' })).toThrow('CHRONOLOG_EXECUTION_PROFILE_INVALID')
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_AGENT_MODULE: '' })).toThrow('CHRONOLOG_AGENT_MODULE_INVALID')
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_AUTHORITY_QUOTA_BYTES: '0' })).toThrow('CHRONOLOG_AUTHORITY_QUOTA_BYTES_INVALID')
+  })
 })

@@ -18,7 +18,7 @@ import {
   FeedStore,
   type FeedKeys,
 } from './feed-store.js'
-import { consumeFeed, decodeBase64 } from '@chronolog/records'
+import { consumeFeed, decodeBase64, pullFeed, type FeedLink } from '@chronolog/records'
 import type { ChronologTransport, ImmutableEvidence, PublishOptions, TransportRecord, TransportStatus } from './types.js'
 
 const require = createRequire(import.meta.url)
@@ -91,6 +91,14 @@ interface ReconnectOptions {
   readonly staleAfterMs?: number
 }
 
+interface FramedLinkConnection {
+  readonly link: FeedLink
+  readonly controller: AbortController
+  pending: Promise<void>
+  evidenceAfter: bigint
+  error?: string
+}
+
 const HISTORY_BATCH = 64
 const SUBSCRIPTION_BATCH = 256
 const RESTREAM_DELAY_MS = 250
@@ -102,6 +110,7 @@ export class FeedTransport implements ChronologTransport {
   readonly #maxRecordBytes: number
   readonly #wanted = new Set<string>()
   readonly #connections = new Map<string, Set<Rpc>>()
+  readonly #links = new Map<string, FramedLinkConnection>()
   readonly #streams = new Map<Rpc, Map<string, () => void>>()
   readonly #configured = new Map<string, ConfiguredPeer>()
   readonly #progress = new Map<string, number>()
@@ -209,6 +218,41 @@ export class FeedTransport implements ChronologTransport {
     if (this.#wanted.has(feedId)) return
     this.#wanted.add(feedId)
     for (const rpc of this.#streams.keys()) this.#startStream(rpc, feedId)
+    for (const connection of this.#links.values()) this.#queueLinkSync(connection)
+  }
+
+  /** Attach a grant-authenticated framed range link alongside native SSB peers. */
+  connectLink(link: FeedLink): void {
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    this.disconnectLink(link.identity)
+    this.#wanted.add(link.identity)
+    const connection: FramedLinkConnection = { link, controller: new AbortController(), pending: Promise.resolve(), evidenceAfter: 0n }
+    this.#links.set(link.identity, connection)
+    this.#queueLinkSync(connection)
+    void (async () => {
+      try {
+        for await (const _hint of link.watch(connection.controller.signal)) {
+          if (connection.controller.signal.aborted) return
+          this.#queueLinkSync(connection)
+          await connection.pending
+        }
+      } catch (error) {
+        if (!connection.controller.signal.aborted) connection.error = errorMessage(error)
+      }
+    })()
+  }
+
+  disconnectLink(identity: string): void {
+    this.#links.get(identity)?.controller.abort()
+    this.#links.delete(identity)
+  }
+
+  async catchUpLinks(): Promise<void> {
+    const connections = [...this.#links.values()]
+    for (const connection of connections) this.#queueLinkSync(connection)
+    await Promise.all(connections.map((connection) => connection.pending))
+    const failed = connections.find((connection) => connection.error !== undefined)
+    if (failed?.error !== undefined) throw new Error(failed.error)
   }
 
   /** Replace the configured peers; their feeds become wanted. */
@@ -268,6 +312,35 @@ export class FeedTransport implements ChronologTransport {
       if (batch.length === 0) return records
       for (const entry of batch) records.push(entry.record)
       cursor = batch[batch.length - 1]!.index
+    }
+  }
+
+  /** Public retained-range port for authenticated direct or relayed frame adapters. */
+  asLink(): FeedLink {
+    const transport = this
+    const range = (after: bigint, limit: number): void => {
+      if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+      if (after < 0n || after > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isSafeInteger(limit) || limit < 1 || limit > 4096) {
+        throw new Error('FEED_RANGE_INVALID')
+      }
+    }
+    return {
+      identity: this.identity,
+      read: async (feed, after, limit) => {
+        range(after, limit)
+        return this.#store.feedAfter(feed, after, limit).map(({ raw }) => raw.slice())
+      },
+      readEvidence: async (after, limit) => {
+        range(after, limit)
+        return this.#store.evidenceAfter(after, limit).map(({ evidence }) => evidence.bytes.slice())
+      },
+      async *watch(signal) {
+        while (!transport.#closed && signal?.aborted !== true) {
+          const version = transport.#version
+          yield undefined
+          await transport.#waitForChange(version, signal)
+        }
+      },
     }
   }
 
@@ -339,7 +412,7 @@ export class FeedTransport implements ChronologTransport {
       identity: this.identity,
       records: this.#store.count(),
       closed: this.#closed,
-      peers: [...this.#connections.keys()].sort(),
+      peers: [...new Set([...this.#connections.keys(), ...this.#links.keys()])].sort(),
       configuredPeers: [...this.#configured.values()]
         .sort((left, right) => left.feedId.localeCompare(right.feedId))
         .map((peer) => ({
@@ -363,12 +436,47 @@ export class FeedTransport implements ChronologTransport {
     if (this.#reconnectTimer !== undefined) clearInterval(this.#reconnectTimer)
     for (const streams of this.#streams.values()) for (const stop of streams.values()) stop()
     this.#streams.clear()
+    const links = [...this.#links.values()]
+    for (const connection of links) connection.controller.abort()
+    this.#links.clear()
     this.#notify()
     await closeServer(this.#server)
+    await Promise.all(links.map((connection) => connection.pending))
     this.#store.close()
   }
 
   // ── replication ────────────────────────────────────────────────────────
+
+  #queueLinkSync(connection: FramedLinkConnection): void {
+    connection.pending = connection.pending.then(async () => {
+      if (connection.controller.signal.aborted || this.#closed) return
+      try {
+        for (const feed of this.#wanted) {
+          await pullFeed(connection.link, feed, { store: this.#store, crypto: nativeFeedCrypto,
+            maxRecordBytes: this.#maxRecordBytes,
+            onStored: (record, result) => {
+              if (result.kind === 'fork') this.#forkRecords.push(result.record)
+              if (result.kind === 'appended') this.#progress.set(record.author, Date.now())
+              this.#notify()
+            },
+          }, connection.controller.signal)
+        }
+        while (!connection.controller.signal.aborted) {
+          const batch = await connection.link.readEvidence(connection.evidenceAfter, 64)
+          if (batch.length > 64) throw new Error('FEED_RANGE_TOO_LARGE')
+          for (const bytes of batch) {
+            if (connection.controller.signal.aborted) return
+            await this.putEvidence(bytes)
+            connection.evidenceAfter += 1n
+          }
+          if (batch.length < 64) break
+        }
+        delete connection.error
+      } catch (error) {
+        if (!connection.controller.signal.aborted) connection.error = errorMessage(error)
+      }
+    })
+  }
 
   #register(feedId: string, rpc: Rpc): void {
     if (this.#closed || this.#streams.has(rpc)) return
@@ -478,6 +586,7 @@ export class FeedTransport implements ChronologTransport {
 
   #lastStreamError(): string | undefined {
     for (const errors of this.#streamErrors.values()) for (const error of errors.values()) return error
+    for (const connection of this.#links.values()) if (connection.error !== undefined) return connection.error
     return undefined
   }
 

@@ -94,5 +94,5 @@ export class NativeAgentStore implements DurableOperationStore {
 }
 
 function validateKey(key: string): void {
-  if (key.length === 0 || key.length > 2048 || /[\u0000-\u001f]/u.test(key)) throw new Error('AGENT_STORE_KEY_INVALID')
+  if (key.length === 0 || key.length > 2048 || [...key].some((character) => character.charCodeAt(0) < 32)) throw new Error('AGENT_STORE_KEY_INVALID')
 }

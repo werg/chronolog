@@ -233,18 +233,18 @@ export class DurableEffectWorker {
     if (!Array.isArray(value) || value.length !== 2 || value[0] !== 1n) throw new Error('EFFECT_CHECKPOINT_INVALID')
     let pending: PendingBatch | null = null
     if (value[1] !== null) {
-      const batch = value[1]
+      const batch: unknown = value[1]
       if (!Array.isArray(batch) || batch.length !== 5 || !Array.isArray(batch[0]) || typeof batch[1] !== 'string' ||
           typeof batch[2] !== 'string' || typeof batch[3] !== 'bigint' || batch[3] < 0n || batch[3] > BigInt(batch[0].length) ||
           batch[0].length > this.#limit * 64) throw new Error('EFFECT_CHECKPOINT_INVALID')
       const events = batch[0].map(decodeEvent)
       let active: ActiveEffect | null = null
       if (batch[4] !== null) {
-        const entry = batch[4]
+        const entry: unknown = batch[4]
         if (!Array.isArray(entry) || entry.length !== 3 || typeof entry[0] !== 'string' ||
             (entry[1] !== 'prepared' && entry[1] !== 'dispatching' && entry[1] !== 'result') ||
             (entry[2] !== null && typeof entry[2] !== 'string')) throw new Error('EFFECT_CHECKPOINT_INVALID')
-        active = { effectId: entry[0], stage: entry[1], result: entry[2] === null ? null : parsePayload(entry[2]) }
+        active = { effectId: entry[0], stage: entry[1] as ActiveEffect['stage'], result: entry[2] === null ? null : parsePayload(entry[2] as string) }
       }
       pending = { events, scannedThrough: batch[1], revision: batch[2], next: Number(batch[3]), active }
     }

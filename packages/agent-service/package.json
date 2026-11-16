@@ -6,12 +6,17 @@
   "exports": {
     ".": "./src/index.ts",
     "./workers": "./src/workers.ts",
-    "./signals": "./src/signals.ts"
+    "./signals": "./src/signals.ts",
+    "./framing": "./src/framing.ts",
+    "./peer-link": "./src/peer-link.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
     "@chronolog/node-core": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*"
+  },
+  "devDependencies": {
+    "@chronolog/transport-ssb": "workspace:*"
   }
 }

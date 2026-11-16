@@ -34,7 +34,7 @@ export interface FinalEventPublisher {
 }
 
 export function validateConsumerId(value: string): void {
-  if (value.length === 0 || value.length > 256 || /[\u0000-\u001f]/u.test(value)) throw new Error('CONSUMER_ID_INVALID')
+  if (value.length === 0 || value.length > 256 || [...value].some((character) => character.charCodeAt(0) < 32)) throw new Error('CONSUMER_ID_INVALID')
 }
 
 export function canonicalTopics(topics: readonly string[]): readonly string[] {
@@ -60,6 +60,7 @@ export function batchEvents(batch: FinalEventBatch, limit: number, topics: reado
       batch.transactions.length > limit) throw new Error('CONSUMER_BATCH_INVALID')
   const events: FinalEvent[] = []
   const seen = new Set<string>()
+  let bytes = 0
   for (const transaction of batch.transactions) {
     if (transaction.events.length > 64) throw new Error('CONSUMER_BATCH_TOO_LARGE')
     for (const value of transaction.events) {
@@ -68,6 +69,8 @@ export function batchEvents(batch: FinalEventBatch, limit: number, topics: reado
         throw new Error('CONSUMER_BATCH_INVALID')
       }
       seen.add(event.id)
+      bytes += new TextEncoder().encode(JSON.stringify(event)).length
+      if (bytes > 1_048_576) throw new Error('CONSUMER_BATCH_TOO_LARGE')
       events.push(event)
     }
   }

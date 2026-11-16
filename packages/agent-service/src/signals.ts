@@ -102,7 +102,7 @@ export class EphemeralChannel {
     const task = this.#sendTail.then(async () => {
       if (this.#closed) throw new Error('SIGNAL_CHANNEL_CLOSED')
       const authorization = { authorId: this.#authorId.slice(), grantId: this.#grantId.slice(), topic }
-      if (!await this.#options.authorize(authorization)) throw new Error('SIGNAL_UNAUTHORIZED')
+      if (!await this.#options.authorize(structuredClone(authorization))) throw new Error('SIGNAL_UNAUTHORIZED')
       const issuedAtMs = this.#now(), expiresAtMs = issuedAtMs + ttlMs
       if (!Number.isSafeInteger(expiresAtMs) || this.#sequence >= Number.MAX_SAFE_INTEGER) throw new Error('SIGNAL_CLOCK_OR_SEQUENCE_EXHAUSTED')
       const sequence = ++this.#sequence
@@ -150,7 +150,7 @@ export class EphemeralChannel {
         throw new Error('SIGNAL_SIGNATURE_INVALID')
       }
       const authorization = { authorId: frame[3].slice(), grantId: frame[4].slice(), topic: frame[9] }
-      if (!await this.#options.authorize(authorization)) throw new Error('SIGNAL_UNAUTHORIZED')
+      if (!await this.#options.authorize(structuredClone(authorization))) throw new Error('SIGNAL_UNAUTHORIZED')
       const currentTime = this.#now()
       if (this.#closed) throw new Error('SIGNAL_CHANNEL_CLOSED')
       if (expiresAtMs <= currentTime) throw new Error('SIGNAL_EXPIRED')
@@ -159,7 +159,11 @@ export class EphemeralChannel {
       const previous = this.#sessions.get(senderSession)
       if (previous !== undefined && sequence <= previous.sequence) throw new Error('SIGNAL_REPLAY')
       if (previous === undefined && this.#sessions.size >= this.#maxSessions) throw new Error('SIGNAL_SESSION_QUOTA_EXCEEDED')
-      this.#sessions.set(senderSession, { sequence, retainThroughMs: Math.max(expiresAtMs, previous?.retainThroughMs ?? 0) })
+      // A lower-sequence frame can have a longer TTL than the latest frame. Keep
+      // the replay floor for the entire admissible lifetime, not only this
+      // frame's expiry; otherwise a delayed older frame could become fresh again.
+      this.#sessions.set(senderSession, { sequence,
+        retainThroughMs: Math.max(currentTime + this.#ttl + this.#skew, previous?.retainThroughMs ?? 0) })
       const signal: EphemeralSignal = { ...authorization, groupId: this.#groupId.slice(), sessionId, sequence,
         issuedAtMs, expiresAtMs, payload }
       for (const subscriber of this.#subscriptions) {

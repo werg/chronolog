@@ -2,11 +2,9 @@ import { join, resolve } from 'node:path'
 
 import { executionManifestArtifacts } from '@chronolog/protocol'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
-import {
-  DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
-  createDoltLiteMaterializationRuntime,
-} from '@chronolog/materializer-doltlite'
+import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
+import type { ChronologMaterializationRuntime } from '@chronolog/materializer'
+import type { DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import {
   ChronologNode,
   type GovernanceControlPlane,
@@ -29,6 +27,7 @@ import { daemonSecretStoreFromEnvironment } from './secret-store.js'
 import { createGovernanceRpcAdmin } from './governance-admin.js'
 import { acquireDataDirectoryLock } from './data-lock.js'
 import { SqliteOperationStore } from './operation-store.js'
+import { createDaemonAgentRuntime, readAuthorityContinuity } from './agent-runtime.js'
 
 const dataDirectory = resolve(process.env.CHRONOLOG_DATA_DIR ?? '.chronolog')
 const dataLock = await acquireDataDirectoryLock(dataDirectory, 'daemon')
@@ -41,9 +40,11 @@ const configuredValidationPolicy = fromBase64(config.validationPolicy)
 const configuredValidatorCapability = fromBase64(config.validatorCapability)
 
 const configuredPeers: readonly SsbPeer[] = runtime.peers
-const executionManifest = createDoltLiteExecutionManifest()
+// An event-only daemon never imports the native/WASM application SQL adapter.
+const sql = runtime.executionProfile === 'sql' ? await import('@chronolog/materializer-doltlite') : null
+const executionManifest = sql === null ? await eventExecutionManifest() : sql.createDoltLiteExecutionManifest()
 const { executionManifestDigest } = await executionManifestArtifacts(executionManifest)
-const { transport, materializer, node, server, address, governance, governed, nat, nodeState } = await startRuntime()
+const { transport, materializer, node, server, address, governance, governed, nat, nodeState, agent } = await startRuntime()
 process.stdout.write(`${JSON.stringify({
   event: 'chronologd.ready',
   url: address.url,
@@ -63,6 +64,10 @@ process.stdout.write(`${JSON.stringify({
   membershipRevision: Buffer.from(node.membershipRevision).toString('base64url'),
   governanceRevision: governance?.snapshot.revision.toString() ?? null,
   encryptionEpoch: governance?.currentEpoch?.toString() ?? config.epoch,
+  historyPolicy: node.historyPolicy,
+  executionProfile: runtime.executionProfile,
+  agentTasks: agent?.taskIds ?? [],
+  nativeAuthority: agent?.authority !== null && agent?.authority !== undefined,
 })}\n`)
 
 let stopping = false
@@ -70,6 +75,7 @@ async function stop(signal: string): Promise<void> {
   if (stopping) return
   stopping = true
   process.stdout.write(`${JSON.stringify({ event: 'chronologd.stopping', signal })}\n`)
+  await agent?.close()
   await server.close()
   if (governed !== undefined) await governed.close()
   else await node.close()
@@ -94,6 +100,15 @@ function terminate(signal: string): void {
 process.once('SIGINT', () => terminate('SIGINT'))
 process.once('SIGTERM', () => terminate('SIGTERM'))
 
+if (agent !== undefined && agent.taskIds.length > 0) {
+  void agent.run().catch(async (error: unknown) => {
+    process.stderr.write(`${JSON.stringify({ event: 'chronologd.agent_failed',
+      task: agent.status.failedTask, error: error instanceof Error ? error.message : String(error) })}\n`)
+    await stop('agent-failed')
+    process.exit(1)
+  })
+}
+
 async function startRuntime() {
   const transport = await FeedTransport.open({
     path: join(dataDirectory, 'ssb'),
@@ -108,29 +123,37 @@ async function startRuntime() {
     },
   })
   let materializer: DeterministicMaterializer | undefined
+  let materialization: ChronologMaterializationRuntime | undefined
   let node: ChronologNode | undefined
   let server: HttpRpcServer | undefined
   let governance: GovernanceControlPlane | undefined
   let governed: GovernedNode | undefined
   let enrollment: ReturnType<typeof createEnrollmentService> | undefined
+  let agent: Awaited<ReturnType<typeof createDaemonAgentRuntime>> | undefined
   let reachability: NatVerificationResult = { status: 'not-configured', address: null }
   // The node's own state (control index, validator cutoffs, feed continuity).
   const nodeState = new NodeStateDatabase(join(dataDirectory, 'node-state.sqlite'))
+  const operationStore = new SqliteOperationStore(nodeState.database)
   // Opened once the genesis root administrator is known: it is the first schema administrator.
   // A fork's genesis names its source group; only then may the root seed rows.
-  const openMaterializer = async (rootAdministrator: Uint8Array, forkSeeding = false): Promise<DeterministicMaterializer> => {
-    materializer = await DeterministicMaterializer.open({
+  const openMaterializer = async (rootAdministrator: Uint8Array, forkSeeding = false): Promise<void> => {
+    if (sql === null) {
+      if (forkSeeding) throw new Error('EVENT_PROFILE_SQL_FORK_UNSUPPORTED')
+      materialization = await createEventMaterializationRuntime({ store: operationStore, namespace: Buffer.from(groupId).toString('hex') })
+      return
+    }
+    materializer = await sql.DeterministicMaterializer.open({
       path: join(dataDirectory, 'application.db'),
       checkpointEvery: runtime.checkpointEvery,
       executionManifest,
       rootAdministrator,
       forkSeeding,
     })
-    return materializer
+    materialization = sql.createDoltLiteMaterializationRuntime(materializer)
   }
   try {
-    const operationStore = new SqliteOperationStore(nodeState.database)
     if (process.env.CHRONOLOG_STATIC_MEMBERSHIP_FILE !== undefined) {
+      if (runtime.historyPolicy === 'coordinated' || runtime.agentModule !== undefined) throw new Error('AGENT_PROFILE_REQUIRES_GOVERNANCE')
       const membershipFile = resolve(process.env.CHRONOLOG_STATIC_MEMBERSHIP_FILE)
       const membership = await loadStaticMembership(membershipFile, {
         groupId, membershipRevision: configuredMembershipRevision, validationPolicy: configuredValidationPolicy,
@@ -139,7 +162,7 @@ async function startRuntime() {
       node = new ChronologNode({
         groupId, groupRoute: fromBase64(config.groupRoute), identity, transport, membership,
         membershipRevision: configuredMembershipRevision, validationPolicy: configuredValidationPolicy,
-        materialization: createDoltLiteMaterializationRuntime(materializer!), operationStore,
+        materialization: materialization!, operationStore,
         controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState)),
         validator: { capabilityId: configuredValidatorCapability, cutoffLagMs: runtime.cutoffLagMs,
           maxFutureSkewMs: runtime.maxFutureSkewMs, heartbeatIntervalMs: runtime.heartbeatIntervalMs },
@@ -151,6 +174,7 @@ async function startRuntime() {
       const bootstrap = await loadOrCreateGovernanceBootstrap({
         dataDirectory, groupId, schemaId: executionManifestDigest, identity, transportAuthor: transport.identity,
         ...(secretStore === undefined ? {} : { secretStore }),
+        ...(runtime.historyPolicy === undefined ? {} : { historyPolicy: runtime.historyPolicy }),
       })
       await openMaterializer(bootstrap.genesis.manifest.rootAdminPublicKey, bootstrap.genesis.manifest.forkedFrom !== undefined)
       const orderPolicy = bootstrap.genesis.manifest.historyPolicy?.kind
@@ -158,7 +182,7 @@ async function startRuntime() {
       governed = await createGovernedNode({
         genesis: bootstrap.genesis, groupRoute: fromBase64(config.groupRoute), identity, transport,
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
-        materialization: createDoltLiteMaterializationRuntime(materializer!), operationStore,
+        materialization: materialization!, operationStore,
         controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState), { orderPolicy }),
         validator: { cutoffLagMs: runtime.cutoffLagMs, maxFutureSkewMs: runtime.maxFutureSkewMs,
           heartbeatIntervalMs: runtime.heartbeatIntervalMs },
@@ -179,6 +203,16 @@ async function startRuntime() {
         },
         executionManifestDigest,
         isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
+      })
+      agent = await createDaemonAgentRuntime({ node, transport, store: operationStore, identity,
+        history: governed.descriptor.history, activeMembership: () => governed!.activeSnapshot,
+        peerLinks: { local: transport.asLink(), attach: (link) => {
+          transport.connectLink(link)
+          return () => transport.disconnectLink(link.identity)
+        } },
+        authorityQuotaBytes: runtime.authorityQuotaBytes,
+        ...(runtime.agentModule === undefined ? {} : { modulePath: runtime.agentModule }),
+        ...(runtime.authorityContinuityFile === undefined ? {} : { continuity: await readAuthorityContinuity(runtime.authorityContinuityFile) }),
       })
     }
     server = new HttpRpcServer({
@@ -206,15 +240,17 @@ async function startRuntime() {
       timeoutMs: runtime.natDiscoveryTimeoutMs,
       ...(runtime.natVerificationUrl === undefined ? {} : { verificationUrl: runtime.natVerificationUrl }),
     })
-    return { transport, materializer: materializer!, node, server, address, governance, governed, nat: { ...nat, reachability }, nodeState }
+    return { transport, materializer: { backend: materializer?.backend ?? 'events-only', executionManifestDigest },
+      node, server, address, governance, governed, nat: { ...nat, reachability }, nodeState, agent }
   } catch (error) {
+    await agent?.close().catch(() => undefined)
     await server?.close().catch(() => undefined)
     if (governed !== undefined) {
       await governed.close().catch(() => undefined)
     } else if (node !== undefined) {
       await node.close().catch(() => undefined)
     } else {
-      materializer?.close()
+      await materialization?.close?.()
       await transport.close().catch(() => undefined)
     }
     nodeState.close()

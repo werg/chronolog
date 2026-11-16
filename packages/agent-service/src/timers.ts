@@ -230,7 +230,7 @@ function parsePayload(value: string): EventPayload {
 function encodeOccurrence(value: TimerOccurrence): CborValue {
   return [value.timerId, value.scheduleEventId, value.occurrenceId, BigInt(value.scheduledAtMs), BigInt(value.observedAtMs), canonicalEventPayload(value.payload)]
 }
-function decodeOccurrence(value: CborValue): TimerOccurrence {
+function decodeOccurrence(value: unknown): TimerOccurrence {
   if (!Array.isArray(value) || value.length !== 6 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
       typeof value[2] !== 'string' || typeof value[3] !== 'bigint' || typeof value[4] !== 'bigint' || typeof value[5] !== 'string') {
     throw new Error('TIMER_CHECKPOINT_INVALID')

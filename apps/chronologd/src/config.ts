@@ -57,6 +57,12 @@ export interface DaemonRuntimeConfig {
   readonly natDiscoveryUrl?: string
   readonly natVerificationUrl?: string
   readonly natDiscoveryTimeoutMs: number
+  /** Explicit immutable policy for new groups; existing genesis must agree. */
+  readonly historyPolicy?: 'peer' | 'coordinated'
+  readonly executionProfile: 'sql' | 'events'
+  readonly agentModule?: string
+  readonly authorityQuotaBytes: number
+  readonly authorityContinuityFile?: string
 }
 
 export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): DaemonRuntimeConfig {
@@ -67,6 +73,10 @@ export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): Daemon
   if (!isLoopbackHost(host) && token === undefined) throw new Error('CHRONOLOG_TOKEN_REQUIRED_FOR_REMOTE_HOST')
   const scope = environment.CHRONOLOG_SSB_SCOPE ?? 'device'
   if (scope !== 'device' && scope !== 'local' && scope !== 'public') throw new Error('CHRONOLOG_SSB_SCOPE_INVALID')
+  const historyPolicy = environment.CHRONOLOG_HISTORY_POLICY
+  if (historyPolicy !== undefined && historyPolicy !== 'peer' && historyPolicy !== 'coordinated') throw new Error('CHRONOLOG_HISTORY_POLICY_INVALID')
+  const executionProfile = environment.CHRONOLOG_EXECUTION_PROFILE ?? 'sql'
+  if (executionProfile !== 'sql' && executionProfile !== 'events') throw new Error('CHRONOLOG_EXECUTION_PROFILE_INVALID')
   return {
     host,
     port: integer(environment.CHRONOLOG_PORT ?? '8787', 0, 65_535, 'CHRONOLOG_PORT'),
@@ -92,6 +102,13 @@ export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): Daemon
       natVerificationUrl: validUrl(environment.CHRONOLOG_NAT_VERIFICATION_URL, 'CHRONOLOG_NAT_VERIFICATION_URL'),
     }),
     natDiscoveryTimeoutMs: integer(environment.CHRONOLOG_NAT_DISCOVERY_TIMEOUT_MS ?? '3000', 1, 60_000, 'CHRONOLOG_NAT_DISCOVERY_TIMEOUT_MS'),
+    ...(historyPolicy === undefined ? {} : { historyPolicy }),
+    executionProfile,
+    ...(environment.CHRONOLOG_AGENT_MODULE === undefined ? {} : { agentModule: nonempty(environment.CHRONOLOG_AGENT_MODULE, 'CHRONOLOG_AGENT_MODULE') }),
+    authorityQuotaBytes: integer(environment.CHRONOLOG_AUTHORITY_QUOTA_BYTES ?? '67108864', 1024, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_AUTHORITY_QUOTA_BYTES'),
+    ...(environment.CHRONOLOG_AUTHORITY_CONTINUITY_FILE === undefined ? {} : {
+      authorityContinuityFile: nonempty(environment.CHRONOLOG_AUTHORITY_CONTINUITY_FILE, 'CHRONOLOG_AUTHORITY_CONTINUITY_FILE'),
+    }),
   }
 }
 

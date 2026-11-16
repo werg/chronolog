@@ -55,6 +55,22 @@ describe('daemon governance bootstrap', () => {
     await expect(loadOrCreateGovernanceBootstrap(withoutSecretStore))
       .rejects.toThrow('DAEMON_SECRET_STORE_REQUIRED')
   })
+
+  it('pins one native authority and rejects policy/profile changes on an existing history', async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), 'chronolog-coordinated-config-'))
+    directories.push(dataDirectory)
+    const options = { dataDirectory, groupId: bytes32(21), schemaId: bytes32(22),
+      identity: await generateEd25519KeyPair(), transportAuthor: '@root.ed25519', historyPolicy: 'coordinated' as const }
+    const first = await loadOrCreateGovernanceBootstrap(options)
+    const second = await loadOrCreateGovernanceBootstrap(options)
+    expect(first.genesis.manifest.historyPolicy).toMatchObject({ kind: 'coordinated', authorityPublicKey: options.identity.publicKeyBytes })
+    expect(first.genesis.manifest.historyPolicy?.historyId).toMatch(/^h_[0-9a-f]{32}$/u)
+    expect(second.genesis).toEqual(first.genesis)
+    expect(first.genesis.manifest.initialCapabilities.find((capability) => capability.role === 'writer')?.program)
+      .toEqual({ sql: true, topics: ['*'], signals: ['*'], forwarded: false })
+    await expect(loadOrCreateGovernanceBootstrap({ ...options, historyPolicy: 'peer' })).rejects.toThrow('GOVERNANCE_HISTORY_POLICY_MISMATCH')
+    await expect(loadOrCreateGovernanceBootstrap({ ...options, schemaId: bytes32(23) })).rejects.toThrow('GOVERNANCE_EXECUTION_PROFILE_MISMATCH')
+  })
 })
 
 function bytes32(seed: number): Uint8Array {
