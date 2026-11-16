@@ -56,7 +56,7 @@
     "@chronolog/transport-tendriller": "workspace:*",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "1.65.0",
-    "@tendriller/core": "file:./test/artifacts/tendriller-sdk-9b8e34f3.tgz",
+    "@tendriller/core": "file:./test/artifacts/tendriller-sdk-4eb9a4fe.tgz",
     "@types/node": "^24.0.0",
     "@vitest/coverage-v8": "^3.2.4",
     "esbuild": "0.28.2",

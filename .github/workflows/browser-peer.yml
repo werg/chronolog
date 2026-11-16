@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller
-          ref: f9197a6c06b52c3c2905c59497815b36b3e817df
+          ref: 4eb9a4fec0892378574324675611d0e0e3eecb55
           path: artifacts/pilot-source/tendriller
           persist-credentials: false
       - name: Check out the exact contrib application specimens
