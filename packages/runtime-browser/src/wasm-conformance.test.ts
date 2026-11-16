@@ -1,0 +1,143 @@
+import { existsSync, readFileSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+import { DeterministicMaterializer as NativeMaterializer, createDoltLiteExecutionManifest } from '@chronolog/materializer-doltlite'
+import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/browser'
+import { sqlStatement, sqlValue } from '@chronolog/protocol'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import { admitted, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
+import { openDatabase as openNativeDatabase } from '../../materializer-doltlite/src/driver.js'
+import { createWasmEngineFactory, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
+
+const directory = resolve(process.env.CHRONOLOG_WASM_DIRECTORY ?? 'artifacts/wasm')
+const built = existsSync(join(directory, 'manifest.json'))
+if (process.env.CHRONOLOG_REQUIRE_WASM === '1' && !built) throw new Error('Build the pinned engine with tools/build-wasm-engine.mjs first')
+
+describe.skipIf(!built)('native/WASM deterministic engine qualification', () => {
+  let factory: ReturnType<typeof createWasmEngineFactory>
+  let nativeDirectory: string
+  beforeAll(async () => {
+    const bytes = new Uint8Array(readFileSync(join(directory, 'sqlite3.wasm')))
+    const build = JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) as WasmBuildManifest
+    verifyWasmBuild(bytes, build)
+    const compiled = await WebAssembly.compile(bytes)
+    const { default: initialize } = await import(/* @vite-ignore */ pathToFileURL(join(directory, 'sqlite3.mjs')).href) as {
+      default(this: void, options: unknown): Promise<ChronologWasmModule>
+    }
+    const module = await initialize({
+      instantiateWasm(imports: WebAssembly.Imports, done: (instance: WebAssembly.Instance, module: WebAssembly.Module) => void) {
+        const instance = new WebAssembly.Instance(compiled, imports)
+        done(instance, compiled)
+        return instance.exports
+      },
+      printErr() { /* OPFS is qualified separately in a real Worker. */ },
+    })
+    factory = createWasmEngineFactory(module, build, 'unix-none')
+    nativeDirectory = await mkdtemp(join(tmpdir(), 'chronolog-wasm-'))
+  })
+  afterAll(async () => { if (nativeDirectory !== undefined) await rm(nativeDirectory, { recursive: true, force: true }) })
+
+  it('executes identical histories, rejects assertions, replays a late predecessor, and reopens exact state', async () => {
+    const executionManifest = createDoltLiteExecutionManifest()
+    const options = { executionManifest, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
+    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'replay.db') })
+    let browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', openDatabase: factory })
+    try {
+      const digest = native.executionManifestDigest
+      const setup = await admitted(1n, 'setup', [
+        'CREATE TABLE balances (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)',
+        'INSERT INTO balances (id, balance) VALUES (1, 10)',
+        'CREATE TABLE probes (id INTEGER PRIMARY KEY, now TEXT, local TEXT, random INTEGER, blob BLOB, real REAL, integer INTEGER, empty BLOB, last_rowid INTEGER, changed INTEGER)',
+      ], digest)
+      const late = await admitted(3n, 'late', ['UPDATE balances SET balance = balance + 100 WHERE id = 1'], digest)
+      const spend = await admitted(5n, 'spend', [
+        "SELECT chronolog_assert((SELECT balance FROM balances WHERE id=1)>=50, 'balance')",
+        'UPDATE balances SET balance=balance-50 WHERE id=1',
+      ], digest)
+      const probe = await admitted(1_700_000_000_000n, 'probe', [sqlStatement(
+        "INSERT INTO probes (id,now,local,random,blob,real,integer,empty,last_rowid,changed) VALUES (1,datetime('now'),datetime('now','localtime'),random(),randomblob(12),?,?,?,last_insert_rowid(),changes())",
+        [sqlValue.real(1), 9_223_372_036_854_775_807n, new Uint8Array()],
+      )], digest)
+      for (const history of [[setup, spend, probe], [setup, late, spend, probe]]) {
+        const n = await native.materialize(history)
+        const w = await browser.materialize(history)
+        expect(w?.outcomeChanges).toEqual(n?.outcomeChanges)
+        expect(browser.transactionLog()).toEqual(native.transactionLog())
+        expect(browser.databaseContentHash).toBe(native.databaseContentHash)
+        for (const query of ['SELECT * FROM balances', 'SELECT id,now,local,random,hex(blob),typeof(real),integer,typeof(empty),length(empty),last_rowid,changed FROM probes']) {
+          expect(browser.localSql(query).rows).toEqual(native.localSql(query).rows)
+        }
+      }
+      const hash = browser.databaseContentHash
+      browser.close()
+      browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', openDatabase: factory })
+      expect(browser.databaseContentHash).toBe(hash)
+      expect(browser.transactionLog()).toEqual(native.transactionLog())
+    } finally { native.close(); browser.close() }
+  })
+
+  it('enforces the same ownership, denied SQL, budgets, trigger lint, and extension behavior', async () => {
+    const executionManifest = createDoltLiteExecutionManifest({ limits: { maxVmSteps: 5_000 } })
+    const options = { executionManifest, rootAdministrator: ROOT_KEY }
+    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'enforcement.db') })
+    const browser = await DeterministicMaterializer.open({ ...options, path: '/enforcement.db', openDatabase: factory })
+    try {
+      const digest = native.executionManifestDigest
+      const other = new Uint8Array(32).fill(9)
+      const programs = [
+        await admitted(1n, 'setup', [
+          'CREATE TABLE notes (id INTEGER PRIMARY KEY, value TEXT NOT NULL)',
+          "INSERT INTO notes (id,value) VALUES(1,'root')",
+          "SELECT vec_distance_L2('[1,2]','[1,4]')",
+        ], digest),
+        await admitted(2n, 'owner', ["UPDATE notes SET value='other' WHERE id=1"], digest, other),
+        await admitted(3n, 'assert', ["SELECT chronolog_assert(0,'expected')"], digest),
+        await admitted(4n, 'attach', ["ATTACH DATABASE ':memory:' AS other"], digest),
+        await admitted(5n, 'multiple', ['SELECT 1; SELECT 2'], digest),
+        await admitted(6n, 'ignore', ['CREATE TRIGGER bad AFTER UPDATE ON notes BEGIN SELECT RAISE(IGNORE); END'], digest),
+        await admitted(7n, 'constraint', ['INSERT INTO notes(id) VALUES(2)'], digest),
+        await admitted(8n, 'budget', ['WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) SELECT count(*) FROM n'], digest),
+      ]
+      await native.materialize(programs)
+      await browser.materialize(programs)
+      expect(browser.transactionLog()).toEqual(native.transactionLog())
+      expect(browser.databaseContentHash).toBe(native.databaseContentHash)
+      expect(browser.outcome(programs[0]!.txId)?.outcome).toBe('accepted')
+      expect(browser.outcome(programs[1]!.txId)?.outcome).toBe('rejected')
+      for (const query of ['UPDATE notes SET value=\'write\'', "SELECT dolt_commit('-m','write')", 'PRAGMA writable_schema=1']) {
+        expect(() => native.localSql(query)).toThrow()
+        expect(() => browser.localSql(query)).toThrow()
+      }
+      expect(browser.localSql('SELECT id,value FROM notes').rows).toEqual(native.localSql('SELECT id,value FROM notes').rows)
+    } finally { native.close(); browser.close() }
+  })
+
+  it('matches the pinned native FTS5, JSON1, integer RTree and sqlite-vec diagnostics', () => {
+    const native = openNativeDatabase({ path: join(nativeDirectory, 'extensions.db') }).database
+    const browser = factory({ path: '/extensions.db' }).database
+    const schema = `
+      CREATE VIRTUAL TABLE docs USING fts5(body);
+      INSERT INTO docs(rowid,body) VALUES(1,'hello world'),(2,'unrelated');
+      CREATE VIRTUAL TABLE boxes USING rtree_i32(id,min_x,max_x);
+      INSERT INTO boxes VALUES(1,0,10),(2,20,30);
+      CREATE VIRTUAL TABLE vectors USING vec0(embedding int8[2]);
+      INSERT INTO vectors(rowid,embedding) VALUES(1,vec_int8('[1,2]')),(2,vec_int8('[3,4]'));
+    `
+    try {
+      native.exec(schema); browser.exec(schema)
+      for (const sql of [
+        "SELECT rowid FROM docs WHERE docs MATCH 'hello'",
+        "SELECT json_extract('{\"value\":\"exact\"}', '$.value') AS value",
+        'SELECT id FROM boxes WHERE min_x<=5 AND max_x>=5',
+        "SELECT rowid,distance FROM vectors WHERE embedding MATCH vec_int8('[1,3]') AND k=2 ORDER BY distance",
+      ]) {
+        const n = native.prepare(sql); const w = browser.prepare(sql)
+        try { expect(w.all()).toEqual(n.all()) } finally { n.finalize?.(); w.finalize?.() }
+      }
+    } finally { native.close(); browser.close() }
+  })
+})
