@@ -67,4 +67,37 @@ describe('durable operation journal', () => {
       apply: async () => { throw new Error('must not republish') },
     })).toEqual(Uint8Array.of(40))
   })
+
+  it('keeps an existing operation visible while its completed receipt replaces the pending entry', async () => {
+    let holdCompletedRead = false
+    let completedRead!: () => void, resumeRead!: () => void
+    const captured = new Promise<void>((resolve) => { completedRead = resolve })
+    const resume = new Promise<void>((resolve) => { resumeRead = resolve })
+    class PausingStore extends MemoryOperationStore {
+      override async get(key: string): Promise<Uint8Array | null> {
+        const value = await super.get(key)
+        if (holdCompletedRead && key === 'visibility/completed/publishing') {
+          holdCompletedRead = false
+          completedRead()
+          await resume
+        }
+        return value
+      }
+    }
+    const journal = new DurableOperationJournal(new PausingStore(), 'visibility')
+    let entered!: () => void, finishApply!: () => void
+    const applying = new Promise<void>((resolve) => { entered = resolve })
+    const releaseApply = new Promise<void>((resolve) => { finishApply = resolve })
+    const publication = journal.run({ operationId: 'publishing', fingerprint: Uint8Array.of(1),
+      prepare: async () => Uint8Array.of(7), apply: async () => { entered(); await releaseApply },
+    })
+    await applying
+    holdCompletedRead = true
+    const overlappingRead = journal.lookup('publishing')
+    await captured
+    finishApply()
+    await publication
+    resumeRead()
+    expect(await overlappingRead).toEqual(Uint8Array.of(7))
+  })
 })

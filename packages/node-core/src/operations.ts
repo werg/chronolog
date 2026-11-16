@@ -77,7 +77,11 @@ export class DurableOperationJournal {
     const completed = await this.#completed(operationId)
     if (completed !== null) return completed.payload.slice()
     const pending = await this.#pending()
-    return pending?.id === operationId ? pending.payload.slice() : null
+    if (pending?.id === operationId) return pending.payload.slice()
+    // Completion is durable before pending is cleared. It can happen between
+    // these two reads; never make an existing operation disappear in that gap.
+    // Keep lookup independent of the authoring lane, which may await transport.
+    return (await this.#completed(operationId))?.payload.slice() ?? null
   }
 
   async #finish(prepared: PreparedOperation, apply: (payload: Uint8Array) => Promise<void>): Promise<void> {
