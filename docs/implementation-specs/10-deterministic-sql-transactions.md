@@ -53,8 +53,8 @@ applications store those as SQLite values and use SQLite's functions.
 ## 3. Signed program
 
 ```text
-SqlTransactionProgram { version: 2, steps: Step[] }        // 1..256
-Step                  = SqlStatement | PlatformOp
+ChangeProgram { version: 3, steps: Step[] }        // 1..256
+Step                  = SqlStatement | PlatformOp | EmitStep
 SqlStatement          { sql: text, bindings: SqlBinding[] }
 SqlBinding            { parameter: index (1-based) | name, value: SqlValue }
 PlatformOp            = Grant { table, grantee, grantor?, rowKey?, operations, columns? }
@@ -70,8 +70,13 @@ Each `sql` must contain exactly one statement (trailing comments, whitespace
 and semicolons are allowed). Keys, collective ids, grant ids and offer ids
 are 32 bytes. A `rowKey` is the row's primary-key values. The program is
 encoded as canonical CBOR inside `TransactionCore.program`: a step is
-`[0, statement]` or `[1, operation]`, and an operation is an integer-keyed map
-whose key 0 is its code. Version 1 programs are not accepted.
+`[0, statement]`, `[1, operation]` or `[2, topic, canonicalJson]`; an operation is an integer-keyed map whose key 0 is its code. Only version 3 programs are accepted.
+
+`EmitStep { op: 'emit', topic, payload }` carries JSON data, never executable application code. A program has at most 256 steps, 64 emits and 262,144 canonical bytes; each payload is at most 16,384 UTF-8 bytes. Topics are bounded application labels. Event payloads use sorted object keys and finite JSON numbers; sparse arrays, accessors and non-JSON values are rejected.
+
+The transaction core is version 2 and signs `operationId` alongside author, exact writer grant, membership revision, execution profile and program. Different proposals reusing one author/operation identity deterministically reject as `operation_conflict`. SQL/platform failure rolls back the whole program and exposes no effective emit. Accepted events are reconstructed from the canonical program and its durable outcome anchor; final readers never advance beyond missing or unresolved outcomes.
+
+The SQL-free execution profile accepts only emits. SQL/platform steps are a deterministic `profile:sql-disabled` rejection in that profile. See [application-log implementation](../plans/application-log.md) for cursors, scopes, pinned views and resident consumers.
 
 The grant, collective or offer created by step `i` of transaction `txId` has
 the id `SHA-256(domain("chronolog/platform-object") ‖ len(txId) ‖ txId ‖ u32(i))`
@@ -329,7 +334,7 @@ There are no read policies: every reader node holds every row.
 
 Every candidate names the execution manifest digest it was authored for. The
 manifest (version 2) records the engine descriptor digest (DoltLite version,
-source digests and patch profile), `programVersion: 2`, the `platformDigest`,
+source digests and patch profile), `programVersion: 3`, the `platformDigest`,
 the profile pragma `recursiveTriggers: true`, and the step and size limits.
 The platform digest covers the platform-operation version, the shared SQL
 portability policy version, and the generated platform schema, views and

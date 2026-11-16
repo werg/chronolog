@@ -1,8 +1,9 @@
 # Documentation index
 
-Chronolog is an unreleased prototype. A transaction is a list of ordinary
-SQLite statements; determinism comes from a pinned engine with fixed
-per-transaction inputs. Documents are classified as follows.
+Chronolog is an unreleased prototype. A signed change program combines ordinary
+SQLite statements, platform operations and literal bounded events. SQL profiles
+pin their engine and transaction inputs; an event-only profile does not load
+that engine. Documents are classified as follows.
 
 | Class | Meaning |
 | --- | --- |
@@ -18,6 +19,8 @@ resolves.
 
 - **Developer:** [README](../README.md), [portable peers](portable-peers.md), then [design](design.md) and
   [Specification 10](implementation-specs/10-deterministic-sql-transactions.md).
+- **Application/agent author:** [Application-log implementation and evidence](plans/application-log.md),
+  [resident service](../packages/agent-service/README.md) and [browser runtimes](../packages/runtime-browser/README.md).
 - **Operator:** [Pilot runbook](pilot-runbook.md), then
   [governance](governance.md), [snapshot recovery](snapshot-recovery.md) and
   [release hardening](release-hardening.md).
@@ -37,6 +40,7 @@ resolves.
 
 | Document | Status | Contents |
 | --- | --- | --- |
+| [plans/application-log.md](plans/application-log.md) | Implementation and qualification | Durable events, native authority, signed ingress, coherent projections, worker/timer recovery and the public contrib pilot. |
 | [portable-peers.md](portable-peers.md) | Architecture and integration | Two history policies, portable records, durable proposals, actual final SQL and live enrollment. |
 | [implementation-status.md](implementation-status.md) | Status | What works end to end and what remains. |
 | [../upcoming.md](../upcoming.md) | Status (ordered roadmap) | Project queue and acceptance checks. |

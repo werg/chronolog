@@ -449,8 +449,8 @@ Platform state changes need trusted code with typed inputs. The signed program
 becomes:
 
 ```text
-SqlTransactionProgram { version: 2, steps: Step[] }       // 1..256
-Step = SqlStatement | PlatformOp
+ChangeProgram { version: 3, steps: Step[] }       // 1..256
+Step = SqlStatement | PlatformOp | EmitStep
 PlatformOp =
   | Grant            { table, grantee, grantor?, rowKey?, operations, columns? } | RevokeGrant { grantId }
   | CreateCollective { governance, invitees } | AcceptMembership { collectiveId } | Leave { collectiveId }
@@ -471,7 +471,7 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
 - **Manifest.** The platform code determines replicated state, so it goes into
   the execution manifest.
   - `ExecutionManifest` is now version 2:
-    `{version, profile, engine, engineDigest, programVersion: 2, platformDigest, recursiveTriggers: true, limits}`.
+    `{version, profile, engine, engineDigest, programVersion: 3, platformDigest, recursiveTriggers: true, limits}`.
   - `platformDigest` is SHA-256 over `PLATFORM_CODE_VERSION` (bumped with any
     change to what an operation checks or writes), the platform schema and
     views, and the triggers generated for a fixed reference table.
@@ -622,10 +622,11 @@ Findings that change the plan:
 
 ### Step 2: protocol and manifest
 
-- **Program v2.** `SqlTransactionProgram { version: 2, steps }`, with a
+- **Program v3.** `ChangeProgram { version: 3, steps }`, with a
   canonical CBOR codec for each `PlatformOp`, validation, fuzz tests and
-  fixtures. Version 1 is removed; there is no compatibility path.
-- **Manifest.** Add `programVersion: 2` and `platformDigest` to
+  fixtures. Earlier program versions are removed; there is no compatibility path.
+  Version 3 also carries literal `EmitStep` values; see [the application-log implementation](plans/application-log.md) for atomic events and durable cursors.
+- **Manifest.** Add `programVersion: 3` and `platformDigest` to
   `ExecutionManifest`. The digest is computed over the platform-operation
   code and the trigger and view generators.
 - **Rejection codes.** Add `policy:<table>:<command>`, `platform:<reason>`,

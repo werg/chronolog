@@ -1,22 +1,34 @@
 # Chronolog DB
 
-Chronolog DB is a TypeScript prototype of a decentralized, permissioned SQL
-database. Each native or browser peer verifies signed records and executes
-**ordinary SQLite transactions** on the same pinned DoltLite engine. A signed
+Chronolog DB is a TypeScript prototype of a decentralized, permissioned
+application log. One signed change program combines **ordinary SQLite
+transactions**, platform operations, and bounded durable events. Native and
+browser peers verify the same original records; SQL profiles execute the same
+pinned DoltLite engine, and event-only profiles do not load it. A signed
 genesis selects one of two built-in history policies: peer chronological
 admission/finality, or certified canonical log positions. SQL executes locally;
-Tendriller can provide an optional retained log and prefix authority.
+the resident native agent can own the fixed coordinated authority. Tendriller
+can host and connect the application, or supply an optional retained log adapter.
 
 Peer chronological history can replay a tentative suffix when a late transaction
 arrives. Coordinated history applies a complete certified prefix in log order.
 Both expose separate local and final SQL revisions, durable submission identity,
-and live reader/writer enrollment. See [portable peers](docs/portable-peers.md)
-for the architecture and acceptance tests.
+and live scoped reader/writer enrollment. See the [application-log roadmap and
+evidence](docs/plans/application-log.md), [resident agent](packages/agent-service/README.md),
+and [portable peers](docs/portable-peers.md) for the architecture and tests.
 
 - **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
   dialect or migration system. Assumptions are SQL statements, usually
   `SELECT chronolog_assert(condition, 'code')`; a failing statement rejects the
   whole transaction.
+- **Atomic events.** Accepted programs expose whole-proposal event batches with
+  stable IDs; rejected programs expose no effective events. Final event readers
+  use bounded pull delivery and history/filter-bound cursors, including progress
+  across nonmatching records. Local projections atomically checkpoint state and
+  processed progress outside the consensus core.
+- **Coherent views.** A bounded read lease pins SQL and effective events to one
+  view. Provisional rebases replace that view; finality and operation status can
+  advance even when rows stay equal.
 - **Owner-controlled rows.** Every application table automatically gets a
   `chronolog_owner` column stamped with the signer of the insert, stored as a
   small integer id (`chronolog_principals` maps ids to keys).
@@ -36,6 +48,11 @@ for the architecture and acceptance tests.
   policy. Live signed enrollment grants reader/writer access with explicit
   historical-key approval. Writes bind their exact grant, and revocations
   activate at verified policy boundaries. Epoch keys are wrapped to readers.
+  SQL, durable topic and ephemeral signal rights are distinct. Limited
+  publishers use original-signer ingress without reader keys or a local replica.
+- **Resident work.** A fenced native store owns the authority, final-intent
+  workers, timer generations and durable dispatch checkpoints. External effects
+  require provider idempotency/reconciliation or an explicit uncertain state.
 
 Read [the design](docs/design.md) for how it works,
 [Specification 10](docs/implementation-specs/10-deterministic-sql-transactions.md)
@@ -64,7 +81,7 @@ pnpm cli transact @transaction.json
 pnpm cli outcome TRANSACTION_ID
 ```
 
-A transaction file lists steps: SQL statements and platform operations.
+A transaction file lists steps: SQL statements, platform operations and emits.
 Bindings are JSON scalars or tagged values
 (`{"kind":"integer","value":"9007199254740993"}`, `{"kind":"real","value":1}`,
 `{"kind":"blob","value":"BASE64URL"}`). The daemon's own node is the group's
@@ -109,6 +126,49 @@ const rows = await client.query(`SELECT a.id, a.balance, p.key AS owner
 `setMembers`, `leave`), revocations and transfers (`transferRow`,
 `transferAll`, `acceptTransfer`); the CLI accepts the same operations as
 `{"platform": ...}` steps (see `apps/chronolog/src/main.ts`).
+
+## Application events and pinned views
+
+Programs and manifests are pre-release formats: `ChangeProgram` is version 3,
+and its signed transaction core binds a stable `operationId`. Reusing that ID
+with different program bytes fails. Exact retries recover the original proposal
+and outcome, including after a writer grant is revoked.
+
+```ts
+import { emit, program, sqlStatement } from '@chronolog/protocol'
+
+const claim = await client.submit(program(
+  sqlStatement("SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = ?) = 1, 'already_claimed')", ['task-1']),
+  sqlStatement('UPDATE tasks SET claimed_by = ? WHERE id = ?', ['member-1', 'task-1']),
+  emit('tasks/claimed', { taskId: 'task-1', memberId: 'member-1' }),
+), { operationId: 'claim-task-1' })
+await claim.final()
+
+const view = await client.readView({ view: 'final' })
+try {
+  const tasks = await view.query('SELECT id, claimed_by FROM tasks')
+  const events = await view.readEvents({ topics: ['tasks/claimed'] })
+  // Publish the combined UI only after both reads from this view finish.
+  render({ revision: view.revision, tasks, events })
+} finally { await view.release() }
+```
+
+The schema/row grants and topic rights must authorize this program. Durable
+workers consume `client.events` or `node.events`; use `DurableProjection` with
+an atomic store for replayable frontend caches. Received cursors are not durable
+processed checkpoints. Typing and replaceable progress use the separate signed
+ephemeral channel, ending in a durable result when persistence matters.
+
+`@chronolog/runtime-browser/events` opens the SQL-free OPFS Worker profile and
+exports `WorkerRpcTransport`. Its exclusive owner, synchronous private control
+journal and durable outbox preserve restart semantics without a WASM engine.
+The SQL profile retains the real pinned engine and isolated-Worker requirements.
+
+The [contrib pilot](https://github.com/werg/tendriller-contrib/pull/13) contains
+two task/chat layouts using the public application backend and the resident
+worker's actual request/result envelopes. Real deployment network routes,
+cost, disk-loss recovery and privacy/device qualification remain separately
+tracked there.
 
 Set `CHRONOLOG_URL`, `CHRONOLOG_GROUP_ID` and `CHRONOLOG_TOKEN` for a
 non-default daemon. RPC refuses a non-loopback bind without a token.
