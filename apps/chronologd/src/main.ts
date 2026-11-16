@@ -173,7 +173,10 @@ async function startRuntime() {
         readerPublicKey: bootstrap.recipientPublicKey, transportAuthor: transport.identity, governance,
         activeMembership: () => governed!.activeSnapshot,
         ...(governed.enrollmentIssuer === undefined ? {} : { issuer: governed.enrollmentIssuer }),
-        connected: async () => governance!.ownsCapabilityFeed || (await transport.status()).peers.length > 0,
+        connected: async () => {
+          const status = await transport.status()
+          return governance!.ownsCapabilityFeed || (status.connected ?? status.peers.length > 0)
+        },
         executionManifestDigest,
         isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
       })

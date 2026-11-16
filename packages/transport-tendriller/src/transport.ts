@@ -51,6 +51,7 @@ export class TendrillerTransport implements ChronologTransport {
   #stopWatch: (() => void) | undefined
   #retry: ReturnType<typeof setTimeout> | undefined
   #lastError: string | undefined
+  #relayConnected = false
   #closed = false
 
   constructor(options: TendrillerTransportOptions) {
@@ -69,7 +70,7 @@ export class TendrillerTransport implements ChronologTransport {
     if (this.#watch) {
       this.#stopWatch = this.#records.watch({
         historyId: this.#configuration.historyId, after: 0,
-        onError: (error) => { this.#lastError = error.message },
+        onError: (error) => { this.#relayConnected = false; this.#lastError = error.message },
       }, () => { void this.catchUp().catch(() => undefined) })
       void this.catchUp().catch(() => undefined)
     }
@@ -132,7 +133,11 @@ export class TendrillerTransport implements ChronologTransport {
 
   async status(): Promise<TransportStatus> {
     const status = await this.#local.status()
-    return { ...status, ...(this.#lastError === undefined ? {} : { lastCatchUpError: this.#lastError }) }
+    return {
+      ...status,
+      connected: !this.#closed && (this.#relayConnected || (status.connected ?? status.peers.length > 0)),
+      ...(this.#lastError === undefined ? {} : { lastCatchUpError: this.#lastError }),
+    }
   }
 
   async close(): Promise<void> {
@@ -153,6 +158,7 @@ export class TendrillerTransport implements ChronologTransport {
         this.#lastError = undefined
         return result
       } catch (error) {
+        this.#relayConnected = false
         this.#lastError = error instanceof Error ? error.message : String(error)
         this.#scheduleRetry()
         throw error
@@ -190,6 +196,7 @@ export class TendrillerTransport implements ChronologTransport {
       const accepted = await this.#records.append(record.payload, { historyId: this.#configuration.historyId, signal: this.#controller.signal })
       await this.#local.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry: adaptRecordEntry(accepted) }))
       this.#acknowledged.add(id)
+      this.#relayConnected = true
     }
   }
 
@@ -214,5 +221,6 @@ export class TendrillerTransport implements ChronologTransport {
         this.#previous = { historyId, position: entry.position, root: entry.root, bytes: this.#previous.bytes + entry.bytes.length }
       }
     }
+    this.#relayConnected = true
   }
 }

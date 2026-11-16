@@ -86,6 +86,7 @@ export interface RpcNodeStatusSnapshot {
   readonly transport: {
     readonly records: number
     readonly peers: readonly string[]
+    readonly connected?: boolean
     readonly configuredPeers?: readonly unknown[]
     readonly feedsWithGaps?: number
     readonly feedStates?: readonly { readonly hasGaps: boolean }[]

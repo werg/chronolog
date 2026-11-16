@@ -157,7 +157,9 @@ describe('public Tendriller adapter', () => {
 
   it('leaves durable local work and evidence usable while the authority route is unavailable', async () => {
     const f = await fixture(), author = await peer(), adapter = f.adapter(author.transport)
+    expect(await adapter.status()).toMatchObject({ connected: false, peers: [] })
     await adapter.publish(envelope('candidate', 1)); await adapter.catchUp()
+    expect(await adapter.status()).toMatchObject({ connected: true, peers: [] })
     f.offline()
     await expect(adapter.publish(envelope('candidate', 2))).rejects.toThrow('Hub unavailable')
     expect(await adapter.history()).toHaveLength(2)
@@ -165,10 +167,14 @@ describe('public Tendriller adapter', () => {
     for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(1)
     expect((await adapter.status()).lastCatchUpError).toContain('Hub unavailable')
+    expect(await adapter.status()).toMatchObject({ connected: false, peers: [] })
     f.online(); await adapter.catchUp()
     for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(2)
     expect((await f.log.head()).position).toBe(2)
+    expect(await adapter.status()).toMatchObject({ connected: true, peers: [] })
+    await adapter.close()
+    expect((await adapter.status()).connected).toBe(false)
   })
 
   it('retries a lost certificate response even when no new head hint arrives', async () => {

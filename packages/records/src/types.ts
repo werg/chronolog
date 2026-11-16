@@ -22,6 +22,8 @@ export interface TransportStatus {
   readonly records: number
   readonly closed: boolean
   readonly peers: readonly string[]
+  /** Reachable history route, including a retained log with no live feed peers. */
+  readonly connected?: boolean
   readonly configuredPeers?: readonly {
     readonly feedId: string
     readonly address: string

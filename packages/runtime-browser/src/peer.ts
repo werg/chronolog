@@ -113,7 +113,10 @@ export async function openBrowserPeer(options: {
       readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: owned.transport.identity,
       governance: governed.governance, activeMembership: () => governed!.activeSnapshot,
       ...(governed.enrollmentIssuer === undefined ? {} : { issuer: governed.enrollmentIssuer }),
-      connected: async () => (await owned.transport.status()).peers.length > 0 || governed!.governance.ownsCapabilityFeed,
+      connected: async () => {
+        const status = await owned.transport.status()
+        return governed!.governance.ownsCapabilityFeed || (status.connected ?? status.peers.length > 0)
+      },
       executionManifestDigest: node.executionManifestDigest,
       isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
     })

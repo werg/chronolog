@@ -24,6 +24,20 @@ function readerNode(): ChronologRpcNodeService {
 }
 
 describe('NodeRpcService policy views and enrollment', () => {
+  it.each([true, false])('reports retained-route connectivity %s without inventing feed peers', async (connected) => {
+    const service = new NodeRpcService({ node: {
+      ...readerNode(),
+      controlStore: { listCandidates: () => [] },
+      async status() {
+        return { started: true, materializedRevision: 6n, orderLength: 3, validating: false,
+          processedTransportRecords: 1, materializationPending: false, quarantinedFeeds: [],
+          transport: { records: 1, peers: [], connected } }
+      },
+    } })
+    const result = await service.getReplicationStatus({ groupId: group, requestId: 'status' }, { method: 'replication.getStatus' })
+    expect(result).toMatchObject({ state: connected ? 'current' : 'offline', connectedPeers: 0, knownPeers: 0 })
+  })
+
   it('delivers new finality after reconnecting with a cursor from an older process', async () => {
     let revision = 1n
     let finalized = false

@@ -375,7 +375,7 @@ export class NodeRpcService implements ChronologRpcService {
         ? 'degraded'
         : ingestionBacklog > 0 || feedsWithGaps > 0 || pendingPayloads > 0 || status.materializationPending
           ? 'syncing'
-          : knownPeers === 0 || status.transport.peers.length > 0 ? 'current' : 'offline',
+          : (status.transport.connected ?? (knownPeers === 0 || status.transport.peers.length > 0)) ? 'current' : 'offline',
     }
   }
 
