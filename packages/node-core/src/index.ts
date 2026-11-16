@@ -18,3 +18,4 @@ export * from './wire.js'
 
 export * from './events.js'
 export * from './publisher.js'
+export * from './ledger-record.js'

@@ -16,3 +16,4 @@ export { FeedForkRegistry } from './feed-forks.js'
 
 export * from './events.js'
 export * from './publisher.js'
+export * from './ledger-record.js'

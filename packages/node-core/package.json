@@ -6,7 +6,8 @@
   "exports": {
     ".": { "browser": "./src/browser.ts", "default": "./src/index.ts" },
     "./browser": "./src/browser.ts",
-    "./history": "./src/history-policy.ts"
+    "./history": "./src/history-policy.ts",
+    "./ledger": "./src/ledger-record.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
