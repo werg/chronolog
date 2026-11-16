@@ -22,7 +22,7 @@ bidirectional old/new mirrors, or automatic authority/policy cutovers.
 
 | Roadmap phase | Implemented boundary | Evidence and next qualification |
 | --- | --- | --- |
-| A. Authority and administration placement | Fixed native ordering authority, portable Cloudflare membership administrator, separately signed schema administrator, typed descriptor history and detached envelopes. | Native late-join/revocation and exact-retry fixture; complete public host/browser gate pending. Separate administrator/native volume recovery remains [contrib #16](https://github.com/werg/tendriller-contrib/issues/16). |
+| A. Authority and administration placement | Fixed native ordering authority, portable Cloudflare membership administrator, separately signed schema administrator, typed descriptor history and detached envelopes. | Native late-join/revocation and exact-retry fixture; complete packaged workerd/native/fresh-browser gate passed in [run 43940378818](https://github.com/werg/chronolog-db/actions/runs/43940378818), authored head `5cfa04440029c24d4313e7b8e88e593952180adb`. Separate administrator/native volume recovery remains [contrib #16](https://github.com/werg/tendriller-contrib/issues/16). |
 | B. General durable events | Version 3 `ChangeProgram` contains SQL, platform operations and bounded literal emits. Event-only and mixed execution, stable event IDs and final durable cursors. | Actual native SQL rollback/reopen and event-only restart. Actual SQL-free Chromium/OPFS qualification passed at the recorded head below. |
 | C. Projections, workers and timers | Pinned combined views, keyed operation status, atomic projection checkpoints, final-intent worker journal, explicit provider recovery, signed signals and generation-fenced SQL timer publication. | Native rebase/finality, SQLite checkpoint rollback, worker ambiguity/deadline and SQL timer integration. Complete two-layout UI gate is separately reported. |
 | D. Production connection path | Bounded framing and mutual grant-checked sessions carry records, evidence, wake hints and ephemeral frames. Real loopback HTTP fixture; Tendriller bounded hosted peer relay. | This proves the protocol over actual native/browser streams, not public-network NAT traversal. Select production direct/fallback routes through [contrib #14](https://github.com/werg/tendriller-contrib/issues/14). |
@@ -109,8 +109,23 @@ not inject capabilities, raw epoch keys or a replacement roster provider.
 Candidate count and payload size vary independently. Reports retain encoded
 descriptor/control and full-peer payload counters, exact package hashes,
 per-stage evidence and failures. `--build-only` explicitly records that workerd
-and browser scenarios were not run. The complete gate remains pending until its
-exact CI report is attached; deployment evidence stays in the contrib issues.
+and browser scenarios were not run. The complete gate passed in
+[CI run 43940378818](https://github.com/werg/chronolog-db/actions/runs/43940378818)
+on clean tested merge `43efd510001c2608bc1e28ee4c7d100cb34c773b` of authored head
+`5cfa04440029c24d4313e7b8e88e593952180adb`, consuming Tendriller
+`43cac4e75b0bbe1e422f4879b7249d6db5988440` with clean embedded membership source
+`46b72ebc1c69f71b4cabab744ef19c6a4e50dfec`. Its report records seven runtime
+assertions plus the independent build/import audit, Chromium `158.0.8127.18`,
+zero application envelope bytes on the administrator path and no page errors.
+Four small candidate envelopes totaled 2,668 bytes with 568 descriptor bytes;
+four large envelopes totaled 789,092 bytes with 576 descriptor bytes. Doubling
+the small candidate count doubled descriptor bytes to 1,136. The same run's
+separate pregranted two-layout application fixture passed eight checks with one
+effect dispatch and zero host application writes. Artifact `14262634338` has
+SHA-256 `910ac51584c70818dcbf93c945a0766abc01ecaa16c168f80b7cf6810e2b877d`;
+the [contrib evidence](https://github.com/werg/tendriller-contrib/blob/feat/chronolog-application-log/cookbooks/run-a-peer-application/notes/thin-membership-administration.md)
+retains the exact reports and per-scenario limits. Deployment evidence stays in
+the contrib issues.
 
 ## Public application model
 
