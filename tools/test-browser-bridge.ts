@@ -20,7 +20,7 @@ const output = join(workspace, 'artifacts/browser-bridge')
 await mkdir(output, { recursive: true })
 const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap((name) =>
   ['', '/browser'].map((suffix) => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
-for (const [name, file] of [['history', 'history-policy'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
+for (const [name, file] of [['history', 'history-policy'], ['finality', 'finality'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
   alias[`@chronolog/node-core/${name}`] = join(workspace, `packages/node-core/src/${file}.ts`)
 }
 await build({

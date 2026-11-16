@@ -55,6 +55,7 @@ try {
   const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap(name =>
     ['', '/browser'].map(suffix => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
   alias['@chronolog/node-core/history'] = join(workspace, 'packages/node-core/src/history-policy.ts')
+  alias['@chronolog/node-core/finality'] = join(workspace, 'packages/node-core/src/finality.ts')
   alias['@chronolog/node-core/ledger'] = join(workspace, 'packages/node-core/src/ledger-record.ts')
   alias['@chronolog/node-core/membership'] = join(workspace, 'packages/node-core/src/membership.ts')
   const publicApi = await build({ absWorkingDir: workspace, entryPoints: ['test/thin-membership/public.ts'],

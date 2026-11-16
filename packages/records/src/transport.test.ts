@@ -22,6 +22,22 @@ async function peer() {
 }
 
 describe('portable peer replication', () => {
+  it('keeps replacement connections when an older in-process route detaches', async () => {
+    const [author, reader] = await Promise.all([peer(), peer()])
+    const oldRoute = connectInProcess(author, reader)
+    await reader.catchUp()
+    const currentRoute = connectInProcess(author, reader)
+    oldRoute(); oldRoute()
+    expect((await reader.status()).peers).toContain(author.identity)
+    expect((await author.status()).peers).toContain(reader.identity)
+    const record = await author.publish(Uint8Array.of(2, 7, 1))
+    await reader.catchUp()
+    expect((await reader.get(record.id))?.payload).toEqual(record.payload)
+    currentRoute()
+    expect((await reader.status()).peers).not.toContain(author.identity)
+    expect((await author.status()).peers).not.toContain(reader.identity)
+  })
+
   it('fetches and retains only explicitly requested payloads without following their author feed', async () => {
     const [author, reader, relay] = await Promise.all([peer(), peer(), peer()])
     const payload = new Uint8Array(96_000).fill(7), hash = await payloadHash(payload)

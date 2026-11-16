@@ -78,18 +78,24 @@ describe('authenticated framed range synchronization', () => {
       openAuthenticatedPeerLink({ connection: browserConnection, local: browser.transport.asLink(), groupId, grantId, identity: browser.identity,
         authorizePeer: ({ authorId }) => equalBytes(authorId, nativeIdentity.publicKeyBytes) }),
     ])
-    cleanup.push(async () => { native.disconnectLink(nativeSession.link.identity); browser.transport.disconnect(browserSession.link.identity)
-      await Promise.all([nativeSession.close(), browserSession.close()]) })
     const nativeRecord = await native.publish(utf8('native record'))
     const browserRecord = await browser.transport.publish(utf8('browser record'))
     await native.putEvidence(utf8('portable certificate bytes'))
-    native.connectLink(nativeSession.link)
-    browser.transport.connect(browserSession.link)
+    const detachNative = native.connectLink(nativeSession.link), detachBrowser = browser.transport.connect(browserSession.link)
+    cleanup.push(async () => { detachNative(); detachBrowser()
+      await Promise.all([nativeSession.close(), browserSession.close()]) })
     await Promise.all([native.catchUpLinks(), browser.transport.catchUp()])
     expect((await native.get(browserRecord.id))?.payload).toEqual(browserRecord.payload)
     expect((await browser.transport.get(nativeRecord.id))?.payload).toEqual(nativeRecord.payload)
     expect((await browser.transport.evidenceHistory()).map((evidence) => evidence.bytes)).toContainEqual(utf8('portable certificate bytes'))
     expect((await native.status()).peers).toContain(browser.transport.identity)
+    const detachReplacement = native.connectLink(nativeSession.link)
+    detachNative()
+    const afterReplacement = await browser.transport.publish(utf8('after native route replacement'))
+    await native.catchUpLinks()
+    expect((await native.get(afterReplacement.id))?.payload).toEqual(afterReplacement.payload)
+    expect((await native.status()).peers).toContain(browser.transport.identity)
+    detachReplacement()
     // Membership is rechecked for range requests after the handshake.
     active = false
     await expect(browserSession.link.read(native.identity, 0n, 1)).rejects.toThrow('PEER_READ_UNAUTHORIZED')

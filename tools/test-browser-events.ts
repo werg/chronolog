@@ -17,7 +17,7 @@ const output = join(workspace, 'artifacts/browser-events')
 await mkdir(output, { recursive: true })
 const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap((name) =>
   ['', '/browser'].map((suffix) => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
-for (const [name, file] of [['history', 'history-policy'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
+for (const [name, file] of [['history', 'history-policy'], ['finality', 'finality'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
   alias[`@chronolog/node-core/${name}`] = join(workspace, `packages/node-core/src/${file}.ts`)
 }
 const bundled = await build({ absWorkingDir: workspace,
@@ -64,12 +64,21 @@ let native: NativeBrowserFixture | undefined
 const checks: string[] = ['SQL-free Worker/client emitted bundle has no SQL or WASM implementation bytes']
 const deviceEvidence: Record<string, unknown> = {
   boundary: 'real Chromium OPFS and native process on loopback; synthetic enrolled identities',
-  quotaMethod: 'Chromium DevTools Storage.overrideQuotaForOrigin, then actual OPFS writes',
+  quotaMethod: 'Chromium Storage Bucket with 64 KiB quota; production OPFS checkpoint and operation-journal classes',
+  defaultBucketQuota: { qualified: false, reason: 'DevTools quota override did not enforce OPFS replacement in Chromium 158.0.8127.18',
+    observedRun: 'https://github.com/werg/chronolog-db/actions/runs/43967265774' },
   storageLossMethod: 'Chromium DevTools Storage.clearDataForOrigin after orderly Worker shutdown',
   exclusions: ['physical device storage pressure or OS eviction', 'deployed identity-provider authentication',
     'private production workload audit', 'browser-vendor and mobile background policies'],
 }
 const passed = (check: string) => { checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
+const save = (passed: boolean, error?: unknown) => writeFile(join(output, 'report.json'), JSON.stringify({
+  passed, browser: browser.version(), checks, engineRequests,
+  nativeFinalThrough: native?.node.finalThrough ?? null, backend: 'native-fixed-authority',
+  transport: 'authenticated-framed-loopback', deviceEvidence,
+  ...(error === undefined ? {} : { error: error instanceof Error ? error.stack ?? error.message :
+    typeof error === 'string' ? error : 'Unknown non-Error failure' }),
+}, null, 2) + '\n')
 const deadline = setTimeout(() => { void page.close() }, 210_000)
 page.on('pageerror', (error) => process.stderr.write(`browser: ${error.message}\n`))
 page.on('console', (message) => { if (message.type() === 'error') process.stderr.write(`browser: ${message.text()}\n`) })
@@ -97,7 +106,7 @@ try {
   const filtered = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.read('owner', { topics: ['chat'], limit: 1 }))
   assert.equal(filtered.transactions[0]!.events.length, 1)
   assert.equal(filtered.transactions[0]!.proposalId, published.proposalId)
-  passed('browser signs one atomic event proposal; native authority orders it and returns identical final events over framed ranges')
+  passed('browser signs one atomic event proposal; native inclusion and closure evidence produces identical chronologically ordered final events over framed ranges')
 
   const revision = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.capture('owner', 'before-native'))
   const pending = page.evaluate(({ cursor }) => (globalThis as unknown as TestWindow).chronologEventTest.readNext('owner', { cursor }), { cursor: first.scannedThrough })
@@ -169,24 +178,13 @@ try {
   passed('an isolated browser context cannot reopen another device identity; explicit setup produces independently keyed storage')
 
   const cdp = await context.newCDPSession(page), origin = new URL(page.url()).origin
-  const usageBefore = await cdp.send('Storage.getUsageAndQuota', { origin })
-  let rejectedSubmission: string | undefined
-  let appliedQuota: typeof usageBefore | undefined
-  await cdp.send('Storage.overrideQuotaForOrigin', { origin, quotaSize: 1 })
-  try {
-    appliedQuota = await cdp.send('Storage.getUsageAndQuota', { origin })
-    assert.equal(appliedQuota.quota, 1)
-    await assert.rejects(page.evaluate(({ next }) => (globalThis as unknown as TestWindow).chronologEventTest.checkpoint('cutoff-reopened',
-      { ...next, state: 'full'.repeat(262_144) }), { next }), /QuotaExceeded|quota|space/iu)
-    assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.checkpointState('cutoff-reopened')), next)
-    try {
-      await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.publish('cutoff-reopened',
-        [{ topic: 'chat', payload: { message: 'quota refuses durable preparation' } }], 'browser-quota-operation'))
-    } catch (error) { rejectedSubmission = error instanceof Error ? error.message : String(error) }
-    assert.match(rejectedSubmission ?? '', /QuotaExceeded|quota|space/iu)
-    assert.equal(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.operation('cutoff-reopened', 'browser-quota-operation')), null)
-    assert.equal((await native.transport.history()).length, recordsBeforePrivate)
-  } finally { await cdp.send('Storage.overrideQuotaForOrigin', { origin }) }
+  deviceEvidence.originStorageBeforeQuotaProbe = await cdp.send('Storage.getUsageAndQuota', { origin })
+  const quota = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.quota('cutoff-reopened'))
+  deviceEvidence.quota = quota
+  assert.equal(quota.passed, true)
+  assert.equal((await native.transport.history()).length, recordsBeforePrivate)
+  passed('real limited-bucket quota errors preserve production OPFS checkpoints and durable operation retries without calling apply for failed preparation')
+
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.close('cutoff-reopened'))
   const quotaReopened = await page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('quota-reopened', name, bootstrap), { name, bootstrap })
   assert.equal(quotaReopened.identity, identity.identity)
@@ -194,21 +192,18 @@ try {
   const acceptedRetry = await page.evaluate(({ events }) => (globalThis as unknown as TestWindow).chronologEventTest.publish('quota-reopened', events, 'browser-atomic-1'), { events })
   assert.equal(acceptedRetry.proposalId, published.proposalId)
   assert.equal((await native.transport.history()).length, recordsBeforePrivate)
-  const afterQuota = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.publish('quota-reopened',
-    [{ topic: 'chat', payload: { message: 'quota refuses durable preparation' } }], 'browser-quota-operation'))
-  assert.equal(afterQuota.outcome.outcome.type, 'accepted')
-  deviceEvidence.quota = { usageBefore, appliedQuota, quotaBytes: 1, failedPreparationLeftNoOperation: true,
-    preservedCheckpoint: next, originalProposalId: published.proposalId, retryProposalId: acceptedRetry.proposalId,
-    restoredPublication: afterQuota.proposalId, failure: rejectedSubmission }
-  passed('actual browser quota failure preserves the prior atomic checkpoint and submits no operation; restored space and reopen retain exact accepted retries')
+  deviceEvidence.defaultPeerReopen = { boundary: 'separate default bucket; it was not quota-exhausted',
+    identity: quotaReopened.identity, preservedCheckpoint: next, originalProposalId: published.proposalId,
+    retryProposalId: acceptedRetry.proposalId, exactRetryAddedRecords: 0 }
 
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.close('quota-reopened'))
   const partialLossHead = (await native.transport.history()).length
-  const backup = await page.evaluate((name) => (globalThis as unknown as TestWindow).chronologEventTest.removeManifest(name), name)
+  const backup = await page.evaluate((name) => (globalThis as unknown as TestWindow).chronologEventTest.removeFeedMetadata(name), name)
   assert.equal(backup.identity, identity.identity)
   await assert.rejects(page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('partial-loss', name, bootstrap), { name, bootstrap }), /BROWSER_FEED_MANIFEST_MISSING/u)
   assert.equal((await native.transport.history()).length, partialLossHead)
-  await page.evaluate(({ name, manifest }) => (globalThis as unknown as TestWindow).chronologEventTest.restoreManifest(name, manifest), { name, manifest: backup.manifest })
+  await page.evaluate(({ name, manifest, binding }) => (globalThis as unknown as TestWindow).chronologEventTest.restoreFeedMetadata(name, manifest, binding),
+    { name, manifest: backup.manifest, binding: backup.binding })
   const partialRestored = await page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('partial-restored', name, bootstrap), { name, bootstrap })
   assert.equal(partialRestored.identity, identity.identity)
   const partialRetry = await page.evaluate(({ events }) => (globalThis as unknown as TestWindow).chronologEventTest.publish('partial-restored', events, 'browser-atomic-1'), { events })
@@ -218,10 +213,10 @@ try {
     [{ topic: 'chat', payload: { message: 'continues the original signed feed' } }], 'browser-after-manifest-restore'))
   assert.equal(afterPartialRestore.outcome.outcome.type, 'accepted')
   assert.notEqual(afterPartialRestore.proposalId, published.proposalId)
-  deviceEvidence.partialStorageLoss = { deleted: 'feed/manifest', identityRetained: true, error: 'BROWSER_FEED_MANIFEST_MISSING',
+  deviceEvidence.partialStorageLoss = { deleted: ['feed/manifest', 'browser/feed-initialized'], identityRetained: true, error: 'BROWSER_FEED_MANIFEST_MISSING',
     exactManifestRestored: true, originalRetryProposalId: partialRetry.proposalId, exactRetryAddedRecords: 0,
     nextPublication: afterPartialRestore.proposalId }
-  passed('selective OPFS feed-manifest loss with surviving keys fails closed; restoring the exact saved manifest retains original proposals without position reuse')
+  passed('loss of both OPFS feed metadata files with surviving keys fails closed; verified restore retains original proposals and continues without position reuse')
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.close('partial-restored'))
   const nativeRecordsBeforeLoss = (await native.transport.history()).length
   await cdp.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' })
@@ -238,9 +233,11 @@ try {
   passed('cleared OPFS fails closed instead of silently replacing identity; deliberate replacement has new keys and no inherited grants or original operation journal')
   await cdp.detach()
   native.assertHealthy()
-  await writeFile(join(output, 'report.json'), JSON.stringify({ passed: true, browser: browser.version(), checks, engineRequests,
-    nativeFinalThrough: native.node.finalThrough, backend: 'native-fixed-authority', transport: 'authenticated-framed-loopback', deviceEvidence }, null, 2) + '\n')
+  await save(true)
   process.stdout.write(`SQL-free browser qualification passed (${checks.length} checks), Chromium ${browser.version()}\n`)
+} catch (error) {
+  await save(false, error)
+  throw error
 } finally {
   clearTimeout(deadline)
   await context.close()

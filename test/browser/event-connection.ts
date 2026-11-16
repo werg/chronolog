@@ -61,10 +61,10 @@ export async function connectGovernedBrowserPeer(options: {
         equalBytes(capability.grant.signingPublicKey, authorId) && equalBytes(authorId, base64UrlToBytes(options.bootstrap.nativeIdentity))
     },
   })
-  options.transport.connect(session.link)
-  void session.completion.finally(() => options.transport.disconnect(session.link.identity)).catch(() => undefined)
+  const detach = options.transport.connect(session.link)
+  void session.completion.finally(detach).catch(() => undefined)
   const authenticatedMs = performance.now() - started
   return { completion: session.completion, sendSignal: (bytes: Uint8Array) => session.sendSignal(bytes),
     stats: () => publicPeer === undefined ? { route: 'http-fixture', authenticatedMs } : { route: publicPeer.route, authenticatedMs, ...publicPeer.stats },
-    async close() { options.transport.disconnect(session.link.identity); await session.close() } }
+    async close() { detach(); await session.close() } }
 }

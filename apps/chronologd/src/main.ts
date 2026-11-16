@@ -209,10 +209,7 @@ async function startRuntime() {
       })
       agent = await createDaemonAgentRuntime({ node, transport, store: operationStore, identity,
         history: governed.descriptor.history, activeMembership: () => governed!.activeSnapshot,
-        peerLinks: { local: transport.asLink(), attach: (link) => {
-          transport.connectLink(link)
-          return () => transport.disconnectLink(link.identity)
-        } },
+        peerLinks: { local: transport.asLink(), attach: (link) => transport.connectLink(link) },
         authorityQuotaBytes: runtime.authorityQuotaBytes,
         cutoffLagMs: Number(bootstrap.genesis.manifest.clockPolicy.cutoffLagMs),
         futureAdmissionWindowMs: Number(bootstrap.genesis.manifest.clockPolicy.maxFutureSkewMs + bootstrap.genesis.manifest.clockPolicy.cutoffLagMs),

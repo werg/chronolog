@@ -1,6 +1,7 @@
 import {
   Mutex, ReferenceRecordLog, createPrefixAuthority, encodeHistoryConfiguration, encodeOrderingEvidence, orderedGenesisRoot,
   createFinalityClosureRecord, evaluateFinalitySnapshot, createLedgerRecord, decodeLedgerRecord, verifyLedgerPayload,
+  decodeOrderingEvidence, verifyPrefixCertificate,
 } from '@chronolog/node-core'
 import type {
   CoordinatedHistoryConfiguration, DurableOperationStore, OrderedRecordEntry, OrderedRecordHead, PrefixCertificate,
@@ -82,30 +83,53 @@ export class NativeAuthority {
       identity: { ...options.identity, publicKeyBytes: new Uint8Array(options.identity.publicKeyBytes) },
       ...(options.continuity === undefined ? {} : { continuity: structuredClone(options.continuity) }) }
     return authorityState(options.store, options.configuration.historyId).mutex.run(async () => {
-    const configuration = encodeHistoryConfiguration(options.configuration)
-    const key = `agent/authority/${options.configuration.historyId}/configuration`
-    const saved = await options.store.get(key)
-    if (saved !== null && !equalBytes(saved, configuration)) throw new Error('AUTHORITY_CONFIGURATION_MISMATCH')
-    // Validate key ownership before creating any durable authority state.
-    createPrefixAuthority({ configuration: options.configuration, identity: options.identity,
-      readHead: async () => { throw new Error('AUTHORITY_NOT_OPEN') } })
-    const log = await ReferenceRecordLog.open(options.configuration.historyId, options.store, options.quotaBytes)
-    // Reopen the complete closure history, including a marker committed before
-    // the process lost its certificate reply. Never reset a closed frontier.
-    await evaluateFinalitySnapshot(options.configuration, await log.read())
-    if (options.continuity !== undefined) {
-      const expected = options.continuity
-      const entries = await log.read()
-      const current = await log.head()
-      if (expected.historyId !== current.historyId || !Number.isSafeInteger(expected.position) ||
-          expected.position < 0 || expected.position > current.position ||
-          (expected.position === 0 ? await orderedGenesisRoot(current.historyId) :
-            entries[expected.position - 1]?.root) !== expected.root) {
-        throw new Error('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+      const configuration = encodeHistoryConfiguration(options.configuration)
+      const prefix = `agent/authority/${options.configuration.historyId}/`
+      const key = `${prefix}configuration`, saved = await options.store.get(key)
+      if (saved !== null && !equalBytes(saved, configuration)) throw new Error('AUTHORITY_CONFIGURATION_MISMATCH')
+      // Validate key ownership and any surviving certificate before creating or
+      // replacing durable state. A damaged local proof must never be overwritten.
+      createPrefixAuthority({ configuration: options.configuration, identity: options.identity,
+        readHead: async () => { throw new Error('AUTHORITY_NOT_OPEN') } })
+      const savedCertificate = await options.store.get(`${prefix}certificate`)
+      let retained: PrefixCertificate | undefined
+      if (savedCertificate !== null) {
+        try {
+          const evidence = decodeOrderingEvidence(savedCertificate)
+          if (evidence.kind !== 'prefix-certificate') throw new Error('AUTHORITY_CERTIFICATE_KIND_INVALID')
+          await verifyPrefixCertificate(evidence.certificate, options.configuration)
+          retained = evidence.certificate
+        } catch (error) { throw new Error('AUTHORITY_RETAINED_CERTIFICATE_INVALID', { cause: error }) }
       }
-    }
-    if (saved === null) await options.store.put(key, configuration)
-    return new NativeAuthority(options, log)
+      let log: ReferenceRecordLog
+      try {
+        log = await ReferenceRecordLog.open(options.configuration.historyId, options.store, {
+          ...(options.quotaBytes === undefined ? {} : { quotaBytes: options.quotaBytes }),
+          requireExisting: saved !== null || retained !== undefined || (options.continuity?.position ?? 0) > 0,
+        })
+      } catch (error) {
+        if (error instanceof Error && error.message === 'RECORD_LOG_MISSING') {
+          throw new Error('AUTHORITY_CONTINUITY_NOT_ESTABLISHED', { cause: error })
+        }
+        throw error
+      }
+      const entries = await log.read()
+      // Reopen the complete closure history, including a marker committed before
+      // the process lost its certificate reply. Never reset a closed frontier.
+      await evaluateFinalitySnapshot(options.configuration, entries)
+      const genesisRoot = await orderedGenesisRoot(log.historyId)
+      for (const expected of [retained, options.continuity]) {
+        if (expected === undefined) continue
+        if (expected.historyId !== log.historyId || !Number.isSafeInteger(expected.position) ||
+            expected.position < 0 || expected.position > entries.length ||
+            (expected.position === 0 ? genesisRoot : entries[expected.position - 1]?.root) !== expected.root) {
+          throw new Error('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+        }
+      }
+      // ReferenceRecordLog has already durably initialized even an empty log.
+      // Thus a saved configuration always requires that log on a later open.
+      if (saved === null) await options.store.put(key, configuration)
+      return new NativeAuthority(options, log)
     })
   }
 

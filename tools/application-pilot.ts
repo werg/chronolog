@@ -11,7 +11,8 @@ import { parseArgs } from 'node:util'
 import type { AgentApplicationModule } from '@chronolog/agent-service'
 import { OWNER_FOR_KEY_SQL, type TransactionHandle } from '@chronolog/client'
 import { DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite'
-import { base64UrlToBytes, bytesToBase64Url, program, sqlStatement, type EffectiveEvent, type EventBatch } from '@chronolog/protocol'
+import { decodeLedgerRecord, isFinalityClosureRecord } from '@chronolog/node-core'
+import { base64UrlToBytes, bytesToBase64Url, compareTransactionOrder, program, sqlStatement, utf8, type EffectiveEvent, type EventBatch } from '@chronolog/protocol'
 import { chromium, expect, type Browser, type Page } from '@playwright/test'
 import { build } from 'esbuild'
 
@@ -47,6 +48,7 @@ const report = { format: 'chronolog-application-pilot/v1', status: 'building', p
 const record = async () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
 const passed = (check: string) => { report.checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
 let native: NativeBrowserFixture | undefined, browser: Browser | undefined, directory: string | undefined
+let heldFinalityClock: number | undefined
 let routes: Awaited<ReturnType<typeof createPeerRouteFixture>> | undefined
 let closeServer: (() => Promise<void>) | undefined
 let deadline: ReturnType<typeof setTimeout> | undefined
@@ -55,6 +57,7 @@ try {
   const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap(name =>
     ['', '/browser'].map(suffix => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
   alias['@chronolog/node-core/history'] = join(workspace, 'packages/node-core/src/history-policy.ts')
+  alias['@chronolog/node-core/finality'] = join(workspace, 'packages/node-core/src/finality.ts')
   alias['@chronolog/node-core/ledger'] = join(workspace, 'packages/node-core/src/ledger-record.ts')
   alias['@chronolog/node-core/membership'] = join(workspace, 'packages/node-core/src/membership.ts')
   const publicBundle = await build({ absWorkingDir: workspace, entryPoints: ['test/application-pilot/public.ts'],
@@ -105,7 +108,7 @@ try {
     const startNative = async (): Promise<PilotBootstrap> => {
       const executionManifest = createDoltLiteExecutionManifest()
       native = await createNativeBrowserFixture({ directory: nativeDirectory, browsers: [...registrations.values()].map(value => value.identity),
-        manifest: executionManifest, application,
+        manifest: executionManifest, application, finalityClock: () => heldFinalityClock ?? Date.now(),
         materialization: async ({ identity }) => createDoltLiteMaterializationRuntime(await DeterministicMaterializer.open({
           path: join(nativeDirectory, 'application.db'), executionManifest, rootAdministrator: identity.signing.publicKeyBytes,
         })) })
@@ -189,24 +192,53 @@ try {
     assert.deepEqual((await native.client.events.read()).transactions, beforeTyping)
     passed('typing traverses authenticated ephemeral frames, expires and leaves no durable event')
 
-    await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.disconnect())))
-    await Promise.all(all.map(page => page.locator('#tasks [data-action="claim"]').click()))
-    await Promise.all(all.map(page => page.waitForFunction(() => {
-      const row = document.querySelector('#operations li'); return row !== null && row.getAttribute('data-status') !== 'unknown'
-    })))
-    const claimIds = await Promise.all(all.map(page => page.locator('#operations > li').first().getAttribute('data-operation')))
-    assert(claimIds.every(id => id !== null))
-    await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.reconnect())))
+    // Keep the timestamp window open while deliberately disconnected clients
+    // prepare their conflicting writes. An ordinary offline write arriving
+    // after its timestamp has closed must instead be finally rejected.
+    heldFinalityClock = Date.now()
+    const clockHeldAt = heldFinalityClock
+    const authority = native.agent.authority
+    assert(authority !== null)
+    const includedCandidates = async () => {
+      const range = await authority.read({ limit: 256 })
+      assert.equal(range.hasMore, false, 'pilot inclusion inspection must cover its complete small history')
+      return range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes) && decodeLedgerRecord(entry.bytes).kind === 'candidate')
+    }
+    const beforeClaims = (await includedCandidates()).length
+    let claimIds: Array<string | null> = []
+    try {
+      await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.disconnect())))
+      await Promise.all(all.map(page => page.locator('#tasks [data-action="claim"]').click()))
+      await Promise.all(all.map(page => page.waitForFunction(() => {
+        const row = document.querySelector('#operations li'); return row !== null && row.getAttribute('data-status') !== 'unknown'
+      })))
+      claimIds = await Promise.all(all.map(page => page.locator('#operations > li').first().getAttribute('data-operation')))
+      assert(claimIds.every(id => id !== null))
+      await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.reconnect())))
+      await waitFor(async () => (await includedCandidates()).length === beforeClaims + 2, 'both conflicting proposals included before releasing the timestamp closure')
+    } finally { heldFinalityClock = undefined }
+    report.diagnostics.concurrentClaims = { clock: 'native finality clock held only through disconnected authoring and inclusion of both claims',
+      heldAtMs: clockHeldAt, heldForMs: Date.now() - clockHeldAt, proposalTimestamps: 'unchanged browser clocks',
+      arbitraryOfflineAdmissionClaim: false }
     await Promise.all(all.map((page, index) => page.waitForFunction(id => {
       const row = document.querySelector(`[data-operation="${id}"]`); return ['final', 'rejected'].includes(row?.getAttribute('data-status') ?? '')
     }, claimIds[index]!)))
     const claimStates = await Promise.all(all.map((page, index) => page.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), claimIds[index]!)))
     assert.deepEqual(claimStates.map(state => state?.status).sort(), ['final', 'rejected'])
+    assert.equal(claimStates.find(state => state?.status === 'rejected')?.error, 'assert:task_unavailable')
+    await native.node.waitForIdle()
+    const claimOrder = claimStates.map((state, index) => {
+      assert(state?.proposalId !== undefined)
+      const candidate = native!.node.candidate(utf8(state.proposalId))
+      assert(candidate !== null)
+      return { index, orderKey: candidate.orderKey }
+    }).sort((left, right) => compareTransactionOrder(left.orderKey, right.orderKey))
+    assert.equal(claimStates[claimOrder[0]!.index]?.status, 'final', 'the earlier deterministic author-time key must win the SQL conflict')
     const winner = all[claimStates[0]?.status === 'final' ? 0 : 1]!
     const loser = all[claimStates[0]?.status === 'final' ? 1 : 0]!
     await Promise.all(all.map(page => expect(page.locator('#tasks [data-action="claim"]')).toBeDisabled()))
     assert.equal(await board.locator('#tasks .task > p').textContent(), await compact.locator('#tasks .task > p').textContent())
-    passed('both disconnected browsers author original competing claims; real authority reconnect produces one final acceptance and one retained final rejection')
+    passed('with the finality clock held through inclusion, disconnected competing claims resolve by deterministic author order to one acceptance and one SQL rejection')
 
     const rejectedJobStarted = Date.now()
     const previousLoserOperation = await loser.locator('#operations > li').first().getAttribute('data-operation')

@@ -464,19 +464,32 @@ export class ReferenceRecordLog {
     this.#mutex = referenceLogLock(store, historyId)
   }
 
-  static async open(historyId: string, store: DurableOperationStore, quotaBytes = 64 * 1024 * 1024): Promise<ReferenceRecordLog> {
+  static async open(historyId: string, store: DurableOperationStore, options: {
+    readonly quotaBytes?: number
+    /** Reopening an established authority must not recreate a missing log. */
+    readonly requireExisting?: boolean
+  } = {}): Promise<ReferenceRecordLog> {
     assertHistoryId(historyId)
+    const quotaBytes = options.quotaBytes ?? 64 * 1024 * 1024
     if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1 || quotaBytes > MAX_LOCAL_HISTORY_BYTES - MAX_RETAINED_HISTORY_ENTRIES * 512) {
       throw new Error('RECORD_LOG_QUOTA_INVALID')
     }
     const log = new ReferenceRecordLog(historyId, store, quotaBytes)
-    await log.read()
-    return log
+    return log.#mutex.run(async () => {
+      if (await store.get(`record-log/${historyId}`) === null) {
+        if (options.requireExisting === true) throw new Error('RECORD_LOG_MISSING')
+        // Establish a durable empty history before another component records
+        // successful setup. A later missing file is loss, not an empty prefix.
+        await store.put(`record-log/${historyId}`, encodeCanonicalCbor([]))
+      }
+      await log.read()
+      return log
+    })
   }
 
   async read(): Promise<readonly OrderedRecordEntry[]> {
     const bytes = await this.store.get(`record-log/${this.historyId}`)
-    if (bytes === null) return []
+    if (bytes === null) throw new Error('RECORD_LOG_MISSING')
     // The public log quota counts proposal bytes. Reserve a fixed bounded
     // allowance for the hash-chain/index encoding instead of using wire limits
     // that can make an already committed >16 MiB history impossible to reopen.

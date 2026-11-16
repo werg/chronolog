@@ -281,4 +281,13 @@ describe('signed provider selection', () => {
     }, options.identity.privateKey)
     await expect(createGovernedNode({ ...options, genesis })).rejects.toThrow('FINALITY_FUTURE_ADMISSION_WINDOW_INVALID')
   })
+
+  it('refuses signing a peer history with an unsupported provider', async () => {
+    const options = await configured()
+    const manifest: GenesisManifest = { ...options.genesis.manifest,
+      historyPolicy: { kind: 'peer', executionManifestDigest: options.materialization.queries.executionManifestDigest,
+        providerId: 'custom-peer-v1' },
+    }
+    await expect(signGenesis(manifest, options.identity.privateKey)).rejects.toThrow('Unknown validator finality provider')
+  })
 })

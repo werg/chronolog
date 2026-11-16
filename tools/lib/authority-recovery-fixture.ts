@@ -219,7 +219,7 @@ export async function inspectStoppedAuthority(directory: string) {
   assert(historyId !== undefined)
   const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
   try {
-    const log = await ReferenceRecordLog.open(historyId, store)
+    const log = await ReferenceRecordLog.open(historyId, store, { requireExisting: true })
     const entries = await log.read(), certificate = await store.get(`agent/authority/${historyId}/certificate`)
     return { head: await log.head(), entries: entries.map(entry => ({ position: entry.position, root: entry.root, recordId: entry.recordId,
       kind: isFinalityClosureRecord(entry.bytes) ? 'closure' as const : decodeLedgerRecord(entry.bytes).kind })),

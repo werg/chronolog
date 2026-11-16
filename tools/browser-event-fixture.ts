@@ -25,6 +25,8 @@ export async function createNativeBrowserFixture(options: {
   readonly directory: string
   readonly browsers: readonly BrowserEventIdentity[]
   readonly topics?: readonly string[]
+  /** Qualification-only clock control; signed proposal timestamps are unchanged. */
+  readonly finalityClock?: () => number
   readonly manifest?: ExecutionManifest
   readonly materialization?: (context: { readonly store: NativeAgentStore; readonly identity: EnrollmentIdentity;
     readonly executionManifest: ExecutionManifest }) => Promise<ChronologMaterializationRuntime>
@@ -73,8 +75,9 @@ export async function createNativeBrowserFixture(options: {
     cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
     futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
     closureIntervalMs: Number(genesis.manifest.clockPolicy.heartbeatIntervalMs),
+    ...(options.finalityClock === undefined ? {} : { finalityClock: options.finalityClock }),
     ...(options.application === undefined ? {} : { application: options.application }),
-    peerLinks: { local: transport.asLink(), attach(link) { transport.connect(link); return () => transport.disconnect(link.identity) } } })
+    peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
   const running = agent.run()
   let serviceFailure: Error | undefined
   void running.catch((error: unknown) => { serviceFailure = error instanceof Error ? error : new Error('NATIVE_AGENT_FAILED', { cause: error }) })

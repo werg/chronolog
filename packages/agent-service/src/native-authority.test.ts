@@ -4,9 +4,9 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence,
-  evaluateFinalitySnapshot, verifyPrefixCertificate } from '@chronolog/node-core'
+  encodeOrderingEvidence, evaluateFinalitySnapshot, verifyPrefixCertificate } from '@chronolog/node-core'
 import type { CoordinatedHistoryConfiguration, DurableOperationStore } from '@chronolog/node-core'
-import { encodeEnvelope, generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
+import { encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -19,12 +19,17 @@ const envelope = (text: string) => encodeEnvelope({ groupRoute: new Uint8Array(3
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-async function fixture() {
+async function credentials() {
   const identity = await generateEd25519KeyPair()
   const configuration: CoordinatedHistoryConfiguration = {
     kind: 'coordinated', historyId: 'h_0123456789abcdef0123456789abcdef', authorityPublicKey: identity.publicKeyBytes,
     groupId: new Uint8Array(32).fill(1), genesisDigest: new Uint8Array(32).fill(2), executionManifestDigest: new Uint8Array(32).fill(3),
   }
+  return { configuration, identity }
+}
+
+async function fixture() {
+  const { configuration, identity } = await credentials()
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-agent-authority-'))
   cleanup.push(() => rm(directory, { recursive: true, force: true }))
   const path = join(directory, 'agent.sqlite')
@@ -32,6 +37,20 @@ async function fixture() {
   cleanup.push(() => store.close())
   const clock = { now: 1_000 }
   return { configuration, identity, store, path, clock, now: () => clock.now, cutoffLagMs: 0 }
+}
+
+async function metadataFixture() {
+  const { configuration, identity } = await credentials()
+  const values = new Map<string, Uint8Array>()
+  const store: DurableOperationStore = {
+    get: async (key) => values.get(key)?.slice() ?? null,
+    put: async (key, bytes) => { values.set(key, bytes.slice()) },
+  }
+  const prefix = `agent/authority/${configuration.historyId}/`
+  const clock = { now: 1_000 }
+  return { configuration, identity, store, values, logKey: `record-log/${configuration.historyId}`,
+    configurationKey: `${prefix}configuration`, certificateKey: `${prefix}certificate`,
+    clock, now: () => clock.now, cutoffLagMs: 0 }
 }
 
 describe('native fixed authority', () => {
@@ -94,7 +113,7 @@ describe('native fixed authority', () => {
 
   it('recovers a commit whose acknowledgment was lost and leaves failed writes unapplied', async () => {
     const f = await fixture()
-    let loseResponse = true, failBeforeWrite = false
+    let loseResponse = false, failBeforeWrite = false
     const store: DurableOperationStore = {
       get: (key) => f.store.get(key),
       put: async (key, bytes) => {
@@ -104,6 +123,7 @@ describe('native fixed authority', () => {
       },
     }
     const authority = await NativeAuthority.open({ ...f, store })
+    loseResponse = true
     await expect(authority.append(envelope('one'))).rejects.toThrow('lost acknowledgment')
     const reopened = await NativeAuthority.open({ ...f, store })
     const recovered = await reopened.append(envelope('one'))
@@ -126,6 +146,112 @@ describe('native fixed authority', () => {
       .rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
     await expect(NativeAuthority.open({ ...f, continuity: { ...checkpoint, root: '0'.repeat(64) } }))
       .rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+  })
+
+  it.each(['before-log', 'after-log', 'before-configuration', 'after-configuration'] as const)(
+    'initializes the empty log before configuration and recovers interruption %s', async (boundary) => {
+      const f = await metadataFixture(), writes: string[] = []
+      const store: DurableOperationStore = {
+        get: (key) => f.store.get(key),
+        put: async (key, bytes) => {
+          writes.push(key)
+          const target = boundary.endsWith('log') ? f.logKey : f.configurationKey
+          if (key === target && boundary.startsWith('before-')) throw new Error('setup interrupted')
+          await f.store.put(key, bytes)
+          if (key === target && boundary.startsWith('after-')) throw new Error('setup interrupted')
+        },
+      }
+      await expect(NativeAuthority.open({ ...f, store })).rejects.toThrow('setup interrupted')
+      expect(writes).toEqual(boundary.endsWith('log') ? [f.logKey] : [f.logKey, f.configurationKey])
+      expect(f.values.has(f.configurationKey)).toBe(boundary === 'after-configuration')
+      expect(f.values.has(f.logKey)).toBe(boundary !== 'before-log')
+      const recovered = await NativeAuthority.open(f)
+      expect((await recovered.head()).position).toBe(0)
+      expect((await recovered.append(envelope('one'))).position).toBe(1)
+    },
+  )
+
+  it.each([false, true])('refuses a missing established log without modifying surviving metadata (certified: %s)', async (certified) => {
+    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    if (certified) { await authority.append(envelope('one')); await authority.certify() }
+    f.values.delete(f.logKey)
+    const before = structuredClone(f.values)
+    await expect(NativeAuthority.open(f)).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+    expect(f.values).toEqual(before)
+    // A still-live owner cannot recreate the missing prefix either.
+    await expect(authority.certify()).rejects.toThrow('RECORD_LOG_MISSING')
+    expect(f.values).toEqual(before)
+  })
+
+  it.each(['empty', 'conflicting'] as const)('enforces a surviving certificate against a %s replacement log', async (damage) => {
+    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    await authority.append(envelope('one'))
+    await authority.certify()
+    const replacement = new MemoryOperationStore()
+    const other = await NativeAuthority.open({ ...f, store: replacement })
+    if (damage === 'conflicting') {
+      await other.append(envelope('replacement'))
+      await other.certify()
+      expect((await other.head()).position).toBe((await authority.head()).position)
+    }
+    f.values.set(f.logKey, (await replacement.get(f.logKey))!)
+    const before = structuredClone(f.values)
+    await expect(NativeAuthority.open(f)).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+    expect(f.values).toEqual(before)
+  })
+
+  it.each(['encoding', 'kind', 'signature', 'configuration'] as const)('refuses a retained certificate with invalid %s before changing storage', async (damage) => {
+    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    const entry = await authority.append(envelope('one'))
+    const certificate = await authority.certify()
+    let bytes: Uint8Array
+    if (damage === 'encoding') bytes = encodeCanonicalCbor([])
+    else if (damage === 'kind') bytes = encodeOrderingEvidence({ kind: 'ordered-entry', entry })
+    else if (damage === 'signature') {
+      certificate.signature[0]! ^= 1
+      bytes = encodeOrderingEvidence({ kind: 'prefix-certificate', certificate })
+    } else {
+      const other = await NativeAuthority.open({ ...f, store: new MemoryOperationStore(),
+        configuration: { ...f.configuration, executionManifestDigest: new Uint8Array(32).fill(9) } })
+      await other.append(envelope('one'))
+      bytes = encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: await other.certify() })
+    }
+    f.values.set(f.certificateKey, bytes)
+    // Even without configuration/log, invalid retained evidence is never treated as
+    // permission to initialize or overwrite this authority's state.
+    f.values.delete(f.configurationKey)
+    f.values.delete(f.logKey)
+    const before = structuredClone(f.values)
+    await expect(NativeAuthority.open(f)).rejects.toThrow('AUTHORITY_RETAINED_CERTIFICATE_INVALID')
+    expect(f.values).toEqual(before)
+  })
+
+  it('reopens committed appends ahead of the retained certificate and preserves their retry positions', async () => {
+    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    const first = await authority.append(envelope('one'))
+    await authority.certify()
+    const second = await authority.append(envelope('two'))
+    const reopened = await NativeAuthority.open(f)
+    expect(await reopened.append(envelope('one'))).toEqual(first)
+    expect(await reopened.append(envelope('two'))).toEqual(second)
+    const certificate = await reopened.certify()
+    expect(certificate.position).toBe(second.position + 1)
+    const proof = await evaluateFinalitySnapshot(f.configuration, (await reopened.read()).entries)
+    expect(proof.records.map(record => record.entry)).toEqual([first, second])
+    expect(proof.closures).toHaveLength(2)
+  })
+
+  it('requires an independent continuity floor to detect a self-consistent whole-volume rollback', async () => {
+    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    await authority.append(envelope('one'))
+    await authority.certify()
+    const backup = structuredClone(f.values)
+    await authority.append(envelope('two'))
+    const latest = await authority.certify()
+    f.values.clear()
+    for (const [key, bytes] of backup) f.values.set(key, bytes)
+    await expect(NativeAuthority.open({ ...f, continuity: latest })).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+    expect(f.values).toEqual(backup)
   })
 
   it('supplies portable range evidence that peers can relay without the authority', async () => {

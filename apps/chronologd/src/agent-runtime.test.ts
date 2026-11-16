@@ -34,6 +34,13 @@ describe('native agent composition', () => {
       recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey }, initialEpochContentKey: new Uint8Array(32).fill(73) })
     cleanup.push(() => governed.close())
     await governed.start()
+    const history = governed.descriptor.history
+    if (history.kind !== 'coordinated') throw new Error('Expected signed-inclusion fixture')
+    const custom = await createDaemonAgentRuntime({ node: governed.node, identity, store, transport,
+      history: { ...history, providerId: 'example-finality-v1' } })
+    expect(custom.authority).toBeNull()
+    expect(custom.taskIds).toEqual([])
+    await custom.close()
     let dispatches = 0
     const agent = await createDaemonAgentRuntime({ node: governed.node, identity, history: governed.descriptor.history, store, transport,
       activeMembership: () => governed.activeSnapshot,

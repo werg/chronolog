@@ -29,7 +29,7 @@ describe('portable coordinated prefix evidence', () => {
   it('makes exact append retries durable across reopening and refuses quota loss', async () => {
     const f = await fixture()
     const first = await f.log.append(utf8('first'))
-    const reopened = await ReferenceRecordLog.open(historyId, f.storage, 5)
+    const reopened = await ReferenceRecordLog.open(historyId, f.storage, { quotaBytes: 5 })
     expect(await reopened.append(utf8('first'))).toEqual(first)
     await expect(reopened.append(utf8('second'))).rejects.toThrow('QUOTA_EXCEEDED')
     expect((await reopened.head()).position).toBe(1)

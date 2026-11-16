@@ -20,7 +20,7 @@ import { PeerGovernanceController } from './peer-governance.js'
 import type { Clock, OperationalMembershipState, RandomSource, ValidatorOptions } from './types.js'
 
 export interface GovernedNodeOptions {
-  /** Verifiers are selected by the provider ID and parameters signed in genesis. */
+  /** Inclusion-family verifiers selected by signed provider ID and parameters; peer validators are built in. */
   readonly finalityProviders?: Readonly<Record<string, (configuration: CoordinatedHistoryConfiguration,
     store: DurableOperationStore) => Promise<FinalityProvider>>>
   readonly genesis: SignedGenesis

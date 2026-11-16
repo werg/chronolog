@@ -74,6 +74,16 @@ one append lock, and `share()` forwards the selected entries and their covering
 certificate. A receiver waits for every retained entry needed to verify the
 complete prefix, including its closure markers.
 
+First setup durably creates an empty record log before saving the authority's
+configuration. A later open with saved configuration requires that log; a missing
+log fails with `AUTHORITY_CONTINUITY_NOT_ESTABLISHED`. Any retained certificate is
+authenticated against the pinned configuration and must match the retained log
+at its certified position. Invalid retained proof fails with
+`AUTHORITY_RETAINED_CERTIFICATE_INVALID`; a shorter or conflicting prefix fails
+the continuity check. Failed opens preserve the surviving state. A log may be
+ahead of its last certificate after an interrupted append, and exact retries
+keep their original positions.
+
 `NativeAgentStore` supplies the same atomic bytes port for embedded native hosts.
 It holds SQLite's exclusive owner fence for the lifetime of the connection and
 can back `DurableFeedStore`, authoring state, the authority, and checkpoints.
@@ -88,7 +98,9 @@ After restoring a volume, establish continuity independently before continuing
 the same authority/history. `NativeFinalityService.open({ continuity })` and
 `CHRONOLOG_AUTHORITY_CONTINUITY_FILE` accept a trusted `{historyId, position,
 root}` checkpoint and refuse an older or conflicting retained prefix. A
-checkpoint copied from the same old backup cannot detect rollback. Without
+checkpoint copied from the same old backup cannot detect rollback. The automatic
+local certificate check detects partial loss or contradiction; it cannot detect
+rollback of the entire consistent volume, including that certificate. Without
 established continuity, create an explicit new history lineage. Neither this
 package nor a missing newer peer certificate proves that a restored backup was
 the latest acknowledged state.
@@ -290,7 +302,11 @@ The native `FeedTransport` exports `asLink()`, `connectLink()`,
 connections share the same signed record store. The portable browser transport
 uses `asLink()` and `connect()`. The daemon module context's `connectPeer()`
 performs active reader authorization and attaches a framed session to the native
-transport.
+transport. `connect()` and `connectLink()` return a detach function bound to that
+connection. Session owners use it on completion or close: delayed cleanup from an
+old route cannot remove a replacement connection for the same identity. The
+explicit `disconnect(identity)` / `disconnectLink(identity)` methods deliberately
+remove whichever connection currently owns that identity.
 
 Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
 use `chronolog/ephemeral/v1`. The session multiplexes bounded range responses,

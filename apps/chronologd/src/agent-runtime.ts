@@ -39,7 +39,9 @@ export interface DaemonAgentRuntimeOptions {
 export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOptions) {
   const sourceId = `${bytesToHex(options.history.groupId)}/${options.history.kind === 'coordinated'
     ? options.history.historyId : bytesToHex(options.history.genesisDigest)}`
-  const authority = options.history.kind === 'coordinated' && equalBytes(options.history.authorityPublicKey, options.identity.publicKeyBytes)
+  const authority = options.history.kind === 'coordinated' &&
+    (options.history.providerId ?? 'signed-inclusion-v1') === 'signed-inclusion-v1' &&
+    equalBytes(options.history.authorityPublicKey, options.identity.publicKeyBytes)
     ? await NativeAuthority.open({ configuration: options.history, identity: options.identity, store: options.store,
       ...(options.finalityClock === undefined ? {} : { now: options.finalityClock }),
       ...(options.cutoffLagMs === undefined ? {} : { cutoffLagMs: options.cutoffLagMs }),
