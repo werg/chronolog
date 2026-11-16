@@ -1,10 +1,13 @@
 # Implementation Status
 
-Chronolog is an unreleased prototype with one signed transaction format,
-shared record/evidence storage and one SQL materializer. A signed group
-configuration selects the peer or coordinated history policy. Native and
-browser hosts supply their storage, engine and connection adapters. The
-transaction contract is
+Chronolog is an unreleased prototype with one signed application history for
+SQL, durable events and resident agent work. A version 3 `ChangeProgram` runs
+under either the SQL/events profile or the SQL-free events profile. A signed
+group configuration selects the peer or coordinated history policy; native and
+browser hosts supply storage and connection adapters. The default Tendriller
+composition places portable roster administration on Cloudflare, with a separate
+fixed native ordering authority and full application replicas. The transaction
+contract is
 [Specification 10](implementation-specs/10-deterministic-sql-transactions.md)
 and the [design](design.md).
 
@@ -12,15 +15,17 @@ and the [design](design.md).
 
 Implemented and covered by executable tests:
 
-- transactions as ordered lists of steps (program version 2): ordinary SQLite
-  statements with positional or named bindings over SQLite's five storage
-  classes, and typed platform operations;
+- transactions as ordered lists of steps (`ChangeProgram` version 3): ordinary
+  SQLite statements with positional or named bindings over SQLite's five storage
+  classes, typed platform operations and bounded literal `emit(topic, payload)`
+  steps. One signed program has one atomic SQL/event outcome; event-only groups
+  execute the shared event contract without loading an application SQL engine;
 - a pinned DoltLite execution profile with per-transaction fixed inputs (`'now'` =
   author timestamp, `random()` seeded from the transaction id, UTC
   `localtime`, zeroed connection counters, `chronolog_actor()` = signing key),
   `recursive_triggers` on, and native `chronolog_assert`,
-  `chronolog_policy_violation` and a `RAISE(IGNORE)` lint on SQLite's own
-  tokenizer;
+  `chronolog_policy_violation`, exact typed row-key/value helpers,
+  `chronolog_transaction_id()` and a `RAISE(IGNORE)` lint on SQLite's own tokenizer;
 - an authorizer block-list (attachments, transaction control, writing pragmas,
   temporary objects, Dolt functions and tables, `chronolog_*` writes and
   objects, the policy function outside platform triggers, `total_changes`,
@@ -54,35 +59,54 @@ Implemented and covered by executable tests:
   `policy:<table>:<command>`, `platform:<reason>`, `schema_unregistered`,
   `trigger_ignore`, `constraint`, `step_limit`, `denied`, `prepare`,
   `binding`, `too_large`, `mismatch`, `error`) and
-  failing step index, recorded in the replicated `chronolog_transactions`
-  table. Missing keys, missing records and an unavailable or incompatible
-  execution manifest block application rather than becoming SQL rejections;
+  failing step index. SQL/events groups record outcomes in the replicated
+  `chronolog_transactions` table. Missing authentic payloads or locally missing
+  keys for an issued epoch block application. A certified entry that contradicts
+  its hash-committed metadata or names an epoch not yet issued at that position
+  is deterministically invalid; it cannot stall later valid history. An
+  authenticated candidate bound to another fixed execution profile receives a
+  deterministic rejection. Unavailable local execution support still blocks
+  application, and unauthenticated bytes never create a claimed proposal outcome.
+  The unordered peer path retains pending-input semantics;
 - empty-schema genesis, atomic rollback of rejected transactions, Dolt
   checkpoints, suffix replay, restart/reopen, and outcome changes after late
   predecessors;
 - transport-neutral signed feed records and content-addressed immutable
   evidence, exact-byte durable storage, in-process peer links, native SQLite
-  storage and SSB secret-handshake replication, relay through connected members,
-  fork evidence and quarantine;
+  storage and SSB secret-handshake replication. The coordinated ledger orders
+  small typed descriptors with inline governance and detached application
+  envelopes fetched through reader-authorized peers. Persisted fork evidence
+  restores quarantine on reopen and is replayed to new subscribers;
 - replicated signed governance, durable serialized reader/writer enrollment,
   explicit historical access and HPKE epoch rotation. Built-in signed
   configurations keep validators, root, administration feed and validation
-  policy fixed, with authoring guards against reconfiguration;
+  policy fixed, with authoring and ingestion guards against reconfiguration
+  before received membership state changes. Signed genesis names the roster
+  root and initial schema administrator separately; roster authority grants no
+  implicit SQL role;
 - peer history using validator attestations, heartbeats, watermarks and
   revision-closure evidence; its order uses author timestamp, signing key and
   stable proposal ID, independent of the outer transport sequence;
-- coordinated history using a fixed authority, contiguous ordered entries and
-  portable prefix certificates. Canonical position controls authorization and
-  order; author timestamps cannot move late submissions into final history;
+- coordinated history using a fixed native authority, contiguous ordered
+  entries and portable prefix certificates. A fenced durable writer stores
+  payloads before descriptors and commits exact-byte deduplication and head
+  state before acknowledgment; certificates cover its own committed head.
+  Canonical position controls authorization, epoch acceptance and order; author
+  timestamps cannot move late submissions into final history;
 - distinct actual local/final SQL revisions, durable prefix publication and
-  recovery, final accepted/rejected transaction waits, and view/revision
-  metadata on ordinary and live queries;
-- `transaction.submit` (SQL and platform steps), outcome, settlement, local and
-  live query RPCs; the TypeScript client with typed `platformOp` builders,
-  live enrollment and explicit local/final views, React hooks, CLI
-  (`{"platform": …}` steps), daemon, examples and chaos
-  workloads (DDL by the root administrator, mixed-author writes through
-  grants, cross-owner probes, platform-trigger and owner invariants);
+  recovery, final accepted/rejected transaction waits, stable final event IDs
+  and bounded durable cursor reads/subscriptions. Retained views pin SQL and
+  events together, and projection state/cursor pairs commit atomically;
+- `change.submit`, signed publisher ingress, event publication/read/subscription,
+  durable operation status, retained views, outcome/settlement and local/live
+  query RPCs. The TypeScript client includes `program`, `platformOp`, enrollment,
+  sealed-data helpers, projections, explicit local/final views and React hooks.
+  The CLI, daemon, examples and chaos workloads exercise schema-authorized DDL,
+  mixed-author writes, cross-owner probes and platform invariants;
+- resident final-intent workers with durable dispatch/result journals, explicit
+  uncertain-effect recovery and cancellation/deadline propagation; SQL timers
+  that enforce their captured generation; and separately signed, bounded ephemeral signals that never
+  advance the application log or durable cursor;
 - fork seeding that keeps owners, teams, memberships and grants, and
   `verify-fork` comparing them. A database containing reader policies requires
   explicit re-encryption for a new group and is refused by automatic fork
@@ -93,8 +117,18 @@ Implemented and covered by executable tests:
 The two policies share node orchestration, protocol decoding, materialization
 and durable record/evidence storage. Proposal identity comes from the canonical
 transaction core, so receiving the same proposal through another author feed or
-another connection cannot repeat its SQL effects. The node supplies canonical
-order to the materializer instead of allowing it to sort a second time.
+another connection cannot repeat its SQL or effective event results. The node
+supplies canonical order to the materializer instead of allowing it to sort a
+second time.
+
+The portable `MembershipAdministrator` verifies every certified descriptor and
+inline control operation in that same history. It has no application-payload
+fetch port or SQL materializer. Issuing a signed revision is separate from
+verifying its effective activation at a certified position; enrollment readiness
+also tracks keys, authorized connectivity and application catch-up. Host login,
+roster issuance, fixed ordering authority and application schema ownership remain
+separate roles. The [typed ledger](typed-ledger-records.md) specifies these
+boundaries and unavailable-versus-invalid input handling.
 
 The [governed peer integration](../test/governed-peer.e2e.test.ts) exercises
 live reader/writer enrollment and fixed-validator revision closure. The
@@ -127,27 +161,33 @@ disconnection, incompatible engines and revocation.
 
 ## Browser implementation and qualification
 
-The [browser runtime](../packages/runtime-browser/README.md) implements a full
-peer in one dedicated Worker: OPFS-backed records, immutable evidence, private
-keys and operation state; a durable control database; a real WASM DoltLite
-engine; and exclusive Web Lock ownership. The page uses the ordinary
-`ChronologClient` and RPC contract. Both policies and live governed enrollment
-use the same core as native peers.
+The [browser runtime](../packages/runtime-browser/README.md) supplies full peers
+in a dedicated Worker: OPFS-backed records, detached payloads, immutable evidence,
+private keys and operation state, plus exclusive Web Lock ownership. SQL/events
+peers use the real WASM DoltLite engine and a durable SQL control database;
+SQL-free events peers use a flushed private control journal and event execution
+anchor without loading WASM or requiring cross-origin isolation. Both use the
+ordinary `ChronologClient`, RPC contract and governed core.
 
-The WASM build compiles the pinned native engine and deterministic hooks, with
-explicit storage-adapter patches and artifact provenance. Native/WASM execution
-comparison tests pass for deterministic values, replay, SQL restrictions,
-ownership, assertions, state/content hashes and reopening. Engine artifacts
-are generated by the documented build and verified before loading.
+The WASM build compiles the pinned native engine and deterministic hooks with
+explicit storage-adapter patches and verified artifact provenance. The current
+six-test native/WASM comparison passed locally after the upstream engine merge.
+It covers replay/reopen, permissions and budgets, extension diagnostics, exact
+typed row keys/value comparisons and transaction context, sealed writes and row
+policy closure, and mixed SQL/event rollback with retained read views.
 
-The real Chromium Worker/OPFS acceptance run passes seven checks: exclusive
-storage ownership, signed/encrypted SQL through the public client, the actual
-final SQL reader and native content-hash equality, durable identity and operation
-recovery after graceful reopen, exact-operation recovery after Worker termination
-following durable preparation, persistence of a private validator cutoff absent
-from all feed records, and replay after termination following candidate SQL
-commit. The required browser workflow builds the artifacts and runs both
-execution and browser lifecycle gates; it fails when the WASM artifact is absent.
+The real Chromium SQL/OPFS lifecycle gate contains eight checks: exclusive
+storage ownership; signed/encrypted SQL through the public client; mixed
+SQL/event atomicity and pinned combined reads; final SQL/native content-hash
+agreement; durable identity and operation recovery after graceful reopen;
+exact-operation recovery after termination following durable preparation;
+persistence of a private validator cutoff absent from feed records; and replay
+after termination following candidate SQL commit. Separate SQL-free, public
+bridge, two-layout application and packaged Cloudflare thin-administrator gates
+exercise their actual Worker/OPFS paths. The required workflow builds artifacts
+and fails if the WASM artifact is absent. Historical complete passes and their
+exact revisions are recorded in the [application-log evidence](plans/application-log.md);
+complete CI for the newly merged runtime and final package pins remains pending.
 
 The combined public-adapter gate enrolls a real browser peer into a native
 issuer's coordinated group, including encrypted pre-enrollment history. The two
@@ -159,21 +199,24 @@ peer link while the hub is offline, with zero hub or authority requests.
 
 ## Daemon operational profile
 
-The generated daemon configuration bootstraps a signed single-participant
-genesis and persists its private governance material with mode `0600`. The
-daemon replays and follows capability and epoch-manifest messages, uses
-policy-activated capability snapshots for authorization, and decrypts retained
-epochs through a live key ring. Every active reader receives new epochs;
-historical epochs only through an explicit administrator rewrap. Ordinary
-submission, governance and publication interruptions recover through durable
-journals and replay. A lost fixed root/authority key or validator quorum still
-requires a new configuration agreed out of band, usually a fork.
+The default Tendriller composition keeps the roster root in Cloudflare and
+runs the fixed ordering authority with its persistent volume on the native host.
+Signed genesis separately names the initial application schema administrator;
+worker signers receive explicit program rights. A standalone self-governed
+native configuration is also available.
+The daemon follows capability and epoch manifests, uses policy-activated
+snapshots for authorization and decrypts retained epochs through its live key
+ring. Every active reader receives new epochs; historical epochs require an
+explicit administrator rewrap. Durable journals preserve exact submission and
+governance retries after interruption. Loss of a fixed root/authority key or
+validator quorum requires a configuration agreed out of band, usually a fork.
 
 The native daemon remains the first pilot deployment target. Its coordinator and
 publication adapter must match the direct native replay digest under
 `pnpm conformance:production`; process-level publication crashes are exercised
 on both sides of the atomic Dolt head move. The transport-neutral workerd/CAS
-contracts remain experimental. See
+application-execution contracts remain experimental; the default portable Cloudflare roster provider
+does not execute application SQL. See
 [production execution](production-execution.md) for the decision and the
 criteria for reconsidering workerd.
 
@@ -187,20 +230,19 @@ archives have staged validation, atomic replacement, and signed-head fork
 repair. Public SSB discovery can require an external-vantage reachability
 proof and degrades health without it.
 
-The actual abrupt-publication recovery tests pass at five points around the
-durable Dolt head change. The current workspace cannot enumerate OS network
-interfaces for five native socket-transport tests; that transport gate needs an
-environment with the required networking facilities. Portable signed-record,
-native SQL, ownership, governed-policy and publication tests remain separate
-executable evidence.
+The abrupt-publication recovery gate exercises five points around the durable
+Dolt head change. Native SSB socket replication, relay, restart health and durable
+fork replay are required CI checks in an environment with the necessary network
+facilities. Earlier complete remote runs are recorded in the application-log
+evidence; a restricted local workspace does not waive that gate for a new head.
+Portable records, native SQL, governed policy and publication recovery retain
+their independent executable tests.
 
-## Owner-rows work still open
-
-- The mixed-author chaos run (Step 9) is to be rerun: the last run found two
-  feed-transport bugs (shutdown hanging on open peers, a sticky stream error
-  keeping a node degraded after a peer restart), both fixed since.
-- The Step 8 benchmark is within the 10% budget end to end; the materializer
-  CPU overhead left is the 32-byte owner per row (design-owner-rows Step 8).
+The previously outstanding mixed-author owner-row chaos rerun completed in the
+recorded remote qualification. Chaos and Linux/macOS replay comparison remain
+required for the final merged runtime. Owner-row CPU, storage and wider workload
+costs remain part of release-hardware characterization; the
+[owner-row design](design-owner-rows.md) records the earlier benchmark scope.
 
 ## Release gates outside this prototype
 

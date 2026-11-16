@@ -4,6 +4,15 @@ This package runs a complete Chronolog peer in one dedicated browser Worker. The
 
 The same protocol, membership, admission, history policy, materializer, SQL restrictions, enrollment service, and RPC contract run in native and browser peers. `openBrowserPeer` supplies the browser storage and engine adapters. A group chooses its peer or coordinated history policy in its signed genesis descriptor; selecting a transport does not change that policy.
 
+In the default coordinated composition, a portable Cloudflare membership
+administrator verifies the same complete small descriptor history as full peers;
+a fixed native authority orders it. Application envelopes are detached and fetched
+only through reader-authorized peers. A SQL-free events peer still receives and
+executes its application events, whereas the thin administrator has no application
+payload-fetch port. Signed genesis separately names the roster issuer and the
+initial schema administrator. Neither host login nor transport access grants an
+application SQL role.
+
 `openBrowserEventPeer`, exported from `@chronolog/runtime-browser/events`, opens
 the durable event execution profile without importing or instantiating the SQL
 engine. This subpath also exports `WorkerRpcTransport`. SQL calls fail explicitly;
@@ -34,7 +43,27 @@ The build emits `artifacts/wasm/sqlite3.mjs`, `sqlite3.wasm`, `sqlite3-opfs-asyn
 
 The build compiles the same pinned DoltLite 0.11.29, sqlite-vec 0.1.9, and native deterministic hooks. Two storage-specific source patches honor optional SQLite VFS features: sector size uses SQLite's guarded default, and an unsupported file-movement check continues with the ordinary size check. The deterministic VFS wrapper forwards storage calls with the original VFS identity, preserving the OPFS pool's state lookup. The exclusive Worker owns the OPFS namespace. These adaptations do not change SQL semantics. A 2 MiB WASM stack supports the shared bootstrap schema and commit paths.
 
-Native/WASM conformance compares content hashes, logs, deterministic time and random values, integer/real/blob handling, assertions, permissions, SQL restrictions, replay, reopening, budgets, callable function catalogs, and extension diagnostics including floating-point vector distances. It also executes mixed SQL/event programs, confirms SQL rollback after a later assertion fails, and keeps a retained SQL read view fixed across a subsequent accepted change. The Chromium lifecycle gate exercises corresponding SQL/event delivery and pinned SQL-plus-event reads through the public client against actual Worker SQL and OPFS. It rejects a competing owner, queries the real final view, reopens durable identity and operation state, and terminates the Worker at preparation and SQL publication boundaries before recovering. It also checks that a private validator cutoff survives termination without any feed record from which it could be reconstructed. It writes `artifacts/browser-qualification/report.json`.
+The six native/WASM conformance tests compare content hashes, logs, deterministic
+time/random values, exact typed row keys and storage-class comparisons, the
+transaction-id context, sealed writes and policy closure, permissions, SQL
+restrictions, budgets, replay/reopen and extension diagnostics. They also execute
+mixed SQL/event programs, confirm rollback after a later assertion fails and
+retain a SQL read view across a subsequent accepted change. Both engines use the
+same v8 native hook profile and v3 program semantics.
+
+The Chromium SQL/OPFS lifecycle gate contains eight checks against the public
+client and actual Worker storage: exclusive ownership; signed/encrypted SQL;
+mixed SQL/event atomicity and pinned combined reads; final SQL/native state
+agreement; graceful identity/operation recovery; exact retry after preparation
+termination; a private validator cutoff surviving termination without a
+reconstructing feed record; and recovery after candidate SQL commit. It writes
+`artifacts/browser-qualification/report.json`.
+
+The six native/WASM tests passed locally after the upstream merge. Historical
+complete browser results remain tied to the source and package hashes in the
+[application-log evidence](../../docs/plans/application-log.md). Complete CI for
+the latest merged runtime and final package pins is pending; a local engine test
+or bundle build does not establish that browser result.
 
 The [SQL-free browser gate](../../tools/test-browser-events.ts) serves no engine
 assets and no cross-origin isolation headers. It checks the emitted browser

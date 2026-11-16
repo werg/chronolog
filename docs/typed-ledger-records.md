@@ -56,13 +56,24 @@ failure. Neither means that the application position may be skipped or that the
 proposal was rejected. Certified ordering, body availability, effective roster
 state and applied application state are separate progress conditions.
 
+A provider response that does not match the committed hash is still unavailable
+trusted input. In contrast, once that exact hash matches, an inconsistent
+committed length, malformed envelope, or contradictory kind/route/epoch proves
+an invalid ledger position. The full reader deterministically advances past it
+without manufacturing a proposal outcome. Provider failures are kept outside
+this classification; arbitrary failed fetches cannot erase a candidate.
+
 For coordinated application admission, the epoch on the fetched and verified
 envelope must match the rotation effective at its canonical position. Receiving
 a later key wrap does not change earlier positions. A stale prepared operation
 gets the durable `ENCRYPTION_EPOCH_CLOSED` result under its original proposal ID;
 an exact retry that already obtained an earlier position preserves that outcome.
-Unavailable bytes remain pending. This fence does not prevent an authorized
-participant from separately disclosing data or keys it already possesses.
+If the epoch was never issued before that canonical position, the verified
+envelope is invalid there and can be skipped without a claimed proposal ID.
+A future manifest does not retroactively issue an earlier epoch. If the epoch
+was issued but its key is locally missing, application still waits for authorized
+key delivery. Unavailable bytes remain pending. This fence does not prevent an
+authorized participant from separately disclosing data or keys it already possesses.
 
 The descriptor format does not promise payload replication or availability. Its
 payload store and peer transport must enforce their own durability, authorization,

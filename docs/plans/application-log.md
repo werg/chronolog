@@ -18,6 +18,36 @@ evidence. The user explicitly requested clean prerelease breaking changes:
 there are no compatibility program decoders, legacy imports, dual outboxes,
 bidirectional old/new mirrors, or automatic authority/policy cutovers.
 
+## Review and upstream-integration checkpoints
+
+This review extends the already implemented roadmap with small pushed fixes.
+The complete `5cfa0444` / `43cac4e7` qualification below remains evidence for
+those exact inputs. It is not relabeled as a result for these later changes.
+
+| Checkpoint | Correctness change | Executable evidence |
+| --- | --- | --- |
+| `a895a4dd` — committed payload metadata | A missing or corrupt provider response remains pending. Once exact hash-committed bytes are available, a contradictory envelope/length/epoch is a deterministic invalid position; later valid history advances without inventing a proposal outcome. | [Ledger codec](../../packages/node-core/src/ledger-record.test.ts), [canonical admission/reopen](../../packages/node-core/src/canonical-epoch.integration.test.ts). |
+| `668c44cf` — immutable governance | A root-signed attempt to change fixed history configuration is rejected before received or canonical membership mutates. A later valid revision still progresses. | [Governance regressions](../../packages/node-core/src/governance.test.ts). |
+| `b80d20b4` — restored fork quarantine | Durable losing records are replayed into the fork registry after reopen and to new subscribers, preserving quarantine across portable and native transports. | [Full-node fork replay](../../test/feed-fork-replay.integration.test.ts), [portable store](../../packages/records/src/store.test.ts), [required native SSB gate](../../packages/transport-ssb/src/feed-transport.test.ts). |
+| `3067dc6d` — canonical epoch availability | An epoch never issued before a certified position is invalid there, even if its manifest arrives later. A genuinely issued epoch with a missing local key continues to block until authorized key delivery. | [Canonical epoch integration](../../packages/node-core/src/canonical-epoch.integration.test.ts). |
+| `e855e1d0` — captured scope generation | The built contrib recipe carries the generation captured when an intent is authored. A durably queued old-generation edit rejects after reset; an already accepted exact retry retains its proposal and adds no record or event. | [Real SQL/public adapter qualification](../../tools/lib/application-scope.ts), invoked by the [application pilot](../../tools/application-pilot.ts). |
+| `cc18d15e` and `1834de1e` — upstream engine integration | Sealed values, lossless typed row keys, exact comparisons and transfer snapshots use the current v3 program and portable byte/hash APIs. Native/WASM transaction context and sealed lifecycle behavior agree; the complete program budget still bounds sealed writes. | [Sealed client](../../packages/client/src/sealed.test.ts), [native sealed execution](../../packages/materializer-doltlite/src/sealed.integration.test.ts), [six native/WASM comparisons](../../packages/runtime-browser/src/wasm-conformance.test.ts). |
+
+The merged native implementation passed 279 focused tests, full typecheck, lint,
+build and documentation checks. The subsequent engine integration passed all six
+actual native/WASM comparisons, and the native captured-scope scenario passed.
+The clean membership package was built from `cc18d15e` with 56 runtime inputs
+and no application engine dependency. These are local integration results.
+The integration pin checkpoint `764a57d1` consumes public Tendriller
+`283f210c1fb9dc2c1d27e9bbd9e8813234a40a70`, embedding that membership package,
+and contrib `8449017159b2657a2b0d9bde398322dac78ee2d1`. The eighteen public-adapter
+tests, both independent bundle builds and the exact built scope recipe passed
+with those inputs; the application build contains 63 explicit assets.
+Complete Quality, cross-platform replay, chaos and browser/pilot CI for the final
+runtime pins is still pending; current run links and final results belong on
+[PR #1](https://github.com/werg/chronolog-db/pull/1). Public-network, recovery and
+deployed application gates remain in the contrib issues below.
+
 ## Delivery phases
 
 | Roadmap phase | Implemented boundary | Evidence and next qualification |
@@ -308,8 +338,8 @@ use the real implementation.
 
 Reports preserve source heads/dirty flags, runtime/WASM/bundle hashes, complete
 specimen manifest, browser version, scenario outcomes and screenshots. Failure
-writes `passed: false` before exit. Local core and contrib wrapper builds passed
-with 62 assets. Local Chromium launch failed with `socket() failed: Operation
+writes `passed: false` before exit. Earlier local core and contrib wrapper builds passed
+with 62 assets. The corresponding local Chromium launch failed with `socket() failed: Operation
 not permitted`; that is not a browser pass. The paired CI workflow runs the
 actual gate on an environment that can launch Chromium.
 
