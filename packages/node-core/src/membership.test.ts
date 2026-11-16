@@ -119,6 +119,32 @@ describe('portable thin membership administrator', () => {
     await expect(fixture.administrator.sync()).rejects.toThrow('MEMBERSHIP_RANGE_GAP')
     expect(fixture.administrator.progress.verifiedThrough).toBe(target)
   })
+
+  it('retains certified malformed and foreign descriptors without blocking a later valid control', async () => {
+    const fixture = await setup(false)
+    const malformed = new Uint8Array([0xff])
+    const foreign = await createLedgerRecord(encodeEnvelope({ groupRoute: new Uint8Array(32).fill(99),
+      messageType: 'capability', encryptionEpoch: null, payload: new Uint8Array([1]) }))
+    await fixture.log.append(malformed)
+    await fixture.log.append(foreign.recordBytes)
+    await fixture.administrator.sync()
+    expect(fixture.administrator.progress.verifiedThrough).toBe(3)
+    expect(fixture.administrator.snapshot.revision).toBe(0n)
+    const applicant = await joinRequest(fixture, 'after-invalid-position')
+    const approval = await fixture.administrator.approve(applicant.request, {
+      operationId: 'approve-after-invalid', roles: ['reader'], grantFullHistory: true,
+    })
+    await verifyEnrollmentApproval(fixture.provisioned.descriptor, applicant.request, approval)
+    expect(fixture.administrator.snapshot.revision).toBe(1n)
+    const retained = fixture.administrator.read({ after: 1 })
+    expect(retained.entries[0]!.bytes).toEqual(malformed)
+    expect(retained.entries[1]!.bytes).toEqual(foreign.recordBytes)
+    await verifyPrefixCertificate(retained.certificate, fixture.configuration)
+    await fixture.administrator.close(); open.delete(fixture.administrator)
+    const restored = await reopen(fixture)
+    expect(restored.progress).toEqual(fixture.administrator.progress)
+    expect(restored.snapshot.revision).toBe(1n)
+  })
 })
 
 describe('signed native membership ledger protocol', () => {

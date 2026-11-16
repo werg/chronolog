@@ -1,23 +1,63 @@
 import {
+  encodeSignedCapabilityRevision,
+  signCapabilityRevision,
   signGenesis,
   validationPolicyId,
   type CapabilityGrant,
   type GenesisManifest,
   type ValidationPolicy,
 } from '@chronolog/capabilities'
-import { generateX25519KeyPair } from '@chronolog/crypto'
-import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
+import { createEpochManifest, encodeSignedEpochManifest, generateX25519KeyPair } from '@chronolog/crypto'
+import { DOMAINS, encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, signDomain } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { CapabilityMembershipResolver } from './capability-membership.js'
-import { GovernanceControlPlane } from './governance.js'
+import { GovernanceControlPlane, isInvalidGovernanceRecord } from './governance.js'
+import { ReferenceRecordLog } from './history-policy.js'
+import { createLedgerRecord } from './ledger-record.js'
 import { MemoryOperationStore, type DurableOperationStore } from './operations.js'
 
 const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('replicated governance control plane', () => {
+  it('skips forged and out-of-order canonical controls while unordered successors still wait for delivery', async () => {
+    const fixture = await governanceFixture(), attacker = await generateEd25519KeyPair()
+    const participant = await GovernanceControlPlane.create({ genesis: fixture.genesis, groupRoute: fixture.groupRoute,
+      transport: fixture.network.createNode('canonical-reader'), identity: await generateEd25519KeyPair() })
+    controllers.push(participant)
+    const log = await ReferenceRecordLog.open('h_0123456789abcdef0123456789abcdef', new MemoryOperationStore())
+    const appendControl = async (type: 'capability' | 'epoch-manifest', body: Uint8Array, tag = 1n, signer = fixture.root) => {
+      const payload = encodeCanonicalCbor([tag, body])
+      const signature = await signDomain(type === 'capability' ? DOMAINS.capabilityRevision : DOMAINS.epochManifest, payload, signer.privateKey)
+      const envelope = encodeEnvelope({ groupRoute: fixture.groupRoute, messageType: type, encryptionEpoch: null,
+        payload: encodeCanonicalCbor([1n, payload, signer.publicKeyBytes, signature]) })
+      return log.append((await createLedgerRecord(envelope)).recordBytes)
+    }
+    const future = { groupId: fixture.groupId, revision: 999n, previousRevisionDigest: bytes32(90),
+      issuerRootPublicKey: fixture.root.publicKeyBytes, grants: [], revocations: [], validationPolicies: [] }
+    const forged = await appendControl('capability', encodeSignedCapabilityRevision(await signCapabilityRevision(future, attacker.privateKey)), 1n, attacker)
+    await expect(participant.ingestCanonical(forged)).rejects.toThrow('GOVERNANCE_REVISION_CONFLICT')
+    const misplaced = await appendControl('capability', encodeSignedCapabilityRevision(await signCapabilityRevision(future, fixture.root.privateKey)))
+    await expect(participant.ingestCanonical(misplaced)).rejects.toThrow('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
+    const capability = await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(44), 'writer')] }, fixture.root.privateKey)
+    const accepted = await appendControl('capability', encodeSignedCapabilityRevision(capability))
+    expect((await participant.ingestCanonical(accepted))?.revision).toBe(1n)
+    const futureEpoch = await createEpochManifest({ groupId: fixture.groupId, epoch: 1n, previousEpochDigest: bytes32(91),
+      createdAtMs: 1n, recipients: [], signerPublicKey: fixture.root.publicKeyBytes, signerPrivateKey: fixture.root.privateKey })
+    for (const tag of [1n, 2n]) {
+      const entry = await appendControl('epoch-manifest', encodeSignedEpochManifest(futureEpoch.signedManifest), tag)
+      const failure = await participant.ingestCanonical(entry).catch((error: unknown) => error)
+      expect(isInvalidGovernanceRecord(failure)).toBe(true)
+      expect(failure).toMatchObject({ message: 'GOVERNANCE_CANONICAL_PREDECESSOR_MISSING' })
+    }
+    const firstEpoch = await fixture.admin.rotateEpoch(fixture.root.privateKey)
+    await participant.ingestCanonical(await appendControl('epoch-manifest', encodeSignedEpochManifest(firstEpoch)))
+    expect(participant.currentEpoch).toBe(0n)
+    expect(participant.pendingRecordCount).toBe(0)
+  })
+
   it('keeps a relayed governance successor pending until its authenticated predecessor arrives', async () => {
     const fixture = await governanceFixture()
     await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(31), 'writer')] }, fixture.root.privateKey)

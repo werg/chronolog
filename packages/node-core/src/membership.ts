@@ -17,7 +17,7 @@ import {
 import { GovernanceActivationIndex } from './governance-activation.js'
 import { GovernanceControlPlane, isInvalidGovernanceRecord } from './governance.js'
 import { CoordinatedHistoryPolicy, verifyOrderedEntry, type CoordinatedProgress } from './history-policy.js'
-import { createLedgerRecord, decodeLedgerRecord } from './ledger-record.js'
+import { createLedgerRecord, decodeLedgerRecord, LedgerRecordError, type LedgerRecord } from './ledger-record.js'
 import { DurableOperationJournal, validateOperationId, type DurableOperationStore } from './operations.js'
 import type { MembershipLedger, MembershipLedgerPage } from './membership-wire.js'
 
@@ -296,8 +296,9 @@ export class MembershipAdministrator {
       if (page.entries.length > 128) throw new Error('MEMBERSHIP_RANGE_TOO_LARGE')
       for (const entry of page.entries) {
         if (entry.position !== cursor + 1) throw new Error('MEMBERSHIP_RANGE_GAP')
-        const record = decodeLedgerRecord(entry.bytes)
-        if (!equalBytes(record.groupRoute, this.#descriptor.groupRoute)) throw new Error('MEMBERSHIP_GROUP_MISMATCH')
+        // Ordering authenticates exact bytes, including positions whose
+        // descriptor is invalid or belongs to another group. Retain them for
+        // the prefix proof; application interpretation cannot create a gap.
         await this.#policy.ingest({ kind: 'ordered-entry', entry })
         cursor = entry.position
       }
@@ -308,8 +309,14 @@ export class MembershipAdministrator {
     } while (cursor < target)
     for (const entry of this.#policy.entries()) {
       if (entry.position <= this.#applied) continue
-      const record = decodeLedgerRecord(entry.bytes)
-      if (record.kind !== 'candidate') {
+      let record: LedgerRecord
+      try { record = decodeLedgerRecord(entry.bytes) }
+      catch (error) {
+        if (!(error instanceof LedgerRecordError)) throw error
+        this.#applied = entry.position
+        continue
+      }
+      if (equalBytes(record.groupRoute, this.#descriptor.groupRoute) && record.kind !== 'candidate') {
         try {
           const snapshot = await this.#governance.ingestCanonical(entry)
           if (snapshot !== null && snapshot.revision > this.#activation.activeSnapshot.revision) {

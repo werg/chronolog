@@ -343,7 +343,14 @@ export class GovernanceControlPlane {
       const bytes = await verifyLedgerPayload(ledger, ledger.inlinePayload)
       const record: TransportRecord = { id: `canonical:${entry.historyId}:${entry.position}`, author: '',
         sequence: BigInt(entry.position), receivedAtMs: 0, payload: bytes }
-      await this.#ingest(record, true)
+      try { await this.#ingest(record, true) }
+      catch (error) {
+        // The caller has verified the complete preceding canonical prefix. A
+        // missing predecessor here is an invalid ordered operation, not missing
+        // feed delivery that could justify stopping before later positions.
+        if (error instanceof GovernanceRecordPendingError) throw new Error('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING', { cause: error })
+        throw error
+      }
       const decoded = await decodeGovernanceEnvelope(bytes, this.#options.groupRoute)
       if (decoded.type !== 'capability') return null
       const tagged = assertCanonicalCbor(decoded.payload)
@@ -369,7 +376,15 @@ export class GovernanceControlPlane {
     }
     if (decoded.type === 'capability') {
       const signed = decodeSignedCapabilityRevisionBytes(tagged[1])
-      if (signed.revision.revision > this.#snapshot.revision + 1n) throw new GovernanceRecordPendingError()
+      if (signed.revision.revision > this.#snapshot.revision + 1n) {
+        // An outer envelope signer cannot reserve unbounded future revisions
+        // with a forged inner root signature, even on an unordered feed.
+        if (!equalBytes(signed.revision.groupId, this.#snapshot.groupId) ||
+            !equalBytes(signed.revision.issuerRootPublicKey, this.#snapshot.rootAdminPublicKey) ||
+            !await verifyDomain(DOMAINS.capabilityRevision, encodeCapabilityRevision(signed.revision),
+              signed.signature, this.#snapshot.rootAdminPublicKey)) throw new Error('GOVERNANCE_REVISION_CONFLICT')
+        throw new GovernanceRecordPendingError()
+      }
       if (signed.revision.revision <= this.#snapshot.revision) {
         const known = this.#snapshots.get(bytesToHex(await capabilityRevisionDigest(signed.revision)))
         if (known === undefined || !await verifyDomain(DOMAINS.capabilityRevision, encodeCapabilityRevision(signed.revision), signed.signature, signed.revision.issuerRootPublicKey)) {
@@ -602,5 +617,5 @@ function compareBigint(left: bigint, right: bigint): number { return left < righ
 class GovernanceRecordPendingError extends Error {}
 
 export function isInvalidGovernanceRecord(error: unknown): error is Error {
-  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_CHAIN_INVALID|REVISION_CONFLICT|ENVELOPE_INVALID|ENVELOPE_SIGNATURE_INVALID)$/u.test(error.message))
+  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_CHAIN_INVALID|REVISION_CONFLICT|ENVELOPE_INVALID|ENVELOPE_SIGNATURE_INVALID|CANONICAL_PREDECESSOR_MISSING)$/u.test(error.message))
 }
