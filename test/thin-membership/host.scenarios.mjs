@@ -19,6 +19,7 @@ async function fixture(path, body) {
 }
 const device = command => fixture('device', command);
 const passed = (name, evidence = {}) => fixture('check', { name, evidence });
+const phase = name => fixture('phase', { name });
 
 function members(api, onResponse) {
   return createMembersClient({ base: 'https://qualification.invalid', fetch: async (url, input) => {
@@ -75,7 +76,10 @@ async function decision(client, method, input, timeout = 30_000) {
 
 const entries = pages => pages.flatMap(bytes => decodeMembershipLedgerResponse(base64UrlToBytes(bytes), 'read').entries);
 
+// The runner owns the bounded aggregate budget for all phases. Individual
+// enrollment decisions, commands, framing and authentication retain their bounds.
 it('administers an independently ordered native/browser group through the actual Cloudflare membership provider', async () => {
+  await phase('membership configuration');
   const setup = await fixture('configuration');
   const page = await createTestPage({ application: { kind: 'peer', id: setup.nativeAuthority.historyId }, lifetime: 'resident' });
   const owner = members(page.ownerApi), applicant = await page.participant(), other = await page.participant();
@@ -93,6 +97,7 @@ it('administers an independently ordered native/browser group through the actual
   await owner.sync();
   await passed('Cloudflare owns a durable membership-only root; the separate native signer owns application schema and ordering');
 
+  await phase('large and small native workloads');
   const small = await fixture('workload', { namespace: 'host-small', count: 4, payloadBytes: 16 });
   await owner.sync();
   const large = await fixture('workload', { namespace: 'host-large', count: 4, payloadBytes: 196_608 });
@@ -110,6 +115,7 @@ it('administers an independently ordered native/browser group through the actual
   expect(traffic.unexpectedAdministratorRequests).toBe(0);
   await passed('large SQL/event envelopes remain on full peers while descriptor traffic grows with candidate count', { small, large, more, traffic });
 
+  await phase('first device authorization and lost approval recovery');
   const prepared = await device({ method: 'prepare', name: 'thin-membership-device' });
   expect(genesis.manifest.initialCapabilities.some(grant => bytesToBase64Url(grant.signingPublicKey) === prepared.signingPublicKey)).toBe(false);
   await device({ method: 'open', name: 'thin-membership-device', bootstrap });
@@ -143,6 +149,7 @@ it('administers an independently ordered native/browser group through the actual
   await expect(owner.approve({ ...approvalDecision, roles: ['reader'] })).rejects.toMatchObject({ status: 409 });
   await passed('host authentication binds device ownership and exact approval survives a lost reply plus real Durable Object eviction');
 
+  await phase('first fresh Worker authenticated history replay');
   const pending = await device({ method: 'approval', requestId, signedApproval: approval.signedApproval });
   expect(pending.enrollment.state).not.toBe('ready');
   const activated = await device({ method: 'history', pages: await history(applicantMembers) });
@@ -159,6 +166,7 @@ it('administers an independently ordered native/browser group through the actual
   expect(joined.value.rtc.receivedBytes).toBeGreaterThan(large.detachedEnvelopeBytes);
   await passed('a fresh OPFS device verifies live approval and HPKE controls, then fetches detached history through authenticated WebRTC in its Worker', { elapsedMs: joined.elapsedMs, rtc: joined.value.rtc });
 
+  await phase('writer revocation and original operation retry');
   const accepted = await device({ method: 'publish', operationId: 'device-before-revocation', text: 'accepted before revocation' });
   await until(() => device({ method: 'operation', operationId: accepted.operationId }), value => value?.final && value.outcome?.outcome === 'accepted', 'device operation did not become final');
   const active = await device({ method: 'status' }), writer = active.grants.find(grant => grant.role === 'writer' && grant.active);
@@ -174,6 +182,7 @@ it('administers an independently ordered native/browser group through the actual
   expect((await device({ method: 'publish', operationId: accepted.operationId, text: 'accepted before revocation' })).proposalId).toBe(accepted.proposalId);
   await passed('writer revocation defeats a direct native-path operation while host login survives and an accepted exact retry stays original', finalRejection);
 
+  await phase('abrupt Worker OPFS recovery');
   await fixture('reload-device', { name: 'thin-membership-device', bootstrap, requestId, signedApproval: approval.signedApproval });
   const reopened = await device({ method: 'status' });
   expect(reopened.identity).toBe(prepared.signingPublicKey);
@@ -181,6 +190,7 @@ it('administers an independently ordered native/browser group through the actual
   expect((await device({ method: 'operation', operationId: rejected.operationId })).outcome.outcome).toBe('rejected');
   await passed('abrupt Worker replacement reopens OPFS identity, grants and original accepted/rejected operations');
 
+  await phase('reader revocation and key rotation');
   const reader = reopened.grants.find(grant => grant.role === 'reader' && grant.active);
   expect(reader).toBeDefined();
   const readerDecision = { operationId: 'host-revoke-reader', capabilityIds: [reader.id] };
@@ -199,6 +209,7 @@ it('administers an independently ordered native/browser group through the actual
     { identity: prepared.signingPublicKey, removedEpoch: removed.epoch, knownEpochs: afterRemoval.knownEpochs,
       availableEpochs: afterRemoval.availableEpochs, cannotReadPostRevocationEvent: true });
 
+  await phase('administrator restart and retained decisions');
   await owner.sync();
   const controlsBeforeRestore = await history(owner), beforeRestore = await owner.info();
   const entriesBeforeRestore = entries(controlsBeforeRestore);
@@ -224,6 +235,7 @@ it('administers an independently ordered native/browser group through the actual
     { before: beforeRestore, after: restored, writerRevocation: writerRemoved, readerRevocation: removed,
       nativeBeforeRestore, nativeAfterRestore, retainedReceipts: entriesBeforeRestore.length, newClosureRecords: newReceipts.length });
 
+  await phase('second fresh Worker approval and full retained history');
   const fresh = await fixture('new-device', { name: 'thin-membership-restored-reader', bootstrap });
   expect(fresh.prepared.signingPublicKey).not.toBe(prepared.signingPublicKey);
   const readerInfo = await otherMembers.info(), readerRequestId = readerInfo.identity.requestPrefix + 'after-admin-restart';
@@ -244,6 +256,7 @@ it('administers an independently ordered native/browser group through the actual
       roles: readerReady.value.grants.filter(grant => grant.active).map(grant => grant.role),
       availableEpochs: readerReady.value.availableEpochs, recoveredEpoch: removed.epoch, elapsedMs: readerReady.elapsedMs });
 
+  await phase('final RTC and administrative byte boundaries');
   const final = await fixture('snapshot');
   expect(final.traffic.applicationEnvelopeBytesToAdministrator).toBe(0);
   expect(final.traffic.unexpectedAdministratorRequests).toBe(0);
@@ -256,4 +269,4 @@ it('administers an independently ordered native/browser group through the actual
   expect(rtc.introductions).toHaveLength(3);
   expect(rtc.introductions.every(value => value.requests === 1 && value.closed && value.requestBytes > 0 && value.responseBytes > 0)).toBe(true);
   await fixture('complete', { traffic: final.traffic, rtc: { browser: rtc, native: final.rtc }, descriptor: configured.descriptor, requestId: submitted.id });
-}, 240_000);
+});

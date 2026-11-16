@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { cp, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -12,6 +12,19 @@ import { bytesToBase64Url } from '@chronolog/protocol'
 import { createThinMembershipNative, type ThinMembershipBootstrap } from './thin-membership-native.js'
 
 type NativeFixture = Awaited<ReturnType<typeof createThinMembershipNative>>
+interface PhaseTiming { name: string; startedAfterMs: number; elapsedMs: number | null; status: 'running' | 'completed' | 'failed' }
+interface CommandTiming {
+  id: number; phase: string; method: string; startedAfterMs: number; elapsedMs: number | null
+  status: 'running' | 'completed' | 'failed'; error?: string
+}
+
+// The measured browser/OPFS scenario used 226 s before its second fresh-device
+// replay, while the shorter first replay took 25 s. Budget the complete sequence
+// of two enrollments, two revocations and two recoveries independently from the
+// unchanged RTC, authentication and individual command deadlines.
+const scenarioTimeoutMs = 420_000
+const hostProcessTimeoutMs = scenarioTimeoutMs + 120_000
+const started = performance.now()
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const { values } = parseArgs({ options: {
@@ -36,12 +49,32 @@ const report = { format: 'chronolog-thin-membership/v2', passed: false, status: 
     rtcSignalingRequestBytes: 'Actual direct introduction HTTP request bodies, including the protocol JSON envelope; excludes HTTP headers.',
     rtcSignalingResponseBytes: 'Actual direct introduction HTTP response bodies, including the protocol JSON envelope; excludes HTTP headers.' },
   artifacts: {} as Record<string, unknown>, browser: '', checks: [] as Array<{ name: string; evidence: unknown }>,
+  phase: 'build', timing: { scenarioTimeoutMs, hostProcessTimeoutMs,
+    phases: [] as PhaseTiming[], commands: [] as CommandTiming[] },
   pageErrors: [] as string[], final: null as unknown, error: '', limits: [
     'The built Cloudflare Worker runs in the real local workerd test harness with synthetic authenticated accounts; this is not a deployed Cloudflare service or public-network qualification.',
     'Descriptor/body byte counters cover the actual loopback membership and peer boundaries; they do not predict provider billing or NAT traversal.',
     'Application peer bytes are logical authenticated RTC frame payloads, excluding framing headers/credit and SCTP/DTLS/IP overhead. SDP HTTP body bytes are measured separately.',
   ] }
-const save = () => writeFile(join(output, 'report.json'), JSON.stringify(report, bigintJson, 2) + '\n')
+let saving = Promise.resolve()
+function save(): Promise<void> {
+  const snapshot = JSON.stringify(report, bigintJson, 2) + '\n'
+  const write = saving.then(async () => {
+    await writeFile(join(output, 'report.pending'), snapshot)
+    await rename(join(output, 'report.pending'), join(output, 'report.json'))
+  })
+  saving = write.catch(() => undefined)
+  return write
+}
+async function phase(name: string): Promise<void> {
+  const now = Math.round(performance.now() - started), previous = report.timing.phases.at(-1)
+  if (previous !== undefined) { previous.elapsedMs = now - previous.startedAfterMs; previous.status = 'completed' }
+  report.phase = name
+  report.timing.phases.push({ name, startedAfterMs: now, elapsedMs: name === 'completed' ? 0 : null,
+    status: name === 'completed' ? 'completed' : 'running' })
+  process.stdout.write(`Phase: ${name} (${now}ms since runner start)\n`)
+  await save()
+}
 let browser: Browser | undefined, page: Page | undefined
 let native: NativeFixture | undefined
 let bootstrap: ThinMembershipBootstrap | undefined
@@ -138,6 +171,7 @@ try {
         const input = request.method === 'GET' ? undefined : await request.json() as Record<string, unknown>
         let result: unknown
         switch (url.pathname.slice('/fixture/'.length)) {
+          case 'phase': await phase(String(input!.name)); result = { recorded: true }; break
           case 'configuration': {
             result = { executionManifestDigest: bytesToBase64Url(native!.executionManifestDigest),
               schemaAdministratorPublicKey: bytesToBase64Url(native!.identity.signing.publicKeyBytes),
@@ -186,18 +220,21 @@ const require = createRequire(import.meta.url);
 const d1Migrations = await readD1Migrations(dirname(require.resolve('@tendriller/engine/accounts-schema')));
 export default defineConfig({ plugins: [cloudflareTest({main: new URL('./entry.mjs', import.meta.url).pathname,
   wrangler: {configPath: new URL('./wrangler.jsonc', import.meta.url).pathname}})],
-  test: {include: ['host.test.mjs'], testTimeout: 240000, provide: {d1Migrations, fixtureBase: ${JSON.stringify(native.base)}}} });
+  test: {include: ['host.test.mjs'], testTimeout: ${scenarioTimeoutMs}, provide: {d1Migrations, fixtureBase: ${JSON.stringify(native.base)}}} });
 `)
     await run(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', '--config', 'vitest.config.mjs',
-      '--reporter=default', '--reporter=json', '--outputFile=host-results.json'], host, 360_000)
+      '--reporter=default', '--reporter=json', '--outputFile=host-results.json'], host, hostProcessTimeoutMs)
     if (!completed) throw new Error('THIN_HOST_DID_NOT_COMPLETE_QUALIFICATION')
     if (report.pageErrors.length > 0) throw new Error(`THIN_BROWSER_PAGE_ERRORS: ${report.pageErrors.join('; ')}`)
     native.assertHealthy()
     report.passed = true; report.status = 'passed'
+    await phase('completed')
     await save()
   }
 } catch (error) {
   report.status = 'failed'; report.error = error instanceof Error ? error.stack ?? error.message : String(error)
+  const active = report.timing.phases.at(-1)
+  if (active !== undefined) { active.elapsedMs = Math.round(performance.now() - started) - active.startedAfterMs; active.status = 'failed' }
   await save()
   if (page !== undefined) {
     try { report.final = { browser: await callDevice(page, { method: 'progress' }), native: await native?.snapshot() } } catch { /* Preserve the original failure. */ }
@@ -212,7 +249,24 @@ process.stdout.write(`Thin membership evidence: ${output}\n`)
 
 interface BrowserPage { readonly thinMembership: { call(command: Record<string, unknown>): Promise<unknown>; replaceWorker(): Promise<void> } }
 async function callDevice(current: Page, command: Record<string, unknown>): Promise<unknown> {
-  return current.evaluate(input => (globalThis as unknown as BrowserPage).thinMembership.call(input), command)
+  const before = performance.now(), timing: CommandTiming = { id: report.timing.commands.length + 1, phase: report.phase,
+    method: String(command.method), startedAfterMs: Math.round(before - started), elapsedMs: null, status: 'running' }
+  report.timing.commands.push(timing)
+  await save()
+  try {
+    const result = await current.evaluate(input => (globalThis as unknown as BrowserPage).thinMembership.call(input), command)
+    timing.status = 'completed'
+    return result
+  } catch (error) {
+    timing.status = 'failed'; timing.error = error instanceof Error ? error.message : String(error)
+    throw error
+  } finally {
+    timing.elapsedMs = Math.round(performance.now() - before)
+    if (timing.elapsedMs >= 1000 || timing.status === 'failed') {
+      process.stdout.write(`Device ${timing.id}: ${timing.phase}/${timing.method} ${timing.status} after ${timing.elapsedMs}ms\n`)
+    }
+    await save()
+  }
 }
 function isolated(type: string): Record<string, string> {
   return { 'Content-Type': type, 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cache-Control': 'no-store' }
@@ -237,9 +291,9 @@ async function run(command: string, args: readonly string[], cwd: string, timeou
     child.once('error', error => { clear(); reject(error) })
     child.once('exit', (code, signal) => {
       clear()
-      if (timedOut) reject(new Error(`THIN_PROCESS_TIMEOUT: ${command} after ${timeoutMs}ms`))
+      if (timedOut) reject(new Error(`THIN_PROCESS_TIMEOUT: ${command} after ${timeoutMs}ms during ${report.phase}`))
       else if (code === 0) resolvePromise()
-      else reject(new Error(`THIN_PROCESS_FAILED: ${command} (${code ?? signal})`))
+      else reject(new Error(`THIN_PROCESS_FAILED: ${command} (${code ?? signal}) during ${report.phase}`))
     })
   })
 }
