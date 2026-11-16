@@ -24,6 +24,16 @@ export interface PilotRouteStats {
   readonly queuedBytes: number
 }
 export interface PilotRegistration { readonly device: string; readonly identity: BrowserEventIdentity }
+export interface PilotProgress {
+  readonly connected: boolean
+  readonly records: number
+  readonly processedRecords: number
+  readonly finalOrderLength: number
+  readonly materializationPending: boolean
+  readonly error?: string
+  readonly transportError?: string
+  readonly ingest?: { readonly phase: string; readonly phaseAgeMs: number; readonly subscriptionRestarts: number; readonly retryRecords: number }
+}
 export interface PilotDiagnostics {
   readonly identity: string
   readonly connectionErrors: readonly string[]
@@ -33,6 +43,7 @@ export interface PilotDiagnostics {
   disconnect(): Promise<void>
   reconnect(): Promise<void>
   routeStats(): Promise<readonly PilotRouteStats[]>
+  progress(): Promise<PilotProgress>
   signalingStats(): readonly WebRtcSession['signaling'][]
   routeState(): Promise<{ readonly records: number; readonly recordDigest: string; readonly capabilityDigest: string; readonly finalOrderLength: number }>
   sync(): Promise<void>

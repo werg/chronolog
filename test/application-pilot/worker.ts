@@ -1,4 +1,3 @@
-import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { EphemeralChannel, type EphemeralSignal } from '@chronolog/agent-service/signals'
 import { decodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
 import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
@@ -8,7 +7,8 @@ import { prepareBrowserIdentity, openBrowserPeer, serveBrowserPeer, type Browser
 import { frameRtcDataChannel, type RtcDataChannel } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
-import type { PilotPeerBootstrap, PilotRouteStats } from './contract.js'
+import type { PilotPeerBootstrap, PilotProgress, PilotRouteStats } from './contract.js'
+import { attachPilotPeer } from './peer.js'
 import { routeState } from './route-state.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
@@ -22,32 +22,22 @@ const subscriptions = new Map<string, { readonly abort: AbortController; readonl
 async function connect(channel: RtcDataChannel): Promise<void> {
   if (peer === undefined || identity === undefined || bootstrap === undefined || signals === undefined) throw new Error('PILOT_NOT_OPEN')
   await disconnect()
-  const started = performance.now(), framed = frameRtcDataChannel(channel)
+  const framed = frameRtcDataChannel(channel)
   try {
-    await framed.ready
-    const snapshot = peer.governed!.activeSnapshot
-    const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
-      isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, identity!.signing.publicKeyBytes))
-    if (reader === undefined) throw new Error('PILOT_READER_GRANT_REQUIRED')
-    const authenticated = await openAuthenticatedPeerLink({ connection: framed, local: peer.transport.asLink(), identity: identity.signing,
-      groupId: snapshot.groupId, grantId: reader.id,
-      receiveSignal: async frame => { await signals!.receive(frame) },
-      authorizePeer: ({ authorId, grantId }) => {
-        const current = peer!.governed!.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
-        return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
-          equalBytes(capability.grant.signingPublicKey, authorId) && equalBytes(authorId, base64UrlToBytes(bootstrap!.nativeIdentity))
-      } })
-    const detach = peer.transport.connect(authenticated.link), authenticatedMs = performance.now() - started
+    const authenticated = await attachPilotPeer({ connection: framed, transport: peer.transport, identity,
+      nativeIdentity: bootstrap.nativeIdentity, activeMembership: () => peer!.governed!.activeSnapshot,
+      receiveSignal: async frame => { await signals!.receive(frame) } })
     let closed = false
     const current = { sendSignal: (bytes: Uint8Array) => authenticated.sendSignal(bytes),
-      stats: (): PilotRouteStats => { const stats = framed.stats; return { route: 'webrtc', authenticatedMs,
+      stats: (): PilotRouteStats => { const stats = framed.stats; return { route: 'webrtc', authenticatedMs: authenticated.authenticatedMs,
         sentBytes: stats.sentBytes, receivedBytes: stats.receivedBytes, queuedBytes: stats.queuedSendBytes + stats.queuedReceiveBytes } },
-      async close() { if (closed) return; closed = true; detach(); await authenticated.close() } }
+      async close() { if (closed) return; closed = true; await authenticated.close() } }
     connection = current
     void authenticated.completion.catch((error: unknown) => {
       if (!closed) endpoint.postMessage({ pilot: 'connection-error', error: String(error) })
-    }).finally(detach)
-    await peer.transport.catchUp(); await peer.node.waitForIdle()
+    }).finally(() => {
+      if (connection === current) { connection = undefined; connectionHistory.push(current.stats()) }
+    })
   } catch (error) { await framed.close(); throw error }
 }
 async function disconnect(): Promise<void> {
@@ -100,7 +90,17 @@ endpoint.addEventListener('message', (event) => {
       case 'sync': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return null
       case 'disconnect': await disconnect(); return null
       case 'routeStats': return [...connectionHistory, ...(connection === undefined ? [] : [connection.stats()])]
-      case 'routeState': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return routeState(peer!.transport, peer!.governed!.activeSnapshot, peer!.node.finalOrderLength)
+      // Neither diagnostic takes the materialization mutex or starts another replay.
+      case 'progress': {
+        const status = await peer!.node.status()
+        return { connected: connection !== undefined, records: status.transport.records,
+          processedRecords: status.processedTransportRecords, finalOrderLength: status.finalOrderLength ?? 0,
+          materializationPending: status.materializationPending,
+          ...(status.lastError === undefined ? {} : { error: status.lastError }),
+          ...(status.transport.lastCatchUpError === undefined ? {} : { transportError: status.transport.lastCatchUpError }),
+          ...(status.ingest === undefined ? {} : { ingest: status.ingest }) } satisfies PilotProgress
+      }
+      case 'routeState': return routeState(peer!.transport, peer!.governed!.activeSnapshot, peer!.node.finalOrderLength)
       case 'signalPublish': return signals!.publish(request.topic!, request.payload!, { ttlMs: request.ttlMs ?? 2500 })
       case 'signalNext': {
         const id = request.subscriptionId!

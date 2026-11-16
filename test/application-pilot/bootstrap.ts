@@ -65,7 +65,9 @@ async function connect(): Promise<void> {
     configuration: { iceServers: [] }, handoff(channel) {
       // Transfer in the creation callback before any awaited work. The Worker
       // alone frames and authenticates the channel, then opens feed replication.
-      attached = command('channel', { channel }, 30_000, [channel as RTCDataChannel])
+      // ICE, framing HELLO and peer authentication have separate bounded phases.
+      // This command ends at authenticated attachment, before SQL/WASM replay.
+      attached = command('channel', { channel }, 60_000, [channel as RTCDataChannel])
       void attached.catch(() => undefined)
     } })
   sessions.push(introduced)
@@ -78,6 +80,9 @@ async function disconnect(): Promise<void> {
   try { await command('disconnect') } finally { await previous?.close() }
 }
 await connect()
+// The invitation and schema-dependent application calls need the initial state.
+// Reconnect only attaches; the qualification observes its replay frontier separately.
+await command('sync', {}, 120_000)
 const rpc = new WorkerRpcTransport(worker)
 let hold: { promise: Promise<void>; release(): void; receipt: { operationId: string; proposalId: string } | null } | null = null
 const transport: RpcTransport = {
@@ -130,8 +135,9 @@ target.applicationPilot = {
   },
   heldSubmission: () => hold?.receipt ?? null,
   releaseSubmission() { const previous = hold; hold = null; previous?.release() },
-  disconnect, reconnect: connect, async sync() { await command('sync') },
+  disconnect, reconnect: connect, async sync() { await command('sync', {}, 120_000) },
   routeStats: () => command('routeStats') as ReturnType<PilotWindow['applicationPilot']['routeStats']>,
+  progress: () => command('progress') as ReturnType<PilotWindow['applicationPilot']['progress']>,
   signalingStats: () => sessions.map(value => ({ ...value.signaling })),
   routeState: () => command('routeState') as ReturnType<PilotWindow['applicationPilot']['routeState']>,
   events: () => client.events.read(), operation: async operationId => backend.operations.get(operationId),

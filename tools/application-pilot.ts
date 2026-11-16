@@ -17,11 +17,12 @@ import { chromium, expect, type Browser, type Page } from '@playwright/test'
 import { build } from 'esbuild'
 
 import { createAgent } from '../examples/resident-agent.js'
-import type { PilotBootstrap, PilotRegistration, PilotWindow } from '../test/application-pilot/contract.js'
+import type { PilotBootstrap, PilotProgress, PilotRegistration, PilotWindow } from '../test/application-pilot/contract.js'
 import { createNativeBrowserFixture, type NativeBrowserFixture } from './browser-event-fixture.js'
 import { qualifyApplicationScope } from './lib/application-scope.js'
 import { createPeerRouteFixture } from './lib/peer-route-fixture.js'
 import { routeState } from '../test/application-pilot/route-state.js'
+import { waitFor } from './lib/wait-for.js'
 
 /** Real public runtime + independent OPFS replicas + native final-intent worker. */
 const workspace = resolve(import.meta.dirname, '..')
@@ -382,9 +383,28 @@ try {
       ), { operationId: `route-catchup-body-${i}` }))
       const resumeStarted = performance.now()
       await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.reconnect())))
+      report.timingsMs.routeReconnectAttachment = performance.now() - resumeStarted
       const finalNative = await native.client.events.read()
       assert.equal(finalNative.hasMore, false, 'route benchmark must compare the complete final event history')
       const lastProposal = finalNative.transactions.at(-1)!.proposalId
+      // A healthy authenticated channel must stay open while SQL/WASM applies
+      // history. Observe cheap committed frontiers, not a sync call queued behind
+      // the materialization mutex under the connection command's short deadline.
+      const replay = { target: { records: (await native.transport.status()).records, finalOrderLength: native.node.finalOrderLength },
+        latest: [] as PilotProgress[], elapsedMs: 0 }
+      report.diagnostics.routeReplay = replay
+      await waitFor(async () => {
+        native!.assertHealthy()
+        replay.latest = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.progress())))
+        replay.elapsedMs = performance.now() - resumeStarted
+        for (const state of replay.latest) {
+          assert(state.connected, `RTC disconnected during durable replay: ${JSON.stringify(state)}`)
+          assert.equal(state.error, undefined, `Replica ingestion failed: ${JSON.stringify(state)}`)
+          assert.equal(state.transportError, undefined, `Replica replication failed: ${JSON.stringify(state)}`)
+        }
+        return replay.latest.every(state => state.records >= replay.target.records && state.processedRecords >= replay.target.records &&
+          state.finalOrderLength >= replay.target.finalOrderLength && !state.materializationPending)
+      }, 'both replicas apply the complete large reconnect history', 120_000)
       await Promise.all(all.map(page => browserHasProposal(page, lastProposal)))
       report.timingsMs.routeReconnectCatchUp = performance.now() - resumeStarted
       const finalViews = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.events())))
@@ -451,7 +471,10 @@ try {
   }
   if (routes !== undefined) { report.diagnostics.routes = routes.snapshot(); await routes.saveTrace(join(output, 'route-trace.ndjson')) }
   await record()
-  process.stderr.write(`Pilot diagnostics: ${JSON.stringify(report.diagnostics)}\n`)
+  // Preserve complete event evidence in report.json without burying the actual
+  // failure beneath 768 KiB of repeated benchmark payloads in the CI log.
+  process.stderr.write(`Pilot diagnostics: ${JSON.stringify(report.diagnostics, (key, value: unknown) =>
+    key === 'body' && typeof value === 'string' && value.length > 1024 ? `[${value.length} benchmark characters; retained in report.json]` : value)}\n`)
   throw error
 } finally {
   if (deadline !== undefined) clearTimeout(deadline)
@@ -480,13 +503,6 @@ async function ready(page: Page) {
   await page.waitForFunction(() => 'applicationPilot' in globalThis)
   await expect(page.locator('#message')).toBeEnabled()
   await expect(page.locator('#status')).toHaveAttribute('data-failure', 'false')
-}
-async function waitFor(predicate: () => Promise<boolean>, description: string) {
-  const deadline = Date.now() + 40_000
-  while (!await predicate()) {
-    if (Date.now() >= deadline) throw new Error(`PILOT_DURABLE_PROGRESS_TIMEOUT: ${description}`)
-    await new Promise(resolve => setTimeout(resolve, 100))
-  }
 }
 async function browserHasProposal(page: Page, proposalId: string) {
   await waitFor(() => page.evaluate(async id => {

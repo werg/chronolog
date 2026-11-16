@@ -4,10 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
-import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
-import { isCapabilityActive } from '@chronolog/capabilities'
 import { loadOrCreateEnrollmentIdentity } from '@chronolog/node-core'
-import { bytesToBase64Url, bytesToHex, equalBytes } from '@chronolog/protocol'
+import { bytesToBase64Url } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { openWebRtcConnection } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
@@ -16,19 +14,25 @@ import { expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 
 import { createNativeBrowserFixture } from '../browser-event-fixture.js'
+import { attachPilotPeer } from '../../test/application-pilot/peer.js'
 import { createPeerRouteFixture } from './peer-route-fixture.js'
 
 it('introduces through the packaged host then replicates signed records over RTC with its listener stopped', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-host-rtc-'))
   const readerStore = new NativeAgentStore(join(directory, 'reader.sqlite'))
   const identity = await loadOrCreateEnrollmentIdentity(readerStore, 'rtc-reader')
-  const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(readerStore, webFeedCrypto), crypto: webFeedCrypto,
+  let releaseWrites!: () => void, writeStarted = false
+  const writesBlocked = new Promise<void>(resolve => { releaseWrites = resolve })
+  const delayedStorage = { get: (key: string) => readerStore.get(key), async put(key: string, bytes: Uint8Array) {
+    if (key.startsWith('feed/object/')) { writeStarted = true; await writesBlocked }
+    await readerStore.put(key, bytes)
+  } }
+  const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(delayedStorage, webFeedCrypto), crypto: webFeedCrypto,
     signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey) })
   let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
   let routes: Awaited<ReturnType<typeof createPeerRouteFixture>> | undefined
   let rtc: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
-  let authenticated: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined
-  let detach: (() => void) | undefined
+  let authenticated: Awaited<ReturnType<typeof attachPilotPeer>> | undefined
   try {
     const engine = join(directory, 'engine')
     await mkdir(engine)
@@ -47,16 +51,13 @@ it('introduces through the packaged host then replicates signed records over RTC
     rtc = await openWebRtcConnection({ role, signaling: rendezvous, configuration: { iceServers: [] },
       createPeerConnection: configuration => createNativePeerConnection(configuration,
         { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }) })
-    const membership = native.governed.activeSnapshot
-    const reader = [...membership.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
-      equalBytes(capability.grant.signingPublicKey, identity.signing.publicKeyBytes))!
-    authenticated = await openAuthenticatedPeerLink({ connection: rtc, local: transport.asLink(), identity: identity.signing,
-      groupId: membership.groupId, grantId: reader.id, authorizePeer: ({ authorId, grantId }) => {
-        const current = native!.governed.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
-        return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
-          equalBytes(capability.grant.signingPublicKey, authorId) && equalBytes(authorId, native!.identity.signing.publicKeyBytes)
-      } })
-    detach = transport.connect(authenticated.link)
+    authenticated = await attachPilotPeer({ connection: rtc, transport, identity,
+      nativeIdentity: bytesToBase64Url(native.identity.signing.publicKeyBytes), activeMembership: () => native!.governed.activeSnapshot })
+    // The exact Worker attachment boundary must finish even if replay cannot
+    // publish its first durable record. A slow OPFS/materializer is not a failed
+    // RTC handshake and cannot tear down the established peer session.
+    await expect.poll(() => writeStarted).toBe(true)
+    expect((await transport.status()).records).toBe(0)
     await expect.poll(() => routes!.snapshot().sessions[0]?.authenticatedMs).toEqual(expect.any(Number))
     await expect.poll(() => routes!.snapshot().signaling.activeSockets).toBe(0)
     expect(rendezvous.stats).toMatchObject({ sentDescriptions: 1, receivedDescriptions: 1, closed: true })
@@ -68,6 +69,7 @@ it('introduces through the packaged host then replicates signed records over RTC
     finally { operation.dispose() }
     const retained = await native.transport.history()
     expect(retained.length).toBeGreaterThan(0)
+    releaseWrites()
     await transport.catchUp()
     for (const record of retained) {
       const { receivedAtMs: _nativeReceiptTime, ...original } = record
@@ -83,7 +85,7 @@ it('introduces through the packaged host then replicates signed records over RTC
     process.stderr.write(`Host/RTC fixture diagnostics: ${JSON.stringify(routes?.snapshot())}\n`)
     throw error
   } finally {
-    detach?.()
+    releaseWrites()
     await authenticated?.close(); await rtc?.close(); await routes?.close()
     await native?.close(); await transport.close(); readerStore.close()
     await rm(directory, { recursive: true, force: true })
