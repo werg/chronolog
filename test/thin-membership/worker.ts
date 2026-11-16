@@ -7,13 +7,14 @@ import { decodeMembershipLedgerResponse } from '@chronolog/node-core/membership'
 import { base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest, emit, equalBytes, program } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { openBrowserPeer, prepareBrowserIdentity, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
+import { frameRtcDataChannel, type RtcDataChannel } from '@chronolog/transport-webrtc'
 
-import { connectGovernedBrowserPeer } from '../browser/event-connection.js'
+import { attachMembershipPeer } from './peer.js'
 import type { ThinMembershipBootstrap } from '../../tools/thin-membership-native.js'
 
 type Request = {
   readonly id: number
-  readonly method: 'prepare' | 'open' | 'request' | 'approval' | 'history' | 'connect' | 'disconnect' | 'sync' |
+  readonly method: 'prepare' | 'open' | 'request' | 'approval' | 'history' | 'channel' | 'disconnect' | 'sync' |
     'publish' | 'operation' | 'events' | 'status' | 'close'
   readonly name?: string
   readonly bootstrap?: ThinMembershipBootstrap
@@ -22,12 +23,13 @@ type Request = {
   readonly pages?: readonly string[]
   readonly operationId?: string
   readonly text?: string
+  readonly channel?: RtcDataChannel
 }
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined, client: ChronologClient | undefined, identity: EnrollmentIdentity | undefined
 let bootstrap: ThinMembershipBootstrap | undefined
-let connection: Awaited<ReturnType<typeof connectGovernedBrowserPeer>> | undefined
+let connection: Awaited<ReturnType<typeof attachMembershipPeer>> | undefined
 let connectionError: string | undefined
 let requestId: string | undefined
 
@@ -46,7 +48,7 @@ async function status() {
   }
   const membership = peer.governed!.activeSnapshot
   return { identity: bytesToBase64Url(identity.signing.publicKeyBytes), connected: connection !== undefined,
-    connectionError, applicationBlockedOnPayload, membershipRevision: String(membership.revision), finalThrough: peer.node.finalThrough,
+    connectionError, rtc: connection?.stats() ?? null, applicationBlockedOnPayload, membershipRevision: String(membership.revision), finalThrough: peer.node.finalThrough,
     availableEpochs: peer.governed!.governance.cipherRing.epochs().map(String),
     knownEpochs: peer.governed!.governance.knownEpochs.map(String),
     grants: [...membership.capabilities.values()].filter(capability =>
@@ -96,13 +98,15 @@ endpoint.addEventListener('message', event => {
         }
         return status()
       }
-      case 'connect': {
-        if (connection !== undefined) return status()
+      case 'channel': {
+        if (connection !== undefined) { request.channel!.close(); throw new Error('THIN_BROWSER_ALREADY_CONNECTED') }
         connectionError = undefined
-        connection = await connectGovernedBrowserPeer({ bootstrap: bootstrap!, identity: identity!, transport: peer!.transport,
+        connection = await attachMembershipPeer({ connection: frameRtcDataChannel(request.channel!),
+          nativeIdentity: bootstrap!.nativeIdentity, identity: identity!, transport: peer!.transport,
           activeMembership: () => peer!.governed!.activeSnapshot })
         const active = connection
         void active.completion.catch((error: unknown) => { if (connection === active) connectionError = String(error) })
+          .finally(() => { if (connection === active) connection = undefined })
         await peer!.transport.catchUp()
         return status()
       }

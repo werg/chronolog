@@ -25,12 +25,21 @@ const output = resolve(values.output ?? join(workspace, `artifacts/thin-membersh
 await mkdir(dirname(output), { recursive: true }); await mkdir(output)
 const host = join(output, 'host'), assets = join(output, 'browser')
 await mkdir(host); await mkdir(assets)
-const report = { format: 'chronolog-thin-membership/v1', passed: false, status: 'building', startedAt: new Date().toISOString(),
+const report = { format: 'chronolog-thin-membership/v2', passed: false, status: 'building', startedAt: new Date().toISOString(),
   command: process.argv.slice(1), revisions: { chronolog: gitState(workspace), tendrillerArtifacts: gitState(artifacts) },
+  topology: { membership: ['packaged workerd administrator', 'signed native membership HTTP'],
+    introduction: ['Window', 'one direct SDP HTTP offer/answer', 'resident native WebRTC handler'],
+    application: ['DedicatedWorker with OPFS/WASM', 'authenticated RTCDataChannel', 'native full replica and finality service'],
+    nativeImplementation: 'werift@0.27.0' },
+  measurement: { applicationBytes: 'Logical authenticated RTC frame payload; excludes framing headers/credit and SCTP/DTLS/IP overhead.',
+    rtcSdpBytes: 'UTF-8 bytes of the complete offer and answer SDP descriptions.',
+    rtcSignalingRequestBytes: 'Actual direct introduction HTTP request bodies, including the protocol JSON envelope; excludes HTTP headers.',
+    rtcSignalingResponseBytes: 'Actual direct introduction HTTP response bodies, including the protocol JSON envelope; excludes HTTP headers.' },
   artifacts: {} as Record<string, unknown>, browser: '', checks: [] as Array<{ name: string; evidence: unknown }>,
   pageErrors: [] as string[], final: null as unknown, error: '', limits: [
     'The built Cloudflare Worker runs in the real local workerd test harness with synthetic authenticated accounts; this is not a deployed Cloudflare service or public-network qualification.',
     'Descriptor/body byte counters cover the actual loopback membership and peer boundaries; they do not predict provider billing or NAT traversal.',
+    'Application peer bytes are logical authenticated RTC frame payloads, excluding framing headers/credit and SCTP/DTLS/IP overhead. SDP HTTP body bytes are measured separately.',
   ] }
 const save = () => writeFile(join(output, 'report.json'), JSON.stringify(report, bigintJson, 2) + '\n')
 let browser: Browser | undefined, page: Page | undefined
@@ -39,6 +48,7 @@ let bootstrap: ThinMembershipBootstrap | undefined
 let completed = false
 const assetPaths = new Map([
   ['/membership-worker.mjs', 'membership-worker.mjs'],
+  ['/membership-page.mjs', 'membership-page.mjs'],
   ...['sqlite3.mjs', 'sqlite3.wasm', 'sqlite3-opfs-async-proxy.js', 'manifest.json'].map(name => [`/engine/${name}`, `engine/${name}`] as const),
 ])
 
@@ -62,6 +72,13 @@ try {
     outfile: join(host, 'membership-api.mjs'), bundle: true, platform: 'browser', format: 'esm', target: 'es2022', alias, metafile: true })
   const worker = await build({ absWorkingDir: workspace, entryPoints: ['test/thin-membership/worker.ts'],
     outfile: join(assets, 'membership-worker.mjs'), bundle: true, platform: 'browser', format: 'esm', target: 'es2022', alias, metafile: true })
+  const window = await build({ absWorkingDir: workspace, entryPoints: ['test/thin-membership/page.ts'],
+    outfile: join(assets, 'membership-page.mjs'), bundle: true, platform: 'browser', format: 'esm', target: 'es2022', alias, metafile: true })
+  for (const bundle of [worker, window]) {
+    const forbidden = Object.values(bundle.metafile.outputs).flatMap(output => Object.entries(output.inputs)
+      .filter(([name, value]) => value.bytesInOutput > 0 && /(?:werift|transport-webrtc\/src\/native|transport-tendriller|runtime-workerd|event-connection)/u.test(name)).map(([name]) => name))
+    if (forbidden.length > 0) throw new Error(`THIN_RTC_BROWSER_IMPORT_AUDIT_FAILED: ${forbidden.join(', ')}`)
+  }
   await mkdir(join(assets, 'engine'))
   for (const name of ['sqlite3.mjs', 'sqlite3.wasm', 'sqlite3-opfs-async-proxy.js', 'manifest.json']) await cp(join(wasm, name), join(assets, 'engine', name))
   await writeFile(join(assets, 'index.html'), browserPage())
@@ -81,8 +98,9 @@ try {
   }, null, 2) + '\n')
   report.artifacts = { sdk: { source: sourceSdk, path: sdk, sha256: await hash(sdk) }, engine: { source: sourceEngine, path: engine, sha256: await hash(engine) },
     wasmManifestSha256: await hash(join(wasm, 'manifest.json')), wasmSha256: await hash(join(wasm, 'sqlite3.wasm')),
-    browserWorkerSha256: await hash(join(assets, 'membership-worker.mjs')), publicMembershipApiSha256: await hash(join(host, 'membership-api.mjs')) }
-  await writeFile(join(output, 'bundles.json'), JSON.stringify({ publicApi: publicApi.metafile, worker: worker.metafile }, null, 2) + '\n')
+    browserWorkerSha256: await hash(join(assets, 'membership-worker.mjs')), browserPageSha256: await hash(join(assets, 'membership-page.mjs')),
+    publicMembershipApiSha256: await hash(join(host, 'membership-api.mjs')) }
+  await writeFile(join(output, 'bundles.json'), JSON.stringify({ publicApi: publicApi.metafile, worker: worker.metafile, window: window.metafile }, null, 2) + '\n')
   await run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], host)
   // The installed public package must expose the real default host and testing
   // boundary. A source checkout or test replacement provider is never injected.
@@ -191,7 +209,7 @@ export default defineConfig({ plugins: [cloudflareTest({main: new URL('./entry.m
 }
 process.stdout.write(`Thin membership evidence: ${output}\n`)
 
-interface BrowserPage { readonly thinMembership: { call(command: Record<string, unknown>): Promise<unknown>; replaceWorker(): void } }
+interface BrowserPage { readonly thinMembership: { call(command: Record<string, unknown>): Promise<unknown>; replaceWorker(): Promise<void> } }
 async function callDevice(current: Page, command: Record<string, unknown>): Promise<unknown> {
   return current.evaluate(input => (globalThis as unknown as BrowserPage).thinMembership.call(input), command)
 }
@@ -225,19 +243,5 @@ async function run(command: string, args: readonly string[], cwd: string, timeou
   })
 }
 function browserPage(): string { return `<!doctype html><html lang="en"><meta charset="utf-8"><title>Thin membership qualification</title>
-<body><h1>Thin membership qualification</h1><p>Actual OPFS device. Membership is approved by the built Cloudflare host.</p><pre id="status">Waiting for the qualification runner.</pre>
-<script type="module">
-let worker, sequence = 0; const pending = new Map();
-function open() {
-  worker = new Worker('/membership-worker.mjs', {type:'module'});
-  worker.onmessage = ({data}) => { const entry = pending.get(data.id); if (!entry) return; pending.delete(data.id); clearTimeout(entry.timer);
-    document.querySelector('#status').textContent = JSON.stringify(data, (_,value) => typeof value === 'bigint' ? String(value) : value, 2);
-    if (data.error) entry.reject(new Error(data.error)); else entry.resolve(data.value); };
-  worker.onerror = event => { for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new Error(event.message)); } pending.clear(); };
-}
-open();
-window.thinMembership = {call(command) { return new Promise((resolve,reject) => { const id=++sequence;
-  const timer=setTimeout(() => {pending.delete(id); reject(new Error('Device command timed out: '+command.method));},75000);
-  pending.set(id,{resolve,reject,timer}); worker.postMessage({...command,id}); }); },
-  replaceWorker() { worker.terminate(); for (const entry of pending.values()) {clearTimeout(entry.timer); entry.reject(new Error('Worker replaced'));} pending.clear(); open(); }};
-</script></body></html>` }
+<body><h1>Thin membership qualification</h1><p>Actual OPFS device. Membership is approved by the built Cloudflare host; application records and bodies use native WebRTC.</p><pre id="status">Waiting for the qualification runner.</pre>
+<script type="module" src="/membership-page.mjs"></script></body></html>` }

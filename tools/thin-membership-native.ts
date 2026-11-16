@@ -1,9 +1,11 @@
 import { once } from 'node:events'
 import { mkdir } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage } from 'node:http'
+import { syncBuiltinESMExports } from 'node:module'
+import os from 'node:os'
 import { join } from 'node:path'
 
-import { NativeAgentStore, framePeerStream } from '@chronolog/agent-service'
+import { NativeAgentStore } from '@chronolog/agent-service'
 import { createMembershipLedgerHandler } from '@chronolog/agent-service/membership-http'
 import { decodeSignedGenesis, encodeSignedGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
@@ -18,6 +20,8 @@ import {
 } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
+import { createWebRtcOfferHandler, WEBRTC_HTTP_LIMITS, type DataChannelConnection } from '@chronolog/transport-webrtc'
+import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
 
 import { createDaemonAgentRuntime } from '../apps/chronologd/src/agent-runtime.js'
 
@@ -26,8 +30,8 @@ export interface ThinMembershipBootstrap {
   readonly groupRoute: string
   readonly executionManifest: string
   readonly nativeIdentity: string
-  readonly peerUrl: string
-  readonly peerToken: string
+  readonly rtcUrl: string
+  readonly rtcToken: string
 }
 
 export interface ThinMembershipTraffic {
@@ -44,6 +48,11 @@ export interface ThinMembershipTraffic {
   unexpectedAdministratorRequests: number
   peerInboundBytes: number
   peerOutboundBytes: number
+  rtcSignalingRequests: number
+  rtcSignalingRequestBytes: number
+  rtcSignalingResponseBytes: number
+  rtcSignalingDescriptions: number
+  rtcSdpBytes: number
 }
 
 /**
@@ -78,7 +87,8 @@ export async function createThinMembershipNative(options: {
   const traffic: ThinMembershipTraffic = { membershipRequests: 0, membershipRequestBytes: 0, membershipResponseBytes: 0,
     descriptorTransfers: 0, closureRecordTransfers: 0, closureRecordBytes: 0,
     candidateDescriptorBytes: 0, inlineControlDescriptorBytes: 0, inlineControlEnvelopeBytes: 0,
-    applicationEnvelopeBytesToAdministrator: 0, unexpectedAdministratorRequests: 0, peerInboundBytes: 0, peerOutboundBytes: 0 }
+    applicationEnvelopeBytesToAdministrator: 0, unexpectedAdministratorRequests: 0, peerInboundBytes: 0, peerOutboundBytes: 0,
+    rtcSignalingRequests: 0, rtcSignalingRequestBytes: 0, rtcSignalingResponseBytes: 0, rtcSignalingDescriptions: 0, rtcSdpBytes: 0 }
   let governed: GovernedNode | undefined
   let control: NodeStateDatabase | undefined
   let agent: Awaited<ReturnType<typeof createDaemonAgentRuntime>> | undefined
@@ -87,62 +97,51 @@ export async function createThinMembershipNative(options: {
   let failure: Error | undefined
   let schemaReady = false
   let dropAppendReply = false
-  const peerToken = crypto.randomUUID()
-  const sessions = new Map<string, { readonly writer: WritableStreamDefaultWriter<Uint8Array>; close(): Promise<void> }>()
+  const rtcToken = crypto.randomUUID(), connections = new Set<DataChannelConnection>()
+  const enumerate = os.networkInterfaces
+  let restrictedInterfaceEnumeration = false
+  try { enumerate() } catch {
+    // Qualification binds loopback explicitly; this sandbox denies optional
+    // interface enumeration. Production adapter behavior remains unchanged.
+    restrictedInterfaceEnumeration = true; os.networkInterfaces = () => ({}); syncBuiltinESMExports()
+  }
+  const measuredTraffic = (): ThinMembershipTraffic => {
+    const value = { ...traffic }
+    for (const connection of connections) {
+      value.peerInboundBytes += connection.stats.receivedBytes
+      value.peerOutboundBytes += connection.stats.sentBytes
+    }
+    return value
+  }
   const checked = () => {
     if (failure !== undefined) throw failure
     if (governed === undefined || agent === undefined || client === undefined) throw new Error('THIN_NATIVE_NOT_STARTED')
     return { governed, agent, client }
   }
   const server = createServer((incoming, outgoing) => {
-    outgoing.setHeader('Access-Control-Allow-Origin', '*')
-    outgoing.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-    outgoing.setHeader('Access-Control-Allow-Headers', 'Content-Type')
     outgoing.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
     outgoing.setHeader('Cache-Control', 'no-store')
-    if (incoming.method === 'OPTIONS') { outgoing.writeHead(204); outgoing.end(); return }
     const handle = async () => {
       const url = new URL(incoming.url ?? '/', 'http://localhost')
-      if (url.pathname.startsWith('/peer/')) {
-        const current = checked()
-        const id = /^\/peer\/([a-z0-9-]{36})$/u.exec(url.pathname)?.[1]
-        if (id === undefined || url.searchParams.get('token') !== peerToken) { outgoing.writeHead(403); outgoing.end(); return }
-        if (incoming.method === 'GET') {
-          if (sessions.has(id)) { outgoing.writeHead(409); outgoing.end(); return }
-          if (sessions.size >= 8) { outgoing.writeHead(429); outgoing.end(); return }
-          outgoing.writeHead(200, { 'Content-Type': 'application/octet-stream' }); outgoing.flushHeaders()
-          const input = new TransformStream<Uint8Array, Uint8Array>(), writer = input.writable.getWriter()
-          const connection = framePeerStream({ readable: input.readable, writable: new WritableStream<Uint8Array>({
-            async write(bytes) { traffic.peerOutboundBytes += bytes.length; await writeStream(outgoing, bytes) },
-            close() { outgoing.end() }, abort() { outgoing.destroy() },
-          }) })
-          let session: Awaited<ReturnType<typeof current.agent.context.connectPeer>> | undefined
-          let closed = false
-          const close = async () => {
-            if (closed) return
-            closed = true; sessions.delete(id)
-            await Promise.allSettled([connection.close(), writer.abort(), session?.close()])
-          }
-          sessions.set(id, { writer, close })
-          outgoing.once('close', () => { void close() })
-          void current.agent.context.connectPeer({ connection }).then(value => {
-            session = value
-            if (closed) { void value.close(); return }
-            void value.completion.catch((error: unknown) => { if (!closed) failure = asError(error) }).finally(close)
-          }, (error: unknown) => { if (!closed) failure = asError(error); void close() })
-        } else {
-          const session = sessions.get(id)
-          if (session === undefined) { outgoing.writeHead(410); outgoing.end(); return }
-          if (incoming.method === 'POST') {
-            const bytes = await boundedBody(incoming)
-            traffic.peerInboundBytes += bytes.length
-            await session.writer.write(bytes)
-          } else if (incoming.method === 'DELETE') await session.close()
-          else { outgoing.writeHead(405); outgoing.end(); return }
-          outgoing.writeHead(204); outgoing.end()
+      if (url.pathname === '/_chronolog/rtc') {
+        const request = await webRequest(incoming, WEBRTC_HTTP_LIMITS.messageBytes)
+        const requestBytes = new Uint8Array(await request.clone().arrayBuffer())
+        traffic.rtcSignalingRequests++; traffic.rtcSignalingRequestBytes += requestBytes.length
+        const response = await introduction.fetch(request), bytes = new Uint8Array(await response.arrayBuffer())
+        traffic.rtcSignalingResponseBytes += bytes.length
+        if (request.method === 'POST' && response.ok) {
+          const offer = JSON.parse(new TextDecoder().decode(requestBytes)) as { description: { sdp: string } }
+          const answer = JSON.parse(new TextDecoder().decode(bytes)) as { description: { sdp: string } }
+          traffic.rtcSignalingDescriptions += 2
+          traffic.rtcSdpBytes += new TextEncoder().encode(offer.description.sdp).length + new TextEncoder().encode(answer.description.sdp).length
         }
-        return
+        response.headers.forEach((value, name) => outgoing.setHeader(name, value))
+        outgoing.writeHead(response.status); outgoing.end(bytes); return
       }
+      outgoing.setHeader('Access-Control-Allow-Origin', '*')
+      outgoing.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+      outgoing.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      if (incoming.method === 'OPTIONS') { outgoing.writeHead(204); outgoing.end(); return }
       const request = await webRequest(incoming)
       if (url.pathname === '/_chronolog/membership') {
         if (membershipHandler === undefined) { outgoing.writeHead(503); outgoing.end(); return }
@@ -198,16 +197,36 @@ export async function createThinMembershipNative(options: {
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('THIN_NATIVE_ADDRESS_UNAVAILABLE')
   const base = `http://127.0.0.1:${address.port}`
+  const introduction = createWebRtcOfferHandler({ allowedOrigins: [base], maxConnections: 8,
+    authorize: request => agent !== undefined && request.headers.get('Authorization') === `Bearer ${rtcToken}`,
+    createPeerConnection: configuration => createNativePeerConnection(configuration,
+      { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
+    onError(error) {
+      const value = asError(error)
+      if (!['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED'].includes(value.message)) failure = value
+    },
+    async accept(connection) {
+      connections.add(connection)
+      const retire = (): void => {
+        if (!connections.delete(connection)) return
+        traffic.peerInboundBytes += connection.stats.receivedBytes; traffic.peerOutboundBytes += connection.stats.sentBytes
+      }
+      try {
+        const session = await checked().agent.context.connectPeer({ connection })
+        void session.completion.finally(retire).catch(() => undefined)
+        return { completion: session.completion, async close() { try { await session.close() } finally { retire() } } }
+      } catch (error) { retire(); throw error }
+    } })
   const bootstrap = (): ThinMembershipBootstrap => {
     const descriptor = checked().governed.descriptor
     return { genesis: bytesToBase64Url(encodeSignedGenesis(descriptor.genesis)), groupRoute: bytesToBase64Url(descriptor.groupRoute),
       executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
-      nativeIdentity: bytesToBase64Url(identity.signing.publicKeyBytes), peerUrl: `${base}/peer`, peerToken }
+      nativeIdentity: bytesToBase64Url(identity.signing.publicKeyBytes), rtcUrl: `${base}/_chronolog/rtc`, rtcToken }
   }
   let closed = false
   return {
     base, membershipUrl: `${base}/_chronolog/membership`, identity, historyId, executionManifestDigest, initialCapabilities,
-    traffic: () => structuredClone(traffic), bootstrap,
+    traffic: measuredTraffic, bootstrap,
     async start(input: { readonly genesis: string; readonly groupRoute: string }) {
       if (governed !== undefined) throw new Error('THIN_NATIVE_ALREADY_STARTED')
       const genesis = decodeSignedGenesis(base64UrlToBytes(input.genesis))
@@ -286,23 +305,28 @@ export async function createThinMembershipNative(options: {
       } finally { await view.release() }
       return { finalThrough: current.governed.node.finalThrough, membershipRevision: String(current.governed.activeSnapshot.revision),
         availableEpochs: current.governed.governance.cipherRing.epochs().map(String), head: await current.agent.authority!.head(),
-        schemaRoles: { nativeSchemaAdministrators, membershipRootGroupMembers }, traffic: structuredClone(traffic) }
+        schemaRoles: { nativeSchemaAdministrators, membershipRootGroupMembers }, traffic: measuredTraffic(),
+        rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift', restrictedInterfaceEnumeration,
+          byteBoundary: 'Logical authenticated peer frame payload; excludes framing headers/credit and SCTP/DTLS/IP overhead.' } }
     },
     loseNextAppendReply() { dropAppendReply = true },
     assertHealthy() { checked() },
     async close() {
       if (closed) return
       closed = true
-      await Promise.all([...sessions.values()].map(session => session.close()))
+      await introduction.close()
       server.closeAllConnections()
       await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error)))
       try { await agent?.close(); await client?.close(); if (governed === undefined) await transport.close(); else await governed.close() }
-      finally { control?.close(); store.close() }
+      finally {
+        control?.close(); store.close()
+        if (restrictedInterfaceEnumeration) { os.networkInterfaces = enumerate; syncBuiltinESMExports() }
+      }
     },
   }
 }
 
-async function webRequest(request: IncomingMessage): Promise<Request> {
+async function webRequest(request: IncomingMessage, maximum?: number): Promise<Request> {
   const headers = new Headers()
   for (const [name, value] of Object.entries(request.headers)) {
     if (Array.isArray(value)) for (const entry of value) headers.append(name, entry)
@@ -310,26 +334,22 @@ async function webRequest(request: IncomingMessage): Promise<Request> {
   }
   const method = request.method ?? 'GET'
   return new Request(`http://localhost${request.url ?? '/'}`, { method, headers,
-    ...(method === 'GET' || method === 'HEAD' ? {} : { body: (await boundedBody(request)).slice().buffer }) })
+    ...(method === 'GET' || method === 'HEAD' ? {} : { body: (await boundedBody(request, maximum)).slice().buffer }) })
 }
 
-async function boundedBody(request: IncomingMessage): Promise<Uint8Array> {
+async function boundedBody(request: IncomingMessage, maximum = 2 * 1024 * 1024): Promise<Uint8Array> {
   const chunks: Uint8Array[] = []
   let length = 0
   for await (const chunk of request) {
     const bytes = typeof chunk === 'string' ? utf8(chunk) : new Uint8Array(chunk as Uint8Array)
     length += bytes.length
-    if (length > 2 * 1024 * 1024) throw new Error('THIN_FIXTURE_BODY_TOO_LARGE')
+    if (length > maximum) throw new Error('THIN_FIXTURE_BODY_TOO_LARGE')
     chunks.push(bytes)
   }
   const result = new Uint8Array(length)
   let offset = 0
   for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length }
   return result
-}
-
-async function writeStream(response: ServerResponse, bytes: Uint8Array): Promise<void> {
-  if (!response.write(bytes)) await once(response, 'drain')
 }
 
 function asError(error: unknown): Error { return error instanceof Error ? error : new Error('THIN_FIXTURE_FAILED', { cause: error }) }

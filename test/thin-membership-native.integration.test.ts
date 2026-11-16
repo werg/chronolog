@@ -16,10 +16,12 @@ import {
 import { bytesToBase64Url, equalBytes } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
+import { createHttpWebRtcSignaling, openWebRtcConnection } from '@chronolog/transport-webrtc'
+import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createThinMembershipNative } from '../tools/thin-membership-native.js'
-import { connectGovernedBrowserPeer } from './browser/event-connection.js'
+import { attachMembershipPeer } from './thin-membership/peer.js'
 
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
@@ -108,7 +110,7 @@ describe('thin membership qualification native boundary', () => {
         rootAdministrator: provisioned.descriptor.genesis.manifest.schemaAdminPublicKey })) })
     cleanup.push(() => replica.close())
     await replica.start()
-    let session: Awaited<ReturnType<typeof connectGovernedBrowserPeer>> | undefined
+    let session: Awaited<ReturnType<typeof attachMembershipPeer>> | undefined
     cleanup.push(() => session?.close())
     const enrollment = createEnrollmentService({ descriptor: replica.descriptor, store: deviceStore, identity: device.signing,
       readerPublicKey: device.reader.publicKeyBytes, transportAuthor: transport.identity, governance: replica.governance,
@@ -141,9 +143,15 @@ describe('thin membership qualification native boundary', () => {
     expect(replica.node.finalThrough).toBeLessThan(administrator.progress.verifiedThrough)
     expect((await client.enrollment.getStatus(request.request.requestId)).state).not.toBe('ready')
     const connect = async () => {
-      session = await connectGovernedBrowserPeer({ bootstrap: native.bootstrap(), identity: device, transport,
+      const bootstrap = native.bootstrap()
+      const signaling = createHttpWebRtcSignaling({ url: bootstrap.rtcUrl, headers: { Authorization: `Bearer ${bootstrap.rtcToken}` } })
+      const connection = await openWebRtcConnection({ role: 'offerer', signaling, configuration: { iceServers: [] },
+        createPeerConnection: configuration => createNativePeerConnection(configuration,
+          { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }) })
+      session = await attachMembershipPeer({ connection, nativeIdentity: bootstrap.nativeIdentity, identity: device, transport,
         activeMembership: () => replica.activeSnapshot })
       await transport.catchUp(); await replica.node.waitForIdle()
+      expect(signaling.stats).toMatchObject({ requests: 1, closed: true })
     }
     await connect()
     await expect.poll(async () => (await client.enrollment.getStatus(request.request.requestId)).state, { timeout: 10_000 }).toBe('ready')
@@ -172,6 +180,9 @@ describe('thin membership qualification native boundary', () => {
     expect((await native.snapshot()).availableEpochs).toContain(String(revoked.epoch))
     expect(native.traffic().applicationEnvelopeBytesToAdministrator).toBe(0)
     expect(native.traffic().unexpectedAdministratorRequests).toBe(0)
+    expect(native.traffic().rtcSignalingDescriptions).toBe(4)
+    expect(native.traffic().rtcSdpBytes).toBeGreaterThan(0)
+    expect(native.traffic().peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
     native.assertHealthy()
   }, 120_000)
 })

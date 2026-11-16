@@ -156,7 +156,8 @@ it('administers an independently ordered native/browser group through the actual
   expect(joined.value.identity).toBe(prepared.signingPublicKey);
   expect(joined.value.applicationBlockedOnPayload).toBe(false);
   expect((await device({ method: 'events' })).transactions.length).toBe(16);
-  await passed('a fresh OPFS device verifies live approval and HPKE controls, then fetches detached history through authenticated peers', { elapsedMs: joined.elapsedMs });
+  expect(joined.value.rtc.receivedBytes).toBeGreaterThan(large.detachedEnvelopeBytes);
+  await passed('a fresh OPFS device verifies live approval and HPKE controls, then fetches detached history through authenticated WebRTC in its Worker', { elapsedMs: joined.elapsedMs, rtc: joined.value.rtc });
 
   const accepted = await device({ method: 'publish', operationId: 'device-before-revocation', text: 'accepted before revocation' });
   await until(() => device({ method: 'operation', operationId: accepted.operationId }), value => value?.final && value.outcome?.outcome === 'accepted', 'device operation did not become final');
@@ -247,5 +248,12 @@ it('administers an independently ordered native/browser group through the actual
   expect(final.traffic.applicationEnvelopeBytesToAdministrator).toBe(0);
   expect(final.traffic.unexpectedAdministratorRequests).toBe(0);
   expect(final.traffic.peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes);
-  await fixture('complete', { traffic: final.traffic, descriptor: configured.descriptor, requestId: submitted.id });
+  expect(final.rtc.transport).toBe('webrtc'); expect(final.rtc.accepted).toBe(3);
+  expect(final.traffic.rtcSignalingDescriptions).toBe(6);
+  expect(final.traffic.rtcSdpBytes).toBeGreaterThan(0);
+  const rtc = await device({ method: 'rtcStats' });
+  expect(rtc.transport).toBe('webrtc'); expect(rtc.channelOwner).toBe('DedicatedWorker');
+  expect(rtc.introductions).toHaveLength(3);
+  expect(rtc.introductions.every(value => value.requests === 1 && value.closed && value.requestBytes > 0 && value.responseBytes > 0)).toBe(true);
+  await fixture('complete', { traffic: final.traffic, rtc: { browser: rtc, native: final.rtc }, descriptor: configured.descriptor, requestId: submitted.id });
 }, 240_000);
