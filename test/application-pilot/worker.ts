@@ -23,11 +23,12 @@ async function connect(channel: RtcDataChannel): Promise<void> {
   if (peer === undefined || identity === undefined || bootstrap === undefined || signals === undefined) throw new Error('PILOT_NOT_OPEN')
   await disconnect()
   const started = performance.now(), framed = frameRtcDataChannel(channel)
-  const snapshot = peer.governed!.activeSnapshot
-  const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
-    isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, identity!.signing.publicKeyBytes))
-  if (reader === undefined) { await framed.close(); throw new Error('PILOT_READER_GRANT_REQUIRED') }
   try {
+    await framed.ready
+    const snapshot = peer.governed!.activeSnapshot
+    const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
+      isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, identity!.signing.publicKeyBytes))
+    if (reader === undefined) throw new Error('PILOT_READER_GRANT_REQUIRED')
     const authenticated = await openAuthenticatedPeerLink({ connection: framed, local: peer.transport.asLink(), identity: identity.signing,
       groupId: snapshot.groupId, grantId: reader.id,
       receiveSignal: async frame => { await signals!.receive(frame) },

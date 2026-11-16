@@ -36,14 +36,17 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
   readonly queueBytes?: number
   readonly queueFrames?: number
   readonly sendTimeoutMs?: number
+  /** Starts when the local channel opens, independently of ICE negotiation. */
+  readonly helloTimeoutMs?: number
 } = {}): DataChannelConnection {
   const maximum = options.maxFrameBytes ?? WEBRTC_LIMITS.frameBytes
   const windowBytes = options.queueBytes ?? WEBRTC_LIMITS.queueBytes
   const windowFrames = options.queueFrames ?? WEBRTC_LIMITS.queueFrames
   const timeoutMs = options.sendTimeoutMs ?? 30_000
-  if (![maximum, windowBytes, windowFrames, timeoutMs].every(Number.isSafeInteger) || maximum < 1 || maximum > WEBRTC_LIMITS.frameBytes ||
+  const helloTimeoutMs = options.helloTimeoutMs ?? 10_000
+  if (![maximum, windowBytes, windowFrames, timeoutMs, helloTimeoutMs].every(Number.isSafeInteger) || maximum < 1 || maximum > WEBRTC_LIMITS.frameBytes ||
       windowBytes < maximum || windowBytes > WEBRTC_LIMITS.queueBytes || windowFrames < 1 || windowFrames > WEBRTC_LIMITS.queueFrames ||
-      timeoutMs < 1 || timeoutMs > 120_000) throw new Error('WEBRTC_BOUNDS_INVALID')
+      timeoutMs < 1 || timeoutMs > 120_000 || helloTimeoutMs < 1 || helloTimeoutMs > 120_000) throw new Error('WEBRTC_BOUNDS_INVALID')
   if (!channel.ordered || channel.maxPacketLifeTime !== null || channel.maxRetransmits !== null) throw new Error('WEBRTC_RELIABLE_ORDERED_REQUIRED')
   channel.binaryType = 'arraybuffer'
   channel.bufferedAmountLowThreshold = WEBRTC_LIMITS.bufferedBytes / 2
@@ -54,6 +57,7 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
   let sentBytes = 0, receivedBytes = 0, sentPackets = 0, receivedPackets = 0
   const queue: Uint8Array[] = [], waiters = new Set<() => void>()
   let tail: Promise<void> = Promise.resolve()
+  let helloTimer: ReturnType<typeof setTimeout> | undefined
   let resolveReady!: () => void, rejectReady!: (error: Error) => void
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
   void ready.catch(() => undefined)
@@ -64,6 +68,7 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
   const stop = (error?: Error): void => {
     if (closed) return
     closed = true; failure = error ?? null
+    clearTimeout(helloTimer)
     rejectReady(error ?? new Error('WEBRTC_CONNECTION_CLOSED'))
     for (const [type, listener] of listeners) channel.removeEventListener(type, listener)
     queue.length = 0; assembling = null; reservedBytes = 0; reservedFrames = 0
@@ -83,6 +88,7 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
       packet(HELLO, maximum, windowBytes, windowFrames)
       opened = true
       if (greeted) resolveReady()
+      else helloTimer = setTimeout(() => fail(new Error('WEBRTC_HELLO_TIMEOUT')), helloTimeoutMs)
     } catch (error) { fail(error) }
   }
   const on = (type: string, listener: EventListener): void => { listeners.push([type, listener]); channel.addEventListener(type, listener) }
@@ -105,7 +111,7 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
         greeted = true; remoteMaximum = a; remoteWindow = b; remoteFrames = c; creditBytes = b; creditFrames = c
         // Native SCTP implementations can deliver the remote HELLO before
         // local DCEP acknowledgement. Never enqueue DATA ahead of our HELLO.
-        if (opened) resolveReady()
+        if (opened) { clearTimeout(helloTimer); resolveReady() }
         wake(); return
       }
       if (!greeted) throw new Error('WEBRTC_HELLO_REQUIRED')

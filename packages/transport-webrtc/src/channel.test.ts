@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { frameRtcDataChannel, WEBRTC_LIMITS } from './channel.js'
 import type { RtcDataChannel } from './types.js'
@@ -36,6 +36,24 @@ function pair(options: Parameters<typeof frameRtcDataChannel>[1] = {}) {
 }
 
 describe('reliable WebRTC frame transport', () => {
+  it('bounds a silent HELLO only after local open, independently of slow ICE negotiation', async () => {
+    vi.useFakeTimers()
+    const left = new Channel(), right = new Channel()
+    left.other = right; right.other = left
+    const connection = frameRtcDataChannel(left, { helloTimeoutMs: 10 })
+    const rejected = expect(connection.ready).rejects.toThrow('WEBRTC_HELLO_TIMEOUT')
+    try {
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(left.readyState).toBe('connecting')
+      left.readyState = 'open'; left.dispatchEvent(new Event('open'))
+      await vi.advanceTimersByTimeAsync(9)
+      expect(left.readyState).toBe('open')
+      await vi.advanceTimersByTimeAsync(1)
+      await rejected
+      expect(left.readyState).toBe('closed')
+    } finally { await connection.close(); vi.useRealTimers() }
+  })
+
   it('waits for local HELLO before sending DATA when the remote HELLO precedes local open', async () => {
     const left = new Channel(), right = new Channel()
     left.other = right; right.other = left

@@ -61,6 +61,7 @@ const session = await negotiateWebRtc({
 
 // DedicatedWorker, receiving the transferred RTCDataChannel.
 const connection = frameRtcDataChannel(channel)
+await connection.ready
 const authenticated = await openAuthenticatedPeerLink({
   connection, local: transport.asLink(), groupId, identity, grantId,
   authorizePeer,
@@ -104,6 +105,11 @@ sends snapshot their input, preserve order and have a deadline. Closing the
 channel rejects pending sends and wakes blocked readers. These bounds are local
 resource guarantees; protocol authentication remains the responsibility of the
 Chronolog session above them.
+
+`ready` requires both local and remote framing HELLO messages. Its 10-second
+HELLO deadline starts after the local channel opens, allowing ICE negotiation
+to finish first. Worker consumers await `ready` before starting Chronolog's
+separate authenticated-session handshake deadline.
 
 ## Verification
 

@@ -38,6 +38,7 @@ endpoint.addEventListener('message', event => {
       }
       case 'channel': {
         channel = frameRtcDataChannel(request.channel!)
+        await channel.ready
         const snapshot = peer!.governed!.activeSnapshot
         const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
           equalBytes(capability.grant.signingPublicKey, identity!.signing.publicKeyBytes) && isCapabilityActive(capability, snapshot.revision))
