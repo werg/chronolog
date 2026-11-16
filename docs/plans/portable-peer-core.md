@@ -61,6 +61,8 @@ Any engine conformance gap remains visible until resolved and exercised.
 - [x] Exercise shared SQL, a contested claim, lost replies, reconnection, third
       device enrollment, and peer delivery during authority unavailability.
 - [x] Check that neither core depends on the other repository's private files.
+- [ ] Qualify one real browser/native scenario combining public enrollment,
+      collective SQL contention, durable retry, and offline third-peer replay.
 
 ## Acceptance and delivery
 
