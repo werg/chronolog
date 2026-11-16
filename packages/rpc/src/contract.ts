@@ -1,4 +1,10 @@
 import type {
+  ApproveEnrollmentRequest,
+  ApproveEnrollmentResponse,
+  CreateEnrollmentRequest,
+  CreateEnrollmentResponse,
+  EnrollmentStatus,
+  GetEnrollmentStatusRequest,
   GetOutcomeRequest,
   GetReplicationStatusRequest,
   GetSettlementEvidenceRequest,
@@ -47,6 +53,9 @@ export interface UnaryRpcMethods {
   'governance.revokeCapabilities': { request: RevokeCapabilitiesRequest; response: RevokeCapabilitiesResponse }
   'governance.rotateEpoch': { request: RotateEpochRequest; response: RotateEpochResponse }
   'governance.grantHistoricalAccess': { request: GrantHistoricalAccessRequest; response: GrantHistoricalAccessResponse }
+  'enrollment.createRequest': { request: CreateEnrollmentRequest; response: CreateEnrollmentResponse }
+  'enrollment.approveRequest': { request: ApproveEnrollmentRequest; response: ApproveEnrollmentResponse }
+  'enrollment.getStatus': { request: GetEnrollmentStatusRequest; response: EnrollmentStatus }
 }
 export interface StreamRpcMethods {
   'node.streamStatus': { request: StreamStatusRequest; response: NodeStatus }
@@ -85,5 +94,8 @@ export interface ChronologRpcService {
   revokeCapabilities(request: RevokeCapabilitiesRequest, context: RpcCallContext): Promise<RevokeCapabilitiesResponse>
   rotateEpoch(request: RotateEpochRequest, context: RpcCallContext): Promise<RotateEpochResponse>
   grantHistoricalAccess(request: GrantHistoricalAccessRequest, context: RpcCallContext): Promise<GrantHistoricalAccessResponse>
+  createEnrollmentRequest(request: CreateEnrollmentRequest, context: RpcCallContext): Promise<CreateEnrollmentResponse>
+  approveEnrollmentRequest(request: ApproveEnrollmentRequest, context: RpcCallContext): Promise<ApproveEnrollmentResponse>
+  getEnrollmentStatus(request: GetEnrollmentStatusRequest, context: RpcCallContext): Promise<EnrollmentStatus>
 }
 export type ChronologService = ChronologRpcService

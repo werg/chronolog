@@ -7,6 +7,7 @@ export type GroupId = string
 export type TransactionId = string
 export type RequestId = string
 export type CanonicalBytes = string
+export type SqlView = 'local' | 'final'
 
 export type LocalSqlValue =
   | { readonly kind: 'null' }
@@ -43,9 +44,14 @@ export type RpcProgramStep = RpcSqlStatement | RpcPlatformStep
 
 export interface RevisionMetadata {
   readonly groupId: GroupId
+  /** The SQL reader represented by materializedRevision and publishedOrderLength. */
+  readonly view: SqlView
   readonly eventSetRevision: Revision
   readonly materializedRevision: Revision
   readonly publishedOrderLength: string
+  /** Applied immutable prefix, independent of speculative local SQL progress. */
+  readonly finalRevision: Revision
+  readonly finalOrderLength: string
   readonly executionManifestDigest: string
   readonly replaying: boolean
 }
@@ -55,6 +61,8 @@ export interface LocalSqlRequest {
   readonly requestId: RequestId
   readonly sql: string
   readonly parameters: readonly LocalSqlValue[]
+  /** Defaults to the current speculative reader. Final reads use a separate SQL snapshot. */
+  readonly view?: SqlView
   readonly maxRows?: number
   readonly atRevision?: Revision
 }
@@ -129,6 +137,8 @@ export interface TransactionOutcome {
   readonly orderKey?: string
   readonly changedByReplay: boolean
   readonly admissible: boolean
+  /** True only after the policy's immutable prefix has been applied locally. */
+  readonly final: boolean
   readonly observedAt: string
 }
 export interface GetOutcomeRequest { readonly groupId: GroupId; readonly transactionId: TransactionId; readonly requestId: RequestId }
@@ -203,3 +213,33 @@ export type RotateEpochRequest = GetGovernanceStatusRequest
 export interface RotateEpochResponse { readonly epoch: string }
 export interface GrantHistoricalAccessRequest extends GetGovernanceStatusRequest { readonly subjectId: string }
 export interface GrantHistoricalAccessResponse { readonly epochManifestsPublished: number }
+
+export type EnrollmentRole = 'reader' | 'writer'
+export type EnrollmentState = 'requested' | 'approved' | 'authorized-disconnected' | 'awaiting-keys' | 'awaiting-history' | 'unsupported-engine' | 'revoked' | 'ready'
+export interface CreateEnrollmentRequest {
+  readonly groupId: GroupId
+  /** Stable device-local request identity; persist it before retrying enrollment. */
+  readonly requestId: RequestId
+  readonly roles: readonly EnrollmentRole[]
+}
+export interface CreateEnrollmentResponse { readonly signedRequest: CanonicalBytes }
+export interface ApproveEnrollmentRequest {
+  readonly groupId: GroupId
+  /** Stable approval operation identity on the issuer. */
+  readonly requestId: RequestId
+  readonly signedRequest: CanonicalBytes
+  readonly roles: readonly EnrollmentRole[]
+  readonly grantFullHistory: boolean
+}
+export interface ApproveEnrollmentResponse { readonly signedApproval: CanonicalBytes }
+export interface GetEnrollmentStatusRequest {
+  readonly groupId: GroupId
+  readonly requestId: RequestId
+  readonly signedApproval?: CanonicalBytes
+}
+export interface EnrollmentStatus {
+  readonly requestId: RequestId
+  readonly state: EnrollmentState
+  readonly missingEpochs: readonly string[]
+  readonly roles: readonly EnrollmentRole[]
+}

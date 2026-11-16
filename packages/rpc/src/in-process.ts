@@ -35,6 +35,9 @@ const unaryDispatch: {
   'governance.revokeCapabilities': 'revokeCapabilities',
   'governance.rotateEpoch': 'rotateEpoch',
   'governance.grantHistoricalAccess': 'grantHistoricalAccess',
+  'enrollment.createRequest': 'createEnrollmentRequest',
+  'enrollment.approveRequest': 'approveEnrollmentRequest',
+  'enrollment.getStatus': 'getEnrollmentStatus',
 }
 
 const streamDispatch: {

@@ -1,6 +1,7 @@
 import { sha256, utf8 } from '@chronolog/canonical'
 import {
   assertValidSqlTransactionProgram,
+  bytesToBase64Url as toBase64Url,
   decodePlatformOp,
   type ProgramStep,
   type SqlStatement,
@@ -11,6 +12,12 @@ import {
 import type { ChronologRpcService, RpcCallContext } from './contract.js'
 import { ChronologRpcError } from './errors.js'
 import type {
+  ApproveEnrollmentRequest,
+  ApproveEnrollmentResponse,
+  CreateEnrollmentRequest,
+  CreateEnrollmentResponse,
+  EnrollmentStatus,
+  GetEnrollmentStatusRequest,
   GetOutcomeRequest,
   GetGovernanceStatusRequest,
   GetReplicationStatusRequest,
@@ -35,6 +42,7 @@ import type {
   RpcProgramStep,
   RpcSqlStatement,
   SettlementEvidence,
+  SqlView,
   StreamOutcomeRequest,
   StreamReplicationStatusRequest,
   StreamSettlementEvidenceRequest,
@@ -49,6 +57,7 @@ import type {
 import { RPC_API_VERSION } from './types.js'
 import type {
   ChronologRpcNodeService,
+  EnrollmentRpcService,
   GovernanceRpcAdmin,
 } from './service-contract.js'
 
@@ -63,41 +72,28 @@ export type {
   RpcNodeWatermark,
 } from './service-contract.js'
 
-interface IdempotentEntry {
-  readonly fingerprint: string
-  readonly promise: Promise<unknown>
-  expiresAt: number
-}
-
 export interface NodeRpcServiceOptions {
   readonly node: ChronologRpcNodeService
   readonly governanceAdmin?: GovernanceRpcAdmin
+  readonly enrollment?: EnrollmentRpcService
   readonly maxLocalSqlRows?: number
-  readonly retentionTtlMs?: number
-  readonly maxIdempotencyEntries?: number
   readonly now?: () => number
-  readonly monotonicNow?: () => number
 }
 
 /** RPC facade over a node: local reads, transaction submission, outcomes and evidence. */
 export class NodeRpcService implements ChronologRpcService {
   readonly #node: ChronologRpcNodeService
   readonly #governanceAdmin: GovernanceRpcAdmin | undefined
+  readonly #enrollmentService: EnrollmentRpcService | undefined
   readonly #maxLocalSqlRows: number
-  readonly #retentionTtlMs: number
-  readonly #maxIdempotencyEntries: number
   readonly #now: () => number
-  readonly #monotonicNow: () => number
-  readonly #publications = new Map<string, IdempotentEntry>()
 
   constructor(options: NodeRpcServiceOptions) {
     this.#node = options.node
     this.#governanceAdmin = options.governanceAdmin
+    this.#enrollmentService = options.enrollment
     this.#maxLocalSqlRows = nonnegative(options.maxLocalSqlRows ?? 10_000, 'maxLocalSqlRows')
-    this.#retentionTtlMs = positive(options.retentionTtlMs ?? 24 * 60 * 60_000, 'retentionTtlMs')
-    this.#maxIdempotencyEntries = positive(options.maxIdempotencyEntries ?? 10_000, 'maxIdempotencyEntries')
     this.#now = options.now ?? Date.now
-    this.#monotonicNow = options.monotonicNow ?? (() => performance.now())
   }
 
   async getStatus(request: GetStatusRequest, _context: RpcCallContext): Promise<NodeStatus> {
@@ -143,6 +139,21 @@ export class NodeRpcService implements ChronologRpcService {
     return this.#admin().grantHistoricalAccess(request)
   }
 
+  async createEnrollmentRequest(request: CreateEnrollmentRequest, _context: RpcCallContext): Promise<CreateEnrollmentResponse> {
+    this.#assertGroup(request.groupId)
+    return this.#enrollment().createRequest(request)
+  }
+
+  async approveEnrollmentRequest(request: ApproveEnrollmentRequest, _context: RpcCallContext): Promise<ApproveEnrollmentResponse> {
+    this.#assertGroup(request.groupId)
+    return this.#enrollment().approveRequest(request)
+  }
+
+  async getEnrollmentStatus(request: GetEnrollmentStatusRequest, _context: RpcCallContext): Promise<EnrollmentStatus> {
+    this.#assertGroup(request.groupId)
+    return this.#enrollment().getStatus(request)
+  }
+
   async *streamStatus(request: StreamStatusRequest, context: RpcCallContext): AsyncIterable<NodeStatus> {
     this.#assertGroupOptional(request.groupId)
     yield await this.getStatus(request, context)
@@ -154,17 +165,18 @@ export class NodeRpcService implements ChronologRpcService {
 
   async localSql(request: LocalSqlRequest, _context: RpcCallContext): Promise<LocalSqlResponse> {
     this.#assertGroup(request.groupId)
-    const atRevision = request.atRevision === undefined ? this.#node.materializedRevision : BigInt(request.atRevision)
+    const view = sqlView(request.view)
+    const atRevision = request.atRevision === undefined ? this.#viewRevision(view) : parseRevision(request.atRevision)
     const execution = this.#node.localSql(
       request.sql,
       request.parameters.map(copyLocalSqlValue),
-      { atRevision },
+      { atRevision, view },
     )
     if (execution.revision !== atRevision) throw revisionUnavailable('Requested SQL reader is unavailable')
     const limit = boundedRows(request.maxRows, this.#maxLocalSqlRows)
     const rows = execution.rows.slice(0, limit).map((row) => row.map(copyLocalSqlValue))
     return {
-      revision: this.#revision(execution.revision, execution.orderLength),
+      revision: this.#revision(execution.revision, execution.orderLength, view),
       result: {
         columns: execution.columns.map((column) => ({ ...column })),
         rows,
@@ -176,7 +188,10 @@ export class NodeRpcService implements ChronologRpcService {
 
   async *liveSql(request: LiveSqlRequest, context: RpcCallContext): AsyncIterable<LiveSqlEvent> {
     this.#assertGroup(request.groupId)
-    const queryDigest = toBase64Url(await sha256(utf8(stableFingerprint({ sql: request.sql, parameters: request.parameters }))))
+    const view = sqlView(request.view)
+    const queryDigest = toBase64Url(await sha256(utf8(stableFingerprint({
+      sql: request.sql, parameters: request.parameters, view, maxRows: boundedRows(request.maxRows, this.#maxLocalSqlRows),
+    }))))
     if (request.resume !== undefined &&
         (request.resume.groupId !== request.groupId || request.resume.queryDigest !== queryDigest)) {
       throw invalid('Live-query cursor does not belong to this SQL query')
@@ -185,10 +200,10 @@ export class NodeRpcService implements ChronologRpcService {
     const events = this.#node.events(barrier, context.signal)
     let prior: LocalSqlResponse
     try {
-      prior = await this.localSql({ ...request, atRevision: this.#node.materializedRevision.toString(10) }, context)
+      prior = await this.localSql({ ...request, view }, context)
     } catch (error) {
       if (isSqlInvalid(error)) {
-        yield { type: 'reset', revision: this.#revision(this.#node.materializedRevision, this.#node.orderLength), queryDigest, reason: 'query_invalid' }
+        yield { type: 'reset', revision: this.#revision(this.#viewRevision(view), this.#viewOrderLength(view), view), queryDigest, reason: 'query_invalid' }
         return
       }
       throw error
@@ -197,30 +212,26 @@ export class NodeRpcService implements ChronologRpcService {
     yield initialMatches
       ? { type: 'snapshot', revision: prior.revision, queryDigest, result: prior.result }
       : { type: 'reset', revision: prior.revision, queryDigest, result: prior.result, reason: 'history_unavailable' }
-    let priorFingerprint = stableFingerprint(prior.result)
     let priorMaterialized = prior.revision.materializedRevision
     let priorManifest = prior.revision.executionManifestDigest
     for await (const _event of events) {
-      if (this.#node.materializedRevision.toString(10) === priorMaterialized) continue
+      if (this.#viewRevision(view).toString(10) === priorMaterialized) continue
       let next: LocalSqlResponse
       try {
-        next = await this.localSql({ ...request, atRevision: this.#node.materializedRevision.toString(10) }, context)
+        next = await this.localSql({ ...request, view }, context)
       } catch (error) {
         if (isSqlInvalid(error)) {
-          yield { type: 'reset', revision: this.#revision(this.#node.materializedRevision, this.#node.orderLength), queryDigest, reason: 'query_invalid' }
+          yield { type: 'reset', revision: this.#revision(this.#viewRevision(view), this.#viewOrderLength(view), view), queryDigest, reason: 'query_invalid' }
           return
         }
         throw error
       }
       const previousMaterializedRevision = priorMaterialized
       priorMaterialized = next.revision.materializedRevision
-      const nextFingerprint = stableFingerprint(next.result)
       if (next.revision.executionManifestDigest !== priorManifest) {
         priorManifest = next.revision.executionManifestDigest
-        priorFingerprint = nextFingerprint
         yield { type: 'reset', revision: next.revision, queryDigest, result: next.result, reason: 'manifest_changed' }
-      } else if (nextFingerprint !== priorFingerprint) {
-        priorFingerprint = nextFingerprint
+      } else {
         yield { type: 'change', revision: next.revision, queryDigest, result: next.result, previousMaterializedRevision }
       }
     }
@@ -232,38 +243,33 @@ export class NodeRpcService implements ChronologRpcService {
     try { assertValidSqlTransactionProgram(program) } catch (error) {
       throw new ChronologRpcError('invalid_argument', `Invalid SQL transaction: ${errorCode(error, 'SQL_PROGRAM_INVALID')}`, { cause: error })
     }
-    const operation = async (): Promise<SubmitTransactionResponse> => {
-      if (!await this.#node.isWritable()) throw failed('This node cannot write to the group')
-      const reserved = this.#node.reserveTransactionContext()
-      const published = await this.#node.publish({
-        program,
-        authorTimestampMs: reserved.authorTimestampMs,
-        nonce: Uint8Array.from(reserved.nonce),
-      })
+    const retryIdentity = request.idempotencyKey ?? request.requestId
+    if (typeof retryIdentity !== 'string' || retryIdentity.length === 0 || retryIdentity.length > 512) {
+      throw invalid('Transaction requestId or idempotencyKey must contain 1 to 512 characters')
+    }
+    const operationId = `rpc-transaction:${toBase64Url(await sha256(utf8(JSON.stringify([
+      principal(context), request.groupId, retryIdentity,
+    ]))))}`
+    try {
+      // The node's durable journal owns authoring, authorization and exact-byte
+      // retries. Recreating this facade or revoking a writer cannot erase a
+      // previous publication or allocate a new timestamp for the same request.
+      const published = await this.#node.publish({ program, operationId })
       return {
         transactionId: published.txIdText,
         candidateDigest: toBase64Url(published.candidateDigest),
         authorTimestampMs: published.core.authorTimestampMs.toString(10),
         transactionNonce: toBase64Url(published.core.nonce),
-        executionManifestDigest: toBase64Url(this.#node.executionManifestDigest),
+        executionManifestDigest: toBase64Url(published.core.executionManifestDigest),
         durableLocalAppend: true as const,
-        publishedAt: new Date(this.#now()).toISOString(),
+        publishedAt: new Date(Number(published.core.authorTimestampMs)).toISOString(),
       }
+    } catch (error) {
+      const code = errorCode(error, 'TRANSACTION_PUBLICATION_FAILED')
+      if (code === 'OPERATION_ID_CONFLICT') throw new ChronologRpcError('already_exists', 'Transaction retry identity is already bound to different steps', { cause: error })
+      if (code === 'WRITER_UNAUTHORIZED') throw failed('This node cannot write to the group')
+      throw error
     }
-    if (request.idempotencyKey === undefined) return operation()
-    this.#prune()
-    const key = `${principal(context)}\0${request.groupId}\0${request.idempotencyKey}`
-    const fingerprint = stableFingerprint({ steps: request.steps })
-    const existing = this.#publications.get(key)
-    if (existing !== undefined) {
-      if (existing.fingerprint !== fingerprint) throw new ChronologRpcError('already_exists', 'Idempotency key is already in use')
-      return existing.promise as Promise<SubmitTransactionResponse>
-    }
-    if (this.#publications.size >= this.#maxIdempotencyEntries) throw exhausted('RPC idempotency cache is full')
-    const promise = operation()
-    this.#publications.set(key, { fingerprint, promise, expiresAt: this.#monotonicNow() + this.#retentionTtlMs })
-    void promise.catch(() => this.#publications.delete(key))
-    return promise
   }
 
   async getOutcome(request: GetOutcomeRequest, _context: RpcCallContext): Promise<TransactionOutcome> {
@@ -292,14 +298,16 @@ export class NodeRpcService implements ChronologRpcService {
       orderKey: orderKeyText(candidate.orderKey),
       changedByReplay: this.#node.outcomeChangedByReplay(txId),
       admissible: candidate.state === 'admissible',
+      final: outcome !== null && this.#node.isFinal(txId),
       observedAt: new Date(this.#now()).toISOString(),
     }
   }
 
   async *streamOutcome(request: StreamOutcomeRequest, context: RpcCallContext): AsyncIterable<TransactionOutcome> {
-    yield await this.getOutcome(request, context)
     const after = BigInt(request.resumeAfterEventSetRevision ?? this.#node.revision)
-    for await (const _event of this.#node.events(after, context.signal)) yield await this.getOutcome(request, context)
+    const events = this.#node.events(after, context.signal)
+    yield await this.getOutcome(request, context)
+    for await (const _event of events) yield await this.getOutcome(request, context)
   }
 
   async getSettlementEvidence(request: GetSettlementEvidenceRequest, context: RpcCallContext): Promise<SettlementEvidence> {
@@ -382,15 +390,26 @@ export class NodeRpcService implements ChronologRpcService {
     for await (const _event of this.#node.events(after, context.signal)) yield await this.getReplicationStatus(request, context)
   }
 
-  #revision(materializedRevision: bigint, orderLength: number, manifest = this.#node.executionManifestDigest): RevisionMetadata {
+  #revision(materializedRevision: bigint, orderLength: number, view: SqlView = 'local'): RevisionMetadata {
     return {
       groupId: this.#groupId(),
+      view,
       eventSetRevision: this.#node.revision.toString(10),
       materializedRevision: materializedRevision.toString(10),
       publishedOrderLength: orderLength.toString(10),
-      executionManifestDigest: toBase64Url(manifest),
+      finalRevision: this.#node.finalRevision.toString(10),
+      finalOrderLength: this.#node.finalOrderLength.toString(10),
+      executionManifestDigest: toBase64Url(this.#node.executionManifestDigest),
       replaying: false,
     }
+  }
+
+  #viewRevision(view: SqlView): bigint { return view === 'final' ? this.#node.finalRevision : this.#node.materializedRevision }
+  #viewOrderLength(view: SqlView): number { return view === 'final' ? this.#node.finalOrderLength : this.#node.orderLength }
+
+  #enrollment(): EnrollmentRpcService {
+    if (this.#enrollmentService === undefined) throw failed('Enrollment is not enabled for this node')
+    return this.#enrollmentService
   }
 
   #admin(): GovernanceRpcAdmin {
@@ -407,10 +426,6 @@ export class NodeRpcService implements ChronologRpcService {
   #assertGroupOptional(groupId?: string): void { if (groupId !== undefined) this.#assertGroup(groupId) }
   #groupId(): string { return toBase64Url(this.#node.groupId) }
 
-  #prune(): void {
-    const now = this.#monotonicNow()
-    for (const [key, entry] of this.#publications) if (entry.expiresAt <= now) this.#publications.delete(key)
-  }
 }
 
 function decodeSteps(values: readonly RpcProgramStep[]): ProgramStep[] {
@@ -485,20 +500,14 @@ function boundedRows(requested: number | undefined, maximum: number): number {
   return Math.min(requested, maximum)
 }
 
-function positive(value: number, field: string): number {
-  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${field} must be a positive safe integer`)
-  return value
-}
-
 function nonnegative(value: number, field: string): number {
   if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative safe integer`)
   return value
 }
 
-function principal(context: RpcCallContext): string { return context.metadata?.principal ?? context.token ?? context.peer ?? 'anonymous-local' }
+function principal(context: RpcCallContext): string { return context.metadata?.principal ?? context.token ?? 'anonymous-local' }
 function invalid(message: string): ChronologRpcError { return new ChronologRpcError('invalid_argument', message) }
 function failed(message: string): ChronologRpcError { return new ChronologRpcError('failed_precondition', message) }
-function exhausted(message: string): ChronologRpcError { return new ChronologRpcError('resource_exhausted', message, { retryable: true }) }
 function revisionUnavailable(message: string): ChronologRpcError { return new ChronologRpcError('revision_unavailable', message) }
 function isSqlInvalid(error: unknown): boolean { return error instanceof Error && /SQL|sqlite|prepare|syntax/iu.test(error.message) }
 function errorCode(error: unknown, fallback: string): string {
@@ -506,7 +515,15 @@ function errorCode(error: unknown, fallback: string): string {
   return error instanceof Error && error.message !== '' ? error.message : fallback
 }
 
-function toBase64Url(value: Uint8Array): string { return Buffer.from(value).toString('base64url') }
+function sqlView(value: SqlView | undefined): SqlView {
+  if (value !== undefined && value !== 'local' && value !== 'final') throw invalid('SQL view must be local or final')
+  return value ?? 'local'
+}
+
+function parseRevision(value: string): bigint {
+  if (!/^(0|[1-9][0-9]*)$/u.test(value)) throw invalid('SQL revision must be a nonnegative decimal integer')
+  return BigInt(value)
+}
 function orderKeyText(key: { readonly authorTimestampMs: bigint; readonly authorId: Uint8Array; readonly authorFeedSequence: bigint; readonly txId: Uint8Array }): string {
   return `${key.authorTimestampMs}:${toBase64Url(key.authorId)}:${key.authorFeedSequence}:${toBase64Url(key.txId)}`
 }

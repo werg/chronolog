@@ -1,6 +1,12 @@
 import type { SqlTransactionProgram } from '@chronolog/protocol'
 
 import type {
+  ApproveEnrollmentRequest,
+  ApproveEnrollmentResponse,
+  CreateEnrollmentRequest,
+  CreateEnrollmentResponse,
+  EnrollmentStatus,
+  GetEnrollmentStatusRequest,
   GetGovernanceStatusRequest,
   GovernanceStatus,
   GrantCapabilityRequest,
@@ -12,6 +18,7 @@ import type {
   RevokeCapabilitiesResponse,
   RotateEpochRequest,
   RotateEpochResponse,
+  SqlView,
 } from './types.js'
 
 export interface GovernanceRpcAdmin {
@@ -20,6 +27,13 @@ export interface GovernanceRpcAdmin {
   revokeCapabilities(request: RevokeCapabilitiesRequest): Promise<RevokeCapabilitiesResponse>
   rotateEpoch(request: RotateEpochRequest): Promise<RotateEpochResponse>
   grantHistoricalAccess(request: GrantHistoricalAccessRequest): Promise<GrantHistoricalAccessResponse>
+}
+
+/** Local replica enrollment. Approval is exposed only when this device is an issuer. */
+export interface EnrollmentRpcService {
+  createRequest(request: CreateEnrollmentRequest): Promise<CreateEnrollmentResponse>
+  approveRequest(request: ApproveEnrollmentRequest): Promise<ApproveEnrollmentResponse>
+  getStatus(request: GetEnrollmentStatusRequest): Promise<EnrollmentStatus>
 }
 
 export interface LocalSqlExecution {
@@ -94,15 +108,16 @@ export interface ChronologRpcNodeService {
   readonly materializedRevision: bigint
   readonly orderLength: number
   readonly executionManifestDigest: Uint8Array
+  readonly finalRevision: bigint
+  readonly finalOrderLength: number
   readonly controlStore: {
     listCandidates(): readonly { readonly state: string }[]
   }
-  reserveTransactionContext(): { readonly authorTimestampMs: bigint; readonly nonce: Uint8Array }
-  publish(input: { readonly program: SqlTransactionProgram; readonly authorTimestampMs: bigint; readonly nonce: Uint8Array }): Promise<{
+  publish(input: { readonly program: SqlTransactionProgram; readonly operationId: string }): Promise<{
     readonly txId: Uint8Array
     readonly txIdText: string
     readonly candidateDigest: Uint8Array
-    readonly core: { readonly authorTimestampMs: bigint; readonly nonce: Uint8Array }
+    readonly core: { readonly authorTimestampMs: bigint; readonly nonce: Uint8Array; readonly executionManifestDigest: Uint8Array }
   }>
   status(): Promise<RpcNodeStatusSnapshot>
   isWritable(): Promise<boolean>
@@ -110,9 +125,10 @@ export interface ChronologRpcNodeService {
   candidateCore(txId: Uint8Array): RpcNodeCandidateCore | null
   outcome(txId: Uint8Array): RpcMaterializedOutcome | null
   outcomeChangedByReplay(txId: Uint8Array): boolean
+  isFinal(txId: Uint8Array): boolean
   settlementEvidence(txId: Uint8Array): Promise<RpcNodeSettlementEvidence | null>
   watermark(): Promise<RpcNodeWatermark | null>
   events(afterRevision?: bigint, signal?: AbortSignal): AsyncIterable<unknown>
-  localSql(sql: string, parameters?: readonly LocalSqlValue[], options?: { readonly atRevision?: bigint }): LocalSqlExecution
+  localSql(sql: string, parameters?: readonly LocalSqlValue[], options?: { readonly atRevision?: bigint; readonly view?: SqlView }): LocalSqlExecution
   validateProgram(program: SqlTransactionProgram): void
 }
