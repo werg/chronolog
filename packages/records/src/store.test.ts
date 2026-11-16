@@ -28,7 +28,7 @@ async function fixture() {
       await rename(`${target}.tmp`, target)
     },
   }
-  const keys = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify']) as CryptoKeyPair
+  const keys = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])
   const id = feedIdFromPublicKey(new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey)))
   const signer = webFeedSigner(id, keys.privateKey)
   return { bytes, signer, failNextPublication: () => { failManifest = true } }

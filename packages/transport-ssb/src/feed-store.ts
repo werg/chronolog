@@ -11,7 +11,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite'
 import {
   DEFAULT_MAX_RECORD_BYTES, FeedRecordError, decodeSignedFeedRecord, encodeSignedFeedRecord,
   feedIdFromPublicKey, publicKeyFromFeedId, feedRecordId, feedSigningBytes, classifyFeedAppend,
-  type FeedRecord,
+  type FeedRecord, type FeedCrypto,
 } from '@chronolog/records'
 import type { TransportRecord } from './types.js'
 
@@ -52,6 +52,11 @@ function publicKeyObject(feedId: string): KeyObject {
     publicKeyCache.set(feedId, key)
   }
   return key
+}
+
+export const nativeFeedCrypto: FeedCrypto = {
+  sha256: (bytes) => createHash('sha256').update(bytes).digest(),
+  verify: (publicKey, bytes, signature) => verify(null, bytes, publicKeyObject(feedIdFromPublicKey(publicKey)), signature),
 }
 
 export function createFeedRecord(

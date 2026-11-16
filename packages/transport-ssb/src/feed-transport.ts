@@ -12,12 +12,13 @@ import { dirname, join } from 'node:path'
 
 import {
   createFeedRecord,
-  decodeFeedRecord,
+  nativeFeedCrypto,
   DEFAULT_MAX_RECORD_BYTES,
   FeedRecordError,
   FeedStore,
   type FeedKeys,
 } from './feed-store.js'
+import { consumeFeed, decodeBase64 } from '@chronolog/records'
 import type { ChronologTransport, PublishOptions, TransportRecord, TransportStatus } from './types.js'
 
 const require = createRequire(import.meta.url)
@@ -369,37 +370,31 @@ export class FeedTransport implements ChronologTransport {
       this.#setStreamError(rpc, feed, error)
       return
     }
+    const controller = new AbortController()
     let stopped = false
     const stop = (): void => {
       if (stopped) return
       stopped = true
       streams.delete(feed)
-      source(true, () => {})
+      controller.abort()
     }
     streams.set(feed, stop)
-    const read = (): void => {
+    void consumeFeed(pullRecords(source, controller.signal), {
+      store: this.#store, crypto: nativeFeedCrypto, feed, maxRecordBytes: this.#maxRecordBytes,
+      onStored: (record, result) => {
+        this.#clearStreamError(rpc, feed)
+        if (result.kind === 'appended' && this.#configured.has(record.author)) this.#progress.set(record.author, Date.now())
+        if (result.kind === 'fork') this.#forkRecords.push(result.record)
+        this.#notify()
+      },
+    }, controller.signal).catch((error: unknown) => {
+      if (!stopped) this.#setStreamError(rpc, feed, error)
+    }).finally(() => {
       if (stopped) return
-      source(null, (end, value) => {
-        if (stopped) return
-        if (end) {
-          stopped = true
-          streams.delete(feed)
-          if (end !== true) this.#setStreamError(rpc, feed, end)
-          this.#restreamLater(rpc, feed)
-          return
-        }
-        const accepted = this.#accept(value)
-        if (accepted === true) this.#clearStreamError(rpc, feed)
-        else if (accepted !== false) this.#setStreamError(rpc, feed, accepted.error)
-        if (accepted !== true) {
-          stop()
-          this.#restreamLater(rpc, feed)
-          return
-        }
-        read()
-      })
-    }
-    read()
+      stopped = true
+      streams.delete(feed)
+      this.#restreamLater(rpc, feed)
+    })
   }
 
   #restreamLater(rpc: Rpc, feed: string): void {
@@ -425,32 +420,6 @@ export class FeedTransport implements ChronologTransport {
   #lastStreamError(): string | undefined {
     for (const errors of this.#streamErrors.values()) for (const error of errors.values()) return error
     return undefined
-  }
-
-  /**
-   * Store one received record. True when stored (or already held); otherwise
-   * the stream restarts from the local head: false for a record that does not
-   * follow it yet, or the error that made the record unusable.
-   */
-  #accept(value: string | undefined): boolean | { readonly error: unknown } {
-    try {
-      if (typeof value !== 'string') throw new FeedRecordError('FEED_RECORD_MALFORMED')
-      const record = decodeFeedRecord(Uint8Array.from(Buffer.from(value, 'base64')), this.#maxRecordBytes)
-      const result = this.#store.append(record)
-      if (result.kind === 'appended') {
-        if (this.#configured.has(record.author)) this.#progress.set(record.author, Date.now())
-        this.#notify()
-        return true
-      }
-      if (result.kind === 'fork') {
-        this.#forkRecords.push(result.record)
-        this.#notify()
-        return true
-      }
-      return result.kind === 'duplicate'
-    } catch (error) {
-      return { error }
-    }
   }
 
   /** Serve one feed's signed records after `after`, then live appends. */
@@ -598,4 +567,34 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Adapt SSB pull callbacks to the portable authenticated record consumer. */
+async function* pullRecords(source: PullSource<string>, signal: AbortSignal): AsyncIterable<Uint8Array> {
+  try {
+    while (!signal.aborted) {
+      const next = await new Promise<{ readonly ended: true } | { readonly ended: false; readonly value: string }>((resolve, reject) => {
+        let settled = false
+        const abort = (): void => {
+          if (settled) return
+          settled = true
+          source(true, () => {})
+          resolve({ ended: true })
+        }
+        signal.addEventListener('abort', abort, { once: true })
+        source(null, (end, value) => {
+          if (settled) return
+          settled = true
+          signal.removeEventListener('abort', abort)
+          if (end instanceof Error) reject(end)
+          else if (end === true) resolve({ ended: true })
+          else if (typeof value !== 'string') reject(new FeedRecordError('FEED_RECORD_MALFORMED'))
+          else resolve({ ended: false, value })
+        })
+        if (signal.aborted) abort()
+      })
+      if (next.ended) return
+      yield decodeBase64(next.value)
+    }
+  } finally { source(true, () => {}) }
 }
