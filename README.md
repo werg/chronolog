@@ -81,7 +81,8 @@ pnpm cli transact @transaction.json
 pnpm cli outcome TRANSACTION_ID
 ```
 
-A transaction file lists steps: SQL statements, platform operations and emits.
+A CLI transaction file lists SQL statements and platform operations. Use the
+public client's `submit` and `events` APIs below for event-only or mixed programs.
 Bindings are JSON scalars or tagged values
 (`{"kind":"integer","value":"9007199254740993"}`, `{"kind":"real","value":1}`,
 `{"kind":"blob","value":"BASE64URL"}`). The daemon's own node is the group's

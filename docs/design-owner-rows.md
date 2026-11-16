@@ -12,7 +12,7 @@ wrong, this document is changed first and the change is logged (§11).
 Written against the simplified core (commits `1fb41d8`–`a8e5954`), where:
 
 - membership is four roles (writer, validator, reader, administrator);
-- a program was `{version: 1, statements}` (now `{version: 2, steps}`);
+- a program was `{version: 1, statements}` (now `{version: 3, steps}`);
 - node state and feeds live in SQLite.
 
 The normative contract is
@@ -20,9 +20,11 @@ The normative contract is
 
 **Owner decisions (2026-11-13):**
 
-- One node is one participant. The system does not support several users
-  behind one node, so there are no relayed or client-signed transactions and
-  no per-session identities.
+- Each authored change has one signed participant identity; there are no
+  per-session identities impersonating the replica. The application-log
+  extension admits original-signer proposals through an explicitly authorized
+  forwarding feed. Row ownership always uses that original signer, and a
+  limited publisher receives no reader keys or history access.
 - Policy violations abort the transaction. Nothing is skipped silently.
 - `recursive_triggers` is on during consensus execution, so `REPLACE` is
   subject to delete checks.
