@@ -32,6 +32,7 @@ interface SqlSpec {
  *   {"platform":"transfer_row","table":"notes","rowKey":[1],"toOwner":ID,"carry":true,"fromOwner":ID?}
  *   {"platform":"transfer_all","toOwner":KEY,"fromOwner":ID?}
  *   {"platform":"accept_transfer","offerId":ID}
+ *   {"platform":"cancel_transfer","offerId":ID}
  */
 type PlatformSpec = { readonly platform: string } & Readonly<Record<string, unknown>>
 interface TransactionSpec {
@@ -268,6 +269,7 @@ function jsonPlatformOp(spec: PlatformSpec): PlatformOp {
       return platformOp.transferAll({ toOwner: id('toOwner'), ...(fromOwner === undefined ? {} : { fromOwner }) })
     }
     case 'accept_transfer': return platformOp.acceptTransfer(id('offerId'))
+    case 'cancel_transfer': return platformOp.cancelTransfer(id('offerId'))
     default: throw new Error(`Unknown platform step: ${spec.platform}`)
   }
 }

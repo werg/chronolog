@@ -104,8 +104,11 @@ widen anyone's rights, but they may narrow them with ordinary app triggers,
 whose writes are themselves checked as the signer. Any violation aborts the
 whole transaction (`policy:<table>:<command>`); rows are never skipped.
 Ownership moves only by an offer accepted by the recipient; a planned key
-change is a bulk transfer. Reads are not restricted: every reader node holds
-every row. See [design-owner-rows.md](design-owner-rows.md).
+change is a bulk transfer. Every reader node holds every row's stored bytes.
+[Sealed BLOB columns](sealed-data.md) encrypt selected values to an explicit
+per-row reader policy; SQL sees their ciphertext and public metadata.
+Ownership controls policy changes without implicitly granting decryption.
+See [design-owner-rows.md](design-owner-rows.md).
 
 ## 4. Determinism
 

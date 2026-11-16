@@ -73,8 +73,30 @@ await client.ownership.removeMembers(teamId, [carol])
 // Transfers move ownership when the recipient accepts.
 const { id: offerId } = await client.ownership.offerRow({ table: 'notes', row: [1n], to: bob, carry: true })
 await bobClient.ownership.acceptOffer(offerId)
-await client.ownership.offerAll({ to: newKey })   // key change: every row you own
+await client.ownership.offerAll({ to: newKey })   // snapshot of the rows you currently own
+// Either endpoint may cancel/decline an open offer:
+await client.ownership.cancelOffer(otherOfferId)
 ```
+
+Offers bind the current row contents and dependent set. Changing an offered
+row cancels the offer; acquiring another row cancels a bulk offer. If a parent
+acquires a new dependent, acceptance rejects the stale snapshot. Create a new
+offer after the data is ready. A transfer closes competing offers and ends
+row-specific grants, so an old offer cannot revive after ownership returns.
+Deleting/replacing a row or changing its primary key also ends row-specific
+grants. Whole-table grants continue to apply to that owner's current rows.
+
+While acceptance runs, captured rows cannot be deleted or have their non-owner
+primary-key components changed by application triggers. The source and
+destination keys are also reserved against inserts and rekeying other rows into
+them, including owner-composite keys, so a trigger cannot substitute a different
+row for one the sender offered. Before accepting, the platform verifies that
+every captured row reached its destination owner and left any old owner-specific
+key. A skipped update, including one suppressed by `ON CONFLICT IGNORE`, rejects
+the entire acceptance. Ordinary ownership cascades still work.
+
+Column grants compare exact stored values: a case change in a NOCASE column,
+or a numeric storage-type change, needs permission for that column too.
 
 To combine these with SQL in one transaction, use the step builders
 (`ownershipSteps.share(…)` or `platformOp.*`) inside `client.transaction([...])`.
@@ -111,7 +133,11 @@ query works with `useOwnershipQuery(query)`.
 
 ## Schema
 
-- Tables need a primary key. Grants and transfers name rows by it.
+- Tables need a non-NULL primary key (at most 64 columns). SQLite's
+  `INTEGER PRIMARY KEY` rowid alias is implicitly non-NULL; use explicit
+  `NOT NULL` for other keys. Grants and transfers name rows by their actual
+  primary-key values. Query results expose an opaque `rk1:` typed key, which
+  preserves NUL text and exact numeric values; do not parse it as SQL literals.
 - `chronolog_owner` is added automatically: to an empty table, or declared as
   `chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id())`.
 - A child table that should move with its parent on transfer references it

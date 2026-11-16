@@ -68,7 +68,7 @@ describe('replicated SQL materialization', () => {
     const incremental = await open(first, manifest, 1)
     const digest = incremental.executionManifestDigest
     const setup = await transaction(1n, 'setup', [
-      sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY, now TEXT, local TEXT, r INTEGER, blob BLOB, last_rowid INTEGER, changed INTEGER)'),
+      sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY NOT NULL, now TEXT, local TEXT, r INTEGER, blob BLOB, last_rowid INTEGER, changed INTEGER)'),
     ], digest)
     const late = await transaction(2n, 'late', [
       sqlStatement('CREATE TABLE marker (id INTEGER PRIMARY KEY)'), sqlStatement('INSERT INTO marker (id) VALUES (7)'),
@@ -99,7 +99,7 @@ describe('replicated SQL materialization', () => {
     const tx = await transaction(1n, 'ordinary', [
       sqlStatement('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, price REAL, doubled REAL GENERATED ALWAYS AS (price * 2))'),
       sqlStatement("INSERT INTO items (name, price) VALUES ('a', 1.5), ('A', 2.25), ('b', 3)"),
-      sqlStatement('CREATE TABLE totals (name TEXT PRIMARY KEY, total REAL, names TEXT, rank INTEGER)'),
+      sqlStatement('CREATE TABLE totals (name TEXT PRIMARY KEY NOT NULL, total REAL, names TEXT, rank INTEGER)'),
       sqlStatement(`INSERT INTO totals (name, total, names, rank) SELECT name, sum(price), group_concat(name), rank() OVER (ORDER BY sum(price) DESC)
         FROM items GROUP BY name`),
       sqlStatement('CREATE TABLE log (id INTEGER PRIMARY KEY, message TEXT)'),

@@ -13,7 +13,7 @@ export const HASH_DOMAINS = Object.freeze({
 
 export type HashDomainKey = keyof typeof HASH_DOMAINS
 
-function bufferSource(value: Uint8Array): ArrayBuffer { return value.slice().buffer }
+function bufferSource(value: Uint8Array): ArrayBuffer { return Uint8Array.from(value).buffer }
 
 export function domainSeparatedBytes(domain: HashDomainKey, payload: Uint8Array): Uint8Array {
   const name = utf8(HASH_DOMAINS[domain])

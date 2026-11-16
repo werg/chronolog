@@ -37,6 +37,11 @@ and [portable peers](docs/portable-peers.md) for the architecture and tests.
   administrators may run DDL and write app triggers that narrow, never widen,
   those rights. Violations abort the whole transaction
   ([design](docs/design-owner-rows.md)).
+- **Explicit encrypted readers.** An owner controls a row's reader policy;
+  the client encrypts individual BLOB columns and wraps each fresh value key
+  only to those readers. Sealed writes still obey ordinary row grants and
+  application triggers. Ownership does not imply decryption rights
+  ([guide](docs/sealed-data.md)).
 - **Determinism from a pinned engine.** Every replica runs the same engine
   build; `'now'`, `random()` and `localtime` are fixed per transaction; a short
   authorizer block-list keeps statements inside the database.

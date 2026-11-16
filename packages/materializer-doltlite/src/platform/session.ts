@@ -1,7 +1,8 @@
-import { createSha256 } from '@chronolog/canonical'
+import { createSha256, utf8 } from '@chronolog/canonical'
 
 import {
   GROUP_COLLECTIVE_ID,
+  isSealedPlatformOp,
   platformObjectIdHashInput,
   type CollectiveRole,
   type PlatformOp,
@@ -11,10 +12,13 @@ import {
 import { isReservedSchemaObjectName, OWNER_COLUMN, withProfiledStatement } from '../sql-profile.js'
 import type { DatabaseLike, SqlRuntimeLimits, StatementLike } from '../types.js'
 import { PLATFORM_VIEW_NAMES, ownerIdsView, type OwnerOperation } from './schema.js'
+import { SEEDABLE_SEALED_TABLES, SealedRejection, SealedSession } from './sealed.js'
 import {
   OWNER_COLUMN_SQL,
   foreignKeyViolation,
   hasValidOwnerColumn,
+  hasNonNullPrimaryKey,
+  PLATFORM_TRIGGER_EVENTS,
   isOwnerComposite,
   ownerColumn,
   platformTriggerName,
@@ -43,13 +47,15 @@ const reject = (reason: string): never => { throw new PlatformRejection(`platfor
  * The `group` collective is not seeded: the fork's genesis root administers it.
  */
 export const SEEDABLE_PLATFORM_TABLES: readonly string[] = [
-  'chronolog_collectives', 'chronolog_collective_members', 'chronolog_grants', 'chronolog_transfers',
+  'chronolog_collectives', 'chronolog_collective_members', 'chronolog_grants', 'chronolog_transfers', 'chronolog_transfer_scope',
+  ...SEEDABLE_SEALED_TABLES,
 ]
 
 export interface PlatformContext {
   /** The signing key of the transaction: chronolog_actor(). */
   readonly actor: Uint8Array
   readonly txId: Uint8Array
+  readonly groupId: Uint8Array
   readonly limits: Partial<SqlRuntimeLimits>
 }
 
@@ -109,6 +115,21 @@ export class PlatformSession {
   }
 
   execute(op: PlatformOp, stepIndex: number): void {
+    if (isSealedPlatformOp(op)) {
+      try {
+        return new SealedSession(this.#database, {
+          ...this.#context,
+          registered: (table) => this.#registered(table),
+          findRow: (shape, values) => this.#findRow(shape, values),
+          ownerOf: (shape, key) => this.#ownerOf(shape, key),
+          administers: (owner) => this.#administers(owner),
+          objectId: (index) => this.#objectId(index),
+        }).execute(op, stepIndex)
+      } catch (error) {
+        if (error instanceof SealedRejection) throw new PlatformRejection(error.message)
+        throw error
+      }
+    }
     switch (op.op) {
       case 'grant': return this.#grant(op, stepIndex)
       case 'revoke_grant': return this.#revokeGrant(op.grantId)
@@ -118,6 +139,7 @@ export class PlatformSession {
       case 'set_members': return this.#setMembers(op)
       case 'transfer_offer': return this.#transferOffer(op, stepIndex)
       case 'transfer_accept': return this.#transferAccept(op.offerId)
+      case 'transfer_cancel': return this.#transferCancel(op.offerId)
       case 'seed_rows': return this.#seedRows(op)
       case 'end_seeding': return this.#endSeeding()
     }
@@ -134,6 +156,7 @@ export class PlatformSession {
   #registerTable(name: string): void {
     let shape = tableShape(this.#database, name)
     if (shape.primaryKey.length === 0) reject('no_primary_key')
+    if (!hasNonNullPrimaryKey(shape)) reject('nullable_primary_key')
     if (ownerColumn(shape) === undefined) {
       // A non-constant DEFAULT can only be added to an empty table.
       if (this.#get(`SELECT EXISTS (SELECT 1 FROM ${quoteIdentifier(name)}) AS present`)?.present === 1) reject('table_not_empty')
@@ -347,21 +370,82 @@ export class PlatformSession {
     }
     if (!this.#administers(from)) reject('not_owner')
     if (sameBytes(from, op.toOwner)) reject('invalid_transfer')
-    this.#run(`INSERT INTO chronolog_transfers (offer_id, tbl, row_key, from_owner, to_owner, carry, state, created_tx, closed_tx)
-      VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL)`,
-    this.#objectId(stepIndex), table, rowKey, from, op.toOwner, flag(op.carry), this.#context.txId)
+    const scope = this.#transferScope(table, rowKey, from, op.carry)
+    const digest = this.#transferScopeDigest(scope, from)
+    const offerId = this.#objectId(stepIndex)
+    this.#run(`INSERT INTO chronolog_transfers (offer_id, tbl, row_key, from_owner, to_owner, carry, scope_digest, state, created_tx, closed_tx)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL)`,
+    offerId, table, rowKey, from, op.toOwner, flag(op.carry), digest, this.#context.txId)
+    for (const row of scope) this.#run('INSERT INTO chronolog_transfer_scope (offer_id, tbl, row_key) VALUES (?, ?, ?)', offerId, row.table, row.key)
+  }
+
+  #transferCancel(offerId: Uint8Array): void {
+    const offer = this.#get('SELECT from_owner, to_owner, state FROM chronolog_transfers WHERE offer_id = ?', offerId) ?? reject('no_such_offer')
+    if (offer.state !== 'open') reject('offer_closed')
+    if (!this.#administers(asBytes(offer.from_owner)) && !this.#administers(asBytes(offer.to_owner))) reject('not_owner')
+    this.#run("UPDATE chronolog_transfers SET state = 'cancelled', closed_tx = ? WHERE offer_id = ?", this.#context.txId, offerId)
   }
 
   #transferAccept(offerId: Uint8Array): void {
-    const offer = this.#get('SELECT tbl, row_key, from_owner, to_owner, carry, state FROM chronolog_transfers WHERE offer_id = ?', offerId) ??
+    const offer = this.#get('SELECT tbl, row_key, from_owner, to_owner, carry, scope_digest, state FROM chronolog_transfers WHERE offer_id = ?', offerId) ??
       reject('no_such_offer')
     if (offer.state !== 'open') reject('offer_closed')
     const from = asBytes(offer.from_owner)
     const to = asBytes(offer.to_owner)
     if (!this.#administers(to)) reject('not_recipient')
-    if (offer.tbl === null) this.#transferAll(from, to)
+    const scope = this.#transferScope(offer.tbl === null ? null : asText(offer.tbl), offer.row_key === null ? null : asText(offer.row_key), from, Number(offer.carry) === 1)
+    if (!sameBytes(this.#transferScopeDigest(scope, from), asBytes(offer.scope_digest))) reject('offer_stale')
+    if (offer.tbl === null) this.#transferAll(from, to, scope)
     else this.#transferRow(asText(offer.tbl), asText(offer.row_key), from, to, Number(offer.carry) === 1)
+    // Lifecycle triggers cancelled every competing offer, including this one;
+    // this completed operation alone becomes accepted.
     this.#run(`UPDATE chronolog_transfers SET state = 'accepted', closed_tx = ? WHERE offer_id = ?`, this.#context.txId, offerId)
+  }
+
+  /** Current concrete rows addressed by an offer, in canonical order. */
+  #transferScope(table: string | null, key: string | null, from: Uint8Array, carry: boolean): RowRef[] {
+    const owner = this.#principalIfAny(from)
+    if (owner === null) return []
+    let rows: RowRef[]
+    if (table === null) {
+      rows = this.#registeredTables().flatMap((name) => {
+        const shape = tableShape(this.#database, name)
+        return this.#all(`SELECT ${rowKeyExpression('t', shape.primaryKey)} AS row_key FROM ${quoteIdentifier(name)} AS t
+          WHERE t.${quoteIdentifier(OWNER_COLUMN)} = ? ORDER BY row_key`, owner).map((row) => ({ table: name, key: String(row.row_key) }))
+      })
+    } else {
+      if (!this.#isRegistered(table) || key === null) reject('offer_stale')
+      const shape = tableShape(this.#database, table)
+      const currentOwner = this.#ownerOf(shape, key!)
+      if (currentOwner === null || !sameBytes(currentOwner, from)) reject('offer_stale')
+      rows = [{ table, key: key! }, ...(carry ? this.#dependents({ table, key: key! }, owner) : [])]
+    }
+    return rows.sort((a, b) => a.table < b.table ? -1 : a.table > b.table ? 1 : a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  }
+
+  /** Bind an offer to exact data, columns and dependent set, not future rows. */
+  #transferScopeDigest(scope: readonly RowRef[], from: Uint8Array): Uint8Array {
+    const hash = createSha256().update('chronolog-transfer-scope-v1\0').update(from)
+    const part = (value: string): void => { hash.update(`${utf8(value).byteLength}:`).update(value) }
+    for (const ref of scope) {
+      const shape = tableShape(this.#database, ref.table)
+      const columns = shape.columns.filter((column) => column.hidden === 0 && column.name !== OWNER_COLUMN)
+      part(ref.table)
+      part(ref.key)
+      part(JSON.stringify(columns.map((column) => [column.name, column.type, column.primaryKey])))
+      const content = this.#get(`SELECT ${columns.length === 0 ? "''" : columns.map((column) => `chronolog_row_key(t.${quoteIdentifier(column.name)})`).join(" || ")} AS data
+        FROM ${quoteIdentifier(ref.table)} AS t WHERE ${rowKeyFilter('t', shape.primaryKey)}`, ...rowKeyBindings(ref.key, shape.primaryKey))
+      if (content === undefined) reject('offer_stale')
+      part(asText(content!.data))
+      // Reader-policy changes alter the state being offered even when the
+      // application ciphertext has not yet been replaced.
+      for (const policy of this.#all(`SELECT hex(policy_id) AS id, CAST(version AS TEXT) AS version
+        FROM chronolog_reader_policies WHERE tbl = ? AND row_key = ? AND closed_tx IS NULL ORDER BY policy_id`, ref.table, ref.key)) {
+        part(String(policy.id))
+        part(String(policy.version))
+      }
+    }
+    return Uint8Array.from(hash.digest())
   }
 
   #transferRow(table: string, key: string, from: Uint8Array, to: Uint8Array, carry: boolean): void {
@@ -374,20 +458,48 @@ export class PlatformSession {
     const dependents = this.#dependents({ table, key }, fromId)
     if (!carry && dependents.length > 0) reject('has_dependents')
     const moved = [{ table, key }, ...dependents]
-    // The exemption admits exactly these owner changes, from `from` to `to`.
-    for (const row of moved) {
-      this.#run(`INSERT INTO chronolog_exemptions (kind, tbl, row_key, from_owner, to_owner) VALUES ('transfer', ?, ?, ?, ?)`, row.table, row.key, fromId, toId)
-    }
+    // Admit these owner changes and guard the captured row generations for
+    // the entire update, including application triggers and FK cascades.
+    for (const row of moved) this.#transferExemption(row, fromId, toId, to)
     try {
       const result = this.#run(`UPDATE ${quoteIdentifier(table)} SET ${quoteIdentifier(OWNER_COLUMN)} = ?
         WHERE ${rowKeyFilter(quoteIdentifier(table), shape.primaryKey)}`, toId, ...rowKeyBindings(key, shape.primaryKey))
       if (Number(result.changes) !== 1) reject('offer_stale')
+      this.#assertTransferComplete(to)
     } finally {
       this.#run('DELETE FROM chronolog_exemptions')
     }
     // Row grants were given by the previous owner.
     for (const row of moved) {
       this.#run('UPDATE chronolog_grants SET revoked_tx = ? WHERE revoked_tx IS NULL AND tbl = ? AND row_key = ?', this.#context.txId, row.table, row.key)
+    }
+  }
+
+  /** Guard both identities of one row while permitting its owner transition. */
+  #transferExemption(row: RowRef, fromId: bigint, toId: bigint, to: Uint8Array): void {
+    const shape = tableShape(this.#database, row.table)
+    let toKey = row.key
+    if (shape.primaryKey.some((column) => column.toLowerCase() === OWNER_COLUMN)) {
+      // Encode directly from SQLite storage: converting TEXT/REAL components
+      // through JavaScript would lose invalid UTF-8 bytes or storage types.
+      const values = shape.primaryKey.map((column) => column.toLowerCase() === OWNER_COLUMN ? '?' : `t.${quoteIdentifier(column)}`)
+      const target = this.#get(`SELECT chronolog_row_key(${values.join(', ')}) AS row_key
+        FROM ${quoteIdentifier(row.table)} AS t WHERE ${rowKeyFilter('t', shape.primaryKey)}`,
+      to, ...rowKeyBindings(row.key, shape.primaryKey)) ?? reject('offer_stale')
+      toKey = asText(target.row_key)
+    }
+    this.#run(`INSERT INTO chronolog_exemptions (kind, tbl, row_key, to_row_key, from_owner, to_owner)
+      VALUES ('transfer', ?, ?, ?, ?, ?)`, row.table, row.key, toKey, fromId, toId)
+  }
+
+  /** A schema-level ON CONFLICT IGNORE must not silently skip an owner change. */
+  #assertTransferComplete(to: Uint8Array): void {
+    for (const row of this.#all("SELECT tbl, row_key, to_row_key FROM chronolog_exemptions WHERE kind = 'transfer' ORDER BY tbl, row_key")) {
+      const shape = tableShape(this.#database, asText(row.tbl))
+      const fromKey = asText(row.row_key)
+      const toKey = asText(row.to_row_key)
+      const owner = this.#ownerOf(shape, toKey)
+      if (owner === null || !sameBytes(owner, to) || (fromKey !== toKey && this.#ownerOf(shape, fromKey) !== null)) reject('offer_stale')
     }
   }
 
@@ -404,17 +516,19 @@ export class PlatformSession {
         for (const foreignKey of child.foreignKeys) {
           if (!isOwnerComposite(foreignKey) || foreignKey.table.toLowerCase() !== parent.table.toLowerCase()) continue
           const referenced = foreignKey.to.map((column, index) => column ?? parentShape.primaryKey[index]!)
-          const values = this.#get(`
-            SELECT ${referenced.map((column, index) => `p.${quoteIdentifier(column)} AS v${index}`).join(', ')}
-              FROM ${quoteIdentifier(parent.table)} AS p WHERE ${rowKeyFilter('p', parentShape.primaryKey)}
-          `, ...rowKeyBindings(parent.key, parentShape.primaryKey))
-          if (values === undefined) continue
+          // SQLite foreign keys compare with the PARENT column's affinity
+          // and collation, not the child's. Unary + removes child affinity
+          // without changing its value; parent-on-left chooses its collation.
+          // Equality also excludes NULL child components (not FK references).
           const children = this.#all(`
-            SELECT ${rowKeyExpression('c', child.primaryKey)} AS row_key FROM ${quoteIdentifier(child.name)} AS c
-             WHERE ${foreignKey.from.map((column) => `c.${quoteIdentifier(column)} IS ?`).join(' AND ')}
+            SELECT ${rowKeyExpression('c', child.primaryKey)} AS row_key
+              FROM ${quoteIdentifier(child.name)} AS c
+              JOIN ${quoteIdentifier(parent.table)} AS p ON
+                ${referenced.map((column, index) => `p.${quoteIdentifier(column)} = +c.${quoteIdentifier(foreignKey.from[index]!)}`).join(' AND ')}
+             WHERE ${rowKeyFilter('p', parentShape.primaryKey)}
                AND c.${quoteIdentifier(OWNER_COLUMN)} = ?
              ORDER BY row_key
-          `, ...referenced.map((_, index) => values[`v${index}`]), owner)
+          `, ...rowKeyBindings(parent.key, parentShape.primaryKey), owner)
           for (const row of children) {
             const ref = { table: child.name, key: String(row.row_key) }
             const id = `${ref.table}\0${ref.key}`
@@ -430,17 +544,23 @@ export class PlatformSession {
   }
 
   /** The key-change path: every row `from` owns, in parent-before-child order. */
-  #transferAll(from: Uint8Array, to: Uint8Array): void {
+  #transferAll(from: Uint8Array, to: Uint8Array, scope: readonly RowRef[]): void {
     const tables = this.#parentFirst(this.#registeredTables().map((name) => tableShape(this.#database, name)))
     const fromId = this.#principal(from)
     const toId = this.#principal(to)
-    for (const shape of tables) {
-      this.#run(`INSERT INTO chronolog_exemptions (kind, tbl, row_key, from_owner, to_owner) VALUES ('transfer', ?, NULL, ?, ?)`, shape.name, fromId, toId)
-    }
+    for (const row of scope) this.#transferExemption(row, fromId, toId, to)
     try {
       for (const shape of tables) {
-        this.#run(`UPDATE ${quoteIdentifier(shape.name)} SET ${quoteIdentifier(OWNER_COLUMN)} = ? WHERE ${quoteIdentifier(OWNER_COLUMN)} = ?`, toId, fromId)
+        for (const row of scope.filter((entry) => entry.table === shape.name)) {
+          // A parent cascade may already have moved this row (and changed an
+          // owner-composite PK). Never widen the captured scope to new rows
+          // that an application trigger inserted during this acceptance.
+          this.#run(`UPDATE ${quoteIdentifier(shape.name)} SET ${quoteIdentifier(OWNER_COLUMN)} = ?
+            WHERE ${quoteIdentifier(OWNER_COLUMN)} = ? AND ${rowKeyFilter(quoteIdentifier(shape.name), shape.primaryKey)}`,
+          toId, fromId, ...rowKeyBindings(row.key, shape.primaryKey))
+        }
       }
+      this.#assertTransferComplete(to)
     } finally {
       this.#run('DELETE FROM chronolog_exemptions')
     }
@@ -563,11 +683,13 @@ export class PlatformSession {
       const moved = this.#get(`SELECT tbl_name FROM sqlite_schema WHERE type = 'trigger' AND name = ?`, platformTriggerName(name, 'ins'))
       const renamedTo = moved === undefined ? undefined : tables.get(String(moved.tbl_name).toLowerCase())
       if (renamedTo !== undefined && !registeredKeys.has(renamedTo.toLowerCase())) {
-        for (const event of ['ins', 'upd', 'del'] as const) this.#run(`DROP TRIGGER IF EXISTS ${quoteIdentifier(platformTriggerName(name, event))}`)
+        for (const event of PLATFORM_TRIGGER_EVENTS) this.#run(`DROP TRIGGER IF EXISTS ${quoteIdentifier(platformTriggerName(name, event))}`)
         for (const trigger of platformTriggers(tableShape(this.#database, renamedTo))) this.#run(trigger.sql)
         this.#run('UPDATE chronolog_tables SET name = ? WHERE name = ?', renamedTo, name)
         this.#run('UPDATE chronolog_grants SET tbl = ? WHERE tbl = ?', renamedTo, name)
         this.#run('UPDATE chronolog_transfers SET tbl = ? WHERE tbl = ?', renamedTo, name)
+        this.#run('UPDATE chronolog_transfer_scope SET tbl = ? WHERE tbl = ?', renamedTo, name)
+        this.#run('UPDATE chronolog_reader_policies SET tbl = ? WHERE tbl = ?', renamedTo, name)
         registeredKeys.delete(name.toLowerCase())
         registeredKeys.add(renamedTo.toLowerCase())
         continue
@@ -575,7 +697,10 @@ export class PlatformSession {
       // Dropping a registered table unregisters it and ends its grants and offers.
       this.#run('DELETE FROM chronolog_tables WHERE name = ?', name)
       this.#run('UPDATE chronolog_grants SET revoked_tx = ? WHERE tbl = ? AND revoked_tx IS NULL', this.#context.txId, name)
+      this.#run('UPDATE chronolog_reader_policies SET closed_tx = ? WHERE tbl = ? AND closed_tx IS NULL', this.#context.txId, name)
       this.#run(`UPDATE chronolog_transfers SET state = 'cancelled', closed_tx = ? WHERE tbl = ? AND state = 'open'`, this.#context.txId, name)
+      this.#run(`UPDATE chronolog_transfers SET state = 'cancelled', closed_tx = ? WHERE state = 'open' AND offer_id IN
+        (SELECT offer_id FROM chronolog_transfer_scope WHERE tbl = ?)`, this.#context.txId, name)
       registeredKeys.delete(name.toLowerCase())
     }
 
@@ -589,8 +714,16 @@ export class PlatformSession {
     const expected = new Set<string>(PLATFORM_VIEW_NAMES)
     for (const key of registeredKeys) {
       const shape = tableShape(this.#database, tables.get(key)!)
-      if (!hasValidOwnerColumn(shape) || shape.primaryKey.length === 0) throw new PlatformRejection('schema_unregistered')
+      if (!hasValidOwnerColumn(shape) || !hasNonNullPrimaryKey(shape)) throw new PlatformRejection('schema_unregistered')
       if (foreignKeyViolation(shape) !== null) throw new PlatformRejection('platform:fk_action')
+      // A sealed column's name and BLOB type are part of its authenticated
+      // context. Dropping/renaming it closes the generation instead of
+      // silently rebinding its ciphertext to another column.
+      const slots = shape.columns.filter((column) => column.hidden === 0 && column.primaryKey === 0 &&
+        column.name !== OWNER_COLUMN && column.type.toUpperCase() === 'BLOB').map((column) => column.name)
+      this.#run(`UPDATE chronolog_reader_policies SET closed_tx = ? WHERE tbl = ? AND closed_tx IS NULL
+        AND EXISTS (SELECT 1 FROM chronolog_sealed_values AS v WHERE v.policy_id = chronolog_reader_policies.policy_id
+          ${slots.length === 0 ? '' : `AND v.slot NOT IN (${slots.map(() => '?').join(', ')})`})`, this.#context.txId, shape.name, ...slots)
       for (const trigger of platformTriggers(shape)) {
         expected.add(trigger.name.toLowerCase())
         const current = this.#get(`SELECT sql, tbl_name FROM sqlite_schema WHERE type = 'trigger' AND name = ?`, trigger.name)
@@ -669,30 +802,30 @@ export function cachedInternalStatement(database: DatabaseLike, sql: string): St
   return statement
 }
 
-const shadowCache = new WeakMap<DatabaseLike, { readonly version: number; readonly tables: ReadonlySet<string> }>()
-
-/** Lower-case names of SQLite shadow tables, cached per schema version; read while no authorizer is installed. */
-export function shadowTables(database: DatabaseLike): ReadonlySet<string> {
-  const version = Number((cachedInternalStatement(database, 'PRAGMA schema_version').get() as Row).schema_version)
-  const cached = shadowCache.get(database)
-  if (cached?.version === version) return cached.tables
-  const rows = cachedInternalStatement(database, `SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'shadow'`).all() as Row[]
-  const tables = new Set(rows.map((row) => String(row.name).toLowerCase()))
-  shadowCache.set(database, { version, tables })
-  return tables
+/**
+ * Exact generated lifecycle callers, read while no authorizer is installed.
+ * Re-read authorization inventories on every use: schema_version is a
+ * rollbackable cookie, not a unique identity for the current catalog. Caching
+ * results by that cookie makes authorization depend on prior failed work.
+ * Only the fixed SQL statements themselves are cached.
+ */
+export function lifecycleTriggerNames(database: DatabaseLike): ReadonlySet<string> {
+  const tables = cachedInternalStatement(database, 'SELECT name FROM chronolog_tables').all() as Row[]
+  return new Set(tables.flatMap((row) => (['life_ins', 'upd', 'del'] as const).map((event) => platformTriggerName(String(row.name), event).replace(/[A-Z]/gu, (letter) => letter.toLowerCase()))))
 }
 
-const writeProtectedCache = new WeakMap<DatabaseLike, { readonly version: number; readonly tables: ReadonlySet<string> }>()
+/** Current lower-case SQLite shadow table names; read while no authorizer is installed. */
+export function shadowTables(database: DatabaseLike): ReadonlySet<string> {
+  const rows = cachedInternalStatement(database, `SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'shadow'`).all() as Row[]
+  return new Set(rows.map((row) => String(row.name).toLowerCase()))
+}
 
 /**
  * Lower-case names of the tables that carry no owner checks: virtual tables
- * (FTS5, R-tree, sqlite-vec) and sqlite-vec's chunk tables. Cached per
- * schema version; read while no authorizer is installed.
+ * (FTS5, R-tree, sqlite-vec) and sqlite-vec's chunk tables. Recomputed from the
+ * current catalog while no authorizer is installed.
  */
 export function writeProtectedTables(database: DatabaseLike): ReadonlySet<string> {
-  const version = Number((cachedInternalStatement(database, 'PRAGMA schema_version').get() as Row).schema_version)
-  const cached = writeProtectedCache.get(database)
-  if (cached?.version === version) return cached.tables
   const schema = cachedInternalStatement(database, `SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND sql IS NOT NULL`).all() as Row[]
   const vecTables = new Map<string, number>()
   const tables = new Set<string>()
@@ -706,7 +839,6 @@ export function writeProtectedTables(database: DatabaseLike): ReadonlySet<string
   for (const row of schema) {
     if (isVecChunkTable(database, String(row.name), vecTables)) tables.add(String(row.name).toLowerCase())
   }
-  writeProtectedCache.set(database, { version, tables })
   return tables
 }
 

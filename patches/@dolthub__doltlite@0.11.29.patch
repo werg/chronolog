@@ -68,7 +68,7 @@ index 767f27601ed81cbbb7374519b48ab1f834b76f50..a580919b43719ddda222b8155d7478c2
 +   * chronolog_actor() and chronolog_actor_id(); resets last_insert_rowid.
 +   * Process-global.
 +   */
-+  setDeterministicContext(unixMs: bigint, seed: number, actor?: Uint8Array | null, actorId?: bigint | null): void
++  setDeterministicContext(unixMs: bigint, seed: number, actor?: Uint8Array | null, actorId?: bigint | null, transactionId?: Uint8Array | null): void
 +  /** Restore the real clock, PRNG and localtime. */
 +  clearDeterministicContext(): void
  
@@ -358,10 +358,12 @@ diff --git a/src/addon.cpp b/src/addon.cpp
 index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..76dcfd4c6f763895e33c3df4bb0d564ce61982f2 100644
 --- a/src/addon.cpp
 +++ b/src/addon.cpp
-@@ -1,14 +1,208 @@
+@@ -1,14 +1,287 @@
  #include "database.h"
  #include "statement.h"
  
++#include <cstdint>
++#include <limits>
 +#include <cstring>
 +#include <ctime>
 +#include <string>
@@ -405,10 +407,13 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..76dcfd4c6f763895e33c3df4bb0d564c
 +// The signer's principal id in the database; chronolog_actor_id() returns it.
 +static bool g_hasActorId = false;
 +static sqlite3_int64 g_actorId = 0;
++static std::string g_transactionId;
 +
 +extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed,
 +                                                 const unsigned char* actor, size_t actorBytes,
-+                                                 int hasActorId, sqlite3_int64 actorId) {
++                                                 int hasActorId, sqlite3_int64 actorId,
++                                                 const unsigned char* transactionId, size_t transactionIdBytes) {
++  g_transactionId.assign(transactionId == nullptr ? "" : std::string((const char*)transactionId, transactionIdBytes));
 +  g_hasActorId = hasActorId != 0;
 +  g_actorId = actorId;
 +  g_hasActor = actor != nullptr;
@@ -422,6 +427,7 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..76dcfd4c6f763895e33c3df4bb0d564c
 +extern "C" void chronologClearDeterministicContext(void) {
 +  g_hasActor = false;
 +  g_actor.clear();
++  g_transactionId.clear();
 +  g_hasActorId = false;
 +  g_actorId = 0;
 +  g_fixedTime = false;
@@ -486,6 +492,73 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..76dcfd4c6f763895e33c3df4bb0d564c
 +  sqlite3_result_error_code(ctx, SQLITE_CONSTRAINT_FUNCTION);
 +}
 +
++// Exact SQLite storage values, independent of collation or numeric coercion.
++static bool ExactSqlValueEqual(sqlite3_value* a, sqlite3_value* b) {
++  int type = sqlite3_value_type(a);
++  if (type != sqlite3_value_type(b)) return false;
++  if (type == SQLITE_NULL) return true;
++  if (type == SQLITE_INTEGER) return sqlite3_value_int64(a) == sqlite3_value_int64(b);
++  if (type == SQLITE_FLOAT) {
++    double x = sqlite3_value_double(a), y = sqlite3_value_double(b);
++    return std::memcmp(&x, &y, sizeof(double)) == 0;
++  }
++  const void* x = type == SQLITE_TEXT ? sqlite3_value_text(a) : sqlite3_value_blob(a);
++  const void* y = type == SQLITE_TEXT ? sqlite3_value_text(b) : sqlite3_value_blob(b);
++  int n = sqlite3_value_bytes(a);
++  return n == sqlite3_value_bytes(b) && (n == 0 || (x && y && std::memcmp(x, y, (size_t)n) == 0));
++}
++
++static void ChronologValueEqual(sqlite3_context* ctx, int, sqlite3_value** argv) {
++  sqlite3_result_int(ctx, ExactSqlValueEqual(argv[0], argv[1]) ? 1 : 0);
++}
++
++static void KeyByte(std::string& key, unsigned int value) {
++  static const char* digits = "0123456789abcdef";
++  key.push_back(digits[(value >> 4) & 15]);
++  key.push_back(digits[value & 15]);
++}
++
++static void KeyUint(std::string& key, uint64_t value, int bytes) {
++  for (int shift = (bytes - 1) * 8; shift >= 0; shift -= 8) KeyByte(key, (unsigned int)(value >> shift));
++}
++
++// rk1: + hex(count:u16, (tag:u8, value)*). Numeric payloads are big-endian
++// int64/IEEE754 bits; TEXT/BLOB payloads are u32 byte length + exact bytes.
++// Kept in lockstep with packages/protocol/src/row-key.ts.
++static void ChronologRowKey(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
++  if (argc < 1 || argc > 64) { sqlite3_result_error(ctx, "chronolog_row_key: expected 1 to 64 values", -1); return; }
++  static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559, "Chronolog requires IEEE754 binary64");
++  std::string key = "rk1:";
++  const size_t maximum = (size_t)sqlite3_limit(sqlite3_context_db_handle(ctx), SQLITE_LIMIT_LENGTH, -1);
++  KeyUint(key, (uint64_t)argc, 2);
++  for (int i = 0; i < argc; ++i) {
++    int type = sqlite3_value_type(argv[i]);
++    size_t extra = type == SQLITE_NULL ? 2 : (type == SQLITE_INTEGER || type == SQLITE_FLOAT) ? 18 : 10 + 2 * (size_t)sqlite3_value_bytes(argv[i]);
++    if (key.size() > maximum || extra > maximum - key.size()) { sqlite3_result_error_toobig(ctx); return; }
++    if (type == SQLITE_NULL) { KeyByte(key, 0); continue; }
++    if (type == SQLITE_INTEGER) {
++      KeyByte(key, 1); KeyUint(key, (uint64_t)sqlite3_value_int64(argv[i]), 8);
++    } else if (type == SQLITE_FLOAT) {
++      double value = sqlite3_value_double(argv[i]);
++      uint64_t bits; std::memcpy(&bits, &value, 8);
++      KeyByte(key, 2); KeyUint(key, bits, 8);
++    } else {
++      const unsigned char* bytes = type == SQLITE_TEXT
++        ? sqlite3_value_text(argv[i]) : (const unsigned char*)sqlite3_value_blob(argv[i]);
++      int length = sqlite3_value_bytes(argv[i]);
++      if (length > 0 && bytes == nullptr) { sqlite3_result_error_nomem(ctx); return; }
++      KeyByte(key, type == SQLITE_TEXT ? 3 : 4); KeyUint(key, (uint64_t)length, 4);
++      for (int j = 0; j < length; ++j) KeyByte(key, bytes[j]);
++    }
++  }
++  sqlite3_result_text64(ctx, key.data(), (sqlite3_uint64)key.size(), SQLITE_TRANSIENT, SQLITE_UTF8);
++}
++
++static void ChronologTransactionId(sqlite3_context* ctx, int, sqlite3_value**) {
++  if (g_transactionId.empty()) { sqlite3_result_null(ctx); return; }
++  sqlite3_result_blob(ctx, g_transactionId.data(), (int)g_transactionId.size(), SQLITE_TRANSIENT);
++}
++
 +static int ChronologRegisterFunctions(sqlite3* db, char**, const sqlite3_api_routines*) {
 +  int rc = sqlite3_create_function_v2(db, "chronolog_assert", 2,
 +    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS, nullptr, ChronologAssert, nullptr, nullptr, nullptr);
@@ -495,6 +568,12 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..76dcfd4c6f763895e33c3df4bb0d564c
 +    SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr, ChronologActorId, nullptr, nullptr, nullptr);
 +  if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "chronolog_policy_violation", 2,
 +    SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr, ChronologPolicyViolation, nullptr, nullptr, nullptr);
++  if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "chronolog_row_key", -1,
++    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS, nullptr, ChronologRowKey, nullptr, nullptr, nullptr);
++  if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "chronolog_value_equal", 2,
++    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS, nullptr, ChronologValueEqual, nullptr, nullptr, nullptr);
++  if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "chronolog_transaction_id", 0,
++    SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr, ChronologTransactionId, nullptr, nullptr, nullptr);
 +  return rc;
 +}
 +
@@ -537,7 +616,7 @@ index f99f1b18e14afd6dd1f1d690556eb7b4df5f048c..76dcfd4c6f763895e33c3df4bb0d564c
 +  manifest.Set("doltliteSourceSha256", "6611b083ea08cf1e4a9ca71d8e873e9fccd989ad893d6ab38b3df3a48aeac6a8");
 +  manifest.Set("sqliteVecVersion", "0.1.9");
 +  manifest.Set("sqliteVecSourceSha256", "3acd67cb4aff080c7050926fd3cf8227905fe5b7ee3829d8ee5024ab1283cf61");
-+  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-deterministic-context-assert-parameters-actor-policy-trigger-lint-actor-id-vec-innocuous-v7");
++  manifest.Set("chronologPatchProfile", "authorizer-progress-limits-tailoffset-dolt-refs-static-vec-dolt-compat-real-empty-blob-bind-deterministic-context-assert-parameters-actor-policy-trigger-lint-actor-id-vec-innocuous-row-key-exact-values-tx-id-v8");
 +  manifest.Set("fts5", true);
 +  manifest.Set("json1", true);
 +  manifest.Set("rtree", true);
@@ -629,7 +708,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..b9ab0090df9dfa07f0340320a1493b3c
  }
  
  Napi::Value Database::IsOpenGetter(const Napi::CallbackInfo& info) {
-@@ -162,6 +174,200 @@ Napi::Value Database::CreateFunction(const Napi::CallbackInfo& info) {
+@@ -162,6 +174,212 @@ Napi::Value Database::CreateFunction(const Napi::CallbackInfo& info) {
    return env.Undefined();
  }
  
@@ -730,7 +809,8 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..b9ab0090df9dfa07f0340320a1493b3c
 +
 +extern "C" void chronologSetDeterministicContext(sqlite3_int64 unixMs, unsigned int seed,
 +                                                 const unsigned char* actor, size_t actorBytes,
-+                                                 int hasActorId, sqlite3_int64 actorId);
++                                                 int hasActorId, sqlite3_int64 actorId,
++                                                 const unsigned char* transactionId, size_t transactionIdBytes);
 +extern "C" void chronologClearDeterministicContext(void);
 +
 +// Fix the engine inputs that do not come from SQL or the database: the clock,
@@ -770,8 +850,19 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..b9ab0090df9dfa07f0340320a1493b3c
 +      return env.Undefined();
 +    }
 +  }
++  std::string transactionId;
++  if (info.Length() >= 5 && !info[4].IsNull() && !info[4].IsUndefined()) {
++    if (!info[4].IsTypedArray() || info[4].As<Napi::TypedArray>().TypedArrayType() != napi_uint8_array) {
++      Napi::TypeError::New(env, "Deterministic transaction id must be bytes").ThrowAsJavaScriptException();
++      return env.Undefined();
++    }
++    auto array = info[4].As<Napi::Uint8Array>();
++    if (array.ByteLength() < 1) { Napi::RangeError::New(env, "Transaction id cannot be empty").ThrowAsJavaScriptException(); return env.Undefined(); }
++    transactionId.assign((const char*)array.Data(), array.ByteLength());
++  }
 +  chronologSetDeterministicContext((sqlite3_int64)unixMs, info[1].As<Napi::Number>().Uint32Value(),
-+    hasActor ? (const unsigned char*)actor.data() : nullptr, actor.size(), hasActorId ? 1 : 0, (sqlite3_int64)actorId);
++    hasActor ? (const unsigned char*)actor.data() : nullptr, actor.size(), hasActorId ? 1 : 0, (sqlite3_int64)actorId,
++    transactionId.empty() ? nullptr : (const unsigned char*)transactionId.data(), transactionId.size());
 +  sqlite3_set_last_insert_rowid(db_, 0);
 +  return env.Undefined();
 +}
@@ -830,7 +921,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..b9ab0090df9dfa07f0340320a1493b3c
  // ── Internal query helpers ────────────────────────────────────────────────────
  
  Napi::Array Database::ExecQuery(Napi::Env env, const std::string& sql,
-@@ -277,6 +483,41 @@ Napi::Value Database::DoltReset(const Napi::CallbackInfo& info) {
+@@ -277,6 +495,41 @@ Napi::Value Database::DoltReset(const Napi::CallbackInfo& info) {
    return env.Undefined();
  }
  
@@ -872,7 +963,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..b9ab0090df9dfa07f0340320a1493b3c
  Napi::Value Database::DoltStatus(const Napi::CallbackInfo& info) {
    return ExecQuery(info.Env(), "SELECT * FROM dolt_status");
  }
-@@ -414,6 +655,13 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
+@@ -414,6 +667,13 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
      InstanceMethod("open",           &Database::Open),
      InstanceMethod("location",       &Database::Location),
      InstanceMethod("createFunction", &Database::CreateFunction),
@@ -886,7 +977,7 @@ index 1537104e3a80018cd4a7147daad8460e27acdea0..b9ab0090df9dfa07f0340320a1493b3c
      InstanceAccessor("isOpen",        &Database::IsOpenGetter,        nullptr),
      InstanceAccessor("inTransaction", &Database::IsTransactionGetter, nullptr),
      // Dolt version-control
-@@ -422,6 +670,9 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
+@@ -422,6 +682,9 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
      InstanceMethod("doltCheckout",   &Database::DoltCheckout),
      InstanceMethod("doltMerge",      &Database::DoltMerge),
      InstanceMethod("doltReset",      &Database::DoltReset),

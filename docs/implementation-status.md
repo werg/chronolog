@@ -35,9 +35,21 @@ Implemented and covered by executable tests:
   cascades, `RAISE(IGNORE)`), automatic table registration, and the platform operations
   `Grant`/`RevokeGrant` (row scope, column caps), `team` collectives
   (`CreateCollective`, `AcceptMembership`, `Leave`, `SetMembers`),
-  `TransferOffer`/`TransferAccept` (row with dependents, or every row for a key
-  change) and `SeedRows` for forks. Tested against `REPLACE`, upserts,
+  `TransferOffer`/`TransferAccept`/`TransferCancel` (state-bound row/dependent
+  scope, or a snapshot of all current rows for a key change) and `SeedRows`
+  for forks. Typed binary row keys preserve NUL and exact storage types;
+  column caps compare exact values, independent of SQL collations. Row grants
+  and offers do not survive delete/reinsert, rekey or ownership reuse.
+  Tested against `REPLACE`, upserts,
   `INSERT … SELECT`, FK cascades, app triggers, recursion and full replay;
+- **sealed data** ([guide](sealed-data.md)): signed reader-key registration,
+  owner-controlled per-row reader policies with version checks, and
+  client-encrypted BLOB columns with fresh AES-256-GCM keys wrapped to each
+  explicit X25519/HPKE reader. Sealed writes execute ordinary row authorization
+  and application triggers. Policy generations close on delete/rekey; an
+  ownership transfer preserves explicit readers. The SDK checks policy
+  finality before encryption by default. Old values and rejected candidates
+  retain their original audiences; SQL sees public metadata and ciphertext;
 - accepted/rejected outcomes with a rejection code (`assert:<code>`,
   `policy:<table>:<command>`, `platform:<reason>`, `schema_unregistered`,
   `trigger_ignore`, `constraint`, `step_limit`, `denied`, `prepare`,
@@ -72,7 +84,9 @@ Implemented and covered by executable tests:
   workloads (DDL by the root administrator, mixed-author writes through
   grants, cross-owner probes, platform-trigger and owner invariants);
 - fork seeding that keeps owners, teams, memberships and grants, and
-  `verify-fork` comparing them.
+  `verify-fork` comparing them. A database containing reader policies requires
+  explicit re-encryption for a new group and is refused by automatic fork
+  seeding; same-group snapshot restoration remains supported.
 
 ## History, enrollment and relay acceptance
 

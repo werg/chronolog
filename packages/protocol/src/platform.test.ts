@@ -31,6 +31,7 @@ const everyOperation: readonly PlatformOp[] = [
   platformOp.transferRow({ table: 'notes', rowKey: [1n], toOwner: key(11), fromOwner: key(12), carry: true }),
   platformOp.transferAll({ toOwner: key(13) }),
   platformOp.acceptTransfer(key(14)),
+  platformOp.cancelTransfer(key(14)),
   platformOp.seedRows('notes', ['id', 'chronolog_owner'], [[1n, key(1)], [2n, key(2)]]),
   platformOp.endSeeding(),
 ]

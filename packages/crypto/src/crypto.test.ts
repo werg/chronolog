@@ -7,6 +7,7 @@ import {
   decryptEpochPayload,
   encryptEpochPayload,
   encodeSignedEpochManifest,
+  exportX25519PrivateKey,
   generateX25519KeyPair,
   hpkeOpenBase,
   hpkeSealBase,
@@ -19,6 +20,24 @@ const bytes = (value: number, length = 32) => new Uint8Array(length).fill(value)
 const hex = (value: string) => Uint8Array.from(Buffer.from(value, 'hex'))
 
 describe('RFC 9180 base-mode adapter', () => {
+  it('imports pooled Buffer keys and opens only the supplied Buffer payload/AAD ranges', async () => {
+    const recipient = await generateX25519KeyPair()
+    const privateKey = await importX25519PrivateKey(Buffer.from(await exportX25519PrivateKey(recipient.privateKey)))
+    const publicKey = Buffer.from(recipient.publicKeyBytes)
+    const backing = Buffer.allocUnsafe(96).fill(0xa5)
+    const plaintext = backing.subarray(20, 31)
+    plaintext.set(utf8('private row'))
+    const expected = Uint8Array.from(plaintext)
+    const info = Buffer.from('buffer info')
+    const aad = Buffer.from('buffer aad')
+    const sealed = await hpkeSealBase(publicKey, plaintext, info, aad)
+    expect(sealed.ciphertext.byteLength).toBe(expected.byteLength + 16)
+    const opened = await hpkeOpenBase(privateKey, publicKey, Buffer.from(sealed.encapsulatedKey), Buffer.from(sealed.ciphertext), info, aad)
+    expect(opened.byteLength).toBe(expected.byteLength)
+    expect(opened).toEqual(expected)
+    expect(Uint8Array.from(plaintext)).toEqual(expected)
+  })
+
   it('opens the published CFRG X25519/HKDF-SHA256/AES-256-GCM vector', async () => {
     // CFRG source vector: https://github.com/cfrg/draft-irtf-cfrg-hpke/blob/master/test-vectors.json
     const privateKey = await importX25519PrivateKey(hex(
@@ -66,6 +85,39 @@ describe('signed encryption epochs', () => {
     expect(await verifyEpochManifest(signedManifest, signer.publicKeyBytes)).toBe(true)
     await expect(unwrapEpochKey({ signedManifest, trustedSigner: signer.publicKeyBytes,
       recipientId: bytes(20), recipientPrivateKey: removed.privateKey })).rejects.toMatchObject({ code: 'INVALID_KEY' })
+  })
+
+  it('encrypts and decrypts exactly the supplied pooled Buffer views', async () => {
+    const key = Buffer.from(bytes(9))
+    const backing = Buffer.allocUnsafe(96).fill(0xa5)
+    const plaintext = backing.subarray(20, 31)
+    plaintext.set(utf8('private row'))
+    const expected = Uint8Array.from(plaintext)
+    const aad = Buffer.from('visible header')
+    const encrypted = await encryptEpochPayload(key, 12n, plaintext, aad)
+    expect(encrypted.ciphertext.byteLength).toBe(expected.byteLength + 16)
+    const opened = await decryptEpochPayload(key, {
+      ...encrypted, nonce: Buffer.from(encrypted.nonce), ciphertext: Buffer.from(encrypted.ciphertext),
+    }, aad)
+    expect(opened.byteLength).toBe(expected.byteLength)
+    expect(opened).toEqual(expected)
+    expect(Uint8Array.from(plaintext)).toEqual(expected)
+  })
+
+  it('owns its supplied Buffer content key rather than aliasing caller storage', async () => {
+    const signer = await generateEd25519KeyPair()
+    const recipient = await generateX25519KeyPair()
+    const contentKey = Buffer.from(bytes(9))
+    const expected = Uint8Array.from(contentKey)
+    const created = await createEpochManifest({
+      groupId: bytes(1), epoch: 1n, previousEpochDigest: null, createdAtMs: 100n,
+      recipients: [{ recipientId: bytes(20), publicKey: recipient.publicKeyBytes }],
+      signerPublicKey: signer.publicKeyBytes, signerPrivateKey: signer.privateKey, contentKey,
+    })
+    contentKey.fill(0xa5)
+    expect(created.contentKey.byteLength).toBe(32)
+    expect(created.contentKey).toEqual(expected)
+    expect(await unwrapEpochKey({ signedManifest: created.signedManifest, trustedSigner: signer.publicKeyBytes, recipientId: bytes(20), recipientPrivateKey: recipient.privateKey })).toEqual(expected)
   })
 
   it('wraps one content key independently to every active reader', async () => {

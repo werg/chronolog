@@ -188,7 +188,7 @@ export interface DatabaseLike {
   setLimit(category: number, value: number): number
   interrupt(): void
   /** Pin 'now', the PRNG seed, UTC localtime, chronolog_actor() and chronolog_actor_id(); resets last_insert_rowid. */
-  setDeterministicContext(unixMs: bigint, seed: number, actor?: Uint8Array | null, actorId?: bigint | null): void
+  setDeterministicContext(unixMs: bigint, seed: number, actor?: Uint8Array | null, actorId?: bigint | null, transactionId?: Uint8Array | null): void
   clearDeterministicContext(): void
   doltCommit(message: string): string
   doltBranch(name: string, from?: string): void

@@ -15,6 +15,7 @@ import {
   required,
 } from './schema.js'
 import { sqlValueFromCanonicalCbor, sqlValueToCanonicalCbor, toSqlValue, type SqlValue } from './sql.js'
+import { isSealedPlatformOp, sealedOp, sealedPlatformOpFromCanonicalCbor, sealedPlatformOpToCanonicalCbor, type SealedPlatformOp } from './sealed.js'
 
 /**
  * Platform operations: typed steps of a transaction program that change the
@@ -51,10 +52,10 @@ export interface MemberChange {
 
 export type TransferScope =
   | { readonly kind: 'row'; readonly table: string; readonly rowKey: readonly SqlValue[] }
-  /** Every row the owner holds, across all registered tables (the key-change path). */
+  /** Snapshot of every row the owner holds when offered; changes invalidate acceptance. */
   | { readonly kind: 'all' }
 
-export type PlatformOp =
+type OwnershipPlatformOp =
   | {
     readonly op: 'grant'
     readonly table: string
@@ -82,6 +83,7 @@ export type PlatformOp =
     readonly carry: boolean
   }
   | { readonly op: 'transfer_accept'; readonly offerId: Uint8Array }
+  | { readonly op: 'transfer_cancel'; readonly offerId: Uint8Array }
   | {
     readonly op: 'seed_rows'
     readonly table: string
@@ -92,18 +94,20 @@ export type PlatformOp =
   /** Closes fork seeding for good; the fork-seed plan ends with it. Genesis root only. */
   | { readonly op: 'end_seeding' }
 
+export type PlatformOp = OwnershipPlatformOp | SealedPlatformOp
 export type PlatformOpName = PlatformOp['op']
+type OwnershipPlatformOpName = OwnershipPlatformOp['op']
 
-const OP_CODES: readonly PlatformOpName[] = [
+const OP_CODES: readonly OwnershipPlatformOpName[] = [
   'grant', 'revoke_grant', 'create_collective', 'accept_membership',
-  'leave', 'set_members', 'transfer_offer', 'transfer_accept', 'seed_rows', 'end_seeding',
+  'leave', 'set_members', 'transfer_offer', 'transfer_accept', 'seed_rows', 'end_seeding', 'transfer_cancel',
 ]
 const OPERATION_BITS: Readonly<Record<GrantOperation, bigint>> = { insert: 1n, update: 2n, delete: 4n }
 const GRANT_OPERATIONS: readonly GrantOperation[] = ['insert', 'update', 'delete']
 
 export function isPlatformOp(value: unknown): value is PlatformOp {
-  return typeof value === 'object' && value !== null && 'op' in value &&
-    OP_CODES.includes((value as { readonly op: PlatformOpName }).op)
+  return isSealedPlatformOp(value) || (typeof value === 'object' && value !== null && 'op' in value &&
+    OP_CODES.includes((value as { readonly op: OwnershipPlatformOpName }).op))
 }
 
 // ── builders ────────────────────────────────────────────────────────────────
@@ -113,6 +117,7 @@ const rowKey = (values: readonly unknown[]): SqlValue[] => values.map(toSqlValue
 
 /** Typed builders for every platform operation; each validates its input. */
 export const platformOp = Object.freeze({
+  ...sealedOp,
   grant: (input: {
     readonly table: string
     readonly grantee: Uint8Array
@@ -160,6 +165,7 @@ export const platformOp = Object.freeze({
     ...(input.fromOwner === undefined ? {} : { fromOwner: bytes(input.fromOwner) }),
   }),
   acceptTransfer: (offerId: Uint8Array): PlatformOp => checked({ op: 'transfer_accept', offerId: bytes(offerId) }),
+  cancelTransfer: (offerId: Uint8Array): PlatformOp => checked({ op: 'transfer_cancel', offerId: bytes(offerId) }),
   seedRows: (table: string, columns: readonly string[], rows: readonly (readonly unknown[])[]): PlatformOp =>
     checked({ op: 'seed_rows', table, columns: [...columns], rows: rows.map(rowKey) }),
   endSeeding: (): PlatformOp => checked({ op: 'end_seeding' }),
@@ -219,6 +225,7 @@ function roleFromCode(value: CborValue, field: string): CollectiveRole {
 }
 
 export function platformOpToCanonicalCbor(op: PlatformOp): CborValue {
+  if (isSealedPlatformOp(op)) return sealedPlatformOpToCanonicalCbor(op)
   const code = OP_CODES.indexOf(op.op)
   protocolInvariant(code >= 0, 'SCHEMA_INVALID', 'Unknown platform operation')
   const entries: (readonly [number, CborValue | undefined])[] = [[0, BigInt(code)]]
@@ -292,7 +299,8 @@ export function platformOpToCanonicalCbor(op: PlatformOp): CborValue {
       break
     }
     case 'transfer_accept':
-      entries.push([1, idToCbor(op.offerId, 'transfer_accept.offer_id')])
+    case 'transfer_cancel':
+      entries.push([1, idToCbor(op.offerId, `${op.op}.offer_id`)])
       break
     case 'seed_rows': {
       uniqueBy(op.columns, (value) => value.toLowerCase(), 'seed_rows.columns')
@@ -313,7 +321,7 @@ export function platformOpToCanonicalCbor(op: PlatformOp): CborValue {
   return integerMap(entries)
 }
 
-const KNOWN_KEYS: Readonly<Record<PlatformOpName, readonly number[]>> = {
+const KNOWN_KEYS: Readonly<Record<OwnershipPlatformOpName, readonly number[]>> = {
   grant: [0, 1, 2, 3, 4, 5, 6],
   revoke_grant: [0, 1],
   create_collective: [0, 1, 2],
@@ -322,6 +330,7 @@ const KNOWN_KEYS: Readonly<Record<PlatformOpName, readonly number[]>> = {
   set_members: [0, 1, 2],
   transfer_offer: [0, 1, 2, 3, 4],
   transfer_accept: [0, 1],
+  transfer_cancel: [0, 1],
   seed_rows: [0, 1, 2, 3],
   end_seeding: [0],
 }
@@ -329,6 +338,7 @@ const KNOWN_KEYS: Readonly<Record<PlatformOpName, readonly number[]>> = {
 export function platformOpFromCanonicalCbor(value: CborValue, name = 'platform_op'): PlatformOp {
   const map = expectMap(value, name)
   const code = expectUint64(required(map, 0, `${name}.op`), `${name}.op`)
+  if (code >= 64n) return sealedPlatformOpFromCanonicalCbor(value, name)
   protocolInvariant(code < BigInt(OP_CODES.length), 'SCHEMA_INVALID', `${name} has an unknown operation`)
   const kind = OP_CODES[Number(code)]!
   assertKnownIntegerKeys(map, KNOWN_KEYS[kind], name)
@@ -426,6 +436,7 @@ export function platformOpFromCanonicalCbor(value: CborValue, name = 'platform_o
       break
     }
     case 'transfer_accept':
+    case 'transfer_cancel':
       op = { op: kind, offerId: id(1, 'offer_id') }
       break
     case 'seed_rows':

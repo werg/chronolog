@@ -34,6 +34,8 @@ describe('ownership helpers', () => {
     expect(ownerKeySql()).toBe('(SELECT key FROM chronolog_principals WHERE id = chronolog_owner)')
     const grant = ownershipSteps.share({ table: 't', with: new Uint8Array(32).fill(1), operations: ['delete', 'update'] })
     expect(grant.op === 'grant' ? grant.operations : []).toEqual(['update', 'delete'])
+    const cancel = ownershipSteps.cancelOffer(new Uint8Array(32).fill(2))
+    expect(cancel.op).toBe('transfer_cancel')
     const team = ownershipSteps.createTeam()
     expect(team.op === 'create_collective' ? team.governance : null).toEqual({ insert: 'member', update: 'member', delete: 'admin' })
   })
