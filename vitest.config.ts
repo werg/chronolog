@@ -7,6 +7,8 @@ export default defineConfig({
       reporter: ['text', 'json-summary'],
       exclude: [
         ...coverageConfigDefaults.exclude,
+        // Generated qualification bundles and vendored WASM sources are not project source.
+        'artifacts/**',
         // Process entry points: top-level argv/env wiring that runs on import, so it is
         // only exercisable as a subprocess (distribution upgrade drill, e2e, container chaos).
         'apps/*/src/main.ts',
