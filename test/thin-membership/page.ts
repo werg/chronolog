@@ -38,7 +38,7 @@ async function disconnect(): Promise<void> {
 }
 async function connect(): Promise<unknown> {
   if (session !== undefined) {
-    const state = await command({ method: 'status' }) as { connected: boolean }
+    const state = await command({ method: 'progress' }) as { connected: boolean }
     if (state.connected) return state
     await session.close(); session = undefined
   }
@@ -67,7 +67,7 @@ Object.assign(globalThis, { thinMembership: {
       const current = opening ??= connect()
       try { return await current } finally { if (opening === current) opening = undefined }
     }
-    if (value.method === 'disconnect') { await disconnect(); return command({ method: 'status' }) }
+    if (value.method === 'disconnect') { await disconnect(); return null }
     if (value.method === 'close') { await disconnect(); return command(value) }
     if (value.method === 'rtcStats') return { transport: 'webrtc', channelOwner: 'DedicatedWorker', introductions }
     return command(value)

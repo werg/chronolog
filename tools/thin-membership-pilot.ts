@@ -198,8 +198,9 @@ export default defineConfig({ plugins: [cloudflareTest({main: new URL('./entry.m
   }
 } catch (error) {
   report.status = 'failed'; report.error = error instanceof Error ? error.stack ?? error.message : String(error)
+  await save()
   if (page !== undefined) {
-    try { report.final = { browser: await callDevice(page, { method: 'status' }), native: await native?.snapshot() } } catch { /* Preserve the original failure. */ }
+    try { report.final = { browser: await callDevice(page, { method: 'progress' }), native: await native?.snapshot() } } catch { /* Preserve the original failure. */ }
     await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => undefined)
   }
   await save(); throw error

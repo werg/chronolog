@@ -15,7 +15,7 @@ import type { ThinMembershipBootstrap } from '../../tools/thin-membership-native
 type Request = {
   readonly id: number
   readonly method: 'prepare' | 'open' | 'request' | 'approval' | 'history' | 'channel' | 'disconnect' | 'sync' |
-    'publish' | 'operation' | 'events' | 'status' | 'close'
+    'publish' | 'operation' | 'events' | 'status' | 'progress' | 'close'
   readonly name?: string
   readonly bootstrap?: ThinMembershipBootstrap
   readonly requestId?: string
@@ -111,7 +111,7 @@ endpoint.addEventListener('message', event => {
         // caller's explicit sync owns retained history and SQL materialization.
         return { connected: true, rtc: active.stats() }
       }
-      case 'disconnect': await disconnect(); return status()
+      case 'disconnect': await disconnect(); return null
       case 'sync': {
         if (connectionError !== undefined) throw new Error(connectionError)
         await peer!.transport.catchUp()
@@ -126,6 +126,9 @@ endpoint.addEventListener('message', event => {
       case 'operation': return client!.operations.get(request.operationId!)
       case 'events': return client!.events.read({ topics: ['qualification'] })
       case 'status': return status()
+      // Diagnostics observe current state without entering the SQL replay mutex.
+      case 'progress': return { opened: peer !== undefined, connected: connection !== undefined, connectionError,
+        rtc: connection?.stats() ?? null, node: await peer?.node.status() }
       case 'close': await client?.close(); await peer?.close(); client = undefined; peer = undefined; return null
     }
   }
