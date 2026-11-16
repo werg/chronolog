@@ -1,13 +1,27 @@
-import type { RuntimeApi, RuntimeConfiguration, RuntimeSocket } from '@tendriller/core/contract'
+import type { RuntimeApi, RuntimeConfiguration } from '@tendriller/core/contract'
 import type { ApplicationBackend } from '@tendriller/core/application'
 import type { EventBatch } from '@chronolog/protocol'
 import type { ApplicationOperation } from '@tendriller/core/application'
+import type { RtcDataChannel, WebRtcSession } from '@chronolog/transport-webrtc'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from '../browser/event-contract.js'
 
+export type PilotPeerBootstrap = Omit<BrowserEventBootstrap, 'peerUrl' | 'peerToken' | 'connection'>
 export interface PilotBootstrap {
-  readonly peer: BrowserEventBootstrap
+  readonly peer: PilotPeerBootstrap
   readonly teamId: string
   readonly applicationId: string
+  readonly hostBase: string
+}
+export interface PeerIntroductionModule {
+  readonly introducePeerWorker: (options: { readonly peers: RuntimeApi['peers']; readonly channel: string; readonly peerId: string;
+    readonly configuration: RTCConfiguration; readonly handoff: (channel: RtcDataChannel) => void }) => Promise<WebRtcSession>
+}
+export interface PilotRouteStats {
+  readonly route: 'webrtc'
+  readonly authenticatedMs: number
+  readonly sentBytes: number
+  readonly receivedBytes: number
+  readonly queuedBytes: number
 }
 export interface PilotRegistration { readonly device: string; readonly identity: BrowserEventIdentity }
 export interface PilotDiagnostics {
@@ -18,8 +32,8 @@ export interface PilotDiagnostics {
   releaseSubmission(): void
   disconnect(): Promise<void>
   reconnect(): Promise<void>
-  setRoute(connection: NonNullable<BrowserEventBootstrap['connection']>): Promise<void>
-  routeStats(): Promise<readonly { readonly route: string; readonly authenticatedMs: number; readonly sentBytes?: number; readonly receivedBytes?: number; readonly queuedBytes?: number }[]>
+  routeStats(): Promise<readonly PilotRouteStats[]>
+  signalingStats(): readonly WebRtcSession['signaling'][]
   routeState(): Promise<{ readonly records: number; readonly recordDigest: string; readonly capabilityDigest: string; readonly finalOrderLength: number }>
   sync(): Promise<void>
   events(): Promise<EventBatch>
@@ -29,10 +43,8 @@ export interface PilotDiagnostics {
 export interface PilotWindow {
   tendril: RuntimeApi
   applicationPilot: PilotDiagnostics
-  __TENDRIL_NO_SW__: boolean
-  __TENDRIL_TRANSPORT__: (url: string) => RuntimeSocket
 }
 export interface PublicKernel {
-  startRuntime(configuration: RuntimeConfiguration, options: { readonly application: ApplicationBackend }): RuntimeApi
+  startRuntime(configuration: RuntimeConfiguration, options?: { readonly application: ApplicationBackend }): RuntimeApi
 }
 

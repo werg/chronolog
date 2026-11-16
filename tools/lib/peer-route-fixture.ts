@@ -4,18 +4,20 @@ import { once } from 'node:events'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:https'
 import { join, resolve } from 'node:path'
+import os from 'node:os'
+import { syncBuiltinESMExports } from 'node:module'
 
-import { frameTendrillerPeer } from '@chronolog/transport-tendriller'
-import { createPeerConnection, PEER_LIMITS, type PeerConnection, type PeerSocket } from '@tendriller/core/peers'
+import { openWebRtcConnection, WEBRTC_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
+import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
+import { createPeerRendezvous, PEER_RENDEZVOUS_LIMITS, PEER_RENDEZVOUS_PROTOCOL, type PeerRendezvous, type PeerSocket } from '@tendriller/core/peers'
 import { Miniflare, Response as HostResponse } from 'miniflare'
 import { WebSocketServer, type WebSocket } from 'ws'
 
 import type { NativeBrowserFixture } from '../browser-event-fixture.js'
 
-type Route = 'direct' | 'relay'
 interface SessionMeasurement {
   readonly id: number
-  readonly route: Route
+  readonly route: 'webrtc'
   readonly startedAt: string
   readyMs: number | null
   authenticatedMs: number | null
@@ -23,14 +25,13 @@ interface SessionMeasurement {
   sampledPeakQueuedBytes: number
   sentBytes: number
   receivedBytes: number
-  readonly domains: Record<string, { sent: number; received: number }>
+  nativeSignaling: PeerRendezvous['stats'] | null
 }
 
 /**
- * Real local WSS and the packaged workerd relay. The relay's browser-facing
- * socket crosses an explicit local bridge: it supplies a synthetic authenticated
- * page session, without exposing the agent credential to the browser. It is
- * intentionally reported as a bridge, never as a deployed browser/login route.
+ * The packaged host exchanges bounded SDP through a local authenticated bridge;
+ * every application frame crosses native/browser WebRTC on loopback UDP. The
+ * synthetic page session is explicit fixture plumbing, not production login.
  */
 export async function createPeerRouteFixture(options: {
   readonly directory: string
@@ -57,7 +58,7 @@ export async function createPeerRouteFixture(options: {
     },
     exports: { Tendril: { type: 'durable-object', storage: 'sqlite' }, Admission: { type: 'durable-object', storage: 'sqlite' } },
   } }] })
-  let relayPage: { id: string; api: string; token: string; page_url: string }
+  let hostPage: { id: string; api: string; token: string; page_url: string }
   let cookie: string
   try {
     const database = await mf.getD1Database('ACCOUNTS')
@@ -78,8 +79,8 @@ export async function createPeerRouteFixture(options: {
       headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.18.0.1' },
       body: JSON.stringify({ owner: email, mode: 'dashboard', application: { kind: 'peer', id: 'route-qualification' } }) })
     if (created.status !== 201) throw new Error(`ROUTE_HOST_CREATE_FAILED: ${created.status} ${await created.text()}`)
-    relayPage = await created.json() as typeof relayPage
-    const code = await mf.dispatchFetch(`https://route.test/auth/page?tendril=${relayPage.id}&key=${new URL(relayPage.page_url).pathname.split('/')[2]}`, {
+    hostPage = await created.json() as typeof hostPage
+    const code = await mf.dispatchFetch(`https://route.test/auth/page?tendril=${hostPage.id}&key=${new URL(hostPage.page_url).pathname.split('/')[2]}`, {
       headers: { Cookie: `__Host-tendriller=${raw}` }, redirect: 'manual',
     })
     const location = code.headers.get('Location')
@@ -92,11 +93,20 @@ export async function createPeerRouteFixture(options: {
 
   const measurements: SessionMeasurement[] = [], trace: unknown[] = [], failures: string[] = []
   const traceStarted = performance.now()
-  const connections = new Map<number, { peer: PeerConnection; sendSignal(bytes: Uint8Array): Promise<void>; close(): Promise<void> }>()
+  const connections = new Map<number, { sample(): void; sendSignal(bytes: Uint8Array): Promise<void>; close(): Promise<void> }>()
   const bridges = new Set<WebSocket>()
-  let sequence = 0, closed = false, relayAvailable = true
-  const server = createServer({ key, cert }, (_request, response) => { response.writeHead(404); response.end() })
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: PEER_LIMITS.frameBytes + 3, perMessageDeflate: false })
+  let sequence = 0, closed = false, rendezvousAvailable = true, unexpectedHostRequests = 0
+  const signaling = { opened: 0, sentMessages: 0, receivedMessages: 0, sentBytes: 0, receivedBytes: 0 }
+  // Some restricted runners deny interface enumeration while permitting UDP
+  // loopback. This qualification explicitly selects 127.0.0.1, so it needs no
+  // enumerated interfaces. Restore the process function when the fixture ends.
+  const originalInterfaces = os.networkInterfaces
+  let restrictedInterfaceEnumeration = false
+  try { originalInterfaces() } catch { restrictedInterfaceEnumeration = true; os.networkInterfaces = () => ({}); syncBuiltinESMExports() }
+  const server = createServer({ key, cert }, (_request, response) => {
+    unexpectedHostRequests++; response.writeHead(503); response.end('Host application services are unavailable')
+  })
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: PEER_RENDEZVOUS_LIMITS.messageBytes, perMessageDeflate: false })
   const signals = await options.native.agent.context.createSignals({
     grantId: [...options.native.governed.activeSnapshot.capabilities.values()].find(value =>
       value.grant.role === 'writer' && Buffer.from(value.grant.signingPublicKey).equals(options.native.identity.signing.publicKeyBytes))!.id,
@@ -106,90 +116,110 @@ export async function createPeerRouteFixture(options: {
     if (trace.length >= 100_000) throw new Error('ROUTE_TRACE_LIMIT')
     trace.push({ elapsedMs: Math.round(performance.now() - traceStarted), ...event })
   }
-  const connect = (socket: PeerSocket, route: Route) => {
-    const id = ++sequence, started = performance.now()
-    const measurement: SessionMeasurement = { id, route, startedAt: new Date().toISOString(), readyMs: null, authenticatedMs: null,
-      closed: false, sampledPeakQueuedBytes: 0, sentBytes: 0, receivedBytes: 0, domains: {} }
+  const connect = async (rendezvous: PeerRendezvous): Promise<void> => {
+    const id = ++sequence, started = performance.now(), abort = new AbortController()
+    const measurement: SessionMeasurement = { id, route: 'webrtc', startedAt: new Date().toISOString(), readyMs: null, authenticatedMs: null,
+      closed: false, sampledPeakQueuedBytes: 0, sentBytes: 0, receivedBytes: 0, nativeSignaling: null }
     measurements.push(measurement)
-    const count = (data: unknown, direction: 'sent' | 'received') => {
-      const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data instanceof ArrayBuffer ? new Uint8Array(data) : data as Uint8Array
-      const domain = typeof data === 'string' ? 'relay-control' : bytes[0] === 0x54 && bytes[1] === 1 ? ['records', 'signals', 'control'][bytes[2]!] ?? 'invalid' : 'invalid'
-      const counters = measurement.domains[domain] ??= { sent: 0, received: 0 }
-      counters[direction] += bytes.byteLength
-      appendTrace({ session: id, route, direction, domain, bytes: bytes.byteLength })
-    }
-    socket.addEventListener('message', (event: { data: unknown }) => count(event.data, 'received'))
-    const observed: PeerSocket = { get readyState() { return socket.readyState }, get bufferedAmount() { return socket.bufferedAmount ?? 0 },
-      set binaryType(value: string) { socket.binaryType = value },
-      addEventListener: (type, listener) => socket.addEventListener(type, listener), removeEventListener: (type, listener) => socket.removeEventListener(type, listener),
-      send(data) { count(data, 'sent'); socket.send(data) }, close(code, reason) { if (socket.readyState < 2) socket.close(code, reason) } }
-    const peer = createPeerConnection(observed, { route, relayHandshake: route === 'relay' })
-    const sample = () => { const stats = peer.stats; measurement.sentBytes = stats.sentBytes; measurement.receivedBytes = stats.receivedBytes;
-      measurement.sampledPeakQueuedBytes = Math.max(measurement.sampledPeakQueuedBytes, stats.queuedBytes) }
-    const timer = setInterval(sample, 10)
+    let rtc: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
     let authenticated: Awaited<ReturnType<typeof options.native.agent.context.connectPeer>> | undefined
+    const sample = () => {
+      measurement.nativeSignaling = { ...rendezvous.stats }
+      if (rtc === undefined) return
+      const stats = rtc.stats
+      measurement.sentBytes = stats.sentBytes; measurement.receivedBytes = stats.receivedBytes
+      measurement.sampledPeakQueuedBytes = Math.max(measurement.sampledPeakQueuedBytes, stats.queuedSendBytes + stats.queuedReceiveBytes)
+    }
+    const timer = setInterval(sample, 10)
     const close = async () => {
       if (measurement.closed) return
-      measurement.closed = true; sample(); clearInterval(timer); connections.delete(id); peer.close(); await authenticated?.close()
-      appendTrace({ session: id, route, event: 'closed' })
+      measurement.closed = true; sample(); clearInterval(timer); connections.delete(id)
+      abort.abort(); rendezvous.close()
+      await authenticated?.close(); await rtc?.close()
+      appendTrace({ session: id, event: 'closed', sentBytes: measurement.sentBytes, receivedBytes: measurement.receivedBytes })
     }
-    socket.addEventListener('close', () => { void close() })
-    connections.set(id, { peer, async sendSignal(bytes) { await authenticated?.sendSignal(bytes) }, close })
-    void peer.ready.then(() => { measurement.readyMs = performance.now() - started }, () => undefined)
-    void options.native.agent.context.connectPeer({ connection: frameTendrillerPeer(peer), signals: { async receive(bytes) {
-      const verified = await signals.receive(bytes)
-      await Promise.allSettled([...connections.entries()].filter(([other]) => other !== id).map(([, other]) => other.sendSignal(bytes)))
-      return verified
-    } } }).then(value => {
-      authenticated = value; measurement.authenticatedMs = performance.now() - started
-      appendTrace({ session: id, route, event: 'authenticated', authenticatedMs: Math.round(measurement.authenticatedMs) })
-      if (measurement.closed) { void value.close(); return }
-      void value.completion.catch((error: unknown) => { if (!measurement.closed) failures.push(String(error)) }).finally(close)
-    }, (error: unknown) => { if (!measurement.closed) failures.push(String(error)); void close() })
-    return { close }
+    connections.set(id, { sample, async sendSignal(bytes) { await authenticated?.sendSignal(bytes) }, close })
+    try {
+      const { role } = await rendezvous.ready
+      rtc = await openWebRtcConnection({ role, signaling: rendezvous, signal: abort.signal, configuration: { iceServers: [] },
+        createPeerConnection(configuration) {
+          const peer = createNativePeerConnection(configuration, { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false })
+          peer.addEventListener('connectionstatechange', () => appendTrace({ session: id, event: 'rtc-state', state: peer.connectionState }))
+          peer.addEventListener('datachannel', event => {
+            const channel = (event as Event & { channel: RtcDataChannel }).channel
+            appendTrace({ session: id, event: 'rtc-channel', state: channel.readyState })
+            channel.addEventListener('close', () => { appendTrace({ session: id, event: 'rtc-closed' }); void close() })
+          })
+          return peer
+        } })
+      measurement.readyMs = performance.now() - started
+      authenticated = await options.native.agent.context.connectPeer({ connection: rtc, signals: { async receive(bytes) {
+        const verified = await signals.receive(bytes)
+        await Promise.allSettled([...connections.entries()].filter(([other]) => other !== id).map(([, other]) => other.sendSignal(bytes)))
+        return verified
+      } } })
+      measurement.authenticatedMs = performance.now() - started; sample()
+      appendTrace({ session: id, event: 'authenticated', authenticatedMs: Math.round(measurement.authenticatedMs) })
+      if (measurement.closed) { await authenticated.close(); await rtc.close(); return }
+      void authenticated.completion.catch((error: unknown) => {
+        appendTrace({ session: id, event: 'ended', error: String(error) })
+        if (!measurement.closed) failures.push(String(error))
+      }).finally(close)
+    } catch (error) { appendTrace({ session: id, event: 'opening-failed', error: String(error) }); if (!measurement.closed) failures.push(String(error)); await close() }
   }
   server.on('upgrade', (request, socket, head) => {
-    const route = new URL(request.url ?? '/', 'https://localhost').pathname.slice(1)
-    if (closed || !['direct', 'relay'].includes(route) || connections.size >= 16 || route === 'relay' && !relayAvailable) {
+    const url = new URL(request.url ?? '/', 'https://localhost')
+    if (url.pathname !== '/host/_tendril/peers/rendezvous') {
+      unexpectedHostRequests++; socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n'); return
+    }
+    if (closed || !rendezvousAvailable || connections.size >= PEER_RENDEZVOUS_LIMITS.sessions) {
       socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n'); return
     }
+    const channel = url.searchParams.get('channel'), peerId = url.searchParams.get('peerId')
+    if (channel === null || peerId === null) { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); return }
     sockets.handleUpgrade(request, socket, head, ws => {
-      if (route === 'direct') { connect(ws, 'direct'); return }
-      bridges.add(ws)
-      const channel = crypto.randomUUID()
+      bridges.add(ws); signaling.opened++
       let upstream: Awaited<ReturnType<typeof mf.dispatchFetch>>['webSocket'] | undefined
-      let nativeConnection: { close(): Promise<void> } | undefined
       let finished = false
       const stop = () => {
         if (finished) return
-        finished = true; bridges.delete(ws); ws.close(); if (upstream?.readyState === 1) upstream.close(); void nativeConnection?.close()
+        finished = true; bridges.delete(ws); ws.close(); if (upstream?.readyState === 1) upstream.close()
+        // Signaling closure must not close its established RTC connection.
       }
       ws.once('close', stop); ws.once('error', stop)
       const start = async () => {
-        const common = { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'tendriller.peer.v1' }
-        const remote = await mf.dispatchFetch(`${relayPage.page_url}_tendril/peers/socket?channel=${channel}&peerId=browser`, {
-          headers: { ...common, Cookie: cookie, Origin: new URL(relayPage.page_url).origin },
+        const common = { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': PEER_RENDEZVOUS_PROTOCOL }
+        const query = new URLSearchParams({ channel, peerId })
+        const remote = await mf.dispatchFetch(`${hostPage.page_url}_tendril/peers/rendezvous?${query}`, {
+          headers: { ...common, Cookie: cookie, Origin: new URL(hostPage.page_url).origin },
         })
-        if (remote.status !== 101 || remote.webSocket === null) throw new Error(`ROUTE_RELAY_PAGE_FAILED: ${remote.status}`)
+        if (remote.status !== 101 || remote.webSocket === null) throw new Error(`ROUTE_RENDEZVOUS_PAGE_FAILED: ${remote.status}`)
         upstream = remote.webSocket
         upstream.addEventListener('message', event => {
-          if (ws.bufferedAmount + (typeof event.data === 'string' ? Buffer.byteLength(event.data) : event.data.byteLength) > PEER_LIMITS.queueBytes) { stop(); return }
+          if (finished) return
+          if (typeof event.data !== 'string' || ws.bufferedAmount + Buffer.byteLength(event.data) > PEER_RENDEZVOUS_LIMITS.messageBytes * 2) { stop(); return }
+          signaling.receivedMessages++; signaling.receivedBytes += Buffer.byteLength(event.data)
+          appendTrace({ channel, boundary: 'host-to-browser', bytes: Buffer.byteLength(event.data), kind: (JSON.parse(event.data) as { t: unknown }).t })
           ws.send(event.data)
         })
         upstream.addEventListener('close', stop); upstream.addEventListener('error', stop)
         ws.on('message', (data, binary) => {
           if (finished || upstream === undefined || upstream === null) return
+          if (binary) { stop(); return }
           const bytes = Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data as ArrayBuffer)
-          upstream.send(binary ? bytes : bytes.toString('utf8'))
+          signaling.sentMessages++; signaling.sentBytes += bytes.byteLength
+          appendTrace({ channel, boundary: 'browser-to-host', bytes: bytes.byteLength, kind: (JSON.parse(bytes.toString('utf8')) as { t: unknown }).t })
+          upstream.send(bytes.toString('utf8'))
         })
         upstream.accept()
-        const counterpart = await mf.dispatchFetch(`${relayPage.api}/peers/socket?channel=${channel}&peerId=native`, {
-          headers: { ...common, Authorization: `Bearer ${relayPage.token}` },
+        const counterpart = await mf.dispatchFetch(`${hostPage.api}/peers/rendezvous?${new URLSearchParams({ channel, peerId: 'native' })}`, {
+          headers: { ...common, Authorization: `Bearer ${hostPage.token}` },
         })
-        if (counterpart.status !== 101 || counterpart.webSocket === null) throw new Error(`ROUTE_RELAY_AGENT_FAILED: ${counterpart.status}`)
-        nativeConnection = connect(counterpart.webSocket as unknown as PeerSocket, 'relay')
+        if (counterpart.status !== 101 || counterpart.webSocket === null) throw new Error(`ROUTE_RENDEZVOUS_AGENT_FAILED: ${counterpart.status}`)
+        const rendezvous = createPeerRendezvous(counterpart.webSocket as unknown as PeerSocket)
         counterpart.webSocket.accept()
-        if (finished) { if (counterpart.webSocket.readyState === 1) counterpart.webSocket.close(); await nativeConnection.close() }
+        if (closed) { rendezvous.close(); return }
+        void connect(rendezvous)
       }
       void start().catch((error: unknown) => { if (!finished) failures.push(String(error)); stop() })
     })
@@ -198,19 +228,26 @@ export async function createPeerRouteFixture(options: {
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('ROUTE_SERVER_ADDRESS_UNAVAILABLE')
   return {
-    endpoint(route: Route) { return { url: `wss://127.0.0.1:${address.port}/${route}`, route, relayHandshake: route === 'relay' } },
-    async disableRelay() { relayAvailable = false; for (const bridge of bridges) bridge.close();
-      await Promise.all([...connections.entries()].filter(([id]) => measurements.find(item => item.id === id)?.route === 'relay').map(([, value]) => value.close())) },
-    enableRelay() { relayAvailable = true },
-    async disconnect() { await Promise.all([...connections.values()].map(value => value.close())); for (const bridge of bridges) bridge.close() },
-    snapshot() { return { sessions: structuredClone(measurements), failures: [...failures], traceEvents: trace.length,
-      engineSha256: createHash('sha256').update(engine).digest('hex'), certificateSha256: createHash('sha256').update(cert).digest('hex'),
-      topology: { direct: ['Chromium', 'local TLS WebSocket endpoint', 'native authenticated peer'],
-        relay: ['Chromium', 'local TLS WebSocket bridge with synthetic page session', 'packaged workerd paired relay', 'native authenticated peer'] },
-      limits: { frameBytes: PEER_LIMITS.frameBytes, signalBytes: PEER_LIMITS.signalBytes, queueBytes: PEER_LIMITS.queueBytes },
-      measurement: { queueSampleIntervalMs: 10, byteBoundary: 'Tendriller encoded frames; per-domain observations additionally count relay ready/credit text, which is excluded from SDK totals',
-        queueScope: 'Observed send and receive queue samples; saturation and worst-case memory are separate tests' },
-      excludes: ['TLS/TCP/WebSocket framing bytes', 'provider billing', 'public DNS/NAT', 'real identity provider', 'home/mobile/corporate network conditions'] } },
+    hostBase: `https://127.0.0.1:${address.port}/host/`,
+    async disableRendezvous() {
+      rendezvousAvailable = false
+      for (const bridge of bridges) bridge.close()
+      server.closeAllConnections()
+      await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error)))
+    },
+    async enableRendezvous() { server.listen(address.port, '127.0.0.1'); await once(server, 'listening'); rendezvousAvailable = true },
+    snapshot() {
+      for (const connection of connections.values()) connection.sample()
+      return { sessions: structuredClone(measurements), failures: [...failures], traceEvents: trace.length, recentTrace: trace.slice(-8),
+        signaling: { ...signaling, activeSockets: bridges.size, available: rendezvousAvailable }, unexpectedHostRequests,
+        engineSha256: createHash('sha256').update(engine).digest('hex'), certificateSha256: createHash('sha256').update(cert).digest('hex'),
+        topology: { signaling: ['Chromium', 'local TLS bridge with synthetic page session', 'packaged workerd SDP rendezvous', 'native peer'],
+          application: ['Chromium Worker', 'WebRTC DataChannel over loopback UDP', 'native authenticated Chronolog peer'] },
+        limits: WEBRTC_LIMITS,
+        measurement: { queueSampleIntervalMs: 10, byteBoundary: 'Logical authenticated peer frame payload bytes before RTC packet headers; SDP JSON envelopes counted separately',
+          queueScope: 'Sampled native send and receive queues; saturation and worst-case memory are separate transport tests', restrictedInterfaceEnumeration },
+        excludes: ['RTC packet headers and credit messages', 'IP/UDP/DTLS/SCTP packet overhead', 'provider billing', 'public DNS/NAT', 'real identity provider', 'home/mobile/corporate network conditions'] }
+    },
     async saveTrace(path: string) { await writeFile(path, trace.map(value => JSON.stringify(value)).join('\n') + '\n') },
     async close() {
       if (closed) return
@@ -218,8 +255,9 @@ export async function createPeerRouteFixture(options: {
       await Promise.all([...connections.values()].map(value => value.close()))
       for (const bridge of bridges) bridge.terminate()
       signals.close(); sockets.close(); server.closeAllConnections()
-      await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error)))
+      if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error)))
       await mf.dispose()
+      if (restrictedInterfaceEnumeration) { os.networkInterfaces = originalInterfaces; syncBuiltinESMExports() }
     },
   }
 }

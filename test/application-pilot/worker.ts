@@ -1,37 +1,55 @@
+import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { EphemeralChannel, type EphemeralSignal } from '@chronolog/agent-service/signals'
 import { decodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
 import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToBase64Url, bytesToHex, decodeExecutionManifest, equalBytes, type EventPayload } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { prepareBrowserIdentity, openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
+import { frameRtcDataChannel, type RtcDataChannel } from '@chronolog/transport-webrtc'
 
-import { connectGovernedBrowserPeer } from '../browser/event-connection.js'
-import type { BrowserEventBootstrap, BrowserEventIdentity } from '../browser/event-contract.js'
+import type { BrowserEventIdentity } from '../browser/event-contract.js'
+import type { PilotPeerBootstrap, PilotRouteStats } from './contract.js'
 import { routeState } from './route-state.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined, identity: EnrollmentIdentity | undefined, signals: EphemeralChannel | undefined
-let connection: Awaited<ReturnType<typeof connectGovernedBrowserPeer>> | undefined
-let bootstrap: BrowserEventBootstrap | undefined, connected = false
-const connectionHistory: ReturnType<Awaited<ReturnType<typeof connectGovernedBrowserPeer>>['stats']>[] = []
+let connection: { close(): Promise<void>; sendSignal(bytes: Uint8Array): Promise<void>; stats(): PilotRouteStats } | undefined
+let bootstrap: PilotPeerBootstrap | undefined
+const connectionHistory: PilotRouteStats[] = []
 const subscriptions = new Map<string, { readonly abort: AbortController; readonly iterator: AsyncIterator<EphemeralSignal> }>()
 
-async function connect(): Promise<void> {
-  if (connected) return
+/** The Window transfers an untouched channel; keys and application frames stay here. */
+async function connect(channel: RtcDataChannel): Promise<void> {
   if (peer === undefined || identity === undefined || bootstrap === undefined || signals === undefined) throw new Error('PILOT_NOT_OPEN')
-  connected = true
+  await disconnect()
+  const started = performance.now(), framed = frameRtcDataChannel(channel)
+  const snapshot = peer.governed!.activeSnapshot
+  const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
+    isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, identity!.signing.publicKeyBytes))
+  if (reader === undefined) { await framed.close(); throw new Error('PILOT_READER_GRANT_REQUIRED') }
   try {
-    connection = await connectGovernedBrowserPeer({ bootstrap, identity, transport: peer.transport,
-      activeMembership: () => peer!.governed!.activeSnapshot,
-      receiveSignal: async frame => { await signals!.receive(frame) } })
-    void connection.completion.catch((error: unknown) => {
-      if (connected) endpoint.postMessage({ pilot: 'connection-error', error: String(error) })
-    })
+    const authenticated = await openAuthenticatedPeerLink({ connection: framed, local: peer.transport.asLink(), identity: identity.signing,
+      groupId: snapshot.groupId, grantId: reader.id,
+      receiveSignal: async frame => { await signals!.receive(frame) },
+      authorizePeer: ({ authorId, grantId }) => {
+        const current = peer!.governed!.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
+        return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
+          equalBytes(capability.grant.signingPublicKey, authorId) && equalBytes(authorId, base64UrlToBytes(bootstrap!.nativeIdentity))
+      } })
+    const detach = peer.transport.connect(authenticated.link), authenticatedMs = performance.now() - started
+    let closed = false
+    const current = { sendSignal: (bytes: Uint8Array) => authenticated.sendSignal(bytes),
+      stats: (): PilotRouteStats => { const stats = framed.stats; return { route: 'webrtc', authenticatedMs,
+        sentBytes: stats.sentBytes, receivedBytes: stats.receivedBytes, queuedBytes: stats.queuedSendBytes + stats.queuedReceiveBytes } },
+      async close() { if (closed) return; closed = true; detach(); await authenticated.close() } }
+    connection = current
+    void authenticated.completion.catch((error: unknown) => {
+      if (!closed) endpoint.postMessage({ pilot: 'connection-error', error: String(error) })
+    }).finally(detach)
     await peer.transport.catchUp(); await peer.node.waitForIdle()
-  } catch (error) { connected = false; throw error }
+  } catch (error) { await framed.close(); throw error }
 }
 async function disconnect(): Promise<void> {
-  connected = false
   const previous = connection
   connection = undefined
   await previous?.close()
@@ -39,9 +57,9 @@ async function disconnect(): Promise<void> {
 }
 
 endpoint.addEventListener('message', (event) => {
-  const request = event.data as { pilot?: string; id?: number; name?: string; bootstrap?: BrowserEventBootstrap;
+  const request = event.data as { pilot?: string; id?: number; name?: string; bootstrap?: PilotPeerBootstrap;
     subscriptionId?: string; topics?: readonly string[]; topic?: string; payload?: EventPayload; ttlMs?: number; createIdentity?: boolean;
-    connection?: NonNullable<BrowserEventBootstrap['connection']> }
+    channel?: RtcDataChannel }
   if (request.pilot === undefined) return
   const run = async (): Promise<unknown> => {
     switch (request.pilot) {
@@ -74,16 +92,14 @@ endpoint.addEventListener('message', (event) => {
             return capability !== undefined && capability.grant.role === 'writer' && isCapabilityActive(capability, current.revision) &&
               equalBytes(capability.grant.signingPublicKey, authorId) && allowed !== undefined && (allowed.includes('*') || allowed.includes(topic))
           } })
-        await connect()
         serveBrowserPeer(endpoint, peer)
         return { groupId: bytesToBase64Url(genesis.manifest.groupId), identity: bytesToBase64Url(peer.node.identity) }
       }
+      case 'channel': await connect(request.channel!); return null
       case 'sync': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return null
       case 'disconnect': await disconnect(); return null
-      case 'reconnect': await connect(); return null
       case 'routeStats': return [...connectionHistory, ...(connection === undefined ? [] : [connection.stats()])]
       case 'routeState': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return routeState(peer!.transport, peer!.governed!.activeSnapshot, peer!.node.finalOrderLength)
-      case 'setRoute': await disconnect(); bootstrap = { ...bootstrap!, connection: request.connection! }; await connect(); return null
       case 'signalPublish': return signals!.publish(request.topic!, request.payload!, { ttlMs: request.ttlMs ?? 2500 })
       case 'signalNext': {
         const id = request.subscriptionId!
@@ -106,4 +122,3 @@ endpoint.addEventListener('message', (event) => {
   void run().then(value => endpoint.postMessage({ pilot: 'response', id: request.id, value }),
     (error: unknown) => endpoint.postMessage({ pilot: 'response', id: request.id, error: error instanceof Error ? error.stack : String(error) }))
 })
-

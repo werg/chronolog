@@ -30,8 +30,8 @@ const { values } = parseArgs({ options: {
   output: { type: 'string' }, browser: { type: 'string' }, 'build-only': { type: 'boolean', default: false },
   'tendriller-engine': { type: 'string' },
 } })
-if (values.contrib === undefined || values['tendriller-runtime'] === undefined) {
-  throw new Error('Usage: application-pilot.ts --contrib /checkout --tendriller-runtime /packaged/runtime [--wasm /engine] [--output /new/directory] [--browser /chromium] [--build-only]')
+if (values.contrib === undefined || values['tendriller-runtime'] === undefined || !values['build-only'] && values['tendriller-engine'] === undefined) {
+  throw new Error('Usage: application-pilot.ts --contrib /checkout --tendriller-runtime /packaged/runtime --tendriller-engine /packaged/engine [--wasm /engine] [--output /new/directory] [--browser /chromium] [--build-only]')
 }
 const contrib = resolve(values.contrib), runtime = resolve(values['tendriller-runtime'])
 const wasm = resolve(values.wasm ?? process.env.CHRONOLOG_WASM_DIRECTORY ?? join(workspace, 'artifacts/wasm'))
@@ -40,10 +40,10 @@ await mkdir(resolve(output, '..'), { recursive: true })
 await mkdir(output) // Never mix an earlier run's assets or evidence into this run.
 const deployment = join(output, 'deployment'), pages = join(output, 'pages')
 await mkdir(deployment)
-const report = { format: 'chronolog-application-pilot/v1', status: 'building', passed: false,
+const report = { format: 'chronolog-application-pilot/v2', status: 'building', passed: false,
   startedAt: new Date().toISOString(), command: process.argv.slice(1), checks: [] as string[],
   revisions: { chronolog: gitState(workspace), contrib: gitState(contrib), tendrillerRuntime: gitState(runtime) },
-  publicArtifacts: {} as Record<string, unknown>, counts: { effectDispatches: 0, hostApplicationWrites: 0 },
+  publicArtifacts: {} as Record<string, unknown>, counts: { effectDispatches: 0, hostApplicationRequests: 0, hostApplicationWrites: 0 },
   browser: '', pageErrors: [] as string[], timingsMs: {} as Record<string, number>, diagnostics: {} as Record<string, unknown>, error: '' }
 const record = async () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
 const passed = (check: string) => { report.checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
@@ -60,10 +60,12 @@ try {
   alias['@chronolog/node-core/finality'] = join(workspace, 'packages/node-core/src/finality.ts')
   alias['@chronolog/node-core/ledger'] = join(workspace, 'packages/node-core/src/ledger-record.ts')
   alias['@chronolog/node-core/membership'] = join(workspace, 'packages/node-core/src/membership.ts')
+  alias['@chronolog/transport-webrtc'] = join(workspace, 'packages/transport-webrtc/src/index.ts')
+  const introductionRecipe = join(contrib, 'cookbooks/run-a-peer-application/snippets/introduce-peer-worker.mjs')
   const publicBundle = await build({ absWorkingDir: workspace, entryPoints: ['test/application-pilot/public.ts'],
     outfile: join(output, 'public-application.mjs'), bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })
   const deploymentBundle = await build({ absWorkingDir: workspace,
-    entryPoints: { bootstrap: 'test/application-pilot/bootstrap.ts', worker: 'test/application-pilot/worker.ts' }, outdir: deployment,
+    entryPoints: { bootstrap: 'test/application-pilot/bootstrap.ts', worker: 'test/application-pilot/worker.ts', 'introduce-peer-worker': introductionRecipe }, outdir: deployment,
     outExtension: { '.js': '.mjs' }, bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })
   // These are the packaged runtime's public assets, never sibling runtime source.
   await cp(join(runtime, 'assets'), join(deployment, 'tendriller'), { recursive: true, dereference: false })
@@ -75,6 +77,7 @@ try {
     '--public-module', join(output, 'public-application.mjs'), '--deployment', deployment, '--output', pages], { encoding: 'utf8' }))
   const packageMetadata: unknown = JSON.parse(await readFile(join(runtime, 'package.json'), 'utf8'))
   report.publicArtifacts = { runtimePackage: packageMetadata, kernelSha256: await sha256(join(runtime, 'assets/kernel.mjs')),
+    peerIntroductionRecipeSha256: await sha256(introductionRecipe), peerIntroductionBundleSha256: await sha256(join(deployment, 'introduce-peer-worker.mjs')),
     wasmManifestSha256: await sha256(join(wasm, 'manifest.json')), wasmSha256: await sha256(join(wasm, 'sqlite3.wasm')),
     publicModuleSha256: await sha256(join(output, 'public-application.mjs')), scopeModuleSha256: await sha256(join(pages, 'scoped-state.mjs')), specimenManifestSha256: await sha256(join(pages, 'specimen-manifest.json')) }
   await writeFile(join(output, 'bundles.json'), JSON.stringify({ public: publicBundle.metafile, deployment: deploymentBundle.metafile }, null, 2) + '\n')
@@ -117,8 +120,9 @@ try {
       await accepted(team.handle)
       await accepted(await native.client.submit(program(sqlStatement(`INSERT INTO tasks (id, title, claimed_by, status, chronolog_owner) VALUES (?, ?, NULL, 'open', ${OWNER_FOR_KEY_SQL})`,
         ['task-1', 'Review the shared inspection evidence', team.id])), { operationId: 'pilot-task' }))
-      if (values['tendriller-engine'] !== undefined) routes = await createPeerRouteFixture({ native, directory: join(nativeDirectory, 'routes'), engine: resolve(values['tendriller-engine']) })
-      return { peer: native.bootstrap, teamId: bytesToBase64Url(team.id), applicationId: `inspection-${bytesToBase64Url(native.node.groupId)}` }
+      routes = await createPeerRouteFixture({ native, directory: join(nativeDirectory, 'routes'), engine: resolve(values['tendriller-engine']!) })
+      const { peerUrl: _httpFixtureUrl, peerToken: _httpFixtureToken, connection: _legacyConnection, ...peer } = native.bootstrap
+      return { peer, hostBase: routes.hostBase, teamId: bytesToBase64Url(team.id), applicationId: `inspection-${bytesToBase64Url(native.node.groupId)}` }
     }
     const files = await staticFiles(pages)
     const server = createServer((request, response) => {
@@ -139,11 +143,10 @@ try {
           registrations.set(registration.device, registration)
           if (registrations.size === 2 && !starting) { starting = true; void startNative().then(resolveBootstrap, rejectBootstrap) }
           const bootstrap = await bootstrapped
-          const selected = routes === undefined ? bootstrap : { ...bootstrap, peer: { ...bootstrap.peer,
-            connection: routes.endpoint(registration.device === 'board' ? 'direct' : 'relay') } }
-          response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(selected)); return
+          response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(bootstrap)); return
         }
         if (path.startsWith('/host/')) {
+          report.counts.hostApplicationRequests++
           if (request.method !== 'GET' && request.method !== 'HEAD') report.counts.hostApplicationWrites++
           response.writeHead(503); response.end('Host application persistence is offline'); return
         }
@@ -170,6 +173,8 @@ try {
     observedPages.push(...all)
     for (const page of all) {
       page.setDefaultTimeout(40_000)
+      page.on('request', request => { if (new URL(request.url()).pathname.startsWith('/host/') && !request.url().includes('/peers/rendezvous?')) report.counts.hostApplicationRequests++ })
+      page.on('websocket', socket => { if (new URL(socket.url()).pathname.startsWith('/host/') && !socket.url().includes('/peers/rendezvous?')) report.counts.hostApplicationRequests++ })
       page.on('pageerror', error => { report.pageErrors.push(error.message); process.stderr.write(`pilot browser: ${error.message}\n`) })
     }
     deadline = setTimeout(() => { void browser?.close() }, 240_000)
@@ -178,11 +183,12 @@ try {
     await Promise.all([board.goto(`${base}/board.html?device=board`), compact.goto(`${base}/compact.html?device=compact`)])
     await Promise.all(all.map(ready))
     report.timingsMs.coldBootstrap = performance.now() - coldStart
-    assert(native !== undefined)
+    assert(native !== undefined && routes !== undefined)
     const identities = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.identity)))
     assert.notEqual(identities[0], identities[1])
     await Promise.all(all.map(page => expect(page.locator('#tasks [data-task="task-1"] h3')).toHaveText('Review the shared inspection evidence')))
     assert.equal(report.counts.hostApplicationWrites, 0)
+    assert.equal(report.counts.hostApplicationRequests + routes.snapshot().unexpectedHostRequests, 0)
     passed('independent browser identities and OPFS replicas render one shared team-owned task through the actual selected Tendriller backend')
 
     const beforeTyping = (await native.client.events.read()).transactions
@@ -330,30 +336,40 @@ try {
     assertResultOrigins(events)
     await Promise.all([board.screenshot({ path: join(output, 'board.png'), fullPage: true }), compact.screenshot({ path: join(output, 'compact.png'), fullPage: true })])
     passed('both layouts rebuild from retained final events without redispatching the worker or writing host application state')
-    if (routes !== undefined) {
+    {
       const beforeRoutes = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.events())))
-      assert.deepEqual(sharedHistory(beforeRoutes[0]!), sharedHistory(beforeRoutes[1]!), 'direct and actual workerd-relayed replicas must expose the identical final history')
+      assert.deepEqual(sharedHistory(beforeRoutes[0]!), sharedHistory(beforeRoutes[1]!), 'both RTC replicas must expose the identical final history')
       const authoredIds = [[claimIds[0]!, delayed.operationId, interrupted.operationId], [claimIds[1]!]]
       const capturedOutcomes = await Promise.all(all.map((page, index) => page.evaluate(async ids => Promise.all(ids.map(id =>
         (globalThis as unknown as PilotWindow).applicationPilot.operation(id))), authoredIds[index]!)))
       assert(capturedOutcomes.every(outcomes => outcomes.every(outcome => outcome !== null)))
-      passed('independent replicas receive identical task/chat final events over direct WSS and the packaged workerd relay')
+      await waitFor(async () => routes!.snapshot().signaling.activeSockets === 0, 'every bounded introduction socket closes after SDP exchange')
+      assert(routes.snapshot().sessions.every(session => session.nativeSignaling?.closed === true))
+      passed('independent replicas receive identical task/chat final events over WebRTC after every host introduction socket has closed')
 
-      await Promise.all(all.map(page => page.evaluate(connection => (globalThis as unknown as PilotWindow).applicationPilot.setRoute(connection), routes!.endpoint('direct'))))
-      await routes.disableRelay()
-      await board.locator('#message').fill('Warm direct session with relay unavailable')
+      await routes.disableRendezvous()
+      const signalingBefore = { host: routes.snapshot().signaling,
+        browsers: await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.signalingStats()))) }
+      const bytesBefore = routes.snapshot().sessions.reduce((total, session) => total + session.sentBytes + session.receivedBytes, 0)
+      await board.locator('#message').fill('Warm WebRTC session with the host unavailable')
       await board.locator('#send').click()
-      await expect(compact.locator('#conversation')).toContainText('Warm direct session with relay unavailable', { timeout: 40_000 })
-      const directHistory = await native.client.events.read()
-      const warmProposal = directHistory.transactions.find(transaction => transaction.events.some(event =>
-        JSON.stringify(event.payload).includes('Warm direct session with relay unavailable')))?.proposalId
+      await expect(compact.locator('#conversation')).toContainText('Warm WebRTC session with the host unavailable', { timeout: 40_000 })
+      const warmHistory = await native.client.events.read()
+      const warmProposal = warmHistory.transactions.find(transaction => transaction.events.some(event =>
+        JSON.stringify(event.payload).includes('Warm WebRTC session with the host unavailable')))?.proposalId
       assert(warmProposal !== undefined)
       await Promise.all(all.map(page => browserHasProposal(page, warmProposal)))
+      const signalingAfter = { host: routes.snapshot().signaling,
+        browsers: await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.signalingStats()))) }
+      const bytesAfter = routes.snapshot().sessions.reduce((total, session) => total + session.sentBytes + session.receivedBytes, 0)
+      assert.deepEqual(signalingAfter, signalingBefore, 'application progress must not send any additional signaling')
+      assert(bytesAfter > bytesBefore, 'application progress must cross the established RTC channels')
+      assert.equal(report.counts.hostApplicationRequests + routes.snapshot().unexpectedHostRequests, 0)
       assert.equal(report.counts.hostApplicationWrites, 0)
-      passed('warm authenticated direct WSS sessions continue final task/chat work while the relay and host application persistence are unavailable')
+      passed('warm authenticated WebRTC sessions finalize new chat while the host listener is stopped, with increasing RTC bytes and exactly zero host requests or signaling growth')
 
       await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.disconnect())))
-      routes.enableRelay()
+      await routes.enableRendezvous()
       const catchUp = await native.client.events.publish('conversation', { type: 'message.posted', version: 1, messageId: 'route-catchup-message', text: 'History added during a route interruption' }, { operationId: 'route-catchup-message' })
       await accepted(catchUp)
       // Keep four large proposals while respecting the public 16 KiB event
@@ -365,7 +381,7 @@ try {
           { sample: i, chunk, body: 'x'.repeat(eventBodySize) })),
       ), { operationId: `route-catchup-body-${i}` }))
       const resumeStarted = performance.now()
-      await Promise.all(all.map((page, index) => page.evaluate(connection => (globalThis as unknown as PilotWindow).applicationPilot.setRoute(connection), routes!.endpoint(index === 0 ? 'relay' : 'direct'))))
+      await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.reconnect())))
       const finalNative = await native.client.events.read()
       assert.equal(finalNative.hasMore, false, 'route benchmark must compare the complete final event history')
       const lastProposal = finalNative.transactions.at(-1)!.proposalId
@@ -377,27 +393,33 @@ try {
       assert.deepEqual(sharedHistory(finalViews[0]!), sharedHistory(finalNative))
       const finalOperations = await Promise.all(all.map((page, index) => page.evaluate(async ids => Promise.all(ids.map(id =>
         (globalThis as unknown as PilotWindow).applicationPilot.operation(id))), authoredIds[index]!)))
-      assert.deepEqual(finalOperations, capturedOutcomes, 'changing the selected byte route cannot change original operation outcomes')
+      assert.deepEqual(finalOperations, capturedOutcomes, 'a fresh RTC connection cannot change original operation outcomes')
       const replicaStates = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeState())))
       const nativeState = await routeState(native.transport, native.governed.activeSnapshot, native.node.finalOrderLength)
       assert.deepEqual(replicaStates[0], nativeState)
       assert.deepEqual(replicaStates[1], nativeState)
       const routeStats = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeStats())))
+      const browserSignaling = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.signalingStats())))
+      assert(browserSignaling.flat().every(session => session.sentMessages === 1 && session.receivedMessages === 1))
       const memory = await Promise.all(all.map(async page => {
         const session = await page.context().newCDPSession(page)
         try { await session.send('Performance.enable'); return await session.send('Performance.getMetrics') }
         finally { await session.detach() }
       }))
-      report.diagnostics.routes = { ...routes.snapshot(), browserSessions: routeStats, pagePerformanceMetrics: memory, replicaStates, nativeState,
+      report.diagnostics.routes = { ...routes.snapshot(), browserSessions: routeStats, browserSignaling, pagePerformanceMetrics: memory, replicaStates, nativeState,
+        originalOperations: { before: capturedOutcomes, after: finalOperations },
+        hostOutage: { signalingBefore, signalingAfter, rtcBytesBefore: bytesBefore, rtcBytesAfter: bytesAfter,
+          hostApplicationRequests: report.counts.hostApplicationRequests + routes.snapshot().unexpectedHostRequests },
         catchUp: { applicationStringBytes: bodySize * bodyCount, eventsPerProposal, eventBodyBytes: eventBodySize, elapsedMs: report.timingsMs.routeReconnectCatchUp,
           applicationBytesPerSecond: bodySize * bodyCount * 1000 / report.timingsMs.routeReconnectCatchUp },
         nativeHarnessPeakRssBytes: process.resourceUsage().maxRSS * 1024, finalEventDigest: createHash('sha256').update(JSON.stringify(sharedHistory(finalNative))).digest('hex'),
         notes: ['Page JS heap snapshots exclude Worker/WASM memory; native peak RSS includes this qualification harness and excludes workerd/browser child processes.',
-          'Routes use loopback TLS and synthetic host accounts; production browser authentication and Internet route selection remain unqualified.'] }
+          'RTC uses loopback UDP; signaling uses loopback TLS and synthetic host accounts. Production identity-provider login, public Internet NAT and optional TURN remain outside this gate.'] }
       await routes.saveTrace(join(output, 'route-trace.ndjson'))
       assert.deepEqual(routes.snapshot().failures, [])
+      assert.equal(report.counts.hostApplicationRequests + routes.snapshot().unexpectedHostRequests, 0)
       assert(routes.snapshot().sessions.every(session => session.sampledPeakQueuedBytes <= 2 * 4 * 1024 * 1024))
-      passed('route interruption and an explicit direct/relay switch recover the same signed history and exact outcomes with measured session bytes and sampled queue sizes')
+      passed('fresh RTC introduction recovers the same signed history and exact outcomes after interruption, including four 192 KiB programs of sixteen 12 KiB events, with measured bytes and bounded queues')
     }
     await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.close())))
     report.status = 'passed'; report.passed = true

@@ -4,10 +4,10 @@ import type { RpcTransport, RpcCallOptions, UnaryRpcMethod, UnaryRequest, UnaryR
 import { WorkerRpcTransport } from '@chronolog/runtime-browser'
 import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
 import type { EphemeralSignal } from '@chronolog/agent-service/signals'
-import type { RuntimeSocket } from '@tendriller/core/contract'
+import type { WebRtcSession } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
-import type { PilotBootstrap, PilotWindow, PublicKernel } from './contract.js'
+import type { PeerIntroductionModule, PilotBootstrap, PilotWindow, PublicKernel } from './contract.js'
 
 const target = globalThis as unknown as PilotWindow
 const device = new URL(globalThis.location.href).searchParams.get('device')
@@ -29,13 +29,14 @@ worker.addEventListener('message', (event: MessageEvent) => {
   if (response.error === undefined) waiter.resolve(response.value)
   else waiter.reject(new Error(response.error))
 })
-const command = (pilot: string, fields: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> => {
+const command = (pilot: string, fields: Record<string, unknown> = {}, timeoutMs = 30_000, transfer: Transferable[] = []): Promise<unknown> => {
   const id = ++sequence
   return new Promise((resolve, reject) => {
     const timer = timeoutMs === 0 ? undefined : setTimeout(() => { pending.delete(id); reject(new Error(`PILOT_WORKER_TIMEOUT: ${pilot}`)) }, timeoutMs)
     const clear = () => { if (timer !== undefined) clearTimeout(timer) }
     pending.set(id, { resolve(value) { clear(); resolve(value) }, reject(error) { clear(); reject(error) } })
-    worker.postMessage({ pilot, id, ...fields })
+    try { worker.postMessage({ pilot, id, ...fields }, transfer) }
+    catch (error) { clear(); pending.delete(id); reject(error) }
   })
 }
 const registration = await fetch(`/pilot/registered?device=${device}`)
@@ -46,6 +47,37 @@ const response = await fetch('/pilot/register', { method: 'POST', headers: { 'Co
 if (!response.ok) throw new Error(`PILOT_BOOTSTRAP_FAILED: ${response.status}`)
 const bootstrap = await response.json() as PilotBootstrap
 const opened = await command('open', { name, bootstrap: bootstrap.peer }) as { groupId: string; identity: string }
+
+// The public peer runtime owns explicit host introduction only. Its application
+// binding can wait for the Worker without starting a diagnostic/socket lifecycle.
+const kernel = await import(new URL('./tendriller/kernel.mjs', import.meta.url).href) as PublicKernel
+target.tendril = kernel.startRuntime({ id: 'peer-application-pilot', base: bootstrap.hostBase, version: 0, documentPath: null,
+  ws: new URL('_tendril/socket', bootstrap.hostBase).href.replace(/^http/u, 'ws'),
+  application: { kind: 'peer', id: bootstrap.applicationId }, features: { push: false, vapid: null, shared_by: '', speech: null } })
+// This bundle is built from the exact supplied contrib recipe, not a pilot copy.
+const { introducePeerWorker } = await import(new URL('./introduce-peer-worker.mjs', import.meta.url).href) as PeerIntroductionModule
+let session: WebRtcSession | undefined
+const sessions: WebRtcSession[] = []
+async function connect(): Promise<void> {
+  if (session !== undefined) return
+  let attached: Promise<unknown> | undefined
+  const introduced = await introducePeerWorker({ peers: target.tendril.peers, channel: crypto.randomUUID(), peerId: device!,
+    configuration: { iceServers: [] }, handoff(channel) {
+      // Transfer in the creation callback before any awaited work. The Worker
+      // alone frames and authenticates the channel, then opens feed replication.
+      attached = command('channel', { channel }, 30_000, [channel as RTCDataChannel])
+      void attached.catch(() => undefined)
+    } })
+  sessions.push(introduced)
+  try { await attached; session = introduced }
+  catch (error) { await introduced.close(); throw error }
+}
+async function disconnect(): Promise<void> {
+  const previous = session
+  session = undefined
+  try { await command('disconnect') } finally { await previous?.close() }
+}
+await connect()
 const rpc = new WorkerRpcTransport(worker)
 let hold: { promise: Promise<void>; release(): void; receipt: { operationId: string; proposalId: string } | null } | null = null
 const transport: RpcTransport = {
@@ -69,16 +101,7 @@ try {
   if (outcome.outcome.type !== 'accepted') throw new Error(`PILOT_MEMBERSHIP_REJECTED: ${JSON.stringify(outcome.outcome)}`)
 } finally { membership.handle.dispose() }
 const backend = createChronologApplicationBackend({ id: bootstrap.applicationId, replica: client, sql: true })
-
-// Use the actual packaged runtime. Only its host socket is deliberately offline;
-// no application data, identity, signature, authority or replay is simulated.
-target.__TENDRIL_NO_SW__ = true
-target.__TENDRIL_TRANSPORT__ = (): RuntimeSocket => ({ readyState: 3, onopen: null, onmessage: null, onerror: null, onclose: null,
-  send() { throw new Error('PILOT_HOST_APPLICATION_PATH_DISABLED') }, close() { this.onclose?.() } })
-const kernel = await import(new URL('./tendriller/kernel.mjs', import.meta.url).href) as PublicKernel
-target.tendril = kernel.startRuntime({ id: 'peer-application-pilot', base: '/host/', version: 0, documentPath: null,
-  ws: new URL('/host/socket', location.href).href.replace(/^http/u, 'ws'), preview: true,
-  application: { kind: 'peer', id: bootstrap.applicationId }, features: { push: false, vapid: null, shared_by: '', speech: null } }, { application: backend })
+target.tendril.application.install(backend)
 
 export const signals = {
   publish: (topic: string, payload: EventPayload, options: { ttlMs?: number } = {}) => command('signalPublish', { topic, payload, ...options }),
@@ -107,17 +130,17 @@ target.applicationPilot = {
   },
   heldSubmission: () => hold?.receipt ?? null,
   releaseSubmission() { const previous = hold; hold = null; previous?.release() },
-  async disconnect() { await command('disconnect') }, async reconnect() { await command('reconnect') }, async sync() { await command('sync') },
-  async setRoute(connection) { await command('setRoute', { connection }) },
+  disconnect, reconnect: connect, async sync() { await command('sync') },
   routeStats: () => command('routeStats') as ReturnType<PilotWindow['applicationPilot']['routeStats']>,
+  signalingStats: () => sessions.map(value => ({ ...value.signaling })),
   routeState: () => command('routeState') as ReturnType<PilotWindow['applicationPilot']['routeState']>,
   events: () => client.events.read(), operation: async operationId => backend.operations.get(operationId),
   async close() {
     if (closed) return
     closed = true
     target.applicationPilot.releaseSubmission()
-    try { await client.close() } finally { worker.terminate() }
+    try { await client.close() } finally { await session?.close(); worker.terminate() }
     await navigator.locks.request(`chronolog:${name}`, { mode: 'exclusive' }, () => undefined)
   },
 }
-addEventListener('pagehide', () => { worker.terminate() })
+addEventListener('pagehide', () => { worker.terminate(); void session?.close() })
