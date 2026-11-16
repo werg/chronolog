@@ -12,55 +12,55 @@ backward compatibility, legacy data migration, or duplicate execution paths.
 
 ## A. Portable records and peer replication
 
-- [ ] Extract exact signed records, identity checks, canonical encoding, and feed
+- [x] Extract exact signed records, identity checks, canonical encoding, and feed
       continuity from native SSB connections.
-- [ ] Inject durable storage and crypto; share neutral connection types.
-- [ ] Extract pull/range synchronization and provide an in-process link.
-- [ ] Preserve native peer admission, tentative replay, and independent finality.
-- [ ] Prove forwarding preserves original authorship and record identity.
+- [x] Inject durable storage and crypto; share neutral connection types.
+- [x] Extract pull/range synchronization and provide an in-process link.
+- [x] Preserve native peer admission, tentative replay, and independent finality.
+- [x] Prove forwarding preserves original authorship and record identity.
 
 ## B. Order, execution, and enrollment
 
-- [ ] Pin the two built-in policies and execution profile in group configuration.
-- [ ] Implement domain-bound prefix certificates, exact ordered-entry evidence,
+- [x] Pin the two built-in policies and execution profile in group configuration.
+- [x] Implement domain-bound prefix certificates, exact ordered-entry evidence,
       a durable reference log, and a head-reading authority that executes no SQL.
-- [ ] Use policy-selected order in node, control store, and materializer together;
+- [x] Use policy-selected order in node, control store, and materializer together;
       coordinated order must never be re-sorted by author timestamps.
-- [ ] Persist exact proposals and caller-operation mappings before send.
-- [ ] Deduplicate proposals across envelopes and preserve original final outcomes.
-- [ ] Publish actual local/final immutable SQL revisions; final waits require
+- [x] Persist exact proposals and caller-operation mappings before send.
+- [x] Deduplicate proposals across envelopes and preserve original final outcomes.
+- [x] Publish actual local/final immutable SQL revisions; final waits require
       complete verified evidence and durable materialization.
-- [ ] Keep missing bytes/keys/engines and infrastructure failures as blocked
+- [x] Keep missing bytes/keys/engines and infrastructure failures as blocked
       progress rather than fabricated SQL rejections.
-- [ ] Add signed resumable reader/writer requests and exact durable approvals.
-- [ ] Serialize governance signing and publication; bind writes to grant identity.
-- [ ] Enforce ordered governance activation, revocation, predecessor continuity,
+- [x] Add signed resumable reader/writer requests and exact durable approvals.
+- [x] Serialize governance signing and publication; bind writes to grant identity.
+- [x] Enforce ordered governance activation, revocation, predecessor continuity,
       and explicit full-history key approval.
-- [ ] Expose readiness through a captured final target, including authorized but
+- [x] Expose readiness through a captured final target, including authorized but
       disconnected and missing historical keys.
 
 ## C. Durable browser peer
 
-- [ ] One Worker owns OPFS record/control storage, signer, and SQL engine.
-- [ ] Enforce one active storage writer with browser ownership/locking.
-- [ ] Inject the native/WASM engine boundary and qualify deterministic SQL,
+- [x] One Worker owns OPFS record/control storage, signer, and SQL engine.
+- [x] Enforce one active storage writer with browser ownership/locking.
+- [x] Inject the native/WASM engine boundary and qualify deterministic SQL,
       assertions, read enforcement, replay, and publication recovery.
-- [ ] Verify native/browser outcome and state equivalence from the same history.
-- [ ] Verify reload, interrupted authoring/application, and competing-tab behavior.
+- [x] Verify native/browser outcome and state equivalence from the same history.
+- [x] Verify reload, interrupted authoring/application, and competing-tab behavior.
 
 A browser RPC shell or a mocked SQL engine does not establish this milestone.
 Any engine conformance gap remains visible until resolved and exercised.
 
 ## D. Optional public Tendriller integration
 
-- [ ] Adapt the public retained log to shared record synchronization.
-- [ ] Keep certificates outside the log they certify; retain and relay certificates
+- [x] Adapt the public retained log to shared record synchronization.
+- [x] Keep certificates outside the log they certify; retain and relay certificates
       and ordered mappings in the ordinary replica record store.
-- [ ] Compose an on-demand authority endpoint around the public engine handler.
-- [ ] Keep host authentication separate from Chronolog database enrollment.
-- [ ] Exercise shared SQL, a contested claim, lost replies, reconnection, third
+- [x] Compose an on-demand authority endpoint around the public engine handler.
+- [x] Keep host authentication separate from Chronolog database enrollment.
+- [x] Exercise shared SQL, a contested claim, lost replies, reconnection, third
       device enrollment, and peer delivery during authority unavailability.
-- [ ] Check that neither core depends on the other repository's private files.
+- [x] Check that neither core depends on the other repository's private files.
 
 ## Acceptance and delivery
 
@@ -79,5 +79,11 @@ WebRTC discovery, and general-purpose plugin frameworks.
 
 ## Status
 
-Planning scaffold. Implementation and verification are tracked above; unchecked
-items are not claimed as complete.
+Portable records, both integrated native history policies, live enrollment,
+actual final SQL/RPC/client interfaces, and the public Tendriller integration are
+implemented and covered by executable acceptance tests. The patched WASM engine
+passes native/WASM differential replay tests. Real Chromium Worker/OPFS
+qualification passes all six checks, including exclusive ownership, actual final
+SQL, persistent identity, and termination after durable preparation and candidate
+commit. Clean-runner CI is the remaining delivery check. See
+[portable peers](../portable-peers.md) for the verification map.

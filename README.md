@@ -1,12 +1,17 @@
 # Chronolog DB
 
 Chronolog DB is a TypeScript prototype of a decentralized, permissioned SQL
-database. Members write **ordinary SQLite transactions**. Transactions are
-signed, replicated peer to peer, admitted by validator attestations, and
-ordered by their immutable author timestamps. Every replica executes them in
-that order on a pinned DoltLite (SQLite + Dolt) engine and derives the same
-database. When a transaction arrives late, replicas rewind to a checkpoint and
-replay from where it belongs. Validators never sign database states.
+database. Each native or browser peer verifies signed records and executes
+**ordinary SQLite transactions** on the same pinned DoltLite engine. A signed
+genesis selects one of two built-in history policies: peer chronological
+admission/finality, or certified canonical log positions. SQL executes locally;
+Tendriller can provide an optional retained log and prefix authority.
+
+Peer chronological history can replay a tentative suffix when a late transaction
+arrives. Coordinated history applies a complete certified prefix in log order.
+Both expose separate local and final SQL revisions, durable submission identity,
+and live reader/writer enrollment. See [portable peers](docs/portable-peers.md)
+for the architecture and acceptance tests.
 
 - **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
   dialect or migration system. Assumptions are SQL statements, usually
@@ -23,14 +28,14 @@ replay from where it belongs. Validators never sign database states.
 - **Determinism from a pinned engine.** Every replica runs the same engine
   build; `'now'`, `random()` and `localtime` are fixed per transaction; a short
   authorizer block-list keeps statements inside the database.
-- **Replication.** Each node keeps signed, hash-chained feeds in one SQLite
-  file and pulls the feeds of all group members from its peers over Secure
-  Scuttlebutt's authenticated handshake. No record size limit beyond a
-  configurable maximum.
-- **Governance.** A signed genesis and capability revisions grant writer,
-  validator, reader and administrator roles; payloads are encrypted with
-  per-epoch keys wrapped to readers. There is no in-protocol recovery: failures
-  are handled by forking the group or out of band.
+- **Replication.** Native SQLite and browser OPFS adapters share the original
+  signed-record codec, immutable evidence, and range/stream synchronization.
+  SSB connections and the optional Tendriller adapter supply connectivity;
+  a relay never changes original authorship.
+- **Governance.** A signed genesis fixes the consensus roles and history
+  policy. Live signed enrollment grants reader/writer access with explicit
+  historical-key approval. Writes bind their exact grant, and revocations
+  activate at verified policy boundaries. Epoch keys are wrapped to readers.
 
 Read [the design](docs/design.md) for how it works,
 [Specification 10](docs/implementation-specs/10-deterministic-sql-transactions.md)
@@ -39,7 +44,7 @@ everything else.
 
 ## Quick start
 
-Requirements: Node.js 22 or newer, pnpm, Python 3 and a C/C++ toolchain for
+Requirements: Node.js 22 or newer, the pinned pnpm 10.12.4, Python 3 and a C/C++ toolchain for
 `node-gyp`. The first install downloads the pinned DoltLite 0.11.29 source,
 verifies its SHA-256 and compiles the patched binding.
 
@@ -94,7 +99,8 @@ const tx = await client.transaction([
   { sql: 'UPDATE accounts SET balance = balance - 50 WHERE id = :id', params: { id: 1 } },
   platformOp.grant({ table: 'accounts', grantee: bobKey, operations: ['update'], rowKey: [1] }),
 ])
-const outcome = await tx.settled()   // accepted, or rejected with { code, statementIndex }
+const provisional = await tx.settled()  // current accepted/rejected result
+const outcome = await tx.final()         // actual applied final result
 const rows = await client.query(`SELECT a.id, a.balance, p.key AS owner
   FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner`)
 ```
@@ -110,9 +116,10 @@ non-default daemon. RPC refuses a non-loopback bind without a token.
 ## Running a group
 
 The daemon creates a signed governance genesis on first start; the local
-identity is administrator, writer, validator and reader. To add nodes, use
-`pnpm group descriptor` / `pnpm group join` and grant the printed capabilities
-with `pnpm cli governance grant`; see the [governance guide](docs/governance.md).
+identity is administrator, writer, validator and reader. New devices adopt the
+public descriptor, then use the live `client.enrollment` request/approval/status
+flow with explicit full-history access. The fixed validator set does not change.
+See the [governance guide](docs/governance.md) and [client API](packages/client/README.md).
 Peers are configured with:
 
 ```sh
@@ -156,11 +163,14 @@ See the [chaos testing guide](docs/chaos-testing.md) and the
 | `protocol` | Signed messages, program (SQL and platform-operation) and value codecs, execution manifest, order keys |
 | `capabilities` | Genesis, grants, revocations, validation policy |
 | `crypto` | HPKE, signed epochs, content encryption |
-| `transport-ssb` | SQLite signed-feed store, replication over the SSB handshake, in-memory simulator |
+| `records` | Portable original signed records, immutable evidence, durable storage and shared range/stream synchronization |
+| `transport-ssb` | Native SQLite record/evidence storage and authenticated SSB connections |
+| `transport-tendriller` | Optional public retained-log adapter and on-demand prefix authority |
 | `control-store` | Candidates, attestations, order, heartbeats, settlement evidence |
-| `node-core` | Ingestion, admission, attestation, encryption, orchestration |
+| `node-core` | Governed peer composition, two history policies, durable operations, live enrollment, admission and finality |
 | `materializer-doltlite` | Deterministic SQL execution, owner-controlled rows (platform operations, generated triggers), Dolt checkpoints, suffix replay, local SQL |
 | `materializer` | Portable materialization contracts shared with the workerd path |
+| `runtime-browser` | Owning Worker, OPFS, Web Lock, patched DoltLite WASM and shared client RPC |
 | `runtime-workerd` | Experimental workerd execution contract ([plan](docs/workerd-reconstruction-plan.md)) |
 | `rpc` | Service contract, in-process and HTTP transports |
 | `client` / `react` | TypeScript client and React hooks |

@@ -1,16 +1,87 @@
 # Replicated Governance
 
-Chronolog's default daemon profile derives authorization and encryption state
-from signed administration records carried on the administrator's feed, which
-replicates like any other feed. Static membership files are an explicit compatibility
-override, not the normal multi-node control plane.
+Chronolog enrolls readers and writers while the group is running. Native and
+browser replicas share signed requests, durable approvals, governance records,
+encryption-key delivery and policy-specific activation through
+`createGovernedNode`. The ordinary public client exposes this workflow through
+`client.enrollment`.
+
+The group's signed genesis fixes its history policy and execution profile.
+Both built-in policies keep the root, administration feed, validator set and
+validation policy fixed. Reader/writer membership and encryption epochs can
+change live. Static membership is an explicit fixture/operator override.
+
+## Live enrollment
+
+The joining device first loads the intended signed group descriptor and opens
+its own durable signing and reader identity. A descriptor is public bootstrap
+material, not permission to read or write. The device creates a signed request
+using a stable request ID:
+
+```ts
+const { signedRequest } = await joiningDevice.enrollment.createRequest({
+  requestId: durableJoinRequestId,
+  roles: ['reader', 'writer'],
+})
+```
+
+Deliver those exact bytes to an authorized issuer through the application's
+invitation channel. Approval is an explicit decision about roles and historical
+access, with its own stable operation ID:
+
+```ts
+const { signedApproval } = await issuer.enrollment.approveRequest({
+  operationId: durableApprovalId,
+  signedRequest,
+  roles: ['reader', 'writer'],
+  grantFullHistory: true,
+})
+```
+
+Return the signed approval to the joining device. The status call persists it
+before evaluating readiness; later calls can use just the request ID:
+
+```ts
+const status = await joiningDevice.enrollment.getStatus(durableJoinRequestId, {
+  signedApproval,
+})
+const refreshed = await joiningDevice.enrollment.getStatus(durableJoinRequestId)
+```
+
+Keep those operation identities across lost replies and restarts. A resumed
+approval publishes the original grants and key envelopes before its dependent
+work; concurrent approvals cannot author competing next revisions or epochs.
+The joining device's private keys remain local.
+
+| State | What the joining replica still needs |
+| --- | --- |
+| `requested` | An issuer's signed decision. |
+| `approved` | The approved membership revision to become active under the selected history policy. |
+| `authorized-disconnected` | A usable connection for synchronization. |
+| `awaiting-keys` | Explicit historical access and the required epoch keys. |
+| `awaiting-history` | The captured final target to be verified and applied locally. |
+| `unsupported-engine` | The execution profile required by the group. |
+| `revoked` | The approval's exact grants are no longer active. |
+| `ready` | Active grants, keys, connection, matching engine and applied final target are all present. |
+
+Approval does not imply readiness. The issuer may go offline after the signed
+records and approval are retained; another authorized peer can deliver the
+history and key envelopes. A relay's host-access permission is separate from
+Chronolog membership. The first enrollment workflow grants reader/writer roles,
+not validators, governance administrators or schema-administrator rights.
+Shared rows and schema access use the existing collective and ownership
+operations described below. See the complete
+[client guide](../packages/client/README.md#enroll-a-reader-or-writer).
 
 ## Bootstrap and key storage
 
 On first start, `chronologd` writes `governance.json` with mode `0600`. It
 contains the signed genesis and the local HPKE reader key. The genesis gives the local identity administrator,
 writer, validator, and reader capabilities and binds those protocol keys to
-the daemon's feed.
+the daemon's feed for the default single-participant peer configuration. The
+genesis also authenticates the selected history policy and execution-manifest
+digest. A coordinated group instead supplies its fixed history ID and authority
+key in that configuration.
 
 On Linux, set `CHRONOLOG_SECRET_STORE=secret-service` to keep the daemon
 signing key, epoch content key, and governance recipient key in the host
@@ -77,35 +148,45 @@ do to the database's rows is decided inside the database
   owns stay owned by its key; a planned key change is a bulk transfer signed by
   the old key and accepted by the new one.
 
-## Joining a group
+## Initial local configuration
 
 Every node of a governed group must use the same signed genesis and group
-route. With all daemons stopped:
+route. Applications can distribute the public descriptor as bootstrap material.
+The existing CLI can export and adopt that configuration:
 
 ```sh
-# On an existing member (usually the administrator):
+# Export public configuration from an existing member's local data directory:
 pnpm group descriptor /secure/group.json
 # On the new node, with an empty data directory:
 CHRONOLOG_DATA_DIR=/var/lib/chronolog pnpm group join /secure/group.json
 ```
 
-The descriptor holds only public material. `join` creates the node's identity,
-SSB feed and reader key, adopts the genesis, and prints `suggestedGrants` (reader,
-writer and validator grant JSON). The administrator submits the ones it wants
-with `chronolog governance grant`, then runs `chronolog governance rotate` so
-the new reader receives the current epoch key. Add the administrator's SSB
-address to the new node's `CHRONOLOG_SSB_PEERS` and start it. Every member
-replicates the feed of every granted member, so the administrator picks up the
-new node's records once its grant is published. A joined node does not create
-epochs of its own; only the administration-feed owner does.
+These commands take an exclusive lock on the local data directory they open,
+so that directory's daemon must be stopped while the command runs. This is
+initial local setup; approving a new device does not require stopping other
+replicas or rebuilding the group.
+
+`join` creates the joining node's identity, feed and reader key and adopts the
+genesis. Its suggested grant material is limited to ordinary reader/writer
+membership. Configure a connection, such as the administrator's SSB address in
+`CHRONOLOG_SSB_PEERS`, start the local replica, and complete
+[live enrollment](#live-enrollment) through the shared client. Every member
+replicates the administration feed and feeds named by grants. Only the
+administration-feed owner authors capability revisions and epochs.
 
 ## When the ordinary path fails
 
-There is no in-protocol recovery mechanism. The root administrator rotates its
-own key or administration feed with an ordinary signed revision, and replaces
-validators the same way. If the root key is lost or compromised, the validator
-set can no longer satisfy its policy, or history below a closed timestamp floor
-must be admitted, participants coordinate out of band and fork.
+Durable journals recover interrupted governance and approval without creating
+new identities or competing revisions. Retained records and evidence let peers
+rebuild local state and recover missing keys or history.
+
+The built-in signed configurations do not provide root or authority rotation,
+administration-feed replacement, validator reconfiguration or validation-policy
+changes. Their authoring APIs reject these operations. If a fixed key is lost
+or compromised, the validators can no longer satisfy their policy, or final
+history must change, participants agree on a new group configuration out of
+band and fork. An unavailable coordinated authority delays new finality;
+existing complete certificates remain usable through other peers.
 
 ### Forking a group
 
@@ -123,7 +204,7 @@ CHRONOLOG_DATA_DIR=/var/lib/fork pnpm group fork /secure/snapshot-r120 --signer 
 pnpm cli seed @/var/lib/fork/fork-seed.json
 # 4. Optionally stop the daemon and confirm the data matches the snapshot:
 CHRONOLOG_DATA_DIR=/var/lib/fork pnpm group verify-fork /secure/snapshot-r120
-# 5. Other participants join the fork with `pnpm group descriptor` / `join` as above.
+# 5. Other participants adopt the descriptor and complete live enrollment.
 ```
 
 `fork` verifies the archive exactly like a snapshot import (file evidence, the
@@ -180,17 +261,17 @@ A grant file contains public material only. For example:
 }
 ```
 
-Roles are `writer`, `validator`, `reader` and `administrator`. A grant ends
-only by revocation. Reader grants require an HPKE public key. Validator grants default
-their minimum author timestamp to the daemon's current time unless an explicit
-unsigned decimal value is supplied. Epoch keys are generated inside the
-daemon and never returned by RPC.
+The protocol represents `writer`, `validator`, `reader` and `administrator`
+roles. Reader grants require an HPKE public key. Live enrollment selects
+reader/writer grants; the fixed validators are established in the signed
+genesis. Epoch keys are generated inside the replica and are never returned
+as plaintext by RPC.
 
 `GovernanceControlPlane` in `@chronolog/node-core` backs that surface:
 
-- `publishCapabilityChange` atomically grants roles, revokes capability IDs,
-  installs validation policies (`minimumValidators`: how many distinct
-  validators must attest), or transfers the root/feed;
+- `publishCapabilityChange` serializes and durably publishes supported grants
+  and revocations; under a built-in signed configuration it rejects changes
+  to validators, validation policy, root and administration feed;
 - `revoke` removes every selected active capability at the next revision;
 - `rotateEpoch` publishes a fresh content key wrapped independently to every
   active reader;
@@ -199,29 +280,48 @@ daemon and never returned by RPC.
 - `ownsCapabilityFeed` tells whether this node is the administration-feed
   owner, the only node that publishes capability revisions and epochs.
 
-Every controller rebuilds the same revision snapshots and epoch chain from
-transport history and follows new records live. Capability records and epoch
-manifests must originate on the signed current administration feed.
+Every controller rebuilds signed revision snapshots and the epoch chain from
+retained records and follows new records live. Ordinary peer delivery verifies
+the configured administration feed and its complete prefix. Coordinated
+delivery verifies the ordered record and its signed governance content through
+the certified history. A replica may receive snapshots and key envelopes ahead
+of activation; its active authorization still follows the history policy.
 
 ## Removal and history policy
 
-Revocation immediately prevents new writes and validator proofs at the new
-membership revision. Rotate the epoch after removing a reader: the removed
-device may retain plaintext and old epoch keys it already possessed, but it is
-not included in the new manifest and cannot decrypt later traffic.
+Revocation takes effect at a verified activation point, not when a newer
+snapshot happens to arrive:
+
+- In peer mode, all fixed validators close the preceding revision with signed
+  evidence. A replica verifies their complete preceding feed admissions and
+  the resulting timestamp boundary before activating the next revision.
+  Validators durably seal the old revision before publishing its closure.
+- In coordinated mode, the capability record's certified canonical position
+  is the boundary. The new revision governs later positions. Backdating an
+  author timestamp cannot restore a grant at a later position.
+
+Earlier final outcomes remain unchanged. A later regrant to the same signing
+key creates a new capability; it cannot reactivate the revoked capability or
+resurrect a rejected proposal. Governance receipt, authorization activation,
+key availability and local application progress are separate conditions.
+
+Rotate the epoch after removing a reader: the removed device may retain
+plaintext and old epoch keys it already possessed, but it is not included in
+the new manifest and cannot decrypt traffic encrypted with that new key.
 
 Every active reader receives each new epoch at rotation. Earlier epochs reach
 a reader only through an explicit `grantHistoricalAccess`. Historical access
 never changes old transaction bytes.
 
-The capability snapshot records the highest timestamp floor ever granted to a
-validator. It only rises, so a new validator's floor may not be lower even
-after every earlier validator has been revoked. Admitting
-history below that floor requires a fork.
+When replaying a complete certified prefix, a late replica first receives its
+verified governance and key envelopes. This lets a historical key grant later
+in the prefix unlock earlier encrypted SQL. That receipt does not activate a
+later writer grant early. Missing keys or an unsupported execution profile
+remain explicit blocked states, not SQL rejections or false readiness.
 
 ## Static override
 
 Setting `CHRONOLOG_STATIC_MEMBERSHIP_FILE` disables the replicated governance
-profile for that process. This is useful for compatibility tests and controlled
+profile for that process. This is useful for isolated tests and controlled
 fixtures, but changes require matching file distribution and restarts. Do not
 mix static and governed nodes as though they shared one live membership model.

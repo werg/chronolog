@@ -16,7 +16,7 @@ resolves.
 
 ## Read first
 
-- **Developer:** [README](../README.md), then [design](design.md) and
+- **Developer:** [README](../README.md), [portable peers](portable-peers.md), then [design](design.md) and
   [Specification 10](implementation-specs/10-deterministic-sql-transactions.md).
 - **Operator:** [Pilot runbook](pilot-runbook.md), then
   [governance](governance.md), [snapshot recovery](snapshot-recovery.md) and
@@ -37,6 +37,7 @@ resolves.
 
 | Document | Status | Contents |
 | --- | --- | --- |
+| [portable-peers.md](portable-peers.md) | Architecture and integration | Two history policies, portable records, durable proposals, actual final SQL and live enrollment. |
 | [implementation-status.md](implementation-status.md) | Status | What works end to end and what remains. |
 | [../upcoming.md](../upcoming.md) | Status (ordered roadmap) | Project queue and acceptance checks. |
 | [security-threat-review.md](security-threat-review.md) | Status | Internal authorizer/protocol review and open findings. |
