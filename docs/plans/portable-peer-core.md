@@ -3,8 +3,8 @@
 ## Goal
 
 Make Chronolog a portable local SQL peer with one durable record substrate and
-one synchronization path. Keep existing peer chronological finality and add
-coordinated order as a second built-in history policy. The optional Tendriller
+one synchronization path. Keep deterministic author-time ordering with either
+peer validators or a signed inclusion/finality service. The optional Tendriller
 adapter consumes a generic retained record log through public artifacts.
 
 The project is unreleased. Refactor prototype interfaces directly; do not add
@@ -24,8 +24,8 @@ backward compatibility, legacy data migration, or duplicate execution paths.
 - [x] Pin the two built-in policies and execution profile in group configuration.
 - [x] Implement domain-bound prefix certificates, exact ordered-entry evidence,
       a durable reference log, and a head-reading authority that executes no SQL.
-- [x] Use policy-selected order in node, control store, and materializer together;
-      coordinated order must never be re-sorted by author timestamps.
+- [x] Use the same deterministic author-time comparator in node, control store,
+      and materializer; receipt position establishes inclusion, not SQL order.
 - [x] Persist exact proposals and caller-operation mappings before send.
 - [x] Deduplicate proposals across envelopes and preserve original final outcomes.
 - [x] Publish actual local/final immutable SQL revisions; final waits require
@@ -77,7 +77,27 @@ deployment or merge is part of this implementation request.
 
 Deferred scope: snapshots/compaction, dynamic validator sets, multi-issuer
 governance, engine upgrades, authority rotation/failover, bearer invitations,
-WebRTC discovery, and general-purpose plugin frameworks.
+automatic peer discovery, and general-purpose plugin frameworks.
+
+## E. Quiet hosting and WebRTC application exchange
+
+- [x] Keep application records, bodies, ephemeral signals and finality on the
+      authenticated peer data plane, independent of the page host.
+- [x] Introduce a provider-independent reliable WebRTC transport with bounded
+      frames, whole-frame credit, deadlines, cancellation and a native adapter.
+- [x] Transfer browser data channels immediately to the owning OPFS Worker;
+      preserve its exclusive ownership of private keys, storage and replay.
+- [x] Provide direct HTTPS resident introduction for cold browser connections
+      and optional short-lived host rendezvous for an explicitly arranged pair.
+- [x] Separate connection attachment from durable history application and
+      expose progress without starting another full replay.
+- [x] Replace hosted application-relay qualification with actual RTC gates,
+      measured signaling closure and progress after the host listener stops.
+
+Required runtime reports remain the evidence for scenario success; a compiled
+gate or protocol unit test is not a substitute. See
+[WebRTC qualification](../route-qualification.md) for the current scenarios,
+measurement boundaries and deployment limits.
 
 ## Status
 

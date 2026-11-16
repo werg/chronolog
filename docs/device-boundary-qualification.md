@@ -55,6 +55,12 @@ After that restart, a separately keyed, read-only browser device is enrolled
 under another synthetic account. The restored administrator must wrap its
 retained historical epoch keys for that device, which catches up through peers
 and reads the post-revocation data; the removed account remains denied.
+The current `chronolog-thin-membership/v2` gate introduces the fresh browser
+through the public HTTP signaling adapter, transfers its RTCDataChannel into
+the owning Worker and authenticates the native identity and active reader grant.
+Application records and bodies use that RTC session; participant administration
+uses the separately measured signed HTTP boundary. Connection attachment and
+durable application readiness are checked separately.
 
 ## Authorization regression checks
 

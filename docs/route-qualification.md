@@ -1,12 +1,12 @@
-# Browser/native route qualification
+# Browser/native WebRTC qualification
 
 This gate supports [contrib issue #14](https://github.com/werg/tendriller-contrib/issues/14).
 It runs the real task-board/chat pages, independently persisted browser replicas,
 the native SQL authority and final-intent worker, and public Tendriller packages.
-The native ordering identity and application history remain unchanged when the
-selected byte route changes.
+Chronolog owns the original signed history, authorization, execution and finality.
+The page host introduces a connection; ordinary application frames use WebRTC.
 
-## Reproduce the automated gate
+## Reproduce the application gate
 
 After building the pinned SQL/WASM engine and public Tendriller packages, run:
 
@@ -16,102 +16,145 @@ node --import tsx tools/application-pilot.ts \
   --tendriller-runtime /public-artifacts/runtime \
   --tendriller-engine /public-artifacts/engine \
   --wasm artifacts/wasm \
-  --output artifacts/application-pilot/new-route-run
+  --output artifacts/application-pilot/new-rtc-run
 ```
 
-The output directory must be new. Omitting `--tendriller-engine` retains the
-existing HTTP loopback fixture for focused page checks. The browser workflow
-supplies the engine and therefore exercises the WSS/relay qualification. It
-checks out exact public artifact sources, builds the engine and both layouts,
-and preserves reports, screenshots, bundle provenance and `route-trace.ndjson`.
-`--build-only` builds and audits assets without claiming a browser execution.
+The output directory must be new. A runtime qualification requires the packaged
+engine; there is no implicit HTTP or hosted application-data fallback. The browser
+workflow checks out exact public artifact sources, builds the engine and both
+layouts, and preserves reports, screenshots, bundle provenance and
+`route-trace.ndjson`. `--build-only` compiles and audits assets without claiming
+that browser scenarios ran. The runtime report format is
+`chronolog-application-pilot/v2`.
 
-| Route | Actual local topology | Authentication boundary |
+| Boundary | Actual local topology | Responsibility |
 | --- | --- | --- |
-| Direct | Chromium → local TLS WebSocket endpoint → native application peer | Real signed group/read-grant handshake |
-| Relay | Chromium → local TLS bridge → packaged workerd paired relay → native application peer | Real relay account/session validation with an explicitly synthetic page-session bridge, followed by the same signed application handshake |
+| Page assets | Local HTTP server → Chromium | Initial HTML, public bundles, Worker and WASM assets. |
+| Optional host introduction | Chromium → local TLS bridge → packaged workerd rendezvous → native peer | One complete SDP description per endpoint, followed by signaling closure. |
+| Application data | Chromium Worker ↔ reliable ordered WebRTC DataChannel over loopback UDP ↔ native peer | Signed records, bodies, finality evidence and ephemeral signals. |
+| Application authentication | The same Chronolog session at both RTC endpoints | Nonce/signature authentication and current reader-capability checks. |
 
-The bridge is part of the recorded topology. It passes opaque frames and supplies
-a synthetic authenticated page session to workerd; it does not expose the agent
-token to the browser. This fixture does **not** establish a deployed browser login,
-cookie/origin route, tunnel/NAT behavior or public Cloudflare service. Its
-ephemeral TLS certificate is trusted only by this local qualification browser.
-The simulator's location metadata fetch and telemetry are disabled.
+The TLS bridge supplies an explicitly synthetic authenticated page session to
+the actual packaged workerd rendezvous. It does not forward application frames
+or expose the native agent token to the browser. The fixture arranges both
+endpoints' participation; this is not an idle resident discovery mechanism.
+Its local certificate is accepted only by the qualification browser. Real
+identity-provider login, public DNS and Internet NAT behavior are outside this
+gate. Simulator telemetry and location metadata fetching are disabled.
 
-## What the scenario establishes
+## Separate direct resident introduction
 
-The board initially uses direct WSS and the compact layout initially uses the
-packaged relay. They independently catch up, author competing claims while
-disconnected, retain one final acceptance and one final rejection, deliver
-ephemeral typing, and process the final agent intent once. Delayed replies and
-abrupt page/Worker replacement preserve each device's original operation and
-draft. Host application persistence stays disabled throughout.
+Production pages can instead use a configured resident HTTPS endpoint, with no
+Tendriller involvement in connection setup. The public transport package provides
+`createHttpWebRtcSignaling` and `createWebRtcOfferHandler`; the contrib cookbook
+provides the Window-to-Worker connection recipe and an actual native HTTPS
+resident task. See [the transport guide](../packages/transport-webrtc/README.md).
 
-Both replicas must expose identical effective event transactions and durable
-scan cursors. Their local publication revision tokens need not match. Original
-operation receipts are compared on their authoring devices; another replica's
-effective history does not create a second author outbox.
-After reconnection, both signed-record content digests, active capability snapshot
-digests and final ordered positions must also match the native replica. Arrival
-timestamps are local observations and do not participate in the comparison.
+Two smaller gates exercise that path independently of the SQL application pilot:
 
-The gate then selects direct WSS for both replicas and disables relay admission.
-A warm direct session must still finalize a new chat message. This checks loss
-of the relay alongside already unavailable host application persistence; static
-assets, bootstrap and authentication services are not all shut down.
+```sh
+node --import tsx tools/test-resident-webrtc.ts \
+  --contrib /checkout/tendriller-contrib --output artifacts/resident-webrtc
+node --import tsx tools/test-browser-webrtc.ts --output artifacts/browser-webrtc
+```
 
-Next, both replicas disconnect. The native peer publishes a message and four
-192-KiB payload samples. Reconnection explicitly swaps the selected routes,
-recovers missing history, and preserves the original accepted/rejected outcomes.
-There is no automatic authority change or hidden fallback writer.
+The resident gate uses the exact public recipe, a trusted generated TLS
+certificate, bounded HTTP admission and the real native RTC adapter. It checks
+that introduction permission alone cannot read history, that admitted peers
+still need an active Chronolog reader grant, and that abort/bind-error cleanup
+releases the listener and peer resources.
+
+The browser gate transfers the untouched RTCDataChannel from the Window into
+the exclusive OPFS Worker. It physically stops its combined page/introduction
+HTTP listener, then exchanges new operations and a 512 KiB content-addressed
+body, retries an original operation, and compares final events and original
+record digests. Its report separates signaling, host requests and subsequent
+logical RTC frame bytes. Build-only output is not passing runtime evidence.
+
+## Application scenarios and replay lifetime
+
+Both layouts initially connect through the bounded workerd SDP introduction.
+They independently catch up, author competing task claims while disconnected,
+retain one final acceptance and one final rejection, deliver expiring typing
+signals, and process the winning final agent intent once. The fixture holds the
+native closure clock only while both competing proposals are authored and
+included; it does not assert that an arbitrary old offline write remains
+admissible after its timestamp has closed.
+
+Delayed replies and abrupt page/Worker replacement preserve each device's
+original operation and draft. Both replicas must expose identical effective
+event transactions and durable scan cursors. Their local observation timestamps
+and materialization revision tokens are not operation identities. Original
+receipts are checked on their authoring devices; replicated history does not
+create a second author outbox.
+
+The gate waits for every introduction socket to close, then stops the TLS
+host/introduction listener. A warm authenticated RTC session must finalize a
+new chat message. Signaling counters must remain unchanged, logical RTC bytes
+must increase, and host application requests and writes must remain zero. This
+application scenario leaves its separate static-asset server running; the
+smaller browser gate above independently stops the combined page/introduction
+listener.
+
+Next, both replicas disconnect. The native peer publishes another message and
+four 192 KiB programs, each containing sixteen 12 KiB events within the public
+per-event limit. Fresh introductions must recover the complete retained history
+and preserve the original accepted/rejected outcomes. Signed-record digests,
+active capability digests and final ordered positions must match the native
+replica. No authority identity changes during reconnection.
+
+An authenticated connection and completed history application are distinct
+states. The Worker attachment command finishes after authentication and feed
+attachment. Startup explicitly awaits its schema/team history before using it;
+the reconnect scenario separately observes committed record, ingestion and
+finality frontiers. Replay is bounded by its own deadline. Observation polling
+must not queue another full catch-up behind ongoing SQL/WASM materialization or
+extend a deadline indefinitely when a Worker observation stops answering.
 
 ## Measurements and limits
 
 `report.json` records exact sources/artifact hashes, Chromium version, cold
-bootstrap and reconnect/catch-up timings, native/public browser session byte
-counters, per-domain counts, sampled queue sizes and a stable final-event digest.
-`route-trace.ndjson` contains one fixture-relative clock, session IDs, route,
-direction, domain and encoded byte length. It contains no frame payloads,
-credentials or private keys.
+bootstrap, connection attachment and replay timings, native/browser session byte
+counters, signaling observations, sampled queue sizes and a final-event digest.
+`route-trace.ndjson` records a fixture-relative clock, session transitions and
+encoded signaling sizes without credentials, private keys or frame payloads.
 
-- SDK counters include the three-byte Tendriller envelope, record fragmentation
-  and application protocol overhead. They exclude WebSocket/TLS/TCP overhead.
-- Raw per-domain observations additionally count relay readiness and credit text.
-  These observations overlap SDK totals; do not add them as separate traffic.
-- Native queue high-water observations are sampled every 10 ms. They are neither
-  an exhaustive maximum nor a saturation stress test. Public protocol/relay tests
-  separately exercise the configured receive/send/credit bounds.
-- Catch-up application bytes count the four authored string bodies. The elapsed
-  time includes connection/authentication and replay; it is not a network-only
-  transfer rate or latency guarantee.
-- Page performance metrics are end-of-scenario snapshots and exclude Worker/WASM
-  memory. Native peak RSS includes this qualification harness and excludes
-  workerd and browser child processes. Whole-device peak memory remains unmeasured.
+- RTC counters measure logical authenticated peer-frame payload bytes. They
+  exclude RTC framing headers/credits and SCTP/DTLS/UDP/IP overhead. SDP JSON
+  envelopes are counted separately; these observations are not provider billing.
+- Native queue high-water observations are sampled every 10 ms. They are not
+  exhaustive maxima or whole-device memory measurements. Transport tests
+  separately exercise configured frame, queue and credit bounds.
+- Catch-up application bytes count the four authored string bodies. Elapsed
+  time includes connection/authentication and durable SQL replay; it is not a
+  network-only throughput or latency guarantee.
+- Page performance snapshots exclude Worker/WASM memory. Native peak RSS
+  includes the qualification harness and excludes workerd/browser children.
 
-The separate thin-membership gate counts descriptors, inline controls and
-detached application envelopes at its real administrator/peer boundaries. Route
-frame bytes are not a substitute for that semantic accounting. The administrator
-must still receive zero application bodies; provider relays carrying those
-bodies remain a separate bandwidth/cost responsibility.
+The separate thin-membership gate uses authenticated native/browser RTC for
+application transfer and signed HTTP requests for participant administration.
+It counts descriptors, inline controls and detached application envelopes at
+the actual administrator/peer boundaries. The administrator must receive zero
+application bodies. It still verifies the required certified descriptors when
+invoked; these checks do not establish a sparse control-proof protocol.
 
-## What must run in a different setting
+## Deployment qualification
 
-Use a deployed public host and native authority with the actual identity-provider
-configuration. Record exact public package hashes, deployed version, browser/OS,
-native process/volume configuration, DNS/TLS endpoints, every tunnel or relay and
-the selected network. Repeat the same workload on home Wi-Fi, mobile hotspot and
-a restrictive corporate network. Record unsupported routes as failures or
-unsupported cases, never inferred direct success.
+Use a deployed page host and reachable resident HTTPS endpoint with the actual
+identity-provider and introduction-admission configuration. Record exact public
+package hashes, browser/OS, native process/volume configuration, DNS/TLS
+endpoints, ICE configuration, selected candidate pair and every configured TURN
+relay. A successful RTC connection alone is not evidence of a direct route.
 
-For each network, measure connection establishment, cold and warm catch-up,
-actual wire/provider bytes, whole-browser/Worker/native peak memory and queue
-behavior under deliberate slow readers. Exercise real browser suspension,
-native process restart, interrupted connections and the available fallback.
-With an already established direct session, stop the deployed host services and
-record exactly which operations remain usable. Keep signed history/outcomes
-identical when comparing routes; host application-state requests must stay zero.
+Repeat the workload on home Wi-Fi, a mobile hotspot and a restrictive corporate
+network. Record unsupported routes explicitly. Measure cold/warm connection and
+replay, actual wire/provider bytes, browser/Worker/native memory, slow-reader
+queues, suspension, native restart and interruption recovery. Stop the deployed
+host after connection and identify which existing operations still work.
 
-Select the production route and fallback from those measurements. Direct WSS is
-a candidate when the native agent is publicly reachable; the paired WSS relay
-is the implemented fallback candidate. No WebRTC adapter, mobile/corporate route,
-provider billing or production route selection is claimed by this local gate.
+The resident's HTTPS endpoint and an ICE route must be reachable for a cold
+connection. An unreachable resident needs an explicit wake/discovery provider
+or an existing peer path. STUN/TURN and reconnection policy are deployment
+configuration; there is no implicit hosted application relay. These local gates
+do not establish Internet direct-connect rates, TURN interoperability, mobile
+storage behavior or measured provider savings.
