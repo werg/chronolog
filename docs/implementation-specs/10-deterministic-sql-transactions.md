@@ -15,8 +15,10 @@ operations** that change who owns and may write which rows. Chronolog does
 not define a dialect, prove query semantics, or attach meaning to schemas.
 Replay determinism comes from four facts:
 
-1. every replica runs the **same pinned engine build** (the DoltLite native
-   addon and its patch profile, recorded in the execution manifest);
+1. every replica runs the **same pinned SQL engine profile** (DoltLite and
+   sqlite-vec sources, deterministic hooks and patch profile, identified by
+   the execution manifest). Native and WASM builds use different host
+   adapters but share these SQL semantics;
 2. every replica runs the **same platform code** (its digest is in the
    execution manifest);
 3. every replica executes the **same steps on the same database state** in the
@@ -26,9 +28,10 @@ Replay determinism comes from four facts:
    signer) are **fixed from the signed transaction** before it runs.
 
 What remains is a short block-list of operations that could escape the
-database or the pinned engine (section 5). Replicas compare state digests; a
-case the block-list misses shows up as a detectable divergence, not silent
-corruption.
+database or observe differences between host builds (section 5). The same
+versioned SQL policy applies to native and WASM execution. Replicas compare
+state digests; a case the block-list misses shows up as a detectable
+divergence, not silent corruption.
 
 Only the database contents are replicated state. Values returned by
 statements (`SELECT`, `RETURNING`) are not recorded or compared.
@@ -91,7 +94,8 @@ triggers) reject the same way.
 
 ## 4. Execution
 
-For each admitted transaction `T` at its position in the stable order:
+For each admitted transaction `T` at its position in the history policy's
+local order:
 
 1. Open a savepoint.
 2. Fix the engine inputs for the duration of `T`:
@@ -114,6 +118,11 @@ For each admitted transaction `T` at its position in the stable order:
    code and the index of the failing step (null for reconciliation).
 6. Append the log row (section 8) and clear the fixed engine inputs.
 
+The peer policy may replay a tentative suffix when earlier transactions
+arrive. The coordinated policy uses certified log positions. Both preserve
+the already applied final prefix; the materializer does not independently
+choose or sort the history order.
+
 `PRAGMA foreign_keys` and `PRAGMA recursive_triggers` are on. With
 `recursive_triggers`, the deletion by `REPLACE` fires delete triggers, so the
 owner checks apply to it. Trigger recursion is limited to depth 16.
@@ -132,10 +141,15 @@ Rejection codes:
 | `trigger_ignore` | an app trigger uses `RAISE(IGNORE)` |
 | `constraint` | `CHECK`, `UNIQUE`, `NOT NULL`, foreign key, or an app `RAISE(ABORT, …)` |
 | `step_limit`, `denied`, `prepare`, `binding`, `too_large`, `mismatch`, `error` | step budget, authorizer, syntax or unknown object, bindings, size, datatype, any other deterministic SQLite error (including trigger recursion) |
-| `manifest_mismatch` | authored for another execution manifest; not executed |
 
-Operational failures (I/O, corruption, out of memory) are not outcomes; they
-stop replay on that replica.
+An unavailable engine or execution profile is **blocked replay**, not a SQL
+rejection. The replica verifies the execution manifest before running the
+program and preserves the last published SQL revision if it cannot execute
+that profile. It must not append an `accepted` or `rejected` log row for the
+blocked transaction or advance the applied final prefix through it.
+Operational failures (I/O, corruption, out of memory) likewise stop replay
+on that replica without producing an application outcome. Missing history
+or an unavailable decryption key blocks progress before SQL execution.
 
 ## 5. Block-list and schema administration
 
@@ -143,14 +157,24 @@ The consensus authorizer denies:
 
 - `ATTACH`/`DETACH`, `load_extension`, and temporary schema objects;
 - transaction control (`BEGIN`, `COMMIT`, `SAVEPOINT`, …) inside a program;
-- `PRAGMA`, except read-only pragma table-valued functions on the main
-  database (`pragma_table_info`, `pragma_index_list`, …);
+- `PRAGMA` and `pragma_*` table-valued functions, except the shared read-only
+  schema queries `foreign_key_list`, `index_info`, `index_list`, `index_xinfo`,
+  `table_info`, `table_list` and `table_xinfo`, and `quick_check` (also used
+  internally by SQLite during `ALTER TABLE`). Both plain read-only pragma
+  statements and their table-valued forms are allowed;
 - writes to Chronolog's own tables (`chronolog_*`), and creating, dropping or
   altering `chronolog_*` objects; dropping the `chronolog_owner` column;
 - `chronolog_policy_violation()` anywhere but inside a `chronolog_*` trigger
   or view;
-- Dolt functions (`dolt_*`, `doltlite_*`), `total_changes()` and
-  `sqlite_offset()`, whose results depend on connection history or storage;
+- Dolt functions (`dolt_*`, `doltlite_*`, `active_branch()`), Dolt system
+  tables, `total_changes()` and `sqlite_offset()`, whose results depend on
+  connection history or storage;
+- host/build introspection: `sqlite_compileoption_get()`,
+  `sqlite_compileoption_used()`, `sqlite_source_id()`, and the
+  `compile_options`, `function_list`, `module_list`, `pragma_list` and
+  `collation_list` pragmas, including their table-valued forms;
+- physical-storage or connection introspection through the `dbstat`,
+  `sqlite_dbpage` and `sqlite_stmt` virtual-table modules or eponymous tables;
 - **all DDL** (`CREATE`/`DROP` of tables, indexes, views, triggers and virtual
   tables, `ALTER TABLE`) unless the signer is an active admin of the `group`
   collective. `ANALYZE` and `REINDEX` are open to every writer.
@@ -158,6 +182,23 @@ The consensus authorizer denies:
 Everything else the pinned engine accepts is allowed, including triggers,
 views, generated columns, window functions, JSON, FTS5, R-tree and sqlite-vec.
 Math functions (`sin`, `exp`, …) are not compiled into the engine.
+
+These restrictions also apply inside application views and triggers,
+including triggers fired by trusted platform operations. Replicated schema
+introspection remains available through `sqlite_schema` and the permitted
+schema pragmas; `sqlite_version()` is allowed because the engine version is
+pinned. Function checks use SQLite's resolved names: a string literal,
+alias or common-table-expression named `sqlite_compileoption_get` is not a
+call to the forbidden function.
+
+A denied function or diagnostic table produces the same `denied` outcome
+when one host build omits it entirely and another exposes it to the
+authorizer. This also applies when SQLite checks a forbidden function's
+argument count before invoking the authorizer. Host availability must not
+turn a policy denial into a distinct `prepare` outcome; invalid argument
+counts for allowed functions remain prepare failures. Native and WASM
+adapters share this normalization and the SQL policy version recorded
+through the platform digest (section 10).
 
 ## 6. Owner-controlled rows
 
@@ -276,18 +317,29 @@ tx_id = :earlier AND outcome = 'accepted'), 'needs_earlier')`.
 ## 9. Local reads
 
 Local query SQL runs on an immutable materialized revision, is not signed or
-replayed, and returns plain SQLite values. It may use any read-only function,
-including the real clock. There are no read policies: every reader node holds
-every row. `chronolog_actor()` is NULL in local reads.
+replayed, and returns plain SQLite values. The caller selects the current
+local view or a separately pinned final view; final reads exclude the
+tentative suffix. Read-only host diagnostics, including the real clock and
+the build and function catalogs denied during consensus execution, may be
+queried locally. External effects and Dolt control functions remain denied.
+There are no read policies: every reader node holds every row.
+`chronolog_actor()` is NULL in local reads.
 
 ## 10. Execution manifest
 
 Every candidate names the execution manifest digest it was authored for. The
-manifest (version 2) records the engine build (DoltLite version, source
-digests, patch profile), `programVersion: 2`, the `platformDigest` (SHA-256
-over the platform-operation version and the generated platform schema, views
-and triggers), the profile pragma `recursiveTriggers: true`, and the step and
-size limits. A replica only executes transactions whose manifest it runs;
-changing the engine or the platform code is a group-wide upgrade. The
-materialized database also records its genesis root administrator, and a
-replica refuses to open it with another.
+manifest (version 2) records the engine descriptor digest (DoltLite version,
+source digests and patch profile), `programVersion: 2`, the `platformDigest`,
+the profile pragma `recursiveTriggers: true`, and the step and size limits.
+The platform digest covers the platform-operation version, the shared SQL
+portability policy version, and the generated platform schema, views and
+triggers. Native and WASM reducers use the same descriptor and platform
+digest; the browser loader separately verifies its WASM artifact bytes and
+supported adapter profile before opening the engine.
+
+A replica only executes transactions whose manifest it runs. An unavailable
+manifest blocks replay without creating a SQL outcome (section 4). The
+execution profile is fixed in the signed group configuration; live engine
+or profile upgrades are outside this initial scope. The materialized
+database also records its genesis root administrator, and a replica refuses
+to open it with another.

@@ -95,6 +95,26 @@ describe('SQL authorization block-list', () => {
     } finally { db.close() }
   })
 
+  it('normalizes denied function arity errors without changing allowed function failures', () => {
+    const db = database()
+    try {
+      for (const sql of ['SELECT load_extension()', 'SELECT "LOAD_EXTENSION"(1, 2, 3)', 'SELECT sqlite_source_id(1)']) {
+        expectProfileViolation(db, sql)
+        expect(() => withProfiledStatement(db, sql, 'consensus', (statement) => statement.all()))
+          .toThrowError(expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_PROFILE_VIOLATION' }))
+      }
+      expectProfileViolation(db, 'SELECT load_extension(1, 2, 3)', 'local_read')
+      for (const [sql, mode] of [
+        ['SELECT abs(1, 2)', 'consensus'],
+        ['SELECT sqlite_source_id(1)', 'local_read'],
+      ] as const) {
+        expect(() => prepareProfiledStatement(db, sql, mode))
+          .toThrowError(expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_PREPARE_FAILED' }))
+      }
+      expectAllowed(db, "SELECT 'load_extension(1, 2, 3)' AS text")
+    } finally { db.close() }
+  })
+
   it('allows ordinary SQLite in consensus, including formerly gated functions', () => {
     const db = database()
     try {

@@ -93,7 +93,7 @@ export const DEFAULT_SQL_RUNTIME_LIMITS: Readonly<SqlRuntimeLimits> = {
 }
 
 /** Included in the execution-manifest platform digest on every runtime. */
-export const SQL_PROFILE_VERSION = 'chronolog-portable-sql-policy-v1'
+export const SQL_PROFILE_VERSION = 'chronolog-portable-sql-policy-v2'
 
 /**
  * Read-only pragmas whose answers describe replicated SQL state. Build and
@@ -263,7 +263,7 @@ export function prepareProfiledStatement(
     try {
       statement = database.prepare(sql)
     } catch (error) {
-      if (isSqlAuthorizationError(error) || isMissingDeniedFeature(error, mode)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
+      if (isSqlAuthorizationError(error) || isDeniedFeatureError(error, mode)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
       if (isOperationalSqliteError(error)) throw error
       throw new SqlProfileError('SQL_PREPARE_FAILED')
     }
@@ -293,7 +293,7 @@ export function withProfiledStatement<T>(
     try {
       statement = database.prepare(sql)
     } catch (error) {
-      if (isSqlAuthorizationError(error) || isMissingDeniedFeature(error, mode)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
+      if (isSqlAuthorizationError(error) || isDeniedFeatureError(error, mode)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
       if (isOperationalSqliteError(error)) throw error
       throw new SqlProfileError('SQL_PREPARE_FAILED')
     }
@@ -542,20 +542,25 @@ function isReadOnlyPragma(name: string, mode: SqlAuthorizationMode): boolean {
 /**
  * Some host builds omit a forbidden diagnostic entirely (e.g. WASM omits
  * load_extension). SQLite resolves names before the authorizer sees them, so
- * absence must produce the same policy rejection as an existing denied name.
+ * absence or a wrong argument count must produce the same policy rejection as
+ * an existing denied name. Both errors can precede authorizer callbacks.
  * Use the parser's resolved error name; do not scan SQL literals or aliases.
  */
-function isMissingDeniedFeature(error: unknown, mode: SqlAuthorizationMode): boolean {
+function isDeniedFeatureError(error: unknown, mode: SqlAuthorizationMode): boolean {
   if (mode === 'internal_bootstrap' || !(error instanceof Error)) return false
+  const arity = /\bwrong number of arguments to function ([A-Za-z_][A-Za-z_0-9]*)\(\)/iu.exec(error.message)
+  if (arity !== null) return isDeniedFunction(asciiLower(arity[1]!), mode)
   const match = /\bno such (function|table):\s*(?:(?:main|temp)\.)?([A-Za-z_][A-Za-z_0-9]*)\b/iu.exec(error.message)
   if (match === null) return false
   const name = asciiLower(match[2]!)
-  if (match[1]!.toLowerCase() === 'function') {
-    if (isDoltName(name)) return true
-    return mode === 'local_read' ? FORBIDDEN_LOCAL_READ_FUNCTIONS.has(name) : CONSENSUS_DENIED_FUNCTIONS.has(name)
-  }
+  if (match[1]!.toLowerCase() === 'function') return isDeniedFunction(name, mode)
   return mode !== 'local_read' && (isDoltName(name) || CONSENSUS_DENIED_MODULES.has(name) ||
     name.startsWith('pragma_') && !READ_ONLY_PRAGMAS.has(name.slice('pragma_'.length)))
+}
+
+function isDeniedFunction(name: string, mode: SqlAuthorizationMode): boolean {
+  if (isDoltName(name)) return true
+  return mode === 'local_read' ? FORBIDDEN_LOCAL_READ_FUNCTIONS.has(name) : CONSENSUS_DENIED_FUNCTIONS.has(name)
 }
 
 function validateSqlSource(sql: string, limits: SqlRuntimeLimits): void {

@@ -34,7 +34,7 @@ describe('NodeRpcService policy views and enrollment', () => {
           transport: { records: 1, peers: [], connected } }
       },
     } })
-    const result = await service.getReplicationStatus({ groupId: group, requestId: 'status' }, { method: 'replication.getStatus' })
+    const result = await service.getReplicationStatus({ groupId: group, requestId: 'status' }, { method: 'node.getReplicationStatus' })
     expect(result).toMatchObject({ state: connected ? 'current' : 'offline', connectedPeers: 0, knownPeers: 0 })
   })
 
