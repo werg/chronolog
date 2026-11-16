@@ -17,6 +17,22 @@ const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('replicated governance control plane', () => {
+  it('serializes concurrent authoring across signing and durable publication', async () => {
+    const fixture = await governanceFixture()
+    const [first, second] = await Promise.all([
+      fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(40), 'writer')] }, fixture.root.privateKey),
+      fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(41), 'writer')] }, fixture.root.privateKey),
+    ])
+    expect([first.revision.revision, second.revision.revision]).toEqual([1n, 2n])
+    expect(fixture.admin.snapshot.revision).toBe(2n)
+    const epochs = await Promise.all([
+      fixture.admin.rotateEpoch(fixture.root.privateKey, bytes32(50)),
+      fixture.admin.rotateEpoch(fixture.root.privateKey, bytes32(51)),
+    ])
+    expect(epochs.map((signed) => signed.manifest.epoch)).toEqual([0n, 1n])
+    expect(fixture.admin.currentEpoch).toBe(1n)
+  })
+
   it('onboards, revokes, rotates epochs, and grants audit history without restart', async () => {
     const fixture = await governanceFixture()
     const participantSigning = await generateEd25519KeyPair()

@@ -80,6 +80,9 @@ export class GovernanceControlPlane {
   readonly #snapshots = new Map<string, CapabilitySnapshot>()
   readonly #seen = new Set<string>()
   readonly #mutex = new Mutex()
+  // Ingestion and authoring have different locks: publish awaits ingestion,
+  // while revision/epoch selection, signing and publication must be one turn.
+  readonly #authoring = new Mutex()
   readonly #events = new RevisionBroadcaster<GovernanceEvent>()
   readonly #epochManifests = new Map<bigint, SignedEpochManifest>()
   readonly #epochDigests = new Map<bigint, Uint8Array>()
@@ -137,6 +140,10 @@ export class GovernanceControlPlane {
   }
 
   async publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey): Promise<SignedCapabilityRevision> {
+    return this.#authoring.run(() => this.#publishCapabilityChange(change, rootPrivateKey))
+  }
+
+  async #publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey): Promise<SignedCapabilityRevision> {
     this.#assertCapabilityFeedOwner()
     const revisionNumber = this.#snapshot.revision + 1n
     const revision: CapabilityRevision = {
@@ -160,6 +167,10 @@ export class GovernanceControlPlane {
   }
 
   async rotateEpoch(rootPrivateKey: CryptoKey, contentKey?: Uint8Array): Promise<SignedEpochManifest> {
+    return this.#authoring.run(() => this.#rotateEpoch(rootPrivateKey, contentKey))
+  }
+
+  async #rotateEpoch(rootPrivateKey: CryptoKey, contentKey?: Uint8Array): Promise<SignedEpochManifest> {
     this.#assertCapabilityFeedOwner()
     const recipients = [...this.#snapshot.capabilities.values()]
       .filter((capability) => capability.grant.role === 'reader' && isCapabilityActive(capability, this.#snapshot.revision))
@@ -184,6 +195,10 @@ export class GovernanceControlPlane {
   }
 
   async grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey): Promise<number> {
+    return this.#authoring.run(() => this.#grantHistoricalAccess(subjectId, rootPrivateKey))
+  }
+
+  async #grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey): Promise<number> {
     this.#assertCapabilityFeedOwner()
     const reader = [...this.#snapshot.capabilities.values()].find((capability) =>
       capability.grant.role === 'reader' &&
