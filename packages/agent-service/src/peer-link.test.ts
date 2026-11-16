@@ -7,7 +7,7 @@ import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { MAX_LEDGER_PAYLOAD_BYTES } from '@chronolog/node-core/ledger'
 import { assertCanonicalCbor, encodeCanonicalCbor, equalBytes, generateEd25519KeyPair, utf8, type CborValue } from '@chronolog/protocol'
-import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
+import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type FeedLink } from '@chronolog/records'
 import { FeedTransport } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -53,6 +53,32 @@ async function payloadSession(readPayload: (hash: string) => Promise<Uint8Array 
   ])
   cleanup.push(async () => { await Promise.all([serverLink.close(), clientLink.close()]) })
   return { server: serverLink, client: clientLink, revoke: () => { active = false } }
+}
+
+async function rangeSession(range: 'records' | 'evidence', read: () => Promise<readonly Uint8Array[]>,
+  afterRecord?: () => Promise<void>) {
+  const server = await portable(), client = await portable(), [outgoing, incoming] = connections()
+  let active = true
+  const sent: Uint8Array[] = []
+  const connection = { ...outgoing, async send(bytes: Uint8Array) {
+    const frame = assertCanonicalCbor(bytes)
+    await outgoing.send(bytes)
+    if (Array.isArray(frame) && frame[2] === 'record' && frame[4] instanceof Uint8Array) {
+      sent.push(frame[4].slice())
+      await afterRecord?.()
+    }
+  } }
+  const local: FeedLink = { ...server.transport.asLink(), ...(range === 'records' ? { read } : { readEvidence: read }) }
+  const groupId = new Uint8Array(32).fill(13), grantId = new Uint8Array(32).fill(14)
+  const [serverLink, clientLink] = await Promise.all([
+    openAuthenticatedPeerLink({ connection, local, groupId, grantId, identity: server.identity,
+      authorizePeer: peer => active && equalBytes(peer.authorId, client.identity.publicKeyBytes) }),
+    openAuthenticatedPeerLink({ connection: incoming, local: client.transport.asLink(), groupId, grantId, identity: client.identity,
+      authorizePeer: peer => equalBytes(peer.authorId, server.identity.publicKeyBytes) }),
+  ])
+  cleanup.push(async () => { await Promise.all([serverLink.close(), clientLink.close()]) })
+  return { sent, revoke: () => { active = false }, read: () => range === 'records'
+    ? clientLink.link.read(server.transport.identity, 0n, 8) : clientLink.link.readEvidence(0n, 8) }
 }
 
 describe('authenticated framed range synchronization', () => {
@@ -140,6 +166,31 @@ describe('authenticated framed range synchronization', () => {
     await lookedUp
     session.revoke(); release(body)
     await expect(result).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+  })
+
+  it.each(['records', 'evidence'] as const)('does not release %s when a grant is revoked during the storage read', async range => {
+    let started!: () => void, release!: (records: readonly Uint8Array[]) => void
+    const reading = new Promise<void>(resolve => { started = resolve })
+    const available = new Promise<readonly Uint8Array[]>(resolve => { release = resolve })
+    const session = await rangeSession(range, async () => { started(); return available })
+    const result = session.read()
+    await reading
+    session.revoke(); release([utf8('private descriptor or control evidence')])
+    await expect(result).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    expect(session.sent).toEqual([])
+  })
+
+  it.each(['records', 'evidence'] as const)('rechecks %s access after a previous frame waits for the reader', async range => {
+    const records = [utf8('authorized first frame'), utf8('must remain private after revocation')]
+    let blocked!: () => void, release!: () => void
+    const sending = new Promise<void>(resolve => { blocked = resolve })
+    const delivered = new Promise<void>(resolve => { release = resolve })
+    const session = await rangeSession(range, async () => records, async () => { blocked(); await delivered })
+    const result = session.read()
+    await sending
+    session.revoke(); release()
+    await expect(result).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    expect(session.sent).toEqual([records[0]])
   })
 
   it('verifies a received body independently of the authenticated sender', async () => {

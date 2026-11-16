@@ -88,6 +88,12 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   const send = (fields: readonly CborValue[]): Promise<void> => options.connection.send(encodeCanonicalCbor([1n, PEER_DOMAIN, ...fields]))
   const authorized = async (): Promise<boolean> => remote !== null &&
     await options.authorizePeer({ authorId: remote.authorId.slice(), grantId: remote.grantId.slice(), feedId: remote.feedId })
+  const sendAuthorized = async (fields: readonly CborValue[]): Promise<void> => {
+    // Storage reads, payload verification and prior duplex writes can suspend
+    // while a grant is revoked. Authorize each release against current state.
+    if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
+    await send(fields)
+  }
 
   const serveRange = async (id: number, feed: string | null, after: bigint, limit: number): Promise<void> => {
     try {
@@ -98,9 +104,9 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       for (const record of records) {
         bytes += record.length
         if (record.length > MAX_RECORD_FRAME - 1024 || bytes > MAX_RANGE_BYTES) throw new Error('PEER_RANGE_TOO_LARGE')
-        await send(['record', BigInt(id), record])
+        await sendAuthorized(['record', BigInt(id), record])
       }
-      await send(['done', BigInt(id)])
+      await sendAuthorized(['done', BigInt(id)])
     } catch (error) {
       if (!controller.signal.aborted) await send(['error', BigInt(id), error instanceof Error ? error.message.slice(0, 256) : 'PEER_RANGE_UNAVAILABLE'])
     } finally { inbound -= 1 }
@@ -115,10 +121,8 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       }
       const payload = stored === null ? null : new Uint8Array(stored)
       if (payload !== null && bytesToHex(await sha256(payload)) !== hash) throw new Error('PEER_PAYLOAD_INVALID')
-      // A provider lookup can suspend while the peer's read grant is revoked.
-      if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
-      if (payload !== null) await send(['record', BigInt(id), payload])
-      await send(['done', BigInt(id)])
+      if (payload !== null) await sendAuthorized(['record', BigInt(id), payload])
+      await sendAuthorized(['done', BigInt(id)])
     } catch (error) {
       if (!controller.signal.aborted) await send(['error', BigInt(id), error instanceof Error ? error.message.slice(0, 256) : 'PEER_PAYLOAD_UNAVAILABLE'])
     } finally { inbound -= 1 }
