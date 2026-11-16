@@ -8,7 +8,8 @@
     "./workers": "./src/workers.ts",
     "./signals": "./src/signals.ts",
     "./framing": "./src/framing.ts",
-    "./peer-link": "./src/peer-link.ts"
+    "./peer-link": "./src/peer-link.ts",
+    "./membership-http": "./src/membership-http.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",

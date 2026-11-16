@@ -3,6 +3,8 @@ import { once } from 'node:events'
 import type { Socket } from 'node:net'
 import { timingSafeEqual } from 'node:crypto'
 
+import { MAX_MEMBERSHIP_LEDGER_BYTES } from '@chronolog/node-core/membership'
+
 import type {
   ChronologRpcService,
   RpcCallContext,
@@ -63,6 +65,8 @@ export interface HttpRpcServerOptions {
   readonly token?: string
   /** Permit only original signed publisher proposals without the owner bearer. */
   readonly publisherIngress?: boolean
+  /** Exact root-signed CBOR route; the handler must authenticate every request. */
+  readonly membershipLedger?: (request: Request) => Promise<Response>
   readonly maxBodyBytes?: number
   /** Maximum wait for graceful connection drain before sockets are destroyed. */
   readonly shutdownTimeoutMs?: number
@@ -167,14 +171,15 @@ export class HttpRpcServer {
       return
     }
     if (request.method !== 'POST' || request.url === undefined) throw new ChronologRpcError('not_found', 'RPC route not found')
-    // Match the raw path exactly: query strings, encoded aliases and stream
-    // routes must never inherit the limited publisher's anonymous exception.
+    // Match raw paths exactly: query strings, encoded aliases and stream routes
+    // never inherit either independently signed route's bearer exception.
     const publicIngress = this.#options.publisherIngress === true && request.url === '/rpc/unary/ingress.submit'
-    if (!publicIngress) this.#authorize(request)
+    const membershipHandler = request.url === '/_chronolog/membership' ? this.#options.membershipLedger : undefined
+    if (!publicIngress && membershipHandler === undefined) this.#authorize(request)
     const match = /^\/rpc\/(unary|stream)\/([^/?]+)$/u.exec(new URL(request.url, 'http://localhost').pathname)
-    if (!match) throw new ChronologRpcError('not_found', 'RPC route not found')
-    const mode = match[1]
-    const method = decodeURIComponent(match[2] ?? '')
+    if (!match && membershipHandler === undefined) throw new ChronologRpcError('not_found', 'RPC route not found')
+    const mode = match?.[1]
+    const method = decodeURIComponent(match?.[2] ?? '')
     const controller = new AbortController()
     const abortPeer = () => controller.abort('peer disconnected')
     const abortClosedResponse = () => {
@@ -192,6 +197,26 @@ export class HttpRpcServer {
     // although the peer is still waiting; body-phase errors must still be reported.
     let readingBody = true
     try {
+      if (membershipHandler !== undefined) {
+        const body = await readRawBody(request, Math.min(this.#options.maxBodyBytes ?? MAX_MEMBERSHIP_LEDGER_BYTES,
+          MAX_MEMBERSHIP_LEDGER_BYTES))
+        readingBody = false
+        const headers = new Headers()
+        for (const name of ['content-type', 'content-length'] as const) {
+          const value = request.headers[name]
+          if (value !== undefined) headers.set(name, value)
+        }
+        const result = await membershipHandler(new Request('http://localhost/_chronolog/membership', {
+          method: 'POST', headers, body: Uint8Array.from(body).buffer, signal: controller.signal,
+        }))
+        const bytes = await readMembershipResponse(result, controller.signal)
+        if (controller.signal.aborted || response.destroyed) return
+        const responseHeaders: Record<string, string> = {}
+        result.headers.forEach((value, name) => { responseHeaders[name] = value })
+        response.writeHead(result.status, responseHeaders)
+        response.end(bytes)
+        return
+      }
       const body = await readBody(request, this.#options.maxBodyBytes ?? 4 * 1024 * 1024)
       let requestValue: unknown
       try { requestValue = decodeJson(body) }
@@ -403,6 +428,10 @@ async function settlesWithin(promise: Promise<void>, milliseconds: number): Prom
 }
 
 async function readBody(request: IncomingMessage, maximum: number): Promise<string> {
+  return (await readRawBody(request, maximum)).toString('utf8')
+}
+
+async function readRawBody(request: IncomingMessage, maximum: number): Promise<Buffer> {
   const chunks: Buffer[] = []
   let length = 0
   for await (const value of request) {
@@ -411,7 +440,27 @@ async function readBody(request: IncomingMessage, maximum: number): Promise<stri
     if (length > maximum) throw new ChronologRpcError('resource_exhausted', 'RPC request body is too large')
     chunks.push(chunk)
   }
-  return Buffer.concat(chunks).toString('utf8')
+  return Buffer.concat(chunks)
+}
+
+async function readMembershipResponse(response: Response, signal: AbortSignal): Promise<Uint8Array> {
+  if (response.body === null) return new Uint8Array()
+  const reader = response.body.getReader(), chunks: Uint8Array[] = []
+  let length = 0
+  try {
+    for (;;) {
+      signal.throwIfAborted()
+      const item = await reader.read()
+      if (item.done) break
+      length += item.value.length
+      if (length > MAX_MEMBERSHIP_LEDGER_BYTES) throw new ChronologRpcError('resource_exhausted', 'Membership response is too large')
+      chunks.push(Uint8Array.from(item.value))
+    }
+  } finally { await reader.cancel().catch(() => undefined); reader.releaseLock() }
+  const bytes = new Uint8Array(length)
+  let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length }
+  return bytes
 }
 
 function encodeJson(value: unknown): string {

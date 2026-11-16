@@ -4,11 +4,15 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": { "browser": "./src/browser.ts", "default": "./src/index.ts" },
+    ".": {
+      "browser": "./src/browser.ts",
+      "default": "./src/index.ts"
+    },
     "./browser": "./src/browser.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
-    "@chronolog/protocol": "workspace:*"
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/node-core": "workspace:*"
   }
 }

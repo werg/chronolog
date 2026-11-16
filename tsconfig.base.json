@@ -108,7 +108,9 @@
       ],
       "@chronolog/runtime-browser/events": [
         "packages/runtime-browser/src/event-peer.ts"
-
+      ],
+      "@chronolog/agent-service/membership-http": [
+        "packages/agent-service/src/membership-http.ts"
       ]
     }
   }

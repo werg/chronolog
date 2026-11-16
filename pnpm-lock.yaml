@@ -356,6 +356,9 @@ importers:
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
+      '@chronolog/node-core':
+        specifier: workspace:*
+        version: link:../node-core
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol

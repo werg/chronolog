@@ -1,5 +1,6 @@
 import { join, resolve } from 'node:path'
 
+import { createMembershipLedgerHandler, MEMBERSHIP_LEDGER_PATH } from '@chronolog/agent-service/membership-http'
 import { executionManifestArtifacts } from '@chronolog/protocol'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
@@ -69,6 +70,7 @@ process.stdout.write(`${JSON.stringify({
   publisherIngress: runtime.publisherIngress,
   agentTasks: agent?.taskIds ?? [],
   nativeAuthority: agent?.authority !== null && agent?.authority !== undefined,
+  membershipLedgerUrl: agent?.authority == null ? null : `${address.url}${MEMBERSHIP_LEDGER_PATH}`,
 })}\n`)
 
 let stopping = false
@@ -228,6 +230,9 @@ async function startRuntime() {
       port: runtime.port,
       ...(runtime.token === undefined ? {} : { token: runtime.token }),
       publisherIngress: runtime.publisherIngress,
+      ...(agent?.authority == null || governed === undefined ? {} : {
+        membershipLedger: createMembershipLedgerHandler({ authority: agent.authority, descriptor: governed.descriptor, sink: transport }),
+      }),
       health: async () => daemonHealth(await node!.status(), stopping, traversalError(runtime.ssbScope, reachability)),
       metrics: async () => prometheusMetrics(await node!.status(), traversalError(runtime.ssbScope, reachability)),
     })

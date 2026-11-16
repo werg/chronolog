@@ -268,6 +268,26 @@ work, and subscriber queues. Slow subscribers receive latest replaceable values.
 No signal advances a durable event cursor. An offline receiver cannot know about
 a revocation it has not received.
 
+## Signed membership ledger endpoint
+
+`createMembershipLedgerHandler({ authority, descriptor, sink? })`, exported from
+`@chronolog/agent-service/membership-http`, serves exact `POST /_chronolog/membership`
+requests as raw canonical CBOR. Each request is signed by the genesis roster root
+and binds the group, exact history configuration, request, nonce and short expiry.
+The native authority key remains separate. The daemon mounts this handler only
+when it hosts the group's pinned native authority. The ordinary owner RPC bearer
+does not authorize this route; its independently verified signature does.
+
+Reads return every descriptor in a contiguous bounded range and a fresh signed
+prefix certificate. They never fetch detached application payloads. Appends
+accept only inline capability or epoch records. The native log commits before
+acknowledgment, so a lost response returns the same position on exact retry.
+When a sink is configured, the handler publishes only the returned entries and
+certificate; a later read can heal interrupted evidence delivery. Read pages
+carry at most 1 MiB of encoded entries, at most 128 entries, and responses and
+requests are capped at 2 MiB. Large recipient wrap lists remain subject to the
+explicit inline control limit.
+
 ## Verification scope
 
 Focused tests cover native fencing/reopen, lost append responses, visible quotas,
