@@ -190,8 +190,23 @@ try {
     assert.equal(await board.locator('#tasks .task > p').textContent(), await compact.locator('#tasks .task > p').textContent())
     passed('both disconnected browsers author original competing claims; real authority reconnect produces one final acceptance and one retained final rejection')
 
+    const rejectedJobStarted = Date.now()
+    const previousLoserOperation = await loser.locator('#operations > li').first().getAttribute('data-operation')
     await loser.locator('#tasks [data-action="job"]').click()
-    await expect(loser.locator('#operations > li').first()).toHaveAttribute('data-status', 'rejected')
+    await loser.waitForFunction(previous => {
+      const id = document.querySelector('#operations > li')?.getAttribute('data-operation')
+      return id !== null && id !== undefined && id !== previous
+    }, previousLoserOperation)
+    const rejectedJobId = await loser.locator('#operations > li').first().getAttribute('data-operation')
+    assert(rejectedJobId !== null)
+    // Rejected proposals produce no durable event. Observe their public
+    // operation frontier before applying the renderer's short DOM deadline.
+    await waitFor(() => loser.evaluate(async id => {
+      const operation = await (globalThis as unknown as PilotWindow).applicationPilot.operation(id)
+      return operation?.status === 'rejected' && operation.error === 'assert:claim_required'
+    }, rejectedJobId), 'losing claimant final job rejection')
+    report.timingsMs.browserRejectedJob = Date.now() - rejectedJobStarted
+    await expect(loser.locator(`#operations > li[data-operation="${rejectedJobId}"]`)).toHaveAttribute('data-status', 'rejected')
     assert.equal(report.counts.effectDispatches, 0)
     const jobStarted = Date.now()
     await winner.locator('#tasks [data-action="job"]').click()

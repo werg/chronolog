@@ -59,6 +59,7 @@ jobs:
           path: artifacts/pilot-source/contrib
           persist-credentials: false
       - name: Build the packaged public Tendriller SDK, runtime and engine
+        id: public_artifacts
         working-directory: artifacts/pilot-source/tendriller
         run: |
           npm ci
@@ -71,6 +72,7 @@ jobs:
             --wasm artifacts/wasm \
             --output artifacts/application-pilot/ci
       - name: Qualify thin Cloudflare membership with a separate native authority and browser device
+        if: ${{ !cancelled() && steps.public_artifacts.outcome == 'success' }}
         run: |
           node --import tsx tools/thin-membership-pilot.ts \
             --tendriller-artifacts artifacts/pilot-source/tendriller/dist \
