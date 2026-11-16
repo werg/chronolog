@@ -18,6 +18,7 @@ import { build } from 'esbuild'
 import { createAgent } from '../examples/resident-agent.js'
 import type { PilotBootstrap, PilotRegistration, PilotWindow } from '../test/application-pilot/contract.js'
 import { createNativeBrowserFixture, type NativeBrowserFixture } from './browser-event-fixture.js'
+import { qualifyApplicationScope } from './lib/application-scope.js'
 
 /** Real public runtime + independent OPFS replicas + native final-intent worker. */
 const workspace = resolve(import.meta.dirname, '..')
@@ -68,7 +69,7 @@ try {
   const packageMetadata: unknown = JSON.parse(await readFile(join(runtime, 'package.json'), 'utf8'))
   report.publicArtifacts = { runtimePackage: packageMetadata, kernelSha256: await sha256(join(runtime, 'assets/kernel.mjs')),
     wasmManifestSha256: await sha256(join(wasm, 'manifest.json')), wasmSha256: await sha256(join(wasm, 'sqlite3.wasm')),
-    publicModuleSha256: await sha256(join(output, 'public-application.mjs')), specimenManifestSha256: await sha256(join(pages, 'specimen-manifest.json')) }
+    publicModuleSha256: await sha256(join(output, 'public-application.mjs')), scopeModuleSha256: await sha256(join(pages, 'scoped-state.mjs')), specimenManifestSha256: await sha256(join(pages, 'specimen-manifest.json')) }
   await writeFile(join(output, 'bundles.json'), JSON.stringify({ public: publicBundle.metafile, deployment: deploymentBundle.metafile }, null, 2) + '\n')
   passed('both contrib layouts compile from an explicit public application bundle, packaged Tendriller runtime and pinned WASM assets')
   if (values['build-only']) {
@@ -76,6 +77,9 @@ try {
     await record()
     process.stdout.write(`Built graph and provenance: ${output}\n`)
   } else {
+    report.status = 'native scope reset qualification'
+    report.diagnostics.scopeReset = await qualifyApplicationScope(join(pages, 'scoped-state.mjs'))
+    passed('the built scope recipe rejects a durably queued stale edit after reset and preserves the original accepted retry without another write')
     report.status = 'browser launch'
     await record()
     const executable = values.browser ?? process.env.CHRONOLOG_CHROMIUM_EXECUTABLE
