@@ -1,0 +1,14 @@
+{
+  "name": "@chronolog/transport-tendriller",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@chronolog/node-core": "workspace:*",
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/records": "workspace:*"
+  },
+  "peerDependencies": { "@tendriller/core": "0.3.0-rc.6" },
+  "devDependencies": { "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-160393ee.tgz" }
+}

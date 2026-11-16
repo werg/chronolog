@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "160393ee92bb36b3f8feba15d0d7c219e6bb3cb8",
+  "buildCommand": "npm ci && npm run build",
+  "package": "@tendriller/core",
+  "version": "0.3.0-rc.6",
+  "artifact": "tendriller-sdk-160393ee.tgz",
+  "sha256": "9ced64523e68a27b8e4decd1bc650dbc912799abb74e8c9214a88c64e26c64b9",
+  "purpose": "Public artifact fixture for the optional Chronolog adapter; no private Tendriller source imports."
+}
