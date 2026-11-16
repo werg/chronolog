@@ -46,6 +46,10 @@ pages, and exact approval/revocation receipts. A conflicting retry fails, a
 removed reader remains denied, and retries add no native position. Its report is
 `artifacts/thin-membership/ci/report.json`. This is real workerd storage reopening;
 it is not a deployed Cloudflare volume-loss or portable root-key move rehearsal.
+After that restart, a separately keyed, read-only browser device is enrolled
+under another synthetic account. The restored administrator must wrap its
+retained historical epoch keys for that device, which catches up through peers
+and reads the post-revocation data; the removed account remains denied.
 
 ## Authorization regression checks
 

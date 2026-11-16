@@ -133,6 +133,12 @@ try {
           case 'workload': result = await native!.publishWorkload(input as unknown as Parameters<NativeFixture['publishWorkload']>[0]); break
           case 'snapshot': result = await native!.snapshot(); break
           case 'device': result = await callDevice(page!, input!); break
+          case 'new-device': {
+            await page!.evaluate(() => (globalThis as unknown as BrowserPage).thinMembership.replaceWorker())
+            const prepared = await callDevice(page!, { method: 'prepare', name: input!.name })
+            const opened = await callDevice(page!, { method: 'open', name: input!.name, bootstrap: input!.bootstrap })
+            result = { prepared, opened }; break
+          }
           case 'reload-device': {
             await page!.evaluate(() => (globalThis as unknown as BrowserPage).thinMembership.replaceWorker())
             await callDevice(page!, { method: 'open', name: input!.name, bootstrap: input!.bootstrap })

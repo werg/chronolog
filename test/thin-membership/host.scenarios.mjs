@@ -171,7 +171,9 @@ it('administers an independently ordered native/browser group through the actual
   await fixture('workload', { namespace: 'after-reader-removal', count: 1, payloadBytes: 4096 });
   expect((await fixture('snapshot')).availableEpochs).toContain(removed.epoch);
   expect((await device({ method: 'events' })).transactions.some(transaction => transaction.events.some(event => event.payload?.id === 'after-reader-removal-0'))).toBe(false);
-  await passed('reader revocation rotates future keys without claiming to erase previously decrypted history');
+  await passed('reader revocation rotates future keys without claiming to erase previously decrypted history',
+    { identity: prepared.signingPublicKey, removedEpoch: removed.epoch, knownEpochs: afterRemoval.knownEpochs,
+      availableEpochs: afterRemoval.availableEpochs, cannotReadPostRevocationEvent: true });
 
   const beforeRestore = await owner.sync(), controlsBeforeRestore = await history(owner);
   const nativeBeforeRestore = (await fixture('snapshot')).head;
@@ -190,6 +192,26 @@ it('administers an independently ordered native/browser group through the actual
   await passed('reopened actual Cloudflare metadata retains root, certified descriptor prefix, revoked roster, epoch decisions and exact action receipts without new native positions',
     { before: beforeRestore, after: restored, writerRevocation: writerRemoved, readerRevocation: removed,
       nativeHead: nativeBeforeRestore, exactControlPages: controlsBeforeRestore.length });
+
+  const fresh = await fixture('new-device', { name: 'thin-membership-restored-reader', bootstrap });
+  expect(fresh.prepared.signingPublicKey).not.toBe(prepared.signingPublicKey);
+  const readerInfo = await otherMembers.info(), readerRequestId = readerInfo.identity.requestPrefix + 'after-admin-restart';
+  const readerRequest = await device({ method: 'request', requestId: readerRequestId });
+  const readerSubmission = await otherMembers.requestEnrollment(readerRequest.signedRequest);
+  const readerApproval = await owner.approve({ operationId: 'approve-reader-after-admin-restart', requestId: readerSubmission.id,
+    roles: ['reader'], grantFullHistory: true });
+  await device({ method: 'approval', requestId: readerRequestId, signedApproval: readerApproval.signedApproval });
+  const readerActivated = await device({ method: 'history', pages: await history(otherMembers) });
+  expect(readerActivated.grants.filter(grant => grant.active).map(grant => grant.role)).toEqual(['reader']);
+  expect(readerActivated.availableEpochs).toContain(removed.epoch);
+  await device({ method: 'connect' });
+  const readerReady = await until(() => device({ method: 'sync' }), value => value.enrollment.state === 'ready', 'reader approved after admin restart did not become ready');
+  expect((await device({ method: 'events' })).transactions.some(transaction => transaction.events.some(event => event.payload?.id === 'after-reader-removal-0'))).toBe(true);
+  await expect(applicantMembers.history({ after: 0 })).rejects.toMatchObject({ status: 403 });
+  await passed('reopened administrator uses restored historical epoch keys to approve a newly keyed read-only device while the removed account stays denied',
+    { identity: fresh.prepared.signingPublicKey, accountId: readerInfo.identity.accountId,
+      roles: readerReady.value.grants.filter(grant => grant.active).map(grant => grant.role),
+      availableEpochs: readerReady.value.availableEpochs, recoveredEpoch: removed.epoch, elapsedMs: readerReady.elapsedMs });
 
   const final = await fixture('snapshot');
   expect(final.traffic.applicationEnvelopeBytesToAdministrator).toBe(0);
