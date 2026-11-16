@@ -131,6 +131,9 @@ export class ChronologNode {
         throw new Error('NODE_HISTORY_CONFIGURATION_MISMATCH')
       }
       if (options.validator !== undefined) throw new Error('COORDINATED_NODE_CANNOT_ATTEST')
+      if (options.envelopeCipher !== undefined && options.historyPolicy.encryptionEpochStatusAt === undefined) {
+        throw new Error('COORDINATED_ENCRYPTION_POLICY_REQUIRED')
+      }
     }
     this.#maximumRetryRecords = options.maximumRetryRecords ?? 4_096
     this.#feedForks = options.feedForkRegistry ?? new FeedForkRegistry()
@@ -518,6 +521,7 @@ export class ChronologNode {
     await this.#mutex.run(async () => {
       if (this.#seen.has(record.id)) return
       this.#setConsumerPhase('ingesting')
+      let coordinatedCandidate = false
       try {
         const continuity = this.#feedForks.observe(record)
         if (continuity === 'discarded') {
@@ -536,6 +540,7 @@ export class ChronologNode {
           this.#seen.add(record.id)
           return
         }
+        coordinatedCandidate = envelope.messageType === 'candidate' && this.historyPolicy === 'coordinated'
         const wire = await this.#decodeRecord(record)
         if (wire.type === 'candidate') await this.#ingestCandidate(record, wire.payload, wire.signer)
         else if (wire.type === 'attestation') await this.#ingestAttestation(record, wire.payload, wire.signer)
@@ -544,7 +549,13 @@ export class ChronologNode {
         this.#retryRecords.delete(record.id)
         if (this.#retryRecords.size === 0 && !this.#retryOverflow) this.#ingestionError = undefined
       } catch (error) {
-        if (error instanceof TerminalIngestError || error instanceof ControlStoreConflictError) {
+        if (coordinatedCandidate && error instanceof Error && error.message === WIRE_ENCRYPTION_EPOCH_UNAVAILABLE) {
+          // The certified path owns this candidate's retry and decides whether
+          // its epoch was issued. An unordered hint needs no second key wait.
+          this.#seen.add(record.id)
+          this.#retryRecords.delete(record.id)
+          if (this.#retryRecords.size === 0 && !this.#retryOverflow) this.#ingestionError = undefined
+        } else if (error instanceof TerminalIngestError || error instanceof ControlStoreConflictError) {
           this.#seen.add(record.id)
           this.#retryRecords.delete(record.id)
           if (error instanceof ControlStoreConflictError) this.#recordError(error)
@@ -699,17 +710,21 @@ export class ChronologNode {
           this.#coordinatedProcessed = entry.position
           continue
         }
+        const epochStatus = selected.encryptionEpochStatusAt?.(entry.position, ledger.encryptionEpoch)
+        if (epochStatus === 'unissued') {
+          // No valid candidate could use this epoch at the fixed position.
+          // Do not wait for a nonexistent key or claim an unverified identity.
+          this.#coordinatedProcessed = entry.position
+          continue
+        }
         const record: TransportRecord = {
           id: `ordered:${entry.historyId}:${entry.position}`, author: '', sequence: 0n,
           receivedAtMs: 0, payload,
         }
         try {
           const wire = await this.#decodeRecord(record)
-          const expectedEpoch = selected.encryptionEpochAt?.(entry.position)
-          const staleEpoch = expectedEpoch !== undefined && (expectedEpoch === null || ledger.encryptionEpoch === null ||
-            !equalBytes(expectedEpoch, ledger.encryptionEpoch))
           await this.#ingestCandidate(record, wire.payload, wire.signer, entry.position,
-            staleEpoch ? 'ENCRYPTION_EPOCH_CLOSED' : undefined)
+            epochStatus === 'closed' ? 'ENCRYPTION_EPOCH_CLOSED' : undefined)
         } catch (error) {
           // A known invalid record occupies its fixed position without stealing
           // a valid proposal identity. Missing keys/engines/storage still block.

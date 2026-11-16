@@ -343,6 +343,9 @@ the configured administration feed and its complete prefix. Coordinated
 delivery verifies the ordered record and its signed governance content through
 the certified history. A replica may receive snapshots and key envelopes ahead
 of activation; its active authorization still follows the history policy.
+The fixed-history restrictions also apply to received root-signed revisions,
+before they can mutate the received snapshot. An unsupported control occupies
+its canonical position without preventing a later valid revision from activating.
 
 ## Removal and history policy
 
@@ -378,8 +381,14 @@ An exact retry already ordered before the rotation retains its original outcome.
 
 This is a rule for canonical acceptance. It cannot prevent a participant from
 disclosing plaintext or old-key ciphertext it already knows. An unavailable
-application body or key still blocks replay; it is not treated as a stale-epoch
-rejection. The full envelope must be retrieved, checked and decrypted first.
+application body, or a missing local key for an epoch already issued at that
+position, still blocks replay; it is not treated as a stale-epoch rejection.
+The full envelope must be retrieved and checked against its committed hash and
+metadata. An epoch not yet issued by the preceding canonical controls is
+permanently invalid at that position, even if a later rotation or received key
+wrap names it. Replicas skip that position without assigning an unverified
+proposal identity. Previously issued epochs must still be decrypted before a
+stale-epoch rejection can identify the original signed proposal.
 Unknown or future membership revisions in an already verified canonical prefix
 are unauthorized at that position. Malformed or out-of-order inline control
 operations occupy their positions without holding up later valid controls.

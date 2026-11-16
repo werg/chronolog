@@ -152,6 +152,14 @@ export class GovernanceControlPlane {
     }
     return null
   }
+  /** Issuance depends on canonical position, never received wraps or local keys. */
+  canonicalEpochStatusAt(position: number, epochId: Uint8Array | null): 'active' | 'closed' | 'unissued' {
+    const active = this.canonicalEpochAt(position)
+    if (epochId === null || active === null) return 'unissued'
+    if (equalBytes(active, epochId)) return 'active'
+    return this.#canonicalEpochs.some(epoch => epoch.after < position && equalBytes(encodeCanonicalCbor(epoch.epoch), epochId))
+      ? 'closed' : 'unissued'
+  }
   /** Whether this node's transport feed is the current administration feed. */
   get ownsCapabilityFeed(): boolean { return this.#options.transport.identity === feedAuthor(this.#snapshot.capabilityLogFeed) }
 

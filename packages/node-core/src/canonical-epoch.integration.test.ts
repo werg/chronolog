@@ -1,4 +1,5 @@
 import { encodeGenesisManifest, signGenesis, type GenesisManifest } from '@chronolog/capabilities'
+import { sha256 } from '@chronolog/canonical'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import {
   DOMAINS, assertCanonicalCbor, bytesToHex, decodeEnvelope, digestExecutionManifest, emit, encodeCanonicalCbor,
@@ -9,6 +10,7 @@ import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCr
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { loadOrCreateEnrollmentIdentity } from './enrollment.js'
+import { createEpochEnvelopeCipher } from './cipher.js'
 import { createGovernedNode } from './governed-node.js'
 import { createPrefixAuthority, encodeOrderingEvidence, ReferenceRecordLog, type CoordinatedHistoryConfiguration } from './history-policy.js'
 import { createLedgerRecord } from './ledger-record.js'
@@ -88,28 +90,34 @@ async function fixture() {
 }
 
 describe('canonical encryption epoch acceptance fence', () => {
-  it.each(['epoch', 'length'] as const)('waits for authentic detached bytes, then skips a contradictory committed %s across restart', async (field) => {
+  it.each(['epoch', 'length', 'envelope'] as const)('waits for authentic detached bytes, then skips a contradictory committed %s across restart', async (field) => {
     const f = await fixture(), peer = await f.open()
     const first = await peer.node.publish({ operationId: 'metadata-before', program: program(emit('chat', 'before')) })
     const core = { ...first.core, operationId: 'contradictory-metadata', nonce: new Uint8Array(32).fill(151),
       program: program(emit('chat', 'must not execute')) }
     const canonical = encodeTransactionCore(core), proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
-    const envelope = await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing, peer.governance.cipherRing)
+    let envelope = await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing, peer.governance.cipherRing)
     const prepared = await createLedgerRecord(envelope)
+    let payloadHash = prepared.record.payloadHash
     const descriptor = assertCanonicalCbor(prepared.recordBytes)
     if (!Array.isArray(descriptor)) throw new Error('wrong test descriptor')
     if (field === 'epoch') descriptor[4] = encodeCanonicalCbor(999n)
-    else descriptor[6] = BigInt(envelope.length + 1)
+    else if (field === 'length') descriptor[6] = BigInt(envelope.length + 1)
+    else {
+      envelope = new Uint8Array([0xff])
+      payloadHash = bytesToHex(await sha256(envelope))
+      descriptor[5] = payloadHash; descriptor[6] = BigInt(envelope.length)
+    }
     await f.log.append(encodeCanonicalCbor(descriptor))
-    f.detached.set(prepared.record.payloadHash, null)
+    f.detached.set(payloadHash, null)
     const following = await peer.node.publish({ operationId: 'metadata-after', program: program(emit('chat', 'after')) })
     await expect(f.certify(peer)).rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
     expect(peer.node.isFinal(following.txId)).toBe(false)
     const corrupt = envelope.slice(); corrupt[corrupt.length - 1]! ^= 1
-    f.detached.set(prepared.record.payloadHash, corrupt)
-    await expect(f.certify(peer)).rejects.toThrow(field === 'epoch' ? 'LEDGER_PAYLOAD_DIGEST_MISMATCH' : 'LEDGER_PAYLOAD_LENGTH_INVALID')
+    f.detached.set(payloadHash, corrupt)
+    await expect(f.certify(peer)).rejects.toThrow(field === 'length' ? 'LEDGER_PAYLOAD_LENGTH_INVALID' : 'LEDGER_PAYLOAD_DIGEST_MISMATCH')
     expect(peer.node.isFinal(following.txId)).toBe(false)
-    f.detached.set(prepared.record.payloadHash, envelope)
+    f.detached.set(payloadHash, envelope)
     await f.certify(peer)
     expect(peer.node.outcome(proposalId)).toBeNull()
     expect(peer.node.outcome(following.txId)?.outcome).toBe('accepted')
@@ -121,6 +129,47 @@ describe('canonical encryption epoch acceptance fence', () => {
     expect(reopened.node.outcome(proposalId)).toBeNull()
     expect((await reopened.node.events.read()).transactions.map(transaction => transaction.proposalId)).toEqual([first.txIdText, following.txIdText])
     expect((await reopened.node.status()).lastError).toBeUndefined()
+  })
+
+  it.each(['unknown', 'future'] as const)('skips the %s encryption epoch never issued before its canonical position', async (kind) => {
+    const f = await fixture(), peer = await f.open()
+    const first = await peer.node.publish({ operationId: 'epoch-before', program: program(emit('chat', 'before')) })
+    const core = { ...first.core, operationId: 'unissued-epoch', nonce: new Uint8Array(32).fill(161),
+      program: program(emit('chat', 'must not execute')) }
+    const canonical = encodeTransactionCore(core), proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
+    const key = new Uint8Array(32).fill(162), epoch = kind === 'future' ? 1n : 999n
+    const envelope = await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing, createEpochEnvelopeCipher(key, epoch))
+    await peer.node.ingest(await peer.transport.publish(envelope))
+    const following = await peer.node.publish({ operationId: 'epoch-after', program: program(emit('chat', 'after')) })
+    if (kind === 'future') await peer.governance.rotateEpoch(f.identity.signing.privateKey, key, { operationId: 'later-rotation' })
+    await f.certify(peer)
+    expect(peer.node.outcome(proposalId)).toBeNull()
+    expect(peer.node.outcome(following.txId)?.outcome).toBe('accepted')
+    expect(peer.node.isFinal(following.txId)).toBe(true)
+    expect((await peer.node.events.read()).transactions.map(transaction => transaction.proposalId)).toEqual([first.txIdText, following.txIdText])
+    expect((await peer.node.status()).ingest?.retryRecords).toBe(0)
+    await peer.close()
+    const reopened = await f.open()
+    await f.certify(reopened)
+    expect(reopened.node.outcome(proposalId)).toBeNull()
+    expect((await reopened.node.events.read()).transactions.map(transaction => transaction.proposalId)).toEqual([first.txIdText, following.txIdText])
+    expect((await reopened.node.status()).lastError).toBeUndefined()
+  })
+
+  it('keeps an issued historical epoch blocked until its missing local key is delivered', async () => {
+    const f = await fixture(), peer = await f.open()
+    const transaction = await peer.node.publish({ operationId: 'issued-historical-epoch', program: program(emit('chat', 'must wait')) })
+    await peer.governance.rotateEpoch(f.identity.signing.privateKey, undefined, { operationId: 'next-epoch' })
+    peer.governance.cipherRing.remove(0n)
+    await expect(f.certify(peer)).rejects.toThrow('WIRE_ENCRYPTION_EPOCH_UNAVAILABLE')
+    expect(peer.node.isFinal(transaction.txId)).toBe(false)
+    expect((await peer.node.events.read()).transactions).toHaveLength(0)
+    await peer.governance.grantHistoricalAccess(f.identity.signing.publicKeyBytes, f.identity.signing.privateKey,
+      { operationId: 'restore-issued-key' })
+    await f.certify(peer)
+    expect(peer.node.outcome(transaction.txId)?.outcome).toBe('accepted')
+    expect(peer.node.isFinal(transaction.txId)).toBe(true)
+    expect((await peer.node.events.read()).transactions.map(item => item.proposalId)).toEqual([transaction.txIdText])
   })
 
   it('rejects a foreign execution profile at its certified position and continues across restart', async () => {

@@ -121,7 +121,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
           // Known invalid administrative bytes occupy their canonical position.
         }
       },
-      encryptionEpochAt: (position) => governance.canonicalEpochAt(position),
+      encryptionEpochStatusAt: (position, epochId) => governance.canonicalEpochStatusAt(position, epochId),
     },
   })
   const abort = new AbortController()
