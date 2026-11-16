@@ -83,8 +83,8 @@ export function createAgent(): AgentApplication {
         version: '1',
         topics: ['job-requests'],
         recovery: 'idempotent',
-        async dispatch({ event, idempotencyKey }) {
-          return provider.perform(event.payload, { idempotencyKey })
+        async dispatch({ event, idempotencyKey, signal }) {
+          return provider.perform(event.payload, { idempotencyKey, signal })
         },
       },
     }],
