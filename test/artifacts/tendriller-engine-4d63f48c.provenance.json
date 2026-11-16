@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "4d63f48c9a0f8e9765fe4d90541d67648fa20340",
+  "sourceTree": "d2479ff86bd9bccc0cd224439392567801df5bf2",
+  "sourceDirty": false,
+  "buildCommand": "npm run build (via npm run check)",
+  "dependencyInstallCommand": "npm ci --ignore-scripts --no-audit --no-fund",
+  "membershipSource": "8476228ca7645ddd003be74e663a3617e3f5c758",
+  "purpose": "Public quiet peer runtime and bounded WebRTC rendezvous; no hosted peer application-frame relay.",
+  "package": "@tendriller/engine",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-engine-4d63f48c.tgz",
+  "sha256": "0c260b5f5ebd6d76dd44b1c7d785a957d6514aa9dffaa70dd8bd122342b3f5b0"
+}

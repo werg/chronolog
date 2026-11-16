@@ -11,6 +11,8 @@ import { join, resolve } from 'node:path'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { isCapabilityActive } from '@chronolog/capabilities'
 import { bytesToHex, equalBytes } from '@chronolog/protocol'
+import type { EventBatch } from '@chronolog/protocol'
+import type { TransactionOutcome } from '@chronolog/rpc'
 import { openWebRtcConnection, WEBRTC_LIMITS } from '@chronolog/transport-webrtc'
 import type { DataChannelStats, PeerDescription } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
@@ -24,8 +26,13 @@ interface TestWindow { readonly chronologWebRtcTest: WebRtcTestApi }
 interface BrowserState {
   readonly records: readonly { readonly id: string; readonly author: string }[]
   readonly historySha256: string
-  readonly events: unknown
+  readonly events: EventBatch
   readonly stats: DataChannelStats
+}
+interface PublishedOperation { readonly proposalId: string; readonly outcome: TransactionOutcome }
+function finalDecision({ proposalId, outcome }: PublishedOperation) {
+  return { proposalId, transactionId: outcome.transactionId, phase: outcome.phase, outcome: outcome.outcome,
+    orderKey: outcome.orderKey, admissible: outcome.admissible, final: outcome.final }
 }
 const workspace = resolve(import.meta.dirname, '..')
 const outputArg = process.argv.indexOf('--output')
@@ -148,35 +155,57 @@ try {
   const nativeBefore = nativeConnection!.stats
   await closeHost()
   const hostBefore = structuredClone(host)
-  const first = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish('rtc-browser-operation', 'browser after signaling host stopped')) as { proposalId: string; outcome: { outcome: { type: string } } }
+  const first = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish('rtc-browser-operation', 'browser after signaling host stopped')) as PublishedOperation
+  assert.equal(first.outcome.transactionId, first.proposalId)
+  assert.equal(first.outcome.final, true)
   assert.equal(first.outcome.outcome.type, 'accepted')
   const nativeHandle = await native.client.events.publish('chat', { text: 'native after signaling host stopped' }, { operationId: 'rtc-native-operation' })
-  let nativeOutcome: unknown
+  let nativeOutcome: TransactionOutcome
   try { nativeOutcome = await nativeHandle.final({ signal: AbortSignal.timeout(20_000) }) } finally { nativeHandle.dispose() }
+  assert.equal(nativeOutcome.transactionId, nativeHandle.proposalId)
+  assert.equal(nativeOutcome.final, true)
+  assert.equal(nativeOutcome.outcome.type, 'accepted')
+  passed('both-original-operations-reach-accepted-finality')
   const receivedPayload = await page.evaluate(hash => (globalThis as unknown as TestWindow).chronologWebRtcTest.payload(hash), payloadHash) as { bytes: number; sha256: string }
   assert.equal(receivedPayload.sha256, payloadHash); assert.equal(receivedPayload.bytes, payload.length)
   passed('detached-body-after-signaling-host-stopped')
-  const retry = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish('rtc-browser-operation', 'browser after signaling host stopped'))
-  assert.deepEqual(retry, first)
+  const beforeRetry = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
+  const browserAuthoredBefore = beforeRetry.records.filter(record => record.author === identity.transportAuthor).map(record => record.id).sort()
+  assert(browserAuthoredBefore.length > 0)
+  const retry = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish('rtc-browser-operation', 'browser after signaling host stopped')) as PublishedOperation
+  // Observation timestamps and applied revisions advance after the native
+  // operation. The retained original identity and final decision cannot change.
+  assert.deepEqual(finalDecision(retry), finalDecision(first))
+  const afterRetry = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
+  const browserAuthoredAfter = afterRetry.records.filter(record => record.author === identity.transportAuthor).map(record => record.id).sort()
+  assert.deepEqual(browserAuthoredAfter, browserAuthoredBefore)
   passed('exact-original-operation-retry')
   let final!: BrowserState
+  let records: Array<{ id: string; author: string }> = [], nativeHistorySha256 = ''
   const deadline = Date.now() + 20_000
   for (;;) {
     final = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
     await native.transport.catchUp(); await native.node.waitForIdle()
-    if (JSON.stringify(final.events) === JSON.stringify(await native.client.events.read())) break
-    if (Date.now() >= deadline) throw new Error('WEBRTC_EVENTS_DID_NOT_CONVERGE')
+    records = (await native.transport.history()).map(record => ({ id: record.id, author: record.author })).sort((a, b) => a.id.localeCompare(b.id))
+    nativeHistorySha256 = digest(records.map(record => record.id).join('\n'))
+    if (JSON.stringify(final.events) === JSON.stringify(await native.client.events.read()) &&
+        final.historySha256 === nativeHistorySha256 && JSON.stringify(final.records) === JSON.stringify(records)) break
+    if (Date.now() >= deadline) throw new Error('WEBRTC_HISTORY_AND_EVENTS_DID_NOT_CONVERGE')
     await new Promise(resolve => setTimeout(resolve, 20))
   }
-  const records = (await native.transport.history()).map(record => ({ id: record.id, author: record.author })).sort((a, b) => a.id.localeCompare(b.id))
-  const nativeHistorySha256 = digest(records.map(record => record.id).join('\n'))
   assert.equal(final.historySha256, nativeHistorySha256)
   assert.deepEqual(final.records, records)
+  assert.deepEqual(final.events.transactions.flatMap(transaction => transaction.events).map(event =>
+    ({ proposalId: event.proposalId, topic: event.topic, payload: event.payload })).sort((a, b) => a.proposalId.localeCompare(b.proposalId)),
+  [{ proposalId: first.proposalId, topic: 'chat', payload: { text: 'browser after signaling host stopped' } },
+    { proposalId: nativeHandle.proposalId, topic: 'chat', payload: { text: 'native after signaling host stopped' } }]
+    .sort((a, b) => a.proposalId.localeCompare(b.proposalId)))
   assert.deepEqual(host, hostBefore)
   assert.equal(host.applicationRequests, 0)
   const signalingAfter = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.signaling())
   assert.equal(signalingAfter.sentMessages, negotiation.sentMessages)
   assert.deepEqual(errors, [])
+  native.assertHealthy()
   passed('final-events-and-original-records-converge-with-host-unavailable')
   const metrics = { signalingMessages: host.signalingMessages, signalingBytes: host.signalingBytes,
     signalingMessagesAfterClosed: signalingAfter.sentMessages - negotiation.sentMessages, signalingClosed: nativeSignalingClosed && signalingAfter.signalingClosed,
@@ -187,7 +216,9 @@ try {
     history: { browserSha256: final.historySha256, nativeSha256: nativeHistorySha256, recordIds: records.map(record => record.id) },
     payload: { bytes: payload.length, expectedSha256: payloadHash, receivedSha256: receivedPayload.sha256 },
     outcomes: { browser: first, retry, native: nativeOutcome, events: final.events },
-    channels: { browser: final.stats, native: nativeConnection!.stats } }
+    retry: { browserAuthoredBefore, browserAuthoredAfter },
+    channels: { browser: final.stats, native: nativeConnection!.stats },
+    byteBoundary: 'Logical authenticated peer frame payload bytes; excludes framing headers/credit and SCTP/DTLS/IP overhead.' }
   assert(metrics.bytesAfterSignalingClosed.browserSent > 0); assert(metrics.bytesAfterSignalingClosed.nativeSent >= payload.length)
   const source = { chronolog: { head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim(),
     dirty: execFileSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).trim().length > 0 } }

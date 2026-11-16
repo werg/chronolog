@@ -401,6 +401,7 @@ try {
       const routeStats = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeStats())))
       const browserSignaling = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.signalingStats())))
       assert(browserSignaling.flat().every(session => session.sentMessages === 1 && session.receivedMessages === 1))
+      await waitFor(async () => routes!.snapshot().signaling.activeSockets === 0, 'fresh introductions retire their signaling sockets before final evidence')
       const memory = await Promise.all(all.map(async page => {
         const session = await page.context().newCDPSession(page)
         try { await session.send('Performance.enable'); return await session.send('Performance.getMetrics') }
