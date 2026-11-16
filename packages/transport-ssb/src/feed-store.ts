@@ -99,6 +99,7 @@ export class FeedStore {
     readonly count: StatementSync
     readonly fork: StatementSync
     readonly forks: StatementSync
+    readonly forksAfter: StatementSync
     readonly maxIndex: StatementSync
     readonly evidenceById: StatementSync
     readonly evidenceInsert: StatementSync
@@ -178,6 +179,7 @@ export class FeedStore {
       count: prepare('SELECT count(*) AS count FROM records'),
       fork: prepare('INSERT OR IGNORE INTO forks (id, author, sequence, raw, received_at) VALUES (?, ?, ?, ?, ?)'),
       forks: prepare('SELECT DISTINCT author FROM forks ORDER BY author'),
+      forksAfter: prepare('SELECT rowid AS local_index, id, raw, received_at FROM forks WHERE rowid > ? ORDER BY rowid LIMIT ?'),
       maxIndex: prepare('SELECT coalesce(max(local_index), 0) AS local_index FROM records'),
       evidenceById: prepare('SELECT local_index FROM evidence WHERE id = ?'),
       evidenceInsert: prepare('INSERT INTO evidence (id, raw) VALUES (?, ?) RETURNING local_index'),
@@ -238,6 +240,21 @@ export class FeedStore {
   after(localIndex: bigint, limit: number): { readonly index: bigint; readonly record: TransportRecord }[] {
     return (this.#statements.after.all(localIndex, limit) as unknown as RecordRow[])
       .map((row) => ({ index: BigInt(row.local_index), record: rowRecord(row) }))
+  }
+
+  /** Retained fork evidence is part of local replay, including after restart. */
+  forksAfter(index: bigint, limit: number): { readonly index: bigint; readonly record: TransportRecord }[] {
+    if (index < 0n || index > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isSafeInteger(limit) || limit < 1 || limit > 4096) {
+      throw new Error('FEED_RANGE_INVALID')
+    }
+    const rows = this.#statements.forksAfter.all(index, limit) as unknown as {
+      local_index: bigint; id: string; raw: Uint8Array; received_at: bigint
+    }[]
+    return rows.map((row) => {
+      const record = decodeFeedRecord(new Uint8Array(row.raw))
+      if (record.id !== row.id) throw new Error('FEED_STORE_RECORD_MISMATCH')
+      return { index: row.local_index, record: toTransportRecord(record, Number(row.received_at)) }
+    })
   }
 
   /** Signed bytes of one feed after `sequence`, in order. */

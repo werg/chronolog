@@ -26,6 +26,8 @@ export interface FeedStorePort {
   getPayload(hash: string): Awaitable<Uint8Array | null>
   putPayload(bytes: Uint8Array): Awaitable<string>
   after(index: bigint, limit: number): Awaitable<readonly { readonly index: bigint; readonly record: TransportRecord }[]>
+  /** Durable conflicting records, replayed independently of the accepted feed prefix. */
+  forksAfter(index: bigint, limit: number): Awaitable<readonly { readonly index: bigint; readonly record: TransportRecord }[]>
   feedAfter(author: string, sequence: bigint, limit: number): Awaitable<readonly { readonly sequence: bigint; readonly raw: Uint8Array }[]>
   heads(): Awaitable<ReadonlyMap<string, bigint>>
   count(): Awaitable<number>
@@ -190,6 +192,12 @@ export class DurableFeedStore implements FeedStorePort {
   after(index: bigint, limit: number): readonly { readonly index: bigint; readonly record: TransportRecord }[] {
     assertRange(index, limit)
     return this.#records.slice(Number(index), Number(index) + limit)
+      .map((item, offset) => ({ index: index + BigInt(offset) + 1n, record: toTransportRecord(item.record, item.receivedAtMs) }))
+  }
+
+  forksAfter(index: bigint, limit: number): readonly { readonly index: bigint; readonly record: TransportRecord }[] {
+    assertRange(index, limit)
+    return this.#forks.slice(Number(index), Number(index) + limit)
       .map((item, offset) => ({ index: index + BigInt(offset) + 1n, record: toTransportRecord(item.record, item.receivedAtMs) }))
   }
 

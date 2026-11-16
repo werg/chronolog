@@ -21,7 +21,6 @@ export class PortableFeedTransport implements ChronologTransport {
   readonly #changes = new ChangeSignal()
   readonly #wanted = new Set<string>()
   readonly #connections = new Map<string, Connection>()
-  readonly #forks: TransportRecord[] = []
   #publish: Promise<unknown> = Promise.resolve()
   #closed = false
 
@@ -75,24 +74,28 @@ export class PortableFeedTransport implements ChronologTransport {
 
   async history(): Promise<readonly TransportRecord[]> {
     const records: TransportRecord[] = []
-    let after = 0n
-    for (;;) {
-      const batch = await this.#store.after(after, 4096)
-      if (batch.length === 0) return records
-      records.push(...batch.map(({ record }) => record))
-      after = batch.at(-1)!.index
+    for (const read of [this.#store.after.bind(this.#store), this.#store.forksAfter.bind(this.#store)]) {
+      let after = 0n
+      for (;;) {
+        const batch = await read(after, 4096)
+        if (batch.length === 0) break
+        records.push(...batch.map(({ record }) => record))
+        after = batch.at(-1)!.index
+      }
     }
+    return records
   }
 
   async *subscribe(signal?: AbortSignal): AsyncIterable<TransportRecord> {
     let after = 0n
-    let forkCursor = this.#forks.length
+    let forkCursor = 0n
     while (!this.#closed && signal?.aborted !== true) {
       const version = this.#changes.version
       const batch = await this.#store.after(after, 256)
       for (const entry of batch) { after = entry.index; yield cloneRecord(entry.record) }
-      while (forkCursor < this.#forks.length) yield cloneRecord(this.#forks[forkCursor++]!)
-      if (batch.length < 256) await this.#changes.wait(version, signal)
+      const forks = await this.#store.forksAfter(forkCursor, 256)
+      for (const entry of forks) { forkCursor = entry.index; yield cloneRecord(entry.record) }
+      if (batch.length < 256 && forks.length < 256) await this.#changes.wait(version, signal)
     }
   }
 
@@ -206,10 +209,7 @@ export class PortableFeedTransport implements ChronologTransport {
         for (const feed of this.#wanted) {
           await pullFeed(connection.link, feed, {
             store: this.#store, crypto: this.#crypto, maxRecordBytes: this.#maxRecordBytes,
-            onStored: (_record, result) => {
-              if (result.kind === 'fork') this.#forks.push(result.record)
-              this.#changes.notify()
-            },
+            onStored: () => { this.#changes.notify() },
           }, connection.controller.signal)
         }
         while (!connection.controller.signal.aborted) {

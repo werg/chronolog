@@ -95,6 +95,24 @@ describe('signed feed records', () => {
 })
 
 describe('FeedTransport', () => {
+  it('replays durable conflicts through history and new subscriptions after restart', async () => {
+    const path = await directory(), keys = ssbKeys.generate()
+    let transport = await open(path, { keys: { ...keys }, network: { reconnect: false } })
+    const first = await transport.publish(Uint8Array.of(1), { timestampMs: 1 })
+    await transport.close()
+    transports.splice(transports.indexOf(transport), 1)
+    const store = new FeedStore(join(path, 'ssb', 'feeds.sqlite'))
+    const fork = createFeedRecord(keys, 1n, null, 1n, Uint8Array.of(2))
+    store.append(fork, 10)
+    store.append(fork, 20)
+    store.close()
+    transport = await open(path, { keys: { ...keys }, network: { reconnect: false } })
+    expect((await transport.history()).map((record) => record.id)).toEqual([first.id, fork.id])
+    expect((await take(transport.subscribe(AbortSignal.timeout(1_000)), 2)).map((record) => record.id)).toEqual([first.id, fork.id])
+    expect(await transport.feedContiguousThrough(keys.id)).toBe(1n)
+    expect((await transport.status()).records).toBe(1)
+  })
+
   it('durably appends and reads exact payloads across reopen, without a size cap at SSB scale', async () => {
     const path = await directory()
     let transport = await open(path)

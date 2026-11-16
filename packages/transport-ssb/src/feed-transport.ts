@@ -116,7 +116,6 @@ export class FeedTransport implements ChronologTransport {
   readonly #progress = new Map<string, number>()
   readonly #connecting = new Set<string>()
   readonly #waiters = new Set<() => void>()
-  readonly #forkRecords: TransportRecord[] = []
   #reconnect?: ReconnectOptions
   #reconnectTimer?: ReturnType<typeof setInterval>
   /**
@@ -325,13 +324,16 @@ export class FeedTransport implements ChronologTransport {
 
   async history(): Promise<readonly TransportRecord[]> {
     const records: TransportRecord[] = []
-    let cursor = 0n
-    for (;;) {
-      const batch = this.#store.after(cursor, 4_096)
-      if (batch.length === 0) return records
-      for (const entry of batch) records.push(entry.record)
-      cursor = batch[batch.length - 1]!.index
+    for (const read of [this.#store.after.bind(this.#store), this.#store.forksAfter.bind(this.#store)]) {
+      let cursor = 0n
+      for (;;) {
+        const batch = read(cursor, 4_096)
+        if (batch.length === 0) break
+        for (const entry of batch) records.push(entry.record)
+        cursor = batch[batch.length - 1]!.index
+      }
     }
+    return records
   }
 
   /** Public retained-range port for authenticated direct or relayed frame adapters. */
@@ -367,14 +369,14 @@ export class FeedTransport implements ChronologTransport {
   /**
    * Every stored record once, in local arrival order, then each new one as it
    * is stored; a conflicting record for an existing sequence (fork evidence)
-   * is delivered as it is seen.
+   * is replayed from durable storage and delivered as it is seen.
    */
   subscribe(signal?: AbortSignal): AsyncIterable<TransportRecord> {
     const transport = this
     return {
       async *[Symbol.asyncIterator]() {
         let cursor = 0n
-        let forkCursor = transport.#forkRecords.length
+        let forkCursor = 0n
         while (!transport.#closed && signal?.aborted !== true) {
           const version = transport.#version
           const batch = transport.#store.after(cursor, SUBSCRIPTION_BATCH)
@@ -382,8 +384,9 @@ export class FeedTransport implements ChronologTransport {
             cursor = entry.index
             yield entry.record
           }
-          while (forkCursor < transport.#forkRecords.length) yield transport.#forkRecords[forkCursor++]!
-          if (batch.length < SUBSCRIPTION_BATCH) await transport.#waitForChange(version, signal)
+          const forks = transport.#store.forksAfter(forkCursor, SUBSCRIPTION_BATCH)
+          for (const entry of forks) { forkCursor = entry.index; yield entry.record }
+          if (batch.length < SUBSCRIPTION_BATCH && forks.length < SUBSCRIPTION_BATCH) await transport.#waitForChange(version, signal)
         }
       },
     }
@@ -475,7 +478,6 @@ export class FeedTransport implements ChronologTransport {
           await pullFeed(connection.link, feed, { store: this.#store, crypto: nativeFeedCrypto,
             maxRecordBytes: this.#maxRecordBytes,
             onStored: (record, result) => {
-              if (result.kind === 'fork') this.#forkRecords.push(result.record)
               if (result.kind === 'appended') this.#progress.set(record.author, Date.now())
               this.#notify()
             },
@@ -545,7 +547,6 @@ export class FeedTransport implements ChronologTransport {
       onStored: (record, result) => {
         this.#clearStreamError(rpc, feed)
         if (result.kind === 'appended' && this.#configured.has(record.author)) this.#progress.set(record.author, Date.now())
-        if (result.kind === 'fork') this.#forkRecords.push(result.record)
         this.#notify()
       },
     }, controller.signal).catch((error: unknown) => {
