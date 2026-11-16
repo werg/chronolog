@@ -125,6 +125,9 @@ identity. A new identity has no inherited grants or local operation journal.
 Use a new peer name when enrolling a replacement device; revoke the lost device
 through the administrator. A surviving replica can supply authorized history,
 but cannot reconstruct that device's erased private keys or unpublished drafts.
+The [device boundary runbook](../../docs/device-boundary-qualification.md) records
+actual Chromium quota/storage-clear scenarios, protocol authorization checks and
+the physical-device/deployed-authentication work that remains separate.
 
 ```ts
 // peer-worker.ts

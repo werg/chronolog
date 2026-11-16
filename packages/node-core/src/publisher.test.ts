@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { capabilityId, encodeGenesisManifest, signGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
-import { DOMAINS, decodeEnvelope, decodeTransactionCore, emit, encodeTransactionCore, hashDomain, program, type Ed25519KeyPair } from '@chronolog/protocol'
+import { DOMAINS, decodeEnvelope, decodeTransactionCore, emit, encodeTransactionCore, hashDomain, platformOp, program, type Ed25519KeyPair } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { CapabilityMembershipResolver } from './capability-membership.js'
 import { loadOrCreateEnrollmentIdentity, type EnrollmentDescriptor } from './enrollment.js'
@@ -83,6 +83,23 @@ describe('limited original-signer publishers', () => {
     expect(record.author).toBe('owner')
     expect(forwarded).toEqual(original)
     expect(forwarded.signer).toEqual(f.publisherIdentity.publicKeyBytes)
+    const publishedCount = (await f.transport.history()).length
+    const capturedCore = decodeTransactionCore(original.payload)
+    // Bypass the friendly publisher API: ingress must check actual signed rights.
+    for (const [label, denied] of [
+      ['topic', program(emit('administration/private', 'outside the grant'))],
+      ['sql', program('SELECT 1', emit('chat/message', 'SQL escalation'))],
+      ['platform', program(platformOp.endSeeding(), emit('chat/message', 'platform escalation'))],
+    ] as const) {
+      const signed = await signWireMessage('candidate', encodeTransactionCore({ ...capturedCore,
+        operationId: `direct-denied-${label}`, program: denied }), f.publisherIdentity)
+      await expect(node.submitSigned(signed)).rejects.toThrow('WRITER_UNAUTHORIZED')
+    }
+    const changedSignature = sent[0]!.slice()
+    changedSignature[changedSignature.length - 1]! ^= 1
+    await expect(node.submitSigned(changedSignature)).rejects.toThrow('WIRE_SIGNATURE_INVALID')
+    expect((await node.submitSigned(sent[0]!)).txIdText).toBe(receipt.proposalId)
+    expect((await f.transport.history()).length).toBe(publishedCount)
     await f.governance.publishCapabilityChange({ revocations: [await capabilityId(f.approval.revision.revision.grants[0]!)] }, f.identity.signing.privateKey)
     const count = (await f.transport.history()).length
     expect((await node.submitSigned(sent[0]!)).txIdText).toBe(receipt.proposalId)
