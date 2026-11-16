@@ -107,11 +107,18 @@ endpoint.addEventListener('message', event => {
         const active = connection
         void active.completion.catch((error: unknown) => { if (connection === active) connectionError = String(error) })
           .finally(() => { if (connection === active) connection = undefined })
-        await peer!.transport.catchUp()
-        return status()
+        // Attachment owns only RTC/framing and the peer identity proof. The
+        // caller's explicit sync owns retained history and SQL materialization.
+        return { connected: true, rtc: active.stats() }
       }
       case 'disconnect': await disconnect(); return status()
-      case 'sync': await peer!.transport.catchUp(); return status()
+      case 'sync': {
+        if (connectionError !== undefined) throw new Error(connectionError)
+        await peer!.transport.catchUp()
+        const current = await status()
+        if (connectionError !== undefined) throw new Error(connectionError)
+        return current
+      }
       case 'publish': {
         const handle = await client!.submit(program(emit('qualification', { text: request.text! })), { operationId: request.operationId! })
         try { return { operationId: request.operationId, proposalId: handle.proposalId } } finally { handle.dispose() }
