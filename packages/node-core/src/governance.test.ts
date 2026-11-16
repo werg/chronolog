@@ -18,6 +18,41 @@ const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('replicated governance control plane', () => {
+  it('keeps a relayed governance successor pending until its authenticated predecessor arrives', async () => {
+    const fixture = await governanceFixture()
+    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(31), 'writer')] }, fixture.root.privateKey)
+    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(32), 'writer')] }, fixture.root.privateKey)
+    const records = await fixture.adminTransport.history()
+    const transport = fixture.network.createNode('late-reader')
+    transport.receive(records[1]!)
+    const participant = await GovernanceControlPlane.create({ genesis: fixture.genesis, groupRoute: fixture.groupRoute,
+      transport, identity: await generateEd25519KeyPair() })
+    controllers.push(participant)
+    await participant.start()
+    expect(participant.snapshot.revision).toBe(0n)
+    expect(participant.pendingRecordCount).toBe(1)
+    transport.receive(records[0]!)
+    await waitFor(() => participant.snapshot.revision === 2n)
+    expect(participant.pendingRecordCount).toBe(0)
+    expect(participant.revisionSnapshots.map((snapshot) => snapshot.revision)).toEqual([0n, 1n, 2n])
+  })
+
+  it('continues consuming valid governance after an unauthorized feed replays a control record', async () => {
+    const fixture = await governanceFixture()
+    const transport = fixture.network.createNode('reader')
+    const attacker = fixture.network.createNode('attacker')
+    fixture.network.connectAll()
+    const participant = await GovernanceControlPlane.create({ genesis: fixture.genesis, groupRoute: fixture.groupRoute,
+      transport, identity: await generateEd25519KeyPair() })
+    controllers.push(participant)
+    await participant.start()
+    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(33), 'writer')] }, fixture.root.privateKey)
+    await waitFor(() => participant.snapshot.revision === 1n)
+    await attacker.publish((await fixture.adminTransport.history())[0]!.payload)
+    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(34), 'writer')] }, fixture.root.privateKey)
+    await waitFor(() => participant.snapshot.revision === 2n)
+  })
+
   it('does not author a successor before a locally retained predecessor reaches the canonical relay', async () => {
     const fixture = await governanceFixture(new MemoryOperationStore())
     let relayAvailable = false

@@ -119,7 +119,10 @@ export class CapabilityMembershipResolver implements MembershipResolver {
       validationPolicy: new Uint8Array(),
       writerId: context.signingId,
     })
-    if (!snapshot) return false
+    if (!snapshot) {
+      if (await this.#snapshots(context.membershipRevision) === null) throw new GovernanceEvidencePendingError()
+      return false
+    }
     const capability = context.role === 'validator'
       ? snapshot.capabilities.get(bytesToHex(context.validatorCapability ?? new Uint8Array()))
       : snapshot.capabilities.get(bytesToHex(context.writerCapability ?? new Uint8Array()))

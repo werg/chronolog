@@ -1,6 +1,7 @@
 import {
   applyCapabilityRevision,
   capabilityId,
+  capabilityRevisionDigest,
   decodeSignedCapabilityRevision as decodeSignedCapabilityRevisionBytes,
   encodeCapabilityRevision,
   encodeSignedCapabilityRevision as encodeSignedCapabilityRevisionBytes,
@@ -25,6 +26,7 @@ import {
 } from '@chronolog/crypto'
 import {
   DOMAINS,
+  ProtocolError,
   assertCanonicalCbor,
   bytesToHex,
   decodeEnvelope,
@@ -85,6 +87,7 @@ export class GovernanceControlPlane {
   readonly #cipherRing: EpochCipherRing
   readonly #snapshots = new Map<string, CapabilitySnapshot>()
   readonly #seen = new Set<string>()
+  readonly #pendingRecords = new Map<string, TransportRecord>()
   readonly #mutex = new Mutex()
   // Ingestion and authoring have different locks: publish awaits ingestion,
   // while revision/epoch selection, signing and publication must be one turn.
@@ -102,6 +105,7 @@ export class GovernanceControlPlane {
   #currentEpoch = -1n
   #consumeTask: Promise<void> | undefined
   #started = false
+  #lastError: string | undefined
 
   private constructor(options: GovernanceControlPlaneOptions, snapshot: CapabilitySnapshot) {
     this.#options = options
@@ -118,6 +122,11 @@ export class GovernanceControlPlane {
   }
 
   get snapshot(): CapabilitySnapshot { return structuredClone(this.#snapshot) }
+  get revisionSnapshots(): readonly CapabilitySnapshot[] {
+    return [...this.#snapshots.values()].sort((a, b) => compareBigint(a.revision, b.revision)).map((snapshot) => structuredClone(snapshot))
+  }
+  get pendingRecordCount(): number { return this.#pendingRecords.size }
+  get lastError(): string | undefined { return this.#lastError }
   get cipherRing(): EpochCipherRing { return this.#cipherRing }
   get currentEpoch(): bigint | null { return this.#currentEpoch < 0n ? null : this.#currentEpoch }
   get knownEpochs(): readonly bigint[] { return [...this.#epochManifests.keys()].sort(compareBigint) }
@@ -132,11 +141,18 @@ export class GovernanceControlPlane {
 
   async start(): Promise<void> {
     if (this.#started) return
-    this.#started = true
     const history = await this.#options.transport.history()
-    for (const record of history) await this.ingest(record)
+    for (const record of history) {
+      try { await this.ingest(record) }
+      catch (error) {
+        if (!invalidGovernanceRecord(error)) throw error
+        this.#seen.add(record.id)
+        this.#lastError = error.message
+      }
+    }
     if (this.ownsCapabilityFeed) await this.#authoring.run(() => this.#operations.recover((prepared) => this.#applyPrepared(prepared)))
-    this.#consumeTask = this.#consume(this.#options.transport.subscribe(this.#abort.signal))
+    this.#started = true
+    this.#consumeTask = this.#consume()
   }
 
   async close(): Promise<void> {
@@ -273,7 +289,34 @@ export class GovernanceControlPlane {
   }
 
   async ingest(record: TransportRecord): Promise<boolean> {
-    return this.#mutex.run(() => this.#ingest(record))
+    return this.#mutex.run(async () => {
+      const attempt = async (input: TransportRecord): Promise<boolean> => {
+        try {
+          const changed = await this.#ingest(input)
+          this.#pendingRecords.delete(input.id)
+          return changed
+        } catch (error) {
+          if (!(error instanceof GovernanceRecordPendingError)) throw error
+          this.#pendingRecords.set(input.id, input)
+          return false
+        }
+      }
+      const changed = await attempt(record)
+      let progressed = true
+      while (progressed && this.#pendingRecords.size > 0) {
+        progressed = false
+        for (const pending of [...this.#pendingRecords.values()]) {
+          try { if (await attempt(pending)) progressed = true }
+          catch (error) {
+            if (!invalidGovernanceRecord(error)) throw error
+            this.#pendingRecords.delete(pending.id)
+            this.#seen.add(pending.id)
+            this.#lastError = error.message
+          }
+        }
+      }
+      return changed
+    })
   }
 
   async #ingest(record: TransportRecord): Promise<boolean> {
@@ -284,12 +327,23 @@ export class GovernanceControlPlane {
     if (record.author !== feedAuthor(this.#snapshot.capabilityLogFeed)) {
       throw new Error('GOVERNANCE_CAPABILITY_FEED_UNAUTHORIZED')
     }
+    if (this.#options.transport.feedContiguousThrough !== undefined &&
+        await this.#options.transport.feedContiguousThrough(record.author) < record.sequence) throw new GovernanceRecordPendingError()
     const tagged = assertCanonicalCbor(decoded.payload)
     if (!Array.isArray(tagged) || tagged.length !== 2 || typeof tagged[0] !== 'bigint' || !(tagged[1] instanceof Uint8Array)) {
       throw new Error('GOVERNANCE_PAYLOAD_INVALID')
     }
     if (decoded.type === 'capability') {
       const signed = decodeSignedCapabilityRevisionBytes(tagged[1])
+      if (signed.revision.revision > this.#snapshot.revision + 1n) throw new GovernanceRecordPendingError()
+      if (signed.revision.revision <= this.#snapshot.revision) {
+        const known = this.#snapshots.get(bytesToHex(await capabilityRevisionDigest(signed.revision)))
+        if (known === undefined || !await verifyDomain(DOMAINS.capabilityRevision, encodeCapabilityRevision(signed.revision), signed.signature, signed.revision.issuerRootPublicKey)) {
+          throw new Error('GOVERNANCE_REVISION_CONFLICT')
+        }
+        this.#seen.add(record.id)
+        return false
+      }
       this.#snapshot = await applyCapabilityRevision(this.#snapshot, signed)
       this.#rememberSnapshot(this.#snapshot)
       this.#emit('capability', record.id)
@@ -317,16 +371,15 @@ export class GovernanceControlPlane {
     const digest = await hashDomain(DOMAINS.epochManifest, encodeEpochManifest(signed.manifest))
     if (!historical) {
       const expectedEpoch = this.#currentEpoch + 1n
+      if (signed.manifest.epoch > expectedEpoch) throw new GovernanceRecordPendingError()
       const expectedPrevious = this.#currentEpoch < 0n ? null : this.#epochDigests.get(this.#currentEpoch) ?? null
       if (signed.manifest.epoch !== expectedEpoch || !nullableBytesEqual(signed.manifest.previousEpochDigest, expectedPrevious)) {
         throw new Error('GOVERNANCE_EPOCH_CHAIN_INVALID')
       }
-      this.#currentEpoch = signed.manifest.epoch
-      this.#epochManifests.set(signed.manifest.epoch, signed)
-      this.#epochDigests.set(signed.manifest.epoch, digest)
     } else if (!this.#epochManifests.has(signed.manifest.epoch)) {
-      throw new Error('GOVERNANCE_HISTORICAL_EPOCH_UNKNOWN')
+      throw new GovernanceRecordPendingError()
     }
+    let unwrapped: Uint8Array | undefined
     if (this.#options.recipient !== undefined) {
       try {
         const key = await unwrapEpochKey({
@@ -335,17 +388,21 @@ export class GovernanceControlPlane {
           recipientId: this.#options.recipient.id,
           recipientPrivateKey: this.#options.recipient.privateKey,
         })
-        this.#contentKeys.set(signed.manifest.epoch, key.slice())
-        this.#cipherRing.install(key, signed.manifest.epoch, !historical)
+        unwrapped = key
       } catch {
         // A valid manifest need not include this participant. Revoked and
         // snapshot-scoped readers intentionally retain only prior epochs.
       }
     }
-    const retained = this.#contentKeys.get(signed.manifest.epoch) ??
+    const retained = unwrapped ?? this.#contentKeys.get(signed.manifest.epoch) ??
       await this.#operationStore.get(`${this.#operationPrefix}/epoch-key/${signed.manifest.epoch}`)
+    if (retained !== null && retained !== undefined && retained.length !== 32) throw new Error('GOVERNANCE_STORED_KEY_INVALID')
+    if (!historical) {
+      this.#currentEpoch = signed.manifest.epoch
+      this.#epochManifests.set(signed.manifest.epoch, signed)
+      this.#epochDigests.set(signed.manifest.epoch, digest)
+    }
     if (retained !== null && retained !== undefined) {
-      if (retained.length !== 32) throw new Error('GOVERNANCE_STORED_KEY_INVALID')
       this.#contentKeys.set(signed.manifest.epoch, retained.slice())
       this.#cipherRing.install(retained, signed.manifest.epoch, !historical)
     }
@@ -384,10 +441,26 @@ export class GovernanceControlPlane {
     }
   }
 
-  async #consume(records: AsyncIterable<TransportRecord>): Promise<void> {
-    for await (const record of records) {
-      if (this.#abort.signal.aborted) return
-      await this.ingest(record)
+  async #consume(): Promise<void> {
+    while (!this.#abort.signal.aborted) {
+      try {
+        for await (const record of this.#options.transport.subscribe(this.#abort.signal)) {
+          if (this.#abort.signal.aborted) return
+          try { await this.ingest(record) }
+          catch (error) {
+            if (!invalidGovernanceRecord(error)) throw error
+            this.#seen.add(record.id)
+            this.#lastError = error.message
+          }
+        }
+      } catch (error) {
+        this.#lastError = error instanceof Error ? error.message : String(error)
+      }
+      if (!this.#abort.signal.aborted) await new Promise<void>((resolve) => {
+        const finish = () => { clearTimeout(timer); this.#abort.signal.removeEventListener('abort', finish); resolve() }
+        const timer = setTimeout(finish, 100)
+        this.#abort.signal.addEventListener('abort', finish, { once: true })
+      })
     }
   }
 
@@ -489,3 +562,9 @@ function decodePrepared(bytes: Uint8Array): {
 
 function preparedResult(bytes: Uint8Array): Uint8Array { return decodePrepared(bytes).result }
 function compareBigint(left: bigint, right: bigint): number { return left < right ? -1 : left > right ? 1 : 0 }
+
+class GovernanceRecordPendingError extends Error {}
+
+function invalidGovernanceRecord(error: unknown): error is Error {
+  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_CHAIN_INVALID|REVISION_CONFLICT)$/u.test(error.message))
+}
