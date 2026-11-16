@@ -237,6 +237,9 @@ export class ChronologNode {
   async publish(input: PublishTransactionInput): Promise<PublishedTransaction> {
     this.#assertReady()
     assertValidChangeProgram(input.program)
+    // Freeze the caller's proposal before the first suspension: the durable
+    // fingerprint and signed bytes must describe the same program and context.
+    input = structuredClone(input)
     const fingerprint = encodeCanonicalCbor([
       changeProgramToCanonicalCbor(input.program), input.authorTimestampMs ?? null,
       input.nonce ?? null, input.membershipRevision ?? null, input.validationPolicy ?? null,
@@ -263,6 +266,7 @@ export class ChronologNode {
    */
   async submitSigned(signed: Uint8Array): Promise<PublishedTransaction> {
     this.#assertReady()
+    signed = signed.slice()
     const wire = await decodeSignedMessage(signed)
     if (wire.type !== 'candidate') throw new Error('INGRESS_CANDIDATE_REQUIRED')
     const core = decodeTransactionCore(wire.payload)
@@ -306,9 +310,10 @@ export class ChronologNode {
   }> {
     return this.#mutex.run(() => {
       const view = options.view ?? 'final'
-      const capture = this.#options.materialization.queries.captureRead
-      if (capture === undefined) throw new Error('MATERIALIZER_SNAPSHOT_UNAVAILABLE')
-      const sql: MaterializedReadHandle = capture.call(this.#options.materialization.queries, { view })
+      const queries = this.#options.materialization.queries
+      if (queries.captureRead === undefined) throw new Error('MATERIALIZER_SNAPSHOT_UNAVAILABLE')
+      const sql: MaterializedReadHandle = queries.captureRead({ view })
+      try {
       const snapshot = this.#eventSnapshot(view)
       const finalRevision = this.#eventSnapshot('final').revision
       let released = false
@@ -323,6 +328,7 @@ export class ChronologNode {
         },
         release() { if (!released) { released = true; sql.release() } },
       }
+      } catch (error) { sql.release(); throw error }
     })
   }
 
@@ -341,7 +347,7 @@ export class ChronologNode {
     const policy = this.#options.historyPolicy
     const historyId = `${bytesToHex(this.groupId)}/${bytesToHex(this.executionManifestDigest)}/${policy?.kind === 'coordinated' ? policy.policy.configuration.historyId : 'peer'}`
     const item = (id: Uint8Array, anchor: string): EventHistoryItem => {
-      const core = this.candidateCore(id)
+      const core = this.#candidateCores.get(this.#idKey(id)) ?? null
       const outcome = this.outcome(id)
       return { anchor, proposalId: new TextDecoder().decode(id),
         ...(core === null ? {} : { program: core.program }), outcome: outcome?.outcome ?? 'unresolved' }
@@ -699,7 +705,7 @@ export class ChronologNode {
   }
 
   candidateCore(txId: Uint8Array): TransactionCore | null {
-    return this.#candidateCores.get(this.#idKey(txId)) ?? null
+    return structuredClone(this.#candidateCores.get(this.#idKey(txId)) ?? null)
   }
 
   async settlementEvidence(txId: Uint8Array): Promise<SettlementEvidence | null> {

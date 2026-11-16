@@ -12,6 +12,7 @@ export {
   type ApproveEnrollmentResponse,
   type CreateEnrollmentResponse,
   type EnrollmentRole,
+  type EnrollmentWriterProgram,
   type EnrollmentState,
   type EnrollmentStatus,
   type LocalSqlValue,

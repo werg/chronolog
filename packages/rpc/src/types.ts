@@ -262,12 +262,19 @@ export interface GrantHistoricalAccessRequest extends GetGovernanceStatusRequest
 export interface GrantHistoricalAccessResponse { readonly epochManifestsPublished: number }
 
 export type EnrollmentRole = 'reader' | 'writer'
+export interface EnrollmentWriterProgram {
+  readonly sql: boolean
+  readonly topics: readonly string[]
+  readonly signals: readonly string[]
+  readonly forwarded?: boolean
+}
 export type EnrollmentState = 'requested' | 'approved' | 'authorized-disconnected' | 'awaiting-keys' | 'awaiting-history' | 'unsupported-engine' | 'revoked' | 'ready'
 export interface CreateEnrollmentRequest {
   readonly groupId: GroupId
   /** Stable device-local request identity; persist it before retrying enrollment. */
   readonly requestId: RequestId
   readonly roles: readonly EnrollmentRole[]
+  readonly writerProgram?: EnrollmentWriterProgram
 }
 export interface CreateEnrollmentResponse { readonly signedRequest: CanonicalBytes }
 export interface ApproveEnrollmentRequest {
@@ -276,6 +283,7 @@ export interface ApproveEnrollmentRequest {
   readonly requestId: RequestId
   readonly signedRequest: CanonicalBytes
   readonly roles: readonly EnrollmentRole[]
+  readonly writerProgram?: EnrollmentWriterProgram
   readonly grantFullHistory: boolean
 }
 export interface ApproveEnrollmentResponse { readonly signedApproval: CanonicalBytes }

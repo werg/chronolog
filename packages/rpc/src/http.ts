@@ -117,14 +117,18 @@ export class HttpRpcServer {
   async close(): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise
     this.#closing = true
+    this.#closePromise = this.#shutdown()
+    return this.#closePromise
+  }
+
+  async #shutdown(): Promise<void> {
     for (const controller of this.#calls) controller.abort('RPC server is shutting down')
     await this.#options.service.close?.()
     if (!this.#server.listening) {
       this.#address = null
       return
     }
-    this.#closePromise = this.#close()
-    return this.#closePromise
+    await this.#close()
   }
 
   async #close(): Promise<void> {

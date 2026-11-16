@@ -1,4 +1,4 @@
-import type { CapabilitySnapshot } from '@chronolog/capabilities'
+import type { CapabilitySnapshot, ProgramRights } from '@chronolog/capabilities'
 import {
   decodeSignedEnrollmentApproval, decodeSignedEnrollmentRequest,
   encodeSignedEnrollmentApproval, encodeSignedEnrollmentRequest,
@@ -28,11 +28,12 @@ export interface EnrollmentServiceOptions {
 
 export function createEnrollmentService(options: EnrollmentServiceOptions) {
   return {
-    async createRequest(request: { readonly requestId: string; readonly roles: readonly EnrollmentRole[] }) {
+    async createRequest(request: { readonly requestId: string; readonly roles: readonly EnrollmentRole[]; readonly writerProgram?: ProgramRights }) {
       const signed = await prepareEnrollmentRequest({
         descriptor: options.descriptor, store: options.store, requestId: request.requestId,
         requestedRoles: request.roles, identity: options.identity,
         readerPublicKey: options.readerPublicKey, transportAuthor: options.transportAuthor,
+        ...(request.writerProgram === undefined ? {} : { writerProgram: request.writerProgram }),
       })
       return { signedRequest: base64url(encodeSignedEnrollmentRequest(signed)) }
     },
@@ -42,10 +43,12 @@ export function createEnrollmentService(options: EnrollmentServiceOptions) {
       readonly signedRequest: string
       readonly roles: readonly EnrollmentRole[]
       readonly grantFullHistory: boolean
+      readonly writerProgram?: ProgramRights
     }) {
       if (options.issuer === undefined) throw new Error('ENROLLMENT_ISSUER_UNAVAILABLE')
       const approval = await options.issuer.approve(decodeSignedEnrollmentRequest(decodeBase64url(request.signedRequest)), {
         operationId: request.requestId, roles: request.roles, grantFullHistory: request.grantFullHistory,
+        ...(request.writerProgram === undefined ? {} : { writerProgram: request.writerProgram }),
       })
       return { signedApproval: base64url(encodeSignedEnrollmentApproval(approval)) }
     },

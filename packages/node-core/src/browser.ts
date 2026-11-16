@@ -15,3 +15,4 @@ export * from './wire.js'
 export { FeedForkRegistry } from './feed-forks.js'
 
 export * from './events.js'
+export * from './publisher.js'

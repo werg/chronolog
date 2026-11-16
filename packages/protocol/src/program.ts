@@ -33,8 +33,15 @@ export function canonicalEventPayload(payload: EventPayload): string {
       return JSON.stringify(value)
     }
     if (Array.isArray(value)) {
-      for (let i = 0; i < value.length; i++) protocolInvariant(Object.hasOwn(value, i), 'SCHEMA_INVALID', 'Event arrays cannot be sparse')
-      return `[${value.map((entry) => visit(entry, depth + 1)).join(',')}]`
+      protocolInvariant(Reflect.ownKeys(value).length === value.length + 1, 'SCHEMA_INVALID', 'Event arrays cannot carry extra properties')
+      const entries: string[] = []
+      for (let i = 0; i < value.length; i++) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, i)
+        protocolInvariant(descriptor !== undefined && 'value' in descriptor && descriptor.enumerable === true,
+          'SCHEMA_INVALID', 'Event arrays require dense data elements')
+        entries.push(visit(descriptor.value as EventPayload, depth + 1))
+      }
+      return `[${entries.join(',')}]`
     }
     protocolInvariant(typeof value === 'object' && value !== null &&
       (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null),

@@ -24,6 +24,15 @@ function readHandle(revision: string, release: () => void): RpcReadHandle {
 }
 
 describe('application RPC', () => {
+  it('closes the owning service once when HTTP shutdown calls overlap', async () => {
+    const close = vi.fn(async () => { await Promise.resolve() })
+    const server = new HttpRpcServer({ service: { close } as unknown as ChronologRpcService, port: 0 })
+    await server.listen()
+    await Promise.all([server.close(), server.close()])
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(server.address).toBeNull()
+  })
+
   it('forwards original publisher bytes without invoking local authoring or operation lookup', async () => {
     const publish = vi.fn<ChronologRpcNodeService['publish']>(async () => { throw new Error('must not re-author') })
     const submitSigned = vi.fn(async (_wire: Uint8Array) => published)

@@ -1,6 +1,7 @@
 import {
   capabilityId, capabilityRevisionDigest, encodeGenesisManifest, encodeSignedCapabilityRevision,
   decodeSignedCapabilityRevision, isCapabilityActive, verifySignedGenesis,
+  normalizeProgramRights, programRightsSubset, type ProgramRights,
   type CapabilityGrant, type CapabilitySnapshot, type SignedCapabilityRevision, type SignedGenesis,
 } from '@chronolog/capabilities'
 import {
@@ -33,6 +34,7 @@ export interface EnrollmentIdentity {
 }
 
 export interface EnrollmentRequest {
+  readonly writerProgram?: ProgramRights
   readonly requestId: string
   readonly groupId: Uint8Array
   readonly genesisDigest: Uint8Array
@@ -58,6 +60,7 @@ export interface EnrollmentFinalTarget {
 }
 
 export interface EnrollmentApproval {
+  readonly writerProgram?: ProgramRights
   readonly requestId: string
   readonly requestDigest: Uint8Array
   readonly groupId: Uint8Array
@@ -123,6 +126,7 @@ export async function prepareEnrollmentRequest(options: {
   readonly readerPublicKey: Uint8Array
   readonly transportAuthor: string
   readonly requestedRoles: readonly EnrollmentRole[]
+  readonly writerProgram?: ProgramRights
 }): Promise<SignedEnrollmentRequest> {
   await verifyEnrollmentDescriptor(options.descriptor)
   const request: EnrollmentRequest = {
@@ -132,6 +136,7 @@ export async function prepareEnrollmentRequest(options: {
     executionManifestDigest: options.descriptor.history.executionManifestDigest,
     signingPublicKey: options.identity.publicKeyBytes, readerPublicKey: options.readerPublicKey,
     transportAuthor: options.transportAuthor, requestedRoles: roles(options.requestedRoles), historyAccess: 'full',
+    ...(options.writerProgram === undefined ? {} : { writerProgram: normalizeProgramRights(options.writerProgram) }),
   }
   const payload = encodeEnrollmentRequest(request)
   return storeLock(options.store).run(async () => {
@@ -203,10 +208,11 @@ export function encodeEnrollmentRequest(request: EnrollmentRequest): Uint8Array 
   if (request.transportAuthor.length === 0 || request.transportAuthor.length > 512 || request.historyAccess !== 'full') {
     throw new Error('ENROLLMENT_REQUEST_INVALID')
   }
+  if (request.writerProgram !== undefined && !request.requestedRoles.includes('writer')) throw new Error('ENROLLMENT_PROGRAM_WITHOUT_WRITER')
   return encodeCanonicalCbor([
-    1n, request.requestId, request.groupId, request.genesisDigest, request.policyDigest,
+    2n, request.requestId, request.groupId, request.genesisDigest, request.policyDigest,
     request.executionManifestDigest, request.signingPublicKey, request.readerPublicKey,
-    request.transportAuthor, roles(request.requestedRoles), request.historyAccess,
+    request.transportAuthor, roles(request.requestedRoles), request.historyAccess, rightsValue(request.writerProgram),
   ])
 }
 
@@ -217,13 +223,14 @@ export function encodeSignedEnrollmentRequest(signed: SignedEnrollmentRequest): 
 
 export function decodeSignedEnrollmentRequest(encoded: Uint8Array): SignedEnrollmentRequest {
   const signed = array(encoded, 2)
-  const value = array(bytes(signed[0]), 11)
-  if (value[0] !== 1n || value[10] !== 'full') throw new Error('ENROLLMENT_REQUEST_INVALID')
+  const value = array(bytes(signed[0]), 12)
+  if (value[0] !== 2n || value[10] !== 'full') throw new Error('ENROLLMENT_REQUEST_INVALID')
   const request: EnrollmentRequest = {
     requestId: string(value[1]), groupId: bytes(value[2], 32), genesisDigest: bytes(value[3], 32),
     policyDigest: bytes(value[4], 32), executionManifestDigest: bytes(value[5], 32),
     signingPublicKey: bytes(value[6], 32), readerPublicKey: bytes(value[7], 32),
     transportAuthor: string(value[8]), requestedRoles: rolesValue(value[9]), historyAccess: 'full',
+    ...(value[11] === null ? {} : { writerProgram: rightsFromValue(value[11]) }),
   }
   // Noncanonical role ordering/duplicates cannot acquire a different identity.
   if (!equalBytes(encodeEnrollmentRequest(request), bytes(signed[0]))) throw new Error('ENROLLMENT_REQUEST_INVALID')
@@ -260,6 +267,7 @@ export class EnrollmentIssuer {
     readonly operationId: string
     readonly roles: readonly EnrollmentRole[]
     readonly grantFullHistory: boolean
+    readonly writerProgram?: ProgramRights
   }): Promise<SignedEnrollmentApproval> {
     validateOperationId(decision.operationId)
     await verifyEnrollmentDescriptor(this.#options.descriptor)
@@ -269,10 +277,12 @@ export class EnrollmentIssuer {
         !equalBytes(request.genesisDigest, this.#options.descriptor.history.genesisDigest) ||
         !equalBytes(request.policyDigest, await historyConfigurationDigest(this.#options.descriptor.history)) ||
         !equalBytes(request.executionManifestDigest, this.#options.descriptor.history.executionManifestDigest) ||
-        grantedRoles.some((role) => !request.requestedRoles.includes(role))) throw new Error('ENROLLMENT_REQUEST_UNAUTHORIZED')
+        grantedRoles.some((role) => !request.requestedRoles.includes(role)) ||
+        (decision.writerProgram !== undefined && !grantedRoles.includes('writer')) ||
+        (grantedRoles.includes('writer') && !programRightsSubset(decision.writerProgram, request.writerProgram))) throw new Error('ENROLLMENT_REQUEST_UNAUTHORIZED')
     const requestBytes = encodeSignedEnrollmentRequest(signed)
     const requestDigest = await hashDomain(DOMAINS.enrollmentRequest, requestBytes)
-    const fingerprint = encodeCanonicalCbor([requestBytes, grantedRoles, decision.grantFullHistory])
+    const fingerprint = encodeCanonicalCbor([requestBytes, grantedRoles, decision.grantFullHistory, rightsValue(decision.writerProgram)])
     const prefix = `enrollment/issuer/${bytesToHex(request.groupId)}`
     const key = `${prefix}/request/${bytesToHex(request.signingPublicKey)}/${encodeURIComponent(request.requestId)}`
     const operationKey = `${prefix}/operation/${encodeURIComponent(decision.operationId)}`
@@ -293,6 +303,7 @@ export class EnrollmentIssuer {
           subjectId: request.signingPublicKey, signingPublicKey: request.signingPublicKey,
           role, transportAuthor: request.transportAuthor,
           ...(role === 'reader' ? { hpkePublicKey: request.readerPublicKey } : {}),
+          ...(role !== 'writer' || decision.writerProgram === undefined ? {} : { program: normalizeProgramRights(decision.writerProgram) }),
         }))
         const revision = await this.#options.governance.publishCapabilityChange({ grants }, this.#options.rootPrivateKey, { operationId: `${operationId}:grants` })
         state = { ...state, revision }
@@ -317,6 +328,7 @@ export class EnrollmentIssuer {
         membershipRevision: await capabilityRevisionDigest(revision.revision), grantedRevision: revision.revision.revision,
         roles: grantedRoles, capabilityIds: await Promise.all(revision.revision.grants.map(capabilityId)),
         fullHistoryGranted: decision.grantFullHistory, target: state.target!,
+        ...(decision.writerProgram === undefined ? {} : { writerProgram: normalizeProgramRights(decision.writerProgram) }),
       }
       const result = { approval, signature: await signDomain(DOMAINS.enrollmentApproval, encodeEnrollmentApproval(approval), this.#options.rootPrivateKey) }
       await this.#options.store.put(key, encodeApprovalState({ ...state, approval: result }))
@@ -359,6 +371,7 @@ export async function enrollmentProgress(options: {
         capability.grant.transportAuthor !== request.transportAuthor ||
         capability.grant.validFromRevision !== approval.grantedRevision ||
         capability.grantedAtRevision !== approval.grantedRevision ||
+        (capability.grant.role === 'writer' && !equalBytes(encodeCanonicalCbor(rightsValue(capability.grant.program)), encodeCanonicalCbor(rightsValue(approval.writerProgram)))) ||
         (capability.grant.role === 'reader' && (capability.grant.hpkePublicKey === undefined ||
           !equalBytes(capability.grant.hpkePublicKey, request.readerPublicKey)))) throw new Error('ENROLLMENT_APPROVAL_INVALID')
     if (!isCapabilityActive(capability, options.activeMembership.revision)) return progress('revoked', [], approval.roles)
@@ -382,6 +395,7 @@ export async function verifyEnrollmentApproval(descriptor: EnrollmentDescriptor,
       !equalBytes(request.policyDigest, await historyConfigurationDigest(descriptor.history)) ||
       !equalBytes(approval.target.executionManifestDigest, request.executionManifestDigest) ||
       approval.roles.some((role) => !request.requestedRoles.includes(role)) ||
+      (approval.roles.includes('writer') && !programRightsSubset(approval.writerProgram, request.writerProgram)) ||
       !equalBytes(approval.requestDigest, await hashDomain(DOMAINS.enrollmentRequest, encodeSignedEnrollmentRequest(signedRequest)))) {
     throw new Error('ENROLLMENT_APPROVAL_INVALID')
   }
@@ -390,12 +404,13 @@ export async function verifyEnrollmentApproval(descriptor: EnrollmentDescriptor,
 export function encodeEnrollmentApproval(approval: EnrollmentApproval): Uint8Array {
   validateOperationId(approval.requestId)
   if (approval.capabilityIds.length !== approval.roles.length || approval.grantedRevision < 1n) throw new Error('ENROLLMENT_APPROVAL_INVALID')
+  if (approval.writerProgram !== undefined && !approval.roles.includes('writer')) throw new Error('ENROLLMENT_PROGRAM_WITHOUT_WRITER')
   for (const id of [approval.requestDigest, approval.groupId, approval.membershipRevision, ...approval.capabilityIds]) {
     if (id.length !== 32) throw new Error('ENROLLMENT_APPROVAL_INVALID')
   }
   return encodeCanonicalCbor([
-    1n, approval.requestId, approval.requestDigest, approval.groupId, approval.membershipRevision,
-    approval.grantedRevision, roles(approval.roles), [...approval.capabilityIds], approval.fullHistoryGranted, targetValue(approval.target),
+    2n, approval.requestId, approval.requestDigest, approval.groupId, approval.membershipRevision,
+    approval.grantedRevision, roles(approval.roles), [...approval.capabilityIds], approval.fullHistoryGranted, targetValue(approval.target), rightsValue(approval.writerProgram),
   ])
 }
 
@@ -406,14 +421,15 @@ export function encodeSignedEnrollmentApproval(signed: SignedEnrollmentApproval)
 
 export function decodeSignedEnrollmentApproval(encoded: Uint8Array): SignedEnrollmentApproval {
   const signed = array(encoded, 2)
-  const value = array(bytes(signed[0]), 10)
-  if (value[0] !== 1n || typeof value[5] !== 'bigint' || !Array.isArray(value[7]) || typeof value[8] !== 'boolean') {
+  const value = array(bytes(signed[0]), 11)
+  if (value[0] !== 2n || typeof value[5] !== 'bigint' || !Array.isArray(value[7]) || typeof value[8] !== 'boolean') {
     throw new Error('ENROLLMENT_APPROVAL_INVALID')
   }
   const approval: EnrollmentApproval = {
     requestId: string(value[1]), requestDigest: bytes(value[2], 32), groupId: bytes(value[3], 32), membershipRevision: bytes(value[4], 32),
     grantedRevision: value[5], roles: rolesValue(value[6]), capabilityIds: (value[7] as readonly CborValue[]).map((id) => bytes(id, 32)),
     fullHistoryGranted: value[8], target: targetFromValue(value[9]),
+    ...(value[10] === null ? {} : { writerProgram: rightsFromValue(value[10]) }),
   }
   if (!equalBytes(encodeEnrollmentApproval(approval), bytes(signed[0]))) throw new Error('ENROLLMENT_APPROVAL_INVALID')
   return { approval, signature: bytes(signed[1], 64) }
@@ -478,4 +494,16 @@ function bytes(value: CborValue | undefined, length?: number): Uint8Array {
 function string(value: CborValue | undefined): string {
   if (typeof value !== 'string') throw new Error('ENROLLMENT_ENCODING_INVALID')
   return value
+}
+
+function rightsValue(input?: ProgramRights): CborValue {
+  if (input === undefined) return null
+  const rights = normalizeProgramRights(input)
+  return [rights.sql, rights.topics, rights.signals, rights.forwarded]
+}
+function rightsFromValue(value: CborValue | undefined): ProgramRights {
+  if (!Array.isArray(value) || value.length !== 4 || typeof value[0] !== 'boolean' || typeof value[3] !== 'boolean' ||
+      !Array.isArray(value[1]) || !value[1].every((item) => typeof item === 'string') ||
+      !Array.isArray(value[2]) || !value[2].every((item) => typeof item === 'string')) throw new Error('ENROLLMENT_PROGRAM_INVALID')
+  return normalizeProgramRights({ sql: value[0], topics: value[1], signals: value[2], forwarded: value[3] })
 }

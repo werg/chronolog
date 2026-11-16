@@ -28,6 +28,7 @@ import {
   type ApproveEnrollmentResponse,
   type CreateEnrollmentResponse,
   type EnrollmentRole,
+  type EnrollmentWriterProgram,
   type EnrollmentStatus,
   type LiveSqlEvent,
   type LocalSqlValue,
@@ -548,6 +549,7 @@ export class EnrollmentActions {
   async createRequest(input: {
     readonly requestId: string
     readonly roles: readonly EnrollmentRole[]
+    readonly writerProgram?: EnrollmentWriterProgram
   }, options: RpcCallOptions = {}): Promise<CreateEnrollmentResponse> {
     return this.client._unary('enrollment.createRequest', { groupId: this.client.groupId, ...input }, options)
   }
@@ -557,11 +559,13 @@ export class EnrollmentActions {
     readonly operationId: string
     readonly signedRequest: string
     readonly roles: readonly EnrollmentRole[]
+    readonly writerProgram?: EnrollmentWriterProgram
     readonly grantFullHistory: boolean
   }, options: RpcCallOptions = {}): Promise<ApproveEnrollmentResponse> {
     return this.client._unary('enrollment.approveRequest', {
       groupId: this.client.groupId, requestId: input.operationId, signedRequest: input.signedRequest,
       roles: input.roles, grantFullHistory: input.grantFullHistory,
+      ...(input.writerProgram === undefined ? {} : { writerProgram: input.writerProgram }),
     }, options)
   }
 

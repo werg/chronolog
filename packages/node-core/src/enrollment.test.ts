@@ -15,6 +15,18 @@ const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('live durable group enrollment', () => {
+  it('binds explicit SQL, durable topic and signal rights to the signed request and approved grant', async () => {
+    const fixture = await setup(), store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'scoped')
+    const writerProgram = { sql: true, topics: ['task/claimed', 'chat/message'], signals: ['chat/typing'] }
+    const request = await prepareEnrollmentRequest({ descriptor: fixture.descriptor, store, requestId: 'scoped', identity: identity.signing,
+      readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'scoped', requestedRoles: ['reader', 'writer'], writerProgram })
+    const approved = await fixture.issuer.approve(request, { operationId: 'approve-scoped', roles: ['reader', 'writer'], grantFullHistory: true, writerProgram })
+    await verifyEnrollmentApproval(fixture.descriptor, request, approved)
+    const grant = fixture.governance.snapshot.capabilities.get(Buffer.from(approved.approval.capabilityIds[1]!).toString('hex'))!.grant
+    expect(grant.program).toEqual({ ...writerProgram, topics: [...writerProgram.topics].sort(), forwarded: false })
+    await expect(fixture.issuer.approve(request, { operationId: 'overbroad', roles: ['reader', 'writer'], grantFullHistory: true,
+      writerProgram: { ...writerProgram, topics: ['*'] } })).rejects.toThrow('UNAUTHORIZED')
+  })
   it('reopens one device identity and exact signed request and rejects changed request identities', async () => {
     const fixture = await setup()
     const store = new MemoryOperationStore()

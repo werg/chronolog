@@ -1,6 +1,6 @@
 import {
   assertCanonicalCbor, assertEventTopic, base64UrlToBytes, bytesToBase64Url,
-  encodeCanonicalCbor, isEmitStep, type ChangeProgram,
+  encodeCanonicalCbor, equalBytes, isEmitStep, type ChangeProgram, type CborValue,
 } from '@chronolog/protocol'
 
 export type { EffectiveEvent, EventTransaction, EventReadOptions, EventBatch } from '@chronolog/protocol'
@@ -22,7 +22,8 @@ export const MAX_EVENT_BATCH_TRANSACTIONS = 128
 
 function filterTopics(topics?: readonly string[]): readonly string[] | null {
   if (topics === undefined) return null
-  if (!Array.isArray(topics) || topics.length > 128) throw new Error('EVENT_FILTER_INVALID')
+  const input: unknown = topics
+  if (!Array.isArray(input) || topics.length > 128) throw new Error('EVENT_FILTER_INVALID')
   topics.forEach(assertEventTopic)
   return [...new Set(topics)].sort()
 }
@@ -40,13 +41,15 @@ function resume(snapshot: EventHistorySnapshot, topics: readonly string[] | null
   if (typeof token !== 'string' || token.length > 32768) throw new Error('EVENT_CURSOR_INVALID')
   let value
   try { value = assertCanonicalCbor(base64UrlToBytes(token)) } catch { throw new Error('EVENT_CURSOR_INVALID') }
-  if (!Array.isArray(value) || value.length !== 6 || value[0] !== 'chronolog/events/v1' ||
-      value[1] !== snapshot.historyId || JSON.stringify(value[2]) !== JSON.stringify(topics) ||
-      typeof value[3] !== 'bigint' || value[3] < 0n || value[3] > BigInt(snapshot.items.length) || value[4] !== 0n) {
+  if (!Array.isArray(value) || value.length !== 6) throw new Error('EVENT_CURSOR_MISMATCH')
+  const fields = value as readonly CborValue[]
+  if (fields[0] !== 'chronolog/events/v1' ||
+      fields[1] !== snapshot.historyId || !equalBytes(encodeCanonicalCbor(fields[2] ?? null), encodeCanonicalCbor(topics)) ||
+      typeof fields[3] !== 'bigint' || fields[3] < 0n || fields[3] > BigInt(snapshot.items.length) || fields[4] !== 0n) {
     throw new Error('EVENT_CURSOR_MISMATCH')
   }
-  const scan = Number(value[3])
-  if (value[5] !== (scan === 0 ? null : snapshot.items[scan - 1]!.anchor)) throw new Error('EVENT_CURSOR_PREFIX_MISMATCH')
+  const scan = Number(fields[3])
+  if (fields[5] !== (scan === 0 ? null : snapshot.items[scan - 1]!.anchor)) throw new Error('EVENT_CURSOR_PREFIX_MISMATCH')
   return scan
 }
 

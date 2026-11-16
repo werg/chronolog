@@ -7,6 +7,23 @@ import { ChronologClient } from './client.js'
 const batch = (cursor: string): EventBatch => ({ transactions: [], revision: `revision-${cursor}`, scannedThrough: cursor, hasMore: false })
 
 describe('application client', () => {
+  it('carries requested and approved SQL/topic/signal scopes without broadening either request', async () => {
+    const calls: Array<{ method: string; request: unknown }> = []
+    const transport = { unary: async (method: string, request: unknown) => {
+      calls.push({ method, request }); return method === 'enrollment.createRequest' ? { signedRequest: 'signed' } : { signedApproval: 'approved' }
+    } } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group' })
+    const requested = { sql: true, topics: ['conversation', 'jobs'], signals: ['typing'], forwarded: false }
+    const approved = { sql: false, topics: ['conversation'], signals: ['typing'], forwarded: false }
+    await client.enrollment.createRequest({ requestId: 'device', roles: ['reader', 'writer'], writerProgram: requested })
+    await client.enrollment.approveRequest({ operationId: 'approve', signedRequest: 'signed', roles: ['reader', 'writer'], writerProgram: approved, grantFullHistory: false })
+    expect(calls).toEqual([
+      { method: 'enrollment.createRequest', request: { groupId: 'group', requestId: 'device', roles: ['reader', 'writer'], writerProgram: requested } },
+      { method: 'enrollment.approveRequest', request: { groupId: 'group', requestId: 'approve', signedRequest: 'signed', roles: ['reader', 'writer'], writerProgram: approved, grantFullHistory: false } },
+    ])
+    await client.close()
+  })
+
   it('retries a copied signed proposal and follows the original transaction identity', async () => {
     const original = new Uint8Array([1, 3, 7])
     const requests: Array<{ signedWire: Uint8Array; requestId: string }> = []

@@ -19,6 +19,8 @@ export const DOMAINS = {
   capabilitySnapshot: 'chronolog/capability-snapshot/v1',
   enrollmentRequest: 'chronolog/enrollment-request/v1',
   enrollmentApproval: 'chronolog/enrollment-approval/v1',
+  publisherRequest: 'chronolog/publisher-request/v1',
+  publisherApproval: 'chronolog/publisher-approval/v1',
   governanceClosure: 'chronolog/governance-closure/v1',
   snapshotManifest: 'chronolog/snapshot-manifest/v1',
   materializedLog: 'chronolog/materialized-log/v1',

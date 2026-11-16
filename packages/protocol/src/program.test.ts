@@ -8,12 +8,15 @@ describe('signed application programs', () => {
     expect(encodeChangeProgram(one)).toEqual(encodeChangeProgram(two))
     expect(decodeChangeProgram(encodeChangeProgram(one))).toEqual(one)
   })
-  it.each([NaN, Infinity, undefined, 2n, new Date(), new Uint8Array([1]), [, 1]])('rejects a lossy JSON payload %s', (value) => {
+  it.each([NaN, Infinity, undefined, 2n, new Date(), new Uint8Array([1]), Array<number>(2)])('rejects a lossy JSON payload %s', (value) => {
     expect(() => emit('topic', value as EventPayload)).toThrow()
   })
   it('rejects accessors without executing them and enforces payload/program budgets', () => {
     let calls = 0
     expect(() => canonicalEventPayload({ get x() { calls++; return 1 } })).toThrow()
+    const array: number[] = []
+    Object.defineProperty(array, '0', { enumerable: true, get() { calls++; return 1 } })
+    expect(() => canonicalEventPayload(array)).toThrow()
     expect(calls).toBe(0)
     expect(() => emit('topic', 'a'.repeat(16_384))).toThrow()
     expect(() => program(...Array.from({ length: 65 }, () => emit('topic', null)))).toThrow()
