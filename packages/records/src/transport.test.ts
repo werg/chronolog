@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from './feed-codec.js'
 import { DurableFeedStore, type AtomicBytesStore } from './store.js'
 import { connectInProcess, PortableFeedTransport } from './transport.js'
+import { payloadHash } from './payload.js'
 
 const peers: PortableFeedTransport[] = []
 afterEach(async () => { await Promise.all(peers.splice(0).map((peer) => peer.close())) })
@@ -21,6 +22,26 @@ async function peer() {
 }
 
 describe('portable peer replication', () => {
+  it('fetches and retains only explicitly requested payloads without following their author feed', async () => {
+    const [author, reader, relay] = await Promise.all([peer(), peer(), peer()])
+    const payload = new Uint8Array(96_000).fill(7), hash = await payloadHash(payload)
+    await author.publish(payload)
+    const remote = author.asLink()
+    let reads = 0
+    reader.connect({ ...remote, read: async () => [], readPayload: async (id) => { reads += 1; return remote.readPayload(id) } })
+    await reader.catchUp()
+    expect(reads).toBe(0)
+    expect(await reader.history()).toEqual([])
+    expect(await reader.getPayload(hash)).toEqual(payload)
+    expect(reads).toBe(1)
+    reader.disconnect(author.identity)
+    expect(await reader.getPayload(hash)).toEqual(payload)
+    relay.connect({ ...reader.asLink(), read: async () => [] })
+    await relay.catchUp()
+    expect(await relay.getPayload(hash)).toEqual(payload)
+    expect(await relay.history()).toEqual([])
+  })
+
   it('forwards signed history through another peer without an authority', async () => {
     const [author, relay, reader] = await Promise.all([peer(), peer(), peer()])
     connectInProcess(author, relay)
@@ -77,7 +98,7 @@ describe('portable peer replication', () => {
   it('does not accept another author as the requested feed', async () => {
     const [author, attacker, reader] = await Promise.all([peer(), peer(), peer()])
     await attacker.publish(Uint8Array.of(1))
-    reader.connect({ identity: author.identity, readEvidence: async () => [], read: (_feed, after, limit) => attacker.asLink().read(attacker.identity, after, limit), async *watch() {} })
+    reader.connect({ identity: author.identity, readEvidence: async () => [], readPayload: async () => null, read: (_feed, after, limit) => attacker.asLink().read(attacker.identity, after, limit), async *watch() {} })
     await expect(reader.catchUp()).rejects.toThrow('FEED_RANGE_AUTHOR_MISMATCH')
     expect(await reader.history()).toEqual([])
   })

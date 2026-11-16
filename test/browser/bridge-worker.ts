@@ -26,13 +26,13 @@ interface FixtureRequest {
   readonly identity?: string
 }
 
-interface LinkRequest {
-  readonly id: number
+type LinkRequestFields = {
   readonly method: 'read' | 'evidence'
   readonly feed?: string
   readonly after: bigint
   readonly limit: number
-}
+} | { readonly method: 'payload'; readonly hash: string }
+type LinkRequest = LinkRequestFields & { readonly id: number }
 interface LinkResponse {
   readonly id?: number
   readonly hint?: true
@@ -61,7 +61,7 @@ function receiveLink(port: MessagePort, identity: string): FeedLink {
     for (const request of pending.values()) request.reject(new Error('BROWSER_PEER_LINK_CLOSED'))
     pending.clear()
   }, { once: true })
-  const request = (fields: Omit<LinkRequest, 'id'>): Promise<readonly Uint8Array[]> => new Promise((resolve, reject) => {
+  const request = (fields: LinkRequestFields): Promise<readonly Uint8Array[]> => new Promise((resolve, reject) => {
     const id = ++next
     pending.set(id, { resolve, reject })
     port.postMessage({ id, ...fields } satisfies LinkRequest)
@@ -70,6 +70,11 @@ function receiveLink(port: MessagePort, identity: string): FeedLink {
     identity,
     read: (feed, after, limit) => request({ method: 'read', feed, after, limit }),
     readEvidence: (after, limit) => request({ method: 'evidence', after, limit }),
+    async readPayload(hash) {
+      const values = await request({ method: 'payload', hash })
+      if (values.length > 1) throw new Error('BROWSER_PEER_PAYLOAD_RESPONSE_INVALID')
+      return values[0] ?? null
+    },
     watch: (signal) => changes.watch(signal),
   }
 }
@@ -78,8 +83,10 @@ function serveLink(port: MessagePort): void {
   ports.add(port)
   const link = peer!.transport.asLink()
   port.addEventListener('message', (event: MessageEvent<LinkRequest>) => {
-    const { id, method, feed, after, limit } = event.data
-    const result = method === 'read' ? link.read(feed!, after, limit) : link.readEvidence(after, limit)
+    const request = event.data, id = request.id
+    const result = request.method === 'payload'
+      ? link.readPayload(request.hash).then(bytes => bytes === null ? [] : [bytes])
+      : request.method === 'read' ? link.read(request.feed!, request.after, request.limit) : link.readEvidence(request.after, request.limit)
     void result.then((bytes) => port.postMessage({ id, bytes } satisfies LinkResponse),
       (error: unknown) => port.postMessage({ id, error: error instanceof Error ? error.message : String(error) } satisfies LinkResponse))
   })

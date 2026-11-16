@@ -36,6 +36,7 @@ describe('transport subscription restart', () => {
       identity: innerA.identity,
       publish: (payload, options) => innerA.publish(payload, options),
       get: (id) => innerA.get(id),
+      getPayload: (hash) => innerA.getPayload(hash),
       history: () => innerA.history(),
       // The first subscription ends at once, as an overflowing subscriber would.
       subscribe: (signal) => (subscriptions += 1) === 1 ? (async function* () { /* ended */ })() : innerA.subscribe(signal),
@@ -71,6 +72,7 @@ describe('transport subscription restart', () => {
       identity: innerA.identity,
       publish: (payload, options) => innerA.publish(payload, options),
       get: (id) => innerA.get(id),
+      getPayload: (hash) => innerA.getPayload(hash),
       history: () => innerA.history(),
       // The first subscription stays open but drops every live record from b.
       subscribe: (signal) => (subscriptions += 1) === 1

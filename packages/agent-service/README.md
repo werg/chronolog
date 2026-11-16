@@ -237,6 +237,16 @@ rendezvous hints or a relay login as database membership. Every range request
 rechecks the receiver's known active grant. A connection can carry records by
 other original authors; endpoint and record identities remain distinct.
 
+`readPayload(hash)` requests one detached application envelope by its SHA-256
+address. Header/evidence synchronization does not request these bodies. The
+provider and receiver both check the address and the 1 MiB envelope bound, and
+the provider rechecks read authorization after its storage lookup completes.
+Missing data returns `null`; it does not advance application progress. The
+normal ledger decoder additionally checks the envelope against the committed
+descriptor's kind, route, epoch and length before execution. These requests
+share the session's existing concurrency, timeout and backpressure bounds;
+they do not append another record or create a separate payload history.
+
 The native `FeedTransport` exports `asLink()`, `connectLink()`,
 `disconnectLink()`, and `catchUpLinks()`. Its native SSB adapter and framed
 connections share the same signed record store. The portable browser transport
@@ -246,7 +256,7 @@ transport.
 
 Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
 use `chronolog/ephemeral/v1`. The session multiplexes bounded range responses,
-change hints, and replaceable signals. Signals cannot hold up retained range
+content-addressed payload responses, change hints, and replaceable signals. Signals cannot hold up retained range
 handling. There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement

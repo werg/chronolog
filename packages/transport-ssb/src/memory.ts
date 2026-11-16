@@ -129,6 +129,14 @@ export class MemoryTransport implements ChronologTransport {
     return record ? cloneRecord(record) : undefined
   }
 
+  async getPayload(hash: string): Promise<Uint8Array | null> {
+    if (!/^[0-9a-f]{64}$/u.test(hash)) throw new Error('PAYLOAD_HASH_INVALID')
+    for (const record of this.#records.values()) {
+      if (createHash('sha256').update(record.payload).digest('hex') === hash) return record.payload.slice()
+    }
+    return null
+  }
+
   async history(): Promise<readonly TransportRecord[]> {
     return this.localHistory().map(cloneRecord)
   }

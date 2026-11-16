@@ -7,6 +7,8 @@ export interface FeedLink {
   read(feed: string, after: bigint, limit: number): Promise<readonly Uint8Array[]>
   /** Wake-up hints only. Every hint is resolved with retained range reads. */
   readEvidence(after: bigint, limit: number): Promise<readonly Uint8Array[]>
+  /** Payload delivery is independent of ledger/header synchronization. */
+  readPayload(hash: string): Promise<Uint8Array | null>
   watch(signal?: AbortSignal): AsyncIterable<void>
 }
 

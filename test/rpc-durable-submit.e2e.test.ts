@@ -36,6 +36,7 @@ it('recovers the exact signed transaction after a lost RPC response and full rep
         return record
       },
       get: (id) => feed.get(id), history: () => feed.history(), status: () => feed.status(),
+      getPayload: (hash) => feed.getPayload(hash),
       subscribe: (signal) => feed.subscribe(signal), close: () => feed.close(),
       feedContiguousThrough: (id) => feed.feedContiguousThrough(id),
     }

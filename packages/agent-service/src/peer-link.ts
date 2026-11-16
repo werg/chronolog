@@ -1,3 +1,5 @@
+import { bytesToHex, sha256 } from '@chronolog/canonical'
+import { MAX_LEDGER_PAYLOAD_BYTES } from '@chronolog/node-core/ledger'
 import {
   assertCanonicalCbor, encodeCanonicalCbor, equalBytes,
 } from '@chronolog/protocol'
@@ -35,6 +37,8 @@ interface RemoteHello extends PeerAuthorization { readonly nonce: Uint8Array; re
 interface PendingRange {
   readonly limit: number
   readonly records: Uint8Array[]
+  /** Non-null requests exactly one detached payload by content address. */
+  readonly payloadHash: string | null
   bytes: number
   readonly resolve: (values: readonly Uint8Array[]) => void
   readonly reject: (error: unknown) => void
@@ -102,6 +106,24 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     } finally { inbound -= 1 }
   }
 
+  const servePayload = async (id: number, hash: string): Promise<void> => {
+    try {
+      if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
+      const stored = await options.local.readPayload(hash)
+      if (stored !== null && (!(stored instanceof Uint8Array) || stored.length < 1 || stored.length > MAX_LEDGER_PAYLOAD_BYTES)) {
+        throw new Error('PEER_PAYLOAD_INVALID')
+      }
+      const payload = stored === null ? null : new Uint8Array(stored)
+      if (payload !== null && bytesToHex(await sha256(payload)) !== hash) throw new Error('PEER_PAYLOAD_INVALID')
+      // A provider lookup can suspend while the peer's read grant is revoked.
+      if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
+      if (payload !== null) await send(['record', BigInt(id), payload])
+      await send(['done', BigInt(id)])
+    } catch (error) {
+      if (!controller.signal.aborted) await send(['error', BigInt(id), error instanceof Error ? error.message.slice(0, 256) : 'PEER_PAYLOAD_UNAVAILABLE'])
+    } finally { inbound -= 1 }
+  }
+
   const handle = async (bytes: Uint8Array): Promise<void> => {
     if (bytes.length > MAX_RECORD_FRAME) throw new Error('PEER_FRAME_TOO_LARGE')
     const frame = assertCanonicalCbor(bytes)
@@ -159,11 +181,21 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       void serveRange(id, frame[4] as string | null, frame[5], limit).catch(fail)
       return
     }
+    if (frame[2] === 'payload') {
+      if (frame.length !== 5 || typeof frame[3] !== 'bigint' || !validPayloadHash(frame[4])) throw new Error('PEER_PAYLOAD_REQUEST_INVALID')
+      const id = Number(frame[3])
+      if (!Number.isSafeInteger(id) || id < 1 || inbound >= 4) throw new Error('PEER_REQUEST_LIMIT_EXCEEDED')
+      inbound += 1
+      void servePayload(id, frame[4]).catch(fail)
+      return
+    }
     if (typeof frame[3] !== 'bigint') throw new Error('PEER_RESPONSE_INVALID')
     const id = Number(frame[3]), request = pending.get(id)
     if (!Number.isSafeInteger(id) || request === undefined) throw new Error('PEER_RESPONSE_UNEXPECTED')
     if (frame[2] === 'record') {
       if (frame.length !== 5 || !(frame[4] instanceof Uint8Array) || request.records.length >= request.limit) throw new Error('PEER_RANGE_TOO_LARGE')
+      if (request.payloadHash !== null && (frame[4].length < 1 || frame[4].length > MAX_LEDGER_PAYLOAD_BYTES ||
+          bytesToHex(await sha256(frame[4])) !== request.payloadHash)) throw new Error('PEER_PAYLOAD_HASH_MISMATCH')
       request.bytes += frame[4].length
       if (request.bytes > MAX_RANGE_BYTES) throw new Error('PEER_RANGE_TOO_LARGE')
       request.records.push(frame[4].slice())
@@ -208,16 +240,29 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     const id = ++nextRequest
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => fail(new Error('PEER_RANGE_TIMEOUT')), timeoutMs)
-      pending.set(id, { limit, records: [], bytes: 0, resolve, reject, timer })
+      pending.set(id, { limit, payloadHash: null, records: [], bytes: 0, resolve, reject, timer })
       void send(['range', BigInt(id), feed, after, BigInt(limit)]).catch(fail)
     })
+  }
+  const requestPayload = async (hash: string): Promise<Uint8Array | null> => {
+    if (!validPayloadHash(hash)) throw new Error('PEER_PAYLOAD_REQUEST_INVALID')
+    if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
+    if (pending.size >= 4 || nextRequest >= Number.MAX_SAFE_INTEGER) throw new Error('PEER_REQUEST_LIMIT_EXCEEDED')
+    const id = ++nextRequest
+    const values = await new Promise<readonly Uint8Array[]>((resolve, reject) => {
+      const timer = setTimeout(() => fail(new Error('PEER_PAYLOAD_TIMEOUT')), timeoutMs)
+      pending.set(id, { limit: 1, payloadHash: hash, records: [], bytes: 0, resolve, reject, timer })
+      void send(['payload', BigInt(id), hash]).catch(fail)
+    })
+    return values[0] ?? null
   }
   const peer = remote as RemoteHello | null
   if (peer === null) throw new Error('PEER_HELLO_MISSING')
   return {
     peer: { authorId: peer.authorId.slice(), grantId: peer.grantId.slice(), feedId: peer.feedId },
     link: { identity: peer.feedId, read: (feed, after, limit) => requestRange(feed, after, limit),
-      readEvidence: (after, limit) => requestRange(null, after, limit), watch: (signal) => changes.watch(signal) },
+      readEvidence: (after, limit) => requestRange(null, after, limit), readPayload: requestPayload,
+      watch: (signal) => changes.watch(signal) },
     completion,
     async sendSignal(bytes) {
       if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
@@ -241,4 +286,8 @@ function validateRange(after: bigint, limit: number): void {
   if (after < 0n || after > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isSafeInteger(limit) || limit < 1 || limit > MAX_RANGE) {
     throw new Error('PEER_RANGE_INVALID')
   }
+}
+
+function validPayloadHash(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value)
 }

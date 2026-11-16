@@ -2,6 +2,7 @@ import { assertCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, type C
 
 import { feedRecordId, type FeedCrypto, type FeedRecord, verifyFeedRecord } from './feed-codec.js'
 import type { ImmutableEvidence, TransportRecord } from './types.js'
+import { payloadHash, validatePayloadHash, verifyPayloadHash } from './payload.js'
 
 export type Awaitable<T> = T | Promise<T>
 
@@ -22,6 +23,8 @@ export interface FeedStorePort {
   head(author: string): Awaitable<FeedHead>
   append(record: FeedRecord, receivedAtMs?: number): Awaitable<FeedAppendResult>
   get(id: string): Awaitable<TransportRecord | undefined>
+  getPayload(hash: string): Awaitable<Uint8Array | null>
+  putPayload(bytes: Uint8Array): Awaitable<string>
   after(index: bigint, limit: number): Awaitable<readonly { readonly index: bigint; readonly record: TransportRecord }[]>
   feedAfter(author: string, sequence: bigint, limit: number): Awaitable<readonly { readonly sequence: bigint; readonly raw: Uint8Array }[]>
   heads(): Awaitable<ReadonlyMap<string, bigint>>
@@ -60,6 +63,7 @@ export class DurableFeedStore implements FeedStorePort {
   readonly #forks: StoredRecord[] = []
   readonly #byId = new Map<string, StoredRecord>()
   readonly #byAuthor = new Map<string, StoredRecord[]>()
+  readonly #payloads = new Map<string, Uint8Array>()
   readonly #evidence: ImmutableEvidence[] = []
   readonly #evidenceIndex = new Map<string, number>()
   #pending: Promise<unknown> = Promise.resolve()
@@ -89,7 +93,7 @@ export class DurableFeedStore implements FeedStorePort {
           if (classifyFeedAppend(record, store.head(record.author), store.#byAuthor.get(record.author)?.[Number(record.sequence - 1n)]?.record.id) !== 'append') {
             throw new Error('FEED_STORE_CONTINUITY_INVALID')
           }
-          store.#remember(item)
+          await store.#remember(item)
         }
       }
     }
@@ -126,7 +130,7 @@ export class DurableFeedStore implements FeedStorePort {
       const forks = kind === 'fork' && !this.#forks.some((fork) => fork.record.id === record.id) ? [...this.#forks, item] : this.#forks
       await this.#bytes.put(objectKey(record.id), record.raw)
       await this.#bytes.put('feed/manifest', encodeCanonicalCbor([1n, manifestRows(records), manifestRows(forks), this.#evidence.map((item) => item.id)]))
-      if (kind === 'append') this.#remember(item)
+      if (kind === 'append') await this.#remember(item)
       else if (forks !== this.#forks) this.#forks.push(item)
       return { kind: kind === 'append' ? 'appended' : 'fork', record: toTransportRecord(record, receivedAtMs) }
     })
@@ -166,6 +170,23 @@ export class DurableFeedStore implements FeedStorePort {
     return stored === undefined ? undefined : toTransportRecord(stored.record, stored.receivedAtMs)
   }
 
+  async getPayload(hash: string): Promise<Uint8Array | null> {
+    validatePayloadHash(hash)
+    const bytes = this.#payloads.get(hash) ?? await this.#bytes.get(`feed/payload/${hash}`)
+    if (bytes === null) return null
+    await verifyPayloadHash(hash, bytes)
+    return bytes.slice()
+  }
+
+  async putPayload(input: Uint8Array): Promise<string> {
+    if (this.#closed) throw new Error('FEED_STORE_CLOSED')
+    const bytes = input.slice()
+    if (bytes.length > 64 * 1024 * 1024) throw new Error('FEED_RECORD_TOO_LARGE')
+    const hash = await payloadHash(bytes)
+    if (!this.#payloads.has(hash)) await this.#bytes.put(`feed/payload/${hash}`, bytes)
+    return hash
+  }
+
   after(index: bigint, limit: number): readonly { readonly index: bigint; readonly record: TransportRecord }[] {
     assertRange(index, limit)
     return this.#records.slice(Number(index), Number(index) + limit)
@@ -183,7 +204,8 @@ export class DurableFeedStore implements FeedStorePort {
   forkedAuthors(): readonly string[] { return [...new Set(this.#forks.map(({ record }) => record.author))].sort() }
   async close(): Promise<void> { await this.#pending; this.#closed = true }
 
-  #remember(item: StoredRecord): void {
+  async #remember(item: StoredRecord): Promise<void> {
+    this.#payloads.set(await payloadHash(item.record.payload), item.record.payload)
     this.#records.push(item)
     this.#byId.set(item.record.id, item)
     const author = this.#byAuthor.get(item.record.author) ?? []

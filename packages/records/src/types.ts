@@ -54,6 +54,8 @@ export interface ChronologTransport {
   /** Recover publication of an already durable local record without authoring it again. */
   ensurePublished?(record: TransportRecord): Promise<void>
   get(id: string): Promise<TransportRecord | undefined>
+  /** Fetch exact content-addressed bytes from local storage or a connected peer. */
+  getPayload(hash: string): Promise<Uint8Array | null>
   history(): Promise<readonly TransportRecord[]>
   subscribe(signal?: AbortSignal): AsyncIterable<TransportRecord>
   status(): Promise<TransportStatus>

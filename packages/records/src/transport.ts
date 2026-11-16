@@ -1,6 +1,7 @@
 import { createFeedRecord, DEFAULT_MAX_RECORD_BYTES, type FeedCrypto, type FeedSigner } from './feed-codec.js'
 import { ChangeSignal, type FeedLink, pullFeed } from './replication.js'
 import type { FeedStorePort } from './store.js'
+import { validatePayloadHash, verifyPayloadHash } from './payload.js'
 import { cloneRecord, type ChronologTransport, type ImmutableEvidence, type PublishOptions, type TransportRecord, type TransportStatus } from './types.js'
 
 interface Connection {
@@ -52,6 +53,25 @@ export class PortableFeedTransport implements ChronologTransport {
   }
 
   async get(id: string): Promise<TransportRecord | undefined> { return this.#store.get(id) }
+
+  async getPayload(hash: string): Promise<Uint8Array | null> {
+    validatePayloadHash(hash)
+    const local = await this.#store.getPayload(hash)
+    if (local !== null) return local
+    let failure: Error | undefined
+    for (const connection of this.#connections.values()) {
+      try {
+        const bytes = await connection.link.readPayload(hash)
+        if (bytes === null) continue
+        if (bytes.length > this.#maxRecordBytes) throw new Error('FEED_RECORD_TOO_LARGE')
+        await verifyPayloadHash(hash, bytes)
+        await this.#store.putPayload(bytes)
+        return bytes.slice()
+      } catch (error) { failure = error instanceof Error ? error : new Error(String(error)) }
+    }
+    if (failure !== undefined) throw failure
+    return null
+  }
 
   async history(): Promise<readonly TransportRecord[]> {
     const records: TransportRecord[] = []
@@ -124,6 +144,7 @@ export class PortableFeedTransport implements ChronologTransport {
         return (await this.#store.feedAfter(feed, after, limit)).map(({ raw }) => raw.slice())
       },
       readEvidence: async (after, limit) => (await this.#store.evidenceAfter(after, limit)).map(({ evidence }) => evidence.bytes.slice()),
+      readPayload: async (hash) => this.#store.getPayload(hash),
       watch: (signal) => this.#changes.watch(signal),
     }
   }

@@ -120,6 +120,7 @@ export class TendrillerTransport implements ChronologTransport {
   }
 
   get(id: string): Promise<TransportRecord | undefined> { return this.#local.get(id) }
+  getPayload(hash: string): Promise<Uint8Array | null> { return this.#local.getPayload(hash) }
   history(): Promise<readonly TransportRecord[]> { return this.#local.history() }
   subscribe(signal?: AbortSignal): AsyncIterable<TransportRecord> { return this.#local.subscribe(signal) }
   putEvidence(bytes: Uint8Array): Promise<ImmutableEvidence> { return this.#local.putEvidence(bytes) }

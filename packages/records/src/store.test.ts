@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createFeedRecord, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from './feed-codec.js'
 import { DurableFeedStore, type AtomicBytesStore } from './store.js'
+import { payloadHash } from './payload.js'
 
 const directories: string[] = []
 afterEach(async () => { await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -35,6 +36,24 @@ async function fixture() {
 }
 
 describe('durable portable feed store', () => {
+  it('retains detached payloads by hash without adding a feed or ledger entry', async () => {
+    const { bytes, signer } = await fixture()
+    let store = await DurableFeedStore.open(bytes, webFeedCrypto)
+    const payload = Uint8Array.of(7, 8, 9), hash = await store.putPayload(payload)
+    payload[0] = 0
+    expect(await store.getPayload(hash)).toEqual(Uint8Array.of(7, 8, 9))
+    expect(store.count()).toBe(0)
+    await store.close()
+    store = await DurableFeedStore.open(bytes, webFeedCrypto)
+    expect(await store.getPayload(hash)).toEqual(Uint8Array.of(7, 8, 9))
+    const record = await createFeedRecord(signer, webFeedCrypto, 1n, null, 1n, Uint8Array.of(3, 4))
+    await store.append(record)
+    expect(await store.getPayload(await payloadHash(record.payload))).toEqual(record.payload)
+    await bytes.put(`feed/payload/${hash}`, Uint8Array.of(9))
+    await expect(store.getPayload(hash)).rejects.toThrow('PAYLOAD_HASH_MISMATCH')
+    await expect(store.getPayload('../escape')).rejects.toThrow('PAYLOAD_HASH_INVALID')
+  })
+
   it('retains immutable evidence independently of mutable feed sequence', async () => {
     const { bytes } = await fixture()
     let store = await DurableFeedStore.open(bytes, webFeedCrypto)

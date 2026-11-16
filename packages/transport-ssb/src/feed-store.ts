@@ -103,6 +103,9 @@ export class FeedStore {
     readonly evidenceById: StatementSync
     readonly evidenceInsert: StatementSync
     readonly evidenceAfter: StatementSync
+    readonly payloadByHash: StatementSync
+    readonly detachedPayloadByHash: StatementSync
+    readonly putPayload: StatementSync
   }
 
   /**
@@ -127,8 +130,14 @@ export class FeedStore {
           timestamp_ms INTEGER NOT NULL,
           received_at INTEGER NOT NULL,
           payload BLOB NOT NULL,
+          payload_hash TEXT NOT NULL,
           raw BLOB NOT NULL,
           UNIQUE (author, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS records_payload_hash ON records (payload_hash);
+        CREATE TABLE IF NOT EXISTS payloads (
+          hash TEXT PRIMARY KEY,
+          bytes BLOB NOT NULL
         );
         CREATE TABLE IF NOT EXISTS evidence (
           local_index INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -159,8 +168,8 @@ export class FeedStore {
     const columns = 'local_index, id, author, sequence, previous, received_at, payload'
     this.#statements = {
       head: prepare('SELECT sequence, id FROM records WHERE author = ? ORDER BY sequence DESC LIMIT 1'),
-      insert: prepare(`INSERT INTO records (id, author, sequence, previous, timestamp_ms, received_at, payload, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING local_index`),
+      insert: prepare(`INSERT INTO records (id, author, sequence, previous, timestamp_ms, received_at, payload, payload_hash, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING local_index`),
       byId: prepare(`SELECT ${columns} FROM records WHERE id = ?`),
       bySequence: prepare('SELECT id FROM records WHERE author = ? AND sequence = ?'),
       after: prepare(`SELECT ${columns} FROM records WHERE local_index > ? ORDER BY local_index LIMIT ?`),
@@ -173,6 +182,9 @@ export class FeedStore {
       evidenceById: prepare('SELECT local_index FROM evidence WHERE id = ?'),
       evidenceInsert: prepare('INSERT INTO evidence (id, raw) VALUES (?, ?) RETURNING local_index'),
       evidenceAfter: prepare('SELECT local_index, id, raw FROM evidence WHERE local_index > ? ORDER BY local_index LIMIT ?'),
+      payloadByHash: prepare('SELECT payload AS bytes FROM records WHERE payload_hash = ? LIMIT 1'),
+      detachedPayloadByHash: prepare('SELECT bytes FROM payloads WHERE hash = ?'),
+      putPayload: prepare('INSERT OR IGNORE INTO payloads (hash, bytes) VALUES (?, ?)'),
     }
   }
 
@@ -195,7 +207,8 @@ export class FeedStore {
       return { kind: 'out_of_order', head: head.sequence }
     }
     this.#statements.insert.get(
-      record.id, record.author, record.sequence, record.previous, record.timestampMs, receivedAtMs, record.payload, record.raw,
+      record.id, record.author, record.sequence, record.previous, record.timestampMs, receivedAtMs,
+      record.payload, createHash('sha256').update(record.payload).digest('hex'), record.raw,
     )
     return { kind: 'appended', record: toTransportRecord(record, receivedAtMs) }
   }
@@ -203,6 +216,22 @@ export class FeedStore {
   get(id: string): TransportRecord | undefined {
     const row = this.#statements.byId.get(id) as RecordRow | undefined
     return row === undefined ? undefined : rowRecord(row)
+  }
+
+  getPayload(hash: string): Uint8Array | null {
+    if (!/^[0-9a-f]{64}$/u.test(hash)) throw new Error('PAYLOAD_HASH_INVALID')
+    const row = (this.#statements.payloadByHash.get(hash) ?? this.#statements.detachedPayloadByHash.get(hash)) as
+      { bytes: Uint8Array } | undefined
+    if (row === undefined) return null
+    if (createHash('sha256').update(row.bytes).digest('hex') !== hash) throw new Error('PAYLOAD_HASH_MISMATCH')
+    return new Uint8Array(row.bytes)
+  }
+
+  putPayload(input: Uint8Array): string {
+    if (input.length > DEFAULT_MAX_RECORD_BYTES) throw new Error('FEED_RECORD_TOO_LARGE')
+    const bytes = input.slice(), hash = createHash('sha256').update(bytes).digest('hex')
+    if (this.#statements.payloadByHash.get(hash) === undefined) this.#statements.putPayload.run(hash, bytes)
+    return hash
   }
 
   /** Records in local arrival order after `localIndex`, with their indexes. */

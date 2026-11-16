@@ -41,6 +41,7 @@ describe('heartbeat ingestion cost', () => {
       identity: inner.identity,
       publish: (payload, options) => inner.publish(payload, options),
       get: (id) => inner.get(id),
+      getPayload: (hash) => inner.getPayload(hash),
       history: () => inner.history(),
       subscribe: (signal) => inner.subscribe(signal),
       status: () => { statusCalls += 1; return inner.status() },
