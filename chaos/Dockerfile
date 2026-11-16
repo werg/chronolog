@@ -12,22 +12,11 @@ RUN apt-get update \
 WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY patches ./patches
-COPY apps/chronolog/package.json apps/chronolog/package.json
-COPY apps/chronologd/package.json apps/chronologd/package.json
-COPY packages/canonical/package.json packages/canonical/package.json
-COPY packages/capabilities/package.json packages/capabilities/package.json
-COPY packages/chaos/package.json packages/chaos/package.json
-COPY packages/client/package.json packages/client/package.json
-COPY packages/control-store/package.json packages/control-store/package.json
-COPY packages/crypto/package.json packages/crypto/package.json
-COPY packages/materializer/package.json packages/materializer/package.json
-COPY packages/materializer-doltlite/package.json packages/materializer-doltlite/package.json
-COPY packages/node-core/package.json packages/node-core/package.json
-COPY packages/protocol/package.json packages/protocol/package.json
-COPY packages/react/package.json packages/react/package.json
-COPY packages/rpc/package.json packages/rpc/package.json
-COPY packages/testkit/package.json packages/testkit/package.json
-COPY packages/transport-ssb/package.json packages/transport-ssb/package.json
+# Install against the complete workspace, including local pinned SDK archives.
+# Copying selected manifests silently drops newly added workspace dependencies.
+COPY apps ./apps
+COPY packages ./packages
+COPY test/artifacts ./test/artifacts
 RUN pnpm install --frozen-lockfile
 
 FROM node:24-bookworm-slim
@@ -42,8 +31,6 @@ RUN corepack enable && corepack prepare pnpm@10.12.4 --activate \
 WORKDIR /workspace
 COPY --from=dependencies /workspace /workspace
 COPY tsconfig.base.json tsconfig.json tsconfig.build.json vitest.config.ts ./
-COPY apps ./apps
-COPY packages ./packages
 
 EXPOSE 8787 8008
 HEALTHCHECK --interval=1s --timeout=2s --start-period=20s --retries=30 \
