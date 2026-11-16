@@ -78,6 +78,8 @@ const api = {
   },
   publish(id: string, events: readonly { topic: string; payload: EventPayload }[], operationId: string) { return peers.get(id)!.publish(events, operationId) },
   read(id: string, options: EventReadOptions = {}) { return peers.get(id)!.client.events.read(options) },
+  operation(id: string, operationId: string) { return peers.get(id)!.client.operations.get(operationId) },
+  privateValue(id: string, value?: string) { return peers.get(id)!.command('privateValue', value === undefined ? {} : { state: value }) },
   async readNext(id: string, options: EventReadOptions) {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 20_000)

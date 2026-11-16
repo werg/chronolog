@@ -78,6 +78,12 @@ endpoint.addEventListener('message', (event) => {
         const saved = await checkpoint().load()
         return saved === null ? null : { cursor: saved.cursor, revision: saved.revision, state: new TextDecoder().decode(saved.state) }
       }
+      case 'privateValue': {
+        const key = 'qualification/private-device-value'
+        if (request.state !== undefined) await operations!.put(key, utf8(request.state))
+        const value = await operations!.get(key)
+        return value === null ? null : new TextDecoder().decode(value)
+      }
       case 'privateCutoff':
       case 'crashCutoff': {
         const root = await navigator.storage.getDirectory()

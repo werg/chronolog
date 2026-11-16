@@ -62,8 +62,15 @@ const page = await context.newPage()
 const directory = await mkdtemp(join(tmpdir(), 'chronolog-browser-events-'))
 let native: NativeBrowserFixture | undefined
 const checks: string[] = ['SQL-free Worker/client emitted bundle has no SQL or WASM implementation bytes']
+const deviceEvidence: Record<string, unknown> = {
+  boundary: 'real Chromium OPFS and native process on loopback; synthetic enrolled identities',
+  quotaMethod: 'Chromium DevTools Storage.overrideQuotaForOrigin, then actual OPFS writes',
+  storageLossMethod: 'Chromium DevTools Storage.clearDataForOrigin after orderly Worker shutdown',
+  exclusions: ['physical device storage pressure or OS eviction', 'deployed identity-provider authentication',
+    'private production workload audit', 'browser-vendor and mobile background policies'],
+}
 const passed = (check: string) => { checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
-const deadline = setTimeout(() => { void page.close() }, 150_000)
+const deadline = setTimeout(() => { void page.close() }, 210_000)
 page.on('pageerror', (error) => process.stderr.write(`browser: ${error.message}\n`))
 page.on('console', (message) => { if (message.type() === 'error') process.stderr.write(`browser: ${message.text()}\n`) })
 try {
@@ -134,9 +141,82 @@ try {
   assert.equal(engineRequests, 0)
   native.assertHealthy()
   passed('private cutoff flush survives abrupt Worker termination; original operation identity and event IDs survive restart without engine requests')
+
+  const privateKey = 'qualification/private-device-value', privateNative = `native-private-${crypto.randomUUID()}`
+  const privateBrowser = `browser-private-${crypto.randomUUID()}`
+  const recordsBeforePrivate = (await native.transport.history()).length
+  await native.store.put(privateKey, new TextEncoder().encode(privateNative))
+  assert.equal(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.privateValue('cutoff-reopened')), null)
+  assert.equal(await page.evaluate((value) => (globalThis as unknown as TestWindow).chronologEventTest.privateValue('cutoff-reopened', value), privateBrowser), privateBrowser)
+  assert.equal(new TextDecoder().decode((await native.store.get(privateKey))!), privateNative)
+  assert.equal((await native.transport.history()).length, recordsBeforePrivate)
+  assert.deepEqual((await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.read('cutoff-reopened'))).transactions, final.transactions)
+  deviceEvidence.privateStores = { nativeValueRemainedLocal: true, browserValueRemainedLocal: true, addedRecords: 0 }
+  passed('private agent and device store values stay separate and produce no replicated records or application events')
+
+  const isolatedContext = await browser.newContext()
+  try {
+    const isolatedPage = await isolatedContext.newPage()
+    await isolatedPage.goto(page.url())
+    await isolatedPage.waitForFunction(() => 'chronologEventTest' in globalThis)
+    await assert.rejects(isolatedPage.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('isolated', name, bootstrap), { name, bootstrap }), /ENROLLMENT_IDENTITY_MISSING/u)
+    const isolatedIdentity = await isolatedPage.evaluate((name) => (globalThis as unknown as TestWindow).chronologEventTest.prepare(name), name)
+    assert.notEqual(isolatedIdentity.identity, identity.identity)
+    assert.notEqual(isolatedIdentity.readerKey, identity.readerKey)
+    deviceEvidence.isolatedStores = { sameOriginAndPeerName: true, originalKeysAbsent: true,
+      originalIdentity: identity.identity, independentIdentity: isolatedIdentity.identity }
+  } finally { await isolatedContext.close() }
+  passed('an isolated browser context cannot reopen another device identity; explicit setup produces independently keyed storage')
+
+  const cdp = await context.newCDPSession(page), origin = new URL(page.url()).origin
+  const usageBefore = await cdp.send('Storage.getUsageAndQuota', { origin })
+  let rejectedSubmission: string | undefined
+  await cdp.send('Storage.overrideQuotaForOrigin', { origin, quotaSize: 1 })
+  try {
+    await assert.rejects(page.evaluate(({ next }) => (globalThis as unknown as TestWindow).chronologEventTest.checkpoint('cutoff-reopened',
+      { ...next, state: 'full'.repeat(262_144) }), { next }), /QuotaExceeded|quota|space/iu)
+    assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.checkpointState('cutoff-reopened')), next)
+    try {
+      await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.publish('cutoff-reopened',
+        [{ topic: 'chat', payload: { message: 'quota refuses durable preparation' } }], 'browser-quota-operation'))
+    } catch (error) { rejectedSubmission = error instanceof Error ? error.message : String(error) }
+    assert.match(rejectedSubmission ?? '', /QuotaExceeded|quota|space/iu)
+    assert.equal(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.operation('cutoff-reopened', 'browser-quota-operation')), null)
+    assert.equal((await native.transport.history()).length, recordsBeforePrivate)
+  } finally { await cdp.send('Storage.overrideQuotaForOrigin', { origin }) }
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.close('cutoff-reopened'))
+  const quotaReopened = await page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('quota-reopened', name, bootstrap), { name, bootstrap })
+  assert.equal(quotaReopened.identity, identity.identity)
+  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.checkpointState('quota-reopened')), next)
+  const acceptedRetry = await page.evaluate(({ events }) => (globalThis as unknown as TestWindow).chronologEventTest.publish('quota-reopened', events, 'browser-atomic-1'), { events })
+  assert.equal(acceptedRetry.proposalId, published.proposalId)
+  assert.equal((await native.transport.history()).length, recordsBeforePrivate)
+  const afterQuota = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.publish('quota-reopened',
+    [{ topic: 'chat', payload: { message: 'quota refuses durable preparation' } }], 'browser-quota-operation'))
+  assert.equal(afterQuota.outcome.outcome.type, 'accepted')
+  deviceEvidence.quota = { usageBefore, quotaBytes: 1, failedPreparationLeftNoOperation: true,
+    preservedCheckpoint: next, originalProposalId: published.proposalId, retryProposalId: acceptedRetry.proposalId,
+    restoredPublication: afterQuota.proposalId, failure: rejectedSubmission }
+  passed('actual browser quota failure preserves the prior atomic checkpoint and submits no operation; restored space and reopen retain exact accepted retries')
+
+  await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.close('quota-reopened'))
+  const nativeRecordsBeforeLoss = (await native.transport.history()).length
+  await cdp.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' })
+  await assert.rejects(page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologEventTest.open('lost-device', name, bootstrap), { name, bootstrap }), /ENROLLMENT_IDENTITY_MISSING/u)
+  const replacement = await page.evaluate((name) => (globalThis as unknown as TestWindow).chronologEventTest.prepare(`${name}-replacement`), name)
+  assert.notEqual(replacement.identity, identity.identity)
+  assert.notEqual(replacement.readerKey, identity.readerKey)
+  assert.equal([...native.governed.activeSnapshot.capabilities.values()].some((entry) =>
+    Buffer.from(entry.grant.signingPublicKey).toString('base64url') === replacement.identity), false)
+  assert.equal((await native.transport.history()).length, nativeRecordsBeforeLoss)
+  deviceEvidence.storageLoss = { error: 'ENROLLMENT_IDENTITY_MISSING', originalIdentity: identity.identity,
+    replacementIdentity: replacement.identity, replacementHasNoInheritedGrants: true,
+    preservedExternalOperationReference: 'browser-atomic-1', nativeHistoryUnchanged: true }
+  passed('cleared OPFS fails closed instead of silently replacing identity; deliberate replacement has new keys and no inherited grants or original operation journal')
+  await cdp.detach()
+  native.assertHealthy()
   await writeFile(join(output, 'report.json'), JSON.stringify({ passed: true, browser: browser.version(), checks, engineRequests,
-    nativeFinalThrough: native.node.finalThrough, backend: 'native-fixed-authority', transport: 'authenticated-framed-loopback' }, null, 2) + '\n')
+    nativeFinalThrough: native.node.finalThrough, backend: 'native-fixed-authority', transport: 'authenticated-framed-loopback', deviceEvidence }, null, 2) + '\n')
   process.stdout.write(`SQL-free browser qualification passed (${checks.length} checks), Chromium ${browser.version()}\n`)
 } finally {
   clearTimeout(deadline)

@@ -142,7 +142,7 @@ it('administers an independently ordered native/browser group through the actual
   const active = await device({ method: 'status' }), writer = active.grants.find(grant => grant.role === 'writer' && grant.active);
   expect(writer).toBeDefined();
   await device({ method: 'disconnect' });
-  await owner.revoke({ operationId: 'host-revoke-writer', capabilityIds: [writer.id] });
+  const writerRemoved = await owner.revoke({ operationId: 'host-revoke-writer', capabilityIds: [writer.id] });
   expect((await applicantMembers.info()).identity.accountId).toBe(applicantInfo.identity.accountId);
   const rejected = await device({ method: 'publish', operationId: 'device-after-writer-revocation', text: 'must fail through direct peer path' });
   await device({ method: 'connect' });
@@ -172,6 +172,24 @@ it('administers an independently ordered native/browser group through the actual
   expect((await fixture('snapshot')).availableEpochs).toContain(removed.epoch);
   expect((await device({ method: 'events' })).transactions.some(transaction => transaction.events.some(event => event.payload?.id === 'after-reader-removal-0'))).toBe(false);
   await passed('reader revocation rotates future keys without claiming to erase previously decrypted history');
+
+  const beforeRestore = await owner.sync(), controlsBeforeRestore = await history(owner);
+  const nativeBeforeRestore = (await fixture('snapshot')).head;
+  expect(beforeRestore.pendingActions).toBe(0);
+  expect(beforeRestore.requests.find(row => row.id === submitted.id).status).toBe('revoked');
+  await page.restart();
+  const restored = await owner.info();
+  expect(restored).toEqual(beforeRestore);
+  expect(await history(owner)).toEqual(controlsBeforeRestore);
+  expect(await owner.approve(decision)).toEqual(approval);
+  expect(await owner.revoke({ operationId: 'host-revoke-writer', capabilityIds: [writer.id] })).toEqual(writerRemoved);
+  expect(await owner.revoke({ operationId: 'host-revoke-reader', capabilityIds: [reader.id] })).toEqual(removed);
+  await expect(owner.revoke({ operationId: 'host-revoke-reader', capabilityIds: [writer.id] })).rejects.toMatchObject({ status: 409 });
+  await expect(applicantMembers.history({ after: 0 })).rejects.toMatchObject({ status: 403 });
+  expect((await fixture('snapshot')).head).toEqual(nativeBeforeRestore);
+  await passed('reopened actual Cloudflare metadata retains root, certified descriptor prefix, revoked roster, epoch decisions and exact action receipts without new native positions',
+    { before: beforeRestore, after: restored, writerRevocation: writerRemoved, readerRevocation: removed,
+      nativeHead: nativeBeforeRestore, exactControlPages: controlsBeforeRestore.length });
 
   const final = await fixture('snapshot');
   expect(final.traffic.applicationEnvelopeBytesToAdministrator).toBe(0);
