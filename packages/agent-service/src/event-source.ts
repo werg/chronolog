@@ -1,0 +1,75 @@
+import { assertEventTopic, canonicalEventPayload } from '@chronolog/protocol'
+import type { EventPayload } from '@chronolog/protocol'
+
+/** Structural public port: provider integrations do not depend on node internals. */
+export interface FinalEvent {
+  readonly id: string
+  readonly proposalId: string
+  readonly eventOrdinal: number
+  readonly topic: string
+  readonly payload: EventPayload
+}
+
+export interface FinalEventBatch {
+  readonly transactions: readonly { readonly proposalId: string; readonly events: readonly FinalEvent[] }[]
+  readonly scannedThrough: string
+  readonly hasMore: boolean
+  readonly revision: string
+}
+
+export interface EventReadOptions {
+  readonly cursor?: string
+  readonly topics?: readonly string[]
+  readonly limit?: number
+}
+
+export interface FinalEventSource {
+  read(options?: EventReadOptions): Promise<FinalEventBatch>
+  subscribe(options?: EventReadOptions & { readonly signal?: AbortSignal }): AsyncIterable<FinalEventBatch>
+}
+
+export interface FinalEventPublisher {
+  /** Resolve only after final acceptance. Retries must reuse exact authored bytes. */
+  publishFinal(topic: string, payload: EventPayload, options: { readonly operationId: string }): Promise<void>
+}
+
+export function validateConsumerId(value: string): void {
+  if (value.length === 0 || value.length > 256 || /[\u0000-\u001f]/u.test(value)) throw new Error('CONSUMER_ID_INVALID')
+}
+
+export function canonicalTopics(topics: readonly string[]): readonly string[] {
+  if (topics.length === 0 || topics.length > 64) throw new Error('CONSUMER_TOPICS_INVALID')
+  for (const topic of topics) assertEventTopic(topic)
+  return [...new Set(topics)].sort()
+}
+
+export function cloneFinalEvent(event: FinalEvent): FinalEvent {
+  validateConsumerId(event.id)
+  validateConsumerId(event.proposalId)
+  if (!Number.isSafeInteger(event.eventOrdinal) || event.eventOrdinal < 0 || event.eventOrdinal >= 64) {
+    throw new Error('CONSUMER_EVENT_INVALID')
+  }
+  assertEventTopic(event.topic)
+  return { ...event, payload: JSON.parse(canonicalEventPayload(event.payload)) as EventPayload }
+}
+
+/** A source cannot bypass consumer memory bounds or mix transaction identities. */
+export function batchEvents(batch: FinalEventBatch, limit: number, topics: readonly string[]): readonly FinalEvent[] {
+  if (typeof batch.scannedThrough !== 'string' || batch.scannedThrough.length === 0 || batch.scannedThrough.length > 16_384 ||
+      typeof batch.revision !== 'string' || batch.revision.length === 0 || batch.revision.length > 16_384 ||
+      batch.transactions.length > limit) throw new Error('CONSUMER_BATCH_INVALID')
+  const events: FinalEvent[] = []
+  const seen = new Set<string>()
+  for (const transaction of batch.transactions) {
+    if (transaction.events.length > 64) throw new Error('CONSUMER_BATCH_TOO_LARGE')
+    for (const value of transaction.events) {
+      const event = cloneFinalEvent(value)
+      if (event.proposalId !== transaction.proposalId || seen.has(event.id) || !topics.includes(event.topic)) {
+        throw new Error('CONSUMER_BATCH_INVALID')
+      }
+      seen.add(event.id)
+      events.push(event)
+    }
+  }
+  return events
+}

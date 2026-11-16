@@ -1,0 +1,17 @@
+{
+  "name": "@chronolog/agent-service",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./workers": "./src/workers.ts",
+    "./signals": "./src/signals.ts"
+  },
+  "dependencies": {
+    "@chronolog/canonical": "workspace:*",
+    "@chronolog/node-core": "workspace:*",
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/records": "workspace:*"
+  }
+}
