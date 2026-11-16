@@ -44,6 +44,16 @@ certify. `serve(transport)` recovers retained evidence and orders eligible signe
 wire records from the transport's durable subscription. SQL acceptance remains a
 replica decision.
 
+First setup durably creates an empty record log before saving the authority's
+configuration. A later open with saved configuration requires that log; a missing
+log fails with `AUTHORITY_CONTINUITY_NOT_ESTABLISHED`. Any retained certificate is
+authenticated against the pinned configuration and must match the retained log
+at its certified position. Invalid retained proof fails with
+`AUTHORITY_RETAINED_CERTIFICATE_INVALID`; a shorter or conflicting prefix fails
+the continuity check. Failed opens preserve the surviving state. A log may be
+ahead of its last certificate after an interrupted append, and exact retries
+keep their original positions.
+
 `NativeAgentStore` supplies the same atomic bytes port for embedded native hosts.
 It holds SQLite's exclusive owner fence for the lifetime of the connection and
 can back `DurableFeedStore`, authoring state, the authority, and checkpoints.
@@ -58,7 +68,9 @@ After restoring a volume, establish continuity independently before continuing
 the same authority/history. `NativeAuthority.open({ continuity })` and
 `CHRONOLOG_AUTHORITY_CONTINUITY_FILE` accept a trusted `{historyId, position,
 root}` checkpoint and refuse an older or conflicting retained prefix. A
-checkpoint copied from the same old backup cannot detect rollback. Without
+checkpoint copied from the same old backup cannot detect rollback. The automatic
+local certificate check detects partial loss or contradiction; it cannot detect
+rollback of the entire consistent volume, including that certificate. Without
 established continuity, create an explicit new history lineage. Neither this
 package nor a missing newer peer certificate proves that a restored backup was
 the latest acknowledged state.

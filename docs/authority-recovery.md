@@ -134,6 +134,29 @@ application database and signed projection manifest, without daemon/authority
 keys, feed history or operation journals. It is useful for its stated purpose;
 it is insufficient as a complete authority backup.
 
+## Partial metadata loss and the independent recovery floor
+
+The native authority creates its durable empty log before saving configuration.
+On reopening an established configuration, an absent log is a continuity failure,
+not permission to restart the sequence. A surviving prefix certificate must
+authenticate under that configuration and match the log at its certified
+position. A damaged certificate, truncated prefix or conflicting replacement
+fails closed without replacing the surviving configuration or proof. A still-open
+log also refuses a missing underlying value. A committed append ahead of the
+last saved certificate remains recoverable with its original retry position.
+
+`packages/agent-service/src/native-authority.test.ts` exercises interrupted setup
+before/after the empty-log and configuration writes, loss of an empty or certified
+log, shorter/conflicting replacement logs, invalid encoding/kind/signature/configuration
+in retained proof, and recovery of an append ahead of the last certificate. These
+targeted metadata tests complement the real process-crash rehearsal above.
+
+This local check protects against partial loss. A whole-volume rollback can
+restore an internally consistent old log, configuration and certificate together.
+Only an independently retained trusted floor can expose that staleness. The
+procedure below still applies; a certificate copied from the same backup does
+not establish freshness.
+
 ## Deployed single-writer and backup procedure
 
 1. Record the pinned group/history and authority public key from verified
