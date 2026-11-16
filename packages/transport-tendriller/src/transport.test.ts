@@ -16,11 +16,14 @@ import {
   type AtomicBytesStore,
 } from '@chronolog/records'
 
-import { authorizeThroughRecordLog, createCertificateFetcher, withTendrillerAuthority } from './authority.js'
+import { authorizeThroughRecordLog, createCertificateFetcher, withTendrillerAuthority, type AuthorityHttp } from './authority.js'
 import { TendrillerTransport } from './transport.js'
 
 const historyId = 'h_00112233445566778899aabbccddeeff'
 const groupRoute = new Uint8Array(32).fill(7)
+const http: AuthorityHttp<Request, Response> = {
+  request: (url, init) => new Request(url, init), response: (body, init) => new Response(body, init),
+}
 const closers: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of closers.splice(0).reverse()) await close() })
 function storage(): AtomicBytesStore {
@@ -78,7 +81,7 @@ async function fixture() {
   const records = createRecordLogClient({ base: 'https://hub.test', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => serve(new Request(input, init)) })
   const engine = { fetch: (request: Request, _env: object, _context: object) => serve(request), scheduled: () => { scheduled += 1 } }
-  const handler = withTendrillerAuthority(engine, { configuration, identity, records,
+  const handler = withTendrillerAuthority(engine, { configuration, identity, records, http,
     authorize: (request) => request.headers.get('Authorization') === 'Bearer owner' })
   const certificate = createCertificateFetcher({ url: 'https://hub.test/_chronolog/certificate', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => handler.fetch(new Request(input, init), {}, {}) })
@@ -93,11 +96,13 @@ async function fixture() {
 }
 
 describe('public Tendriller adapter', () => {
-  it('pins the built public SDK artifact and provenance', async () => {
-    const artifact = new URL('../../../test/artifacts/tendriller-sdk-160393ee.tgz', import.meta.url)
-    const provenance = JSON.parse(await readFile(new URL('../../../test/artifacts/tendriller-sdk-160393ee.provenance.json', import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
-    expect(createHash('sha256').update(await readFile(artifact)).digest('hex')).toBe(provenance.sha256)
-    expect(provenance.sourceCommit).toBe('160393ee92bb36b3f8feba15d0d7c219e6bb3cb8')
+  it('pins the built public SDK/engine artifacts and provenance', async () => {
+    for (const name of ['sdk', 'engine']) {
+      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-160393ee.tgz`, import.meta.url)
+      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-160393ee.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
+      expect(createHash('sha256').update(await readFile(artifact)).digest('hex')).toBe(provenance.sha256)
+      expect(provenance.sourceCommit).toBe('160393ee92bb36b3f8feba15d0d7c219e6bb3cb8')
+    }
     expect(RECORD_LOG_FORMAT).toBe('record-log/v1')
   })
 
@@ -187,7 +192,7 @@ describe('public Tendriller adapter', () => {
 
   it('fails closed before reading/signing and composes ordinary engine requests and scheduling', async () => {
     const f = await fixture()
-    const denied = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity, records: f.records })
+    const denied = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity, records: f.records, http })
     expect((await denied.fetch(new Request('https://hub.test/_chronolog/certificate', { method: 'POST' }), {}, {})).status).toBe(403)
     expect(f.headReads()).toBe(0)
     expect((await f.handler.fetch(new Request('https://hub.test/_chronolog/certificate', { method: 'POST',
@@ -203,8 +208,8 @@ describe('public Tendriller adapter', () => {
 
   it('can authorize through the configured public engine record route with the original credentials', async () => {
     const f = await fixture()
-    const handler = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity, records: f.records,
-      authorize: authorizeThroughRecordLog(f.engine, { base: 'https://hub.test', historyId }),
+    const handler = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity, records: f.records, http,
+      authorize: authorizeThroughRecordLog(f.engine, { base: 'https://hub.test', historyId, http }),
     })
     const request = (token: string) => new Request('https://hub.test/_chronolog/certificate', {
       method: 'POST', headers: { Authorization: `Bearer ${token}` },

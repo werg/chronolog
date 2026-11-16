@@ -91,15 +91,24 @@ import engine from '@tendriller/engine'
 import {
   authorizeThroughRecordLog,
   withTendrillerAuthority,
+  type AuthorityHttp,
 } from '@chronolog/transport-tendriller'
+
+// Use this deployment's Worker Request/Response globals and declarations.
+const http: AuthorityHttp<Request, Response> = {
+  request: (url, init) => new Request(url, init),
+  response: (body, init) => new Response(body, init),
+}
 
 export default withTendrillerAuthority(engine, {
   configuration,
   identity: stableAuthorityKey,
   records: authenticatedRecordsClient,
+  http,
   authorize: authorizeThroughRecordLog(engine, {
     base: fixedTendrilRecordApiBase,
     historyId: configuration.historyId,
+    http,
   }),
 })
 ```
@@ -107,7 +116,9 @@ export default withTendrillerAuthority(engine, {
 The host must supply `authorize`. Omission fails closed. The helper dispatches an
 authenticated read to the fixed public record route using the original request's
 credentials, so the existing owner/agent checks decide access. It does not create
-another identity registry. Authorization runs before
+another identity registry. The small `http` port preserves the deployment's own
+Web API types, including Cloudflare-specific request/response properties, without
+casting them to browser DOM types. Authorization runs before
 reading the head or signing. The default endpoint is `POST /_chronolog/certificate`
 with no request body; a caller cannot supply a root to sign. The authority reads
 its own configured log's committed head through the public record API and returns
@@ -117,14 +128,22 @@ execute SQL and certificates never enter the log they certify.
 
 ## Public artifact boundary and verification
 
-The package consumes the public `@tendriller/core/records` subpath. Tests install a
-built SDK archive pinned to a Tendriller source commit in `test/artifacts`; its
-adjacent provenance file records the exact source commit, build command and SHA-256.
-The artifact hash is checked by the test suite. No sibling Tendriller checkout or
-private source import is needed to install or run the adapter tests.
+The package consumes the public `@tendriller/core/records` subpath. Tests install
+built SDK and engine archives pinned to a Tendriller source commit in
+`test/artifacts`; each adjacent provenance file records the exact source commit,
+build command and SHA-256. The artifact hashes are checked by the test suite. A
+strict declaration consumer checks composition against the actual packaged engine
+types. No sibling Tendriller checkout or private source import is needed to install
+or run the adapter tests.
 
 The adapter tests exercise real signed portable feed records and durable evidence
 against an independent reference log through the packed public SDK. They cover
 lost replies and reopen, governance ordering, offline proof relay, authority access
-checks and delegation. Tendriller's own Worker suite separately covers transactional
-append, quota, restart, owner/agent authorization and the public HTTP routes.
+checks and delegation. The SQL integration test runs two independent native peers,
+creates an explicit shared collective, accepts its invitation and has both members
+claim one task. Both replicas agree on one accepted transaction, one deterministic
+SQL assertion rejection and the actual final SQL revision. Re-encapsulating the
+same signed proposal does not repeat its SQL effects. A fresh third replica then
+rebuilds those outcomes through an ordinary peer link with the hub unavailable.
+Tendriller's own Worker suite separately covers transactional append, quota,
+restart, owner/agent authorization and the public HTTP routes.
