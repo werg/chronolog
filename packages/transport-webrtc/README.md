@@ -1,8 +1,9 @@
 # WebRTC peer transport
 
 This package carries Chronolog's existing authenticated peer protocol over a
-reliable ordered WebRTC data channel. The page host introduces peers with one
-complete offer and one complete answer. Once connected, records, finality
+reliable ordered WebRTC data channel. A reachable resident accepts one HTTPS
+offer and returns one answer; the page host need not participate. An explicitly
+coordinated pair can also use a separate signaling service. Once connected, records, finality
 proofs, detached application bodies and ephemeral signals travel over WebRTC.
 Stopping the signaling host does not stop an established peer connection.
 
@@ -10,6 +11,86 @@ The transport has no Cloudflare, Tendriller, database, enrollment or application
 write semantics. `openAuthenticatedPeerLink` still authenticates signing keys
 and checks current reader capabilities before serving data. An authenticated
 host account or successful ICE connection does not authorize database reads.
+
+## Cold connection to a resident
+
+Publish the resident's HTTPS introduction address in the initial page or
+deployment configuration. A new browser can then contact the running resident
+directly. The resident does not need a Cloudflare socket, a polling loop, a
+model turn, or a test fixture to notice that browser.
+
+The resident mounts this portable `Request`/`Response` handler on its own HTTPS
+server. Its `accept` port fits the ordinary `AgentApplicationContext`:
+
+```ts
+import { createWebRtcOfferHandler } from '@chronolog/transport-webrtc'
+import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
+
+const introductions = createWebRtcOfferHandler({
+  allowedOrigins: ['https://application.example'],
+  authorize: (request, signal) => admission.authorizeIntroduction(request, signal),
+  configuration: { iceServers },
+  createPeerConnection: configuration => createNativePeerConnection(configuration),
+  accept: connection => context.connectPeer({ connection }),
+  onError: reportPeerFailure,
+})
+// Mount introductions.fetch(request) at the published resident HTTPS address.
+// The resident's final shutdown awaits introductions.close().
+```
+
+`authorize` is required and must return exactly `true`; it admits an introduction,
+not database access. Deployment supplies its admission mechanism. Exact allowed
+browser origins and a bounded preflight are checked separately. Native clients
+without an `Origin` header still undergo authorization. Once the channel exists,
+`context.connectPeer` performs the Chronolog nonce/signature handshake and checks
+current reader capabilities before serving application data.
+
+The Window uses the public HTTP signaling adapter with the existing synchronous
+Worker handoff:
+
+```ts
+import { createHttpWebRtcSignaling, negotiateWebRtc } from '@chronolog/transport-webrtc'
+
+const signaling = createHttpWebRtcSignaling({
+  url: deployment.residentIntroductionUrl,
+  headers: introductionAdmissionHeaders,
+})
+const session = await negotiateWebRtc({
+  role: 'offerer', signaling, configuration: { iceServers },
+  onDataChannel(channel) {
+    const transferable = channel as RTCDataChannel
+    worker.postMessage({ type: 'peer-channel', channel: transferable }, [transferable])
+  },
+})
+```
+
+The wire protocol is `chronolog.webrtc.v1`: one JSON POST containing a complete
+offer, and one JSON answer response. The resident returns the answer **before**
+waiting for ICE/DTLS or the Chronolog handshake; waiting for connection completion
+before answering would deadlock a cold browser. HTTP credentials are omitted,
+redirects are rejected, and admission headers are explicit. Endpoint URLs require
+HTTPS without credentials, query or fragment; HTTP is restricted to loopback
+qualification. The contrib cookbook provides complete `connect-resident-worker`
+and `serve-resident-webrtc` recipes, including the actual native HTTPS resident
+task and cleanup when negotiation cannot start.
+
+The handler defaults to eight pending introductions, 32 total pending/live
+connections and a 30-second deadline covering introduction and authentication.
+Each JSON message is limited to 128 KiB and each SDP to 64 KiB. Request buffers
+and stream fragment counts have fixed bounds; authorization and connection waits
+have deadlines. Closing native connections retain their capacity slots until cleanup finishes.
+Application acceptance receives a cancellation signal and late accepted sessions
+are closed. `stats` exposes pending/live counts and introduction outcomes.
+
+Completing an HTTP response, closing the client's signaling adapter, or stopping
+only the HTTPS listener does not close an established RTC connection. Closing
+the handler is the resident shutdown operation and closes its accepted peers.
+No application frame is carried through the introduction endpoint.
+
+Cold connection requires a resident HTTPS endpoint reachable by the browser and
+an available ICE route. An unreachable resident needs an explicit wake or
+discovery arrangement or an existing peer connection. This package does not
+create an idle host subscription to conceal that reachability requirement.
 
 ## Native peer
 
@@ -116,7 +197,9 @@ separate authenticated-session handshake deadline.
 `packages/transport-webrtc/src/channel.test.ts` checks fragmentation, exact bytes,
 credit/backpressure, invalid frames and close behavior. `native.test.ts` connects
 two real Werift implementations over loopback ICE/DTLS/SCTP and exchanges large
-frames after signaling closes.
+frames after signaling closes. `http.test.ts` checks admission, origins, body and
+concurrency limits, stalled request cancellation, native cleanup, and a real
+HTTP cold introduction followed by RTC exchange after its listener stops.
 
 ```sh
 pnpm exec vitest run packages/transport-webrtc/src

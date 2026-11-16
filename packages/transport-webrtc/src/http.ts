@@ -85,7 +85,7 @@ export function createWebRtcOfferHandler(options: {
   readonly maxPending?: number
   readonly maxConnections?: number
   readonly timeoutMs?: number
-  readonly onError?: (error: unknown) => void
+  readonly onError?: (error: unknown) => void | Promise<void>
 }): WebRtcOfferHandler {
   if (typeof options.authorize !== 'function' || typeof options.accept !== 'function' || typeof options.createPeerConnection !== 'function') {
     throw new Error('WEBRTC_HTTP_HANDLER_PORTS_REQUIRED')
@@ -104,7 +104,10 @@ export function createWebRtcOfferHandler(options: {
   const entries = new Set<Entry>()
   let closed = false, requests = 0, offers = 0, accepted = 0, rejected = 0, failed = 0
   const pending = (): number => [...entries].filter(entry => !entry.active).length
-  const observe = (error: unknown): void => { try { options.onError?.(error) } catch { /* Observer failures cannot retain a connection. */ } }
+  const observe = (error: unknown): void => {
+    try { void Promise.resolve(options.onError?.(error)).catch(() => undefined) }
+    catch { /* Observer failures cannot retain a connection. */ }
+  }
   return {
     get stats() { return { requests, offers, accepted, rejected, failed, pending: pending(), active: entries.size - pending(), closed } },
     async fetch(request) {
@@ -132,7 +135,9 @@ export function createWebRtcOfferHandler(options: {
       const entry: Entry = { active: false, close(reason = new HttpIntroductionError(503, 'introduction_closed')) {
         if (closing !== undefined) return closing
         closing = Promise.resolve().then(async () => {
-          await Promise.allSettled([peer?.close(), rtc?.close(), opening?.then(value => value.close())])
+          const outcomes = await Promise.allSettled([Promise.resolve().then(() => peer?.close()),
+            Promise.resolve().then(() => rtc?.close()), opening?.then(value => value.close())])
+          for (const outcome of outcomes) if (outcome.status === 'rejected') observe(outcome.reason)
           entries.delete(entry)
         })
         clearTimeout(timer); controller.abort(reason); answer.reject(reason)

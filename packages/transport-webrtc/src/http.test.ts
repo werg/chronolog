@@ -154,7 +154,7 @@ it('cold-connects a resident through actual HTTP and keeps native RTC alive afte
   const factory = () => createNativePeerConnection({}, { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false })
   const errors: unknown[] = []
   const endpoint = createWebRtcOfferHandler({ createPeerConnection: factory, allowedOrigins: [origin],
-    authorize: incoming => incoming.headers.get('Authorization') === 'Bearer introduction-test', onError: error => errors.push(error),
+    authorize: incoming => incoming.headers.get('Authorization') === 'Bearer introduction-test', onError: error => { errors.push(error) },
     async accept(connection) {
       const completion = (async () => { for await (const frame of connection.frames()) await connection.send(frame) })()
       return { completion, close: () => connection.close() }
@@ -193,4 +193,25 @@ it('cold-connects a resident through actual HTTP and keeps native RTC alive afte
     if (server.listening) await new Promise<void>(resolve => { server.close(() => resolve()) })
     interfaces.mockRestore(); syncBuiltinESMExports()
   }
+})
+
+it('releases native RTC when an application closer throws and observes failed async diagnostics', async () => {
+  const interfaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue({})
+  syncBuiltinESMExports()
+  const factory = () => createNativePeerConnection({}, { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false })
+  const observed: unknown[] = [], closeError = new Error('application close failed')
+  const endpoint = createWebRtcOfferHandler({ createPeerConnection: factory, allowedOrigins: [], authorize: () => true,
+    async accept() { return { completion: new Promise<void>(() => undefined), close() { throw closeError } } },
+    async onError(error) { observed.push(error); throw new Error('diagnostic observer failed') },
+  })
+  let connection: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
+  try {
+    const signaling = createHttpWebRtcSignaling({ url,
+      fetch: async (input, init) => endpoint.fetch(new Request(input, init)) })
+    connection = await openWebRtcConnection({ role: 'offerer', signaling, createPeerConnection: factory })
+    await expect.poll(() => endpoint.stats.active).toBe(1)
+    await endpoint.close()
+    expect(endpoint.stats).toMatchObject({ active: 0, pending: 0, closed: true })
+    expect(observed).toContain(closeError)
+  } finally { await endpoint.close(); await connection?.close(); interfaces.mockRestore(); syncBuiltinESMExports() }
 })
