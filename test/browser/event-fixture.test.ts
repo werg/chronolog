@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 import { decodeSignedGenesis } from '@chronolog/capabilities'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
+import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { createGovernedNode, loadOrCreateEnrollmentIdentity, MemoryOperationStore } from '@chronolog/node-core'
 import { base64UrlToBytes, bytesToBase64Url } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
@@ -11,12 +12,42 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { waitForFinalAcceptance } from '../../apps/chronologd/src/agent-runtime.js'
 import { createNativeBrowserFixture } from '../../tools/browser-event-fixture.js'
+import { createAgent } from '../../examples/resident-agent.js'
 import { connectGovernedBrowserPeer } from './event-connection.js'
 
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 describe('browser qualification native fixture', () => {
+  it('runs the actual SQL task-summary module and publishes its correlated final result', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'chronolog-pilot-native-worker-'))
+    cleanup.push(() => rm(directory, { recursive: true, force: true }))
+    const native = await createNativeBrowserFixture({ directory, browsers: [], manifest: createDoltLiteExecutionManifest(),
+      application: { createAgent }, materialization: async ({ identity, executionManifest }) =>
+        createDoltLiteMaterializationRuntime(await DeterministicMaterializer.open({
+          path: join(directory, 'application.db'), executionManifest, rootAdministrator: identity.signing.publicKeyBytes,
+        })) })
+    cleanup.push(() => native.close())
+    const setup = await native.client.transaction([
+      'CREATE TABLE tasks(id TEXT PRIMARY KEY, title TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL)',
+      "INSERT INTO tasks(id,title,status) VALUES('task-1','Inspect evidence','open')",
+    ], { idempotencyKey: 'native-pilot-schema' })
+    try { expect((await setup.final({ signal: AbortSignal.timeout(5000) })).outcome.type).toBe('accepted') }
+    finally { setup.dispose() }
+    const request = await native.client.events.publish('job-requests', { type: 'job.requested', version: 1,
+      kind: 'summarize-task', jobId: 'job-1', taskId: 'task-1' }, { operationId: 'native-pilot-job' })
+    try { expect((await request.final({ signal: AbortSignal.timeout(5000) })).outcome.type).toBe('accepted') }
+    finally { request.dispose() }
+    let result
+    for await (const batch of native.node.events.subscribe({ topics: ['job-results'], signal: AbortSignal.timeout(5000) })) {
+      result = batch.transactions[0]?.events[0]
+      if (result !== undefined) break
+    }
+    expect(result?.payload).toMatchObject({ type: 'effect.completed', originEventId: `${request.proposalId}:0`,
+      result: { type: 'job.completed', version: 1, jobId: 'job-1', taskId: 'task-1', text: 'Inspect evidence — status: open.' } })
+    native.assertHealthy()
+  })
+
   it('runs real HTTP framed authenticated ranges bidirectionally against the durable native authority', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-http-framing-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true }))

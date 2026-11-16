@@ -83,8 +83,7 @@ jobs:
             artifacts/browser-events/bundle.json
             artifacts/application-pilot/ci/report.json
             artifacts/application-pilot/ci/bundles.json
-            artifacts/application-pilot/ci/board.png
-            artifacts/application-pilot/ci/compact.png
+            artifacts/application-pilot/ci/*.png
             artifacts/application-pilot/ci/pages/specimen-manifest.json
           if-no-files-found: error
           retention-days: 30

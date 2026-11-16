@@ -39,12 +39,13 @@ const report = { format: 'chronolog-application-pilot/v1', status: 'building', p
   startedAt: new Date().toISOString(), command: process.argv.slice(1), checks: [] as string[],
   revisions: { chronolog: gitState(workspace), contrib: gitState(contrib), tendrillerRuntime: gitState(runtime) },
   publicArtifacts: {} as Record<string, unknown>, counts: { effectDispatches: 0, hostApplicationWrites: 0 },
-  browser: '', pageErrors: [] as string[], error: '' }
+  browser: '', pageErrors: [] as string[], timingsMs: {} as Record<string, number>, diagnostics: {} as Record<string, unknown>, error: '' }
 const record = async () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
 const passed = (check: string) => { report.checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
 let native: NativeBrowserFixture | undefined, browser: Browser | undefined, directory: string | undefined
 let closeServer: (() => Promise<void>) | undefined
 let deadline: ReturnType<typeof setTimeout> | undefined
+const observedPages: Page[] = []
 try {
   const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap(name =>
     ['', '/browser'].map(suffix => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
@@ -145,6 +146,7 @@ try {
     const contexts = await Promise.all([browser.newContext({ viewport: { width: 1365, height: 1000 } }), browser.newContext({ viewport: { width: 430, height: 932 } })])
     const [board, compact] = await Promise.all(contexts.map(context => context.newPage())) as [Page, Page]
     const all = [board, compact]
+    observedPages.push(...all)
     for (const page of all) {
       page.setDefaultTimeout(40_000)
       page.on('pageerror', error => { report.pageErrors.push(error.message); process.stderr.write(`pilot browser: ${error.message}\n`) })
@@ -189,11 +191,29 @@ try {
     await loser.locator('#tasks [data-action="job"]').click()
     await expect(loser.locator('#operations > li').first()).toHaveAttribute('data-status', 'rejected')
     assert.equal(report.counts.effectDispatches, 0)
+    const jobStarted = Date.now()
     await winner.locator('#tasks [data-action="job"]').click()
+    // Native execution and each real WASM replica have separate applied
+    // frontiers. Observe those before testing the UI renderer's short deadline.
+    // In the first CI run the preceding two claims needed 8s to apply, while
+    // Playwright's default DOM expectation allowed only 5s for two more writes.
+    let resultEvent: EffectiveEvent | undefined
+    await waitFor(async () => {
+      native!.assertHealthy()
+      resultEvent = (await native!.client.events.read()).transactions.flatMap(transaction => transaction.events).find(event => event.topic === 'job-results')
+      return resultEvent !== undefined
+    }, 'native final worker result')
+    report.timingsMs.nativeWorkerResult = Date.now() - jobStarted
+    assert(resultEvent !== undefined)
+    const resultProposalId = resultEvent.proposalId
+    await Promise.all(all.map(async (page, index) => {
+      await browserHasProposal(page, resultProposalId)
+      report.timingsMs[`browser${index}WorkerResult`] = Date.now() - jobStarted
+    }))
     await Promise.all(all.map(page => expect(page.locator('#jobs')).toContainText('completed · task-1')))
     assert.equal(report.counts.effectDispatches, 1)
     await assert.rejects(board.evaluate(async () => (globalThis as unknown as PilotWindow).tendril.application.backend.events.publish('job-results',
-      { type: 'forged-result', version: 1 }, { operationId: 'forged-pilot-result' })), /authoriz|capabilit|scope|permission|PROGRAM/iu)
+      { type: 'forged-result', version: 1 }, { operationId: 'forged-pilot-result' })), /authoriz|capabilit|scope|permission|PROGRAM|cannot write/iu)
     passed('a failed SQL guard emits no intent; the final winning intent runs the native worker once and records a correlated result that browser scope cannot forge')
 
     await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.holdNextSubmission())
@@ -202,6 +222,7 @@ try {
     await board.waitForFunction(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission() !== null)
     const delayed = await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission())
     assert(delayed !== null)
+    await Promise.all(all.map(page => browserHasProposal(page, delayed.proposalId)))
     await expect(compact.locator('#conversation')).toContainText('A note whose append reply is delayed')
     await expect(board.locator(`#operations > li[data-operation="${delayed.operationId}"]`)).toHaveAttribute('data-status', 'final')
     await board.locator('#message').fill('Newer unsent text must survive')
@@ -220,6 +241,7 @@ try {
     await board.reload()
     await ready(board)
     assert.equal(await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.identity), identities[0])
+    await Promise.all(all.map(page => browserHasProposal(page, interrupted.proposalId)))
     await expect(board.locator(`#operations > li[data-operation="${interrupted.operationId}"]`)).toHaveAttribute('data-status', 'final')
     const recovered = await board.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), interrupted.operationId)
     assert.equal(recovered?.proposalId, interrupted.proposalId)
@@ -249,7 +271,27 @@ try {
 } catch (error) {
   report.error = error instanceof Error ? error.stack ?? error.message : String(error)
   report.status = `failed during ${report.status}`
+  const observations = await Promise.allSettled(observedPages.map(async (page, index) => {
+    const observation = await bounded(page.evaluate(async () => {
+      const target = globalThis as unknown as PilotWindow
+      const ui = Object.fromEntries(['status', 'revision', 'jobs', 'operations', 'typing'].map(id => [id, document.getElementById(id)?.textContent]))
+      const operationIds = Array.from(document.querySelectorAll('#operations > li')).map(row => row.getAttribute('data-operation')).filter((id): id is string => id !== null)
+      const outcomes = await Promise.allSettled(operationIds.map(id => target.applicationPilot.operation(id)))
+      const events = await target.applicationPilot.events()
+      return { url: location.href, ui, failure: document.getElementById('status')?.getAttribute('data-failure'), outcomes, events,
+        connectionErrors: target.applicationPilot.connectionErrors }
+    }), 5_000)
+    await page.screenshot({ path: join(output, `failure-${index}.png`), fullPage: true }).catch(() => undefined)
+    return observation
+  }))
+  report.diagnostics.pages = observations.map(value => value.status === 'fulfilled' ? value.value : String(value.reason))
+  if (native !== undefined) {
+    report.diagnostics.nativeAgent = native.agent.status
+    report.diagnostics.nativeRevision = native.node.revision.toString()
+    report.diagnostics.nativeFinalEvents = await bounded(native.client.events.read(), 5_000).catch((error: unknown) => String(error))
+  }
   await record()
+  process.stderr.write(`Pilot diagnostics: ${JSON.stringify(report.diagnostics)}\n`)
   throw error
 } finally {
   if (deadline !== undefined) clearTimeout(deadline)
@@ -273,6 +315,24 @@ async function ready(page: Page) {
   await page.waitForFunction(() => 'applicationPilot' in globalThis)
   await expect(page.locator('#message')).toBeEnabled()
   await expect(page.locator('#status')).toHaveAttribute('data-failure', 'false')
+}
+async function waitFor(predicate: () => Promise<boolean>, description: string) {
+  const deadline = Date.now() + 40_000
+  while (!await predicate()) {
+    if (Date.now() >= deadline) throw new Error(`PILOT_DURABLE_PROGRESS_TIMEOUT: ${description}`)
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+}
+async function browserHasProposal(page: Page, proposalId: string) {
+  await waitFor(() => page.evaluate(async id => {
+    const events = await (globalThis as unknown as PilotWindow).applicationPilot.events()
+    return events.transactions.some(transaction => transaction.proposalId === id)
+  }, proposalId), `browser final proposal ${proposalId}`)
+}
+async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('PILOT_DIAGNOSTIC_TIMEOUT')), timeoutMs) })]) }
+  finally { if (timer !== undefined) clearTimeout(timer) }
 }
 async function jsonBody(request: IncomingMessage): Promise<unknown> {
   let bytes = 0
