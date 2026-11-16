@@ -110,6 +110,10 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     }),
     historyPolicy: coordinated === undefined ? { kind: 'peer' } : {
       kind: 'coordinated', policy: coordinated,
+      receiveControlRecord: async (entry) => {
+        try { await governance.ingestCanonical(entry) }
+        catch (error) { if (!isInvalidGovernanceRecord(error)) throw error }
+      },
       applyControlRecord: async (entry) => {
         try {
           const snapshot = await governance.ingestCanonical(entry)

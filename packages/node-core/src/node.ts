@@ -59,6 +59,7 @@ export class ChronologNode {
   readonly #validatorClosures: ValidatorRevisionClosures
   #evidenceTask: Promise<void> | null = null
   #coordinatedProcessed = 0
+  #coordinatedControlReceivedThrough = 0
   #coordinatedAppliedThrough = 0
   readonly #canonicalPositions = new Map<string, number>()
   readonly #mutex = new Mutex()
@@ -515,6 +516,19 @@ export class ChronologNode {
     const selected = this.#options.historyPolicy
     if (selected?.kind !== 'coordinated') return
     const entries = selected.policy.entries(selected.policy.progress.finalThrough)
+    // Historical keys can be granted after the encrypted transactions they
+    // unlock. Receipt of verified governance is independent from its ordered
+    // activation, so a relay-only reader can decrypt the earlier prefix.
+    for (const entry of entries.slice(this.#coordinatedControlReceivedThrough)) {
+      let envelope: ReturnType<typeof decodeEnvelope>
+      try { envelope = decodeEnvelope(entry.bytes) }
+      catch { this.#coordinatedControlReceivedThrough = entry.position; continue }
+      if (equalBytes(envelope.groupRoute, this.#groupRoute()) &&
+          (envelope.messageType === 'capability' || envelope.messageType === 'epoch-manifest')) {
+        await selected.receiveControlRecord?.(entry)
+      }
+      this.#coordinatedControlReceivedThrough = entry.position
+    }
     for (const entry of entries.slice(this.#coordinatedProcessed)) {
       let envelope: ReturnType<typeof decodeEnvelope>
       try { envelope = decodeEnvelope(entry.bytes) }

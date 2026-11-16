@@ -198,6 +198,16 @@ describe('governed coordinated native replicas', () => {
     }
     disconnect()
     await newcomer.close()
+    // Rebuild from the retained relay alone: no original governance feed or
+    // prior epoch keys. Its historical key grant appears after encrypted SQL
+    // in this same certified prefix, and must be received before replay can run.
+    const relayOnly = await open('relay-only', joining, new MemoryOperationStore())
+    for (const entry of await log.read()) await relayOnly.node.ingestOrderingEvidence({ kind: 'ordered-entry', entry })
+    await relayOnly.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: await authority.certify() })
+    expect(relayOnly.activeSnapshot.revision).toBe(3n)
+    expect(relayOnly.node.outcome(staleAgain.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
+    expect(relayOnly.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows)
+      .toEqual(admin.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows)
     const reopened = await open('joining', joining, joiningStore)
     await reopened.node.waitForIdle()
     expect(reopened.activeSnapshot.revision).toBe(3n)
