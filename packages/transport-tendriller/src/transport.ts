@@ -204,8 +204,10 @@ export class TendrillerTransport implements ChronologTransport {
     const target = Math.max(requiredThrough, head.position)
     while (this.#previous.position < target) {
       const page = await this.#records.read({ historyId, after: this.#previous.position, previous: this.#previous, signal: this.#controller.signal })
+      if (page.head.position < target || page.entries.length === 0) throw new Error('TENDRILLER_HISTORY_CONFLICT')
       for (const record of page.entries) {
         const entry = adaptRecordEntry(record)
+        if (entry.position === head.position && entry.root !== head.root) throw new Error('TENDRILLER_HISTORY_CONFLICT')
         await this.#local.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
         // This is only a delivery optimization. The durable evidence store owns
         // recovery; reopening revalidates retained bytes from genesis.

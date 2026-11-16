@@ -190,6 +190,29 @@ describe('public Tendriller adapter', () => {
     expect((await f.log.head()).position).toBe(1)
   })
 
+  it.each(['rollback', 'fork'] as const)('stops visibly if the history changes by %s between head and retained range reads', async (change) => {
+    const f = await fixture(), local = await peer()
+    await f.log.append(envelope('candidate', 1))
+    if (change === 'rollback') await f.log.append(envelope('candidate', 2))
+    const replacement = await ReferenceRecordLog.open(historyId, storage())
+    await replacement.append(envelope('candidate', change === 'rollback' ? 1 : 3))
+    let reads = 0
+    const records = createRecordLogClient({ base: 'https://restored.test', fetch: async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      if (url.pathname === '/records') return Response.json(await f.records.info())
+      if (++reads > 1) throw new Error('UNEXPECTED_REPEATED_READ')
+      const entries = await replacement.read(), after = Number(url.searchParams.get('after'))
+      const page = entries.slice(after).map(wireEntry)
+      return Response.json({ historyId, after, cursor: page.at(-1)?.position ?? after, entries: page,
+        head: { ...await replacement.head(), bytes: entries.reduce((size, entry) => size + entry.bytes.length, 0) } })
+    } })
+    const adapter = new TendrillerTransport({ local: local.transport, records, configuration: f.configuration, groupRoute, watch: false })
+    closers.push(() => adapter.close())
+    await expect(adapter.catchUp()).rejects.toThrow('TENDRILLER_HISTORY_CONFLICT')
+    expect(reads).toBe(1)
+    expect(await adapter.evidenceHistory()).toHaveLength(0)
+  })
+
   it('fails closed before reading/signing and composes ordinary engine requests and scheduling', async () => {
     const f = await fixture()
     const denied = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity, records: f.records, http })
