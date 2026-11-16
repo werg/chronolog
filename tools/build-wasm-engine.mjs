@@ -65,13 +65,31 @@ extern "C" int sqlite3_wasm_extra_init(const char*) {
   int rc = doltliteInstallAutoExt();
   return rc == SQLITE_OK ? sqlite3_auto_extension(reinterpret_cast<void(*)(void)>(sqlite3_vec_init)) : rc;
 }
+// The native hook wraps a VFS by copying its method table. Browser VFSes may
+// key their state by the original sqlite3_vfs pointer, so forward that pointer
+// explicitly for storage methods while preserving the shared clock hooks.
+static int ChronologVfsOpen(sqlite3_vfs*, const char* name, sqlite3_file* file, int flags, int* out) { return g_baseVfs->xOpen(g_baseVfs, name, file, flags, out); }
+static int ChronologVfsDelete(sqlite3_vfs*, const char* name, int sync) { return g_baseVfs->xDelete(g_baseVfs, name, sync); }
+static int ChronologVfsAccess(sqlite3_vfs*, const char* name, int flags, int* out) { return g_baseVfs->xAccess(g_baseVfs, name, flags, out); }
+static int ChronologVfsFullPath(sqlite3_vfs*, const char* name, int bytes, char* out) { return g_baseVfs->xFullPathname(g_baseVfs, name, bytes, out); }
+static int ChronologVfsRandom(sqlite3_vfs*, int bytes, char* out) { return g_baseVfs->xRandomness(g_baseVfs, bytes, out); }
+static int ChronologVfsSleep(sqlite3_vfs*, int micros) { return g_baseVfs->xSleep(g_baseVfs, micros); }
+static int ChronologVfsError(sqlite3_vfs*, int bytes, char* out) { return g_baseVfs->xGetLastError(g_baseVfs, bytes, out); }
 extern "C" EMSCRIPTEN_KEEPALIVE int chronolog_wasm_init(const char* vfsName) {
   if(vfsName && *vfsName) {
     sqlite3_vfs* vfs = sqlite3_vfs_find(vfsName);
     if(!vfs) return SQLITE_NOTFOUND;
     int rc = sqlite3_vfs_register(vfs, 1); if(rc != SQLITE_OK) return rc;
   }
-  return InstallDeterministicEngine() ? SQLITE_OK : SQLITE_ERROR;
+  if(!InstallDeterministicEngine()) return SQLITE_ERROR;
+  g_chronologVfs.xOpen = ChronologVfsOpen;
+  g_chronologVfs.xDelete = ChronologVfsDelete;
+  g_chronologVfs.xAccess = ChronologVfsAccess;
+  g_chronologVfs.xFullPathname = ChronologVfsFullPath;
+  g_chronologVfs.xRandomness = ChronologVfsRandom;
+  g_chronologVfs.xSleep = ChronologVfsSleep;
+  if(g_baseVfs->xGetLastError) g_chronologVfs.xGetLastError = ChronologVfsError;
+  return SQLITE_OK;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE int chronolog_wasm_security(sqlite3* db) {
 ${security}
@@ -89,6 +107,23 @@ function writeIfChanged(path, text) {
   if (!existsSync(path) || readFileSync(path, 'utf8') !== text) writeFileSync(path, text)
 }
 writeIfChanged(shimPath, shim)
+// xSectorSize is optional in SQLite's VFS contract. DoltLite's chunk store
+// bypasses SQLite's guarded helper in two places, which traps with the OPFS
+// VFS. Preserve its exact behavior on native VFSes and use SQLite's standard
+// default when this optional callback is absent. This changes storage I/O,
+// not SQL or the deterministic execution profile.
+const amalgamation = readFileSync(join(nativeRoot, 'amalgamation/doltlite.c'), 'utf8')
+const sectorCall = 'cs->file.pFile->pMethods->xSectorSize(cs->file.pFile)'
+if (amalgamation.split(sectorCall).length !== 3) throw new Error('WASM_SECTOR_SIZE_SOURCE_ANCHOR_MISSING')
+// SQLITE_FCNTL_HAS_MOVED is also optional. The owned OPFS namespace cannot be
+// replaced by another database owner; unsupported movement detection should
+// continue with the ordinary size check instead of failing every read lock.
+const movedCheck = 'rc = sqlite3OsFileControl(cs->file.pFile, SQLITE_FCNTL_HAS_MOVED, &bMoved);\n  if( rc!=SQLITE_OK ) return rc;'
+if (amalgamation.split(movedCheck).length !== 2) throw new Error('WASM_HAS_MOVED_SOURCE_ANCHOR_MISSING')
+const portableAmalgamation = join(output, 'doltlite-wasm.c')
+writeIfChanged(portableAmalgamation, amalgamation
+  .replaceAll(sectorCall, 'sqlite3OsSectorSize(cs->file.pFile)')
+  .replace(movedCheck, movedCheck.replace('if( rc!=SQLITE_OK )', 'if( rc!=SQLITE_OK && rc!=SQLITE_NOTFOUND )')))
 if (!existsSync(join(source, 'Makefile'))) run('./configure', [`--with-emsdk=${emsdk}`, '--disable-tcl', '--disable-readline'], source)
 run('make', ['parse.h', 'opcodes.h'], source)
 // Upstream exports assume its optional session extension. The native profile
@@ -111,7 +146,7 @@ const nativeFlags = [
   '-DSQLITE_ENABLE_COLUMN_METADATA', '-DDOLTLITE_PROLLY=1',
   '-DSQLITE_WASM_SPLIT_BUILD', '-DSQLITE_PRIVATE=', '-DSQLITE_EXTRA_INIT_MUTEXED=sqlite3_wasm_extra_init',
   '-DBLAKE3_NO_SSE2=1', '-DBLAKE3_NO_SSE41=1', '-DBLAKE3_NO_AVX2=1', '-DBLAKE3_NO_AVX512=1',
-  `-DSQLITE_C=${join(nativeRoot, 'amalgamation/doltlite.c')}`,
+  `-DSQLITE_C=${portableAmalgamation}`,
 ].join(' ')
 run('make', [
   'b-esm', 'jswasm/sqlite3-opfs-async-proxy.js', 'DOLTLITE_WASM=0', `bin.emcc=${emcc}`, 'bin.wasm-strip=true', 'bin.wasm-opt=',
@@ -124,7 +159,7 @@ run('make', [
   // but os.c excludes that include under Emscripten. Supply the missing header.
   `cflags.common=-I. -I${join(nativeRoot, 'amalgamation')} -I${join(source, 'src')} -I${source} -include fcntl.h -include unistd.h -fPIC`,
   `sqlite3_wasm_extra_init.c=${shimPath}`,
-  `sqlite3-wasm.c.in=api/sqlite3-wasm.c ${shimPath} ${join(nativeRoot, 'amalgamation/doltlite.c')} ${join(nativeRoot, 'amalgamation/doltlite_orig.c')} ${join(nativeRoot, 'amalgamation/sqlite_vec_static.c')}`,
+  `sqlite3-wasm.c.in=api/sqlite3-wasm.c ${shimPath} ${portableAmalgamation} ${join(nativeRoot, 'amalgamation/doltlite_orig.c')} ${join(nativeRoot, 'amalgamation/sqlite_vec_static.c')}`,
 ], wasmRoot)
 function copyArtifact(sourcePath, targetPath) {
   if (existsSync(targetPath)) chmodSync(targetPath, 0o644)
@@ -136,6 +171,7 @@ copyArtifact(join(wasmRoot, 'jswasm/sqlite3-opfs-async-proxy.js'), join(output, 
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex')
 writeFileSync(join(output, 'manifest.json'), JSON.stringify({
   format: 1, toolchain: 'emscripten-4.0.20', nativeManifest, runtimeVersions,
+  portabilityPatches: ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1'],
   deterministicSourceSha256: digest(deterministic), wasmSha256: digest(readFileSync(join(output, 'sqlite3.wasm'))),
   wasmBytes: statSync(join(output, 'sqlite3.wasm')).size,
 }, null, 2) + '\n')

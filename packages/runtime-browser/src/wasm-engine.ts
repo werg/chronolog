@@ -53,6 +53,15 @@ interface SqliteApi {
 export interface ChronologWasmModule {
   readonly capi: SqliteApi
   readonly wasm: WasmApi
+  installOpfsSAHPoolVfs?(options: {
+    readonly name: string; readonly directory: string; readonly initialCapacity: number
+  }): Promise<OpfsSqlitePool>
+}
+
+export interface OpfsSqlitePool {
+  readonly vfsName: string
+  /** Release owned handles without deleting durable data; all SQL must be closed first. */
+  pauseVfs(): unknown
 }
 
 export interface WasmBuildManifest {
@@ -60,6 +69,7 @@ export interface WasmBuildManifest {
   readonly toolchain: 'emscripten-4.0.20'
   readonly nativeManifest: NativeEngineManifest
   readonly runtimeVersions: { readonly doltlite: string; readonly sqlite: string; readonly vec: string }
+  readonly portabilityPatches: readonly ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1']
   readonly deterministicSourceSha256: string
   readonly wasmSha256: string
   readonly wasmBytes: number
@@ -75,12 +85,16 @@ const SECURITY: NativeSecurityConfiguration = {
 export function verifyWasmBuild(bytes: Uint8Array, manifest: WasmBuildManifest): void {
   if (manifest.format !== 1 || manifest.toolchain !== 'emscripten-4.0.20' || bytes.length !== manifest.wasmBytes ||
       bytesToHex(sha256Sync(bytes)) !== manifest.wasmSha256) throw new Error('WASM_ENGINE_BUILD_MISMATCH')
+  if (manifest.portabilityPatches?.length !== 3 || manifest.portabilityPatches[0] !== 'chunk-store-optional-sector-size-v1' ||
+      manifest.portabilityPatches[1] !== 'chunk-store-optional-has-moved-v1' || manifest.portabilityPatches[2] !== 'vfs-identity-forwarding-v1') {
+    throw new Error('WASM_ENGINE_PORTABILITY_PROFILE_UNSUPPORTED')
+  }
   if (manifest.nativeManifest.doltliteVersion !== '0.11.29' || manifest.nativeManifest.sqliteVecVersion !== '0.1.9' ||
       !manifest.nativeManifest.chronologPatchProfile.endsWith('v7')) throw new Error('WASM_ENGINE_PROFILE_UNSUPPORTED')
 }
 
 /** Create a synchronous engine factory after the Worker has loaded its one WASM instance. */
-export function createWasmEngineFactory(module: ChronologWasmModule, manifest: WasmBuildManifest, vfs = 'opfs'): (options: { path?: string }) => OpenedDatabase {
+export function createWasmEngineFactory(module: ChronologWasmModule, manifest: WasmBuildManifest, vfs: string): (options: { path?: string }) => OpenedDatabase {
   withBytes(module.wasm, utf8(vfs), (pointer) => {
     const rc = module.wasm.xCall('chronolog_wasm_init', pointer)
     if (rc !== 0) throw new Error(`WASM_ENGINE_VFS_UNAVAILABLE:${vfs}:${rc}`)

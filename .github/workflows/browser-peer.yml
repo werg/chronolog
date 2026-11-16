@@ -1,0 +1,52 @@
+name: Browser peer qualification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-peer-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install pinned Emscripten toolchain
+        run: |
+          git clone --depth 1 --branch 4.0.20 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/chronolog-emsdk"
+          test "$(git -C "$RUNNER_TEMP/chronolog-emsdk" rev-parse HEAD)" = e4fe26ef59168ff44f4c23c466e497bf60b3411e
+          "$RUNNER_TEMP/chronolog-emsdk/emsdk" install 4.0.20
+          "$RUNNER_TEMP/chronolog-emsdk/emsdk" activate 4.0.20
+      - name: Build the real pinned SQL engine
+        run: node tools/build-wasm-engine.mjs --emsdk "$RUNNER_TEMP/chronolog-emsdk"
+      - name: Compare native and WASM execution
+        env:
+          CHRONOLOG_REQUIRE_WASM: '1'
+        run: pnpm exec vitest run packages/runtime-browser/src/wasm-conformance.test.ts
+      - name: Install real Chromium with platform dependencies
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify Worker ownership, OPFS recovery and the public client
+        run: node --import tsx tools/test-browser-peer.ts
+      - name: Preserve the qualification and engine provenance
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: browser-peer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/wasm/manifest.json
+            artifacts/browser-qualification/report.json
+          if-no-files-found: error
+          retention-days: 30

@@ -11,6 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { admitted, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
 import { openDatabase as openNativeDatabase } from '../../materializer-doltlite/src/driver.js'
+import { CONSENSUS_DENIED_FUNCTIONS } from '../../materializer-doltlite/src/sql-profile.js'
 import { createWasmEngineFactory, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
 
 const directory = resolve(process.env.CHRONOLOG_WASM_DIRECTORY ?? 'artifacts/wasm')
@@ -101,6 +102,11 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         await admitted(6n, 'ignore', ['CREATE TRIGGER bad AFTER UPDATE ON notes BEGIN SELECT RAISE(IGNORE); END'], digest),
         await admitted(7n, 'constraint', ['INSERT INTO notes(id) VALUES(2)'], digest),
         await admitted(8n, 'budget', ['WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) SELECT count(*) FROM n'], digest),
+        ...await Promise.all([
+          "SELECT sqlite_compileoption_used('OMIT_UTF16')", 'SELECT sqlite_compileoption_get(0)', 'SELECT sqlite_source_id()',
+          'SELECT * FROM pragma_compile_options', 'SELECT * FROM pragma_function_list', 'SELECT * FROM pragma_module_list',
+          'SELECT * FROM pragma_pragma_list', 'SELECT * FROM pragma_collation_list', "SELECT load_extension('x')",
+        ].map((sql, index) => admitted(BigInt(index + 9), `host-probe-${index}`, [sql], digest))),
       ]
       await native.materialize(programs)
       await browser.materialize(programs)
@@ -108,6 +114,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       expect(browser.databaseContentHash).toBe(native.databaseContentHash)
       expect(browser.outcome(programs[0]!.txId)?.outcome).toBe('accepted')
       expect(browser.outcome(programs[1]!.txId)?.outcome).toBe('rejected')
+      for (const transaction of programs.slice(8)) expect(browser.outcome(transaction.txId)?.outcome).toBe('rejected')
       for (const query of ['UPDATE notes SET value=\'write\'', "SELECT dolt_commit('-m','write')", 'PRAGMA writable_schema=1']) {
         expect(() => native.localSql(query)).toThrow()
         expect(() => browser.localSql(query)).toThrow()
@@ -129,6 +136,16 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
     `
     try {
       native.exec(schema); browser.exec(schema)
+      const catalog = (database: typeof native): string[] => {
+        const statement = database.prepare('SELECT name,narg FROM pragma_function_list ORDER BY name,narg')
+        try {
+          return [...new Set(statement.all().map((row) => {
+            const { name, narg } = row as { name: string; narg: number }
+            return CONSENSUS_DENIED_FUNCTIONS.has(name) || name.startsWith('dolt_') ? '' : `${name}:${narg}`
+          }))].filter(Boolean)
+        } finally { statement.finalize?.() }
+      }
+      expect(catalog(browser)).toEqual(catalog(native))
       for (const sql of [
         "SELECT rowid FROM docs WHERE docs MATCH 'hello'",
         "SELECT json_extract('{\"value\":\"exact\"}', '$.value') AS value",

@@ -1,1 +1,6 @@
 export * from './opfs.js'
+export * from './wasm-engine.js'
+export * from './load-engine.js'
+export * from './control-persistence.js'
+export * from './peer.js'
+export * from './worker-rpc.js'
