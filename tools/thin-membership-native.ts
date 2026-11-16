@@ -218,7 +218,7 @@ export async function createThinMembershipNative(options: {
       await governed.start()
       agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, history: governed.descriptor.history,
         store, transport, activeMembership: () => governed!.activeSnapshot,
-        peerLinks: { local: transport.asLink(), attach(link) { transport.connect(link); return () => transport.disconnect(link.identity) } } })
+        peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
       if (agent.authority === null) throw new Error('THIN_NATIVE_AUTHORITY_REQUIRED')
       membershipHandler = createMembershipLedgerHandler({ authority: agent.authority, descriptor: governed.descriptor, sink: transport })
       void agent.run().catch((error: unknown) => { failure = asError(error) })

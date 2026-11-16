@@ -272,7 +272,11 @@ The native `FeedTransport` exports `asLink()`, `connectLink()`,
 connections share the same signed record store. The portable browser transport
 uses `asLink()` and `connect()`. The daemon module context's `connectPeer()`
 performs active reader authorization and attaches a framed session to the native
-transport.
+transport. `connect()` and `connectLink()` return a detach function bound to that
+connection. Session owners use it on completion or close: delayed cleanup from an
+old route cannot remove a replacement connection for the same identity. The
+explicit `disconnect(identity)` / `disconnectLink(identity)` methods deliberately
+remove whichever connection currently owns that identity.
 
 Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
 use `chronolog/ephemeral/v1`. The session multiplexes bounded range responses,

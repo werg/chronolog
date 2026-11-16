@@ -209,10 +209,7 @@ async function startRuntime() {
       })
       agent = await createDaemonAgentRuntime({ node, transport, store: operationStore, identity,
         history: governed.descriptor.history, activeMembership: () => governed!.activeSnapshot,
-        peerLinks: { local: transport.asLink(), attach: (link) => {
-          transport.connectLink(link)
-          return () => transport.disconnectLink(link.identity)
-        } },
+        peerLinks: { local: transport.asLink(), attach: (link) => transport.connectLink(link) },
         authorityQuotaBytes: runtime.authorityQuotaBytes,
         ...(runtime.agentModule === undefined ? {} : { modulePath: runtime.agentModule }),
         ...(runtime.authorityContinuityFile === undefined ? {} : { continuity: await readAuthorityContinuity(runtime.authorityContinuityFile) }),

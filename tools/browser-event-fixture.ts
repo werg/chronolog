@@ -71,7 +71,7 @@ export async function createNativeBrowserFixture(options: {
   const agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, history: governed.descriptor.history,
     store, transport, activeMembership: () => governed.activeSnapshot,
     ...(options.application === undefined ? {} : { application: options.application }),
-    peerLinks: { local: transport.asLink(), attach(link) { transport.connect(link); return () => transport.disconnect(link.identity) } } })
+    peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
   const running = agent.run()
   let serviceFailure: Error | undefined
   void running.catch((error: unknown) => { serviceFailure = error instanceof Error ? error : new Error('NATIVE_AGENT_FAILED', { cause: error }) })

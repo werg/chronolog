@@ -97,8 +97,8 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
           equalBytes(capability.grant.signingPublicKey, authorId)
       },
     })
-    local.connect(peer.link)
-    void peer.completion.finally(() => local.disconnect(peer.link.identity)).catch(() => undefined)
+    const detach = local.connect(peer.link)
+    void peer.completion.finally(detach).catch(() => undefined)
     return peer
   } })
   let online = true

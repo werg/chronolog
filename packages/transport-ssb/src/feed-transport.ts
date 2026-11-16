@@ -220,8 +220,8 @@ export class FeedTransport implements ChronologTransport {
     for (const connection of this.#links.values()) this.#queueLinkSync(connection)
   }
 
-  /** Attach a grant-authenticated framed range link alongside native SSB peers. */
-  connectLink(link: FeedLink): void {
+  /** Attach a grant-authenticated link; detach only this connection on cleanup. */
+  connectLink(link: FeedLink): () => void {
     if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
     this.disconnectLink(link.identity)
     this.#wanted.add(link.identity)
@@ -239,6 +239,10 @@ export class FeedTransport implements ChronologTransport {
         if (!connection.controller.signal.aborted) connection.error = errorMessage(error)
       }
     })()
+    return () => {
+      connection.controller.abort()
+      if (this.#links.get(link.identity) === connection) this.#links.delete(link.identity)
+    }
   }
 
   disconnectLink(identity: string): void {

@@ -107,8 +107,8 @@ export class PortableFeedTransport implements ChronologTransport {
     for (const connection of this.#connections.values()) this.#queueSync(connection)
   }
 
-  /** Attaches a link and starts retained catch-up. Errors remain observable and retryable. */
-  connect(link: FeedLink): void {
+  /** Attaches a link; the returned detach belongs only to this connection. */
+  connect(link: FeedLink): () => void {
     if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
     this.disconnect(link.identity)
     this.#wanted.add(link.identity)
@@ -124,6 +124,10 @@ export class PortableFeedTransport implements ChronologTransport {
         }
       } catch (error) { connection.error = error instanceof Error ? error.message : String(error) }
     })()
+    return () => {
+      connection.controller.abort()
+      if (this.#connections.get(link.identity) === connection) this.#connections.delete(link.identity)
+    }
   }
 
   disconnect(identity: string): void {
@@ -229,7 +233,6 @@ export class PortableFeedTransport implements ChronologTransport {
 
 /** A tiny test/application link with exactly the same range protocol as network adapters. */
 export function connectInProcess(left: PortableFeedTransport, right: PortableFeedTransport): () => void {
-  left.connect(right.asLink())
-  right.connect(left.asLink())
-  return () => { left.disconnect(right.identity); right.disconnect(left.identity) }
+  const detachLeft = left.connect(right.asLink()), detachRight = right.connect(left.asLink())
+  return () => { detachLeft(); detachRight() }
 }
