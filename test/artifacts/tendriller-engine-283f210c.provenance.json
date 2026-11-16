@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "283f210c1fb9dc2c1d27e9bbd9e8813234a40a70",
+  "sourceTree": "6c905a09a81083d510c4164d3171c6ccb01e5d56",
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm install --ignore-scripts --no-audit --no-fund",
+  "membershipSource": "cc18d15ed5b5580b386fb2fc3e986afab935c7de",
+  "purpose": "Pinned public artifacts for portable thin membership, application, peer and record-log qualification without private Tendriller source imports.",
+  "package": "@tendriller/engine",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-engine-283f210c.tgz",
+  "sha256": "bb9039154d67dc0e21d65d3d2cd712834fa276c824b6f32ddc59c6edcee41607"
+}

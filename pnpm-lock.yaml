@@ -25,12 +25,12 @@ importers:
       '@chronolog/control-store':
         specifier: workspace:*
         version: link:packages/control-store
-      '@chronolog/materializer':
-        specifier: workspace:*
-        version: link:packages/materializer
       '@chronolog/crypto':
         specifier: workspace:*
         version: link:packages/crypto
+      '@chronolog/materializer':
+        specifier: workspace:*
+        version: link:packages/materializer
       '@chronolog/materializer-doltlite':
         specifier: workspace:*
         version: link:packages/materializer-doltlite
@@ -65,8 +65,8 @@ importers:
         specifier: 1.65.0
         version: 1.65.0
       '@tendriller/core':
-        specifier: file:./test/artifacts/tendriller-sdk-43cac4e7.tgz
-        version: file:test/artifacts/tendriller-sdk-43cac4e7.tgz
+        specifier: file:./test/artifacts/tendriller-sdk-283f210c.tgz
+        version: file:test/artifacts/tendriller-sdk-283f210c.tgz
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
@@ -471,11 +471,11 @@ importers:
         specifier: workspace:*
         version: link:../rpc
       '@tendriller/core':
-        specifier: file:../../test/artifacts/tendriller-sdk-43cac4e7.tgz
-        version: file:test/artifacts/tendriller-sdk-43cac4e7.tgz
+        specifier: file:../../test/artifacts/tendriller-sdk-283f210c.tgz
+        version: file:test/artifacts/tendriller-sdk-283f210c.tgz
       '@tendriller/engine':
-        specifier: file:../../test/artifacts/tendriller-engine-43cac4e7.tgz
-        version: file:test/artifacts/tendriller-engine-43cac4e7.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-43cac4e7.tgz)
+        specifier: file:../../test/artifacts/tendriller-engine-283f210c.tgz
+        version: file:test/artifacts/tendriller-engine-283f210c.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-283f210c.tgz)
 
 packages:
 
@@ -1000,12 +1000,12 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@tendriller/core@file:test/artifacts/tendriller-sdk-43cac4e7.tgz':
-    resolution: {integrity: sha512-N70Dgm4GmjtzXY8tgqKSPRYJj2BllGKGzS56JLMq8ZhADqsO1+w0Tcs9+EI3TXjD004vb/c1FYnLFYSvNlkCcA==, tarball: file:test/artifacts/tendriller-sdk-43cac4e7.tgz}
+  '@tendriller/core@file:test/artifacts/tendriller-sdk-283f210c.tgz':
+    resolution: {integrity: sha512-Mw2pH07Ygv28q1w1liMGeZk04Zawu+vDssQbcAo7bMweLWBvm3uiomp7QAk5yjOOc7hvP4y0PKN5BO/CaKzkzw==, tarball: file:test/artifacts/tendriller-sdk-283f210c.tgz}
     version: 0.3.0-rc.9
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-43cac4e7.tgz':
-    resolution: {integrity: sha512-V9MPpXM4dlqnzXboapZG/ieTA/nvEK27FfJbD6ijj7lmRm3mS3D5uQogYYoa0xrG2Sd5esgwts6ZE3g9Qt8XBQ==, tarball: file:test/artifacts/tendriller-engine-43cac4e7.tgz}
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-283f210c.tgz':
+    resolution: {integrity: sha512-9DAdDovla7owIbbtw937x6idViF6gjUkxmDH5tbnCJ1B6j1CprVsuDtrkgpQwBuOCQv3pwbhVmpvub4+lnvHRw==, tarball: file:test/artifacts/tendriller-engine-283f210c.tgz}
     version: 0.3.0-rc.9
     peerDependencies:
       '@tendriller/core': 0.3.0-rc.9
@@ -3101,12 +3101,12 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.62.2':
     optional: true
 
-  '@tendriller/core@file:test/artifacts/tendriller-sdk-43cac4e7.tgz': {}
+  '@tendriller/core@file:test/artifacts/tendriller-sdk-283f210c.tgz': {}
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-43cac4e7.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-43cac4e7.tgz)':
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-283f210c.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-283f210c.tgz)':
     dependencies:
       '@cloudflare/workers-types': 5.20261113.1
-      '@tendriller/core': file:test/artifacts/tendriller-sdk-43cac4e7.tgz
+      '@tendriller/core': file:test/artifacts/tendriller-sdk-283f210c.tgz
 
   '@testcontainers/toxiproxy@12.0.4':
     dependencies:
