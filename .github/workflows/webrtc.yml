@@ -1,0 +1,42 @@
+name: WebRTC native and browser
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webrtc-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify bounded framing and native ICE/DTLS/SCTP
+        run: pnpm exec vitest run packages/transport-webrtc/src
+      - name: Install actual Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify OPFS peer after page and signaling host shutdown
+        run: node --import tsx tools/test-browser-webrtc.ts --output artifacts/browser-webrtc
+      - name: Preserve browser results and emitted graph
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: webrtc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/browser-webrtc/report.json
+            artifacts/browser-webrtc/bundle.json
+          if-no-files-found: error
+          retention-days: 30

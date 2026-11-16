@@ -18,7 +18,7 @@ class Channel extends EventTarget implements RtcDataChannel {
     if (this.readyState !== 'open') throw new Error('closed channel')
     const copy = data.slice(0)
     this.sent.push(new Uint8Array(copy))
-    queueMicrotask(() => { if (this.other.readyState === 'open') this.other.dispatchEvent(new MessageEvent('message', { data: copy })) })
+    queueMicrotask(() => { if (this.other.readyState !== 'closed') this.other.dispatchEvent(new MessageEvent('message', { data: copy })) })
   }
   close(): void {
     if (this.readyState === 'closed') return
@@ -36,6 +36,28 @@ function pair(options: Parameters<typeof frameRtcDataChannel>[1] = {}) {
 }
 
 describe('reliable WebRTC frame transport', () => {
+  it('waits for local HELLO before sending DATA when the remote HELLO precedes local open', async () => {
+    const left = new Channel(), right = new Channel()
+    left.other = right; right.other = left
+    const a = frameRtcDataChannel(left), b = frameRtcDataChannel(right)
+    const read = b.frames()[Symbol.asyncIterator]()
+    let ready = false
+    void a.ready.then(() => { ready = true }, () => undefined)
+    const writing = a.send(new Uint8Array([9]))
+    void writing.catch(() => undefined)
+    try {
+      right.readyState = 'open'; right.dispatchEvent(new Event('open'))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(a.stats.receivedPackets).toBe(1)
+      expect(ready).toBe(false)
+      expect(left.sent).toEqual([])
+      left.readyState = 'open'; left.dispatchEvent(new Event('open'))
+      await Promise.all([a.ready, b.ready, writing])
+      expect(left.sent.map(packet => packet[3])).toEqual([1, 2])
+      expect((await read.next()).value).toEqual(new Uint8Array([9]))
+    } finally { await Promise.all([a.close(), b.close()]); await writing.catch(() => undefined); await read.return?.() }
+  })
+
   it('fragments large signed frames without changing bytes and transfers both directions', async () => {
     const { a, b, left } = pair()
     const bytes = Uint8Array.from({ length: 700_003 }, (_, i) => i % 251)

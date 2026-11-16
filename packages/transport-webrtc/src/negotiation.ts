@@ -18,29 +18,32 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
   const factory = options.createPeerConnection ?? ((configuration: RTCConfiguration) => new RTCPeerConnection(configuration))
   const connection = factory(structuredClone(options.configuration ?? {}))
   const controller = new AbortController(), signal = controller.signal
-  let channel: RtcDataChannel | undefined, closed = false
+  let channel: RtcDataChannel | undefined, negotiationFailed = false
+  let closing: Promise<void> | undefined, outcome: WebRtcSession | undefined
+  let negotiationError: unknown
   let channelCreated!: () => void
   const channelReady = new Promise<void>(resolve => { channelCreated = resolve })
   let sentMessages = 0, receivedMessages = 0, sentBytes = 0, receivedBytes = 0
-  const close = async (): Promise<void> => {
-    if (closed) return
-    closed = true; controller.abort(new Error('WEBRTC_CONNECTION_CLOSED'))
+  const close = (): Promise<void> => {
+    if (closing !== undefined) return closing
+    controller.abort(new Error('WEBRTC_CONNECTION_CLOSED'))
     options.signal?.removeEventListener('abort', abort)
     connection.removeEventListener('datachannel', dataChannel)
     connection.removeEventListener('connectionstatechange', failed)
-    await connection.close()
+    closing = Promise.resolve().then(() => connection.close())
+    return closing
   }
-  const abort = (): void => { controller.abort(options.signal?.reason); void close() }
+  const abort = (): void => { controller.abort(options.signal?.reason); void close().catch(() => undefined) }
   options.signal?.addEventListener('abort', abort, { once: true })
   const failed = (): void => {
     if (['failed', 'closed'].includes(connection.connectionState)) {
-      controller.abort(new Error('WEBRTC_CONNECTION_FAILED')); void close()
+      controller.abort(new Error('WEBRTC_CONNECTION_FAILED')); void close().catch(() => undefined)
     }
   }
   connection.addEventListener('connectionstatechange', failed)
   const accept = (incoming: RtcDataChannel): void => {
     if (channel !== undefined || incoming.label !== LABEL || !incoming.ordered || incoming.maxPacketLifeTime !== null || incoming.maxRetransmits !== null) {
-      incoming.close(); controller.abort(new Error('WEBRTC_CHANNEL_UNEXPECTED')); void close(); return
+      incoming.close(); controller.abort(new Error('WEBRTC_CHANNEL_UNEXPECTED')); void close().catch(() => undefined); return
     }
     channel = incoming
     try {
@@ -83,15 +86,20 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     await waitFor(connection, 'connectionstatechange', () => connection.connectionState === 'connected', signal)
     await interruptible(channelReady, signal)
     signal.throwIfAborted()
-    return { connection, signal, signaling: { sentMessages, receivedMessages, sentBytes, receivedBytes }, close }
-  } catch (error) { await close(); throw error }
-  finally {
-    clearTimeout(timeout)
-    await options.signaling.close()
-    // close() is the signaling cancellation boundary; do not wait for a remote
-    // iterator return that can remain blocked after an aborted negotiation.
-    void descriptions.return?.().catch(() => undefined)
+    outcome = { connection, signal, signaling: { sentMessages, receivedMessages, sentBytes, receivedBytes }, close }
+  } catch (error) { negotiationFailed = true; negotiationError = error; await close().catch(() => undefined) }
+  clearTimeout(timeout)
+  try { await options.signaling.close() }
+  catch (error) {
+    await close().catch(() => undefined)
+    if (!negotiationFailed) { negotiationFailed = true; negotiationError = error }
   }
+  // close() is the signaling cancellation boundary; do not wait for a remote
+  // iterator return that can remain blocked after an aborted negotiation.
+  void Promise.resolve().then(() => descriptions.return?.()).catch(() => undefined)
+  if (negotiationFailed) throw negotiationError
+  if (outcome === undefined) throw new Error('WEBRTC_NEGOTIATION_INCOMPLETE')
+  return outcome
 }
 
 export async function openWebRtcConnection(options: WebRtcOptions): Promise<DataChannelConnection & { readonly session: WebRtcSession }> {

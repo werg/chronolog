@@ -1,0 +1,210 @@
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { once } from 'node:events'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import os, { tmpdir } from 'node:os'
+import { syncBuiltinESMExports } from 'node:module'
+import { join, resolve } from 'node:path'
+
+import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
+import { isCapabilityActive } from '@chronolog/capabilities'
+import { bytesToHex, equalBytes } from '@chronolog/protocol'
+import { openWebRtcConnection, WEBRTC_LIMITS } from '@chronolog/transport-webrtc'
+import type { DataChannelStats, PeerDescription } from '@chronolog/transport-webrtc'
+import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
+import { chromium } from '@playwright/test'
+import { build } from 'esbuild'
+
+import type { WebRtcTestApi } from '../test/browser/webrtc-page.js'
+import { createNativeBrowserFixture } from './browser-event-fixture.js'
+
+interface TestWindow { readonly chronologWebRtcTest: WebRtcTestApi }
+interface BrowserState {
+  readonly records: readonly { readonly id: string; readonly author: string }[]
+  readonly historySha256: string
+  readonly events: unknown
+  readonly stats: DataChannelStats
+}
+const workspace = resolve(import.meta.dirname, '..')
+const outputArg = process.argv.indexOf('--output')
+const output = outputArg < 0 ? join(workspace, 'artifacts/browser-webrtc') : resolve(process.argv[outputArg + 1]!)
+await mkdir(output, { recursive: true })
+const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap(name =>
+  ['', '/browser'].map(suffix => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
+for (const [name, file] of [['history', 'history-policy'], ['finality', 'finality'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
+  alias[`@chronolog/node-core/${name}`] = join(workspace, `packages/node-core/src/${file}.ts`)
+}
+const bundle = await build({ absWorkingDir: workspace,
+  entryPoints: { 'webrtc-worker': 'test/browser/webrtc-worker.ts', 'webrtc-page': 'test/browser/webrtc-page.ts' },
+  outdir: output, bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })
+const forbidden = Object.values(bundle.metafile.outputs).flatMap(entry => Object.entries(entry.inputs)
+  .filter(([name, input]) => input.bytesInOutput > 0 && /(?:werift|transport-webrtc\/src\/native|runtime-workerd|transport-tendriller)/u.test(name)).map(([name]) => name))
+assert.deepEqual(forbidden, [], 'browser RTC data plane imports native or hosted transports')
+await writeFile(join(output, 'bundle.json'), JSON.stringify(bundle.metafile, null, 2) + '\n')
+if (process.argv.includes('--build-only')) { process.stdout.write('WebRTC page/Worker bundles built; runtime qualification was not run.\n'); process.exit(0) }
+
+let resolveOffer!: (description: PeerDescription) => void, rejectOffer!: (error: unknown) => void
+const offer = new Promise<PeerDescription>((resolve, reject) => { resolveOffer = resolve; rejectOffer = reject })
+void offer.catch(() => undefined)
+let resolveAnswer!: (description: PeerDescription) => void, rejectAnswer!: (error: unknown) => void
+const answer = new Promise<PeerDescription>((resolve, reject) => { resolveAnswer = resolve; rejectAnswer = reject })
+void answer.catch(() => undefined)
+const host = { requests: 0, requestBytes: 0, responseBytes: 0, applicationRequests: 0, signalingMessages: 0, signalingBytes: 0 }
+let signaled = false, hostClosed = false, nativeSignalingClosed = false
+const server = createServer((request, response) => {
+  host.requests += 1
+  response.setHeader('Cache-Control', 'no-store')
+  const path = new URL(request.url ?? '/', 'http://localhost').pathname
+  const run = async (): Promise<void> => {
+    if (path === '/signal' && request.method === 'POST') {
+      if (signaled) { response.writeHead(409); response.end(); return }
+      signaled = true
+      const chunks: Buffer[] = []; let bytes = 0
+      for await (const chunk of request) {
+        const value = Buffer.from(chunk as Uint8Array); bytes += value.length
+        if (bytes > WEBRTC_LIMITS.sdpBytes + 1024) throw new Error('WEBRTC_SIGNAL_TOO_LARGE')
+        chunks.push(value)
+      }
+      host.requestBytes += bytes
+      const description = JSON.parse(Buffer.concat(chunks).toString('utf8')) as PeerDescription
+      host.signalingMessages += 1; host.signalingBytes += Buffer.byteLength(description.sdp)
+      resolveOffer(description)
+      const returned = await answer, body = JSON.stringify(returned)
+      host.responseBytes += Buffer.byteLength(body); host.signalingMessages += 1; host.signalingBytes += Buffer.byteLength(returned.sdp)
+      response.setHeader('Content-Type', 'application/json'); response.end(body); return
+    }
+    const file = new Map([['/webrtc-page.js', 'webrtc-page.js'], ['/webrtc-worker.js', 'webrtc-worker.js']]).get(path)
+    const bytes = path === '/' ? Buffer.from('<!doctype html><meta charset="utf-8"><title>Chronolog WebRTC qualification</title><script type="module" src="/webrtc-page.js"></script>')
+      : file === undefined ? null : await readFile(join(output, file))
+    if (bytes === null) { if (path !== '/favicon.ico') host.applicationRequests += 1; response.writeHead(404); response.end(); return }
+    response.setHeader('Content-Type', path === '/' ? 'text/html' : 'application/javascript')
+    host.responseBytes += bytes.length; response.end(bytes)
+  }
+  void run().catch((error: unknown) => { rejectOffer(error); rejectAnswer(error); response.writeHead(500); response.end(String(error)) })
+})
+server.listen(0, '127.0.0.1'); await once(server, 'listening')
+const address = server.address()
+if (address === null || typeof address === 'string') throw new Error('WEBRTC_FIXTURE_ADDRESS_MISSING')
+const browser = await chromium.launch({ headless: true,
+  ...(process.env.CHRONOLOG_CHROMIUM_EXECUTABLE === undefined ? {} : { executablePath: process.env.CHRONOLOG_CHROMIUM_EXECUTABLE }) }).catch(async (error: unknown) => {
+  server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()))
+  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v1', passed: false,
+    phase: 'browser-launch', error: error instanceof Error ? error.message : String(error) }, null, 2) + '\n')
+  throw error
+})
+const context = await browser.newContext(), page = await context.newPage()
+const directory = await mkdtemp(join(tmpdir(), 'chronolog-webrtc-'))
+let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
+let nativeConnection: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
+let nativeSession: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined, detach: (() => void) | undefined
+const errors: string[] = [], checks: Array<{ id: string; passed: boolean }> = []
+page.on('pageerror', error => errors.push(error.message))
+const passed = (id: string): void => { checks.push({ id, passed: true }); process.stdout.write(`Passed: ${id}\n`) }
+const closeHost = async (): Promise<void> => {
+  if (hostClosed) return
+  hostClosed = true; server.closeAllConnections()
+  await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error)))
+}
+const digest = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex')
+const payload = Uint8Array.from({ length: 512 * 1024 + 37 }, (_, i) => i % 251), payloadHash = digest(payload)
+try {
+  await page.goto(`http://127.0.0.1:${address.port}`)
+  await page.waitForFunction(() => 'chronologWebRtcTest' in globalThis)
+  const name = `rtc-${crypto.randomUUID()}`
+  const identity = await page.evaluate(name => (globalThis as unknown as TestWindow).chronologWebRtcTest.prepare(name), name)
+  native = await createNativeBrowserFixture({ directory, browsers: [identity], topics: ['chat'] })
+  await page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologWebRtcTest.open(name, bootstrap), { name, bootstrap: native.bootstrap })
+  // The fixture binds loopback explicitly. Avoid optional interface discovery,
+  // which this sandbox denies; all ICE/DTLS/SCTP packets still use real sockets.
+  const enumerate = os.networkInterfaces
+  os.networkInterfaces = () => ({})
+  syncBuiltinESMExports()
+  const nativeOpening = (async () => {
+    nativeConnection = await openWebRtcConnection({ role: 'answerer', signaling: {
+      messages: { async *[Symbol.asyncIterator]() { yield await offer } }, async send(description) { resolveAnswer(description) }, close() { nativeSignalingClosed = true },
+    }, createPeerConnection: configuration => createNativePeerConnection(configuration,
+      { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] } })
+    const snapshot = native.governed.activeSnapshot
+    const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
+      equalBytes(capability.grant.signingPublicKey, native!.identity.signing.publicKeyBytes))!
+    nativeSession = await openAuthenticatedPeerLink({ connection: nativeConnection,
+      local: { ...native.transport.asLink(), readPayload: hash => hash === payloadHash ? Promise.resolve(payload) : native!.transport.asLink().readPayload(hash) },
+      groupId: snapshot.groupId, identity: native.identity.signing, grantId: reader.id,
+      authorizePeer: ({ authorId, grantId }) => {
+        const current = native!.governed.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
+        return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
+          equalBytes(capability.grant.signingPublicKey, authorId)
+      } })
+    detach = native.transport.connect(nativeSession.link)
+  })()
+  const [negotiation] = await Promise.all([page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.connect()), nativeOpening])
+    .finally(() => { os.networkInterfaces = enumerate; syncBuiltinESMExports() })
+  assert.equal(negotiation.workerOwnsChannel, true); assert.equal(nativeSignalingClosed, true); assert.equal(negotiation.signalingClosed, true)
+  assert.equal(host.signalingMessages, 2)
+  passed('native-browser-rtc-and-worker-ownership')
+  const before = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
+  const nativeBefore = nativeConnection!.stats
+  await closeHost()
+  const hostBefore = structuredClone(host)
+  const first = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish('rtc-browser-operation', 'browser after signaling host stopped')) as { proposalId: string; outcome: { outcome: { type: string } } }
+  assert.equal(first.outcome.outcome.type, 'accepted')
+  const nativeHandle = await native.client.events.publish('chat', { text: 'native after signaling host stopped' }, { operationId: 'rtc-native-operation' })
+  let nativeOutcome: unknown
+  try { nativeOutcome = await nativeHandle.final({ signal: AbortSignal.timeout(20_000) }) } finally { nativeHandle.dispose() }
+  const receivedPayload = await page.evaluate(hash => (globalThis as unknown as TestWindow).chronologWebRtcTest.payload(hash), payloadHash) as { bytes: number; sha256: string }
+  assert.equal(receivedPayload.sha256, payloadHash); assert.equal(receivedPayload.bytes, payload.length)
+  passed('detached-body-after-signaling-host-stopped')
+  const retry = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish('rtc-browser-operation', 'browser after signaling host stopped'))
+  assert.deepEqual(retry, first)
+  passed('exact-original-operation-retry')
+  let final!: BrowserState
+  const deadline = Date.now() + 20_000
+  for (;;) {
+    final = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
+    await native.transport.catchUp(); await native.node.waitForIdle()
+    if (JSON.stringify(final.events) === JSON.stringify(await native.client.events.read())) break
+    if (Date.now() >= deadline) throw new Error('WEBRTC_EVENTS_DID_NOT_CONVERGE')
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  const records = (await native.transport.history()).map(record => ({ id: record.id, author: record.author })).sort((a, b) => a.id.localeCompare(b.id))
+  const nativeHistorySha256 = digest(records.map(record => record.id).join('\n'))
+  assert.equal(final.historySha256, nativeHistorySha256)
+  assert.deepEqual(final.records, records)
+  assert.deepEqual(host, hostBefore)
+  assert.equal(host.applicationRequests, 0)
+  const signalingAfter = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.signaling())
+  assert.equal(signalingAfter.sentMessages, negotiation.sentMessages)
+  assert.deepEqual(errors, [])
+  passed('final-events-and-original-records-converge-with-host-unavailable')
+  const metrics = { signalingMessages: host.signalingMessages, signalingBytes: host.signalingBytes,
+    signalingMessagesAfterClosed: signalingAfter.sentMessages - negotiation.sentMessages, signalingClosed: nativeSignalingClosed && signalingAfter.signalingClosed,
+    hostApplicationRequests: host.applicationRequests, host: { before: hostBefore, after: host },
+    bytesAfterSignalingClosed: { browserSent: final.stats.sentBytes - before.stats.sentBytes, nativeSent: nativeConnection!.stats.sentBytes - nativeBefore.sentBytes },
+    records: { browserAuthored: records.filter(record => record.author === identity.transportAuthor).length,
+      nativeAuthored: records.filter(record => record.author === native!.transport.identity).length, atBrowser: final.records.length, atNative: records.length },
+    history: { browserSha256: final.historySha256, nativeSha256: nativeHistorySha256, recordIds: records.map(record => record.id) },
+    payload: { bytes: payload.length, expectedSha256: payloadHash, receivedSha256: receivedPayload.sha256 },
+    outcomes: { browser: first, retry, native: nativeOutcome, events: final.events },
+    channels: { browser: final.stats, native: nativeConnection!.stats } }
+  assert(metrics.bytesAfterSignalingClosed.browserSent > 0); assert(metrics.bytesAfterSignalingClosed.nativeSent >= payload.length)
+  const source = { chronolog: { head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim(),
+    dirty: execFileSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).trim().length > 0 } }
+  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v1', passed: true, source,
+    runtime: { node: process.version, browser: browser.version(), native: 'werift@0.27.0' },
+    topology: { transport: 'webrtc', nativeImplementation: 'werift', signaling: 'loopback HTTP offer/answer fixture',
+      networkDiscovery: 'native binds loopback explicitly; optional interface enumeration disabled in fixture', browserStorage: 'OPFS', channelOwner: 'DedicatedWorker', hostStoppedAfterNegotiation: true,
+      excludes: ['packaged Tendriller signaling host', 'public NAT connectivity', 'TURN interoperability', 'provider billing'] },
+    checks, metrics }, null, 2) + '\n')
+  process.stdout.write(`WebRTC qualification passed: ${join(output, 'report.json')}\n`)
+} catch (error) {
+  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v1', passed: false, checks, errors,
+    error: error instanceof Error ? error.stack : String(error) }, null, 2) + '\n')
+  throw error
+} finally {
+  detach?.(); await nativeSession?.close(); await nativeConnection?.close()
+  try { await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.close()) } catch { /* Preserve qualification errors. */ }
+  await context.close(); await browser.close(); await native?.close(); await closeHost()
+  await rm(directory, { recursive: true, force: true })
+}

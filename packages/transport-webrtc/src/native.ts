@@ -61,7 +61,10 @@ class NativeDataChannel extends EventTarget implements RtcDataChannel {
         const value = typeof data === 'string' ? data : new Uint8Array(data).buffer
         this.dispatchEvent(new MessageEvent('message', { data: value }))
       }),
-      channel.stateChanged.subscribe(state => { if (state === 'open' || state === 'closed') this.dispatchEvent(new Event(state === 'open' ? 'open' : 'close')) }),
+      channel.stateChanged.subscribe(state => {
+        if (state === 'open') this.dispatchEvent(new Event('open'))
+        else if (state === 'closed') this.close()
+      }),
       channel.bufferedAmountLow.subscribe(() => this.dispatchEvent(new Event('bufferedamountlow'))),
       channel.error.subscribe(() => this.dispatchEvent(new Event('error'))),
     ]

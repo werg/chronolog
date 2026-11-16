@@ -47,8 +47,7 @@ export async function connectGovernedBrowserPeer(options: {
     isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, options.identity.signing.publicKeyBytes))
   if (reader === undefined) throw new Error('BROWSER_READER_GRANT_MISSING')
   const started = performance.now()
-  const publicPeer = options.bootstrap.connection === undefined ? undefined : connectPeer({ url: options.bootstrap.connection.url, route: options.bootstrap.connection.route },
-    { relayHandshake: options.bootstrap.connection.relayHandshake })
+  const publicPeer = options.bootstrap.connection === undefined ? undefined : connectPeer({ url: options.bootstrap.connection.url, route: options.bootstrap.connection.route })
   const connection = publicPeer === undefined
     ? await openHttpPeerConnection(options.bootstrap.peerUrl, options.bootstrap.peerToken) : frameTendrillerPeer(publicPeer)
   const session = await openAuthenticatedPeerLink({

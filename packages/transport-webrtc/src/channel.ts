@@ -79,8 +79,11 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
   }
   const open = (): void => {
     if (opened || closed) return
-    opened = true
-    try { packet(HELLO, maximum, windowBytes, windowFrames) } catch (error) { fail(error) }
+    try {
+      packet(HELLO, maximum, windowBytes, windowFrames)
+      opened = true
+      if (greeted) resolveReady()
+    } catch (error) { fail(error) }
   }
   const on = (type: string, listener: EventListener): void => { listeners.push([type, listener]); channel.addEventListener(type, listener) }
   on('open', open)
@@ -100,7 +103,10 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
         if (greeted || bytes.length !== HEADER || a < 1 || a > WEBRTC_LIMITS.frameBytes || b < a || b > WEBRTC_LIMITS.queueBytes ||
             c < 1 || c > WEBRTC_LIMITS.queueFrames) throw new Error('WEBRTC_HELLO_INVALID')
         greeted = true; remoteMaximum = a; remoteWindow = b; remoteFrames = c; creditBytes = b; creditFrames = c
-        resolveReady(); wake(); return
+        // Native SCTP implementations can deliver the remote HELLO before
+        // local DCEP acknowledgement. Never enqueue DATA ahead of our HELLO.
+        if (opened) resolveReady()
+        wake(); return
       }
       if (!greeted) throw new Error('WEBRTC_HELLO_REQUIRED')
       if (kind === CREDIT) {

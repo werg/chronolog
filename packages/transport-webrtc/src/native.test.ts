@@ -42,4 +42,24 @@ describe('native WebRTC interoperability', () => {
       expect(left.stats.sentBytes).toBe(body.length)
     } finally { await Promise.all([left.close(), right.close()]) }
   })
+
+  it('aborting the native session wakes a blocked frame reader and closes its channel', async () => {
+    const signals = signalingPair(), controller = new AbortController()
+    const factory = () => createNativePeerConnection({}, { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false })
+    const interfaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue({})
+    syncBuiltinESMExports()
+    const [left, right] = await Promise.all([
+      openWebRtcConnection({ role: 'offerer', signaling: signals.a, createPeerConnection: factory, signal: controller.signal }),
+      openWebRtcConnection({ role: 'answerer', signaling: signals.b, createPeerConnection: factory }),
+    ]).finally(() => { interfaces.mockRestore(); syncBuiltinESMExports() })
+    try {
+      const reading = left.frames()[Symbol.asyncIterator]().next()
+      const rejected = expect(reading).rejects.toThrow('WEBRTC_CONNECTION_ENDED')
+      controller.abort()
+      await rejected
+      expect(left.session.signal.aborted).toBe(true)
+      await expect(left.send(new Uint8Array([1]))).rejects.toThrow('WEBRTC_CONNECTION_ENDED')
+    } finally { await Promise.all([left.close(), right.close()]) }
+  })
+
 })

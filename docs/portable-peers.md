@@ -19,6 +19,7 @@ there is no compatibility decoder or data migration path for earlier prototypes.
 | `@chronolog/control-store` | The derived admission/order index and durable validator signing cutoffs. |
 | `@chronolog/materializer-doltlite` | One SQL reducer, ownership checks, checkpoints, replay, and separate immutable local/final readers. Native and browser entrypoints inject their engine driver. |
 | `@chronolog/runtime-browser` | An owning Worker, OPFS storage, Web Lock ownership, real patched DoltLite WASM, and the shared RPC contract over Worker messages. |
+| `@chronolog/transport-webrtc` | Provider-independent WebRTC negotiation, bounded data channels, direct Worker ownership and optional native Werift adapter. |
 | `@chronolog/transport-tendriller` | An optional adapter and on-demand prefix authority composed with public Tendriller packages. |
 | `@chronolog/client`, `@chronolog/rpc` | The common application interface across native HTTP, embedded peers, and browser Workers. |
 
@@ -132,6 +133,20 @@ configuration and client contract apply; private keys stay inside that Worker.
 See the [browser runtime](../packages/runtime-browser/README.md) for its build,
 headers, ownership, and qualification commands.
 
+## WebRTC data plane
+
+[WebRTC transport](../packages/transport-webrtc/README.md) introduces peers with one
+complete SDP offer and answer, then closes signaling. The browser transfers its
+data channel directly into the owning Worker. Native peers use the optional
+Werift adapter. The existing authenticated peer session exchanges original
+records, detached bodies and finality evidence; the host does not carry ordinary
+application frames. STUN/TURN configuration and reconnection are explicit.
+
+`tools/test-browser-webrtc.ts` verifies actual native/Chromium interoperability,
+OPFS ownership, final event convergence, large payloads and original retries
+after the page/signaling host has stopped. This loopback gate does not establish
+Internet direct-connect rates or provider savings.
+
 ## Live reader/writer enrollment
 
 Enrollment uses the running device's durable signer, reader key, and original
@@ -180,5 +195,5 @@ new snapshot alone does not establish a revocation boundary.
 
 The initial scope does not add log compaction, authority failover, dynamic
 validator sets, root/authority rotation, multiple issuers, bearer invitations,
-WebRTC discovery, or execution-engine upgrades. Existing native snapshot tools
+execution-engine upgrades. Existing native snapshot tools
 are separate from this full-history portable path.
