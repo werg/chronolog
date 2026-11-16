@@ -236,8 +236,15 @@ export default defineConfig({ plugins: [cloudflareTest({main: new URL('./entry.m
   const active = report.timing.phases.at(-1)
   if (active !== undefined) { active.elapsedMs = Math.round(performance.now() - started) - active.startedAfterMs; active.status = 'failed' }
   await save()
+  const diagnostics: Record<string, unknown> = {}
+  report.final = diagnostics
+  try { diagnostics.native = native?.diagnostics() ?? null }
+  catch (error) { diagnostics.nativeError = error instanceof Error ? error.stack ?? error.message : String(error) }
+  await save()
   if (page !== undefined) {
-    try { report.final = { browser: await callDevice(page, { method: 'progress' }), native: await native?.snapshot() } } catch { /* Preserve the original failure. */ }
+    try { diagnostics.browser = await callDevice(page, { method: 'progress' }) }
+    catch (error) { diagnostics.browserError = error instanceof Error ? error.stack ?? error.message : String(error) }
+    await save()
     await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => undefined)
   }
   await save(); throw error

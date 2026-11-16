@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
+import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
@@ -184,5 +185,26 @@ describe('thin membership qualification native boundary', () => {
     expect(native.traffic().rtcSdpBytes).toBeGreaterThan(0)
     expect(native.traffic().peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
     native.assertHealthy()
+
+    // A real denied peer must leave its originating native error observable
+    // even though the success snapshot now refuses to return healthy evidence.
+    const bootstrap = native.bootstrap()
+    const connection = await openWebRtcConnection({ role: 'offerer',
+      signaling: createHttpWebRtcSignaling({ url: bootstrap.rtcUrl, headers: { Authorization: `Bearer ${bootstrap.rtcToken}` } }),
+      configuration: { iceServers: [] }, createPeerConnection: configuration => createNativePeerConnection(configuration,
+        { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }) })
+    cleanup.push(() => connection.close())
+    const denied = await openAuthenticatedPeerLink({ connection, local: transport.asLink(),
+      groupId: replica.descriptor.history.groupId, identity: device.signing, grantId: reader.id, authorizePeer: () => true })
+      .then(async peer => { cleanup.push(() => peer.close()); await peer.completion }).catch((error: unknown) => error)
+    expect(denied).toBeInstanceOf(Error)
+    await expect.poll(() => native.diagnostics().failure).toMatchObject({ source: 'peer', message: 'PEER_READ_UNAUTHORIZED' })
+    await expect(native.snapshot()).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    const diagnostic = native.diagnostics()
+    expect(diagnostic.finalThrough).toBeGreaterThan(0)
+    expect(diagnostic.availableEpochs).toContain(String(revoked.epoch))
+    expect(diagnostic.traffic.rtcSignalingDescriptions).toBe(6)
+    expect(diagnostic.traffic.peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
+    expect(diagnostic.failure).toEqual(native.diagnostics().failure)
   }, 120_000)
 })

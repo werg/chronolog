@@ -95,6 +95,13 @@ export async function createThinMembershipNative(options: {
   let client: ChronologClient | undefined
   let membershipHandler: ((request: Request) => Promise<Response>) | undefined
   let failure: Error | undefined
+  let firstFailure: { source: 'peer' | 'agent'; observedAt: string; name: string; message: string; stack: string | null } | null = null
+  const retainFailure = (error: unknown, source: 'peer' | 'agent'): void => {
+    if (failure !== undefined) return
+    failure = asError(error)
+    firstFailure = { source, observedAt: new Date().toISOString(), name: failure.name, message: failure.message, stack: failure.stack ?? null }
+    process.stderr.write(`Thin native ${source} failure: ${failure.stack ?? failure.message}\n`)
+  }
   let schemaReady = false
   let dropAppendReply = false
   const rtcToken = crypto.randomUUID(), connections = new Set<DataChannelConnection>()
@@ -203,7 +210,7 @@ export async function createThinMembershipNative(options: {
       { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
     onError(error) {
       const value = asError(error)
-      if (!['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED'].includes(value.message)) failure = value
+      if (!['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED'].includes(value.message)) retainFailure(value, 'peer')
     },
     async accept(connection) {
       connections.add(connection)
@@ -252,7 +259,7 @@ export async function createThinMembershipNative(options: {
         peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
       if (agent.authority === null) throw new Error('THIN_NATIVE_AUTHORITY_REQUIRED')
       membershipHandler = createMembershipLedgerHandler({ authority: agent.authority, descriptor: governed.descriptor, sink: transport })
-      void agent.run().catch((error: unknown) => { failure = asError(error) })
+      void agent.run().catch((error: unknown) => { retainFailure(error, 'agent') })
       client = new ChronologClient({ groupId: bytesToBase64Url(genesis.manifest.groupId),
         transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node })), unaryRetryAttempts: 1 })
       return bootstrap()
@@ -308,6 +315,15 @@ export async function createThinMembershipNative(options: {
         schemaRoles: { nativeSchemaAdministrators, membershipRootGroupMembers }, traffic: measuredTraffic(),
         rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift', restrictedInterfaceEnumeration,
           byteBoundary: 'Logical authenticated peer frame payload; excludes framing headers/credit and SCTP/DTLS/IP overhead.' } }
+    },
+    // Failure evidence must remain available when checked() rejects. Observe
+    // cached frontiers and counters without requesting SQL replay or a view.
+    diagnostics() {
+      return { failure: firstFailure === null ? null : { ...firstFailure }, started: governed !== undefined,
+        finalThrough: governed?.node.finalThrough ?? null,
+        membershipRevision: governed === undefined ? null : String(governed.activeSnapshot.revision),
+        availableEpochs: governed?.governance.cipherRing.epochs().map(String) ?? [],
+        traffic: measuredTraffic(), rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift' } }
     },
     loseNextAppendReply() { dropAppendReply = true },
     assertHealthy() { checked() },
