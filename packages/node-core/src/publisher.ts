@@ -89,21 +89,23 @@ export async function preparePublisherRequest(options: {
   readonly descriptor: EnrollmentDescriptor; readonly store: DurableOperationStore; readonly identity: Ed25519KeyPair
   readonly requestId: string; readonly topics: readonly string[]; readonly signals?: readonly string[]
 }): Promise<SignedPublisherRequest> {
-  await verifyEnrollmentDescriptor(options.descriptor)
-  const request: PublisherRequest = { requestId: options.requestId, groupId: options.descriptor.history.groupId,
-    historyDigest: await historyConfigurationDigest(options.descriptor.history), signer: options.identity.publicKeyBytes,
-    topics: scopes(options.topics), signals: scopes(options.signals ?? []) }
+  const descriptor = structuredClone(options.descriptor), store = options.store
+  const identity = { ...options.identity, publicKeyBytes: options.identity.publicKeyBytes.slice() }
+  const requestId = options.requestId, topics = scopes(options.topics), signals = scopes(options.signals ?? [])
+  await verifyEnrollmentDescriptor(descriptor)
+  const request: PublisherRequest = { requestId, groupId: descriptor.history.groupId,
+    historyDigest: await historyConfigurationDigest(descriptor.history), signer: identity.publicKeyBytes, topics, signals }
   const body = requestBody(request)
-  return lock(options.store).run(async () => {
+  return lock(store).run(async () => {
     const key = `publisher/request/${bytesToHex(request.groupId)}/${encodeURIComponent(request.requestId)}`
-    const saved = await options.store.get(key)
+    const saved = await store.get(key)
     if (saved !== null) {
       const result = decodePublisherRequest(saved)
       if (!equalBytes(requestBody(result.request), body)) throw new Error('PUBLISHER_REQUEST_ID_CONFLICT')
       return result
     }
-    const signed = { request, signature: await signDomain(DOMAINS.publisherRequest, body, options.identity.privateKey) }
-    await options.store.put(key, encodePublisherRequest(signed))
+    const signed = { request, signature: await signDomain(DOMAINS.publisherRequest, body, identity.privateKey) }
+    await store.put(key, encodePublisherRequest(signed))
     return signed
   })
 }
@@ -126,37 +128,43 @@ export async function approvePublisherRequest(options: {
   readonly store: DurableOperationStore; readonly rootPrivateKey: CryptoKey
   readonly request: SignedPublisherRequest; readonly topics: readonly string[]; readonly signals?: readonly string[]
 }): Promise<PublisherApproval> {
-  await verifyEnrollmentDescriptor(options.descriptor)
-  const { request } = options.request
+  const descriptor = structuredClone(options.descriptor)
+  const signed = decodePublisherRequest(encodePublisherRequest(options.request))
+  const { request } = signed
+  const governance = options.governance, store = options.store, rootPrivateKey = options.rootPrivateKey
   const topics = scopes(options.topics), signals = scopes(options.signals ?? [])
-  if (!equalBytes(request.groupId, options.descriptor.history.groupId) ||
-      !equalBytes(request.historyDigest, await historyConfigurationDigest(options.descriptor.history)) ||
-      !await verifyDomain(DOMAINS.publisherRequest, requestBody(request), options.request.signature, request.signer) ||
+  await verifyEnrollmentDescriptor(descriptor)
+  if (!equalBytes(request.groupId, descriptor.history.groupId) ||
+      !equalBytes(request.historyDigest, await historyConfigurationDigest(descriptor.history)) ||
+      !await verifyDomain(DOMAINS.publisherRequest, requestBody(request), signed.signature, request.signer) ||
       topics.some((topic) => !request.topics.includes(topic)) || signals.some((topic) => !request.signals.includes(topic))) throw new Error('PUBLISHER_REQUEST_UNAUTHORIZED')
-  const signedRequest = encodePublisherRequest(options.request)
+  const signedRequest = encodePublisherRequest(signed)
   const requestDigest = await hashDomain(DOMAINS.publisherRequest, signedRequest)
   const fingerprint = encodeCanonicalCbor([signedRequest, topics, signals])
-  return lock(options.store).run(async () => {
+  return lock(store).run(async () => {
     const key = `publisher/issued/${bytesToHex(request.groupId)}/${bytesToHex(request.signer)}/${encodeURIComponent(request.requestId)}`
-    const saved = await options.store.get(key)
+    const saved = await store.get(key)
     if (saved !== null) {
       const state = assertCanonicalCbor(saved)
       if (!Array.isArray(state) || state.length !== 2 || !(state[0] instanceof Uint8Array) || !equalBytes(state[0], fingerprint)) throw new Error('PUBLISHER_DECISION_CONFLICT')
       if (state[1] instanceof Uint8Array) return decodePublisherApproval(state[1])
       if (state[1] !== null) throw new Error('PUBLISHER_APPROVAL_INVALID')
-    } else await options.store.put(key, encodeCanonicalCbor([fingerprint, null]))
-    const revision = await options.governance.publishCapabilityChange({ grants: [{
+    } else await store.put(key, encodeCanonicalCbor([fingerprint, null]))
+    const revision = await governance.publishCapabilityChange({ grants: [{
       role: 'writer', subjectId: request.signer, signingPublicKey: request.signer,
       program: { sql: false, topics, signals, forwarded: true },
-    }] }, options.rootPrivateKey, { operationId: `publisher:${bytesToHex(requestDigest)}` })
-    const body = { requestDigest, revision, validationPolicy: await validationPolicyId(options.descriptor.genesis.manifest.validationPolicies[0]!) }
-    const approval = { ...body, signature: await signDomain(DOMAINS.publisherApproval, approvalBody(body), options.rootPrivateKey) }
-    await options.store.put(key, encodeCanonicalCbor([fingerprint, encodePublisherApproval(approval)]))
+    }] }, rootPrivateKey, { operationId: `publisher:${bytesToHex(requestDigest)}` })
+    const body = { requestDigest, revision, validationPolicy: await validationPolicyId(descriptor.genesis.manifest.validationPolicies[0]!) }
+    const approval = { ...body, signature: await signDomain(DOMAINS.publisherApproval, approvalBody(body), rootPrivateKey) }
+    await store.put(key, encodeCanonicalCbor([fingerprint, encodePublisherApproval(approval)]))
     return approval
   })
 }
 
 export async function verifyPublisherApproval(descriptor: EnrollmentDescriptor, request: SignedPublisherRequest, approval: PublisherApproval): Promise<void> {
+  descriptor = structuredClone(descriptor)
+  request = decodePublisherRequest(encodePublisherRequest(request))
+  approval = decodePublisherApproval(encodePublisherApproval(approval))
   await verifyEnrollmentDescriptor(descriptor)
   const root = descriptor.genesis.manifest.rootAdminPublicKey
   const revision = approval.revision.revision, grant = revision.grants[0]
@@ -183,30 +191,38 @@ export async function createLimitedPublisher(options: {
   readonly send: (signed: Uint8Array) => Promise<{ readonly txIdText?: string; readonly proposalId?: string }>
   readonly now?: () => number
 }) {
-  await verifyPublisherApproval(options.descriptor, options.request, options.approval)
-  if (!equalBytes(options.identity.publicKeyBytes, options.request.request.signer)) throw new Error('PUBLISHER_IDENTITY_MISMATCH')
-  const grant = options.approval.revision.revision.grants[0]!
+  // These data remain authoritative for this instance. Keep owned snapshots,
+  // including byte arrays, before verification or journal I/O can suspend.
+  const descriptor = structuredClone(options.descriptor)
+  const request = decodePublisherRequest(encodePublisherRequest(options.request))
+  const approval = decodePublisherApproval(encodePublisherApproval(options.approval))
+  const identity = { ...options.identity, publicKeyBytes: options.identity.publicKeyBytes.slice() }
+  const store = options.store, sendToIngress = options.send, now = options.now ?? Date.now
+  await verifyPublisherApproval(descriptor, request, approval)
+  if (!equalBytes(identity.publicKeyBytes, request.request.signer)) throw new Error('PUBLISHER_IDENTITY_MISMATCH')
+  const grant = approval.revision.revision.grants[0]!
   const writerCapability = await capabilityId(grant)
-  const membershipRevision = await capabilityRevisionDigest(options.approval.revision.revision)
-  const journal = new DurableOperationJournal(options.store, `publisher/outbox/${bytesToHex(options.descriptor.history.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
+  const membershipRevision = await capabilityRevisionDigest(approval.revision.revision)
+  const journal = new DurableOperationJournal(store, `publisher/outbox/${bytesToHex(descriptor.history.groupId)}/${bytesToHex(identity.publicKeyBytes)}`)
   const send = async (signed: Uint8Array): Promise<void> => {
     const wire = await decodeSignedMessage(signed)
     const expected = `tx_${bytesToHex(await transactionDigest(wire.payload))}`
-    const receipt = await options.send(signed)
+    const receipt = await sendToIngress(signed)
     if ((receipt.proposalId ?? receipt.txIdText) !== expected) throw new Error('PUBLISHER_RECEIPT_MISMATCH')
   }
   const submit = async (change: ChangeProgram, input: { readonly operationId: string }): Promise<PublisherReceipt> => {
+    const operationId = input.operationId
     const fingerprint = encodeChangeProgram(change)
     change = decodeChangeProgram(fingerprint)
-    const signed = await journal.run({ operationId: input.operationId, fingerprint,
+    const signed = await journal.run({ operationId, fingerprint,
       prepare: async () => {
         if (!change.steps.every(isEmitStep) || !programAllowed(grant, change)) throw new Error('PUBLISHER_PROGRAM_UNAUTHORIZED')
-        const core: TransactionCore = { operationId: input.operationId, groupId: options.descriptor.history.groupId,
-          membershipRevision, validationPolicy: options.approval.validationPolicy, writerCapability,
-          authorId: options.identity.publicKeyBytes, authorTimestampMs: BigInt(Math.trunc((options.now ?? Date.now)())),
-          nonce: crypto.getRandomValues(new Uint8Array(32)), executionManifestDigest: options.descriptor.history.executionManifestDigest,
+        const core: TransactionCore = { operationId, groupId: descriptor.history.groupId,
+          membershipRevision, validationPolicy: approval.validationPolicy, writerCapability,
+          authorId: identity.publicKeyBytes, authorTimestampMs: BigInt(Math.trunc(now())),
+          nonce: crypto.getRandomValues(new Uint8Array(32)), executionManifestDigest: descriptor.history.executionManifestDigest,
           program: change }
-        return signWireMessage('candidate', encodeTransactionCore(core), options.identity)
+        return signWireMessage('candidate', encodeTransactionCore(core), identity)
       }, apply: send })
     const wire = await decodeSignedMessage(signed)
     return { operationId: decodeTransactionCore(wire.payload).operationId, proposalId: `tx_${bytesToHex(await transactionDigest(wire.payload))}` }

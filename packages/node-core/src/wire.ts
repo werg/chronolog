@@ -37,29 +37,34 @@ export async function encodeSignedEnvelope(
   signer: Ed25519KeyPair,
   cipher?: EnvelopeCipher | EnvelopeCipherResolver,
 ): Promise<Uint8Array> {
+  groupRoute = groupRoute.slice()
   return sealSignedMessage(groupRoute, await signWireMessage(type, payload, signer), cipher)
 }
 
 /** A publisher signs without knowing any reader key or retaining group history. */
 export async function signWireMessage(type: SignedWireMessage['type'], payload: Uint8Array, signer: Ed25519KeyPair): Promise<Uint8Array> {
+  payload = payload.slice()
+  const publicKeyBytes = signer.publicKeyBytes.slice()
   const signature = await signDomain(domainFor(type), payload, signer.privateKey)
   return encodeCanonicalCbor([
     1n,
     BigInt(WIRE_TYPES.indexOf(type)),
     payload,
-    signer.publicKeyBytes,
+    publicKeyBytes,
     signature,
   ])
 }
 
 /** Wrap the original signed bytes in the group's current encryption epoch. */
 export async function sealSignedMessage(groupRoute: Uint8Array, wire: Uint8Array, cipher?: EnvelopeCipher | EnvelopeCipherResolver): Promise<Uint8Array> {
+  groupRoute = groupRoute.slice()
+  wire = wire.slice()
   const { type } = await decodeSignedMessage(wire)
   const activeCipher = cipher === undefined ? undefined : isCipherResolver(cipher) ? cipher.current() : cipher
-  const epochId = activeCipher?.epochId ?? null
+  const epochId = activeCipher?.epochId.slice() ?? null
   const envelopePayload = activeCipher === undefined
     ? wire
-    : await activeCipher.seal(wire, envelopeAssociatedData(groupRoute, type, activeCipher.epochId))
+    : await activeCipher.seal(wire, envelopeAssociatedData(groupRoute, type, epochId!))
   return encodeEnvelope({ groupRoute, messageType: type, encryptionEpoch: epochId, payload: envelopePayload })
 }
 
@@ -68,6 +73,8 @@ export async function decodeSignedEnvelope(
   expectedGroupRoute: Uint8Array,
   cipher?: EnvelopeCipher | EnvelopeCipherResolver,
 ): Promise<SignedWireMessage> {
+  encoded = encoded.slice()
+  expectedGroupRoute = expectedGroupRoute.slice()
   const envelope = decodeEnvelope(encoded)
   if (!equalBytes(envelope.groupRoute, expectedGroupRoute)) throw wireError('WIRE_WRONG_GROUP')
   const payloadBytes = envelope.payload
@@ -95,6 +102,7 @@ export async function decodeSignedEnvelope(
 }
 
 export async function decodeSignedMessage(wireBytes: Uint8Array): Promise<SignedWireMessage> {
+  wireBytes = wireBytes.slice()
   const value = assertCanonicalCbor(wireBytes, { maxBytes: 2 * 1024 * 1024 })
   if (!Array.isArray(value) || value.length !== 5 || value[0] !== 1n) {
     throw wireError('WIRE_SCHEMA_INVALID')
