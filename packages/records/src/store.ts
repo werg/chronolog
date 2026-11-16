@@ -70,8 +70,17 @@ export class DurableFeedStore implements FeedStorePort {
   readonly #evidenceIndex = new Map<string, number>()
   #pending: Promise<unknown> = Promise.resolve()
   #closed = false
+  #writeFailed = false
+  #writeFailure: unknown
 
   private constructor(bytes: AtomicBytesStore, crypto: FeedCrypto) { this.#bytes = bytes; this.#crypto = crypto }
+
+  /** Explicit first setup; durable empty history precedes creation of its signer. */
+  static async create(bytes: AtomicBytesStore, crypto: FeedCrypto): Promise<DurableFeedStore> {
+    if (await bytes.get('feed/manifest') !== null) throw new Error('FEED_STORE_ALREADY_EXISTS')
+    await bytes.put('feed/manifest', encodeCanonicalCbor([1n, [], [], []]))
+    return new DurableFeedStore(bytes, crypto)
+  }
 
   static async open(bytes: AtomicBytesStore, crypto: FeedCrypto): Promise<DurableFeedStore> {
     const store = new DurableFeedStore(bytes, crypto)
@@ -118,7 +127,7 @@ export class DurableFeedStore implements FeedStorePort {
   append(input: FeedRecord, receivedAtMs = Date.now()): Promise<FeedAppendResult> {
     const raw = input.raw.slice()
     const task = this.#pending.then(async (): Promise<FeedAppendResult> => {
-      if (this.#closed) throw new Error('FEED_STORE_CLOSED')
+      this.#assertWritable()
       if (!Number.isSafeInteger(receivedAtMs) || receivedAtMs < 0) throw new Error('FEED_RECEIVED_AT_INVALID')
       const record = await verifyFeedRecord(raw, this.#crypto)
       if (record.id !== input.id) throw new Error('FEED_STORE_RECORD_MISMATCH')
@@ -130,10 +139,12 @@ export class DurableFeedStore implements FeedStorePort {
       const item = { record, receivedAtMs }
       const records = kind === 'append' ? [...this.#records, item] : this.#records
       const forks = kind === 'fork' && !this.#forks.some((fork) => fork.record.id === record.id) ? [...this.#forks, item] : this.#forks
-      await this.#bytes.put(objectKey(record.id), record.raw)
-      await this.#bytes.put('feed/manifest', encodeCanonicalCbor([1n, manifestRows(records), manifestRows(forks), this.#evidence.map((item) => item.id)]))
-      if (kind === 'append') await this.#remember(item)
-      else if (forks !== this.#forks) this.#forks.push(item)
+      try {
+        await this.#put(objectKey(record.id), record.raw)
+        await this.#put('feed/manifest', encodeCanonicalCbor([1n, manifestRows(records), manifestRows(forks), this.#evidence.map((item) => item.id)]))
+        if (kind === 'append') await this.#remember(item)
+        else if (forks !== this.#forks) this.#forks.push(item)
+      } catch (error) { this.#failWrite(error); throw error }
       return { kind: kind === 'append' ? 'appended' : 'fork', record: toTransportRecord(record, receivedAtMs) }
     })
     this.#pending = task.catch(() => undefined)
@@ -143,14 +154,14 @@ export class DurableFeedStore implements FeedStorePort {
   putEvidence(input: Uint8Array): Promise<{ readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence }> {
     const bytes = input.slice()
     const task = this.#pending.then(async () => {
-      if (this.#closed) throw new Error('FEED_STORE_CLOSED')
+      this.#assertWritable()
       if (bytes.length > 64 * 1024 * 1024) throw new Error('FEED_RECORD_TOO_LARGE')
       const id = feedRecordId(await this.#crypto.sha256(bytes))
       const existing = this.#evidenceIndex.get(id)
       if (existing !== undefined) return { kind: 'duplicate' as const, index: BigInt(existing + 1), evidence: { id, bytes: bytes.slice() } }
       const evidence = { id, bytes }
-      await this.#bytes.put(objectKey(id), bytes)
-      await this.#bytes.put('feed/manifest', encodeCanonicalCbor([
+      await this.#put(objectKey(id), bytes)
+      await this.#put('feed/manifest', encodeCanonicalCbor([
         1n, manifestRows(this.#records), manifestRows(this.#forks), [...this.#evidence.map((item) => item.id), id],
       ]))
       this.#evidenceIndex.set(id, this.#evidence.length)
@@ -181,11 +192,11 @@ export class DurableFeedStore implements FeedStorePort {
   }
 
   async putPayload(input: Uint8Array): Promise<string> {
-    if (this.#closed) throw new Error('FEED_STORE_CLOSED')
+    this.#assertWritable()
     const bytes = input.slice()
     if (bytes.length > 64 * 1024 * 1024) throw new Error('FEED_RECORD_TOO_LARGE')
     const hash = await payloadHash(bytes)
-    if (!this.#payloads.has(hash)) await this.#bytes.put(`feed/payload/${hash}`, bytes)
+    if (!this.#payloads.has(hash)) await this.#put(`feed/payload/${hash}`, bytes)
     return hash
   }
 
@@ -211,6 +222,23 @@ export class DurableFeedStore implements FeedStorePort {
   count(): number { return this.#records.length }
   forkedAuthors(): readonly string[] { return [...new Set(this.#forks.map(({ record }) => record.author))].sort() }
   async close(): Promise<void> { await this.#pending; this.#closed = true }
+
+  #assertWritable(): void {
+    if (this.#closed) throw new Error('FEED_STORE_CLOSED')
+    if (this.#writeFailed) throw new Error('FEED_STORE_REOPEN_REQUIRED', { cause: this.#writeFailure })
+  }
+
+  async #put(key: string, bytes: Uint8Array): Promise<void> {
+    this.#assertWritable()
+    try { await this.#bytes.put(key, bytes) }
+    catch (error) { this.#failWrite(error); throw error }
+  }
+
+  #failWrite(error: unknown): void {
+    if (this.#writeFailed) return
+    this.#writeFailed = true
+    this.#writeFailure = error
+  }
 
   async #remember(item: StoredRecord): Promise<void> {
     this.#payloads.set(await payloadHash(item.record.payload), item.record.payload)

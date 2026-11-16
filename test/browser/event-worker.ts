@@ -1,9 +1,9 @@
 import { CheckpointStore } from '@chronolog/agent-service/workers'
 import { decodeSignedGenesis } from '@chronolog/capabilities'
-import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
+import { loadEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToBase64Url, bytesToHex, utf8 } from '@chronolog/protocol'
 import { feedIdFromPublicKey, type AtomicBytesStore } from '@chronolog/records'
-import { openBrowserEventPeer, serveBrowserEventPeer, type BrowserEventPeer } from '@chronolog/runtime-browser/events'
+import { openBrowserEventPeer, prepareBrowserIdentity, serveBrowserEventPeer, type BrowserEventPeer } from '@chronolog/runtime-browser/events'
 
 import { acquireBrowserStorage } from '../../packages/runtime-browser/src/opfs.js'
 import { openSyncControl } from '../../packages/runtime-browser/src/sync-control.js'
@@ -30,13 +30,10 @@ endpoint.addEventListener('message', (event) => {
   const run = async (): Promise<unknown> => {
     switch (request.fixture) {
       case 'prepare': {
-        const storage = await acquireBrowserStorage(request.name!)
-        try {
-          const prepared = await loadOrCreateEnrollmentIdentity(storage.bytes, 'peer')
-          const value: BrowserEventIdentity = { identity: bytesToBase64Url(prepared.signing.publicKeyBytes),
-            readerKey: bytesToBase64Url(prepared.reader.publicKeyBytes), transportAuthor: feedIdFromPublicKey(prepared.signing.publicKeyBytes) }
-          return value
-        } finally { await storage.close() }
+        const prepared = await prepareBrowserIdentity(request.name!, true)
+        const value: BrowserEventIdentity = { identity: bytesToBase64Url(prepared.signing.publicKeyBytes),
+          readerKey: bytesToBase64Url(prepared.reader.publicKeyBytes), transportAuthor: feedIdFromPublicKey(prepared.signing.publicKeyBytes) }
+        return value
       }
       case 'removeManifest':
       case 'restoreManifest': {

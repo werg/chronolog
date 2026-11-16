@@ -1,12 +1,12 @@
 import { decodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
-import { loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
+import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { encodeOrderingEvidence } from '@chronolog/node-core/history'
 import { LedgerRecordError } from '@chronolog/node-core/ledger'
 import { decodeMembershipLedgerResponse } from '@chronolog/node-core/membership'
 import { base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest, emit, equalBytes, program } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
-import { acquireBrowserStorage, openBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
+import { openBrowserPeer, prepareBrowserIdentity, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
 
 import { connectGovernedBrowserPeer } from '../browser/event-connection.js'
 import type { ThinMembershipBootstrap } from '../../tools/thin-membership-native.js'
@@ -61,12 +61,9 @@ endpoint.addEventListener('message', event => {
   const run = async (): Promise<unknown> => {
     switch (request.method) {
       case 'prepare': {
-        const storage = await acquireBrowserStorage(request.name!)
-        try {
-          const device = await loadOrCreateEnrollmentIdentity(storage.bytes, 'peer')
-          return { signingPublicKey: bytesToBase64Url(device.signing.publicKeyBytes), readerPublicKey: bytesToBase64Url(device.reader.publicKeyBytes),
-            transportAuthor: feedIdFromPublicKey(device.signing.publicKeyBytes) }
-        } finally { await storage.close() }
+        const device = await prepareBrowserIdentity(request.name!, true)
+        return { signingPublicKey: bytesToBase64Url(device.signing.publicKeyBytes), readerPublicKey: bytesToBase64Url(device.reader.publicKeyBytes),
+          transportAuthor: feedIdFromPublicKey(device.signing.publicKeyBytes) }
       }
       case 'open': {
         if (peer !== undefined) throw new Error('THIN_BROWSER_ALREADY_OPEN')

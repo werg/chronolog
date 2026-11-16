@@ -11,6 +11,7 @@ import { openBrowserDeviceRecords } from './device-records.js'
 import { openSyncControl, type SyncControlPersistence } from './sync-control.js'
 import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'
 export { WorkerRpcTransport } from './worker-rpc.js'
+export { prepareBrowserIdentity } from './device-records.js'
 
 export interface BrowserEventPeerContext {
   readonly identity: EnrollmentIdentity

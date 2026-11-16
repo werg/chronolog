@@ -87,7 +87,12 @@ stand in for the native transport test.
 
 Ordinary `openBrowserPeer` and `openBrowserEventPeer` calls load existing keys.
 Only an explicit first-device setup passes `createIdentity: true` or creates keys
-in its separate enrollment stage. Do not catch a missing/corrupt identity and
+through `prepareBrowserIdentity(name, true)` in its separate enrollment stage.
+Existing keys always require the corresponding feed manifest and matching
+identity binding; losing both does not authorize a fresh sequence. A failure
+after an ambiguous durable write fences publication until the store reopens.
+Interrupted final setup also fails closed and needs verified restore or a new
+device name. Do not catch a missing/corrupt identity and
 automatically call creation. The page must say that this device's local history
 or keys are unavailable and offer a deliberate recovery/new-device decision.
 

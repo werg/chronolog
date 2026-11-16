@@ -1,38 +1,48 @@
-import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity } from '@chronolog/node-core/browser'
+import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { encodeCanonicalCbor, equalBytes } from '@chronolog/protocol'
 import { DurableFeedStore, webFeedCrypto, type AtomicBytesStore } from '@chronolog/records'
 
-const markerKey = 'browser/feed-initialized'
-const manifestKey = 'feed/manifest'
+import { acquireBrowserStorage } from './opfs.js'
 
-/**
- * A surviving device must never restart its signed feed from position zero
- * because one manifest file disappeared. Mark the first manifest publication
- * durably before acknowledging it. A crash between manifest and marker writes
- * is recovered by validating the surviving manifest before installing its marker.
- */
+/** Existing keys always require their feed. First setup persists an empty feed before keys. */
 export async function openBrowserDeviceRecords(bytes: AtomicBytesStore, createIdentity?: true) {
-  const marker = await bytes.get(markerKey), manifest = await bytes.get(manifestKey)
-  const existing = marker !== null || manifest !== null
-  const identity = await (!existing && createIdentity === true ? loadOrCreateEnrollmentIdentity : loadEnrollmentIdentity)(bytes, 'peer')
-  const binding = encodeCanonicalCbor([1n, identity.signing.publicKeyBytes])
-  if (marker !== null && !equalBytes(marker, binding)) throw new Error('BROWSER_DEVICE_IDENTITY_MISMATCH')
-  if (marker !== null && manifest === null) throw new Error('BROWSER_FEED_MANIFEST_MISSING')
-  let marked = marker !== null
-  const mark = async () => {
-    if (marked) return
-    await bytes.put(markerKey, binding)
-    marked = true
+  let identity: EnrollmentIdentity | undefined
+  try { identity = await loadEnrollmentIdentity(bytes, 'peer') }
+  catch (error) {
+    if (createIdentity !== true || !(error instanceof Error) || error.message !== 'ENROLLMENT_IDENTITY_MISSING') throw error
   }
-  const records = await DurableFeedStore.open({
-    get: (key) => bytes.get(key),
-    async put(key, value) {
-      await bytes.put(key, value)
-      if (key === manifestKey) await mark()
-    },
-  }, webFeedCrypto)
+  const manifest = await bytes.get('feed/manifest'), binding = await bytes.get('browser/feed-initialized')
+  if (identity !== undefined && manifest === null) throw new Error('BROWSER_FEED_MANIFEST_MISSING')
+  if (identity !== undefined && binding === null) throw new Error('BROWSER_DEVICE_BINDING_MISSING')
+  if (identity !== undefined && !equalBytes(binding!, encodeCanonicalCbor([1n, identity.signing.publicKeyBytes]))) {
+    throw new Error('BROWSER_DEVICE_IDENTITY_MISMATCH')
+  }
+  if (identity === undefined && binding !== null) throw new Error('ENROLLMENT_IDENTITY_MISSING')
+  const records = manifest === null
+    ? await DurableFeedStore.create(bytes, webFeedCrypto)
+    : await DurableFeedStore.open(bytes, webFeedCrypto)
   try {
-    if (manifest !== null) await mark()
+    if (identity === undefined) {
+      // Resume only interrupted first setup, before any signed feed/evidence existed.
+      if (records.count() !== 0 || records.forkedAuthors().length !== 0 || records.evidenceAfter(0n, 1).length !== 0) {
+        throw new Error('ENROLLMENT_IDENTITY_MISSING')
+      }
+      identity = await loadOrCreateEnrollmentIdentity(bytes, 'peer')
+      // Complete setup before exposing keys/records to any publisher. This is
+      // never an extra fallible write after a signed manifest publication.
+      await bytes.put('browser/feed-initialized', encodeCanonicalCbor([1n, identity.signing.publicKeyBytes]))
+    }
     return { identity, records }
   } catch (error) { await records.close(); throw error }
+}
+
+/** Explicit Worker-only setup for enrollment that needs public device keys before group creation. */
+export async function prepareBrowserIdentity(name: string, createIdentity?: true): Promise<EnrollmentIdentity> {
+  if (typeof document !== 'undefined') throw new Error('BROWSER_PEER_WORKER_REQUIRED')
+  const storage = await acquireBrowserStorage(name)
+  try {
+    const opened = await openBrowserDeviceRecords(storage.bytes, createIdentity)
+    await opened.records.close()
+    return opened.identity
+  } finally { await storage.close() }
 }

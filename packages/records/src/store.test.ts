@@ -89,9 +89,20 @@ describe('durable portable feed store', () => {
     failNextPublication()
     await expect(store.append(second)).rejects.toThrow('publication failure')
     expect(store.get(second.id)).toBeUndefined()
+    await expect(store.append(first)).rejects.toThrow('FEED_STORE_REOPEN_REQUIRED')
+    await expect(store.putEvidence(Uint8Array.of(9))).rejects.toThrow('FEED_STORE_REOPEN_REQUIRED')
+    await expect(store.putPayload(Uint8Array.of(9))).rejects.toThrow('FEED_STORE_REOPEN_REQUIRED')
     const recovered = await DurableFeedStore.open(bytes, webFeedCrypto)
     expect(recovered.count()).toBe(1)
     expect(recovered.head(signer.identity).id).toBe(first.id)
+  })
+
+  it('does not fence a store for invalid input rejected before a durable write', async () => {
+    const { bytes, signer } = await fixture(), store = await DurableFeedStore.open(bytes, webFeedCrypto)
+    const record = await createFeedRecord(signer, webFeedCrypto, 1n, null, 1n, Uint8Array.of(1))
+    const damaged = record.raw.slice(); damaged[damaged.length - 1]! ^= 1
+    await expect(store.append({ ...record, raw: damaged })).rejects.toThrow()
+    expect((await store.append(record)).kind).toBe('appended')
   })
 
   it('serializes append decisions and preserves fork evidence across reopen', async () => {

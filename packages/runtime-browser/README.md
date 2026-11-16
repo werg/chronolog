@@ -117,7 +117,9 @@ The application supplies its verified group descriptor, execution manifest and r
 Opening either browser profile loads an existing device identity. Missing keys
 fail with `ENROLLMENT_IDENTITY_MISSING` before application bootstrap; malformed
 keys also fail. Only deliberate first-device setup passes `createIdentity: true`
-(or prepares keys in an explicit enrollment stage). Never add that flag in an
+(or calls `prepareBrowserIdentity(name, true)` in its explicit enrollment stage).
+Preparation persists an empty feed before creating keys and completes their
+identity binding before returning a usable identity. Never add that flag in an
 automatic recovery catch block. After browser storage is cleared, show that the
 device needs recovery or new enrollment, retain any externally saved original
 operation references, and require an explicit decision before creating a new
@@ -125,12 +127,15 @@ identity. A new identity has no inherited grants or local operation journal.
 Use a new peer name when enrolling a replacement device; revoke the lost device
 through the administrator. A surviving replica can supply authorized history,
 but cannot reconstruct that device's erased private keys or unpublished drafts.
-An identity-bound feed initialization marker also makes selective loss of
-`feed/manifest` fail with `BROWSER_FEED_MANIFEST_MISSING`; surviving keys must not
-start another feed at sequence one. Explicit creation cannot bypass initialized
-feed state. Restore the exact verified store or enroll under a new device name.
-The marker detects this missing-file case; it does not prove that an arbitrary
-backup is current or that independently copied stores have one active writer.
+Existing keys always require their retained feed manifest and matching identity
+binding, even when explicit creation is requested. Missing `feed/manifest` fails
+with `BROWSER_FEED_MANIFEST_MISSING`; losing both manifest and binding still
+cannot restart that signer at sequence one. A missing/mismatched binding also
+fails. Incomplete final setup requires verified restore or a new device name.
+An ambiguous durable write fences the live feed store with
+`FEED_STORE_REOPEN_REQUIRED` until reopening reconciles its committed head.
+These checks do not prove that an arbitrary backup is current or that
+independently copied stores have one active writer.
 The [device boundary runbook](../../docs/device-boundary-qualification.md) records
 actual Chromium quota/storage-clear scenarios, protocol authorization checks and
 the physical-device/deployed-authentication work that remains separate.
