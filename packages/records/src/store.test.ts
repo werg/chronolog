@@ -35,6 +35,19 @@ async function fixture() {
 }
 
 describe('durable portable feed store', () => {
+  it('retains immutable evidence independently of mutable feed sequence', async () => {
+    const { bytes } = await fixture()
+    let store = await DurableFeedStore.open(bytes, webFeedCrypto)
+    const proof = await store.putEvidence(Uint8Array.of(1, 5, 8))
+    expect(proof.kind).toBe('appended')
+    await store.close()
+    store = await DurableFeedStore.open(bytes, webFeedCrypto)
+    expect((await store.putEvidence(proof.evidence.bytes)).kind).toBe('duplicate')
+    expect(store.evidenceAfter(0n, 10)).toEqual([{ index: 1n, evidence: proof.evidence }])
+    expect(store.heads().size).toBe(0)
+    expect(store.count()).toBe(0)
+  })
+
   it('reopens exact bytes, contiguous heads, and idempotent append identity', async () => {
     const { bytes, signer } = await fixture()
     let store = await DurableFeedStore.open(bytes, webFeedCrypto)

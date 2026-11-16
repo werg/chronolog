@@ -13,7 +13,7 @@ import {
   feedIdFromPublicKey, publicKeyFromFeedId, feedRecordId, feedSigningBytes, classifyFeedAppend,
   type FeedRecord, type FeedCrypto,
 } from '@chronolog/records'
-import type { TransportRecord } from './types.js'
+import type { ImmutableEvidence, TransportRecord } from './types.js'
 
 export { DEFAULT_MAX_RECORD_BYTES, FeedRecordError, feedIdFromPublicKey, publicKeyFromFeedId }
 export type { FeedRecord }
@@ -100,6 +100,9 @@ export class FeedStore {
     readonly fork: StatementSync
     readonly forks: StatementSync
     readonly maxIndex: StatementSync
+    readonly evidenceById: StatementSync
+    readonly evidenceInsert: StatementSync
+    readonly evidenceAfter: StatementSync
   }
 
   /**
@@ -126,6 +129,11 @@ export class FeedStore {
           payload BLOB NOT NULL,
           raw BLOB NOT NULL,
           UNIQUE (author, sequence)
+        );
+        CREATE TABLE IF NOT EXISTS evidence (
+          local_index INTEGER PRIMARY KEY AUTOINCREMENT,
+          id TEXT NOT NULL UNIQUE,
+          raw BLOB NOT NULL
         );
         CREATE TABLE IF NOT EXISTS forks (
           id TEXT PRIMARY KEY,
@@ -162,6 +170,9 @@ export class FeedStore {
       fork: prepare('INSERT OR IGNORE INTO forks (id, author, sequence, raw, received_at) VALUES (?, ?, ?, ?, ?)'),
       forks: prepare('SELECT DISTINCT author FROM forks ORDER BY author'),
       maxIndex: prepare('SELECT coalesce(max(local_index), 0) AS local_index FROM records'),
+      evidenceById: prepare('SELECT local_index FROM evidence WHERE id = ?'),
+      evidenceInsert: prepare('INSERT INTO evidence (id, raw) VALUES (?, ?) RETURNING local_index'),
+      evidenceAfter: prepare('SELECT local_index, id, raw FROM evidence WHERE local_index > ? ORDER BY local_index LIMIT ?'),
     }
   }
 
@@ -221,6 +232,22 @@ export class FeedStore {
 
   forkedAuthors(): readonly string[] {
     return (this.#statements.forks.all() as unknown as { author: string }[]).map((row) => row.author)
+  }
+
+  putEvidence(input: Uint8Array): { readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence } {
+    if (input.length > DEFAULT_MAX_RECORD_BYTES) throw new FeedRecordError('FEED_RECORD_TOO_LARGE')
+    const bytes = input.slice()
+    const id = recordId(bytes)
+    const existing = this.#statements.evidenceById.get(id) as { local_index: bigint } | undefined
+    if (existing !== undefined) return { kind: 'duplicate', index: existing.local_index, evidence: { id, bytes } }
+    const row = this.#statements.evidenceInsert.get(id, bytes) as { local_index: bigint }
+    return { kind: 'appended', index: row.local_index, evidence: { id, bytes } }
+  }
+
+  evidenceAfter(after: bigint, limit: number): readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[] {
+    if (after < 0n || !Number.isSafeInteger(limit) || limit < 1 || limit > 4096) throw new Error('FEED_RANGE_INVALID')
+    const rows = this.#statements.evidenceAfter.all(after, limit) as unknown as { local_index: bigint; id: string; raw: Uint8Array }[]
+    return rows.map((row) => ({ index: row.local_index, evidence: { id: row.id, bytes: Uint8Array.from(row.raw) } }))
   }
 
   close(): void {

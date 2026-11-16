@@ -49,6 +49,19 @@ async function eventually(check: () => Promise<boolean>, timeoutMs = 10_000): Pr
 }
 
 describe('signed feed records', () => {
+  it('retains exact immutable evidence across reopen without requiring an author feed', async () => {
+    const path = join(await directory(), 'evidence.sqlite')
+    let store = new FeedStore(path)
+    const first = store.putEvidence(Uint8Array.of(4, 5, 6))
+    store.close()
+    store = new FeedStore(path)
+    try {
+      expect(store.putEvidence(first.evidence.bytes)).toMatchObject({ kind: 'duplicate', index: 1n, evidence: first.evidence })
+      expect(store.evidenceAfter(0n, 10)).toEqual([{ index: 1n, evidence: first.evidence }])
+      expect(store.count()).toBe(0)
+    } finally { store.close() }
+  })
+
   it('round-trips, chains and rejects tampering', () => {
     const keys = ssbKeys.generate()
     const first = createFeedRecord(keys, 1n, null, 5n, Uint8Array.of(1, 2, 3))

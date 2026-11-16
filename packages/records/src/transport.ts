@@ -1,12 +1,13 @@
 import { createFeedRecord, DEFAULT_MAX_RECORD_BYTES, type FeedCrypto, type FeedSigner } from './feed-codec.js'
 import { ChangeSignal, type FeedLink, pullFeed } from './replication.js'
 import type { FeedStorePort } from './store.js'
-import { cloneRecord, type ChronologTransport, type PublishOptions, type TransportRecord, type TransportStatus } from './types.js'
+import { cloneRecord, type ChronologTransport, type ImmutableEvidence, type PublishOptions, type TransportRecord, type TransportStatus } from './types.js'
 
 interface Connection {
   readonly link: FeedLink
   readonly controller: AbortController
   pending: Promise<void>
+  evidenceAfter: bigint
   error?: string
 }
 
@@ -88,7 +89,7 @@ export class PortableFeedTransport implements ChronologTransport {
     if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
     this.disconnect(link.identity)
     this.#wanted.add(link.identity)
-    const connection: Connection = { link, controller: new AbortController(), pending: Promise.resolve() }
+    const connection: Connection = { link, controller: new AbortController(), pending: Promise.resolve(), evidenceAfter: 0n }
     this.#connections.set(link.identity, connection)
     this.#queueSync(connection)
     void (async () => {
@@ -122,7 +123,36 @@ export class PortableFeedTransport implements ChronologTransport {
         if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
         return (await this.#store.feedAfter(feed, after, limit)).map(({ raw }) => raw.slice())
       },
+      readEvidence: async (after, limit) => (await this.#store.evidenceAfter(after, limit)).map(({ evidence }) => evidence.bytes.slice()),
       watch: (signal) => this.#changes.watch(signal),
+    }
+  }
+
+  async putEvidence(bytes: Uint8Array): Promise<ImmutableEvidence> {
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const result = await this.#store.putEvidence(bytes)
+    if (result.kind === 'appended') this.#changes.notify()
+    return result.evidence
+  }
+
+  async evidenceHistory(): Promise<readonly ImmutableEvidence[]> {
+    const result: ImmutableEvidence[] = []
+    let after = 0n
+    for (;;) {
+      const batch = await this.#store.evidenceAfter(after, 256)
+      if (batch.length === 0) return result
+      result.push(...batch.map((item) => item.evidence))
+      after = batch.at(-1)!.index
+    }
+  }
+
+  async *subscribeEvidence(signal?: AbortSignal): AsyncIterable<ImmutableEvidence> {
+    let after = 0n
+    while (!this.#closed && !signal?.aborted) {
+      const version = this.#changes.version
+      const batch = await this.#store.evidenceAfter(after, 256)
+      for (const item of batch) { after = item.index; yield item.evidence }
+      if (batch.length < 256) await this.#changes.wait(version, signal)
     }
   }
 
@@ -160,6 +190,15 @@ export class PortableFeedTransport implements ChronologTransport {
               this.#changes.notify()
             },
           }, connection.controller.signal)
+        }
+        while (!connection.controller.signal.aborted) {
+          const batch = await connection.link.readEvidence(connection.evidenceAfter, 64)
+          if (batch.length > 64) throw new Error('FEED_RANGE_TOO_LARGE')
+          for (const bytes of batch) {
+            await this.putEvidence(bytes)
+            connection.evidenceAfter += 1n
+          }
+          if (batch.length < 64) break
         }
         delete connection.error
       } catch (error) { connection.error = error instanceof Error ? error.message : String(error) }

@@ -7,6 +7,12 @@ export interface TransportRecord {
   readonly payload: Uint8Array
 }
 
+/** Content-addressed immutable proof bytes; interpretation belongs to the selected policy. */
+export interface ImmutableEvidence {
+  readonly id: string
+  readonly bytes: Uint8Array
+}
+
 export interface PublishOptions {
   readonly timestampMs?: number
 }
@@ -43,6 +49,8 @@ export interface TransportStatus {
 export interface ChronologTransport {
   readonly identity: string
   publish(payload: Uint8Array, options?: PublishOptions): Promise<TransportRecord>
+  /** Recover publication of an already durable local record without authoring it again. */
+  ensurePublished?(record: TransportRecord): Promise<void>
   get(id: string): Promise<TransportRecord | undefined>
   history(): Promise<readonly TransportRecord[]>
   subscribe(signal?: AbortSignal): AsyncIterable<TransportRecord>
@@ -55,6 +63,9 @@ export interface ChronologTransport {
   feedContiguousThrough?(feedId: string): Promise<bigint>
   /** Replicate `feedId` from connected peers (membership tells the node which feeds matter). */
   requestFeed?(feedId: string): void
+  putEvidence?(bytes: Uint8Array): Promise<ImmutableEvidence>
+  evidenceHistory?(): Promise<readonly ImmutableEvidence[]>
+  subscribeEvidence?(signal?: AbortSignal): AsyncIterable<ImmutableEvidence>
   close(): Promise<void>
 }
 

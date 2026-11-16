@@ -1,7 +1,7 @@
 import { assertCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, type CborValue } from '@chronolog/canonical'
 
 import { feedRecordId, type FeedCrypto, type FeedRecord, verifyFeedRecord } from './feed-codec.js'
-import type { TransportRecord } from './types.js'
+import type { ImmutableEvidence, TransportRecord } from './types.js'
 
 export type Awaitable<T> = T | Promise<T>
 
@@ -26,6 +26,8 @@ export interface FeedStorePort {
   feedAfter(author: string, sequence: bigint, limit: number): Awaitable<readonly { readonly sequence: bigint; readonly raw: Uint8Array }[]>
   heads(): Awaitable<ReadonlyMap<string, bigint>>
   count(): Awaitable<number>
+  putEvidence(bytes: Uint8Array): Awaitable<{ readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence }>
+  evidenceAfter(index: bigint, limit: number): Awaitable<readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[]>
   close(): Awaitable<void>
 }
 
@@ -58,6 +60,8 @@ export class DurableFeedStore implements FeedStorePort {
   readonly #forks: StoredRecord[] = []
   readonly #byId = new Map<string, StoredRecord>()
   readonly #byAuthor = new Map<string, StoredRecord[]>()
+  readonly #evidence: ImmutableEvidence[] = []
+  readonly #evidenceIndex = new Map<string, number>()
   #pending: Promise<unknown> = Promise.resolve()
   #closed = false
 
@@ -68,7 +72,7 @@ export class DurableFeedStore implements FeedStorePort {
     const manifest = await bytes.get('feed/manifest')
     if (manifest === null) return store
     const decoded = assertCanonicalCbor(manifest, DEFAULT_DECODE_LIMITS)
-    if (!Array.isArray(decoded) || decoded.length !== 3 || decoded[0] !== 1n || !Array.isArray(decoded[1]) || !Array.isArray(decoded[2])) {
+    if (!Array.isArray(decoded) || decoded.length !== 4 || decoded[0] !== 1n || !Array.isArray(decoded[1]) || !Array.isArray(decoded[2]) || !Array.isArray(decoded[3])) {
       throw new Error('FEED_STORE_MANIFEST_INVALID')
     }
     for (const [items, forks] of [[decoded[1], false], [decoded[2], true]] as const) {
@@ -88,6 +92,14 @@ export class DurableFeedStore implements FeedStorePort {
           store.#remember(item)
         }
       }
+    }
+    for (const id of decoded[3] as readonly CborValue[]) {
+      if (typeof id !== 'string' || store.#evidenceIndex.has(id)) throw new Error('FEED_STORE_MANIFEST_INVALID')
+      const raw = await bytes.get(objectKey(id))
+      if (raw === null) throw new Error('FEED_STORE_EVIDENCE_MISSING')
+      if (feedRecordId(await crypto.sha256(raw)) !== id) throw new Error('FEED_STORE_EVIDENCE_MISMATCH')
+      store.#evidenceIndex.set(id, store.#evidence.length)
+      store.#evidence.push({ id, bytes: raw.slice() })
     }
     return store
   }
@@ -113,13 +125,40 @@ export class DurableFeedStore implements FeedStorePort {
       const records = kind === 'append' ? [...this.#records, item] : this.#records
       const forks = kind === 'fork' && !this.#forks.some((fork) => fork.record.id === record.id) ? [...this.#forks, item] : this.#forks
       await this.#bytes.put(objectKey(record.id), record.raw)
-      await this.#bytes.put('feed/manifest', encodeCanonicalCbor([1n, manifestRows(records), manifestRows(forks)]))
+      await this.#bytes.put('feed/manifest', encodeCanonicalCbor([1n, manifestRows(records), manifestRows(forks), this.#evidence.map((item) => item.id)]))
       if (kind === 'append') this.#remember(item)
       else if (forks !== this.#forks) this.#forks.push(item)
       return { kind: kind === 'append' ? 'appended' : 'fork', record: toTransportRecord(record, receivedAtMs) }
     })
     this.#pending = task.catch(() => undefined)
     return task
+  }
+
+  putEvidence(input: Uint8Array): Promise<{ readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence }> {
+    const bytes = input.slice()
+    const task = this.#pending.then(async () => {
+      if (this.#closed) throw new Error('FEED_STORE_CLOSED')
+      if (bytes.length > 64 * 1024 * 1024) throw new Error('FEED_RECORD_TOO_LARGE')
+      const id = feedRecordId(await this.#crypto.sha256(bytes))
+      const existing = this.#evidenceIndex.get(id)
+      if (existing !== undefined) return { kind: 'duplicate' as const, index: BigInt(existing + 1), evidence: { id, bytes: bytes.slice() } }
+      const evidence = { id, bytes }
+      await this.#bytes.put(objectKey(id), bytes)
+      await this.#bytes.put('feed/manifest', encodeCanonicalCbor([
+        1n, manifestRows(this.#records), manifestRows(this.#forks), [...this.#evidence.map((item) => item.id), id],
+      ]))
+      this.#evidenceIndex.set(id, this.#evidence.length)
+      this.#evidence.push(evidence)
+      return { kind: 'appended' as const, index: BigInt(this.#evidence.length), evidence: { id, bytes: bytes.slice() } }
+    })
+    this.#pending = task.catch(() => undefined)
+    return task
+  }
+
+  evidenceAfter(index: bigint, limit: number): readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[] {
+    assertRange(index, limit)
+    return this.#evidence.slice(Number(index), Number(index) + limit)
+      .map((item, offset) => ({ index: index + BigInt(offset) + 1n, evidence: { id: item.id, bytes: item.bytes.slice() } }))
   }
 
   get(id: string): TransportRecord | undefined {

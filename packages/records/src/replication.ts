@@ -6,6 +6,7 @@ export interface FeedLink {
   readonly identity: string
   read(feed: string, after: bigint, limit: number): Promise<readonly Uint8Array[]>
   /** Wake-up hints only. Every hint is resolved with retained range reads. */
+  readEvidence(after: bigint, limit: number): Promise<readonly Uint8Array[]>
   watch(signal?: AbortSignal): AsyncIterable<void>
 }
 

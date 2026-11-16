@@ -52,6 +52,21 @@ describe('portable peer replication', () => {
     expect((await reader.history()).map((item) => item.sequence)).toEqual([1n, 2n])
   })
 
+  it('relays immutable evidence without authoring another feed record', async () => {
+    const [author, relay, reader] = await Promise.all([peer(), peer(), peer()])
+    const proof = await author.putEvidence(Uint8Array.of(5, 9, 2))
+    connectInProcess(author, relay)
+    await relay.catchUp()
+    author.disconnect(relay.identity)
+    relay.disconnect(author.identity)
+    connectInProcess(relay, reader)
+    await reader.catchUp()
+    expect(await reader.evidenceHistory()).toEqual([proof])
+    expect(await reader.history()).toEqual([])
+    expect(await reader.putEvidence(proof.bytes)).toEqual(proof)
+    expect(await reader.evidenceHistory()).toHaveLength(1)
+  })
+
   it('serializes concurrent local signing so no feed sequence forks', async () => {
     const author = await peer()
     const records = await Promise.all(Array.from({ length: 10 }, (_, index) => author.publish(Uint8Array.of(index))))
@@ -62,7 +77,7 @@ describe('portable peer replication', () => {
   it('does not accept another author as the requested feed', async () => {
     const [author, attacker, reader] = await Promise.all([peer(), peer(), peer()])
     await attacker.publish(Uint8Array.of(1))
-    reader.connect({ identity: author.identity, read: (_feed, after, limit) => attacker.asLink().read(attacker.identity, after, limit), async *watch() {} })
+    reader.connect({ identity: author.identity, readEvidence: async () => [], read: (_feed, after, limit) => attacker.asLink().read(attacker.identity, after, limit), async *watch() {} })
     await expect(reader.catchUp()).rejects.toThrow('FEED_RANGE_AUTHOR_MISMATCH')
     expect(await reader.history()).toEqual([])
   })

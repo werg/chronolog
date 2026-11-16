@@ -19,7 +19,7 @@ import {
   type FeedKeys,
 } from './feed-store.js'
 import { consumeFeed, decodeBase64 } from '@chronolog/records'
-import type { ChronologTransport, PublishOptions, TransportRecord, TransportStatus } from './types.js'
+import type { ChronologTransport, ImmutableEvidence, PublishOptions, TransportRecord, TransportStatus } from './types.js'
 
 const require = createRequire(import.meta.url)
 
@@ -56,7 +56,7 @@ type PullSource<T> = (end: PullEnd, callback: (end: PullEnd, value?: T) => void)
 
 interface Rpc {
   readonly id?: string
-  readonly chronologFeeds?: { history(options: HistoryRequest): PullSource<string> }
+  readonly chronologFeeds?: { history(options: HistoryRequest): PullSource<string>; objects?(options: { after: string }): PullSource<string> }
   on?(event: string, callback: () => void): void
   close?(error?: Error | boolean, callback?: () => void): void
 }
@@ -145,12 +145,16 @@ export class FeedTransport implements ChronologTransport {
       const plugin = {
         name: 'chronologFeeds',
         version: '1.0.0',
-        manifest: { history: 'source' },
-        permissions: { anonymous: { allow: ['history'] } },
+        manifest: { history: 'source', objects: 'source' },
+        permissions: { anonymous: { allow: ['history', 'objects'] } },
         init: () => ({
           history: (request: HistoryRequest): PullSource<string> => {
             if (ready.transport === undefined) return (_end, callback) => callback(new Error('FEED_TRANSPORT_STARTING'))
             return ready.transport.#historySource(request)
+          },
+          objects: (request: { after: string }): PullSource<string> => {
+            if (ready.transport === undefined) return (_end, callback) => callback(new Error('FEED_TRANSPORT_STARTING'))
+            return ready.transport.#evidenceSource(request)
           },
         }),
       }
@@ -292,6 +296,34 @@ export class FeedTransport implements ChronologTransport {
     }
   }
 
+  async putEvidence(bytes: Uint8Array): Promise<ImmutableEvidence> {
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const result = this.#store.putEvidence(bytes)
+    if (result.kind === 'appended') this.#notify()
+    return result.evidence
+  }
+
+  async evidenceHistory(): Promise<readonly ImmutableEvidence[]> {
+    const result: ImmutableEvidence[] = []
+    let after = 0n
+    for (;;) {
+      const batch = this.#store.evidenceAfter(after, 256)
+      if (batch.length === 0) return result
+      result.push(...batch.map((entry) => entry.evidence))
+      after = batch.at(-1)!.index
+    }
+  }
+
+  async *subscribeEvidence(signal?: AbortSignal): AsyncIterable<ImmutableEvidence> {
+    let after = 0n
+    while (!this.#closed && !signal?.aborted) {
+      const version = this.#version
+      const batch = this.#store.evidenceAfter(after, 256)
+      for (const entry of batch) { after = entry.index; yield entry.evidence }
+      if (batch.length < 256) await this.#waitForChange(version, signal)
+    }
+  }
+
   async feedContiguousThrough(feedId: string): Promise<bigint> {
     return this.#store.head(feedId).sequence
   }
@@ -345,6 +377,7 @@ export class FeedTransport implements ChronologTransport {
     this.#connections.set(feedId, connections)
     this.#streams.set(rpc, new Map())
     for (const feed of this.#wanted) this.#startStream(rpc, feed)
+    this.#startEvidence(rpc)
     let closed = false
     rpc.on?.('closed', () => {
       if (closed) return
@@ -397,6 +430,32 @@ export class FeedTransport implements ChronologTransport {
     })
   }
 
+  #startEvidence(rpc: Rpc, after = 0n): void {
+    const streams = this.#streams.get(rpc)
+    const key = '__immutable_evidence__'
+    if (this.#closed || streams === undefined || streams.has(key) || rpc.chronologFeeds?.objects === undefined) return
+    const controller = new AbortController()
+    let stopped = false
+    let source: PullSource<string>
+    try { source = rpc.chronologFeeds.objects({ after: after.toString(10) }) } catch (error) {
+      this.#setStreamError(rpc, key, error)
+      return
+    }
+    streams.set(key, () => { stopped = true; controller.abort(); streams.delete(key) })
+    void (async () => {
+      for await (const raw of pullRecords(source, controller.signal)) {
+        await this.putEvidence(raw)
+        after += 1n
+        this.#clearStreamError(rpc, key)
+      }
+    })().catch((error: unknown) => { if (!stopped) this.#setStreamError(rpc, key, error) }).finally(() => {
+      if (stopped) return
+      streams.delete(key)
+      const timer = setTimeout(() => { if (this.#streams.has(rpc)) this.#startEvidence(rpc, after) }, RESTREAM_DELAY_MS)
+      timer.unref?.()
+    })
+  }
+
   #restreamLater(rpc: Rpc, feed: string): void {
     const timer = setTimeout(() => { if (this.#streams.has(rpc)) this.#startStream(rpc, feed) }, RESTREAM_DELAY_MS)
     timer.unref?.()
@@ -431,6 +490,19 @@ export class FeedTransport implements ChronologTransport {
     } catch {
       return (_end, callback) => callback(new Error('FEED_HISTORY_REQUEST_INVALID'))
     }
+    return this.#rangeSource(cursor, (after) => this.#store.feedAfter(request.feed, after, HISTORY_BATCH))
+  }
+
+  #evidenceSource(request: { after: string }): PullSource<string> {
+    let cursor: bigint
+    try { cursor = BigInt(request.after); if (cursor < 0n) throw new Error('invalid') } catch {
+      return (_end, callback) => callback(new Error('FEED_HISTORY_REQUEST_INVALID'))
+    }
+    return this.#rangeSource(cursor, (after) => this.#store.evidenceAfter(after, HISTORY_BATCH)
+      .map((entry) => ({ sequence: entry.index, raw: entry.evidence.bytes })))
+  }
+
+  #rangeSource(cursor: bigint, read: (after: bigint) => readonly { readonly sequence: bigint; readonly raw: Uint8Array }[]): PullSource<string> {
     const buffer: string[] = []
     let ended = false
     let cancelWait: (() => void) | undefined
@@ -447,7 +519,7 @@ export class FeedTransport implements ChronologTransport {
           return
         }
         if (buffer.length === 0) {
-          for (const row of this.#store.feedAfter(request.feed, cursor, HISTORY_BATCH)) {
+          for (const row of read(cursor)) {
             buffer.push(Buffer.from(row.raw).toString('base64'))
             cursor = row.sequence
           }
