@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { bytesToHex, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
 import type {
   ControlStoreJournalEntry,
   ControlStorePersistence,
@@ -13,7 +13,7 @@ function encodeTagged(value: unknown): string {
   return JSON.stringify(value, (_key, item: unknown) => {
     if (typeof item === 'bigint') return { [BIGINT_TAG]: item.toString(10) }
     if (item instanceof Uint8Array) {
-      return { [BYTES_TAG]: Buffer.from(item).toString('base64') }
+      return { [BYTES_TAG]: bytesToHex(item) }
     }
     return item
   })
@@ -23,7 +23,7 @@ function decodeTagged(text: string): unknown {
   return JSON.parse(text, (_key, value: unknown) => {
     if (isTagged(value, BIGINT_TAG)) return BigInt(value[BIGINT_TAG]!)
     if (isTagged(value, BYTES_TAG)) {
-      return Uint8Array.from(Buffer.from(value[BYTES_TAG]!, 'base64'))
+      return hexToBytes(value[BYTES_TAG]!)
     }
     return value
   })
@@ -84,7 +84,7 @@ export function decodeControlStoreJournal(text: string): ControlStoreJournalEntr
 }
 
 function journalChecksum(body: string): string {
-  return createHash('sha256').update(body, 'utf8').digest('hex').slice(0, JOURNAL_CHECKSUM_LENGTH)
+  return bytesToHex(sha256Sync(utf8(body))).slice(0, JOURNAL_CHECKSUM_LENGTH)
 }
 
 function isTagged(value: unknown, tag: string): value is Record<string, string> {
@@ -117,7 +117,7 @@ export class MemoryControlStorePersistence implements ControlStorePersistence {
   }
 
   saveValidatorCutoff(cutoff: ValidatorCutoffState): void {
-    const key = Buffer.from(cutoff.validatorId).toString('base64url')
+    const key = bytesToHex(cutoff.validatorId)
     const previous = this.#cutoffs.get(key)
     if (previous !== undefined && cutoff.acceptedAboveMs < previous.acceptedAboveMs) {
       throw new Error('CONTROL_STORE_VALIDATOR_CUTOFF_REGRESSION')

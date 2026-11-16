@@ -34,6 +34,7 @@
       "@chronolog/runtime-browser": ["packages/runtime-browser/src/index.ts"],
       "@chronolog/materializer-doltlite/browser": ["packages/materializer-doltlite/src/browser.ts"],
       "@chronolog/rpc": ["packages/rpc/src/index.ts"],
+      "@chronolog/rpc/browser": ["packages/rpc/src/browser.ts"],
       "@chronolog/client": ["packages/client/src/index.ts"],
       "@chronolog/react": ["packages/react/src/index.ts"],
       "@chronolog/testkit": ["packages/testkit/src/index.ts"]
