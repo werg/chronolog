@@ -79,6 +79,7 @@ jobs:
           npm ci
           npm run build
       - name: Qualify both contrib layouts with native agents and independent browser peers
+        id: application_pilot
         if: ${{ !cancelled() && steps.public_artifacts.outcome == 'success' && steps.contrib_source.outcome == 'success' }}
         run: |
           node --import tsx tools/application-pilot.ts \
@@ -87,6 +88,19 @@ jobs:
             --tendriller-engine artifacts/pilot-source/tendriller/dist/engine \
             --wasm artifacts/wasm \
             --output artifacts/application-pilot/ci
+      - name: Preserve application qualification immediately
+        if: ${{ always() && (steps.application_pilot.outcome == 'success' || steps.application_pilot.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: application-pilot-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/application-pilot/ci/report.json
+            artifacts/application-pilot/ci/bundles.json
+            artifacts/application-pilot/ci/route-trace.ndjson
+            artifacts/application-pilot/ci/*.png
+            artifacts/application-pilot/ci/pages/specimen-manifest.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Qualify thin Cloudflare membership with a separate native authority and browser device
         if: ${{ !cancelled() && steps.public_artifacts.outcome == 'success' }}
         run: |
