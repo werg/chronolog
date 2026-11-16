@@ -128,6 +128,7 @@ async function createGenesis(
   const manifest: GenesisManifest = {
     groupId: options.groupId,
     schemaId: options.schemaId,
+    historyPolicy: { kind: 'peer', executionManifestDigest: options.schemaId },
     rootAdminPublicKey: options.identity.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode(options.transportAuthor),
     initialCapabilities: [

@@ -1,7 +1,6 @@
 import { join, resolve } from 'node:path'
 
 import { executionManifestArtifacts } from '@chronolog/protocol'
-import { isCapabilityActive } from '@chronolog/capabilities'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import {
   DeterministicMaterializer,
@@ -9,15 +8,15 @@ import {
   createDoltLiteMaterializationRuntime,
 } from '@chronolog/materializer-doltlite'
 import {
-  CapabilityMembershipResolver,
   ChronologNode,
   GovernanceControlPlane,
   FeedForkRegistry,
   SqliteFeedForkPersistence,
   createEpochEnvelopeCipher,
-  type MembershipResolver,
+  createGovernedNode,
+  createEnrollmentService,
+  type GovernedNode,
 } from '@chronolog/node-core'
-import { equalBytes } from '@chronolog/protocol'
 import { HttpRpcServer, NodeRpcService } from '@chronolog/rpc'
 import { FeedTransport, type SsbPeer } from '@chronolog/transport-ssb'
 
@@ -29,6 +28,7 @@ import { daemonHealth, prometheusMetrics } from './observability.js'
 import { daemonSecretStoreFromEnvironment } from './secret-store.js'
 import { createGovernanceRpcAdmin } from './governance-admin.js'
 import { acquireDataDirectoryLock } from './data-lock.js'
+import { SqliteOperationStore } from './operation-store.js'
 
 const dataDirectory = resolve(process.env.CHRONOLOG_DATA_DIR ?? '.chronolog')
 const dataLock = await acquireDataDirectoryLock(dataDirectory, 'daemon')
@@ -43,7 +43,7 @@ const configuredValidatorCapability = fromBase64(config.validatorCapability)
 const configuredPeers: readonly SsbPeer[] = runtime.peers
 const executionManifest = createDoltLiteExecutionManifest()
 const { executionManifestDigest } = await executionManifestArtifacts(executionManifest)
-const { transport, materializer, node, server, address, governance, nat, nodeState } = await startRuntime()
+const { transport, materializer, node, server, address, governance, governed, nat, nodeState } = await startRuntime()
 process.stdout.write(`${JSON.stringify({
   event: 'chronologd.ready',
   url: address.url,
@@ -71,8 +71,8 @@ async function stop(signal: string): Promise<void> {
   stopping = true
   process.stdout.write(`${JSON.stringify({ event: 'chronologd.stopping', signal })}\n`)
   await server.close()
-  await governance?.close()
-  await node.close()
+  if (governed !== undefined) await governed.close()
+  else await node.close()
   nodeState.close()
   await dataLock.release()
 }
@@ -111,6 +111,8 @@ async function startRuntime() {
   let node: ChronologNode | undefined
   let server: HttpRpcServer | undefined
   let governance: GovernanceControlPlane | undefined
+  let governed: GovernedNode | undefined
+  let enrollment: ReturnType<typeof createEnrollmentService> | undefined
   let reachability: NatVerificationResult = { status: 'not-configured', address: null }
   // The node's own state (control index, validator cutoffs, feed continuity).
   const nodeState = new NodeStateDatabase(join(dataDirectory, 'node-state.sqlite'))
@@ -127,95 +129,59 @@ async function startRuntime() {
     return materializer
   }
   try {
-    const controlStore = new ControlStore(new SqliteControlStorePersistence(nodeState))
-    let membership: MembershipResolver
-    let membershipRevision = configuredMembershipRevision
-    let validationPolicy = configuredValidationPolicy
-    let validatorCapability = configuredValidatorCapability
-    const envelopeCipher = createEpochEnvelopeCipher(fromBase64(config.epochContentKey), BigInt(config.epoch))
-    let membershipState: (() => {
-      readonly membershipRevision: Uint8Array
-      readonly validationPolicy: Uint8Array
-      readonly validatorCapability?: Uint8Array
-    }) | undefined
+    const operationStore = new SqliteOperationStore(nodeState.database)
     if (process.env.CHRONOLOG_STATIC_MEMBERSHIP_FILE !== undefined) {
       const membershipFile = resolve(process.env.CHRONOLOG_STATIC_MEMBERSHIP_FILE)
-      membership = await loadStaticMembership(membershipFile, {
-        groupId,
-        membershipRevision,
-        validationPolicy,
+      const membership = await loadStaticMembership(membershipFile, {
+        groupId, membershipRevision: configuredMembershipRevision, validationPolicy: configuredValidationPolicy,
       })
       await openMaterializer(await readStaticRootAdministrator(membershipFile))
+      node = new ChronologNode({
+        groupId, groupRoute: fromBase64(config.groupRoute), identity, transport, membership,
+        membershipRevision: configuredMembershipRevision, validationPolicy: configuredValidationPolicy,
+        materialization: createDoltLiteMaterializationRuntime(materializer!), operationStore,
+        controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState)),
+        validator: { capabilityId: configuredValidatorCapability, cutoffLagMs: runtime.cutoffLagMs,
+          maxFutureSkewMs: runtime.maxFutureSkewMs, heartbeatIntervalMs: runtime.heartbeatIntervalMs },
+        envelopeCipher: createEpochEnvelopeCipher(fromBase64(config.epochContentKey), BigInt(config.epoch)),
+        feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
+      })
+      await node.start()
     } else {
       const bootstrap = await loadOrCreateGovernanceBootstrap({
-        dataDirectory,
-        groupId,
-        schemaId: executionManifestDigest,
-        identity,
-        transportAuthor: transport.identity,
+        dataDirectory, groupId, schemaId: executionManifestDigest, identity, transportAuthor: transport.identity,
         ...(secretStore === undefined ? {} : { secretStore }),
       })
       await openMaterializer(bootstrap.genesis.manifest.rootAdminPublicKey, bootstrap.genesis.manifest.forkedFrom !== undefined)
-      governance = await GovernanceControlPlane.create({
-        genesis: bootstrap.genesis,
-        groupRoute: fromBase64(config.groupRoute),
-        transport,
-        identity,
+      const orderPolicy = bootstrap.genesis.manifest.historyPolicy?.kind
+      if (orderPolicy === undefined) throw new Error('GENESIS_HISTORY_POLICY_REQUIRED')
+      governed = await createGovernedNode({
+        genesis: bootstrap.genesis, groupRoute: fromBase64(config.groupRoute), identity, transport,
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
+        materialization: createDoltLiteMaterializationRuntime(materializer!), operationStore,
+        controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState), { orderPolicy }),
+        validator: { cutoffLagMs: runtime.cutoffLagMs, maxFutureSkewMs: runtime.maxFutureSkewMs,
+          heartbeatIntervalMs: runtime.heartbeatIntervalMs },
+        initialEpochContentKey: fromBase64(config.epochContentKey),
+        feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
       })
-      await governance.start()
-      // Only the administration-feed owner creates the first epoch; a node that
-      // joined an existing group waits for the epoch wrapped to its reader key.
-      if (governance.currentEpoch === null && governance.ownsCapabilityFeed) {
-        await governance.rotateEpoch(identity.privateKey, fromBase64(config.epochContentKey))
-      }
-      membership = new CapabilityMembershipResolver({
-        snapshotForRevision: (digest) => governance!.snapshotForRevision(digest),
+      node = governed.node
+      governance = governed.governance
+      await governed.start()
+      enrollment = createEnrollmentService({
+        descriptor: governed.descriptor, store: operationStore, identity,
+        readerPublicKey: bootstrap.recipientPublicKey, transportAuthor: transport.identity, governance,
+        activeMembership: () => governed!.activeSnapshot,
+        ...(governed.enrollmentIssuer === undefined ? {} : { issuer: governed.enrollmentIssuer }),
+        connected: async () => governance!.ownsCapabilityFeed || (await transport.status()).peers.length > 0,
+        executionManifestDigest,
+        isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
       })
-      validationPolicy = bootstrap.validationPolicyId
-      const state = () => {
-        const snapshot = governance!.snapshot
-        const activeValidator = [...snapshot.capabilities.values()].find((capability) =>
-          capability.grant.role === 'validator' &&
-          equalBytes(capability.grant.signingPublicKey, identity.publicKeyBytes) &&
-          isCapabilityActive(capability, snapshot.revision))
-        return {
-          membershipRevision: snapshot.revisionDigest,
-          validationPolicy,
-          ...(activeValidator === undefined ? {} : { validatorCapability: activeValidator.id }),
-        }
-      }
-      const initial = state()
-      membershipRevision = initial.membershipRevision
-      validatorCapability = initial.validatorCapability ?? configuredValidatorCapability
-      membershipState = state
-      // The node reads the ring's current epoch lazily: a node that joined an
-      // existing group has no epoch until the administrator wraps one to it.
     }
-    node = new ChronologNode({
-      groupId,
-      groupRoute: fromBase64(config.groupRoute),
-      membershipRevision,
-      validationPolicy,
-      identity,
-      transport,
-      materialization: createDoltLiteMaterializationRuntime(materializer!),
-      controlStore,
-      membership,
-      ...(membershipState === undefined ? {} : { membershipState }),
-      validator: {
-        capabilityId: validatorCapability,
-        cutoffLagMs: runtime.cutoffLagMs,
-        maxFutureSkewMs: runtime.maxFutureSkewMs,
-        heartbeatIntervalMs: runtime.heartbeatIntervalMs,
-      },
-      envelopeCipher: governance?.cipherRing ?? envelopeCipher,
-      feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
-    })
-    await node.start()
     server = new HttpRpcServer({
       service: new NodeRpcService({
         node,
+        ...(enrollment === undefined ? {} : { enrollment }),
         ...(governance === undefined ? {} : {
           governanceAdmin: createGovernanceRpcAdmin({ governance, rootPrivateKey: identity.privateKey }),
         }),
@@ -237,11 +203,12 @@ async function startRuntime() {
       timeoutMs: runtime.natDiscoveryTimeoutMs,
       ...(runtime.natVerificationUrl === undefined ? {} : { verificationUrl: runtime.natVerificationUrl }),
     })
-    return { transport, materializer: materializer!, node, server, address, governance, nat: { ...nat, reachability }, nodeState }
+    return { transport, materializer: materializer!, node, server, address, governance, governed, nat: { ...nat, reachability }, nodeState }
   } catch (error) {
     await server?.close().catch(() => undefined)
-    await governance?.close().catch(() => undefined)
-    if (node !== undefined) {
+    if (governed !== undefined) {
+      await governed.close().catch(() => undefined)
+    } else if (node !== undefined) {
       await node.close().catch(() => undefined)
     } else {
       materializer?.close()

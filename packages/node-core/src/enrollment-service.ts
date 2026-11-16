@@ -4,10 +4,12 @@ import {
   encodeSignedEnrollmentApproval, encodeSignedEnrollmentRequest,
   enrollmentProgress, loadEnrollmentApproval, loadEnrollmentRequest,
   prepareEnrollmentRequest, saveEnrollmentApproval,
-  type DurableOperationStore, type EnrollmentDescriptor, type EnrollmentFinalTarget,
-  type EnrollmentIssuer, type EnrollmentRole, type GovernanceControlPlane,
-} from '@chronolog/node-core'
-import { equalBytes, type Ed25519KeyPair } from '@chronolog/protocol'
+  type EnrollmentDescriptor, type EnrollmentFinalTarget,
+  type EnrollmentIssuer, type EnrollmentRole,
+} from './enrollment.js'
+import type { DurableOperationStore } from './operations.js'
+import type { GovernanceControlPlane } from './governance.js'
+import { base64UrlToBytes, bytesToBase64Url as base64url, equalBytes, type Ed25519KeyPair } from '@chronolog/protocol'
 
 export interface EnrollmentServiceOptions {
   readonly descriptor: EnrollmentDescriptor
@@ -72,10 +74,7 @@ export function createEnrollmentService(options: EnrollmentServiceOptions) {
   }
 }
 
-function base64url(value: Uint8Array): string { return Buffer.from(value).toString('base64url') }
 function decodeBase64url(value: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/u.test(value) || value.length > 1_000_000) throw new Error('ENROLLMENT_BYTES_INVALID')
-  const decoded = Uint8Array.from(Buffer.from(value, 'base64url'))
-  if (base64url(decoded) !== value) throw new Error('ENROLLMENT_BYTES_INVALID')
-  return decoded
+  return base64UrlToBytes(value)
 }

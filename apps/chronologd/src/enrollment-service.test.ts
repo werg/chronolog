@@ -6,7 +6,7 @@ import {
 import { DOMAINS, hashDomain } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
-import { createEnrollmentService } from './enrollment-service.js'
+import { createEnrollmentService } from '../../../packages/node-core/src/enrollment-service.js'
 
 describe('live daemon enrollment service', () => {
   it('requests membership using the running replica identity and recovers the exact request', async () => {

@@ -41,7 +41,8 @@ import {
   type EnvelopeMessageType,
   type ProtocolDomain,
 } from '@chronolog/protocol'
-import type { ChronologTransport, TransportRecord } from '@chronolog/transport-ssb'
+import type { ChronologTransport, TransportRecord } from '@chronolog/records'
+import type { OrderedRecordEntry } from './history-policy.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import { EpochCipherRing } from './cipher.js'
@@ -145,7 +146,7 @@ export class GovernanceControlPlane {
     for (const record of history) {
       try { await this.ingest(record) }
       catch (error) {
-        if (!invalidGovernanceRecord(error)) throw error
+        if (!isInvalidGovernanceRecord(error)) throw error
         this.#seen.add(record.id)
         this.#lastError = error.message
       }
@@ -308,7 +309,7 @@ export class GovernanceControlPlane {
         for (const pending of [...this.#pendingRecords.values()]) {
           try { if (await attempt(pending)) progressed = true }
           catch (error) {
-            if (!invalidGovernanceRecord(error)) throw error
+            if (!isInvalidGovernanceRecord(error)) throw error
             this.#pendingRecords.delete(pending.id)
             this.#seen.add(pending.id)
             this.#lastError = error.message
@@ -319,15 +320,30 @@ export class GovernanceControlPlane {
     })
   }
 
-  async #ingest(record: TransportRecord): Promise<boolean> {
+  /** Called only for a record in the locally verified certified log prefix. */
+  async ingestCanonical(entry: OrderedRecordEntry): Promise<CapabilitySnapshot | null> {
+    return this.#mutex.run(async () => {
+      const record: TransportRecord = { id: `canonical:${entry.historyId}:${entry.position}`, author: '',
+        sequence: BigInt(entry.position), receivedAtMs: 0, payload: entry.bytes }
+      await this.#ingest(record, true)
+      const decoded = await decodeGovernanceEnvelope(entry.bytes, this.#options.groupRoute)
+      if (decoded.type !== 'capability') return null
+      const tagged = assertCanonicalCbor(decoded.payload)
+      if (!Array.isArray(tagged) || !(tagged[1] instanceof Uint8Array)) throw new Error('GOVERNANCE_PAYLOAD_INVALID')
+      const revision = decodeSignedCapabilityRevisionBytes(tagged[1])
+      return this.snapshotForRevision(await capabilityRevisionDigest(revision.revision))
+    })
+  }
+
+  async #ingest(record: TransportRecord, canonical = false): Promise<boolean> {
     if (this.#seen.has(record.id)) return false
     let decoded: { readonly type: GovernanceMessageType; readonly payload: Uint8Array }
     try { decoded = await decodeGovernanceEnvelope(record.payload, this.#options.groupRoute) }
     catch { return false }
-    if (record.author !== feedAuthor(this.#snapshot.capabilityLogFeed)) {
+    if (!canonical && record.author !== feedAuthor(this.#snapshot.capabilityLogFeed)) {
       throw new Error('GOVERNANCE_CAPABILITY_FEED_UNAUTHORIZED')
     }
-    if (this.#options.transport.feedContiguousThrough !== undefined &&
+    if (!canonical && this.#options.transport.feedContiguousThrough !== undefined &&
         await this.#options.transport.feedContiguousThrough(record.author) < record.sequence) throw new GovernanceRecordPendingError()
     const tagged = assertCanonicalCbor(decoded.payload)
     if (!Array.isArray(tagged) || tagged.length !== 2 || typeof tagged[0] !== 'bigint' || !(tagged[1] instanceof Uint8Array)) {
@@ -370,6 +386,7 @@ export class GovernanceControlPlane {
         !await verifyEpochManifest(signed, this.#snapshot.rootAdminPublicKey)) throw new Error('GOVERNANCE_EPOCH_INVALID')
     const digest = await hashDomain(DOMAINS.epochManifest, encodeEpochManifest(signed.manifest))
     if (!historical) {
+      if (nullableBytesEqual(this.#epochDigests.get(signed.manifest.epoch) ?? null, digest)) return
       const expectedEpoch = this.#currentEpoch + 1n
       if (signed.manifest.epoch > expectedEpoch) throw new GovernanceRecordPendingError()
       const expectedPrevious = this.#currentEpoch < 0n ? null : this.#epochDigests.get(this.#currentEpoch) ?? null
@@ -448,7 +465,7 @@ export class GovernanceControlPlane {
           if (this.#abort.signal.aborted) return
           try { await this.ingest(record) }
           catch (error) {
-            if (!invalidGovernanceRecord(error)) throw error
+            if (!isInvalidGovernanceRecord(error)) throw error
             this.#seen.add(record.id)
             this.#lastError = error.message
           }
@@ -565,6 +582,6 @@ function compareBigint(left: bigint, right: bigint): number { return left < righ
 
 class GovernanceRecordPendingError extends Error {}
 
-function invalidGovernanceRecord(error: unknown): error is Error {
-  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_CHAIN_INVALID|REVISION_CONFLICT)$/u.test(error.message))
+export function isInvalidGovernanceRecord(error: unknown): error is Error {
+  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_CHAIN_INVALID|REVISION_CONFLICT|ENVELOPE_INVALID|ENVELOPE_SIGNATURE_INVALID)$/u.test(error.message))
 }

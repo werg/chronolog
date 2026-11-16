@@ -9,7 +9,8 @@ const groupId = new Uint8Array(32).fill(1)
 const group = bytesToBase64Url(groupId)
 
 function readerNode(): ChronologRpcNodeService {
-  return {
+  const node: Pick<ChronologRpcNodeService, 'groupId' | 'revision' | 'materializedRevision' | 'orderLength' |
+    'finalRevision' | 'finalOrderLength' | 'executionManifestDigest' | 'localSql'> = {
     groupId, revision: 8n, materializedRevision: 6n, orderLength: 3,
     finalRevision: 2n, finalOrderLength: 1, executionManifestDigest: new Uint8Array(32).fill(2),
     localSql(_sql, _parameters, options) {
@@ -17,7 +18,8 @@ function readerNode(): ChronologRpcNodeService {
       return { revision: final ? 2n : 6n, orderLength: final ? 1 : 3,
         columns: [{ name: 'value' }], rows: [[{ kind: 'integer', value: final ? '10' : '30' }]] }
     },
-  } as ChronologRpcNodeService
+  }
+  return node as ChronologRpcNodeService
 }
 
 describe('NodeRpcService policy views and enrollment', () => {
@@ -39,7 +41,7 @@ describe('NodeRpcService policy views and enrollment', () => {
     const enrollment = {
       createRequest: vi.fn(async () => ({ signedRequest: 'signed-request' })),
       approveRequest: vi.fn(async () => ({ signedApproval: 'signed-approval' })),
-      getStatus: vi.fn(async (request) => ({ requestId: request.requestId, state: 'awaiting-keys', missingEpochs: ['1'], roles: ['reader'] })),
+      getStatus: vi.fn<EnrollmentRpcService['getStatus']>(async (request) => ({ requestId: request.requestId, state: 'awaiting-keys', missingEpochs: ['1'], roles: ['reader'] })),
     } satisfies EnrollmentRpcService
     const transport = new InProcessRpcTransport(new NodeRpcService({ node: readerNode(), enrollment }))
     const create = { groupId: group, requestId: 'join-device', roles: ['reader'] as const }
