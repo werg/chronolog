@@ -274,7 +274,7 @@ export class EnrollmentIssuer {
     const requestDigest = await hashDomain(DOMAINS.enrollmentRequest, requestBytes)
     const fingerprint = encodeCanonicalCbor([requestBytes, grantedRoles, decision.grantFullHistory])
     const prefix = `enrollment/issuer/${bytesToHex(request.groupId)}`
-    const key = `${prefix}/request/${encodeURIComponent(request.requestId)}`
+    const key = `${prefix}/request/${bytesToHex(request.signingPublicKey)}/${encodeURIComponent(request.requestId)}`
     const operationKey = `${prefix}/operation/${encodeURIComponent(decision.operationId)}`
     const operationId = `enrollment:${bytesToHex(requestDigest)}`
     return this.#mutex.run(async () => {
@@ -354,7 +354,13 @@ export async function enrollmentProgress(options: {
   for (let i = 0; i < approval.capabilityIds.length; i += 1) {
     const capability = options.activeMembership.capabilities.get(bytesToHex(approval.capabilityIds[i]!))
     if (capability === undefined || capability.grant.role !== approval.roles[i] ||
-        !equalBytes(capability.grant.signingPublicKey, request.signingPublicKey)) throw new Error('ENROLLMENT_APPROVAL_INVALID')
+        !equalBytes(capability.grant.subjectId, request.signingPublicKey) ||
+        !equalBytes(capability.grant.signingPublicKey, request.signingPublicKey) ||
+        capability.grant.transportAuthor !== request.transportAuthor ||
+        capability.grant.validFromRevision !== approval.grantedRevision ||
+        capability.grantedAtRevision !== approval.grantedRevision ||
+        (capability.grant.role === 'reader' && (capability.grant.hpkePublicKey === undefined ||
+          !equalBytes(capability.grant.hpkePublicKey, request.readerPublicKey)))) throw new Error('ENROLLMENT_APPROVAL_INVALID')
     if (!isCapabilityActive(capability, options.activeMembership.revision)) return progress('revoked', [], approval.roles)
   }
   if (!options.connected) return progress('authorized-disconnected', [], approval.roles)

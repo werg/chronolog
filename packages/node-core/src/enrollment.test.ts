@@ -1,11 +1,11 @@
-import { encodeGenesisManifest, signGenesis, type CapabilityGrant, type GenesisManifest } from '@chronolog/capabilities'
-import { DOMAINS, hashDomain } from '@chronolog/protocol'
+import { capabilityId, capabilityRevisionDigest, encodeGenesisManifest, signGenesis, type CapabilityGrant, type GenesisManifest } from '@chronolog/capabilities'
+import { DOMAINS, hashDomain, signDomain } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
-  EnrollmentIssuer, decodeSignedEnrollmentRequest, encodeSignedEnrollmentRequest, enrollmentProgress,
-  loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest, verifySignedEnrollmentRequest,
+  EnrollmentIssuer, decodeSignedEnrollmentRequest, encodeEnrollmentApproval, encodeSignedEnrollmentRequest, enrollmentProgress,
+  loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest, verifyEnrollmentApproval, verifySignedEnrollmentRequest,
   type EnrollmentDescriptor, type EnrollmentFinalTarget,
 } from './enrollment.js'
 import { GovernanceControlPlane } from './governance.js'
@@ -89,20 +89,64 @@ describe('live durable group enrollment', () => {
     await expect(fixture.issuer.approve(request, { ...decision, roles: ['reader', 'writer'] })).rejects.toThrow('OPERATION_ID_CONFLICT')
   })
 
-  it('serializes concurrent approvals into one revision chain', async () => {
+  it('serializes applicants with the same device-local request ID and rejects changes by the same applicant', async () => {
     const fixture = await setup()
-    const requests = await Promise.all(['one', 'two'].map(async (name) => {
+    const applicants = await Promise.all(['one', 'two'].map(async (name) => {
       const store = new MemoryOperationStore()
       const identity = await loadOrCreateEnrollmentIdentity(store, name)
-      return prepareEnrollmentRequest({ descriptor: fixture.descriptor, store, requestId: name,
+      const options = { descriptor: fixture.descriptor, store, requestId: 'join',
         identity: identity.signing, readerPublicKey: identity.reader.publicKeyBytes,
-        transportAuthor: name, requestedRoles: ['reader'] })
+        transportAuthor: name, requestedRoles: ['reader'] as const }
+      return { options, request: await prepareEnrollmentRequest(options) }
     }))
-    const approvals = await Promise.all(requests.map((request, i) => fixture.issuer.approve(request,
+    const approvals = await Promise.all(applicants.map(({ request }, i) => fixture.issuer.approve(request,
       { operationId: `approval-${i}`, roles: ['reader'], grantFullHistory: true })))
     expect(approvals.map((signed) => signed.approval.grantedRevision).sort()).toEqual([1n, 2n])
     expect(fixture.governance.snapshot.revision).toBe(2n)
+    const reopened = new EnrollmentIssuer(fixture.issuerOptions)
+    for (let i = 0; i < applicants.length; i += 1) {
+      expect(await reopened.approve(applicants[i]!.request,
+        { operationId: `approval-${i}`, roles: ['reader'], grantFullHistory: true })).toEqual(approvals[i])
+    }
+    const altered = await prepareEnrollmentRequest({ ...applicants[0]!.options,
+      store: new MemoryOperationStore(), transportAuthor: 'replacement-feed' })
+    await expect(reopened.approve(altered, { operationId: 'altered-approval', roles: ['reader'], grantFullHistory: true }))
+      .rejects.toThrow('ENROLLMENT_DECISION_CONFLICT')
+    expect(fixture.governance.snapshot.revision).toBe(2n)
   })
+
+  it.each(['subject', 'feed', 'missing-feed', 'reader-key', 'grant-revision'] as const)(
+    'rejects a root-signed approval referring to a grant with a different %s binding', async (mismatch) => {
+      const fixture = await setup()
+      const store = new MemoryOperationStore()
+      const identity = await loadOrCreateEnrollmentIdentity(store, 'applicant')
+      const request = await prepareEnrollmentRequest({ descriptor: fixture.descriptor, store,
+        requestId: 'join', identity: identity.signing, readerPublicKey: identity.reader.publicKeyBytes,
+        transportAuthor: 'applicant', requestedRoles: ['reader'] })
+      const approved = await fixture.issuer.approve(request,
+        { operationId: 'approve', roles: ['reader'], grantFullHistory: true })
+      const revision = await fixture.governance.publishCapabilityChange({ grants: [{
+        subjectId: mismatch === 'subject' ? bytes(90) : identity.signing.publicKeyBytes,
+        signingPublicKey: identity.signing.publicKeyBytes,
+        role: 'reader',
+        ...(mismatch === 'missing-feed' ? {} : { transportAuthor: mismatch === 'feed' ? 'different-feed' : 'applicant' }),
+        hpkePublicKey: mismatch === 'reader-key' ? bytes(91) : identity.reader.publicKeyBytes,
+      }] }, fixture.identity.signing.privateKey)
+      const approval = { ...approved.approval,
+        grantedRevision: mismatch === 'grant-revision' ? approved.approval.grantedRevision : revision.revision.revision,
+        membershipRevision: mismatch === 'grant-revision' ? approved.approval.membershipRevision : await capabilityRevisionDigest(revision.revision),
+        capabilityIds: [await capabilityId(revision.revision.grants[0]!)],
+      }
+      const signed = { approval, signature: await signDomain(DOMAINS.enrollmentApproval,
+        encodeEnrollmentApproval(approval), fixture.identity.signing.privateKey) }
+      await expect(verifyEnrollmentApproval(fixture.descriptor, request, signed)).resolves.toBeUndefined()
+      const options = { descriptor: fixture.descriptor, request, activeMembership: fixture.governance.snapshot,
+        connected: true, availableEpochs: fixture.governance.cipherRing.epochs(),
+        executionManifestDigest: fixture.target.executionManifestDigest, isFinalTargetApplied: () => true }
+      expect((await enrollmentProgress({ ...options, approval: approved })).state).toBe('ready')
+      await expect(enrollmentProgress({ ...options, approval: signed })).rejects.toThrow('ENROLLMENT_APPROVAL_INVALID')
+    },
+  )
 })
 
 async function setup() {
