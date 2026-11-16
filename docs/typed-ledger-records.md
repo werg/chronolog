@@ -6,6 +6,21 @@ descriptors. There is one ordering history; the participant roster has no second
 ordering service. The certificate configuration continues to bind the group,
 genesis and application execution profile.
 
+Genesis uses wire version 2 and the signing domain `chronolog/genesis/v2`.
+It explicitly authenticates two independent public keys: `rootAdminPublicKey`
+issues roster and key-distribution operations; `schemaAdminPublicKey` initializes
+the SQL `group` collective. The default Cloudflare administrator holds the former
+and the native application owner holds the latter. Roster administration gives
+no implicit SQL membership or schema privilege. Readers require both fields;
+there is no fallback that assigns the SQL role to the roster issuer.
+
+The canonical genesis map is contiguous: version (0), group (1), execution profile
+(2), roster root (3), schema administrator (4), capability feed (5), initial
+capabilities (6), validation policies (7), clock policy (8), resource policy (9),
+encryption suite (10), creation time (11), optional fork origin (12), and optional
+history policy (13). The signed wrapper is also version 2. Version 1 input is
+rejected; this prerelease change defines a new authenticated group configuration.
+
 `@chronolog/node-core/ledger` defines the descriptor boundary. A descriptor has a
 kind, group route, encryption epoch, SHA-256 payload address and exact payload
 length. Application candidates are detached references to their original signed

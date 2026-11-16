@@ -12,7 +12,7 @@ export const DOMAINS = {
   heartbeat: 'chronolog/validator-heartbeat/v1',
   envelope: 'chronolog/envelope/v1',
   canonicalResult: 'chronolog/sql-result/v1',
-  genesis: 'chronolog/genesis/v1',
+  genesis: 'chronolog/genesis/v2',
   capabilityRevision: 'chronolog/capability-revision/v1',
   capabilityGrant: 'chronolog/capability-grant/v1',
   validationPolicy: 'chronolog/validation-policy/v1',

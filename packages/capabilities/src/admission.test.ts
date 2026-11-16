@@ -48,7 +48,7 @@ const writer: CapabilityGrant = { subjectId: bytes(20), signingPublicKey: bytes(
 async function fixture(extraGrants: readonly CapabilityGrant[] = []) {
   const root = await generateEd25519KeyPair()
   const manifest: GenesisManifest = {
-    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, capabilityLogFeed: bytes(3),
+    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, schemaAdminPublicKey: root.publicKeyBytes, capabilityLogFeed: bytes(3),
     initialCapabilities: [writer, validator(21, 'A'), validator(22, 'B'), ...extraGrants],
     validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 300_000n, heartbeatIntervalMs: 30_000n },

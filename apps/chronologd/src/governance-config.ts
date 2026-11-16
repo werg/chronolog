@@ -143,6 +143,7 @@ async function createGenesis(
         authorityPublicKey: options.identity.publicKeyBytes }
       : { kind: 'peer', executionManifestDigest: options.schemaId },
     rootAdminPublicKey: options.identity.publicKeyBytes,
+    schemaAdminPublicKey: options.identity.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode(options.transportAuthor),
     initialCapabilities: [
       { ...common, role: 'administrator' },

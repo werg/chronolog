@@ -37,7 +37,7 @@ describe('live native governed peer', () => {
       const state = new NodeStateDatabase(join(path, 'state.sqlite'))
       const store = new SqliteOperationStore(state.database)
       const materializer = await DeterministicMaterializer.open({ path: join(path, 'application.db'), executionManifest: manifest,
-        rootAdministrator: bootstrap.genesis.manifest.rootAdminPublicKey })
+        rootAdministrator: bootstrap.genesis.manifest.schemaAdminPublicKey })
       const runtime = await createGovernedNode({
         genesis: bootstrap.genesis, groupRoute, identity, transport,
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },

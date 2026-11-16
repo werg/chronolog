@@ -217,7 +217,7 @@ async function governanceFixture(operationStore?: DurableOperationStore) {
   const manifest: GenesisManifest = {
     groupId,
     schemaId: bytes32(3),
-    rootAdminPublicKey: root.publicKeyBytes,
+    rootAdminPublicKey: root.publicKeyBytes, schemaAdminPublicKey: root.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode('admin'),
     initialCapabilities: [
       { ...grant(root.publicKeyBytes, 'administrator', { transportAuthor: 'admin' }), validFromRevision: 0n },

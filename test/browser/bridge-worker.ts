@@ -131,7 +131,7 @@ endpoint.addEventListener('message', (event) => {
               })
             }
             return {
-              materializer: { executionManifest, rootAdministrator: genesis.manifest.rootAdminPublicKey, checkpointEvery: 1 },
+              materializer: { executionManifest, rootAdministrator: genesis.manifest.schemaAdminPublicKey, checkpointEvery: 1 },
               governed: { genesis, groupRoute },
               ...(relay === undefined ? {} : { transport: relay, start: () => relay!.catchUp() }),
               async close() { closing.abort(); for (const port of ports) port.close() },

@@ -64,6 +64,12 @@
       "@chronolog/node-core/history": [
         "packages/node-core/src/history-policy.ts"
       ],
+      "@chronolog/node-core/ledger": [
+        "packages/node-core/src/ledger-record.ts"
+      ],
+      "@chronolog/node-core/membership": [
+        "packages/node-core/src/membership.ts"
+      ],
       "@chronolog/runtime-browser": [
         "packages/runtime-browser/src/index.ts"
       ],
@@ -102,6 +108,7 @@
       ],
       "@chronolog/runtime-browser/events": [
         "packages/runtime-browser/src/event-peer.ts"
+
       ]
     }
   }

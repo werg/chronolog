@@ -153,19 +153,21 @@ function resourceFromCbor(value: CborValue): ResourcePolicy {
 
 function genesisToCbor(value: GenesisManifest): CborValue {
   protocolInvariant(value.rootAdminPublicKey.length === 32, 'SCHEMA_INVALID', 'Genesis root key must contain 32 bytes')
+  protocolInvariant(value.schemaAdminPublicKey instanceof Uint8Array && value.schemaAdminPublicKey.length === 32,
+    'SCHEMA_INVALID', 'Genesis schema administrator key must contain 32 bytes')
   protocolInvariant(value.validationPolicies.length > 0, 'SCHEMA_INVALID', 'Genesis requires at least one validation policy')
   return integerMap([
-    [0, 1n], [1, value.groupId], [2, value.schemaId], [3, value.rootAdminPublicKey],
-    [4, value.capabilityLogFeed],
-    [7, value.initialCapabilities.map(grantToCbor)], [8, value.validationPolicies.map(policyToCbor)],
-    [9, clockToCbor(value.clockPolicy)], [10, resourceToCbor(value.resourcePolicy)],
-    [11, value.encryptionSuite], [12, value.createdAtMs],
-    [13, value.forkedFrom === undefined ? undefined : integerMap([
+    [0, 2n], [1, value.groupId], [2, value.schemaId], [3, value.rootAdminPublicKey],
+    [4, value.schemaAdminPublicKey], [5, value.capabilityLogFeed],
+    [6, value.initialCapabilities.map(grantToCbor)], [7, value.validationPolicies.map(policyToCbor)],
+    [8, clockToCbor(value.clockPolicy)], [9, resourceToCbor(value.resourcePolicy)],
+    [10, value.encryptionSuite], [11, value.createdAtMs],
+    [12, value.forkedFrom === undefined ? undefined : integerMap([
       [0, value.forkedFrom.groupId],
       [1, value.forkedFrom.snapshotManifestSha256],
       [2, value.forkedFrom.materializedRevision],
     ])],
-    [14, value.historyPolicy === undefined ? undefined : historyPolicyToCbor(value.historyPolicy)],
+    [13, value.historyPolicy === undefined ? undefined : historyPolicyToCbor(value.historyPolicy)],
   ])
 }
 
@@ -213,22 +215,22 @@ export function encodeGenesisManifest(value: GenesisManifest): Uint8Array {
 
 export function decodeGenesisManifest(bytes: Uint8Array): GenesisManifest {
   const map = expectMap(assertCanonicalCbor(bytes), 'genesis')
-  // Keys 5 and 6 are retired (formerly recovery keys and threshold).
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14], 'genesis')
-  expectVersion(map, 1n, 'genesis')
-  const forkedFrom = optional(map, 13)
-  const historyPolicy = optional(map, 14)
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], 'genesis')
+  expectVersion(map, 2n, 'genesis')
+  const forkedFrom = optional(map, 12)
+  const historyPolicy = optional(map, 13)
   const manifest: GenesisManifest = {
     groupId: expectBytes(required(map, 1, 'genesis.group_id'), 'genesis.group_id'),
     schemaId: expectBytes(required(map, 2, 'genesis.schema_id'), 'genesis.schema_id'),
     rootAdminPublicKey: expectBytes(required(map, 3, 'genesis.root_key'), 'genesis.root_key', 32),
-    capabilityLogFeed: expectBytes(required(map, 4, 'genesis.capability_feed'), 'genesis.capability_feed'),
-    initialCapabilities: expectArray(required(map, 7, 'genesis.capabilities'), 'genesis.capabilities').map((item, index) => grantFromCbor(item, `genesis.capabilities[${index}]`)),
-    validationPolicies: expectArray(required(map, 8, 'genesis.policies'), 'genesis.policies').map((item, index) => policyFromCbor(item, `genesis.policies[${index}]`)),
-    clockPolicy: clockFromCbor(required(map, 9, 'genesis.clock_policy')),
-    resourcePolicy: resourceFromCbor(required(map, 10, 'genesis.resource_policy')),
-    encryptionSuite: expectString(required(map, 11, 'genesis.encryption_suite'), 'genesis.encryption_suite'),
-    createdAtMs: expectUint64(required(map, 12, 'genesis.created_at'), 'genesis.created_at'),
+    schemaAdminPublicKey: expectBytes(required(map, 4, 'genesis.schema_admin_key'), 'genesis.schema_admin_key', 32),
+    capabilityLogFeed: expectBytes(required(map, 5, 'genesis.capability_feed'), 'genesis.capability_feed'),
+    initialCapabilities: expectArray(required(map, 6, 'genesis.capabilities'), 'genesis.capabilities').map((item, index) => grantFromCbor(item, `genesis.capabilities[${index}]`)),
+    validationPolicies: expectArray(required(map, 7, 'genesis.policies'), 'genesis.policies').map((item, index) => policyFromCbor(item, `genesis.policies[${index}]`)),
+    clockPolicy: clockFromCbor(required(map, 8, 'genesis.clock_policy')),
+    resourcePolicy: resourceFromCbor(required(map, 9, 'genesis.resource_policy')),
+    encryptionSuite: expectString(required(map, 10, 'genesis.encryption_suite'), 'genesis.encryption_suite'),
+    createdAtMs: expectUint64(required(map, 11, 'genesis.created_at'), 'genesis.created_at'),
     ...(forkedFrom === undefined ? {} : { forkedFrom: forkOriginFromCbor(forkedFrom) }),
     ...(historyPolicy === undefined ? {} : { historyPolicy: historyPolicyFromCbor(historyPolicy) }),
   }
@@ -238,7 +240,7 @@ export function decodeGenesisManifest(bytes: Uint8Array): GenesisManifest {
 
 export function encodeSignedGenesis(value: SignedGenesis): Uint8Array {
   return encodeCanonicalCbor(integerMap([
-    [0, 1n],
+    [0, 2n],
     [1, encodeGenesisManifest(value.manifest)],
     [2, value.signature],
   ]))
@@ -247,7 +249,7 @@ export function encodeSignedGenesis(value: SignedGenesis): Uint8Array {
 export function decodeSignedGenesis(bytes: Uint8Array): SignedGenesis {
   const map = expectMap(assertCanonicalCbor(bytes), 'signed_genesis')
   assertKnownIntegerKeys(map, [0, 1, 2], 'signed_genesis')
-  expectVersion(map, 1n, 'signed_genesis')
+  expectVersion(map, 2n, 'signed_genesis')
   return {
     manifest: decodeGenesisManifest(expectBytes(required(map, 1, 'signed_genesis.manifest'), 'signed_genesis.manifest')),
     signature: expectBytes(required(map, 2, 'signed_genesis.signature'), 'signed_genesis.signature', 64),

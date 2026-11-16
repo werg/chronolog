@@ -50,6 +50,8 @@ try {
   const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap(name =>
     ['', '/browser'].map(suffix => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
   alias['@chronolog/node-core/history'] = join(workspace, 'packages/node-core/src/history-policy.ts')
+  alias['@chronolog/node-core/ledger'] = join(workspace, 'packages/node-core/src/ledger-record.ts')
+  alias['@chronolog/node-core/membership'] = join(workspace, 'packages/node-core/src/membership.ts')
   const publicBundle = await build({ absWorkingDir: workspace, entryPoints: ['test/application-pilot/public.ts'],
     outfile: join(output, 'public-application.mjs'), bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })
   const deploymentBundle = await build({ absWorkingDir: workspace,

@@ -41,7 +41,8 @@
     "chaos:crash": "tsx packages/chaos/src/cli.ts run crash",
     "chaos:stress": "tsx packages/chaos/src/cli.ts run stress",
     "docs:check": "node tools/check-doc-links.mjs",
-    "prepare": "husky"
+    "prepare": "husky",
+    "package:membership": "node tools/package-membership.mjs"
   },
   "devDependencies": {
     "@chronolog/client": "workspace:*",

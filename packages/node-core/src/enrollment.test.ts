@@ -223,7 +223,7 @@ async function setup() {
     { subjectId: identity.signing.publicKeyBytes, signingPublicKey: identity.signing.publicKeyBytes, role: 'validator', transportAuthor: 'admin', minimumAuthorTimestampMs: 0n, validFromRevision: 0n },
   ]
   const manifest: GenesisManifest = {
-    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identity.signing.publicKeyBytes,
+    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identity.signing.publicKeyBytes, schemaAdminPublicKey: identity.signing.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode('admin'), initialCapabilities,
     validationPolicies: [{ version: 1n, minimumValidators: 1n }],
     clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 1_000n, heartbeatIntervalMs: 1_000n },

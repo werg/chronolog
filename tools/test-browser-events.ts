@@ -17,6 +17,9 @@ const output = join(workspace, 'artifacts/browser-events')
 await mkdir(output, { recursive: true })
 const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap((name) =>
   ['', '/browser'].map((suffix) => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
+for (const [name, file] of [['history', 'history-policy'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
+  alias[`@chronolog/node-core/${name}`] = join(workspace, `packages/node-core/src/${file}.ts`)
+}
 const bundled = await build({ absWorkingDir: workspace,
   entryPoints: { 'event-worker': 'test/browser/event-worker.ts', 'event-page': 'test/browser/event-page.ts' },
   outdir: output, bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })

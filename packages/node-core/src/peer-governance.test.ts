@@ -103,7 +103,7 @@ async function fixture() {
     { subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes, role: 'validator', validFromRevision: 0n, transportAuthor: transports[i]!.identity, minimumAuthorTimestampMs: 0n },
   ])
   const manifest: GenesisManifest = {
-    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identities[0].publicKeyBytes,
+    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identities[0].publicKeyBytes, schemaAdminPublicKey: identities[0].publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode(transports[0]!.identity), initialCapabilities,
     validationPolicies: [{ version: 1n, minimumValidators: 2n }],
     clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 1_000n, heartbeatIntervalMs: 1_000n },

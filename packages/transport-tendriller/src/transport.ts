@@ -7,6 +7,7 @@ import {
   type CoordinatedHistoryConfiguration, type OrderedRecordEntry, type PrefixCertificate,
 } from '@chronolog/node-core/history'
 import { decodeEnvelope, equalBytes } from '@chronolog/protocol'
+import { createLedgerRecord } from '@chronolog/node-core/ledger'
 import type {
   ChronologTransport, ImmutableEvidence, PublishOptions, TransportRecord, TransportStatus,
 } from '@chronolog/records'
@@ -192,9 +193,10 @@ export class TendrillerTransport implements ChronologTransport {
       .sort((a, b) => a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : 0)
     for (const record of local) {
       if (!this.#isSubmission(record.payload)) continue
-      const id = await recordId(record.payload)
+      const prepared = await createLedgerRecord(record.payload)
+      const id = await recordId(prepared.recordBytes)
       if (this.#acknowledged.has(id)) continue
-      const accepted = await this.#records.append(record.payload, { historyId: this.#configuration.historyId, signal: this.#controller.signal })
+      const accepted = await this.#records.append(prepared.recordBytes, { historyId: this.#configuration.historyId, signal: this.#controller.signal })
       await this.#local.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry: adaptRecordEntry(accepted) }))
       this.#acknowledged.add(id)
       this.#relayConnected = true

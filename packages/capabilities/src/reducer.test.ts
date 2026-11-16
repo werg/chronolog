@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { generateEd25519KeyPair, type Ed25519KeyPair } from '@chronolog/protocol'
+import { assertCanonicalCbor, encodeCanonicalCbor, generateEd25519KeyPair, type Ed25519KeyPair } from '@chronolog/protocol'
 import {
   applyCapabilityRevision,
   capabilityId,
+  decodeGenesisManifest,
+  decodeSignedGenesis,
+  encodeGenesisManifest,
+  encodeSignedGenesis,
   isCapabilityActive,
   reduceCapabilityLog,
   signCapabilityRevision,
@@ -27,7 +31,7 @@ const validatorAt = (subject: number, revision: bigint, floor: bigint): Capabili
 async function fixture(overrides: Partial<GenesisManifest> = {}) {
   const root = await generateEd25519KeyPair()
   const manifest: GenesisManifest = {
-    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, capabilityLogFeed: bytes(3),
+    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, schemaAdminPublicKey: root.publicKeyBytes, capabilityLogFeed: bytes(3),
     initialCapabilities: [writer, validatorAt(21, 0n, 1_000n)], validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 300_000n, heartbeatIntervalMs: 30_000n },
     resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 100n, maxMutations: 100n },
@@ -49,6 +53,39 @@ function revisionAfter(
 }
 
 describe('genesis verification', () => {
+  it('authenticates an independent SQL schema administrator without changing the roster issuer', async () => {
+    const schemaAdministrator = await generateEd25519KeyPair()
+    const f = await fixture({ schemaAdminPublicKey: schemaAdministrator.publicKeyBytes })
+    const roundTrip = decodeSignedGenesis(encodeSignedGenesis(f.genesis))
+    expect(roundTrip.manifest.schemaAdminPublicKey).toEqual(schemaAdministrator.publicKeyBytes)
+    expect(roundTrip.manifest.rootAdminPublicKey).toEqual(f.root.publicKeyBytes)
+    expect(f.snapshot.rootAdminPublicKey).toEqual(f.root.publicKeyBytes)
+    expect(await verifySignedGenesis(roundTrip)).toBe(true)
+    const changedSchemaOwner = { ...f.genesis, manifest: { ...f.manifest, schemaAdminPublicKey: f.root.publicKeyBytes } }
+    expect(await verifySignedGenesis(changedSchemaOwner)).toBe(false)
+    const schemaSignedRoster = await signGenesis(f.manifest, schemaAdministrator.privateKey)
+    expect(await verifySignedGenesis(schemaSignedRoster)).toBe(false)
+  })
+
+  it('requires the explicit schema key and rejects prior genesis wire versions', async () => {
+    const f = await fixture(), fields = assertCanonicalCbor(encodeGenesisManifest(f.manifest))
+    if (!(fields instanceof Map)) throw new Error('GENESIS_MAP_REQUIRED')
+    expect(fields.get(0n)).toBe(2n)
+    fields.delete(4n)
+    expect(() => decodeGenesisManifest(encodeCanonicalCbor(fields))).toThrow()
+    fields.set(4n, new Uint8Array(31))
+    expect(() => decodeGenesisManifest(encodeCanonicalCbor(fields))).toThrow()
+    fields.set(4n, f.manifest.schemaAdminPublicKey)
+    fields.set(0n, 1n)
+    expect(() => decodeGenesisManifest(encodeCanonicalCbor(fields))).toThrow()
+    const wrapper = assertCanonicalCbor(encodeSignedGenesis(f.genesis))
+    if (!(wrapper instanceof Map)) throw new Error('SIGNED_GENESIS_MAP_REQUIRED')
+    expect(wrapper.get(0n)).toBe(2n)
+    wrapper.set(0n, 1n)
+    expect(() => decodeSignedGenesis(encodeCanonicalCbor(wrapper))).toThrow()
+    expect(() => encodeGenesisManifest({ ...f.manifest, schemaAdminPublicKey: new Uint8Array(31) })).toThrow()
+  })
+
   it('rejects a genesis whose signature does not cover the manifest', async () => {
     const f = await fixture()
     const tampered = { ...f.genesis, manifest: { ...f.genesis.manifest, createdAtMs: 11n } }

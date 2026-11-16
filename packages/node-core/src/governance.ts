@@ -43,6 +43,7 @@ import {
 } from '@chronolog/protocol'
 import type { ChronologTransport, TransportRecord } from '@chronolog/records'
 import type { OrderedRecordEntry } from './history-policy.js'
+import { decodeLedgerRecord, verifyLedgerPayload } from './ledger-record.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import { EpochCipherRing } from './cipher.js'
@@ -71,6 +72,8 @@ export interface GovernanceControlPlaneOptions {
   readonly now?: () => number
   /** Required for crash-safe authoring; production runtimes provide persistent storage. */
   readonly operationStore?: DurableOperationStore
+  /** Thin administrators follow only the small administration feed. */
+  readonly replication?: 'all' | 'administration'
 }
 
 export interface GovernanceOperationOptions { readonly operationId?: string }
@@ -172,7 +175,8 @@ export class GovernanceControlPlane {
   }
 
   async publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions = {}): Promise<SignedCapabilityRevision> {
-    return this.#authoring.run(() => this.#publishCapabilityChange(change, rootPrivateKey, options))
+    const captured = structuredClone(change), capturedOptions = { ...options }
+    return this.#authoring.run(() => this.#publishCapabilityChange(captured, rootPrivateKey, capturedOptions))
   }
 
   async #publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions): Promise<SignedCapabilityRevision> {
@@ -224,7 +228,8 @@ export class GovernanceControlPlane {
   }
 
   async rotateEpoch(rootPrivateKey: CryptoKey, contentKey?: Uint8Array, options: GovernanceOperationOptions = {}): Promise<SignedEpochManifest> {
-    return this.#authoring.run(() => this.#rotateEpoch(rootPrivateKey, contentKey, options))
+    const captured = contentKey?.slice(), capturedOptions = { ...options }
+    return this.#authoring.run(() => this.#rotateEpoch(rootPrivateKey, captured, capturedOptions))
   }
 
   async #rotateEpoch(rootPrivateKey: CryptoKey, contentKey: Uint8Array | undefined, options: GovernanceOperationOptions): Promise<SignedEpochManifest> {
@@ -259,7 +264,8 @@ export class GovernanceControlPlane {
   }
 
   async grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions = {}): Promise<number> {
-    return this.#authoring.run(() => this.#grantHistoricalAccess(subjectId, rootPrivateKey, options))
+    const captured = subjectId.slice(), capturedOptions = { ...options }
+    return this.#authoring.run(() => this.#grantHistoricalAccess(captured, rootPrivateKey, capturedOptions))
   }
 
   async #grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions): Promise<number> {
@@ -332,10 +338,13 @@ export class GovernanceControlPlane {
   /** Called only for a record in the locally verified certified log prefix. */
   async ingestCanonical(entry: OrderedRecordEntry): Promise<CapabilitySnapshot | null> {
     return this.#mutex.run(async () => {
+      const ledger = decodeLedgerRecord(entry.bytes)
+      if (ledger.kind === 'candidate') return null
+      const bytes = await verifyLedgerPayload(ledger, ledger.inlinePayload)
       const record: TransportRecord = { id: `canonical:${entry.historyId}:${entry.position}`, author: '',
-        sequence: BigInt(entry.position), receivedAtMs: 0, payload: entry.bytes }
+        sequence: BigInt(entry.position), receivedAtMs: 0, payload: bytes }
       await this.#ingest(record, true)
-      const decoded = await decodeGovernanceEnvelope(entry.bytes, this.#options.groupRoute)
+      const decoded = await decodeGovernanceEnvelope(bytes, this.#options.groupRoute)
       if (decoded.type !== 'capability') return null
       const tagged = assertCanonicalCbor(decoded.payload)
       if (!Array.isArray(tagged) || !(tagged[1] instanceof Uint8Array)) throw new Error('GOVERNANCE_PAYLOAD_INVALID')
@@ -497,6 +506,7 @@ export class GovernanceControlPlane {
     const request = this.#options.transport.requestFeed?.bind(this.#options.transport)
     if (request === undefined) return
     request(feedAuthor(snapshot.capabilityLogFeed))
+    if (this.#options.replication === 'administration') return
     for (const capability of snapshot.capabilities.values()) {
       if (capability.grant.transportAuthor !== undefined) request(capability.grant.transportAuthor)
     }

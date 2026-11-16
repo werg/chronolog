@@ -17,7 +17,7 @@ const bytes = (n: number) => new Uint8Array(32).fill(n)
 async function publisherFixture() {
   const identity = await generateEd25519KeyPair(), store = new MemoryOperationStore()
   const network = new MemoryTransportNetwork(), transport = network.createNode('owner')
-  const genesis = await signGenesis({ groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identity.publicKeyBytes,
+  const genesis = await signGenesis({ groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identity.publicKeyBytes, schemaAdminPublicKey: identity.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode('owner'), initialCapabilities: [], validationPolicies: [{ version: 1n, minimumValidators: 1n }],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 1000n, heartbeatIntervalMs: 1000n },
     resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 100n, maxMutations: 100n },

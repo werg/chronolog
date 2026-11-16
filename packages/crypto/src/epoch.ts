@@ -74,7 +74,8 @@ function wrapToCbor(value: EpochKeyWrap): CborValue {
 function manifestToCbor(value: EpochManifest): CborValue {
   protocolInvariant(value.epoch >= 0n, 'INTEGER_OUT_OF_RANGE', 'Encryption epoch cannot be negative')
   protocolInvariant(value.suite === HPKE_SUITE, 'SCHEMA_INVALID', 'Unsupported HPKE suite')
-  protocolInvariant(value.wraps.length > 0, 'SCHEMA_INVALID', 'Epoch manifest requires at least one recipient')
+  // A group with no readers still advances its key epoch. The administrator
+  // retains the key privately; no revoked reader receives a wrap for it.
   const sorted = [...value.wraps].sort((a, b) => compareBytes(a.recipientId, b.recipientId))
   for (let index = 1; index < sorted.length; index += 1) {
     protocolInvariant(compareBytes(sorted[index - 1]?.recipientId ?? new Uint8Array(), sorted[index]?.recipientId ?? new Uint8Array()) !== 0, 'SCHEMA_INVALID', 'Epoch manifest contains duplicate recipient')
@@ -151,7 +152,6 @@ export async function createEpochManifest(input: {
   const contentKey = input.contentKey?.slice() ?? globalThis.crypto.getRandomValues(new Uint8Array(32))
   protocolInvariant(contentKey.length === 32, 'SCHEMA_INVALID', 'Epoch content key must contain 32 bytes')
   const recipients = [...input.recipients].sort((a, b) => compareBytes(a.recipientId, b.recipientId))
-  protocolInvariant(recipients.length > 0, 'SCHEMA_INVALID', 'Epoch requires at least one reader recipient')
   const wraps: EpochKeyWrap[] = []
   for (let index = 0; index < recipients.length; index += 1) {
     const recipient = recipients[index] as EpochRecipient

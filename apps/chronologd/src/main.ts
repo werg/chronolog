@@ -135,7 +135,7 @@ async function startRuntime() {
   // The node's own state (control index, validator cutoffs, feed continuity).
   const nodeState = new NodeStateDatabase(join(dataDirectory, 'node-state.sqlite'))
   const operationStore = new SqliteOperationStore(nodeState.database)
-  // Opened once the genesis root administrator is known: it is the first schema administrator.
+  // SQL ownership is initialized from the explicit signed schema administrator.
   // A fork's genesis names its source group; only then may the root seed rows.
   const openMaterializer = async (rootAdministrator: Uint8Array, forkSeeding = false): Promise<void> => {
     if (sql === null) {
@@ -177,7 +177,7 @@ async function startRuntime() {
         ...(secretStore === undefined ? {} : { secretStore }),
         ...(runtime.historyPolicy === undefined ? {} : { historyPolicy: runtime.historyPolicy }),
       })
-      await openMaterializer(bootstrap.genesis.manifest.rootAdminPublicKey, bootstrap.genesis.manifest.forkedFrom !== undefined)
+      await openMaterializer(bootstrap.genesis.manifest.schemaAdminPublicKey, bootstrap.genesis.manifest.forkedFrom !== undefined)
       const orderPolicy = bootstrap.genesis.manifest.historyPolicy?.kind
       if (orderPolicy === undefined) throw new Error('GENESIS_HISTORY_POLICY_REQUIRED')
       governed = await createGovernedNode({

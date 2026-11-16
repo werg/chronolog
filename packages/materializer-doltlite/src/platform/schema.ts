@@ -110,7 +110,7 @@ export const PLATFORM_VIEW_NAMES: ReadonlySet<string> = new Set(
 
 /**
  * Create the platform tables and views and the `group` collective,
- * administered by the root. Fork seeding starts open only in a fork.
+ * administered by the signed schema key. Fork seeding starts open only in a fork.
  */
 export function initializePlatform(database: DatabaseLike, rootAdministrator: Uint8Array, forkSeeding: boolean): void {
   if (rootAdministrator.length !== 32) throw new Error('MATERIALIZER_ROOT_ADMINISTRATOR_INVALID')

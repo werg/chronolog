@@ -29,6 +29,9 @@ await mkdir(output, { recursive: true })
 // Explicit aliases also cover this monorepo's native-default tsconfig paths.
 const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap((name) =>
   ['', '/browser'].map((suffix) => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
+for (const [name, file] of [['history', 'history-policy'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
+  alias[`@chronolog/node-core/${name}`] = join(workspace, `packages/node-core/src/${file}.ts`)
+}
 await build({
   absWorkingDir: workspace, entryPoints: { 'peer-worker': 'test/browser/peer-worker.ts', page: 'test/browser/page.ts' },
   outdir: output, bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias,

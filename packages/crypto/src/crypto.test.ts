@@ -56,6 +56,18 @@ describe('RFC 9180 base-mode adapter', () => {
 })
 
 describe('signed encryption epochs', () => {
+  it('signs an epoch with no recipients after the final reader is removed', async () => {
+    const signer = await generateEd25519KeyPair(), removed = await generateX25519KeyPair()
+    const created = await createEpochManifest({ groupId: bytes(1), epoch: 5n, previousEpochDigest: bytes(2),
+      createdAtMs: 100n, recipients: [], signerPublicKey: signer.publicKeyBytes, signerPrivateKey: signer.privateKey })
+    const signedManifest = decodeSignedEpochManifest(encodeSignedEpochManifest(created.signedManifest))
+    expect(signedManifest.manifest.wraps).toEqual([])
+    expect(created.contentKey).toHaveLength(32)
+    expect(await verifyEpochManifest(signedManifest, signer.publicKeyBytes)).toBe(true)
+    await expect(unwrapEpochKey({ signedManifest, trustedSigner: signer.publicKeyBytes,
+      recipientId: bytes(20), recipientPrivateKey: removed.privateKey })).rejects.toMatchObject({ code: 'INVALID_KEY' })
+  })
+
   it('wraps one content key independently to every active reader', async () => {
     const signer = await generateEd25519KeyPair()
     const first = await generateX25519KeyPair()

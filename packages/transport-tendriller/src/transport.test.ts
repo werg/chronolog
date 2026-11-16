@@ -1,3 +1,4 @@
+import { createLedgerRecord } from '@chronolog/node-core/ledger'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 
@@ -139,7 +140,7 @@ describe('public Tendriller adapter', () => {
     const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
     for (const item of await reader.transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(1)
-    expect(policy.entries()[0]!.bytes).toEqual(original.payload)
+    expect(policy.entries()[0]!.bytes).toEqual((await createLedgerRecord(original.payload)).recordBytes)
   })
 
   it('preserves governance publication order and keeps other feeds/groups out of the relay', async () => {
@@ -151,7 +152,7 @@ describe('public Tendriller adapter', () => {
     f.loseReply()
     await expect(adapter.ensurePublished(second)).rejects.toThrow('APPEND_REPLY_LOST')
     await adapter.ensurePublished(second)
-    expect((await f.log.read()).map((entry) => entry.bytes)).toEqual([first.payload, second.payload])
+    expect((await f.log.read()).map((entry) => entry.bytes)).toEqual(await Promise.all([first, second].map(async record => (await createLedgerRecord(record.payload)).recordBytes)))
     expect((await adapter.history()).map((record) => record.id)).toEqual((await author.transport.history()).map((record) => record.id))
   })
 

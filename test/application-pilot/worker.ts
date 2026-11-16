@@ -54,7 +54,7 @@ endpoint.addEventListener('message', (event) => {
         const genesis = decodeSignedGenesis(base64UrlToBytes(bootstrap.genesis))
         peer = await openBrowserPeer({ name: request.name!, engineUrl: new URL('./engine/', globalThis.location.href), configure(context) {
           identity = context.identity
-          return { materializer: { executionManifest: decodeExecutionManifest(base64UrlToBytes(bootstrap!.executionManifest)), rootAdministrator: genesis.manifest.rootAdminPublicKey },
+          return { materializer: { executionManifest: decodeExecutionManifest(base64UrlToBytes(bootstrap!.executionManifest)), rootAdministrator: genesis.manifest.schemaAdminPublicKey },
             governed: { genesis, groupRoute: base64UrlToBytes(bootstrap!.groupRoute), initialEpochContentKey: base64UrlToBytes(bootstrap!.epochContentKey) },
             close: async () => {
               for (const subscription of subscriptions.values()) subscription.abort.abort()

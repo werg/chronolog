@@ -38,7 +38,7 @@ async function setup() {
   const store = new MemoryOperationStore()
   const identity = await loadOrCreateEnrollmentIdentity(store, 'local')
   const manifest: GenesisManifest = {
-    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identity.signing.publicKeyBytes,
+    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identity.signing.publicKeyBytes, schemaAdminPublicKey: identity.signing.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode('admin'), initialCapabilities: [],
     validationPolicies: [{ version: 1n, minimumValidators: 1n }],
     clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 1_000n, heartbeatIntervalMs: 1_000n },

@@ -114,6 +114,8 @@ describe('Tendriller coordinated SQL connection', () => {
       return { node, client, local, transport, adapter, materializer }
     }
     const alice = await open('alice', aliceKey, true), bob = await open('bob', bobKey, true)
+    // The host retains small descriptors; application envelopes travel between peers.
+    connectInProcess(alice.local, bob.local)
     const participants = [alice, bob]
     const sync = async () => {
       for (const peer of participants) {

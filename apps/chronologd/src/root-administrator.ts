@@ -8,7 +8,7 @@ import { fromBase64 } from './config.js'
 import { readStaticRootAdministrator } from './static-membership.js'
 
 /**
- * The group's genesis root administrator, needed to open the materialized
+ * The SQL group's initial schema administrator, needed to open the materialized
  * database: from the database itself when it exists, otherwise from the
  * group's genesis (governance.json) or the static membership file.
  */
@@ -19,7 +19,7 @@ export async function resolveRootAdministrator(dataDirectory: string, environmen
   if (await exists(governancePath)) {
     const document = JSON.parse(await readFile(governancePath, 'utf8')) as { readonly signedGenesis?: unknown }
     if (typeof document.signedGenesis !== 'string') throw new Error('ROOT_ADMINISTRATOR_GENESIS_INVALID')
-    return decodeSignedGenesis(fromBase64(document.signedGenesis)).manifest.rootAdminPublicKey
+    return decodeSignedGenesis(fromBase64(document.signedGenesis)).manifest.schemaAdminPublicKey
   }
   if (environment.CHRONOLOG_STATIC_MEMBERSHIP_FILE !== undefined) {
     return readStaticRootAdministrator(resolve(environment.CHRONOLOG_STATIC_MEMBERSHIP_FILE))

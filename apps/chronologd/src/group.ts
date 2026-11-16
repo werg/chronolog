@@ -166,7 +166,7 @@ async function initialize(
   const transport = await FeedTransport.open({ path: join(dataDirectory, 'ssb') })
   const transportAuthor = transport.identity
   await transport.close()
-  // The daemon creates the database on first start, once the genesis names its root administrator.
+  // The daemon creates the database after genesis names its SQL schema administrator.
   const { executionManifestDigest: schemaId } = await executionManifestArtifacts(createDoltLiteExecutionManifest())
   const loaded = await loadOrCreateGovernanceBootstrap({
     dataDirectory,
@@ -215,7 +215,7 @@ async function validateMaterializer(
   executionManifest: ExecutionManifest,
   manifest: TrustedSnapshotManifest,
 ): Promise<void> {
-  // A snapshot database carries its own group's root administrator.
+  // A snapshot database carries its own SQL schema administrator.
   const materializer = await DeterministicMaterializer.open({ path, executionManifest, rootAdministrator: readMaterializedRootAdministrator(path) })
   try {
     if (materializer.revision !== manifest.materializedRevision || materializer.orderLength !== manifest.orderLength ||

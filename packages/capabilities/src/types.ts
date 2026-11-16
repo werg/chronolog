@@ -52,7 +52,10 @@ export interface GenesisManifest {
   }
   readonly groupId: Uint8Array
   readonly schemaId: Uint8Array
+  /** Roster and key-distribution issuer; this key grants no SQL ownership. */
   readonly rootAdminPublicKey: Uint8Array
+  /** Initial SQL group administrator, authenticated independently of the roster issuer. */
+  readonly schemaAdminPublicKey: Uint8Array
   readonly capabilityLogFeed: Uint8Array
   readonly initialCapabilities: readonly CapabilityGrant[]
   readonly validationPolicies: readonly ValidationPolicy[]

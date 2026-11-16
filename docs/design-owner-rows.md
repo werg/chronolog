@@ -218,11 +218,12 @@ are derived from the creating transaction id and step index.
 App triggers and app SQL can use these views too.
 
 **The `group` collective** (id: 32 zero bytes) is created at genesis, with
-the root administrator's key as its admin and admin-only governance. The
-materializer is opened with the group's root administrator key (from the
+the explicit `schemaAdminPublicKey` as its admin and admin-only governance. The
+materializer is opened with that SQL administrator key (from the signed
 genesis, or `rootAdministrator` in a static membership file), stores it in
 `chronolog_platform`, and refuses to reopen the database with another. Its
-admins are the schema administrators.
+admins are the schema administrators. The roster issuer `rootAdminPublicKey`
+is a separate authority and does not implicitly join this collective.
 They may run DDL, including creating tables (registered automatically) and app
 triggers.
 
@@ -523,7 +524,7 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
     principal id for that key, and keeps the `fork_seed_applied` per-batch
     guard.
   - It is allowed only in a **fork** (a group whose genesis names a source
-    group), only for the genesis root, and only until seeding ends. Seeding
+    group), only for the initial schema administrator, and only until seeding ends. Seeding
     ends at the root's `EndSeeding` step, which is the seed plan's last
     batch, or at the first accepted transaction by any other author, if that
     comes first. After that not even the root can seed. In every other group
@@ -653,7 +654,7 @@ Findings that change the plan:
 ### Step 4: ownership core
 
 - **Platform tables and the `group` collective.** Create the platform tables,
-  and seed the `group` collective with the root administrator's key at genesis.
+  and seed the `group` collective with the explicit schema administrator's key at genesis.
 - **Registration** (automatic since 2026-11-13; §11). It adds or checks the
   owner column, lints FK actions, and generates the three platform triggers
   and the lookup views.
@@ -686,7 +687,7 @@ Findings that change the plan:
 
 ### Step 6: forks and snapshots
 
-- **`SeedRows`** is allowed only in a fork, only for the genesis root, until
+- **`SeedRows`** is allowed only in a fork, only for the initial schema administrator, until
   `EndSeeding` or the first accepted transaction by another author, and
   keeps the `fork_seed_applied` guard.
 - **`chronolog-fork-seed`** emits platform tables and `SeedRows`, orders

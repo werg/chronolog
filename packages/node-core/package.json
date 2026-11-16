@@ -7,7 +7,8 @@
     ".": { "browser": "./src/browser.ts", "default": "./src/index.ts" },
     "./browser": "./src/browser.ts",
     "./history": "./src/history-policy.ts",
-    "./ledger": "./src/ledger-record.ts"
+    "./ledger": "./src/ledger-record.ts",
+    "./membership": "./src/membership.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",

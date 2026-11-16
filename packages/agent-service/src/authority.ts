@@ -1,12 +1,13 @@
 import {
   Mutex, ReferenceRecordLog, createPrefixAuthority, encodeHistoryConfiguration, encodeOrderingEvidence, orderedGenesisRoot,
+  createLedgerRecord, decodeLedgerRecord, verifyLedgerPayload,
 } from '@chronolog/node-core'
 import type {
   CoordinatedHistoryConfiguration, DurableOperationStore, OrderedRecordEntry, OrderedRecordHead, PrefixCertificate,
 } from '@chronolog/node-core'
 import { decodeEnvelope, equalBytes } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
-import type { ChronologTransport } from '@chronolog/records'
+import { validatePayloadHash, verifyPayloadHash, type ChronologTransport } from '@chronolog/records'
 
 export interface EvidenceSink { putEvidence(bytes: Uint8Array): Promise<unknown> }
 
@@ -78,10 +79,39 @@ export class NativeAuthority {
   get configuration(): CoordinatedHistoryConfiguration { return structuredClone(this.#configuration) }
   head(): Promise<OrderedRecordHead> { return this.#log.head() }
 
-  /** Exact bytes, deduplication, position and prefix root commit before return. */
+  /** Retain the exact payload before committing its small typed ledger record. */
   append(bytes: Uint8Array): Promise<OrderedRecordEntry> {
     const exact = bytes.slice()
-    return this.#mutex.run(() => this.#log.append(exact))
+    return this.#mutex.run(async () => {
+      const prepared = await createLedgerRecord(exact)
+      if (prepared.detachedPayload !== null) {
+        await this.#store.put(this.#payloadKey(prepared.record.payloadHash), prepared.detachedPayload)
+      }
+      return this.#log.append(prepared.recordBytes)
+    })
+  }
+
+  /** Administrative ingress carries complete inline operations, never application bodies. */
+  appendLedgerRecord(bytes: Uint8Array): Promise<OrderedRecordEntry> {
+    const exact = bytes.slice()
+    return this.#mutex.run(async () => {
+      const record = decodeLedgerRecord(exact)
+      const payload = record.inlinePayload ?? await this.getPayload(record.payloadHash)
+      if (payload === null) throw new Error('LEDGER_PAYLOAD_UNAVAILABLE')
+      await verifyLedgerPayload(record, payload)
+      return this.#log.append(exact)
+    })
+  }
+
+  async getPayload(hash: string): Promise<Uint8Array | null> {
+    validatePayloadHash(hash)
+    const bytes = await this.#store.get(this.#payloadKey(hash))
+    if (bytes !== null) await verifyPayloadHash(hash, bytes)
+    return bytes
+  }
+
+  #payloadKey(hash: string): string {
+    return `agent/authority/${this.#configuration.historyId}/payload/${hash}`
   }
 
   /** The only signing input is this authority's own committed native head. */

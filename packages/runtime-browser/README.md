@@ -98,7 +98,7 @@ const peer = await openBrowserPeer({
     const configuration: BrowserPeerConfiguration = {
       materializer: {
         executionManifest,
-        rootAdministrator: genesis.manifest.rootAdminPublicKey,
+        rootAdministrator: genesis.manifest.schemaAdminPublicKey,
       },
       governed: { genesis, groupRoute },
       start: async () => { transport.connect(relay); await transport.catchUp() },

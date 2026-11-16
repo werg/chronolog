@@ -47,7 +47,7 @@ endpoint.addEventListener('message', (event) => {
                 transportAuthor: context.transport.identity, validFromRevision: 0n }
               const genesis = await signGenesis({
                 groupId, schemaId: executionManifestDigest, historyPolicy: { kind: 'peer', executionManifestDigest },
-                rootAdminPublicKey: context.identity.signing.publicKeyBytes,
+                rootAdminPublicKey: context.identity.signing.publicKeyBytes, schemaAdminPublicKey: context.identity.signing.publicKeyBytes,
                 capabilityLogFeed: new TextEncoder().encode(context.transport.identity),
                 initialCapabilities: [
                   { ...common, role: 'administrator' }, { ...common, role: 'writer',
@@ -66,7 +66,7 @@ endpoint.addEventListener('message', (event) => {
             const genesis = decodeSignedGenesis(savedGenesis)
             return {
               materializer: {
-                executionManifest, rootAdministrator: genesis.manifest.rootAdminPublicKey, checkpointEvery: 1,
+                executionManifest, rootAdministrator: genesis.manifest.schemaAdminPublicKey, checkpointEvery: 1,
                 publicationFaultInjector(point) {
                   if (!pauseApplication || point !== 'after_candidate_commit') return
                   endpoint.postMessage({ fixture: 'paused', point })

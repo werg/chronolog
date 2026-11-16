@@ -131,11 +131,13 @@ Capability roles decide who may author, validate and read. What a writer may
 do to the database's rows is decided inside the database
 ([owner-controlled rows](design-owner-rows.md)):
 
-- The genesis root administrator is the first admin of the **`group`
+- The signed genesis `schemaAdminPublicKey` is the first admin of the **`group`
   collective** (id: 32 zero bytes), created when the materialized database is
-  initialized. The daemon reads the root key from the genesis
-  (`rootAdminPublicKey`), or from `rootAdministrator` in a static membership
-  file.
+  initialized. The daemon reads that explicit schema key from the genesis,
+  or `rootAdministrator` from a static membership file. The roster issuer
+  `rootAdminPublicKey` does not receive SQL ownership through its issuer role.
+  Cloudflare provisioning names the native application owner's public key as
+  schema administrator and keeps its own roster signing key separate.
 - Active admins of the `group` collective are the **schema administrators**.
   Only they may run DDL (tables, indexes, views, app triggers, `ALTER TABLE`)
   (tables are owner-checked automatically). A group admin adds another with a `set_members` step

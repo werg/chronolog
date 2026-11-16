@@ -41,7 +41,7 @@ async function fixture() {
   }
   const initialValidator = validator(21, 0n, 1_000n)
   const manifest: GenesisManifest = {
-    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes,
+    groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, schemaAdminPublicKey: root.publicKeyBytes,
     capabilityLogFeed: bytes(3),
     initialCapabilities: [writer, initialValidator], validationPolicies: [policy],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 300_000n, heartbeatIntervalMs: 30_000n },

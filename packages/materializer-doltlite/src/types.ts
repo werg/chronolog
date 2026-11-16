@@ -212,7 +212,7 @@ export interface MaterializerOptions {
   readonly path?: string
   readonly executionManifest: ExecutionManifest
   /**
-   * The group's genesis root administrator key: the first admin of the
+   * The genesis schemaAdminPublicKey: the first SQL admin of the
    * `group` collective, and the only key that may seed rows into a fork.
    */
   readonly rootAdministrator: Uint8Array

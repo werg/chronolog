@@ -56,7 +56,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       transportAuthor: administratorFeed, validFromRevision: 0n }
     const genesis = await signGenesis({
       groupId: crypto.getRandomValues(new Uint8Array(32)), schemaId: executionManifestDigest,
-      rootAdminPublicKey: administrator.signing.publicKeyBytes, capabilityLogFeed: utf8(administratorFeed),
+      rootAdminPublicKey: administrator.signing.publicKeyBytes, schemaAdminPublicKey: administrator.signing.publicKeyBytes, capabilityLogFeed: utf8(administratorFeed),
       initialCapabilities: [
         { ...common, role: 'administrator' }, { ...common, role: 'writer' },
         { ...common, role: 'reader', hpkePublicKey: administrator.reader.publicKeyBytes },
@@ -174,7 +174,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
     signer: webFeedSigner(administratorFeed, administrator.signing.privateKey),
   })
   const materializer = await DeterministicMaterializer.open({ path: join(options.rootDirectory, 'native-application.db'),
-    executionManifest, rootAdministrator: administrator.signing.publicKeyBytes, checkpointEvery: 1 })
+    executionManifest, rootAdministrator: genesis.manifest.schemaAdminPublicKey, checkpointEvery: 1 })
   let governed: GovernedNode | undefined
   let client: ChronologClient | undefined
   let closed = false

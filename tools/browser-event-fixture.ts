@@ -53,7 +53,7 @@ export async function createNativeBrowserFixture(options: {
         topics: options.topics ?? ['conversation', 'tasks', 'job-requests'], signals: ['typing'] } }]
   })
   const genesis = await signGenesis({ groupId, schemaId: executionManifestDigest,
-    rootAdminPublicKey: identity.signing.publicKeyBytes, capabilityLogFeed: utf8(transport.identity),
+    rootAdminPublicKey: identity.signing.publicKeyBytes, schemaAdminPublicKey: identity.signing.publicKeyBytes, capabilityLogFeed: utf8(transport.identity),
     historyPolicy: { kind: 'coordinated', executionManifestDigest,
       historyId: `h_${crypto.randomUUID().replaceAll('-', '')}`, authorityPublicKey: identity.signing.publicKeyBytes },
     initialCapabilities: [{ ...root, role: 'administrator' },

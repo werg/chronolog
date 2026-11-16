@@ -24,6 +24,7 @@ import { createGovernedNode } from './governed-node.js'
 import { createPrefixAuthority, encodeOrderingEvidence, ReferenceRecordLog } from './history-policy.js'
 import type { CoordinatedHistoryConfiguration } from './history-policy.js'
 import { MemoryOperationStore } from './operations.js'
+import { createLedgerRecord } from './ledger-record.js'
 import { encodeSignedEnvelope } from './wire.js'
 
 const cleanup: Array<() => Promise<void>> = []
@@ -43,7 +44,7 @@ class ReferenceSubmissionTransport extends PortableFeedTransport {
   async ensurePublished(record: TransportRecord): Promise<void> {
     const type = decodeEnvelope(record.payload).messageType
     if (type !== 'candidate' && type !== 'capability' && type !== 'epoch-manifest') return
-    const entry = await this.log.append(record.payload)
+    const entry = await this.log.append((await createLedgerRecord(record.payload)).recordBytes)
     await this.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
   }
 }
@@ -68,7 +69,7 @@ describe('governed coordinated native replicas', () => {
         transportAuthor: administratorFeed, role: 'reader', hpkePublicKey: administrator.reader.publicKeyBytes, validFromRevision: 0n },
     ]
     const manifest: GenesisManifest = {
-      groupId: bytes32(21), schemaId: executionManifestDigest, rootAdminPublicKey: administrator.signing.publicKeyBytes,
+      groupId: bytes32(21), schemaId: executionManifestDigest, rootAdminPublicKey: administrator.signing.publicKeyBytes, schemaAdminPublicKey: administrator.signing.publicKeyBytes,
       capabilityLogFeed: utf8(administratorFeed), initialCapabilities,
       historyPolicy: { kind: 'coordinated', executionManifestDigest, historyId, authorityPublicKey: authorityIdentity.publicKeyBytes },
       validationPolicies: [{ version: 1n, minimumValidators: 1n }],
@@ -216,13 +217,17 @@ describe('governed coordinated native replicas', () => {
       ...await authority.certify(), signature: new Uint8Array(64),
     } }))
     await newcomer.close()
-    // Rebuild from the retained relay alone: no original governance feed or
-    // prior epoch keys. Its historical key grant appears after encrypted SQL
-    // in this same certified prefix, and must be received before replay can run.
+    // Rebuild membership and wrapped keys from small descriptors alone. Missing
+    // SQL bodies cannot prevent the reader grant from becoming effective.
     const relayOnly = await open('relay-only', joining, new MemoryOperationStore())
     for (const entry of await log.read()) await relayOnly.node.ingestOrderingEvidence({ kind: 'ordered-entry', entry })
-    await relayOnly.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: await authority.certify() })
+    const retainedCertificate = await authority.certify()
+    await expect(relayOnly.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: retainedCertificate }))
+      .rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
     expect(relayOnly.activeSnapshot.revision).toBe(3n)
+    // Fetch application envelopes by hash without replicating any author feed.
+    relayOnly.transport.connect({ ...admin.transport.asLink(), read: async () => [] })
+    await relayOnly.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: retainedCertificate })
     expect(relayOnly.node.outcome(staleAgain.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
     expect(relayOnly.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows)
       .toEqual(admin.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows)

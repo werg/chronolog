@@ -42,6 +42,7 @@ import { ChangeSignal, type TransportRecord } from '@chronolog/records'
 import { readEffectiveEvents, type EventBatch, type EventReadOptions, type EventHistorySnapshot, type EventHistoryItem } from './events.js'
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { decodeOrderingEvidence, encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
+import { decodeLedgerRecord, resolveLedgerPayload, type LedgerRecord } from './ledger-record.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import type {
@@ -593,27 +594,34 @@ export class ChronologNode {
   }
 
   async finalTarget(): Promise<Uint8Array> {
-    const ids = this.#control.orderedTransactionIds().slice(0, this.finalOrderLength)
     const policy = this.#options.historyPolicy
+    if (policy?.kind === 'coordinated') {
+      return encodeCanonicalCbor([3n, this.groupId, 'coordinated', policy.policy.configuration.historyId,
+        BigInt(this.#coordinatedAppliedThrough), policy.policy.entries(this.#coordinatedAppliedThrough).at(-1)?.root ??
+          await orderedGenesisRoot(policy.policy.configuration.historyId)])
+    }
+    const ids = this.#control.orderedTransactionIds().slice(0, this.finalOrderLength)
     return encodeCanonicalCbor([2n, this.groupId, this.historyPolicy, BigInt(ids.length), await sha256(encodeCanonicalCbor(ids)),
-      policy?.kind === 'coordinated' ? BigInt(this.#coordinatedAppliedThrough) : null,
-      policy?.kind === 'coordinated' ? policy.policy.entries(this.#coordinatedAppliedThrough).at(-1)?.root ??
-        await orderedGenesisRoot(policy.policy.configuration.historyId) : null,
+      null, null,
     ])
   }
 
   async isFinalTargetApplied(frontier: Uint8Array): Promise<boolean> {
     const value = assertCanonicalCbor(frontier)
+    const policy = this.#options.historyPolicy
+    if (policy?.kind === 'coordinated') {
+      if (!Array.isArray(value) || value.length !== 6 || value[0] !== 3n || !(value[1] instanceof Uint8Array) ||
+          !equalBytes(value[1], this.groupId) || value[2] !== 'coordinated' || value[3] !== policy.policy.configuration.historyId ||
+          typeof value[4] !== 'bigint' || value[4] < 0n || value[4] > BigInt(this.#coordinatedAppliedThrough) ||
+          typeof value[5] !== 'string') return false
+      const root = policy.policy.entries(Number(value[4])).at(-1)?.root ?? await orderedGenesisRoot(policy.policy.configuration.historyId)
+      return root === value[5]
+    }
     if (!Array.isArray(value) || value.length !== 7 || value[0] !== 2n || !(value[1] instanceof Uint8Array) ||
         !equalBytes(value[1], this.groupId) || value[2] !== this.historyPolicy || typeof value[3] !== 'bigint' ||
         value[3] < 0n || value[3] > BigInt(this.finalOrderLength) || !(value[4] instanceof Uint8Array)) return false
     const ids = this.#control.orderedTransactionIds().slice(0, Number(value[3]))
-    const policy = this.#options.historyPolicy
-    if (policy?.kind === 'coordinated') {
-      if (typeof value[5] !== 'bigint' || value[5] < 0n || value[5] > BigInt(this.#coordinatedAppliedThrough) || typeof value[6] !== 'string') return false
-      const root = policy.policy.entries(Number(value[5])).at(-1)?.root ?? await orderedGenesisRoot(policy.policy.configuration.historyId)
-      if (root !== value[6]) return false
-    } else if (value[5] !== null || value[6] !== null) return false
+    if (value[5] !== null || value[6] !== null) return false
     return equalBytes(await sha256(encodeCanonicalCbor(ids)), value[4])
   }
 
@@ -654,31 +662,35 @@ export class ChronologNode {
     const selected = this.#options.historyPolicy
     if (selected?.kind !== 'coordinated') return
     const entries = selected.policy.entries(selected.policy.progress.finalThrough)
-    // Historical keys can be granted after the encrypted transactions they
-    // unlock. Receipt of verified governance is independent from its ordered
-    // activation, so a relay-only reader can decrypt the earlier prefix.
+    // Membership follows the complete certified descriptor prefix, without
+    // waiting for application bodies or SQL. Each candidate still authorizes
+    // against the membership at its own canonical position. A late reader can
+    // obtain its grant and wrapped keys before opening a reader peer connection.
     for (const entry of entries.slice(this.#coordinatedControlReceivedThrough)) {
-      let envelope: ReturnType<typeof decodeEnvelope>
-      try { envelope = decodeEnvelope(entry.bytes) }
+      let record: LedgerRecord
+      try { record = decodeLedgerRecord(entry.bytes) }
       catch { this.#coordinatedControlReceivedThrough = entry.position; continue }
-      if (equalBytes(envelope.groupRoute, this.#groupRoute()) &&
-          (envelope.messageType === 'capability' || envelope.messageType === 'epoch-manifest')) {
-        await selected.receiveControlRecord?.(entry)
+      if (equalBytes(record.groupRoute, this.#groupRoute()) && record.kind !== 'candidate') {
+        if (selected.applyGovernanceRecord === undefined) throw new Error('COORDINATED_GOVERNANCE_HANDLER_UNAVAILABLE')
+        await selected.applyGovernanceRecord(entry)
       }
       this.#coordinatedControlReceivedThrough = entry.position
     }
     for (const entry of entries.slice(this.#coordinatedProcessed)) {
-      let envelope: ReturnType<typeof decodeEnvelope>
-      try { envelope = decodeEnvelope(entry.bytes) }
+      let ledger: LedgerRecord
+      try { ledger = decodeLedgerRecord(entry.bytes) }
       catch { this.#coordinatedProcessed = entry.position; continue }
-      if (!equalBytes(envelope.groupRoute, this.#groupRoute())) {
+      if (!equalBytes(ledger.groupRoute, this.#groupRoute())) {
         this.#coordinatedProcessed = entry.position
         continue
       }
-      if (envelope.messageType === 'candidate') {
+      if (ledger.kind === 'candidate') {
+        // The certified descriptor selects the type. A missing body blocks
+        // application progress; it cannot hide governance or become a rejection.
+        const payload = await resolveLedgerPayload(ledger, (hash) => this.#options.transport.getPayload(hash))
         const record: TransportRecord = {
           id: `ordered:${entry.historyId}:${entry.position}`, author: '', sequence: 0n,
-          receivedAtMs: 0, payload: entry.bytes,
+          receivedAtMs: 0, payload,
         }
         try {
           const wire = await this.#decodeRecord(record)
@@ -688,9 +700,6 @@ export class ChronologNode {
           // a valid proposal identity. Missing keys/engines/storage still block.
           if (!(error instanceof TerminalIngestError)) throw error
         }
-      } else if (envelope.messageType === 'capability' || envelope.messageType === 'epoch-manifest') {
-        if (selected.applyControlRecord === undefined) throw new Error('COORDINATED_GOVERNANCE_HANDLER_UNAVAILABLE')
-        await selected.applyControlRecord(entry)
       }
       this.#coordinatedProcessed = entry.position
     }

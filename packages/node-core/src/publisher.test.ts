@@ -24,7 +24,7 @@ async function fixture() {
       program: { sql: false, topics: ['*'], signals: ['*'] } },
     { role: 'reader', subjectId: identity.signing.publicKeyBytes, signingPublicKey: identity.signing.publicKeyBytes, transportAuthor: 'owner', validFromRevision: 0n, hpkePublicKey: identity.reader.publicKeyBytes },
   ]
-  const genesis = await signGenesis({ groupId: bytes(1), schemaId: runtime.queries.executionManifestDigest, rootAdminPublicKey: identity.signing.publicKeyBytes,
+  const genesis = await signGenesis({ groupId: bytes(1), schemaId: runtime.queries.executionManifestDigest, rootAdminPublicKey: identity.signing.publicKeyBytes, schemaAdminPublicKey: identity.signing.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode('owner'), initialCapabilities, validationPolicies: [{ version: 1n, minimumValidators: 1n }],
     clockPolicy: { maxFutureSkewMs: 60_000n, cutoffLagMs: 1000n, heartbeatIntervalMs: 1000n },
     resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 100n, maxMutations: 100n },

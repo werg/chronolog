@@ -296,11 +296,12 @@ between steps).
 | `SetMembers` | An active admin. New keys are invited and join by accepting; existing members change role or are removed. | `no_such_collective`, `not_collective_admin`, `not_member`, `last_admin` |
 | `TransferOffer` | The owner (or an admin of an owner collective). `all` covers every row the owner holds in every registered table. | `unregistered_table`, `no_such_row`, `not_owner`, `invalid_transfer` |
 | `TransferAccept` | The recipient (or an admin of a recipient collective). Moves the row and, with `carry`, its same-owner dependents through owner-composite FKs; a row offer revokes the row's grants. `all` moves rows parent tables first and re-points the old owner's grants. | `no_such_offer`, `offer_closed`, `not_recipient`, `offer_stale`, `has_dependents`, `fk_cycle` |
-| `SeedRows` | The genesis root administrator of a fork (a genesis with `forkedFrom`), before the first accepted transaction by any other author; never in other groups. Writes rows with their owners verbatim, without app triggers; also seeds `chronolog_collectives`, `_collective_members`, `_grants` and `_transfers` (never the `group` collective). | `not_root`, `seed_closed`, `unregistered_table`, `unknown_column`, `invalid_seed` |
+| `SeedRows` | The initial schema administrator of a fork (the signed genesis `schemaAdminPublicKey`, with `forkedFrom`), before the first accepted transaction by any other author; never in other groups. Writes rows with their owners verbatim, without app triggers; also seeds `chronolog_collectives`, `_collective_members`, `_grants` and `_transfers` (never the `group` collective). | `not_root`, `seed_closed`, `unregistered_table`, `unknown_column`, `invalid_seed` |
 
-The `group` collective (all-zero id) exists from genesis with the root
-administrator as its admin and admin-only governance. Its active admins are
-the schema administrators.
+The `group` collective (all-zero id) exists from genesis with the explicit
+`schemaAdminPublicKey` as its admin and admin-only governance. Its active admins
+are the schema administrators. The roster issuer `rootAdminPublicKey` grants
+no implicit SQL membership, schema privilege or row ownership.
 
 ## 8. Transaction log
 
@@ -346,5 +347,5 @@ A replica only executes transactions whose manifest it runs. An unavailable
 manifest blocks replay without creating a SQL outcome (section 4). The
 execution profile is fixed in the signed group configuration; live engine
 or profile upgrades are outside this initial scope. The materialized
-database also records its genesis root administrator, and a replica refuses
+database also records its initial schema administrator, and a replica refuses
 to open it with another.

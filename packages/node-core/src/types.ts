@@ -121,10 +121,8 @@ export interface ChronologNodeOptions {
   readonly historyPolicy?: { readonly kind: 'peer' } | {
     readonly kind: 'coordinated'
     readonly policy: CoordinatedHistoryPolicy
-    /** Receives verified snapshots/keys without activating application authority. */
-    readonly receiveControlRecord?: (entry: OrderedRecordEntry) => Promise<void>
-    /** Applies verified governance records at their certified position. */
-    readonly applyControlRecord?: (entry: OrderedRecordEntry) => Promise<void>
+    /** Apply verified inline governance at its certified position, independently of application bodies. */
+    readonly applyGovernanceRecord?: (entry: OrderedRecordEntry) => Promise<void>
   }
   readonly groupId: Uint8Array
   readonly groupRoute?: Uint8Array

@@ -3,13 +3,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { CoordinatedHistoryPolicy, MemoryOperationStore, decodeOrderingEvidence, verifyPrefixCertificate } from '@chronolog/node-core'
+import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence, verifyPrefixCertificate } from '@chronolog/node-core'
 import type { CoordinatedHistoryConfiguration, DurableOperationStore } from '@chronolog/node-core'
-import { generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
+import { encodeEnvelope, generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { NativeAuthority } from './authority.js'
 import { NativeAgentStore } from './native-store.js'
+
+const envelope = (text: string) => encodeEnvelope({ groupRoute: new Uint8Array(32).fill(1),
+  messageType: 'candidate', encryptionEpoch: null, payload: utf8(text) })
 
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
@@ -29,10 +32,26 @@ async function fixture() {
 }
 
 describe('native fixed authority', () => {
+  it('certifies only small descriptors while retaining exact detached payloads before commitment', async () => {
+    const f = await fixture(), authority = await NativeAuthority.open(f)
+    const payload = envelope('large-content'.repeat(40_000)), entry = await authority.append(payload)
+    const descriptor = decodeLedgerRecord(entry.bytes)
+    expect(entry.bytes.length).toBeLessThan(256)
+    expect(descriptor.kind).toBe('candidate')
+    expect(descriptor.inlinePayload).toBeNull()
+    expect(await authority.getPayload(descriptor.payloadHash)).toEqual(payload)
+    expect(await authority.appendLedgerRecord(entry.bytes)).toEqual(entry)
+    const missing = await createLedgerRecord(envelope('unavailable'))
+    await expect(authority.appendLedgerRecord(missing.recordBytes)).rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
+    expect((await authority.head()).position).toBe(1)
+    const reopened = await NativeAuthority.open(f)
+    expect(await reopened.getPayload(descriptor.payloadHash)).toEqual(payload)
+  })
+
   it('fences another process and durably reopens exact retry identities, order and head', async () => {
     const f = await fixture()
     const authority = await NativeAuthority.open(f)
-    const entry = await authority.append(utf8('one'))
+    const entry = await authority.append(envelope('one'))
     const certificate = await authority.certify()
     expect(() => new NativeAgentStore(f.path)).toThrow('AGENT_STORE_IN_USE')
     const second = spawnSync(process.execPath, ['--input-type=module', '-e', `
@@ -47,19 +66,20 @@ describe('native fixed authority', () => {
     const reopenedStore = new NativeAgentStore(f.path)
     cleanup.push(() => reopenedStore.close())
     const reopened = await NativeAuthority.open({ ...f, store: reopenedStore, continuity: certificate })
-    expect(await reopened.append(utf8('one'))).toEqual(entry)
+    expect(await reopened.append(envelope('one'))).toEqual(entry)
     expect(await reopened.head()).toEqual({ historyId: entry.historyId, position: 1, root: entry.root })
     await verifyPrefixCertificate(await reopened.certify(), f.configuration)
-    expect((await reopened.append(utf8('two'))).position).toBe(2)
+    expect((await reopened.append(envelope('two'))).position).toBe(2)
   })
 
   it('atomically refuses exhausted quotas without consuming a position', async () => {
     const f = await fixture()
-    const authority = await NativeAuthority.open({ ...f, quotaBytes: 3 })
-    const original = await authority.append(utf8('one'))
-    await expect(authority.append(utf8('two'))).rejects.toThrow('RECORD_LOG_QUOTA_EXCEEDED')
+    const quotaBytes = (await createLedgerRecord(envelope('one'))).recordBytes.length
+    const authority = await NativeAuthority.open({ ...f, quotaBytes })
+    const original = await authority.append(envelope('one'))
+    await expect(authority.append(envelope('two'))).rejects.toThrow('RECORD_LOG_QUOTA_EXCEEDED')
     expect((await authority.head()).position).toBe(1)
-    expect(await authority.append(utf8('one'))).toEqual(original)
+    expect(await authority.append(envelope('one'))).toEqual(original)
     const isolated = new NativeAgentStore(':memory:', { quotaBytes: 3, maxValueBytes: 4 })
     cleanup.push(() => isolated.close())
     await isolated.put('state', utf8('one'))
@@ -81,21 +101,21 @@ describe('native fixed authority', () => {
       },
     }
     const authority = await NativeAuthority.open({ ...f, store })
-    await expect(authority.append(utf8('one'))).rejects.toThrow('lost acknowledgment')
+    await expect(authority.append(envelope('one'))).rejects.toThrow('lost acknowledgment')
     const reopened = await NativeAuthority.open({ ...f, store })
-    const recovered = await reopened.append(utf8('one'))
+    const recovered = await reopened.append(envelope('one'))
     expect(recovered.position).toBe(1)
     failBeforeWrite = true
-    await expect(reopened.append(utf8('two'))).rejects.toThrow('disk unavailable')
+    await expect(reopened.append(envelope('two'))).rejects.toThrow('disk unavailable')
     expect((await reopened.head()).position).toBe(1)
     failBeforeWrite = false
-    expect((await reopened.append(utf8('two'))).position).toBe(2)
+    expect((await reopened.append(envelope('two'))).position).toBe(2)
   })
 
   it('pins configuration and refuses a recovery checkpoint newer than the retained volume', async () => {
     const f = await fixture()
     const authority = await NativeAuthority.open(f)
-    await authority.append(utf8('one'))
+    await authority.append(envelope('one'))
     const checkpoint = await authority.certify()
     await expect(NativeAuthority.open({ ...f, configuration: { ...f.configuration, executionManifestDigest: new Uint8Array(32).fill(9) } }))
       .rejects.toThrow('AUTHORITY_CONFIGURATION_MISMATCH')
@@ -108,7 +128,7 @@ describe('native fixed authority', () => {
   it('supplies portable range evidence that peers can relay without the authority', async () => {
     const f = await fixture()
     const authority = await NativeAuthority.open(f)
-    await Promise.all(['one', 'two', 'three'].map((text) => authority.append(utf8(text))))
+    await Promise.all(['one', 'two', 'three'].map((text) => authority.append(envelope(text))))
     const captured: Uint8Array[] = []
     const sink = { putEvidence: async (bytes: Uint8Array) => { captured.push(bytes) } }
     const first = await authority.share(sink, { limit: 1 })
