@@ -9,6 +9,7 @@ export default tseslint.config(
       ".claude/**",
       ".chronolog/**",
       "coverage/**",
+      "artifacts/**",
       "dist/**",
       "node_modules/**",
     ],

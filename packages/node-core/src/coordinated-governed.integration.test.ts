@@ -197,6 +197,12 @@ describe('governed coordinated native replicas', () => {
       ])
     }
     disconnect()
+    // Shared immutable storage is not a trusted certificate database. Foreign
+    // evidence and a forged signature must not poison later node recovery.
+    await newcomer.transport.putEvidence(utf8('unrelated immutable evidence'))
+    await newcomer.transport.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: {
+      ...await authority.certify(), signature: new Uint8Array(64),
+    } }))
     await newcomer.close()
     // Rebuild from the retained relay alone: no original governance feed or
     // prior epoch keys. Its historical key grant appears after encrypted SQL
@@ -210,6 +216,7 @@ describe('governed coordinated native replicas', () => {
       .toEqual(admin.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows)
     const reopened = await open('joining', joining, joiningStore)
     await reopened.node.waitForIdle()
+    expect((await reopened.node.status()).lastError).toBeUndefined()
     expect(reopened.activeSnapshot.revision).toBe(3n)
     expect(reopened.node.outcome(delayed.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
     expect(reopened.node.outcome(staleAgain.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')

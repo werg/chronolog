@@ -9,7 +9,7 @@ import {
 } from '@chronolog/materializer-doltlite'
 import {
   ChronologNode,
-  GovernanceControlPlane,
+  type GovernanceControlPlane,
   FeedForkRegistry,
   SqliteFeedForkPersistence,
   createEpochEnvelopeCipher,

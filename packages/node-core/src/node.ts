@@ -491,9 +491,9 @@ export class ChronologNode {
   }
 
   async #consumeEvidence(): Promise<void> {
-    const subscribe = this.#options.transport.subscribeEvidence
+    const subscribe = this.#options.transport.subscribeEvidence?.bind(this.#options.transport)
     if (subscribe === undefined) return
-    for await (const item of subscribe.call(this.#options.transport, this.#abort.signal)) {
+    for await (const item of subscribe(this.#abort.signal)) {
       if (this.#closed) return
       await this.#ingestSharedEvidence(item.bytes)
     }

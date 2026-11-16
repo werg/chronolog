@@ -1,4 +1,6 @@
 import {
+  bytesToBase64Url,
+  equalBytes as bytesEqual,
   compareTransactionOrder,
   decodeTransactionCore,
   encodeTransactionCore,
@@ -614,18 +616,18 @@ async function validateTransactionSet(
     if (transaction.authorFeedSequence < 0n || transaction.authorFeedSequence > (1n << 63n) - 1n) {
       throw new MaterializerInputError('MATERIALIZER_AUTHOR_FEED_SEQUENCE_INVALID')
     }
-    if (!sameBytes(encodeTransactionCore(transaction.core), transaction.canonicalCandidate)) {
+    if (!bytesEqual(encodeTransactionCore(transaction.core), transaction.canonicalCandidate)) {
       throw new MaterializerInputError('MATERIALIZER_CANONICAL_CANDIDATE_MISMATCH')
     }
     // A logged row's digest was checked when it was admitted. It is a pure function of the canonical bytes, which the check above
     // binds to this core, so a byte-identical candidate needs no recheck.
     const known = verified[index]
     const alreadyVerified = known !== undefined &&
-      sameBytes(known.txId, transaction.txId) &&
-      sameBytes(known.canonicalCandidate, transaction.canonicalCandidate) &&
-      sameBytes(known.candidateDigest, transaction.candidateDigest)
+      bytesEqual(known.txId, transaction.txId) &&
+      bytesEqual(known.canonicalCandidate, transaction.canonicalCandidate) &&
+      bytesEqual(known.candidateDigest, transaction.candidateDigest)
     if (!alreadyVerified) {
-      if (!sameBytes(await transactionDigest(transaction.canonicalCandidate), transaction.candidateDigest)) {
+      if (!bytesEqual(await transactionDigest(transaction.canonicalCandidate), transaction.candidateDigest)) {
         throw new MaterializerInputError('MATERIALIZER_CANDIDATE_DIGEST_MISMATCH')
       }
     }
@@ -798,11 +800,7 @@ function orderKeyOf(transaction: AdmittedTransaction): TransactionOrderKey {
 }
 function cloneTransaction(transaction: AdmittedTransaction): AdmittedTransaction { return structuredClone(transaction) }
 function cloneLogRow(row: TransactionLogRow): TransactionLogRow { return structuredClone(row) }
-function idKey(bytes: Uint8Array): string { return Buffer.from(bytes).toString('base64url') }
-function bytesEqual(left: Uint8Array, right: Uint8Array): boolean { return left.length === right.length && left.every((value, index) => value === right[index]) }
-function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
-  return Buffer.from(left.buffer, left.byteOffset, left.byteLength).equals(Buffer.from(right.buffer, right.byteOffset, right.byteLength))
-}
+function idKey(bytes: Uint8Array): string { return bytesToBase64Url(bytes) }
 function copyBytes(value: Uint8Array): Uint8Array { return Uint8Array.from(value) }
 function validatePositiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new MaterializerInputError(`MATERIALIZER_INVALID_${name.toUpperCase()}`)

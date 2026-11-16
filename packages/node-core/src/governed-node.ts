@@ -63,7 +63,6 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
   const activation = new GovernanceActivationIndex(initial, configured.kind)
   const coordinated = descriptor.history.kind === 'coordinated'
     ? await CoordinatedHistoryPolicy.open(descriptor.history, options.operationStore) : undefined
-  let node: ChronologNode
   const peer = configured.kind === 'peer' ? new PeerGovernanceController({
     genesis: initial, governance, groupRoute: options.groupRoute, transport: options.transport,
     identity: options.identity, store: options.operationStore, cipher: governance.cipherRing,
@@ -95,7 +94,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     },
   })
   const validatorCapability = membershipState().validatorCapability
-  node = new ChronologNode({
+  const node: ChronologNode = new ChronologNode({
     groupId: genesis.manifest.groupId, groupRoute: options.groupRoute,
     membershipRevision: initial.revisionDigest, validationPolicy, identity: options.identity,
     transport: options.transport, materialization: options.materialization, membership, membershipState,
