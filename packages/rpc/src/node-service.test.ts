@@ -50,7 +50,7 @@ describe('NodeRpcService policy views and enrollment', () => {
       outcome: () => ({ outcome: 'accepted', rejectionCode: null, failingStatementIndex: null }),
       isFinal: () => finalized,
       outcomeChangedByReplay: () => false,
-      events(after = 0n, signal) {
+      revisions(after = 0n, signal) {
         signal?.addEventListener('abort', () => { released = true; events.close() }, { once: true })
         return { async *[Symbol.asyncIterator]() { for await (const event of events) if (event > after) yield event } }
       },

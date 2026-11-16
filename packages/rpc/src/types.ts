@@ -1,3 +1,5 @@
+import type { EventBatch, EventPayload, EventReadOptions } from '@chronolog/protocol'
+
 /** Chronolog's local RPC API. Consensus codecs are versioned separately. */
 export const RPC_API_VERSION = 'chronolog.rpc' as const
 
@@ -40,7 +42,52 @@ export interface RpcPlatformStep {
   readonly platform: Uint8Array
 }
 
-export type RpcProgramStep = RpcSqlStatement | RpcPlatformStep
+export interface RpcEmitStep { readonly emit: { readonly topic: string; readonly payload: EventPayload } }
+export type RpcProgramStep = RpcSqlStatement | RpcPlatformStep | RpcEmitStep
+
+export interface SubmitChangeRequest {
+  readonly groupId: GroupId
+  readonly requestId: RequestId
+  readonly operationId: string
+  /** Canonical, versioned ChangeProgram. */
+  readonly program: Uint8Array
+}
+export interface SubmitChangeResponse extends SubmitTransactionResponse {
+  readonly operationId: string
+  readonly proposalId: string
+}
+/** Original signed publisher proposal; the ingress must never re-author it. */
+export interface SubmitSignedRequest {
+  readonly groupId: GroupId
+  readonly requestId: RequestId
+  readonly signedWire: Uint8Array
+}
+export interface EventReadRequest extends EventReadOptions { readonly groupId: GroupId; readonly requestId: RequestId }
+export type EventReadResponse = EventBatch
+export interface OperationStatus {
+  readonly operationId: string
+  readonly proposalId: string
+  readonly final: boolean
+  readonly outcome: {
+    readonly outcome: 'accepted' | 'rejected'
+    readonly rejectionCode: string | null
+    readonly failingStatementIndex: number | null
+  } | null
+}
+export interface GetOperationRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly operationId: string }
+export interface StreamOperationsRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly operationId: string }
+
+export interface OpenReadViewRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly view?: SqlView }
+export interface OpenReadViewResponse {
+  readonly viewId: string
+  readonly revision: string
+  readonly finalRevision: string
+  readonly view: SqlView
+  readonly expiresAt: number
+}
+export interface ReadViewRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly viewId: string }
+export interface QueryReadViewRequest extends ReadViewRequest { readonly sql: string; readonly parameters: readonly LocalSqlValue[]; readonly maxRows?: number }
+export interface EventsReadViewRequest extends ReadViewRequest, EventReadOptions {}
 
 export interface RevisionMetadata {
   readonly groupId: GroupId
@@ -102,7 +149,7 @@ export interface StreamStatusRequest extends GetStatusRequest { readonly resumeA
 export interface SubmitTransactionRequest {
   readonly groupId: GroupId
   readonly requestId: RequestId
-  /** SQL statements and platform operations, executed in order as this node's key. */
+  /** SQL, emitted events and platform operations, executed in order as this node's key. */
   readonly steps: readonly RpcProgramStep[]
   /** Repeating a key with the same steps returns the original submission. */
   readonly idempotencyKey?: string

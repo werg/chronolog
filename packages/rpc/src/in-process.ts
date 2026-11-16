@@ -23,6 +23,14 @@ export type RpcInterceptor = <T>(
 const unaryDispatch: {
   [M in UnaryRpcMethod]: keyof ChronologRpcService
 } = {
+  'change.submit': 'submitChange',
+  'ingress.submit': 'submitSigned',
+  'events.read': 'readEvents',
+  'operation.get': 'getOperation',
+  'view.open': 'openReadView',
+  'view.query': 'queryReadView',
+  'view.events': 'eventsReadView',
+  'view.release': 'releaseReadView',
   'node.getStatus': 'getStatus',
   'query.localSql': 'localSql',
   'transaction.submit': 'submitTransaction',
@@ -43,6 +51,8 @@ const unaryDispatch: {
 const streamDispatch: {
   [M in StreamRpcMethod]: keyof ChronologRpcService
 } = {
+  'events.subscribe': 'subscribeEvents',
+  'operation.subscribe': 'subscribeOperations',
   'node.streamStatus': 'streamStatus',
   'query.liveSql': 'liveSql',
   'transaction.streamOutcome': 'streamOutcome',
@@ -160,7 +170,9 @@ export class InProcessRpcTransport implements RpcTransport {
   }
 
   async close(): Promise<void> {
+    if (this.#closed) return
     this.#closed = true
+    await this.#service.close?.()
   }
 }
 

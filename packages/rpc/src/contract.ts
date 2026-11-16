@@ -35,12 +35,24 @@ import type {
   RotateEpochResponse,
   GrantHistoricalAccessRequest,
   GrantHistoricalAccessResponse,
+  SubmitChangeRequest, SubmitChangeResponse, SubmitSignedRequest,
+  EventReadRequest, EventReadResponse,
+  GetOperationRequest, OperationStatus, StreamOperationsRequest,
+  OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
 } from './types.js'
 
 export interface RpcCallOptions { readonly signal?: AbortSignal; readonly token?: string; readonly timeoutMs?: number; readonly metadata?: Readonly<Record<string, string>> }
 export interface RpcCallContext extends RpcCallOptions { readonly method: RpcMethod; readonly peer?: string }
 
 export interface UnaryRpcMethods {
+  'change.submit': { request: SubmitChangeRequest; response: SubmitChangeResponse }
+  'ingress.submit': { request: SubmitSignedRequest; response: SubmitTransactionResponse }
+  'events.read': { request: EventReadRequest; response: EventReadResponse }
+  'operation.get': { request: GetOperationRequest; response: OperationStatus | null }
+  'view.open': { request: OpenReadViewRequest; response: OpenReadViewResponse }
+  'view.query': { request: QueryReadViewRequest; response: LocalSqlResult }
+  'view.events': { request: EventsReadViewRequest; response: EventReadResponse }
+  'view.release': { request: ReadViewRequest; response: { readonly released: true } }
   'node.getStatus': { request: GetStatusRequest; response: NodeStatus }
   'query.localSql': { request: LocalSqlRequest; response: LocalSqlResponse }
   'transaction.submit': { request: SubmitTransactionRequest; response: SubmitTransactionResponse }
@@ -58,6 +70,8 @@ export interface UnaryRpcMethods {
   'enrollment.getStatus': { request: GetEnrollmentStatusRequest; response: EnrollmentStatus }
 }
 export interface StreamRpcMethods {
+  'events.subscribe': { request: EventReadRequest; response: EventReadResponse }
+  'operation.subscribe': { request: StreamOperationsRequest; response: OperationStatus }
   'node.streamStatus': { request: StreamStatusRequest; response: NodeStatus }
   'query.liveSql': { request: LiveSqlRequest; response: LiveSqlEvent }
   'transaction.streamOutcome': { request: StreamOutcomeRequest; response: TransactionOutcome }
@@ -77,6 +91,18 @@ export interface RpcTransport {
   close?(): Promise<void>
 }
 export interface ChronologRpcService {
+  submitChange(request: SubmitChangeRequest, context: RpcCallContext): Promise<SubmitChangeResponse>
+  submitSigned(request: SubmitSignedRequest, context: RpcCallContext): Promise<SubmitTransactionResponse>
+  readEvents(request: EventReadRequest, context: RpcCallContext): Promise<EventReadResponse>
+  subscribeEvents(request: EventReadRequest, context: RpcCallContext): AsyncIterable<EventReadResponse>
+  getOperation(request: GetOperationRequest, context: RpcCallContext): Promise<OperationStatus | null>
+  subscribeOperations(request: StreamOperationsRequest, context: RpcCallContext): AsyncIterable<OperationStatus>
+  openReadView(request: OpenReadViewRequest, context: RpcCallContext): Promise<OpenReadViewResponse>
+  queryReadView(request: QueryReadViewRequest, context: RpcCallContext): Promise<LocalSqlResult>
+  eventsReadView(request: EventsReadViewRequest, context: RpcCallContext): Promise<EventReadResponse>
+  releaseReadView(request: ReadViewRequest, context: RpcCallContext): Promise<{ readonly released: true }>
+  /** Release retained read leases when the owning RPC server/Worker stops. */
+  close?(): void | Promise<void>
   getStatus(request: GetStatusRequest, context: RpcCallContext): Promise<NodeStatus>
   streamStatus(request: StreamStatusRequest, context: RpcCallContext): AsyncIterable<NodeStatus>
   localSql(request: LocalSqlRequest, context: RpcCallContext): Promise<LocalSqlResponse>

@@ -18,6 +18,14 @@ import type {
 import { ChronologRpcError, toChronologRpcError, type RpcErrorCode } from './errors.js'
 
 const unaryDispatch: Record<UnaryRpcMethod, keyof ChronologRpcService> = {
+  'change.submit': 'submitChange',
+  'ingress.submit': 'submitSigned',
+  'events.read': 'readEvents',
+  'operation.get': 'getOperation',
+  'view.open': 'openReadView',
+  'view.query': 'queryReadView',
+  'view.events': 'eventsReadView',
+  'view.release': 'releaseReadView',
   'node.getStatus': 'getStatus',
   'query.localSql': 'localSql',
   'transaction.submit': 'submitTransaction',
@@ -36,6 +44,8 @@ const unaryDispatch: Record<UnaryRpcMethod, keyof ChronologRpcService> = {
 }
 
 const streamDispatch: Record<StreamRpcMethod, keyof ChronologRpcService> = {
+  'events.subscribe': 'subscribeEvents',
+  'operation.subscribe': 'subscribeOperations',
   'node.streamStatus': 'streamStatus',
   'query.liveSql': 'liveSql',
   'transaction.streamOutcome': 'streamOutcome',
@@ -108,6 +118,7 @@ export class HttpRpcServer {
     if (this.#closePromise !== undefined) return this.#closePromise
     this.#closing = true
     for (const controller of this.#calls) controller.abort('RPC server is shutting down')
+    await this.#options.service.close?.()
     if (!this.#server.listening) {
       this.#address = null
       return
@@ -392,19 +403,45 @@ async function readBody(request: IncomingMessage, maximum: number): Promise<stri
 }
 
 function encodeJson(value: unknown): string {
-  return JSON.stringify(value, (_key, item: unknown) =>
-    item instanceof Uint8Array ? { $chronologBytes: Buffer.from(item).toString('base64') } : item)
+  const encode = (item: unknown): unknown => {
+    if (item instanceof Uint8Array) return { $chronologRpc: ['bytes', Buffer.from(item).toString('base64')] }
+    if (Array.isArray(item)) return item.map(encode)
+    if (typeof item === 'object' && item !== null) {
+      const entries = Object.entries(item).map(([key, child]) => [key, encode(child)])
+      // Literal application JSON can use every key, including our own marker.
+      if (Object.hasOwn(item, '$chronologRpc')) return { $chronologRpc: ['object', entries] }
+      return Object.fromEntries(entries)
+    }
+    return item
+  }
+  return JSON.stringify(encode(value))
 }
 
 function decodeJson(value: string): unknown {
-  return JSON.parse(value, (_key, item: unknown) => {
-    if (
-      typeof item === 'object' && item !== null &&
-      Object.keys(item).length === 1 && '$chronologBytes' in item &&
-      typeof (item as { $chronologBytes?: unknown }).$chronologBytes === 'string'
-    ) return Uint8Array.from(Buffer.from((item as { $chronologBytes: string }).$chronologBytes, 'base64'))
+  const decode = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(decode)
+    if (typeof item === 'object' && item !== null) {
+      const object = item as Record<string, unknown>
+      if (Object.keys(object).length === 1 && '$chronologRpc' in object) {
+        const tag = object.$chronologRpc
+        if (!Array.isArray(tag) || tag.length !== 2) throw new TypeError('Malformed RPC value tag')
+        if (tag[0] === 'bytes' && typeof tag[1] === 'string') {
+          const bytes = Buffer.from(tag[1], 'base64')
+          if (bytes.toString('base64') !== tag[1]) throw new TypeError('Noncanonical RPC bytes')
+          return Uint8Array.from(bytes)
+        }
+        if (tag[0] === 'object' && Array.isArray(tag[1])) {
+          const entries = tag[1] as unknown[]
+          if (!entries.every((entry) => Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string')) throw new TypeError('Malformed escaped RPC object')
+          return Object.fromEntries((entries as [string, unknown][]).map(([key, child]) => [key, decode(child)]))
+        }
+        throw new TypeError('Unknown RPC value tag')
+      }
+      return Object.fromEntries(Object.entries(object).map(([key, child]) => [key, decode(child)]))
+    }
     return item
-  })
+  }
+  return decode(JSON.parse(value) as unknown)
 }
 
 async function* lines(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
@@ -416,6 +453,7 @@ async function* lines(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
       const result = await reader.read()
       if (result.done) break
       buffered += decoder.decode(result.value, { stream: true })
+      if (buffered.length > 4 * 1024 * 1024) throw new ChronologRpcError('resource_exhausted', 'RPC stream frame is too large')
       let newline: number
       while ((newline = buffered.indexOf('\n')) >= 0) {
         yield buffered.slice(0, newline)
@@ -425,6 +463,7 @@ async function* lines(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
     buffered += decoder.decode()
     if (buffered.length > 0) yield buffered
   } finally {
+    await reader.cancel().catch(() => undefined)
     reader.releaseLock()
   }
 }
@@ -433,6 +472,7 @@ function combinedSignal(options: RpcCallOptions): { readonly signal: AbortSignal
   const controller = new AbortController()
   const abort = () => controller.abort(options.signal?.reason)
   options.signal?.addEventListener('abort', abort, { once: true })
+  if (options.signal?.aborted === true) abort()
   const timeout = options.timeoutMs === undefined ? undefined : setTimeout(() => controller.abort('deadline'), options.timeoutMs)
   return {
     signal: controller.signal,

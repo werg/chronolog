@@ -1,12 +1,15 @@
 import { sha256, utf8 } from '@chronolog/canonical'
 import {
-  assertValidSqlTransactionProgram,
+  assertValidChangeProgram,
   bytesToBase64Url as toBase64Url,
   decodePlatformOp,
+  decodeChangeProgram,
+  emit,
   type ProgramStep,
   type SqlStatement,
-  type SqlTransactionProgram,
+  type ChangeProgram,
   type SqlValue,
+  type EventReadOptions,
 } from '@chronolog/protocol'
 
 import type { ChronologRpcService, RpcCallContext } from './contract.js'
@@ -53,12 +56,17 @@ import type {
   SubmitTransactionResponse,
   TransactionOutcome,
   ValidatorWatermark,
+  SubmitChangeRequest, SubmitChangeResponse, SubmitSignedRequest, EventReadRequest, EventReadResponse,
+  GetOperationRequest, OperationStatus, StreamOperationsRequest,
+  OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
 } from './types.js'
 import { RPC_API_VERSION } from './types.js'
 import type {
   ChronologRpcNodeService,
   EnrollmentRpcService,
   GovernanceRpcAdmin,
+  RpcReadHandle,
+  RpcPublishedTransaction,
 } from './service-contract.js'
 
 export type {
@@ -78,6 +86,16 @@ export interface NodeRpcServiceOptions {
   readonly enrollment?: EnrollmentRpcService
   readonly maxLocalSqlRows?: number
   readonly now?: () => number
+  readonly maxReadViews?: number
+  readonly readViewLeaseMs?: number
+}
+
+interface ReadLease {
+  readonly owner: string
+  readonly requestKey: string
+  readonly handle: RpcReadHandle
+  readonly response: OpenReadViewResponse
+  readonly timer: ReturnType<typeof setTimeout>
 }
 
 /** RPC facade over a node: local reads, transaction submission, outcomes and evidence. */
@@ -87,6 +105,11 @@ export class NodeRpcService implements ChronologRpcService {
   readonly #enrollmentService: EnrollmentRpcService | undefined
   readonly #maxLocalSqlRows: number
   readonly #now: () => number
+  readonly #maxReadViews: number
+  readonly #readViewLeaseMs: number
+  readonly #views = new Map<string, ReadLease>()
+  readonly #opening = new Map<string, { readonly view: SqlView; readonly promise: Promise<OpenReadViewResponse> }>()
+  #closed = false
 
   constructor(options: NodeRpcServiceOptions) {
     this.#node = options.node
@@ -94,6 +117,150 @@ export class NodeRpcService implements ChronologRpcService {
     this.#enrollmentService = options.enrollment
     this.#maxLocalSqlRows = nonnegative(options.maxLocalSqlRows ?? 10_000, 'maxLocalSqlRows')
     this.#now = options.now ?? Date.now
+    this.#maxReadViews = nonnegative(options.maxReadViews ?? 32, 'maxReadViews')
+    this.#readViewLeaseMs = nonnegative(options.readViewLeaseMs ?? 30_000, 'readViewLeaseMs')
+    if (this.#readViewLeaseMs < 1 || this.#readViewLeaseMs > 300_000) throw new TypeError('readViewLeaseMs must be from 1 to 300000')
+  }
+
+  async submitChange(request: SubmitChangeRequest, context: RpcCallContext): Promise<SubmitChangeResponse> {
+    this.#assertGroup(request.groupId)
+    let program: ChangeProgram
+    try {
+      if (!(request.program instanceof Uint8Array)) throw invalid('program must be canonical bytes')
+      program = decodeChangeProgram(request.program)
+    } catch (error) { throw new ChronologRpcError('invalid_argument', 'Invalid canonical change program', { cause: error }) }
+    const submission = await this.#publish(program, request.operationId, request.groupId, context)
+    return { ...submission, operationId: request.operationId, proposalId: submission.transactionId }
+  }
+
+  async submitSigned(request: SubmitSignedRequest, context: RpcCallContext): Promise<SubmitTransactionResponse> {
+    this.#assertGroup(request.groupId)
+    context.signal?.throwIfAborted()
+    if (!(request.signedWire instanceof Uint8Array) || request.signedWire.byteLength === 0) throw invalid('signedWire must contain original signed proposal bytes')
+    if (this.#node.submitSigned === undefined) throw failed('Signed publisher ingress is not enabled for this node')
+    // The publisher owns signing and retry identity. The replica validates and
+    // appends these exact bytes without access to its local authoring path.
+    return submissionResponse(await this.#node.submitSigned(request.signedWire))
+  }
+
+  async readEvents(request: EventReadRequest, context: RpcCallContext): Promise<EventReadResponse> {
+    this.#assertGroup(request.groupId)
+    context.signal?.throwIfAborted()
+    if (this.#node.events === undefined) throw failed('Durable events are not enabled for this node')
+    return this.#node.events.read(eventOptions(request))
+  }
+
+  async *subscribeEvents(request: EventReadRequest, context: RpcCallContext): AsyncIterable<EventReadResponse> {
+    this.#assertGroup(request.groupId)
+    if (this.#node.events === undefined) throw failed('Durable events are not enabled for this node')
+    yield* this.#node.events.subscribe({ ...eventOptions(request), ...(context.signal === undefined ? {} : { signal: context.signal }) })
+  }
+
+  async getOperation(request: GetOperationRequest, context: RpcCallContext): Promise<OperationStatus | null> {
+    this.#assertGroup(request.groupId)
+    if (this.#node.operation === undefined) throw failed('Durable operation lookup is not enabled for this node')
+    const identity = await operationIdentity(request.operationId, request.groupId, context)
+    const found = await this.#node.operation(identity)
+    if (found === null) return null
+    return { operationId: request.operationId, proposalId: found.proposalId, final: found.final,
+      outcome: found.outcome === null ? null : { outcome: found.outcome.outcome,
+        rejectionCode: found.outcome.rejectionCode, failingStatementIndex: found.outcome.failingStatementIndex } }
+  }
+
+  async *subscribeOperations(request: StreamOperationsRequest, context: RpcCallContext): AsyncIterable<OperationStatus> {
+    this.#assertGroup(request.groupId)
+    let previous: string | undefined
+    for await (const operation of this.#snapshots(undefined, context.signal, () => this.getOperation(request, context))) {
+      if (operation === null) continue
+      const fingerprint = stableFingerprint(operation)
+      if (fingerprint !== previous) { previous = fingerprint; yield operation }
+    }
+  }
+
+  async openReadView(request: OpenReadViewRequest, context: RpcCallContext): Promise<OpenReadViewResponse> {
+    this.#assertGroup(request.groupId)
+    context.signal?.throwIfAborted()
+    if (this.#node.readView === undefined) throw failed('Revision-scoped reads are not enabled for this node')
+    if (typeof request.requestId !== 'string' || request.requestId.length === 0 || request.requestId.length > 512) throw invalid('Read requestId must contain 1 to 512 characters')
+    const view = request.view === undefined ? 'final' : sqlView(request.view)
+    const owner = principal(context)
+    const requestKey = JSON.stringify([owner, request.groupId, request.requestId])
+    const existing = this.#opening.get(requestKey)
+    if (existing !== undefined) {
+      if (existing.view !== view) throw new ChronologRpcError('already_exists', 'Read request identity is bound to another view')
+      return existing.promise
+    }
+    for (const [viewId, lease] of this.#views) if (lease.response.expiresAt <= this.#now()) await this.#releaseView(viewId)
+    if (this.#opening.size >= this.#maxReadViews) throw new ChronologRpcError('resource_exhausted', 'Too many pinned read views')
+    const promise = (async () => {
+      const handle = await this.#node.readView!({ view })
+      if (this.#closed || context.signal?.aborted === true) {
+        await handle.release()
+        throw new ChronologRpcError('cancelled', 'Read view creation was cancelled')
+      }
+      const viewId = crypto.randomUUID()
+      const response = { viewId, revision: handle.revision, finalRevision: handle.finalRevision, view: handle.view, expiresAt: this.#now() + this.#readViewLeaseMs }
+      const timer = setTimeout(() => { void this.#releaseView(viewId).catch(() => undefined) }, this.#readViewLeaseMs)
+      timer.unref?.()
+      this.#views.set(viewId, { owner, requestKey, handle, response, timer })
+      return response
+    })()
+    this.#opening.set(requestKey, { view, promise })
+    try { return await promise }
+    catch (error) { this.#opening.delete(requestKey); throw error }
+  }
+
+  async queryReadView(request: QueryReadViewRequest, context: RpcCallContext): Promise<LocalSqlResult> {
+    const lease = await this.#lease(request, context)
+    const execution = await lease.handle.query(request.sql, request.parameters.map(copyLocalSqlValue))
+    const limit = boundedRows(request.maxRows, this.#maxLocalSqlRows)
+    const rows = execution.rows.slice(0, limit).map((row) => row.map(copyLocalSqlValue))
+    return { columns: execution.columns.map((column) => ({ ...column })), rows, truncated: rows.length !== execution.rows.length, consensusSafe: false }
+  }
+
+  async eventsReadView(request: EventsReadViewRequest, context: RpcCallContext): Promise<EventReadResponse> {
+    const lease = await this.#lease(request, context)
+    return lease.handle.readEvents(eventOptions(request))
+  }
+
+  async releaseReadView(request: ReadViewRequest, context: RpcCallContext): Promise<{ readonly released: true }> {
+    this.#assertGroup(request.groupId)
+    const lease = this.#views.get(request.viewId)
+    if (lease !== undefined) {
+      if (lease.owner !== principal(context)) throw new ChronologRpcError('not_found', 'Unknown read view')
+      await this.#releaseView(request.viewId)
+    }
+    return { released: true }
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) return
+    this.#closed = true
+    await Promise.allSettled([...this.#views.keys()].map((viewId) => this.#releaseView(viewId)))
+    await Promise.allSettled([...this.#opening.values()].map((entry) => entry.promise))
+    this.#opening.clear()
+  }
+
+  async #lease(request: ReadViewRequest, context: RpcCallContext): Promise<ReadLease> {
+    this.#assertGroup(request.groupId)
+    context.signal?.throwIfAborted()
+    if (typeof request.viewId !== 'string' || request.viewId.length > 128) throw invalid('Invalid read view identity')
+    const lease = this.#views.get(request.viewId)
+    if (lease === undefined || lease.owner !== principal(context)) throw revisionUnavailable('Pinned read view is unavailable')
+    if (lease.response.expiresAt <= this.#now()) {
+      await this.#releaseView(request.viewId)
+      throw revisionUnavailable('Pinned read view expired; capture a new coherent view')
+    }
+    return lease
+  }
+
+  async #releaseView(viewId: string): Promise<void> {
+    const lease = this.#views.get(viewId)
+    if (lease === undefined) return
+    this.#views.delete(viewId)
+    this.#opening.delete(lease.requestKey)
+    clearTimeout(lease.timer)
+    await lease.handle.release()
   }
 
   async getStatus(request: GetStatusRequest, _context: RpcCallContext): Promise<NodeStatus> {
@@ -193,7 +360,7 @@ export class NodeRpcService implements ChronologRpcService {
       throw invalid('Live-query cursor does not belong to this SQL query')
     }
     const barrier = this.#node.revision
-    const events = this.#node.events(barrier, context.signal)
+    const events = this.#node.revisions(barrier, context.signal)
     let prior: LocalSqlResponse
     try {
       prior = await this.localSql({ ...request, view }, context)
@@ -235,31 +402,21 @@ export class NodeRpcService implements ChronologRpcService {
 
   async submitTransaction(request: SubmitTransactionRequest, context: RpcCallContext): Promise<SubmitTransactionResponse> {
     this.#assertGroup(request.groupId)
-    const program: SqlTransactionProgram = { version: 2, steps: decodeSteps(request.steps) }
-    try { assertValidSqlTransactionProgram(program) } catch (error) {
+    const program: ChangeProgram = { version: 3, steps: decodeSteps(request.steps) }
+    try { assertValidChangeProgram(program) } catch (error) {
       throw new ChronologRpcError('invalid_argument', `Invalid SQL transaction: ${errorCode(error, 'SQL_PROGRAM_INVALID')}`, { cause: error })
     }
-    const retryIdentity = request.idempotencyKey ?? request.requestId
-    if (typeof retryIdentity !== 'string' || retryIdentity.length === 0 || retryIdentity.length > 512) {
-      throw invalid('Transaction requestId or idempotencyKey must contain 1 to 512 characters')
-    }
-    const operationId = `rpc-transaction:${toBase64Url(await sha256(utf8(JSON.stringify([
-      principal(context), request.groupId, retryIdentity,
-    ]))))}`
+    return this.#publish(program, request.idempotencyKey ?? request.requestId, request.groupId, context)
+  }
+
+  async #publish(program: ChangeProgram, callerOperationId: string, groupId: string, context: RpcCallContext): Promise<SubmitTransactionResponse> {
+    const operationId = await operationIdentity(callerOperationId, groupId, context)
     try {
       // The node's durable journal owns authoring, authorization and exact-byte
       // retries. Recreating this facade or revoking a writer cannot erase a
       // previous publication or allocate a new timestamp for the same request.
       const published = await this.#node.publish({ program, operationId })
-      return {
-        transactionId: published.txIdText,
-        candidateDigest: toBase64Url(published.candidateDigest),
-        authorTimestampMs: published.core.authorTimestampMs.toString(10),
-        transactionNonce: toBase64Url(published.core.nonce),
-        executionManifestDigest: toBase64Url(published.core.executionManifestDigest),
-        durableLocalAppend: true as const,
-        publishedAt: new Date(Number(published.core.authorTimestampMs)).toISOString(),
-      }
+      return submissionResponse(published)
     } catch (error) {
       const code = errorCode(error, 'TRANSACTION_PUBLICATION_FAILED')
       if (code === 'OPERATION_ID_CONFLICT') throw new ChronologRpcError('already_exists', 'Transaction retry identity is already bound to different steps', { cause: error })
@@ -392,7 +549,7 @@ export class NodeRpcService implements ChronologRpcService {
     // previous process is only a resume hint: the node's local event counter
     // can restart below it. Subscribe at the current barrier before reading so
     // neither a restart nor an update during the initial read hides finality.
-    const events = this.#node.events(this.#node.revision, subscriptionSignal)
+    const events = this.#node.revisions(this.#node.revision, subscriptionSignal)
     try {
       yield await read()
       for await (const _event of events) yield await read()
@@ -431,6 +588,7 @@ export class NodeRpcService implements ChronologRpcService {
   }
 
   #assertGroup(groupId: string): void {
+    if (this.#closed) throw new ChronologRpcError('transport_unavailable', 'RPC service is closed')
     if (groupId !== this.#groupId()) throw new ChronologRpcError('not_found', 'Unknown group')
   }
 
@@ -439,9 +597,26 @@ export class NodeRpcService implements ChronologRpcService {
 
 }
 
+function submissionResponse(published: RpcPublishedTransaction): SubmitTransactionResponse {
+  return {
+    transactionId: published.txIdText,
+    candidateDigest: toBase64Url(published.candidateDigest),
+    authorTimestampMs: published.core.authorTimestampMs.toString(10),
+    transactionNonce: toBase64Url(published.core.nonce),
+    executionManifestDigest: toBase64Url(published.core.executionManifestDigest),
+    durableLocalAppend: true,
+    publishedAt: new Date(Number(published.core.authorTimestampMs)).toISOString(),
+  }
+}
+
 function decodeSteps(values: readonly RpcProgramStep[]): ProgramStep[] {
   if (!(values instanceof Array)) throw invalid('steps must be an array')
   return values.map((value): ProgramStep => {
+    if (typeof value === 'object' && value !== null && 'emit' in value) {
+      if (Object.keys(value).length !== 1 || typeof value.emit !== 'object' || value.emit === null) throw invalid('Emit step is malformed')
+      try { return emit(value.emit.topic, value.emit.payload) }
+      catch (error) { throw new ChronologRpcError('invalid_argument', 'Invalid emit step', { cause: error }) }
+    }
     if (typeof value === 'object' && value !== null && 'platform' in value) {
       if (!(value.platform instanceof Uint8Array)) throw invalid('Platform step must be canonical CBOR bytes')
       try { return decodePlatformOp(value.platform) } catch (error) {
@@ -517,6 +692,15 @@ function nonnegative(value: number, field: string): number {
 }
 
 function principal(context: RpcCallContext): string { return context.metadata?.principal ?? context.token ?? 'anonymous-local' }
+async function operationIdentity(operationId: string, groupId: string, context: RpcCallContext): Promise<string> {
+  if (typeof operationId !== 'string' || operationId.length === 0 || operationId.length > 512) throw invalid('Operation identity must contain 1 to 512 characters')
+  return `rpc-operation:${toBase64Url(await sha256(utf8(JSON.stringify([principal(context), groupId, operationId]))))}`
+}
+function eventOptions(request: EventReadRequest | EventsReadViewRequest): EventReadOptions {
+  return { ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+    ...(request.topics === undefined ? {} : { topics: request.topics }),
+    ...(request.limit === undefined ? {} : { limit: request.limit }) }
+}
 function invalid(message: string): ChronologRpcError { return new ChronologRpcError('invalid_argument', message) }
 function failed(message: string): ChronologRpcError { return new ChronologRpcError('failed_precondition', message) }
 function revisionUnavailable(message: string): ChronologRpcError { return new ChronologRpcError('revision_unavailable', message) }

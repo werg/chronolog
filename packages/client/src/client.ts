@@ -2,6 +2,10 @@ import {
   base64UrlToBytes,
   bytesToBase64Url as toBase64Url,
   encodePlatformOp,
+  encodeChangeProgram,
+  emit,
+  isEmitStep,
+  program,
   isPlatformOp,
   isSqlValue,
   platformOp,
@@ -12,6 +16,11 @@ import {
   type PlatformOp,
   type SqlStatement,
   type SqlValue,
+  type ChangeProgram,
+  type EmitStep,
+  type EventPayload,
+  type EventBatch,
+  type EventReadOptions,
 } from '@chronolog/protocol'
 import {
   ChronologRpcError,
@@ -37,6 +46,9 @@ import {
   type UnaryResponse,
   type UnaryRpcMethod,
   type ValidatorWatermark,
+  type OperationStatus,
+  type OpenReadViewResponse,
+  type SubmitChangeResponse,
 } from '@chronolog/rpc'
 
 import {
@@ -93,6 +105,18 @@ export interface TransactionOptions {
   readonly idempotencyKey?: string
 }
 
+export interface ChangeOptions { readonly operationId: string; readonly signal?: AbortSignal }
+export interface EventReaderOptions extends EventReadOptions { readonly signal?: AbortSignal }
+export interface ClientReadView {
+  readonly revision: string
+  readonly finalRevision: string
+  readonly view: SqlView
+  readonly expiresAt: number
+  query(sql: string, parameters?: readonly LocalSqlInput[], options?: { readonly maxRows?: number; readonly signal?: AbortSignal }): Promise<DecodedLocalSqlResult>
+  readEvents(options?: EventReaderOptions): Promise<EventBatch>
+  release(): Promise<void>
+}
+
 /** A JavaScript value bound to a SQL parameter; see `toSqlValue` for the mapping. */
 export type ClientSqlValue = null | undefined | boolean | bigint | number | string | Uint8Array | SqlValue
 export type ClientSqlBindings = readonly ClientSqlValue[] | Readonly<Record<string, ClientSqlValue>>
@@ -106,8 +130,8 @@ export interface CompiledSqlStatement {
 
 export type TransactionStatementInput = string | CompiledSqlStatement | SqlStatement
 
-/** One step of a transaction: a SQL statement, or a platform operation built with `platformOp`. */
-export type TransactionStepInput = TransactionStatementInput | PlatformOp
+/** One step of a transaction: SQL, an emitted event, or a platform operation. */
+export type TransactionStepInput = TransactionStatementInput | PlatformOp | EmitStep
 
 export class TransactionHandle {
   readonly outcome: StreamResource<TransactionOutcome>
@@ -116,12 +140,14 @@ export class TransactionHandle {
   constructor(
     readonly client: ChronologClient,
     readonly submission: SubmitTransactionResponse,
+    readonly operationId?: string,
   ) {
     this.outcome = client.transactionOutcome(submission.transactionId)
     this.evidence = client.settlementEvidence(submission.transactionId)
   }
 
   get transactionId(): string { return this.submission.transactionId }
+  get proposalId(): string { return this.submission.transactionId }
 
   /** The current speculative result. Replay can change this until final() resolves. */
   settled(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
@@ -192,11 +218,30 @@ export class ChronologClient {
   readonly #unaryRetryAttempts: number
   readonly #streamRetryDelayMs?: (attempt: number) => number
   readonly #resources = new Set<{ dispose(): void }>()
+  readonly #readViews = new Set<ClientReadView>()
+  readonly #abort = new AbortController()
   #identity: Promise<Uint8Array> | undefined
   #closed = false
   /** Sharing, teams and transfers of owned rows; each call submits one transaction. */
   readonly ownership: OwnershipActions = new OwnershipActions(this)
   readonly enrollment: EnrollmentActions = new EnrollmentActions(this)
+  /** At-least-once final batches; never coalesced into snapshot notifications. */
+  readonly events = {
+    publish: (topic: string, payload: EventPayload, options: ChangeOptions): Promise<TransactionHandle> => this.submit(program(emit(topic, payload)), options),
+    read: (options: EventReaderOptions = {}): Promise<EventBatch> => this._unary('events.read', {
+      groupId: this.groupId, requestId: this._requestId(), ...eventReadOptions(options),
+    }, options.signal === undefined ? {} : { signal: options.signal }),
+    subscribe: (options: EventReaderOptions = {}): AsyncIterable<EventBatch> => this.#durableEvents(options),
+  }
+  readonly operations = {
+    get: (operationId: string, options: { readonly signal?: AbortSignal } = {}): Promise<OperationStatus | null> => this._unary('operation.get', {
+      groupId: this.groupId, requestId: this._requestId(), operationId,
+    }, options),
+    subscribe: (options: { readonly operationId: string; readonly signal?: AbortSignal }): AsyncIterable<OperationStatus> => {
+      const request = { groupId: this.groupId, requestId: this._requestId(), operationId: options.operationId }
+      return this.#reconnecting((signal) => this.#transport.stream('operation.subscribe', request, this.#callOptions(signal)), options.signal)
+    },
+  }
 
   constructor(options: ChronologClientOptions) {
     this.groupId = options.groupId
@@ -205,6 +250,56 @@ export class ChronologClient {
     this.#idFactory = options.requestId ?? (() => crypto.randomUUID())
     this.#unaryRetryAttempts = options.unaryRetryAttempts ?? 2
     if (options.streamRetryDelayMs !== undefined) this.#streamRetryDelayMs = options.streamRetryDelayMs
+  }
+
+  async submit(change: ChangeProgram, options: ChangeOptions): Promise<TransactionHandle> {
+    const submission: SubmitChangeResponse = await this._unary('change.submit', {
+      groupId: this.groupId, requestId: this._requestId(), operationId: options.operationId, program: encodeChangeProgram(change),
+    }, options.signal === undefined ? {} : { signal: options.signal })
+    return new TransactionHandle(this, submission, submission.operationId)
+  }
+
+  /** Forward an already signed publisher proposal and follow its original transaction. */
+  async submitSigned(signedWire: Uint8Array, options: { readonly signal?: AbortSignal } = {}): Promise<TransactionHandle> {
+    if (!(signedWire instanceof Uint8Array) || signedWire.byteLength === 0) throw new TypeError('signedWire must contain original signed proposal bytes')
+    const submission = await this._unary('ingress.submit', {
+      groupId: this.groupId, requestId: this._requestId(), signedWire: signedWire.slice(),
+    }, options)
+    return new TransactionHandle(this, submission)
+  }
+
+  async readView(options: { readonly view?: SqlView; readonly signal?: AbortSignal } = {}): Promise<ClientReadView> {
+    const captured: OpenReadViewResponse = await this._unary('view.open', {
+      groupId: this.groupId, requestId: this._requestId(), view: options.view ?? 'final',
+    }, options.signal === undefined ? {} : { signal: options.signal })
+    let released = false
+    const base = { groupId: this.groupId, viewId: captured.viewId }
+    const assertHeld = () => { if (released) throw new ChronologRpcError('revision_unavailable', 'Read view was released') }
+    const handle: ClientReadView = {
+      revision: captured.revision, finalRevision: captured.finalRevision, view: captured.view, expiresAt: captured.expiresAt,
+      query: async (sql, parameters = [], queryOptions = {}) => {
+        assertHeld()
+        return decodeLocalSqlResult(await this._unary('view.query', {
+          ...base, requestId: this._requestId(), sql, parameters: encodeLocalSqlParameters(parameters),
+          ...(queryOptions.maxRows === undefined ? {} : { maxRows: queryOptions.maxRows }),
+        }, queryOptions.signal === undefined ? {} : { signal: queryOptions.signal }))
+      },
+      readEvents: async (readOptions = {}) => {
+        assertHeld()
+        return this._unary('view.events', { ...base, requestId: this._requestId(), ...eventReadOptions(readOptions) },
+          readOptions.signal === undefined ? {} : { signal: readOptions.signal })
+      },
+      release: async () => {
+        if (released) return
+        released = true
+        this.#readViews.delete(handle)
+        // close() has already disabled authoring; leases must still be released.
+        await this.#transport.unary('view.release', { ...base, requestId: this._requestId() }, this.#callOptions())
+      },
+    }
+    if (this.#closed) { await handle.release(); throw new ChronologRpcError('transport_unavailable', 'Client closed while capturing a read view') }
+    this.#readViews.add(handle)
+    return handle
   }
 
   async query(sql: string, bindings: readonly LocalSqlInput[] = [], options: QueryOptions = {}): Promise<LocalSqlQueryResponse> {
@@ -366,9 +461,52 @@ export class ChronologClient {
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true
+    this.#abort.abort(new ChronologRpcError('cancelled', 'Client is closed'))
     for (const resource of this.#resources) resource.dispose()
     this.#resources.clear()
+    await Promise.allSettled([...this.#readViews].map((view) => view.release()))
     await this.#transport.close?.()
+  }
+
+  #durableEvents(options: EventReaderOptions): AsyncIterable<EventBatch> {
+    const request = { groupId: this.groupId, requestId: this._requestId(), ...eventReadOptions(options) }
+    const self = this
+    return { async *[Symbol.asyncIterator]() {
+      let cursor = request.cursor
+      const source = self.#reconnecting((signal) => self.#transport.stream('events.subscribe', {
+        ...request, ...(cursor === undefined ? {} : { cursor }),
+      }, self.#callOptions(signal)), options.signal)
+      for await (const batch of source) {
+        yield batch
+        // Only the next pull advances received progress. Durable processing is
+        // the consumer's state/cursor commit, never this in-memory variable.
+        cursor = batch.scannedThrough
+      }
+    } }
+  }
+
+  #reconnecting<T>(open: (signal: AbortSignal) => AsyncIterable<T>, externalSignal?: AbortSignal): AsyncIterable<T> {
+    const self = this
+    return { async *[Symbol.asyncIterator]() {
+      const controller = new AbortController()
+      const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(externalSignal === undefined ? [] : [externalSignal])])
+      let attempt = 0
+      try {
+        while (!signal.aborted) {
+          if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
+          try {
+            for await (const value of open(signal)) { attempt = 0; yield value }
+            if (signal.aborted) return
+            throw new ChronologRpcError('transport_unavailable', 'Subscription disconnected')
+          } catch (error) {
+            if (signal.aborted) return
+            if (!isChronologRpcError(error) || !error.retryable) throw error
+            attempt++
+            await delay(self.#streamRetryDelayMs?.(attempt) ?? Math.min(100 * 2 ** Math.min(attempt, 5), 3000), signal)
+          }
+        }
+      } finally { controller.abort() }
+    } }
   }
 
   _requestId(): string { return this.#idFactory() }
@@ -519,7 +657,17 @@ export class OwnershipActions {
 }
 
 function encodeTransactionStep(input: TransactionStepInput): RpcProgramStep {
+  if (isEmitStep(input)) {
+    const validated = emit(input.topic, input.payload)
+    return { emit: { topic: validated.topic, payload: validated.payload } }
+  }
   return typeof input !== 'string' && isPlatformOp(input) ? { platform: encodePlatformOp(input) } : encodeTransactionStatement(input)
+}
+
+function eventReadOptions(options: EventReadOptions): EventReadOptions {
+  return { ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+    ...(options.topics === undefined ? {} : { topics: [...options.topics] }),
+    ...(options.limit === undefined ? {} : { limit: options.limit }) }
 }
 
 function encodeTransactionStatement(input: TransactionStatementInput): RpcSqlStatement {

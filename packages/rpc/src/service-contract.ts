@@ -1,4 +1,4 @@
-import type { SqlTransactionProgram } from '@chronolog/protocol'
+import type { ChangeProgram, EventBatch, EventReadOptions } from '@chronolog/protocol'
 
 import type {
   ApproveEnrollmentRequest,
@@ -19,6 +19,7 @@ import type {
   RotateEpochRequest,
   RotateEpochResponse,
   SqlView,
+  OperationStatus,
 } from './types.js'
 
 export interface GovernanceRpcAdmin {
@@ -57,7 +58,7 @@ export interface RpcNodeCandidateCore {
   readonly authorTimestampMs: bigint
   readonly validationPolicy: Uint8Array
   readonly membershipRevision: Uint8Array
-  readonly program: SqlTransactionProgram
+  readonly program: ChangeProgram
 }
 
 export interface RpcNodeSettlementEvidence {
@@ -100,7 +101,31 @@ export interface RpcMaterializedOutcome {
   readonly failingStatementIndex: number | null
 }
 
+/** Captured read port, supplied by the materializer without any RPC dependency. */
+export interface RpcReadHandle {
+  readonly revision: string
+  readonly finalRevision: string
+  readonly view: SqlView
+  query(sql: string, parameters?: readonly LocalSqlValue[]): LocalSqlExecution | Promise<LocalSqlExecution>
+  readEvents(options?: EventReadOptions): EventBatch | Promise<EventBatch>
+  release(): void | Promise<void>
+}
+
+export interface RpcPublishedTransaction {
+  readonly txId: Uint8Array
+  readonly txIdText: string
+  readonly candidateDigest: Uint8Array
+  readonly core: { readonly authorTimestampMs: bigint; readonly nonce: Uint8Array; readonly executionManifestDigest: Uint8Array }
+}
+
 export interface ChronologRpcNodeService {
+  readonly events?: {
+    read(options?: EventReadOptions): Promise<EventBatch>
+    subscribe(options?: EventReadOptions & { readonly signal?: AbortSignal }): AsyncIterable<EventBatch>
+  }
+  readView?(options?: { readonly view?: SqlView }): Promise<RpcReadHandle>
+  operation?(operationId: string): Promise<OperationStatus | null>
+  submitSigned?(signedWire: Uint8Array): Promise<RpcPublishedTransaction>
   readonly identity: Uint8Array
   readonly groupId: Uint8Array
   readonly membershipRevision: Uint8Array
@@ -114,12 +139,7 @@ export interface ChronologRpcNodeService {
   readonly controlStore: {
     listCandidates(): readonly { readonly state: string }[]
   }
-  publish(input: { readonly program: SqlTransactionProgram; readonly operationId: string }): Promise<{
-    readonly txId: Uint8Array
-    readonly txIdText: string
-    readonly candidateDigest: Uint8Array
-    readonly core: { readonly authorTimestampMs: bigint; readonly nonce: Uint8Array; readonly executionManifestDigest: Uint8Array }
-  }>
+  publish(input: { readonly program: ChangeProgram; readonly operationId: string }): Promise<RpcPublishedTransaction>
   status(): Promise<RpcNodeStatusSnapshot>
   isWritable(): Promise<boolean>
   candidate(txId: Uint8Array): RpcNodeCandidate | null
@@ -129,7 +149,7 @@ export interface ChronologRpcNodeService {
   isFinal(txId: Uint8Array): boolean
   settlementEvidence(txId: Uint8Array): Promise<RpcNodeSettlementEvidence | null>
   watermark(): Promise<RpcNodeWatermark | null>
-  events(afterRevision?: bigint, signal?: AbortSignal): AsyncIterable<unknown>
+  revisions(afterRevision?: bigint, signal?: AbortSignal): AsyncIterable<unknown>
   localSql(sql: string, parameters?: readonly LocalSqlValue[], options?: { readonly atRevision?: bigint; readonly view?: SqlView }): LocalSqlExecution
-  validateProgram(program: SqlTransactionProgram): void
+  validateProgram(program: ChangeProgram): void
 }
