@@ -235,7 +235,8 @@ export class DurableEffectWorker {
         result: active.result,
       }
       // A lost publication response repeats this exact result without dispatch.
-      await this.#options.publisher.publishFinal(this.#options.resultTopic, result, { operationId: `effect-result:${effectId}` })
+      await this.#options.publisher.publishFinal(this.#options.resultTopic, result, { operationId: `effect-result:${effectId}`,
+        ...(signal === undefined ? {} : { signal }) })
       state = { ...state, pending: { ...pending, next: pending.next + 1, active: null } }
       await this.#save(state)
     }

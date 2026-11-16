@@ -68,6 +68,11 @@ describe('native agent composition', () => {
       expect(dispatches).toBe(1)
       expect(() => governed.node.localSql('SELECT 1')).toThrow('SQL_DISABLED_FOR_EVENT_PROFILE')
     } finally { clearTimeout(timeout); deadline.abort() }
+    const publication = new AbortController(), reason = new Error('resident task stopped')
+    const waiting = agent.context.publisher.publishFinal('jobs.results', { cancelledWait: true },
+      { operationId: 'cancel-publication-wait', signal: publication.signal })
+    publication.abort(reason)
+    await expect(waiting).rejects.toBe(reason)
     await agent.close()
     await running
   })

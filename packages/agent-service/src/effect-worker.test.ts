@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { DurableEffectWorker, effectIdentity } from './effect-worker.js'
 import type { EffectHandler, EffectWorkerOptions } from './effect-worker.js'
 import type { EventReadOptions, FinalEventBatch, FinalEventSource } from './event-source.js'
+import { ResidentAgentService } from './service.js'
 
 function source(batches: readonly { readonly topic: string; readonly payloads: readonly EventPayload[] }[]): FinalEventSource {
   return {
@@ -135,6 +136,49 @@ describe('durable final-intent workers', () => {
     expect(f.calls).toHaveLength(1)
     expect(attempts).toHaveLength(2)
     expect(attempts[1]).toEqual(attempts[0])
+  })
+
+  it('stops result finality waits after a sibling service failure and resumes the exact saved result', async () => {
+    const f = fixture()
+    let entered!: () => void, interrupt!: () => void
+    const publishing = new Promise<void>((resolve) => { entered = resolve })
+    const attempts: { operationId: string; payload: EventPayload }[] = []
+    let publicationSignal: AbortSignal | undefined
+    const configuration: EffectWorkerOptions = { ...f.configuration,
+      source: { ...f.configuration.source, async *subscribe() { yield await f.configuration.source.read() } },
+      publisher: { publishFinal: async (_topic: string, payload: EventPayload, input: { operationId: string; signal?: AbortSignal }) => {
+        attempts.push({ operationId: input.operationId, payload: structuredClone(payload) })
+        publicationSignal = input.signal
+        entered()
+        await new Promise<void>((_resolve, reject) => {
+          interrupt = () => reject(new Error('publication interrupted'))
+          input.signal?.addEventListener('abort', interrupt, { once: true })
+          if (input.signal?.aborted) interrupt()
+        })
+      } } }
+    const worker = await DurableEffectWorker.open(configuration)
+    const service = new ResidentAgentService([
+      { id: 'effects', run: (signal) => worker.run(signal) },
+      { id: 'authority', run: async () => { await publishing; throw new Error('authority stopped') } },
+    ])
+    let finished = false
+    const running = service.run().then(() => { finished = true; return null }, (error: unknown) => { finished = true; return error })
+    await publishing
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    try {
+      expect(finished).toBe(true)
+      expect(publicationSignal?.aborted).toBe(true)
+    } finally { interrupt() }
+    expect(await running).toMatchObject({ message: 'RESIDENT_TASK_FAILED: authority', cause: { message: 'authority stopped' } })
+    expect(await worker.status()).toMatchObject({ cursor: null, remaining: 2, effect: { stage: 'result', result: { ok: true } } })
+    expect(f.calls).toHaveLength(1)
+    const reopened = await DurableEffectWorker.open({ ...f.configuration, publisher: {
+      publishFinal: async (_topic, payload, input) => { attempts.push({ operationId: input.operationId, payload: structuredClone(payload) }) },
+    } })
+    await reopened.processNext()
+    expect(attempts[1]).toEqual(attempts[0])
+    expect(f.calls).toHaveLength(2)
+    expect(await reopened.status()).toMatchObject({ cursor: 'c:1', remaining: 0, effect: null })
   })
 
   it('binds consumer progress to source, topic filter and handler version', async () => {

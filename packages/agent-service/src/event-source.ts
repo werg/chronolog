@@ -29,8 +29,8 @@ export interface FinalEventSource {
 }
 
 export interface FinalEventPublisher {
-  /** Resolve only after final acceptance. Retries must reuse exact authored bytes. */
-  publishFinal(topic: string, payload: EventPayload, options: { readonly operationId: string }): Promise<void>
+  /** Resolve only after final acceptance. Cancellation interrupts waiting, not a prepared operation's identity. */
+  publishFinal(topic: string, payload: EventPayload, options: { readonly operationId: string; readonly signal?: AbortSignal }): Promise<void>
 }
 
 export function validateConsumerId(value: string): void {

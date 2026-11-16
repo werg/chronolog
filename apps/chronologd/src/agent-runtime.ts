@@ -46,9 +46,12 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
   const peerClosers = new Set<() => Promise<void>>()
   const publisher: FinalEventPublisher = {
     publishFinal: async (topic, payload, input) => {
-      if (controller.signal.aborted) throw new Error('AGENT_SERVICE_STOPPED')
-      const transaction = await options.node.events.publish(topic, payload, input)
-      await waitForFinalAcceptance(options.node, transaction.txId, controller.signal)
+      // A sibling resident task can stop the authority before runtime.close().
+      // Its task signal must interrupt finality waiting as well as provider work.
+      const signal = input.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, input.signal])
+      signal.throwIfAborted()
+      const transaction = await options.node.events.publish(topic, payload, { operationId: input.operationId })
+      await waitForFinalAcceptance(options.node, transaction.txId, signal)
     },
   }
   const context: AgentApplicationContext = {
@@ -134,8 +137,9 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
 
 /** Subscribe before checking so materialization/finality changes cannot be missed. */
 export async function waitForFinalAcceptance(node: ChronologNode, txId: Uint8Array, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
   const waiting = new AbortController()
-  const abort = (): void => waiting.abort()
+  const abort = (): void => waiting.abort(signal?.reason)
   signal?.addEventListener('abort', abort, { once: true })
   if (signal?.aborted) waiting.abort()
   const revisions = node.revisions(0n, waiting.signal)
@@ -149,6 +153,7 @@ export async function waitForFinalAcceptance(node: ChronologNode, txId: Uint8Arr
   try {
     if (accepted()) return
     for await (const _revision of revisions) if (accepted()) return
+    signal?.throwIfAborted()
     throw new Error('AGENT_FINALITY_WAIT_INTERRUPTED')
   } finally {
     waiting.abort()
