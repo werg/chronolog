@@ -4,8 +4,8 @@ import { writeSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
-import { bytesToBase64Url, emit, program } from '@chronolog/protocol'
-import { CoordinatedHistoryPolicy, decodeOrderingEvidence, MemoryOperationStore, type OrderedRecordHead } from '@chronolog/node-core'
+import { base64UrlToBytes, bytesToBase64Url, emit, program } from '@chronolog/protocol'
+import { CoordinatedHistoryPolicy, decodeOrderingEvidence, encodeOrderingEvidence, MemoryOperationStore, type OrderedRecordHead } from '@chronolog/node-core'
 
 import {
   AUTHORITY_CRASH_POINTS, inspectStoppedAuthority, openAuthorityRecoveryFixture, recoveryJson,
@@ -39,6 +39,15 @@ if (action === 'raw') {
       process.kill(process.pid, 'SIGKILL')
     },
   })
+  const retainedEvidence = async (state: Awaited<ReturnType<typeof fixture.inspect>>) => {
+    const range = await fixture.authority.read({ limit: 256 })
+    assert(!range.hasMore, 'RECOVERY_FIXTURE_RECEIPT_LIMIT')
+    const entries = range.entries.filter(entry => entry.position <= state.head.position)
+    assert.equal(entries.at(-1)?.root, state.head.root)
+    return [...entries.map(entry => encodeOrderingEvidence({ kind: 'ordered-entry', entry })),
+      encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: { ...state.head,
+        configuration: base64UrlToBytes(state.certificate.configuration), signature: base64UrlToBytes(state.certificate.signature) } })]
+  }
   try {
     if (action === 'initialize') await fixture.initialize()
     if (action === 'submit' || action === 'crash') {
@@ -60,34 +69,40 @@ if (action === 'raw') {
     }
     if (action === 'hold') {
       const configuration = fixture.authority.configuration
-      writeSync(1, `${recoveryJson({ event: 'holding', state: await fixture.inspect(), configuration: {
+      const state = await fixture.inspect(), evidence = await retainedEvidence(state)
+      writeSync(1, `${recoveryJson({ event: 'holding', state, configuration: {
         kind: configuration.kind, historyId: configuration.historyId,
         authorityPublicKey: bytesToBase64Url(configuration.authorityPublicKey), groupId: bytesToBase64Url(configuration.groupId),
         genesisDigest: bytesToBase64Url(configuration.genesisDigest), executionManifestDigest: bytesToBase64Url(configuration.executionManifestDigest),
-      }, evidence: (await fixture.transport.evidenceHistory()).map(item => bytesToBase64Url(item.bytes)) })}\n`)
+        ...(configuration.providerId === undefined ? {} : { providerId: configuration.providerId }),
+        ...(configuration.providerParameters === undefined ? {} : { providerParameters: bytesToBase64Url(configuration.providerParameters) }),
+      }, evidence: evidence.map(bytesToBase64Url) })}\n`)
       process.stdin.resume()
       await new Promise<void>(resolve => { process.stdin.once('end', resolve) })
     } else if (action === 'offline') {
       const before = await fixture.inspect()
-      const retained = await fixture.transport.evidenceHistory()
+      const retained = await retainedEvidence(before)
       await fixture.agent.close()
+      const stoppedHead = await fixture.authority.head()
       const observer = await CoordinatedHistoryPolicy.open(fixture.authority.configuration, new MemoryOperationStore())
-      for (const evidence of [...retained].reverse()) await observer.ingest(decodeOrderingEvidence(evidence.bytes))
+      for (const evidence of [...retained].reverse()) await observer.ingest(decodeOrderingEvidence(evidence))
       const secondObserver = await CoordinatedHistoryPolicy.open(fixture.authority.configuration, new MemoryOperationStore())
       for (const evidence of [...observer.evidence()].reverse()) await secondObserver.ingest(evidence)
       assert.equal(observer.progress.finalThrough, before.head.position)
       assert.deepEqual(secondObserver.progress, observer.progress)
+      assert.deepEqual(secondObserver.snapshot(), observer.snapshot())
       const receipt = await fixture.node.publish({ operationId: 'recovery-authority-offline', program: program(emit('recovery.changed', { pending: true })) })
       await fixture.node.waitForIdle()
       const pending = await fixture.node.operation('recovery-authority-offline')
       assert(pending !== null && !pending.final)
-      assert.equal((await fixture.authority.head()).position, before.head.position)
+      assert.deepEqual(await fixture.authority.head(), stoppedHead)
       assert.deepEqual(fixture.node.localSql('SELECT id, value FROM recovery_probe ORDER BY id', [], { view: 'final' }).rows, before.rows)
       assert.deepEqual((await fixture.node.events.read()).transactions, before.events)
-      process.stdout.write(`${recoveryJson({ event: 'offline', previousHead: before.head, proposalId: receipt.txIdText,
+      process.stdout.write(`${recoveryJson({ event: 'offline', previousHead: stoppedHead, proposalId: receipt.txIdText,
         operation: pending, finalRows: before.rows, finalEvents: (await fixture.node.events.read()).transactions,
-        relayedEvidence: { bytes: retained.reduce((sum, item) => sum + item.bytes.length, 0),
-          independentObservers: 2, progress: secondObserver.progress, applicationBodiesSupplied: 0 } })}\n`)
+        relayedEvidence: { bytes: retained.reduce((sum, item) => sum + item.length, 0),
+          independentObservers: 2, progress: secondObserver.progress, closedThroughMs: secondObserver.closedThroughMs,
+          applicationBodiesSupplied: 0 } })}\n`)
     } else process.stdout.write(`${recoveryJson({ event: 'state', state: await fixture.inspect() })}\n`)
   } finally { await fixture.close() }
 }

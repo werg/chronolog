@@ -1,10 +1,12 @@
 # Typed ledger records and detached application payloads
 
-The coordinated log orders small Chronolog descriptors. Its existing exact-byte
-record IDs, positions, hash chain and prefix certificates authenticate those
-descriptors. There is one ordering history; the participant roster has no second
-ordering service. The certificate configuration continues to bind the group,
-genesis and application execution profile.
+The inclusion receipt log retains small Chronolog descriptors. Exact-byte IDs,
+receipt positions, a hash chain and prefix certificates authenticate that data.
+Signed closure records additionally prove which author timestamps are closed.
+Application execution always uses the shared chronological comparator; receipt
+positions never select execution order. Membership controls occupy this same
+ledger and follow their signed causal chains. The configuration binds the group,
+genesis, execution profile and finality provider identity/parameters.
 
 Genesis uses wire version 2 and the signing domain `chronolog/genesis/v2`.
 It explicitly authenticates two independent public keys: `rootAdminPublicKey`
@@ -18,7 +20,7 @@ The canonical genesis map is contiguous: version (0), group (1), execution profi
 (2), roster root (3), schema administrator (4), capability feed (5), initial
 capabilities (6), validation policies (7), clock policy (8), resource policy (9),
 encryption suite (10), creation time (11), optional fork origin (12), and optional
-history policy (13). The signed wrapper is also version 2. Version 1 input is
+history policy and verifier selection (13). The signed wrapper is also version 2. Version 1 input is
 rejected; this prerelease change defines a new authenticated group configuration.
 
 `@chronolog/node-core/ledger` defines the descriptor boundary. A descriptor has a
@@ -37,7 +39,8 @@ descriptor by itself does not establish the inner message's validity.
 `decodeLedgerRecord` validates inline control bytes immediately, so a membership
 administrator can scan every certified descriptor and every governance operation
 without requesting application ciphertext. It must still verify the complete
-descriptor prefix. Filtering out descriptors on the server would not establish
+receipt prefix, including signed finality closures. Filtering out descriptors
+or closures on the server would not establish
 the absence of an omitted membership change. Unknown or malformed descriptors
 are deterministically invalid records; readers must not fall back to treating
 them as the previous envelope-in-ledger format.
@@ -53,7 +56,7 @@ reencrypting the same intent would create a different payload address.
 Inline controls never invoke the provider. A missing body produces
 `LEDGER_PAYLOAD_UNAVAILABLE`; a storage/provider failure remains a storage/provider
 failure. Neither means that the application position may be skipped or that the
-proposal was rejected. Certified ordering, body availability, effective roster
+proposal was rejected. Certified inclusion, closed author time, body availability, effective roster
 state and applied application state are separate progress conditions.
 
 A provider response that does not match the committed hash is still unavailable
@@ -63,14 +66,15 @@ an invalid ledger position. The full reader deterministically advances past it
 without manufacturing a proposal outcome. Provider failures are kept outside
 this classification; arbitrary failed fetches cannot erase a candidate.
 
-For coordinated application admission, the epoch on the fetched and verified
-envelope must match the rotation effective at its canonical position. Receiving
-a later key wrap does not change earlier positions. A stale prepared operation
-gets the durable `ENCRYPTION_EPOCH_CLOSED` result under its original proposal ID;
-an exact retry that already obtained an earlier position preserves that outcome.
-If the epoch was never issued before that canonical position, the verified
-envelope is invalid there and can be skipped without a claimed proposal ID.
-A future manifest does not retroactively issue an earlier epoch. If the epoch
+For application admission, the epoch on the verified envelope must match the
+rotation effective at its signed author timestamp. Receiving a later key wrap
+does not rewrite earlier activation. A stale prepared operation gets
+`ENCRYPTION_EPOCH_CLOSED`, or `FINALITY_TIMESTAMP_CLOSED` when first included behind
+an already closed time, under its original proposal ID. An exact previously
+finalized retry preserves its result. If the epoch and its causal predecessors
+were absent from the candidate's first covered inclusion set, the descriptor
+is invalid there and is skipped without claiming an unverified proposal ID.
+A later manifest cannot retroactively satisfy that inclusion dependency. If the epoch
 was issued but its key is locally missing, application still waits for authorized
 key delivery. Unavailable bytes remain pending. This fence does not prevent an
 authorized participant from separately disclosing data or keys it already possesses.

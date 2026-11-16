@@ -46,6 +46,9 @@ export interface GenesisManifest {
   /** Immutable history semantics and SQL profile, authenticated by the root. */
   readonly historyPolicy?: {
     readonly kind: 'peer' | 'coordinated'
+    /** Authenticated verifier selection; it never selects execution ordering. */
+    readonly providerId?: string
+    readonly providerParameters?: Uint8Array
     readonly executionManifestDigest: Uint8Array
     readonly historyId?: string
     readonly authorityPublicKey?: Uint8Array

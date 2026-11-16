@@ -27,12 +27,12 @@ export async function qualifyApplicationScope(modulePath: string) {
       path: join(directory, 'application.db'), executionManifest, rootAdministrator: identity.signing.publicKeyBytes,
     })) })
   try {
-    // Stop automatic ordering, retaining the same fenced native authority. This
-    // lets an already durable authored edit arrive after a separately authored reset.
+    // Pause automatic inclusion/closure, retaining the same fenced service.
+    // This lets an original offline edit arrive after the reset's time closes.
     await native.agent.close()
     const authority = native.agent.authority
     assert(authority !== null)
-    // Complete the retained genesis key controls before choosing application order.
+    // Finalize the retained genesis key controls before submitting application work.
     for (const record of await native.transport.history()) {
       const kind = decodeEnvelope(record.payload).messageType
       if (kind === 'capability' || kind === 'epoch-manifest') await authority.append(record.payload)
@@ -46,27 +46,37 @@ export async function qualifyApplicationScope(modulePath: string) {
       assert.equal(appended.length, 1, 'One durable authored record per new operation')
       return { receipt, record: appended[0]! }
     }
-    const order = async (pending: Awaited<ReturnType<typeof submit>>): Promise<ApplicationOperation> => {
+    const include = async (pending: Awaited<ReturnType<typeof submit>>): Promise<ApplicationOperation> => {
       await authority.append(pending.record.payload)
-      await authority.share({ putEvidence: bytes => native.transport.putEvidence(bytes) })
-      for await (const value of backend.operations.subscribe({ operationId: pending.receipt.operationId, signal: AbortSignal.timeout(10_000) })) {
-        if (value.status === 'final' || value.status === 'rejected') return value
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline) {
+        await authority.share({ putEvidence: bytes => native.transport.putEvidence(bytes) })
+        await native.node.waitForIdle()
+        const value = await backend.operations.get(pending.receipt.operationId)
+        if (value?.status === 'final' || value?.status === 'rejected') return value
+        await new Promise(resolve => setTimeout(resolve, 10))
       }
       throw new Error('SCOPE_OPERATION_DID_NOT_SETTLE')
     }
     const scope = 'inspection-notes'
-    assert.equal((await order(await submit(recipe.initializeScopedState({ scope }), 'scope-initialize'))).status, 'final')
+    assert.equal((await include(await submit(recipe.initializeScopedState({ scope }), 'scope-initialize'))).status, 'final')
     const original = recipe.setScopedState({ scope, expectedGeneration: 0, value: { note: 'already accepted' } })
-    const accepted = await order(await submit(original, 'scope-accepted'))
+    const accepted = await include(await submit(original, 'scope-accepted'))
     assert.equal(accepted.status, 'final')
     const stale = await submit(recipe.setScopedState({ scope, expectedGeneration: 0, value: { note: 'offline edit' } }), 'scope-stale')
     assert.notEqual((await backend.operations.get('scope-stale'))?.status, 'final')
-    const reset = await order(await submit(recipe.rotateScopedState({ scope, expectedGeneration: 0, value: { note: 'reset' } }), 'scope-reset'))
+    const reset = await include(await submit(recipe.rotateScopedState({ scope, expectedGeneration: 0, value: { note: 'reset' } }), 'scope-reset'))
     assert.equal(reset.status, 'final')
-    const rejection = await order(stale)
+    const rejection = await include(stale)
     assert.equal(rejection.status, 'rejected')
-    assert.equal(rejection.error, 'assert:scope_generation_changed')
+    assert.equal(rejection.error, 'FINALITY_TIMESTAMP_CLOSED')
     assert.equal(rejection.proposalId, stale.receipt.proposalId)
+    // A newly authored edit carrying the captured old generation reaches SQL
+    // in chronological order and is independently rejected by the application guard.
+    const generationRejection = await include(await submit(recipe.setScopedState({ scope,
+      expectedGeneration: 0, value: { note: 'stale captured generation' } }), 'scope-stale-generation'))
+    assert.equal(generationRejection.status, 'rejected')
+    assert.equal(generationRejection.error, 'assert:scope_generation_changed')
 
     const beforeRetry = await native.transport.history()
     const retried = await backend.submit(original, { operationId: 'scope-accepted' })
@@ -85,7 +95,9 @@ export async function qualifyApplicationScope(modulePath: string) {
       assert(!events.some(event => event.proposalId === stale.receipt.proposalId))
       native.assertHealthy()
       return { acceptedProposalId: accepted.proposalId, staleProposalId: rejection.proposalId, resetProposalId: reset.proposalId,
-        generation: 1, effectiveEvents: events.length, rejectedCode: rejection.error, exactRetryAddsRecords: 0 }
+        generation: 1, effectiveEvents: events.length, rejectedCode: generationRejection.error,
+        closedRejectionCode: rejection.error, generationRejectedProposalId: generationRejection.proposalId,
+        exactRetryAddsRecords: 0 }
     } finally { await view.release() }
   } finally {
     await native.close()

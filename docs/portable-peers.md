@@ -2,8 +2,9 @@
 
 Chronolog executes SQL locally on each replica. Signed records, governance,
 proposal identity, finality, and SQL replay are shared between the native daemon
-and the browser Worker. The group signs one of two built-in history policies
-into its genesis. Tendriller is an optional retained log and authority host.
+and the browser Worker. Ordering is always the protocol's deterministic
+chronological comparator. The group signs its inclusion/finality provider into
+genesis. Tendriller is an optional receipt store and finality-service host.
 
 This is an unreleased architecture. New groups use the current format directly;
 there is no compatibility decoder or data migration path for earlier prototypes.
@@ -28,21 +29,22 @@ head and signs the immutable group/history configuration plus that head. It does
 not execute SQL, accept a caller-selected root, or put certificates into the log
 being certified.
 
-## Two built-in policies
+## One ordering rule, pluggable finality
 
-| Property | Peer chronological | Coordinated |
+| Property | Peer validators | Signed inclusion service |
 | --- | --- | --- |
-| Admission | The signed fixed-validator policy. | A complete authority-certified log prefix and the record's valid signature/grant. |
-| SQL order | Author timestamp, signing key, then stable proposal identity. | The proposal's first canonical log position. |
-| Late delivery | Can change a tentative suffix through replay. | Fills missing evidence; cannot reorder a certified prefix. |
-| Finality | Contiguous validator feeds, admission references, and watermarks or completed governance closure barriers. | Complete verified entries, a valid prefix certificate, and successful local application of that prefix. |
-| Governance activation | Signed no-more-old-admission promises from every fixed validator, with their complete earlier feed prefixes. | The governance record's certified position. |
-| Role of timestamps | Determine chronological order and validator cutoff eligibility. | Deterministic SQL input; never a substitute for log position. |
+| Admission | The signed fixed-validator policy. | Verified inclusion plus the original signature, permission and dependency checks. |
+| SQL/event order | Author timestamp, signing key, stable proposal identity. | Exactly the same comparator. Receipt position is never execution order. |
+| Late delivery | Can change a tentative suffix through replay. | A new proposal at or below its first inclusion's already-closed time is rejected. Exact retries keep their result. |
+| Finality | Complete validator feeds, admission references and cutoff promises. | Complete inclusion evidence and signed closure history, all needed bodies/keys, and local application through the closed timestamp. |
+| Membership activation | Signed old-revision closures with complete validator evidence. | Signed membership predecessor chain activated at its proved closed timestamp boundary. |
+| Provider outage | Progress depends on the required validators. | New closures stop; existing certified history remains usable. |
 
-The materializer executes the order supplied by the selected policy. It does not
-sort coordinated transactions by author timestamps. An old capability cannot be
+The core always sorts with `compareTransactionOrder`. The materializer executes
+that order; a finality plugin cannot supply a sorter. An old capability cannot be
 revived by backdating a transaction or by regranting a new capability to the same
-key. Each governed proposal binds its exact writer capability ID.
+key. Each governed proposal binds its exact writer capability ID. See the
+[provider contract](pluggable-finality.md) for injected verifiers and closure proofs.
 
 Validators, validation policy, root issuer, administration feed, execution
 profile, and coordinated authority/history are fixed for this initial scope.
@@ -155,7 +157,7 @@ examples.
 Receiving administrative records and activating them are separate operations.
 A late coordinated reader can receive a verified historical-key grant from later
 in the certified prefix before decrypting earlier SQL. Membership still activates
-at the grant's own canonical position. Peer governance instead closes the old
+at the grant's proved chronological closure boundary. Peer governance closes the old
 revision through signed validator promises and complete feed scans; receipt of a
 new snapshot alone does not establish a revocation boundary.
 

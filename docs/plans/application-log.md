@@ -1,5 +1,18 @@
 # Application log follow-up: implementation and qualification
 
+## Architecture correction: deterministic order, pluggable finality
+
+The current follow-up separates inclusion/finality from ordering. All providers
+use the core chronological comparator. A native or hosted service certifies
+inclusion and durable closed-time promises; its receipt positions never choose
+SQL/event order. Membership and epoch controls remain signed ledger kinds, with
+causal-chain validation and author-time activation boundaries. See the current
+[contract and regression map](../pluggable-finality.md).
+
+The qualification reports below describe their exact historical source pins.
+Reports which used receipt-order execution are not evidence for the corrected
+semantics; new qualification must run against the changed public artifacts.
+
 The 16 November 2026 follow-up extends portable peer core with one signed
 application history for SQL, durable events and resident agent work. The revised
 deployment places portable membership administration on Cloudflare by default,

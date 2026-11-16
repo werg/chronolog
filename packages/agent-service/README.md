@@ -1,6 +1,6 @@
 # Native application agent service
 
-This package runs the fixed coordinating authority, durable event consumers,
+This package runs a native inclusion and finality service, durable event consumers,
 timers, and peer connections alongside an application agent. The loops do not
 depend on model turns. Provider calls stay in trusted application modules;
 Chronolog's execution and UI replay never call them.
@@ -23,8 +23,11 @@ continuing history is an error. `peer` remains a separately selected native
 policy. Leaving `CHRONOLOG_HISTORY_POLICY` unset uses an existing genesis, or
 creates the ordinary peer profile for a new daemon.
 
-The coordinated genesis records one history ID and the daemon's persistent
-signing key as authority. Another enrolled node does not become an authority
+The `coordinated` configuration selects a signed-inclusion provider; it never
+changes application ordering. Every replica executes proposals by their signed
+author timestamp and the protocol's deterministic tie-breakers. Its genesis
+records one history ID and the daemon's persistent signing key as finality
+authority. Another enrolled node does not become that authority
 unless its key is the one that genesis explicitly names. The daemon uses its
 existing fenced data directory and FULL-synchronous SQLite operation store.
 `CHRONOLOG_AUTHORITY_QUOTA_BYTES` bounds retained proposal bytes (64 MiB by
@@ -36,26 +39,53 @@ the resident service and are reported as `chronologd.agent_failed`.
 
 ## Authority storage and recovery
 
-`NativeAuthority` composes the public `ReferenceRecordLog` and prefix certificate
-implementation. Exact bytes, deduplication, ordered entries, and the rolling head
-are one atomic record-store update before append acknowledgment. Certificates
-come only from the committed local head and remain outside the history they
-certify. `serve(transport)` recovers retained evidence and orders eligible signed
-wire records from the transport's durable subscription. SQL acceptance remains a
-replica decision.
+`NativeFinalityService` (also exported as `NativeAuthority`) composes the public
+`ReferenceRecordLog`, signed closure markers and prefix certificates. Exact bytes,
+deduplication, receipt entries and the rolling head are one atomic record-store
+update before append acknowledgment. Receipt positions enumerate inclusion;
+replicas independently derive chronological execution order.
+
+`certify()` uses the provider clock and configured `cutoffLagMs` to close author
+time. It signs a marker naming the exact preceding receipt head, commits that
+marker, then returns a certificate for the committed prefix. Every earlier
+closure stays in retained history, so a fresh peer can reject a proposal first
+included after its author timestamp was already closed. Exact retries retain
+their original receipt. Prefix certificates remain outside the log they certify.
+
+`serve(transport)` includes retained local records before its first new closure,
+then follows durable submissions and advances the frontier on the
+`closureIntervalMs` timer even while the application is quiet. `now` is injectable
+for deterministic fixtures. The daemon supplies the signed genesis clock policy;
+direct callers default to a one-second cutoff lag and one-second closure interval.
+Retained exact retries do not trigger extra closures.
+
+`futureAdmissionWindowMs` **must equal the signed genesis sum of
+`maxFutureSkewMs + cutoffLagMs`**; its direct-call default is 31,000. A proposal's
+author time must be at most its first covering closure plus that window. Replicas
+reject a later timestamp deterministically. Without inspecting encrypted bodies,
+the service therefore knows when all covered proposals could have become final.
+It stops advancing after the greatest such horizon, reconstructs that bound on
+reopen, and skips full-history validation on quiet timer ticks once it is reached.
+An empty log needs no closure marker. New receipts restart the bounded tail.
+
+Closure markers consume the same explicit retained-history quota as other
+records. `certifiedRead()` captures the post-closure range and certificate under
+one append lock, and `share()` forwards the selected entries and their covering
+certificate. A receiver waits for every retained entry needed to verify the
+complete prefix, including its closure markers.
 
 `NativeAgentStore` supplies the same atomic bytes port for embedded native hosts.
 It holds SQLite's exclusive owner fence for the lifetime of the connection and
 can back `DurableFeedStore`, authoring state, the authority, and checkpoints.
 The existing daemon instead shares its already fenced node-state database.
 
-A persistent volume is required. A certificate proves order, not a second
+A persistent volume is required. A certificate proves inclusion, not a second
 durable copy or an external backup. An unavailable authority pauses new finality;
 peers retain local reads and already certified history. There is no automatic
 authority or policy failover.
 
 After restoring a volume, establish continuity independently before continuing
-the same authority/history. `NativeAuthority.open({ continuity })` and
+the same authority/history. `NativeFinalityService.open({ continuity })` and
 `CHRONOLOG_AUTHORITY_CONTINUITY_FILE` accept a trusted `{historyId, position,
 root}` checkpoint and refuse an older or conflicting retained prefix. A
 checkpoint copied from the same old backup cannot detect rollback. Without

@@ -11,6 +11,7 @@ import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { createGovernedNode, loadOrCreateEnrollmentIdentity, type GovernedNode } from '@chronolog/node-core'
 import { decodeLedgerRecord } from '@chronolog/node-core/ledger'
+import { isFinalityClosureRecord } from '@chronolog/node-core/finality'
 import { decodeMembershipLedgerResponse, verifyMembershipLedgerRequest } from '@chronolog/node-core/membership'
 import {
   GROUP_COLLECTIVE_ID, base64UrlToBytes, bytesToBase64Url, digestExecutionManifest, emit, encodeExecutionManifest, equalBytes, program, sqlStatement, utf8,
@@ -34,6 +35,8 @@ export interface ThinMembershipTraffic {
   membershipRequestBytes: number
   membershipResponseBytes: number
   descriptorTransfers: number
+  closureRecordTransfers: number
+  closureRecordBytes: number
   candidateDescriptorBytes: number
   inlineControlDescriptorBytes: number
   inlineControlEnvelopeBytes: number
@@ -73,7 +76,8 @@ export async function createThinMembershipNative(options: {
     { ...common, role: 'writer', program: { sql: true, topics: ['*'], signals: ['*'] } },
   ]
   const traffic: ThinMembershipTraffic = { membershipRequests: 0, membershipRequestBytes: 0, membershipResponseBytes: 0,
-    descriptorTransfers: 0, candidateDescriptorBytes: 0, inlineControlDescriptorBytes: 0, inlineControlEnvelopeBytes: 0,
+    descriptorTransfers: 0, closureRecordTransfers: 0, closureRecordBytes: 0,
+    candidateDescriptorBytes: 0, inlineControlDescriptorBytes: 0, inlineControlEnvelopeBytes: 0,
     applicationEnvelopeBytesToAdministrator: 0, unexpectedAdministratorRequests: 0, peerInboundBytes: 0, peerOutboundBytes: 0 }
   let governed: GovernedNode | undefined
   let control: NodeStateDatabase | undefined
@@ -151,6 +155,11 @@ export async function createThinMembershipNative(options: {
           const entries = input.kind === 'read' ? decodeMembershipLedgerResponse(bytes, 'read').entries
             : [decodeMembershipLedgerResponse(bytes, 'append')]
           for (const entry of entries) {
+            if (isFinalityClosureRecord(entry.bytes)) {
+              traffic.closureRecordTransfers += 1
+              traffic.closureRecordBytes += entry.bytes.length
+              continue
+            }
             const record = decodeLedgerRecord(entry.bytes)
             traffic.descriptorTransfers += 1
             if (record.kind === 'candidate') {
@@ -218,6 +227,9 @@ export async function createThinMembershipNative(options: {
       await governed.start()
       agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, history: governed.descriptor.history,
         store, transport, activeMembership: () => governed!.activeSnapshot,
+        cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
+        futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
+        closureIntervalMs: Number(genesis.manifest.clockPolicy.heartbeatIntervalMs),
         peerLinks: { local: transport.asLink(), attach(link) { transport.connect(link); return () => transport.disconnect(link.identity) } } })
       if (agent.authority === null) throw new Error('THIN_NATIVE_AUTHORITY_REQUIRED')
       membershipHandler = createMembershipLedgerHandler({ authority: agent.authority, descriptor: governed.descriptor, sink: transport })
@@ -252,7 +264,8 @@ export async function createThinMembershipNative(options: {
       }
       await governed.node.waitForIdle()
       const range = await agent.authority!.read({ after: before.position, limit: 128 })
-      const candidates = range.entries.map(entry => ({ entry, record: decodeLedgerRecord(entry.bytes) }))
+      const candidates = range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes))
+        .map(entry => ({ entry, record: decodeLedgerRecord(entry.bytes) }))
         .filter(value => value.record.kind === 'candidate')
       return { proposals, count: candidates.length, descriptorBytes: candidates.reduce((sum, value) => sum + value.entry.bytes.length, 0),
         detachedEnvelopeBytes: candidates.reduce((sum, value) => sum + value.record.payloadLength, 0),

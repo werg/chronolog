@@ -214,6 +214,9 @@ async function startRuntime() {
           return () => transport.disconnectLink(link.identity)
         } },
         authorityQuotaBytes: runtime.authorityQuotaBytes,
+        cutoffLagMs: Number(bootstrap.genesis.manifest.clockPolicy.cutoffLagMs),
+        futureAdmissionWindowMs: Number(bootstrap.genesis.manifest.clockPolicy.maxFutureSkewMs + bootstrap.genesis.manifest.clockPolicy.cutoffLagMs),
+        closureIntervalMs: Number(bootstrap.genesis.manifest.clockPolicy.heartbeatIntervalMs),
         ...(runtime.agentModule === undefined ? {} : { modulePath: runtime.agentModule }),
         ...(runtime.authorityContinuityFile === undefined ? {} : { continuity: await readAuthorityContinuity(runtime.authorityContinuityFile) }),
       })

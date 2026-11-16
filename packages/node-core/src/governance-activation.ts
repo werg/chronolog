@@ -81,13 +81,13 @@ export async function verifyGovernanceClosure(signed: SignedGovernanceClosure): 
 
 interface Activation {
   readonly snapshot: CapabilitySnapshot
-  /** The new revision governs positions/timestamps strictly after this bound. */
+  /** The new revision governs author timestamps strictly after this closed bound. */
   readonly after: bigint
 }
 
 /**
  * Policy activation is separate from receiving a newer governance snapshot.
- * Replay always selects the snapshot at the immutable ordering point; a later
+ * Replay always selects the snapshot at the immutable author timestamp; a later
  * revocation never changes authorization of an earlier final transaction.
  */
 export class GovernanceActivationIndex {
@@ -115,10 +115,12 @@ export class GovernanceActivationIndex {
   get activeSnapshot(): CapabilitySnapshot { return structuredClone(this.#activations[this.#activations.length - 1]!.snapshot) }
   get activationBoundary(): bigint { return this.#activations[this.#activations.length - 1]!.after }
 
-  /** The caller has verified this record's position in the canonical log. */
-  activateCoordinated(snapshot: CapabilitySnapshot, position: bigint): void {
-    if (this.#kind !== 'coordinated' || position < 1n) throw new Error('GOVERNANCE_ACTIVATION_POLICY_MISMATCH')
-    this.#activate(snapshot, position)
+  /** The provider proved inclusion and closed this author-time boundary. */
+  activateFinalized(snapshot: CapabilitySnapshot, cutoffMs: bigint): void {
+    if (this.#kind !== 'coordinated' || cutoffMs < 0n) throw new Error('GOVERNANCE_ACTIVATION_POLICY_MISMATCH')
+    // A successor whose predecessor arrived in a later closure takes effect
+    // with that predecessor, never retroactively inside an already closed view.
+    this.#activate(snapshot, cutoffMs < this.activationBoundary ? this.activationBoundary : cutoffMs)
   }
 
   async activatePeer(snapshot: CapabilitySnapshot, evidence: readonly VerifiedGovernanceClosureEvidence[]): Promise<bigint> {
@@ -155,7 +157,7 @@ export class GovernanceActivationIndex {
   snapshotFor(context: WriterAuthorizationContext): CapabilitySnapshot | null {
     if (!equalBytes(context.groupId, this.#groupId) || !this.#snapshots.has(bytesToHex(context.membershipRevision))) return null
     if (this.#snapshots.get(bytesToHex(context.membershipRevision))!.revision > this.activeSnapshot.revision) return null
-    const point = this.#kind === 'coordinated' ? context.canonicalPosition : context.authorTimestampMs
+    const point = context.authorTimestampMs
     if (point === undefined || point < 0n) return null
     for (let index = this.#activations.length - 1; index >= 0; index -= 1) {
       const activation = this.#activations[index]!
@@ -167,7 +169,8 @@ export class GovernanceActivationIndex {
   #activate(snapshot: CapabilitySnapshot, after: bigint): void {
     this.#assertSuccessor(snapshot)
     if (after < this.activationBoundary) throw new Error('GOVERNANCE_ACTIVATION_REGRESSION')
-    if (this.#kind === 'coordinated' && after === this.activationBoundary) throw new Error('GOVERNANCE_ACTIVATION_POSITION_REUSED')
+    // Several causal membership revisions may share one closed batch. Their
+    // signed revision chain, not receipt order, resolves the effective state.
     this.observe(snapshot)
     this.#activations.push({ snapshot: structuredClone(snapshot), after })
   }

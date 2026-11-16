@@ -12,7 +12,8 @@ import type {
 } from '@chronolog/protocol'
 import type { ChronologTransport, TransportStatus } from '@chronolog/records'
 import type { FeedForkRegistry } from './feed-forks.js'
-import type { CoordinatedHistoryPolicy, OrderedRecordEntry } from './history-policy.js'
+import type { OrderedRecordEntry } from './history-policy.js'
+import type { FinalityProvider } from './finality.js'
 import type { DurableOperationStore } from './operations.js'
 
 export interface Clock {
@@ -39,6 +40,8 @@ export interface CandidateAdmissionContext {
   readonly program?: ChangeProgram
   readonly writerCapability?: Uint8Array
   readonly authorTimestampMs?: bigint
+  /** This proposal is covered by a complete closed inclusion frontier. */
+  readonly finalityClosed?: boolean
   readonly canonicalPosition?: bigint
   readonly txId?: Uint8Array
   readonly groupId: Uint8Array
@@ -120,11 +123,15 @@ export interface ChronologNodeOptions {
   readonly operationStore?: DurableOperationStore
   readonly historyPolicy?: { readonly kind: 'peer' } | {
     readonly kind: 'coordinated'
-    readonly policy: CoordinatedHistoryPolicy
-    /** Apply verified inline governance at its certified position, independently of application bodies. */
-    readonly applyGovernanceRecord?: (entry: OrderedRecordEntry) => Promise<void>
-    /** Required for encrypted histories; issuance is independent of local key availability. */
-    readonly encryptionEpochStatusAt?: (position: number, epochId: Uint8Array | null) => 'active' | 'closed' | 'unissued'
+    readonly policy: FinalityProvider
+    /** Maximum author time beyond the first inclusion closure; defaults to 31,000 ms. */
+    readonly futureAdmissionWindowMs?: number
+    /** Apply inline membership at a proved closed timestamp boundary. */
+    readonly applyGovernanceRecord?: (entry: OrderedRecordEntry, cutoffMs: bigint) => Promise<void>
+    /** Issuance is independent of whether this reader has obtained the key. */
+    readonly hasEncryptionEpoch?: (epochId: Uint8Array | null, includedThrough: number) => boolean
+    /** Authorization uses the signed author timestamp, never a provider position. */
+    readonly encryptionEpochStatusAt?: (authorTimestampMs: bigint, epochId: Uint8Array | null) => 'active' | 'closed' | 'unissued'
   }
   readonly groupId: Uint8Array
   readonly groupRoute?: Uint8Array

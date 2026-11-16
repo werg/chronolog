@@ -1,8 +1,9 @@
-import { createRecordLogClient, type RecordLogClient } from '@tendriller/core/records'
+import { createRecordLogClient, decodeRecord, recordGenesisRoot, type RecordLogClient } from '@tendriller/core/records'
 import {
   createPrefixAuthority, decodeOrderingEvidence, encodeOrderingEvidence,
-  type CoordinatedHistoryConfiguration, type PrefixCertificate,
+  type CoordinatedHistoryConfiguration, type OrderedRecordEntry, type OrderedRecordHead, type PrefixCertificate,
 } from '@chronolog/node-core/history'
+import { createFinalityClosureRecord, evaluateFinalitySnapshot, type FinalitySnapshot } from '@chronolog/node-core/finality'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
 
 export interface AuthorityRequest {
@@ -31,6 +32,10 @@ export interface TendrillerAuthorityOptions<Env, Context, HostRequest extends Au
   /** Stable deployment key; never generated per request or stored in Tendriller core. */
   readonly identity: Ed25519KeyPair
   readonly records: RecordLogClient
+  readonly now?: () => number
+  readonly cutoffLagMs?: number
+  /** Must equal signed genesis maxFutureSkewMs + cutoffLagMs; defaults to 31,000. */
+  readonly futureAdmissionWindowMs?: number
   /** The host's Web API constructors keep Worker and DOM declarations distinct. */
   readonly http: AuthorityHttp<HostRequest, HostResponse>
   readonly path?: string
@@ -72,11 +77,80 @@ export function withTendrillerAuthority<Env, Context, HostRequest extends Author
 ): Handler {
   const path = options.path ?? '/_chronolog/certificate'
   if (!path.startsWith('/') || path.includes('?') || path.includes('#')) throw new Error('AUTHORITY_PATH_INVALID')
-  const historyId = options.configuration.historyId
+  const configuration = structuredClone(options.configuration)
+  const identity = { ...options.identity, publicKeyBytes: new Uint8Array(options.identity.publicKeyBytes) }
+  const historyId = configuration.historyId
+  const now = options.now ?? Date.now, cutoffLagMs = options.cutoffLagMs ?? 1_000
+  const futureAdmissionWindowMs = options.futureAdmissionWindowMs ?? 31_000
+  if (!Number.isSafeInteger(cutoffLagMs) || cutoffLagMs < 0 ||
+      !Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0) throw new Error('AUTHORITY_CLOCK_CONFIGURATION_INVALID')
+  let committedHead: OrderedRecordHead | null = null
+  let cachedSnapshot: FinalitySnapshot | null = null
   const authority = createPrefixAuthority({
-    configuration: options.configuration, identity: options.identity,
-    readHead: async () => (await options.records.info({ historyId })).head,
+    configuration, identity,
+    readHead: async () => {
+      if (committedHead === null) throw new Error('AUTHORITY_HEAD_UNAVAILABLE')
+      return structuredClone(committedHead)
+    },
   })
+  let pending: Promise<void> = Promise.resolve()
+  const certify = (): Promise<PrefixCertificate> => {
+    const operation = pending.then(async () => {
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        const head = structuredClone((await options.records.info({ historyId })).head)
+        let snapshot = cachedSnapshot
+        if (snapshot === null || snapshot.includedThrough !== head.position || snapshot.checkpointId !== head.root) {
+          const entries: OrderedRecordEntry[] = []
+          let previous = { historyId, position: 0, root: await recordGenesisRoot(historyId), bytes: 0 }
+          while (previous.position < head.position) {
+            const page = await options.records.read({ historyId, after: previous.position, previous })
+            for (const entry of page.entries) {
+              if (entry.position > head.position) break
+              const bytes = decodeRecord(entry.record)
+              entries.push({ historyId: entry.historyId, position: entry.position, recordId: entry.recordId,
+                previousRoot: entry.previousRoot, root: entry.root, bytes })
+              previous = { historyId, position: entry.position, root: entry.root, bytes: previous.bytes + bytes.length }
+            }
+          }
+          if (previous.root !== head.root) throw new Error('TENDRILLER_HISTORY_CONFLICT')
+          snapshot = await evaluateFinalitySnapshot(configuration, entries)
+          cachedSnapshot = snapshot
+        }
+        const observed = Math.trunc(now())
+        if (!Number.isSafeInteger(observed) || observed < 0) throw new Error('AUTHORITY_CLOCK_INVALID')
+        const cutoff = BigInt(observed) - BigInt(cutoffLagMs)
+        const uncovered = snapshot.records.some((record) => record.closureBoundary === null)
+        let coveredDemand = -1n
+        for (const record of snapshot.records) {
+          if (record.closureBoundary === null) continue
+          const horizon = record.closureBoundary.closedThroughMs + BigInt(futureAdmissionWindowMs)
+          if (horizon > coveredDemand) coveredDemand = horizon
+        }
+        const requestedCutoff = uncovered || cutoff < coveredDemand ? cutoff : coveredDemand
+        const closedThroughMs = requestedCutoff > snapshot.closedThroughMs ? requestedCutoff : snapshot.closedThroughMs
+        if (closedThroughMs >= 0n && (closedThroughMs > snapshot.closedThroughMs || uncovered)) {
+          const marker = await createFinalityClosureRecord({ configuration, identity, includedHead: head, closedThroughMs })
+          try {
+            // The generic conditional append prevents a concurrent submission
+            // from separating this signed closure from its exact predecessor.
+            const retained = await options.records.append(marker, { historyId,
+              expectedHead: { position: head.position, root: head.root } })
+            if (retained.position !== head.position + 1 || retained.previousRoot !== head.root) {
+              throw new Error('FINALITY_CLOSURE_HEAD_MISMATCH')
+            }
+            committedHead = { historyId, position: retained.position, root: retained.root }
+          } catch (error) {
+            if (error !== null && typeof error === 'object' && 'code' in error && error.code === 'record_head_conflict') continue
+            throw error
+          }
+        } else committedHead = head
+        return authority.certify()
+      }
+      throw new Error('AUTHORITY_HEAD_BUSY')
+    })
+    pending = operation.then(() => undefined, () => undefined)
+    return operation
+  }
   const respond = options.http.response.bind(options.http)
   const fetch = async (request: HostRequest, env: Env, context: Context): Promise<HostResponse> => {
     if (new URL(request.url).pathname !== path) return engine.fetch(request, env, context)
@@ -87,7 +161,7 @@ export function withTendrillerAuthority<Env, Context, HostRequest extends Author
     // This endpoint has no caller-supplied signing input, including no root/head.
     if (request.body !== null) return respond('Certificate requests have no body', { status: 400 })
     try {
-      const certificate = await authority.certify()
+      const certificate = await certify()
       return respond(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate }).slice().buffer, {
         headers: { 'Content-Type': 'application/cbor', 'Cache-Control': 'no-store' },
       })

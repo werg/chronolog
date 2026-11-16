@@ -1,4 +1,6 @@
 import { createLedgerRecord } from '@chronolog/node-core/ledger'
+import { Mutex } from '@chronolog/node-core/browser'
+import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 
@@ -47,14 +49,15 @@ const wireEntry = (entry: OrderedRecordEntry): RecordLogEntry => ({
   previousRoot: entry.previousRoot, root: entry.root, record: encodeRecord(entry.bytes),
 })
 
-async function fixture() {
+async function fixture(futureAdmissionWindowMs = 31_000) {
   const identity = await generateEd25519KeyPair()
   const configuration: CoordinatedHistoryConfiguration = {
     kind: 'coordinated', historyId, authorityPublicKey: identity.publicKeyBytes,
     groupId: new Uint8Array(32).fill(1), genesisDigest: new Uint8Array(32).fill(2), executionManifestDigest: new Uint8Array(32).fill(3),
   }
   const log = await ReferenceRecordLog.open(historyId, storage())
-  let online = true, loseAppendReply = false, headReads = 0, scheduled = 0
+  const writes = new Mutex(), clock = { now: 1_000 }
+  let online = true, loseAppendReply = false, headReads = 0, scheduled = 0, raceClosure = false
   const serve = async (request: Request): Promise<Response> => {
     if (!online) return Response.json({ error: { code: 'offline', message: 'Hub unavailable' } }, { status: 503 })
     if (request.headers.get('Authorization') !== 'Bearer owner') return new Response(null, { status: 403 })
@@ -66,11 +69,23 @@ async function fixture() {
       return Response.json({ descriptor: { historyId, format: RECORD_LOG_FORMAT, limits: RECORD_LOG_LIMITS }, head })
     }
     if (url.pathname === '/records/entries' && request.method === 'POST') {
-      const body = await request.json() as { historyId: string; record: string }
+      const body = await request.json() as { historyId: string; record: string; expectedHead?: { position: number; root: string } }
       if (body.historyId !== historyId) return new Response(null, { status: 409 })
-      const result = wireEntry(await log.append(decodeRecord(body.record)))
-      if (loseAppendReply) { loseAppendReply = false; throw new Error('APPEND_REPLY_LOST') }
-      return Response.json(result)
+      if (raceClosure && body.expectedHead !== undefined) {
+        raceClosure = false
+        await log.append((await createLedgerRecord(envelope('candidate', 99))).recordBytes)
+      }
+      return writes.run(async () => {
+        const previous = (await log.read()).find((entry) => encodeRecord(entry.bytes) === body.record)
+        if (previous !== undefined) return Response.json(wireEntry(previous))
+        const current = await log.head()
+        if (body.expectedHead !== undefined && (current.position !== body.expectedHead.position || current.root !== body.expectedHead.root)) {
+          return Response.json({ error: { code: 'record_head_conflict', message: 'Concurrent append changed the predecessor' } }, { status: 409 })
+        }
+        const result = wireEntry(await log.append(decodeRecord(body.record)))
+        if (loseAppendReply) { loseAppendReply = false; throw new Error('APPEND_REPLY_LOST') }
+        return Response.json(result)
+      })
     }
     if (url.pathname === '/records/entries') {
       const after = Number(url.searchParams.get('after')), limit = Number(url.searchParams.get('limit'))
@@ -82,7 +97,8 @@ async function fixture() {
   const records = createRecordLogClient({ base: 'https://hub.test', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => serve(new Request(input, init)) })
   const engine = { fetch: (request: Request, _env: object, _context: object) => serve(request), scheduled: () => { scheduled += 1 } }
-  const handler = withTendrillerAuthority(engine, { configuration, identity, records, http,
+  const handler = withTendrillerAuthority(engine, { configuration, identity, records, http, now: () => clock.now, cutoffLagMs: 0,
+    futureAdmissionWindowMs,
     authorize: (request) => request.headers.get('Authorization') === 'Bearer owner' })
   const certificate = createCertificateFetcher({ url: 'https://hub.test/_chronolog/certificate', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => handler.fetch(new Request(input, init), {}, {}) })
@@ -91,9 +107,9 @@ async function fixture() {
     closers.push(() => transport.close())
     return transport
   }
-  return { configuration, identity, log, records, certificate, handler, engine, adapter,
+  return { configuration, identity, log, records, certificate, handler, engine, adapter, clock,
     offline: () => { online = false }, online: () => { online = true }, loseReply: () => { loseAppendReply = true },
-    headReads: () => headReads, scheduled: () => scheduled }
+    headReads: () => headReads, scheduled: () => scheduled, raceClosure: () => { raceClosure = true } }
 }
 
 describe('public Tendriller adapter', () => {
@@ -121,16 +137,16 @@ describe('public Tendriller adapter', () => {
     expect(await resumed.history()).toHaveLength(1)
     expect((await f.log.head()).position).toBe(1)
     await resumed.catchUp()
-    expect((await resumed.evidenceHistory()).map((item) => decodeOrderingEvidence(item.bytes).kind).sort()).toEqual(['ordered-entry', 'prefix-certificate'])
+    expect((await resumed.evidenceHistory()).map((item) => decodeOrderingEvidence(item.bytes).kind).sort()).toEqual(['ordered-entry', 'ordered-entry', 'prefix-certificate'])
   })
 
-  it('keeps proofs out of the log and relays complete certified history through another peer offline', async () => {
+  it('retains closure markers, keeps prefix certificates separate and relays complete proofs through another peer offline', async () => {
     const f = await fixture(), author = await peer(), reader = await peer(), adapter = f.adapter(author.transport)
     const original = await adapter.publish(envelope('candidate'))
     await adapter.catchUp()
-    expect((await f.log.head()).position).toBe(1)
+    expect((await f.log.head()).position).toBe(2)
     await adapter.catchUp()
-    expect((await f.log.head()).position).toBe(1)
+    expect((await f.log.head()).position).toBe(2)
     f.offline()
     connectInProcess(author.transport, reader.transport)
     await reader.transport.catchUp()
@@ -139,7 +155,8 @@ describe('public Tendriller adapter', () => {
     })
     const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
     for (const item of await reader.transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
-    expect(policy.progress.finalThrough).toBe(1)
+    expect(policy.progress.finalThrough).toBe(2)
+    expect(policy.snapshot().closedThroughMs).toBe(1_000n)
     expect(policy.entries()[0]!.bytes).toEqual((await createLedgerRecord(original.payload)).recordBytes)
   })
 
@@ -166,13 +183,13 @@ describe('public Tendriller adapter', () => {
     expect(await adapter.history()).toHaveLength(2)
     const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
     for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
-    expect(policy.progress.finalThrough).toBe(1)
+    expect(policy.progress.finalThrough).toBe(2)
     expect((await adapter.status()).lastCatchUpError).toContain('Hub unavailable')
     expect(await adapter.status()).toMatchObject({ connected: false, peers: [] })
     f.online(); await adapter.catchUp()
     for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
-    expect(policy.progress.finalThrough).toBe(2)
-    expect((await f.log.head()).position).toBe(2)
+    expect(policy.progress.finalThrough).toBe(4)
+    expect((await f.log.head()).position).toBe(4)
     expect(await adapter.status()).toMatchObject({ connected: true, peers: [] })
     await adapter.close()
     expect((await adapter.status()).connected).toBe(false)
@@ -194,7 +211,62 @@ describe('public Tendriller adapter', () => {
     await expect.poll(async () => (await adapter.evidenceHistory()).some((item) =>
       decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate'), { timeout: 3_000 }).toBe(true)
     expect(attempts).toBe(2)
-    expect((await f.log.head()).position).toBe(1)
+    expect((await f.log.head()).position).toBe(2)
+  })
+
+  it('retries a raced closure without retaining a marker for the wrong predecessor', async () => {
+    const f = await fixture(), author = await peer(), adapter = f.adapter(author.transport)
+    await adapter.publish(envelope('candidate'))
+    f.raceClosure()
+    await adapter.catchUp()
+    const snapshot = await evaluateFinalitySnapshot(f.configuration, await f.log.read())
+    expect(snapshot.records).toHaveLength(2)
+    expect(snapshot.closures).toHaveLength(1)
+    expect(snapshot.closedThroughMs).toBe(1_000n)
+    expect(snapshot.includedThrough).toBe(3)
+  })
+
+  it('polls the finality provider while receipt-head hints are quiet', async () => {
+    const f = await fixture(), author = await peer()
+    await author.transport.publish(envelope('candidate'))
+    const adapter = new TendrillerTransport({ local: author.transport, configuration: f.configuration, groupRoute,
+      records: { ...f.records, watch: () => () => undefined }, certificate: f.certificate, finalityPollIntervalMs: 5 })
+    closers.push(() => adapter.close())
+    const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
+    const frontier = async () => {
+      for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
+      return policy.snapshot().closedThroughMs
+    }
+    await expect.poll(frontier).toBe(1_000n)
+    f.clock.now = 1_200
+    await expect.poll(frontier).toBe(1_200n)
+    expect(policy.snapshot().records).toHaveLength(1)
+  })
+
+  it('bounds idle closures by the first closure window and restores that bound from retained history', async () => {
+    const f = await fixture(100)
+    expect((await f.certificate()).position).toBe(0)
+    await f.records.append((await createLedgerRecord(envelope('candidate'))).recordBytes, { historyId })
+    await f.certificate()
+    f.clock.now = 1_050
+    await f.certificate()
+    expect((await evaluateFinalitySnapshot(f.configuration, await f.log.read())).closedThroughMs).toBe(1_050n)
+    f.clock.now = 10_000
+    await f.certificate()
+    const head = await f.log.head()
+    expect((await evaluateFinalitySnapshot(f.configuration, await f.log.read())).closedThroughMs).toBe(1_100n)
+    for (let idle = 0; idle < 20; idle += 1) {
+      f.clock.now += 1_000
+      expect(await f.certificate()).toMatchObject(head)
+    }
+    const reopened = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity,
+      records: f.records, http, now: () => f.clock.now, cutoffLagMs: 0, futureAdmissionWindowMs: 100,
+      authorize: () => true })
+    const response = await reopened.fetch(new Request('https://hub.test/_chronolog/certificate', { method: 'POST' }), {}, {})
+    expect(response.status).toBe(200)
+    expect(decodeOrderingEvidence(new Uint8Array(await response.arrayBuffer())))
+      .toMatchObject({ kind: 'prefix-certificate', certificate: head })
+    expect(await f.log.head()).toEqual(head)
   })
 
   it.each(['rollback', 'fork'] as const)('stops visibly if the history changes by %s between head and retained range reads', async (change) => {

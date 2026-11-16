@@ -51,11 +51,21 @@ import { DurableOperationJournal, MemoryOperationStore, type DurableOperationSto
 
 type GovernanceMessageType = Extract<EnvelopeMessageType, 'capability' | 'epoch-manifest'>
 
-interface CanonicalEpochActivation {
+interface FinalizedEpochActivation {
   readonly epoch: bigint
   readonly digest: Uint8Array
-  /** The rotation governs application positions strictly after this record. */
-  readonly after: number
+  /** The rotation governs author timestamps strictly after this closed bound. */
+  readonly after: bigint
+  /** Closure proving this epoch and all of its signed predecessors are included. */
+  readonly finalizedAt: bigint
+  /** Inclusion extent needed for this control and every signed predecessor. */
+  readonly includedThrough: number
+}
+
+export interface FinalizedGovernanceRecord {
+  readonly entry: OrderedRecordEntry
+  /** Independently verified closure boundary covering this included control. */
+  readonly cutoffMs: bigint
 }
 
 export interface GovernanceEvent {
@@ -110,7 +120,7 @@ export class GovernanceControlPlane {
   readonly #epochManifests = new Map<bigint, SignedEpochManifest>()
   readonly #epochDigests = new Map<bigint, Uint8Array>()
   readonly #contentKeys = new Map<bigint, Uint8Array>()
-  readonly #canonicalEpochs: CanonicalEpochActivation[] = []
+  readonly #finalizedEpochs: FinalizedEpochActivation[] = []
   readonly #abort = new AbortController()
   #snapshot: CapabilitySnapshot
   #eventRevision = 0n
@@ -143,22 +153,27 @@ export class GovernanceControlPlane {
   get currentEpoch(): bigint | null { return this.#currentEpoch < 0n ? null : this.#currentEpoch }
   get knownEpochs(): readonly bigint[] { return [...this.#epochManifests.keys()].sort(compareBigint) }
   get missingHistoricalEpochs(): readonly bigint[] { return this.knownEpochs.filter((epoch) => !this.#contentKeys.has(epoch)) }
-  /** Rebuilt from verified ordered controls, independently of received key wraps. */
-  canonicalEpochAt(position: number): Uint8Array | null {
-    if (!Number.isSafeInteger(position) || position < 1) throw new Error('GOVERNANCE_CANONICAL_POSITION_INVALID')
-    for (let index = this.#canonicalEpochs.length - 1; index >= 0; index--) {
-      const activation = this.#canonicalEpochs[index]!
-      if (position > activation.after) return encodeCanonicalCbor(activation.epoch)
+  /** Rebuilt from included controls covered by verified author-time closures. */
+  finalizedEpochAt(authorTimestampMs: bigint): Uint8Array | null {
+    if (authorTimestampMs < 0n) throw new Error('GOVERNANCE_AUTHOR_TIMESTAMP_INVALID')
+    for (let index = this.#finalizedEpochs.length - 1; index >= 0; index--) {
+      const activation = this.#finalizedEpochs[index]!
+      if (authorTimestampMs > activation.after) return encodeCanonicalCbor(activation.epoch)
     }
     return null
   }
-  /** Issuance depends on canonical position, never received wraps or local keys. */
-  canonicalEpochStatusAt(position: number, epochId: Uint8Array | null): 'active' | 'closed' | 'unissued' {
-    const active = this.canonicalEpochAt(position)
+  /** Issuance depends on finalized author time, never received wraps or local keys. */
+  finalizedEpochStatusAt(authorTimestampMs: bigint, epochId: Uint8Array | null): 'active' | 'closed' | 'unissued' {
+    const active = this.finalizedEpochAt(authorTimestampMs)
     if (epochId === null || active === null) return 'unissued'
     if (equalBytes(active, epochId)) return 'active'
-    return this.#canonicalEpochs.some(epoch => epoch.after < position && equalBytes(encodeCanonicalCbor(epoch.epoch), epochId))
+    return this.#finalizedEpochs.some(epoch => epoch.after < authorTimestampMs && equalBytes(encodeCanonicalCbor(epoch.epoch), epochId))
       ? 'closed' : 'unissued'
+  }
+  /** Availability only: this does not authorize an epoch at an application timestamp. */
+  hasFinalizedEpoch(epochId: Uint8Array | null, includedThrough = Number.MAX_SAFE_INTEGER): boolean {
+    return epochId !== null && this.#finalizedEpochs.some(epoch => epoch.includedThrough <= includedThrough &&
+      equalBytes(encodeCanonicalCbor(epoch.epoch), epochId))
   }
   /** Whether this node's transport feed is the current administration feed. */
   get ownsCapabilityFeed(): boolean { return this.#options.transport.identity === feedAuthor(this.#snapshot.capabilityLogFeed) }
@@ -352,8 +367,9 @@ export class GovernanceControlPlane {
     })
   }
 
-  /** Called only for a record in the locally verified certified log prefix. */
-  async ingestCanonical(entry: OrderedRecordEntry, activeSnapshot: CapabilitySnapshot): Promise<CapabilitySnapshot | null> {
+  /** Called only for an included control covered by a verified author-time closure. */
+  async ingestFinalized(entry: OrderedRecordEntry, activeSnapshot: CapabilitySnapshot, cutoffMs: bigint): Promise<CapabilitySnapshot | null> {
+    if (cutoffMs < 0n) throw new Error('GOVERNANCE_FINALITY_BOUNDARY_INVALID')
     entry = { ...entry, bytes: Uint8Array.from(entry.bytes) }
     const activeDigest = activeSnapshot.revisionDigest.slice(), activeRevision = activeSnapshot.revision
     return this.#mutex.run(async () => {
@@ -368,31 +384,26 @@ export class GovernanceControlPlane {
           (tagged[0] !== 1n && !(decoded.type === 'epoch-manifest' && tagged[0] === 2n))) {
         throw new Error('GOVERNANCE_PAYLOAD_INVALID')
       }
-      // Received feeds may already contain later signed controls. Validate this
-      // position against the caller's one canonical membership index instead.
+      // Received feeds may already contain later signed controls. Resolve this
+      // event against the finalized causal membership chain instead.
       let snapshot: CapabilitySnapshot | null = null
-      let epoch: CanonicalEpochActivation | null = null
+      let epoch: FinalizedEpochActivation | null = null
       if (decoded.type === 'capability') {
-        snapshot = await this.#verifyCanonicalRevision(decodeSignedCapabilityRevisionBytes(tagged[1]), active)
+        snapshot = await this.#verifyFinalizedRevision(decodeSignedCapabilityRevisionBytes(tagged[1]), active)
       } else {
-        epoch = await this.#verifyCanonicalEpoch(decodeSignedEpochManifest(tagged[1]), tagged[0] === 2n, active, entry.position)
+        epoch = await this.#verifyFinalizedEpoch(decodeSignedEpochManifest(tagged[1]), tagged[0] === 2n, active, cutoffMs, entry.position)
       }
       const record: TransportRecord = { id: `canonical:${entry.historyId}:${entry.position}`, author: '',
         sequence: BigInt(entry.position), receivedAtMs: 0, payload: bytes }
-      try { await this.#ingest(record, true) }
-      catch (error) {
-        // The caller has verified the complete preceding canonical prefix. A
-        // missing predecessor here is an invalid ordered operation, not missing
-        // feed delivery that could justify stopping before later positions.
-        if (error instanceof GovernanceRecordPendingError) throw new Error('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING', { cause: error })
-        throw error
-      }
-      if (epoch !== null) this.#canonicalEpochs.push(epoch)
+      // Receipt order cannot prove that a signed predecessor is impossible.
+      // Keep gaps retriable when another included batch supplies that event.
+      await this.#ingest(record, true)
+      if (epoch !== null) this.#finalizedEpochs.push(epoch)
       return snapshot === null ? null : structuredClone(snapshot)
     })
   }
 
-  async #verifyCanonicalRevision(signed: SignedCapabilityRevision, active: CapabilitySnapshot): Promise<CapabilitySnapshot> {
+  async #verifyFinalizedRevision(signed: SignedCapabilityRevision, active: CapabilitySnapshot): Promise<CapabilitySnapshot> {
     if (!equalBytes(signed.revision.groupId, active.groupId) ||
         !await verifyDomain(DOMAINS.capabilityRevision, encodeCapabilityRevision(signed.revision),
           signed.signature, signed.revision.issuerRootPublicKey)) throw new Error('GOVERNANCE_REVISION_CONFLICT')
@@ -403,18 +414,18 @@ export class GovernanceControlPlane {
       return known
     }
     if (!equalBytes(signed.revision.issuerRootPublicKey, active.rootAdminPublicKey)) throw new Error('GOVERNANCE_REVISION_CONFLICT')
-    if (signed.revision.revision !== active.revision + 1n) throw new Error('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
+    if (signed.revision.revision !== active.revision + 1n) throw new GovernanceRecordPendingError()
     return applyCapabilityRevision(active, signed)
   }
 
-  async #verifyCanonicalEpoch(signed: SignedEpochManifest, historical: boolean, active: CapabilitySnapshot,
-    position: number): Promise<CanonicalEpochActivation | null> {
+  async #verifyFinalizedEpoch(signed: SignedEpochManifest, historical: boolean, active: CapabilitySnapshot,
+    cutoffMs: bigint, includedPosition: number): Promise<FinalizedEpochActivation | null> {
     if (!equalBytes(signed.manifest.groupId, active.groupId) || !await verifyEpochManifest(signed, active.rootAdminPublicKey)) {
       throw new Error('GOVERNANCE_EPOCH_INVALID')
     }
-    const known = this.#canonicalEpochs.find(item => item.epoch === signed.manifest.epoch)
+    const known = this.#finalizedEpochs.find(item => item.epoch === signed.manifest.epoch)
     if (historical) {
-      if (known === undefined) throw new Error('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
+      if (known === undefined) throw new GovernanceRecordPendingError()
       return null
     }
     const digest = await hashDomain(DOMAINS.epochManifest, encodeEpochManifest(signed.manifest))
@@ -422,11 +433,16 @@ export class GovernanceControlPlane {
       if (!equalBytes(known.digest, digest)) throw new Error('GOVERNANCE_EPOCH_CHAIN_INVALID')
       return null
     }
-    const previous = this.#canonicalEpochs.at(-1)
-    if (signed.manifest.epoch !== (previous?.epoch ?? -1n) + 1n) throw new Error('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
+    const previous = this.#finalizedEpochs.at(-1)
+    if (signed.manifest.epoch !== (previous?.epoch ?? -1n) + 1n) throw new GovernanceRecordPendingError()
     if (!nullableBytesEqual(signed.manifest.previousEpochDigest, previous?.digest ?? null)) throw new Error('GOVERNANCE_EPOCH_CHAIN_INVALID')
-    if (previous !== undefined && position <= previous.after) throw new Error('GOVERNANCE_CANONICAL_POSITION_INVALID')
-    return { epoch: signed.manifest.epoch, digest, after: position }
+    const finalizedAt = previous !== undefined && previous.finalizedAt > cutoffMs ? previous.finalizedAt : cutoffMs
+    // Epoch zero supplies the genesis key, not a rotation of an older key.
+    // It can authorize genesis writers in its own first closure; the caller
+    // still proves issuance within the candidate's immutable inclusion set.
+    const after = previous === undefined ? -1n : finalizedAt
+    return { epoch: signed.manifest.epoch, digest, after, finalizedAt,
+      includedThrough: Math.max(includedPosition, previous?.includedThrough ?? 0) }
   }
 
   async #ingest(record: TransportRecord, canonical = false): Promise<boolean> {
@@ -629,6 +645,43 @@ export class GovernanceControlPlane {
   }
 }
 
+/**
+ * Receipt order is transport metadata, not membership causality. Each control
+ * chain is resolved by its signed predecessor/revision; activation still uses
+ * the independently proved cutoff attached to the original included event.
+ * Malformed/foreign/application entries have no governance effect.
+ */
+export async function orderFinalizedGovernanceRecords(
+  records: readonly FinalizedGovernanceRecord[], groupRoute: Uint8Array,
+): Promise<readonly FinalizedGovernanceRecord[]> {
+  const route = groupRoute.slice()
+  const captured = records.map(input => ({ entry: { ...input.entry, bytes: input.entry.bytes.slice() }, cutoffMs: input.cutoffMs }))
+  const controls: Array<{ readonly record: FinalizedGovernanceRecord; readonly kind: number;
+    readonly revision: bigint; readonly historical: number; readonly id: string }> = []
+  for (const record of captured) {
+    try {
+      const ledger = decodeLedgerRecord(record.entry.bytes)
+      if (ledger.kind === 'candidate' || !equalBytes(ledger.groupRoute, route)) continue
+      const bytes = await verifyLedgerPayload(ledger, ledger.inlinePayload)
+      const decoded = await decodeGovernanceEnvelope(bytes, route)
+      const tagged = assertCanonicalCbor(decoded.payload)
+      if (!Array.isArray(tagged) || tagged.length !== 2 || !(tagged[1] instanceof Uint8Array) ||
+          (tagged[0] !== 1n && !(decoded.type === 'epoch-manifest' && tagged[0] === 2n))) continue
+      const revision = decoded.type === 'capability'
+        ? decodeSignedCapabilityRevisionBytes(tagged[1]).revision.revision
+        : decodeSignedEpochManifest(tagged[1]).manifest.epoch
+      controls.push({ record, kind: decoded.type === 'capability' ? 0 : 1, revision,
+        historical: tagged[0] === 2n ? 1 : 0, id: ledger.payloadHash })
+    } catch {
+      // These operations only decode and authenticate supplied bytes. Invalid
+      // records remain in the provider's proof but cannot mutate governance.
+    }
+  }
+  controls.sort((left, right) => left.kind - right.kind || compareBigint(left.revision, right.revision) ||
+    left.historical - right.historical || left.id.localeCompare(right.id))
+  return controls.map(item => item.record)
+}
+
 async function encodeGovernanceEnvelope(
   groupRoute: Uint8Array,
   type: GovernanceMessageType,
@@ -698,8 +751,10 @@ function decodePrepared(bytes: Uint8Array): {
 function preparedResult(bytes: Uint8Array): Uint8Array { return decodePrepared(bytes).result }
 function compareBigint(left: bigint, right: bigint): number { return left < right ? -1 : left > right ? 1 : 0 }
 
-class GovernanceRecordPendingError extends Error {}
+export class GovernanceRecordPendingError extends Error {
+  constructor() { super('GOVERNANCE_PREDECESSOR_PENDING'); this.name = 'GovernanceRecordPendingError' }
+}
 
 export function isInvalidGovernanceRecord(error: unknown): error is Error {
-  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_CHAIN_INVALID|REVISION_CONFLICT|ENVELOPE_INVALID|ENVELOPE_SIGNATURE_INVALID|CANONICAL_PREDECESSOR_MISSING|FIXED_(ROOT|ADMINISTRATION_FEED|VALIDATION_POLICY|VALIDATORS))$/u.test(error.message))
+  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_CHAIN_INVALID|REVISION_CONFLICT|ENVELOPE_INVALID|ENVELOPE_SIGNATURE_INVALID|FIXED_(ROOT|ADMINISTRATION_FEED|VALIDATION_POLICY|VALIDATORS))$/u.test(error.message))
 }

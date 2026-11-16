@@ -70,6 +70,9 @@ export async function createNativeBrowserFixture(options: {
   await governed.start()
   const agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, history: governed.descriptor.history,
     store, transport, activeMembership: () => governed.activeSnapshot,
+    cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
+    futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
+    closureIntervalMs: Number(genesis.manifest.clockPolicy.heartbeatIntervalMs),
     ...(options.application === undefined ? {} : { application: options.application }),
     peerLinks: { local: transport.asLink(), attach(link) { transport.connect(link); return () => transport.disconnect(link.identity) } } })
   const running = agent.run()

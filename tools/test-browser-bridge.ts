@@ -70,7 +70,7 @@ const sync = async (id = 'browser'): Promise<void> => {
 const compare = (actual: BrowserBridgeSnapshot, expected: BrowserBridgeSnapshot): void => {
   assert.equal(actual.hash, expected.hash, 'native and browser SQL content hashes differ')
   assert.equal(actual.finalOrderLength, expected.finalOrderLength)
-  assert.equal(actual.finalThrough, expected.finalThrough)
+  assert(actual.finalThrough >= expected.finalThrough, 'browser has not applied the native inclusion checkpoint')
   assert.deepEqual(actual.rows, expected.rows)
   assert.deepEqual(actual.outcomes.map(({ outcome, final }) => ({ outcome, final })), expected.outcomes.map(({ outcome, final }) => ({ outcome, final })))
 }
@@ -152,7 +152,7 @@ try {
     (globalThis as unknown as TestWindow).chronologBrowserBridge.final('browser', transactionId), browserClaim)
   assert.deepEqual(retryFinal.outcome, browserFinal.outcome)
   const retried = await fixture.sync(transactionIds)
-  assert.equal(retried.logPosition, nativeFinal.logPosition, 'retry appended a duplicate ordered proposal')
+  assert.equal(retried.includedRecordCount, nativeFinal.includedRecordCount, 'retry appended a duplicate proposal')
   compare(await state('browser', transactionIds), nativeFinal)
   passed('page reload retains OPFS signer, reader key, signed enrollment request, final SQL, and exact durable claim identity')
 

@@ -5,17 +5,21 @@ application log. One signed change program combines **ordinary SQLite
 transactions**, platform operations, and bounded durable events. Native and
 browser peers verify the same original records; SQL profiles execute the same
 pinned DoltLite engine, and event-only profiles do not load it. A signed
-genesis selects one of two built-in history policies: peer chronological
-admission/finality, or certified canonical log positions. SQL executes locally;
-the resident native agent can own the fixed coordinated authority. Tendriller
+genesis selects an inclusion/finality provider. Every provider uses the same
+deterministic application order: author timestamp, signing key, proposal ID.
+Validators or an external service can prove inclusion and close a timestamp
+prefix; neither supplies an execution order. SQL executes locally. Tendriller
 can host and connect the application, or supply an optional retained log adapter.
 
-Peer chronological history can replay a tentative suffix when a late transaction
-arrives. Coordinated history applies a complete certified prefix in log order.
+Peer history can replay a tentative suffix when a late transaction arrives.
+The signed-inclusion provider retains receipts and durable closure promises;
+receipt positions never order SQL or effective events. Newly included backdated
+proposals cannot reopen a closed prefix. Custom verifiers are selected by the
+provider ID and parameters signed in genesis.
 Both expose separate local and final SQL revisions, durable submission identity,
 and live scoped reader/writer enrollment. See the [application-log roadmap and
 evidence](docs/plans/application-log.md), [resident agent](packages/agent-service/README.md),
-and [portable peers](docs/portable-peers.md) for the architecture and tests.
+and [pluggable finality](docs/pluggable-finality.md) for the architecture and tests.
 
 - **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
   dialect or migration system. Assumptions are SQL statements, usually

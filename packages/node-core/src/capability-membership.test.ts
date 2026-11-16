@@ -131,7 +131,8 @@ describe('CapabilityMembershipResolver revision pinning', () => {
   it('denies everything when the revision is unknown', async () => {
     const resolver = resolverFor(null)
     await expect(resolver.canWrite(context())).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
-    expect(await resolver.canWrite({ ...context(), canonicalPosition: 1n })).toBe(false)
+    await expect(resolver.canWrite({ ...context(), authorTimestampMs: 1n })).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
+    expect(await resolver.canWrite({ ...context(), authorTimestampMs: 1n, finalityClosed: true })).toBe(false)
     expect(await resolver.canValidate({ ...context(), validatorId: validatorKeys[0], validatorCapability: capabilities.validator0.id })).toBe(false)
     expect(await resolver.canHeartbeat({ groupId, membershipRevision: revisionDigest, validatorId: validatorKeys[0], validatorCapability: capabilities.validator0.id })).toBe(false)
     expect(await resolver.threshold(context())).toBe(Number.MAX_SAFE_INTEGER)
@@ -152,10 +153,11 @@ describe('CapabilityMembershipResolver revision pinning', () => {
     expect(await resolver.canUseTransportAuthor({ groupId: otherGroupId, membershipRevision: revisionDigest, role: 'writer', signingId: writerKey, transportAuthor: '@writer.feed' })).toBe(false)
   })
 
-  it('rejects a received future revision at a fixed position without waiting for later activation', async () => {
+  it('keeps a received future revision pending until its causal activation is known', async () => {
     const resolver = resolverFor(snapshot(), { authorizationSnapshot: () => null })
     await expect(resolver.canWrite(context())).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
-    expect(await resolver.canWrite({ ...context(), canonicalPosition: 1n })).toBe(false)
+    await expect(resolver.canWrite({ ...context(), authorTimestampMs: 1n })).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
+    expect(await resolver.canWrite({ ...context(), authorTimestampMs: 1n, finalityClosed: true })).toBe(false)
   })
 
   it('denies a source that returns a snapshot for a different revision than requested', async () => {
@@ -193,7 +195,7 @@ describe('CapabilityMembershipResolver writer authority', () => {
     expect(await resolver.canWrite(context({ writerCapability: regrant.id }))).toBe(false)
   })
 
-  it('keeps missing activation evidence pending and checks the exact ordering point', async () => {
+  it('keeps missing activation evidence pending and checks the signed author timestamp', async () => {
     const original = snapshot()
     const revoked = { ...capabilities.writer, revokedAtRevision: REVISION + 1n }
     const after = snapshot(policy(), [], {
@@ -201,11 +203,11 @@ describe('CapabilityMembershipResolver writer authority', () => {
       capabilities: new Map([...original.capabilities, [bytesToHex(revoked.id), revoked]]),
     })
     const resolver = resolverFor(original, {
-      authorizationSnapshot: (input) => input.canonicalPosition === undefined ? null : input.canonicalPosition < 10n ? original : after,
+      authorizationSnapshot: (input) => input.authorTimestampMs === undefined ? null : input.authorTimestampMs < 10n ? original : after,
     })
     await expect(resolver.canWrite(context())).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
-    expect(await resolver.canWrite({ ...context(), canonicalPosition: 9n })).toBe(true)
-    expect(await resolver.canWrite({ ...context(), canonicalPosition: 10n })).toBe(false)
+    expect(await resolver.canWrite({ ...context(), authorTimestampMs: 9n })).toBe(true)
+    expect(await resolver.canWrite({ ...context(), authorTimestampMs: 10n })).toBe(false)
   })
 
   it('denies revoked, expired, not-yet-valid, unknown and non-writer keys', async () => {

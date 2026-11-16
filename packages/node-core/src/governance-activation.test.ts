@@ -5,16 +5,36 @@ import { describe, expect, it } from 'vitest'
 import { GovernanceActivationIndex, signGovernanceClosure, type VerifiedGovernanceClosureEvidence } from './governance-activation.js'
 
 describe('governance activation', () => {
-  it('selects coordinated membership strictly after the control record position', async () => {
+  it('selects membership strictly after a finalized author-time boundary', async () => {
     const { genesis, next, context } = await fixture()
     const index = new GovernanceActivationIndex(genesis, 'coordinated')
     index.observe(next)
-    expect(index.snapshotFor({ ...context, membershipRevision: next.revisionDigest, canonicalPosition: 5n })).toBeNull()
-    index.activateCoordinated(next, 5n)
-    expect(index.snapshotFor({ ...context, canonicalPosition: 5n })?.revision).toBe(0n)
-    expect(index.snapshotFor({ ...context, canonicalPosition: 6n })?.revision).toBe(1n)
-    // Later reception never changes the preceding position's authorization.
-    expect(index.snapshotFor({ ...context, canonicalPosition: 1n })?.revision).toBe(0n)
+    expect(index.snapshotFor({ ...context, membershipRevision: next.revisionDigest, authorTimestampMs: 5n })).toBeNull()
+    index.activateFinalized(next, 5n)
+    expect(index.snapshotFor({ ...context, authorTimestampMs: 5n })?.revision).toBe(0n)
+    expect(index.snapshotFor({ ...context, authorTimestampMs: 6n })?.revision).toBe(1n)
+    // Later reception never changes an earlier timestamp's authorization.
+    expect(index.snapshotFor({ ...context, authorTimestampMs: 1n })?.revision).toBe(0n)
+  })
+
+  it('resolves multiple signed revisions at one closure without receipt positions', async () => {
+    const { genesis, next, context } = await fixture()
+    const index = new GovernanceActivationIndex(genesis, 'coordinated')
+    const successor = { ...next, revision: 2n, revisionDigest: bytes(20) }
+    index.activateFinalized(next, 100n)
+    index.activateFinalized(successor, 100n)
+    expect(index.snapshotFor({ ...context, authorTimestampMs: 100n })?.revision).toBe(0n)
+    expect(index.snapshotFor({ ...context, authorTimestampMs: 101n })?.revision).toBe(2n)
+  })
+
+  it('does not backdate a successor whose predecessor finalized in a later batch', async () => {
+    const { genesis, next, context } = await fixture()
+    const index = new GovernanceActivationIndex(genesis, 'coordinated')
+    index.activateFinalized(next, 200n)
+    index.activateFinalized({ ...next, revision: 2n, revisionDigest: bytes(21) }, 100n)
+    expect(index.activationBoundary).toBe(200n)
+    expect(index.snapshotFor({ ...context, authorTimestampMs: 150n })?.revision).toBe(0n)
+    expect(index.snapshotFor({ ...context, authorTimestampMs: 201n })?.revision).toBe(2n)
   })
 
   it('requires every fixed validator and complete prior admission evidence to close a peer revision', async () => {

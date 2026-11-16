@@ -1,6 +1,7 @@
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { decodeOrderingEvidence, encodeOrderingEvidence, verifyPrefixCertificate } from '@chronolog/node-core/history'
 import { createLedgerRecord, decodeLedgerRecord } from '@chronolog/node-core/ledger'
+import { decodeFinalityClosureRecord } from '@chronolog/node-core/finality'
 import {
   MAX_MEMBERSHIP_LEDGER_BYTES, decodeMembershipLedgerResponse, provisionMembership, signMembershipLedgerRequest,
   type MembershipLedgerRequest,
@@ -18,7 +19,7 @@ async function setup() {
     schemaAdministratorPublicKey: native.publicKeyBytes }
   const { descriptor, identity } = await provisionMembership(provision)
   if (descriptor.history.kind !== 'coordinated') throw new Error('COORDINATED_FIXTURE_REQUIRED')
-  const authority = await NativeAuthority.open({ configuration: descriptor.history, identity: native, store })
+  const authority = await NativeAuthority.open({ configuration: descriptor.history, identity: native, store, now: () => 1_000, cutoffLagMs: 0 })
   const control = (value: number, size = 8) => createLedgerRecord(encodeEnvelope({ groupRoute: descriptor.groupRoute,
     messageType: 'capability', encryptionEpoch: null, payload: new Uint8Array(size).fill(value) }))
   const signed = async (request: MembershipLedgerRequest, now = 1_000) => signMembershipLedgerRequest({ descriptor, identity, request, now })
@@ -45,12 +46,14 @@ describe('signed native membership HTTP handler', () => {
     const bytes = new Uint8Array(await response.arrayBuffer())
     expect(bytes.length).toBeLessThan(2_048)
     const page = decodeMembershipLedgerResponse(bytes, 'read')
-    expect(page.entries).toHaveLength(1)
+    expect(page.entries).toHaveLength(2)
     expect(page.hasMore).toBe(false)
     expect(decodeLedgerRecord(page.entries[0]!.bytes)).toMatchObject({ kind: 'candidate', inlinePayload: null, payloadLength: body.length })
+    expect(decodeFinalityClosureRecord(page.entries[1]!.bytes)).toMatchObject({ closedThroughMs: 1_000n,
+      includedHead: { position: 1, root: page.entries[0]!.root } })
     await verifyPrefixCertificate(page.certificate, f.authority.configuration)
     expect(fetchPayload).not.toHaveBeenCalled()
-    expect(mirrored.map(decodeOrderingEvidence).map(item => item.kind)).toEqual(['ordered-entry', 'prefix-certificate'])
+    expect(mirrored.map(decodeOrderingEvidence).map(item => item.kind)).toEqual(['ordered-entry', 'ordered-entry', 'prefix-certificate'])
   })
 
   it('recovers an interrupted post-commit delivery with exact retry identity and a subsequent range read', async () => {
@@ -63,24 +66,25 @@ describe('signed native membership HTTP handler', () => {
     let handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, sink, now: () => 1_000 })
     const control = await f.control(1), append = await f.signed({ kind: 'append', recordBytes: control.recordBytes })
     expect((await handler(request(append))).status).toBe(503)
-    expect((await f.authority.head()).position).toBe(1)
-    const reopened = await NativeAuthority.open({ configuration: f.authority.configuration, identity: f.native, store: f.store })
+    expect((await f.authority.head()).position).toBe(2)
+    const reopened = await NativeAuthority.open({ configuration: f.authority.configuration, identity: f.native, store: f.store, now: () => 1_000, cutoffLagMs: 0 })
     handler = createMembershipLedgerHandler({ authority: reopened, descriptor: f.descriptor, sink, now: () => 1_000 })
     const retry = await handler(request(append))
     const entry = decodeMembershipLedgerResponse(new Uint8Array(await retry.arrayBuffer()), 'append')
     expect(entry.position).toBe(1)
     expect(entry.bytes).toEqual(control.recordBytes)
-    expect((await reopened.head()).position).toBe(1)
+    expect((await reopened.head()).position).toBe(2)
     fail = true
     const second = await f.control(2)
     expect((await handler(request(await f.signed({ kind: 'append', recordBytes: second.recordBytes })))).status).toBe(503)
     mirrored.length = 0
-    const read = await handler(request(await f.signed({ kind: 'read', after: 1, limit: 1 })))
+    const read = await handler(request(await f.signed({ kind: 'read', after: 2, limit: 2 })))
     expect(read.status).toBe(200)
     const healed = mirrored.map(decodeOrderingEvidence)
-    expect(healed).toHaveLength(2)
-    expect(healed[0]).toMatchObject({ kind: 'ordered-entry', entry: { position: 2, bytes: second.recordBytes } })
-    expect(healed[1]).toMatchObject({ kind: 'prefix-certificate', certificate: { position: 2 } })
+    expect(healed).toHaveLength(3)
+    expect(healed[0]).toMatchObject({ kind: 'ordered-entry', entry: { position: 3, bytes: second.recordBytes } })
+    expect(healed[1]).toMatchObject({ kind: 'ordered-entry', entry: { position: 4 } })
+    expect(healed[2]).toMatchObject({ kind: 'prefix-certificate', certificate: { position: 4 } })
   })
 
   it('requires the pinned root signature, configuration, expiry and inline control classification', async () => {
@@ -126,9 +130,9 @@ describe('signed native membership HTTP handler', () => {
     expect(first.hasMore).toBe(true)
     const next = await handler(request(await f.signed({ kind: 'read', after: first.entries.at(-1)!.position, limit: 128 })))
     const second = decodeMembershipLedgerResponse(new Uint8Array(await next.arrayBuffer()), 'read')
-    expect(second.entries.map(entry => entry.position)).toEqual([5])
+    expect(second.entries.map(entry => entry.position)).toEqual([5, 6])
     expect(second.hasMore).toBe(false)
-    expect((await handler(request(await f.signed({ kind: 'read', after: 6, limit: 1 })))).status).toBe(409)
+    expect((await handler(request(await f.signed({ kind: 'read', after: 7, limit: 1 })))).status).toBe(409)
   })
 
   it('rejects route aliases, non-CBOR and oversized bodies before any append', async () => {

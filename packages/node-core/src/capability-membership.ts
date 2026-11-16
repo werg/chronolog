@@ -22,8 +22,8 @@ export interface CapabilityMembershipResolverOptions {
   ) => CapabilitySnapshot | null | Promise<CapabilitySnapshot | null>
   readonly maximumWatermarkValidators?: number
   /**
-   * Policy-selected snapshot at the transaction's ordering/activation point.
-   * A null result means required closure/order evidence has not arrived.
+   * Effective snapshot at the transaction's signed author timestamp.
+   * A null result means required causal/closure evidence has not arrived.
    * Governed production runtimes must provide this; the pinned-only default is
    * useful for isolated revision verification, not revocation activation.
    */
@@ -39,7 +39,8 @@ export interface CapabilityMembershipResolverOptions {
 export type WriterAuthorizationContext = Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'> & {
   readonly writerCapability?: Uint8Array
   readonly authorTimestampMs?: bigint
-  readonly canonicalPosition?: bigint
+  /** The author time is closed and all included causal controls are resolved. */
+  readonly finalityClosed?: boolean
   readonly txId?: Uint8Array
 }
 
@@ -65,10 +66,9 @@ export class CapabilityMembershipResolver implements MembershipResolver {
   async canWrite(context: WriterAuthorizationContext): Promise<boolean> {
     const snapshot = await this.#snapshot(context)
     if (!snapshot) {
-      // A canonical position comes with its complete preceding control prefix.
-      // An unknown author-selected revision cannot arrive before that position.
-      if (context.canonicalPosition !== undefined) return false
-      if (await this.#snapshots(context.membershipRevision) === null) throw new GovernanceEvidencePendingError()
+      // Inclusion receipts do not establish causal governance completeness.
+      // A signed predecessor may still arrive through a later provider batch.
+      if (await this.#snapshots(context.membershipRevision) === null && !context.finalityClosed) throw new GovernanceEvidencePendingError()
       return false
     }
     if (context.writerCapability === undefined) return false
@@ -79,7 +79,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     if (context.program !== undefined && !programAllowed(grant.grant, context.program)) return false
     const effective = this.#authorizationSnapshot === undefined ? snapshot : await this.#authorizationSnapshot(context)
     if (effective === null) {
-      if (context.canonicalPosition !== undefined) return false
+      if (context.finalityClosed) return false
       throw new GovernanceEvidencePendingError()
     }
     const active = effective.capabilities.get(id)

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest, verifyEnrollmentApproval } from './enrollment.js'
 import { createPrefixAuthority, ReferenceRecordLog, verifyPrefixCertificate } from './history-policy.js'
+import { createFinalityClosureRecord, decodeFinalityClosureRecord, isFinalityClosureRecord } from './finality.js'
 import { createLedgerRecord, decodeLedgerRecord } from './ledger-record.js'
 import {
   MembershipAdministrator, provisionMembership, createMembershipLedgerClient, encodeMembershipLedgerResponse,
@@ -32,6 +33,42 @@ describe('portable thin membership administrator', () => {
       .rejects.toThrow('MEMBERSHIP_CONFIGURATION_CONFLICT')
   })
 
+  it('keeps certified grants inactive until author time is closed, then resumes the exact approval', async () => {
+    const fixture = await setup(false), applicant = await joinRequest(fixture, 'await-closure')
+    const closeAndRead = fixture.ledger.read.bind(fixture.ledger)
+    fixture.ledger.read = async ({ after, limit = 128 }) => {
+      const entries = (await fixture.log.read()).slice(after, after + limit)
+      const authority = createPrefixAuthority({ configuration: fixture.configuration, identity: fixture.native.signing,
+        readHead: () => fixture.log.head() })
+      return { entries, certificate: await authority.certify(), hasMore: after + entries.length < (await fixture.log.head()).position }
+    }
+    const decision = { operationId: 'approve-after-closure', roles: ['reader'] as const, grantFullHistory: true }
+    await expect(fixture.administrator.approve(applicant.request, decision)).rejects.toThrow('MEMBERSHIP_PREFIX_PENDING')
+    expect(fixture.administrator.snapshot.revision).toBe(0n)
+    const pendingHead = await fixture.log.head()
+    fixture.ledger.read = closeAndRead
+    const approval = await fixture.administrator.approve(applicant.request, decision)
+    expect(fixture.administrator.snapshot.revision).toBe(1n)
+    expect((await fixture.log.head()).position).toBe(pendingHead.position + 1)
+    await verifyEnrollmentApproval(fixture.provisioned.descriptor, applicant.request, approval)
+  })
+
+  it('preserves the signed finality provider selection through provisioning and restart', async () => {
+    const fixture = await setup(false)
+    const options = { ...fixture.provisionOptions, store: new MemoryOperationStore(),
+      providerId: 'alternate-finality-v1', providerParameters: new Uint8Array([7, 8]) }
+    const provisioned = await provisionMembership(options)
+    expect(provisioned.descriptor.history).toMatchObject({ providerId: options.providerId, providerParameters: options.providerParameters })
+    expect(provisioned.descriptor.genesis.manifest.historyPolicy).toMatchObject({ providerId: options.providerId,
+      providerParameters: options.providerParameters })
+    expect((await provisionMembership(options)).descriptor).toEqual(provisioned.descriptor)
+    await expect(provisionMembership({ ...options, providerParameters: new Uint8Array([7, 9]) }))
+      .rejects.toThrow('MEMBERSHIP_CONFIGURATION_CONFLICT')
+    // This native HTTP adapter must not silently substitute its built-in verifier.
+    await expect(MembershipAdministrator.open({ ...provisioned, store: options.store, ledger: fixture.ledger }))
+      .rejects.toThrow('FINALITY_PROVIDER_UNAVAILABLE')
+  })
+
   it('verifies a large application prefix using descriptors only, then enrolls and delivers historical keys', async () => {
     const fixture = await setup()
     let applicationBytes = 0
@@ -45,8 +82,9 @@ describe('portable thin membership administrator', () => {
     }
     const before = fixture.traffic.bytes
     await fixture.administrator.sync()
-    expect(fixture.administrator.progress.verifiedThrough).toBe(141)
+    expect(fixture.administrator.progress.verifiedThrough).toBe(143)
     expect(fixture.traffic.bytes - before).toBeLessThan(applicationBytes / 100)
+    const prefixThrough = fixture.administrator.progress.verifiedThrough
     const applicant = await joinRequest(fixture, 'browser')
     const approval = await fixture.administrator.approve(applicant.request, {
       operationId: 'approve-browser', roles: ['reader', 'writer'], grantFullHistory: true,
@@ -55,11 +93,12 @@ describe('portable thin membership administrator', () => {
     await verifyEnrollmentApproval(fixture.provisioned.descriptor, applicant.request, approval)
     expect(fixture.administrator.snapshot.revision).toBe(1n)
     const frontier = assertCanonicalCbor(approval.approval.target.frontier)
-    expect(frontier).toEqual([3n, fixture.provisioned.descriptor.history.groupId, 'coordinated', fixture.historyId,
-      BigInt(fixture.administrator.progress.verifiedThrough), fixture.administrator.progress.root])
-    const page = fixture.administrator.read({ after: 141 })
+    const closure = decodeFinalityClosureRecord((await fixture.log.read()).at(-1)!.bytes)
+    expect(frontier).toEqual([4n, fixture.provisioned.descriptor.history.groupId, 'chronological', fixture.historyId,
+      BigInt(closure.includedHead.position), closure.includedHead.root, closure.closedThroughMs])
+    const page = fixture.administrator.read({ after: prefixThrough })
     await verifyPrefixCertificate(page.certificate, fixture.configuration)
-    const deliveries = page.entries.map(entry => decodeLedgerRecord(entry.bytes)).filter(record => record.kind === 'epoch-manifest')
+    const deliveries = page.entries.filter(entry => !isFinalityClosureRecord(entry.bytes)).map(entry => decodeLedgerRecord(entry.bytes)).filter(record => record.kind === 'epoch-manifest')
     expect(deliveries).toHaveLength(1)
     const key = await unwrapEpochKey({ signedManifest: epochFromEnvelope(deliveries[0]!.inlinePayload!),
       trustedSigner: fixture.provisioned.identity.publicKeyBytes, recipientId: applicant.identity.signing.publicKeyBytes,
@@ -95,7 +134,7 @@ describe('portable thin membership administrator', () => {
     const result = await administrator.revoke(revoke), head = await fixture.log.head()
     expect(result.epoch).toBe(1n)
     expect(administrator.snapshot.capabilities.get(bytesToHex(approved.approval.capabilityIds[0]!))!.revokedAtRevision).toBe(2n)
-    const lastEpoch = [...await fixture.log.read()].reverse().map(entry => decodeLedgerRecord(entry.bytes)).find(record => record.kind === 'epoch-manifest')!
+    const lastEpoch = [...await fixture.log.read()].reverse().filter(entry => !isFinalityClosureRecord(entry.bytes)).map(entry => decodeLedgerRecord(entry.bytes)).find(record => record.kind === 'epoch-manifest')!
     expect(epochFromEnvelope(lastEpoch.inlinePayload!).manifest.wraps).toEqual([])
     expect(await administrator.revoke(revoke)).toEqual(result)
     expect(await fixture.log.head()).toEqual(head)
@@ -128,7 +167,7 @@ describe('portable thin membership administrator', () => {
     await fixture.log.append(malformed)
     await fixture.log.append(foreign.recordBytes)
     await fixture.administrator.sync()
-    expect(fixture.administrator.progress.verifiedThrough).toBe(3)
+    expect(fixture.administrator.progress.verifiedThrough).toBe(5)
     expect(fixture.administrator.snapshot.revision).toBe(0n)
     const applicant = await joinRequest(fixture, 'after-invalid-position')
     const approval = await fixture.administrator.approve(applicant.request, {
@@ -136,7 +175,7 @@ describe('portable thin membership administrator', () => {
     })
     await verifyEnrollmentApproval(fixture.provisioned.descriptor, applicant.request, approval)
     expect(fixture.administrator.snapshot.revision).toBe(1n)
-    const retained = fixture.administrator.read({ after: 1 })
+    const retained = fixture.administrator.read({ after: 2 })
     expect(retained.entries[0]!.bytes).toEqual(malformed)
     expect(retained.entries[1]!.bytes).toEqual(foreign.recordBytes)
     await verifyPrefixCertificate(retained.certificate, fixture.configuration)
@@ -180,7 +219,7 @@ describe('signed native membership ledger protocol', () => {
     const page = await client.read({ after: 0, limit: 1 })
     expect(page.entries).toHaveLength(1)
     expect(await client.append(page.entries[0]!.bytes)).toEqual(page.entries[0])
-    expect(await fixture.log.head()).toMatchObject({ position: 1 })
+    expect(await fixture.log.head()).toMatchObject({ position: 2 })
   })
 })
 
@@ -201,9 +240,15 @@ async function setup(withNativeReader = true) {
   const log = await ReferenceRecordLog.open(historyId, new MemoryOperationStore())
   const authority = createPrefixAuthority({ configuration, identity: native.signing, readHead: () => log.head() })
   const traffic = { bytes: 0 }
+  let closureClock = 100_000n
   const ledger: MembershipLedger = {
     append: bytes => log.append(bytes),
     read: async ({ after, limit }) => {
+      const previous = await log.read()
+      if (previous.length && !isFinalityClosureRecord(previous.at(-1)!.bytes)) {
+        await log.append(await createFinalityClosureRecord({ configuration, identity: native.signing,
+          includedHead: await log.head(), closedThroughMs: ++closureClock }))
+      }
       const all = await log.read(), entries = all.slice(after, after + limit)
       traffic.bytes += entries.reduce((sum, entry) => sum + entry.bytes.length, 0)
       return { entries, certificate: await authority.certify(), hasMore: after + entries.length < all.length }

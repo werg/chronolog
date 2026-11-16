@@ -6,7 +6,9 @@ The same protocol, membership, admission, history policy, materializer, SQL rest
 
 In the default coordinated composition, a portable Cloudflare membership
 administrator verifies the same complete small descriptor history as full peers;
-a fixed native authority orders it. Application envelopes are detached and fetched
+a native finality service proves inclusion and closes author time. Every browser
+sorts application proposals itself with the shared chronological comparator.
+Application envelopes are detached and fetched
 only through reader-authorized peers. A SQL-free events peer still receives and
 executes its application events, whereas the thin administrator has no application
 payload-fetch port. Signed genesis separately names the roster issuer and the

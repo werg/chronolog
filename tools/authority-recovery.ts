@@ -7,7 +7,7 @@ import { parseArgs } from 'node:util'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
 import { createDoltLiteExecutionManifest, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
-import { CoordinatedHistoryPolicy, decodeLedgerRecord, decodeOrderingEvidence, ReferenceRecordLog,
+import { CoordinatedHistoryPolicy, decodeLedgerRecord, decodeOrderingEvidence, isFinalityClosureRecord, ReferenceRecordLog,
   type CoordinatedHistoryConfiguration, type OrderedRecordHead } from '@chronolog/node-core'
 import { base64UrlToBytes } from '@chronolog/protocol'
 
@@ -16,6 +16,9 @@ import { fileSha256, git } from './lib/common.js'
 
 interface RecoveryState {
   readonly head: OrderedRecordHead
+  readonly receipts: readonly { readonly position: number; readonly root: string; readonly recordId: string; readonly kind: string }[]
+  readonly proposalCount: number
+  readonly closedThroughMs: string
   readonly authorityIdentity: string
   readonly executionManifestDigest: string
   readonly certificate: Readonly<Record<string, unknown>>
@@ -31,7 +34,8 @@ interface ChildResult { readonly status: number | null; readonly signal: NodeJS.
 interface HoldingAuthority {
   readonly state: RecoveryState
   readonly configuration: { readonly kind: 'coordinated'; readonly historyId: string; readonly authorityPublicKey: string;
-    readonly groupId: string; readonly genesisDigest: string; readonly executionManifestDigest: string }
+    readonly groupId: string; readonly genesisDigest: string; readonly executionManifestDigest: string;
+    readonly providerId?: string; readonly providerParameters?: string }
   readonly evidence: readonly string[]
 }
 
@@ -94,9 +98,17 @@ try {
       assert(crashed.signal === 'SIGKILL' || crashed.status === 137, `${crashed.stdout}\n${crashed.stderr}`)
       assert(crashed.stdout.includes(`"point":"${point}"`))
       const raw = await inspectStoppedAuthority(directory)
-      const committed = ['after_record_commit', 'after_certificate_commit', 'before_acknowledgement'].includes(point)
-      assert.equal(raw.head.position, before.head.position + (committed ? 1 : 0))
-      assert.deepEqual(raw.entries.slice(0, before.head.position).map(entry => entry.recordId), before.payloads.map(entry => entry.recordId))
+      const committed = !['before_payload_commit', 'after_payload_commit', 'before_record_commit'].includes(point)
+      assert.equal(raw.proposalCount, before.proposalCount + (committed ? 1 : 0))
+      assert.deepEqual(raw.entries.slice(0, before.head.position).map(entry => entry.recordId), before.receipts.map(entry => entry.recordId))
+      const target = raw.entries.filter(entry => entry.kind === 'candidate')[before.proposalCount]
+      const closure = target === undefined ? undefined : raw.closures.find(item => item.includedHead.position >= target.position)
+      assert.equal(closure !== undefined,
+        ['after_closure_commit', 'before_certificate_commit', 'after_certificate_commit', 'before_acknowledgement'].includes(point))
+      if (closure !== undefined) {
+        const certified = raw.certificate?.kind === 'prefix-certificate' ? raw.certificate.certificate.position : -1
+        assert.equal(certified >= closure.position, ['after_certificate_commit', 'before_acknowledgement'].includes(point))
+      }
       if (point === 'after_certificate_commit' || point === 'before_acknowledgement') {
         assert.equal(raw.certificate?.kind, 'prefix-certificate')
         if (raw.certificate?.kind === 'prefix-certificate') {
@@ -106,14 +118,17 @@ try {
       }
       const recovered = state(child('submit', directory, operation))
       assertTerminal(recovered, operation)
-      assert.equal(recovered.head.position, before.head.position + 1)
+      assert.equal(recovered.proposalCount, before.proposalCount + 1)
+      assert.equal(recovered.payloads.length, before.payloads.length + 1)
+      assert.deepEqual(recovered.receipts.slice(0, before.head.position).map(entry => entry.recordId), before.receipts.map(entry => entry.recordId))
       const retried = state(child('submit', directory, operation))
       assert.equal(retried.operations[operation]?.proposalId, recovered.operations[operation]?.proposalId)
-      assert.deepEqual(retried.head, recovered.head)
+      assertSameState(retried, recovered)
       assert.deepEqual(retried.rows, recovered.rows)
       assert.deepEqual(retried.events, recovered.events)
       assert(retried.payloads.every(payload => payload.payloadBytes !== null))
-      checked(`crash/${point}/${operation}`, { before, afterCrash: raw, recovered, exactRetry: retried.head })
+      checked(`crash/${point}/${operation}`, { before, afterCrash: raw, recovered,
+        exactRetry: { head: retried.head, proposalCount: retried.proposalCount, closedThroughMs: retried.closedThroughMs } })
     }
   }
 
@@ -157,7 +172,9 @@ try {
     two = new NativeAgentStore(join(volumes, 'retained-observer-two.sqlite'))
     const publicConfiguration: CoordinatedHistoryConfiguration = { kind: 'coordinated', historyId: held.value.configuration.historyId,
       authorityPublicKey: base64UrlToBytes(held.value.configuration.authorityPublicKey), groupId: base64UrlToBytes(held.value.configuration.groupId),
-      genesisDigest: base64UrlToBytes(held.value.configuration.genesisDigest), executionManifestDigest: base64UrlToBytes(held.value.configuration.executionManifestDigest) }
+      genesisDigest: base64UrlToBytes(held.value.configuration.genesisDigest), executionManifestDigest: base64UrlToBytes(held.value.configuration.executionManifestDigest),
+      ...(held.value.configuration.providerId === undefined ? {} : { providerId: held.value.configuration.providerId }),
+      ...(held.value.configuration.providerParameters === undefined ? {} : { providerParameters: base64UrlToBytes(held.value.configuration.providerParameters) }) }
     const first = await CoordinatedHistoryPolicy.open(publicConfiguration, one)
     const second = await CoordinatedHistoryPolicy.open(publicConfiguration, two)
     projection = await DeterministicMaterializer.open({ path: projectionPath, executionManifest: createDoltLiteExecutionManifest(),
@@ -170,11 +187,13 @@ try {
     // The process has exited. Only the first peer's retained public evidence is used.
     for (const evidence of [...first.evidence()].reverse()) await second.ingest(evidence)
     assert.deepEqual(second.progress, first.progress)
+    assert.deepEqual(second.snapshot(), first.snapshot())
+    assert.equal(second.closedThroughMs, BigInt(held.value.state.closedThroughMs))
     const rows = projection.localSql('SELECT id, value FROM recovery_probe ORDER BY id', [], { view: 'final' }).rows
     assert.deepEqual(rows, held.value.state.rows)
     checked('authority-process-loss-with-independent-retained-readers', { termination: killed.signal, authorityProcessExited: true,
       previouslyAcknowledgedHead: held.value.state.head, independentlyOpenStores: 3, authorityPrivateKeysCopied: 0,
-      finalSqlRowsAfterProcessExit: rows, relayedProgress: second.progress,
+      finalSqlRowsAfterProcessExit: rows, relayedProgress: second.progress, closedThroughMs: second.closedThroughMs,
       evidenceBytes: held.value.evidence.reduce((sum, item) => sum + base64UrlToBytes(item).length, 0),
       applicationBodiesNeededForCertificateRelay: 0, publicNetworkClaim: false })
   } finally {
@@ -203,15 +222,17 @@ try {
       await descriptorStore.put(key, value)
     }
     const log = await ReferenceRecordLog.open(historyId, descriptorStore)
-    assert.deepEqual(await log.head(), resumed.head)
-    const descriptors = (await log.read()).map(entry => decodeLedgerRecord(entry.bytes))
+    const retained = await log.read()
+    assert(retained.length >= resumed.head.position)
+    assert.equal(retained[resumed.head.position - 1]?.root, resumed.head.root)
+    const descriptors = retained.filter(entry => !isFinalityClosureRecord(entry.bytes)).map(entry => decodeLedgerRecord(entry.bytes))
     const missing = descriptors.filter(descriptor => descriptor.inlinePayload === null)
     for (const descriptor of missing) {
       assert.equal(await descriptorStore.get(`agent/authority/${historyId}/payload/${descriptor.payloadHash}`), null)
     }
     assert(missing.length > 0)
     checked('descriptor-survival-is-not-payload-survival', { head: await log.head(),
-      descriptorCount: descriptors.length, inlineControls: descriptors.length - missing.length,
+      descriptorCount: descriptors.length, closureCount: retained.length - descriptors.length, inlineControls: descriptors.length - missing.length,
       missingDetachedBodies: missing.length, missingCommittedEnvelopeBytes: missing.reduce((sum, descriptor) => sum + descriptor.payloadLength, 0),
       retainedValueBytes: descriptorStore.usageBytes(), applicationReplayClaim: false })
   } finally { fullStore.close(); descriptorStore.close() }
@@ -219,6 +240,7 @@ try {
   // A separate lineage has exactly one current disk and an older offline backup.
   const doomed = join(volumes, 'only-current-disk'), stale = join(volumes, 'stale-backup')
   const old = state(child('initialize', doomed))
+  const backupHead = (await inspectStoppedAuthority(doomed)).head
   await copyClosedVolume(doomed, stale)
   const backupAt = new Date().toISOString()
   const acknowledged = state(child('after-backup', doomed))
@@ -229,12 +251,13 @@ try {
   const refusal = child('inspect', stale, 'accepted', 'none', latest)
   assert.notEqual(refusal.status, 0)
   assert.match(refusal.stderr, /AUTHORITY_CONTINUITY_NOT_ESTABLISHED/u)
-  assert.deepEqual((await inspectStoppedAuthority(stale)).head, old.head)
+  assert.deepEqual((await inspectStoppedAuthority(stale)).head, backupHead)
   const replacement = state(child('initialize', join(volumes, 'explicit-new-lineage')))
   assert.notEqual(replacement.head.historyId, acknowledged.head.historyId)
   assert.notEqual(replacement.authorityIdentity, acknowledged.authorityIdentity)
-  checked('permanent-latest-disk-loss', { backupAt, acknowledgedAt, backupHead: old.head, lastAcknowledgedHead: acknowledged.head,
-    knownBackupLagRecords: acknowledged.head.position - old.head.position,
+  checked('permanent-latest-disk-loss', { backupAt, acknowledgedAt, backupHead, lastAcknowledgedHead: acknowledged.head,
+    knownBackupLagReceipts: acknowledged.head.position - backupHead.position,
+    knownBackupLagProposals: acknowledged.proposalCount - old.proposalCount,
     knownBackupLagElapsedMs: Date.parse(acknowledgedAt) - Date.parse(backupAt),
     retainedIndependentEvidence: 'latest acknowledged head outside both volumes',
     staleRestoreResult: 'AUTHORITY_CONTINUITY_NOT_ESTABLISHED', decision: 'new lineage; old history never resumed',
@@ -265,9 +288,16 @@ function assertTerminal(state: RecoveryState, operation: RecoveryOperation) {
   assert.equal(state.events.length, operation === 'accepted' ? 1 : 0)
 }
 function assertSameState(actual: RecoveryState, expected: RecoveryState) {
-  for (const key of ['head', 'authorityIdentity', 'executionManifestDigest', 'certificate', 'feed', 'operations', 'rows', 'events', 'payloads'] as const) {
+  for (const key of ['authorityIdentity', 'executionManifestDigest', 'feed', 'operations', 'rows', 'events', 'payloads', 'proposalCount'] as const) {
     assert.deepEqual(actual[key], expected[key], `RESTORE_CHANGED_${key}`)
   }
+  assert(actual.head.position >= expected.head.position, 'RESTORE_REGRESSED_RECEIPTS')
+  assert.deepEqual(actual.receipts.slice(0, expected.head.position), expected.receipts, 'RESTORE_CHANGED_RECEIPT_PREFIX')
+  assert(BigInt(actual.closedThroughMs) >= BigInt(expected.closedThroughMs), 'RESTORE_REGRESSED_CUTOFF')
+  assert.equal(actual.certificate.historyId, actual.head.historyId)
+  assert.equal(actual.certificate.position, actual.head.position)
+  assert.equal(actual.certificate.root, actual.head.root)
+  assert.equal(actual.certificate.configuration, expected.certificate.configuration)
 }
 async function copyClosedVolume(source: string, destination: string) {
   const before = await manifest(source)

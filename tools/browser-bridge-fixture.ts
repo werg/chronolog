@@ -11,7 +11,7 @@ import {
   createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer,
 } from '@chronolog/materializer-doltlite'
 import {
-  createEnrollmentService, createGovernedNode, loadOrCreateEnrollmentIdentity,
+  createEnrollmentService, createGovernedNode, decodeFinalityClosureRecord, evaluateFinalitySnapshot, isFinalityClosureRecord, loadOrCreateEnrollmentIdentity, Mutex,
   type EnrollmentRole, type GovernedNode,
 } from '@chronolog/node-core'
 import {
@@ -79,6 +79,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       !equalBytes(history.executionManifestDigest, executionManifestDigest) ||
       !equalBytes(history.authorityPublicKey, authority.signing.publicKeyBytes)) throw new Error('BRIDGE_FIXTURE_CONFIGURATION_MISMATCH')
   const log = await ReferenceRecordLog.open(history.historyId, new SqliteOperationStore(logState.database))
+  const appendMutex = new Mutex()
   const token = crypto.randomUUID()
   let governed: GovernedNode | undefined
   const peerToken = crypto.randomUUID()
@@ -125,9 +126,15 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       const requestedHistory = url.searchParams.get('historyId')
       if (requestedHistory !== null && requestedHistory !== log.historyId) return new Response(null, { status: 409 })
       if (request.method === 'POST' && url.pathname === '/records/entries') {
-        const input = await request.json() as { historyId?: string; record?: string }
+        const input = await request.json() as { historyId?: string; record?: string; expectedHead?: { position: number; root: string } }
         if (input.historyId !== log.historyId || typeof input.record !== 'string') return new Response(null, { status: 400 })
-        const entry = await log.append(decodeRecord(input.record))
+        const bytes = decodeRecord(input.record)
+        const entry = await appendMutex.run(async () => {
+          const current = await log.head()
+          if (input.expectedHead !== undefined && (input.expectedHead.position !== current.position || input.expectedHead.root !== current.root)) return null
+          return log.append(bytes)
+        })
+        if (entry === null) return Response.json({ code: 'record_head_conflict' }, { status: 409 })
         if (loseAppendResponse) {
           loseAppendResponse = false
           lostAppend = { position: entry.position, recordId: entry.recordId }
@@ -227,6 +234,8 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       request: (url, init) => new Request(url, init), response: (body, init) => new Response(body, init),
     }
     const handler = withTendrillerAuthority(engine, { configuration, identity: authority.signing, records, http,
+      cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
+      futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
       authorize: authorizeThroughRecordLog(engine, { base: hubUrl, historyId: log.historyId, http }) })
     dispatch = (request) => handler.fetch(request, {}, {})
     const adapter = new TendrillerTransport({ local, records, configuration, groupRoute, watch: false,
@@ -246,13 +255,29 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       transport: new InProcessRpcTransport(new NodeRpcService({ node: root.node, enrollment })), unaryRetryAttempts: 1 })
     const native = client
     const syncEvidence = async () => {
-      peerHttp.assertHealthy()
-      await adapter.catchUp()
-      for (const evidence of await local.evidenceHistory()) await root.node.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
-      await root.node.waitForIdle()
-      const status = await root.node.status()
-      if (status.lastError !== undefined) throw new Error(`BRIDGE_NATIVE_SYNC_FAILED: ${status.lastError}`)
-      if (root.node.finalThrough !== (await log.head()).position) throw new Error('BRIDGE_NATIVE_PREFIX_INCOMPLETE')
+      const throughMs = BigInt(Date.now())
+      const deadline = Date.now() + 10_000
+      for (;;) {
+        peerHttp.assertHealthy()
+        await adapter.catchUp()
+        for (const evidence of await local.evidenceHistory()) await root.node.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
+        await root.node.waitForIdle()
+        const status = await root.node.status()
+        if (status.lastError !== undefined) throw new Error(`BRIDGE_NATIVE_SYNC_FAILED: ${status.lastError}`)
+        const retained = await log.read()
+        const marker = retained.at(-1)
+        if (marker === undefined || !isFinalityClosureRecord(marker.bytes)) throw new Error('BRIDGE_NATIVE_CLOSURE_MISSING')
+        const closure = decodeFinalityClosureRecord(marker.bytes)
+        if (root.node.finalThrough < closure.includedHead.position) throw new Error('BRIDGE_NATIVE_PREFIX_INCOMPLETE')
+        const proof = await evaluateFinalitySnapshot(configuration, retained)
+        const allowance = genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs
+        const horizon = proof.records.reduce((last, record) => record.closureBoundary === null ? last :
+          record.closureBoundary.closedThroughMs + allowance > last ? record.closureBoundary.closedThroughMs + allowance : last, -1n)
+        const target = throughMs < horizon ? throughMs : horizon
+        if (closure.closedThroughMs >= target) return
+        if (Date.now() >= deadline) throw new Error('BRIDGE_NATIVE_CLOSURE_TIMEOUT')
+        await new Promise(resolve => setTimeout(resolve, Math.min(Number(target - closure.closedThroughMs) + 1, 1_000)))
+      }
     }
     const finalize = async (handle: TransactionHandle) => {
       try {
@@ -283,6 +308,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
         rows: root.node.localSql('SELECT id, claimed_by FROM tasks ORDER BY id', [], { view: 'final' }).rows,
         outcomes: await Promise.all(transactionIds.map((transactionId) => native.getTransactionOutcome(transactionId))),
         logPosition: (await log.head()).position,
+        includedRecordCount: (await log.read()).filter(entry => !isFinalityClosureRecord(entry.bytes)).length,
       }
     }
     return {

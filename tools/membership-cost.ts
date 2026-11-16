@@ -10,6 +10,7 @@ import { parseArgs } from 'node:util'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
 import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
+import { isFinalityClosureRecord } from '@chronolog/node-core/finality'
 import {
   MembershipAdministrator, createMembershipLedgerClient, encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity,
   prepareEnrollmentRequest, provisionMembership, verifyEnrollmentApproval, type DurableOperationStore,
@@ -73,7 +74,7 @@ const report = {
     'Store put counts and value bytes are logical durable writes, not provider SQL row billing, block writes, or write amplification.',
     'Live file sizes include SQLite WAL/SHM and materializer files; closed sizes are separate. Neither is time-integrated billed storage.',
     'No backup was taken and no blob was replicated. A committed descriptor does not establish any second durable payload copy.',
-    'Inline control envelopes are a subset of inline control descriptor bytes. Traffic includes repeated transfers.',
+    'Inline control envelopes are a subset of inline control descriptor bytes. Closure records are counted separately. Traffic includes repeated transfers.',
   ],
 }
 const save = () => writeFile(join(output, 'report.json'), `${JSON.stringify(report, (_key, value: unknown) => typeof value === 'bigint' ? String(value) : value, 2)}\n`)
@@ -130,12 +131,24 @@ try {
     return result
   }, result => ({ signedApprovalSha256: createHash('sha256').update(encodeSignedEnrollmentApproval(result)).digest('hex') }))
   await phase('approval-exact-retry', async () => {
-    const before = (await native!.snapshot()).head.position
+    await administrator!.sync()
+    const before = administrator!.progress.verifiedThrough
     const retried = await administrator!.approve(request, decision)
     assert.deepEqual(encodeSignedEnrollmentApproval(retried), encodeSignedEnrollmentApproval(approval))
     await assert.rejects(administrator!.approve(request, { ...decision, roles: ['reader'] }))
-    assert.equal((await native!.snapshot()).head.position, before)
-    return { newOrderedEntries: 0, conflictingRequestRefused: true }
+    await administrator!.sync()
+    const through = administrator!.progress.verifiedThrough
+    let cursor = before, newClosureRecords = 0
+    while (cursor < through) {
+      const page = administrator!.read({ after: cursor })
+      assert(page.entries.length > 0)
+      for (const entry of page.entries) {
+        assert(isFinalityClosureRecord(entry.bytes), 'Exact approval retry appended an application or control descriptor')
+        newClosureRecords += 1
+        cursor = entry.position
+      }
+    }
+    return { newApplicationOrControlEntries: 0, newClosureRecords, newReceiptEntries: through - before, conflictingRequestRefused: true }
   })
   report.checks.push('lost append reply, administrator reopen and exact/conflicting approval retries preserve original identity and decision')
   const capabilities = [...administrator.snapshot.capabilities.values()].filter(capability =>
@@ -150,13 +163,20 @@ try {
   }
   await phase('future-epoch-payload', () => native!.publishWorkload({ namespace: 'future', count: 1, payloadBytes: 4096 }))
   report.checks.push('enrollment and writer/reader revocation with future epoch payload are included in per-phase costs')
+  // Pin a finite catch-up target. The finality service may append another idle
+  // closure while the measurement reads the administrator and native views.
+  const target = (await native.snapshot()).head
+  await administrator.sync()
+  const verifiedThrough = administrator.progress.verifiedThrough
   const final = await native.snapshot()
   assert.equal(final.traffic.applicationEnvelopeBytesToAdministrator, 0)
   assert.equal(final.traffic.unexpectedAdministratorRequests, 0)
-  assert.equal(administrator.progress.verifiedThrough, final.head.position)
+  assert(verifiedThrough >= target.position)
+  assert(verifiedThrough <= final.head.position)
+  if (target.position > 0) assert.equal(administrator.read({ after: target.position - 1, limit: 1 }).entries[0]?.root, target.root)
   assert.equal(final.schemaRoles.membershipRootGroupMembers, 0)
   report.checks.push('instrumented signed native endpoint returns no application envelopes and administrator attempts no body endpoint')
-  report.final = { traffic: final.traffic, verifiedThrough: administrator.progress.verifiedThrough,
+  report.final = { traffic: final.traffic, verifiedThrough, verifiedTarget: target, observedHead: final.head,
     nativeFinalThrough: final.finalThrough, administrator: measured.snapshot(),
     nativeLiveFiles: await directoryBytes(nativeDirectory),
     deviceValueBytes: deviceStore.usageBytes(), backup: { measured: false, latestDurableCopy: null, lag: null },

@@ -25,6 +25,7 @@ import { createPrefixAuthority, encodeOrderingEvidence, ReferenceRecordLog } fro
 import type { CoordinatedHistoryConfiguration } from './history-policy.js'
 import { MemoryOperationStore } from './operations.js'
 import { createLedgerRecord } from './ledger-record.js'
+import { createFinalityClosureRecord } from './finality.js'
 import { encodeSignedEnvelope } from './wire.js'
 
 const cleanup: Array<() => Promise<void>> = []
@@ -49,8 +50,8 @@ class ReferenceSubmissionTransport extends PortableFeedTransport {
   }
 }
 
-describe('governed coordinated native replicas', () => {
-  it('activates live enrollment and revocation at certified positions, ignores backdating and never revives an old grant', async () => {
+describe('governed chronological native replicas with a finality provider', () => {
+  it('activates membership at closed author-time boundaries, rejects backdating and never revives an old grant', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-governed-coordinated-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true, maxRetries: 5 }))
     const administratorStore = new MemoryOperationStore(), joiningStore = new MemoryOperationStore()
@@ -84,6 +85,7 @@ describe('governed coordinated native replicas', () => {
     }
     const log = await ReferenceRecordLog.open(historyId, new MemoryOperationStore())
     const authority = createPrefixAuthority({ configuration, identity: authorityIdentity, readHead: () => log.head() })
+    let now = 1_000
 
     const open = async (name: string, identity: EnrollmentIdentity, store: MemoryOperationStore) => {
       const transport = new ReferenceSubmissionTransport({
@@ -93,7 +95,7 @@ describe('governed coordinated native replicas', () => {
       const materializer = await DeterministicMaterializer.open({ path: join(directory, `${name}.db`), executionManifest,
         rootAdministrator: administrator.signing.publicKeyBytes })
       const governed = await createGovernedNode({ genesis, groupRoute, identity: identity.signing, transport,
-        operationStore: store, materialization: createDoltLiteMaterializationRuntime(materializer),
+        operationStore: store, materialization: createDoltLiteMaterializationRuntime(materializer), clock: { now: () => now },
         recipient: { id: identity.signing.publicKeyBytes, privateKey: identity.reader.privateKey }, initialEpochContentKey: bytes32(22),
       })
       cleanup.push(() => governed.close())
@@ -103,6 +105,10 @@ describe('governed coordinated native replicas', () => {
     const admin = await open('administrator', administrator, administratorStore)
     const peers = [admin]
     const certify = async () => {
+      now += 100
+      await log.append(await createFinalityClosureRecord({ configuration, identity: authorityIdentity,
+        includedHead: await log.head(), closedThroughMs: BigInt(now) }))
+      now += 1
       const entries = await log.read(), certificate = await authority.certify()
       for (const peer of peers) {
         for (const entry of entries) await peer.node.ingestOrderingEvidence({ kind: 'ordered-entry', entry })
@@ -143,34 +149,36 @@ describe('governed coordinated native replicas', () => {
     await certify()
     expect(newcomer.activeSnapshot.revision).toBe(1n)
     expect((await progress()).state).toBe('ready')
-    const accepted = await newcomer.node.publish({ operationId: 'first-member-write', authorTimestampMs: 100n,
+    const accepted = await newcomer.node.publish({ operationId: 'first-member-write',
       program: program('INSERT INTO notes (id, value) VALUES (2, 20)') })
     await certify()
     expect(newcomer.node.outcome(accepted.txId)?.outcome).toBe('accepted')
     const oldRevision = newcomer.node.membershipRevision
     const oldWriter = [...newcomer.activeSnapshot.capabilities.values()].find((capability) =>
       capability.grant.role === 'writer' && bytesToHex(capability.grant.signingPublicKey) === bytesToHex(joining.signing.publicKeyBytes))!
-    const staleProposal = async (nonce: number, program: ChangeProgram) => {
+    const staleProposal = async (nonce: number, program: ChangeProgram, authorTimestampMs = BigInt(now)) => {
       const core: TransactionCore = {
         operationId: `stale-${nonce}`,
         groupId: manifest.groupId, membershipRevision: oldRevision, validationPolicy: newcomer.node.validationPolicy,
-        authorId: joining.signing.publicKeyBytes, authorTimestampMs: 0n, nonce: bytes32(nonce),
+        authorId: joining.signing.publicKeyBytes, authorTimestampMs, nonce: bytes32(nonce),
         executionManifestDigest, writerCapability: oldWriter.id, program,
       }
       const canonical = encodeTransactionCore(core)
       const envelope = await encodeSignedEnvelope(groupRoute, 'candidate', canonical, joining.signing, newcomer.governance.cipherRing)
       return { envelope, txId: utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`) }
     }
-    const delayed = await staleProposal(23, program('INSERT INTO notes (id, value) VALUES (3, 999)'))
+    const delayed = await staleProposal(23, program('INSERT INTO notes (id, value) VALUES (3, 999)'), 0n)
     const priorRows = admin.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows
     await admin.governance.revoke([oldWriter.id], administrator.signing.privateKey, { operationId: 'revoke-writer' })
     await newcomer.transport.catchUp()
     for (const record of await newcomer.transport.history()) await newcomer.governance.ingest(record)
     expect(newcomer.governance.snapshot.revision).toBe(2n)
     expect(newcomer.activeSnapshot.revision).toBe(1n)
+    await certify()
+    expect(newcomer.activeSnapshot.revision).toBe(2n)
     await newcomer.transport.publish(delayed.envelope)
     // Consume the unfinalized proposal before recording notification progress.
-    // Its later authorization rejection changes finality without changing SQL.
+    // The closed-time rejection changes finality without changing SQL.
     for (const peer of peers) {
       await peer.transport.catchUp()
       for (const record of await peer.transport.history()) await peer.node.ingest(record)
@@ -180,7 +188,7 @@ describe('governed coordinated native replicas', () => {
     await certify()
     for (const [index, peer] of peers.entries()) {
       expect(peer.activeSnapshot.revision).toBe(2n)
-      expect(peer.node.outcome(delayed.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'WRITER_UNAUTHORIZED' })
+      expect(peer.node.outcome(delayed.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' })
       expect(peer.node.isFinal(delayed.txId)).toBe(true)
       expect(peer.node.outcome(accepted.txId)?.outcome).toBe('accepted')
       expect(peer.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows).toEqual(priorRows)
@@ -200,7 +208,7 @@ describe('governed coordinated native replicas', () => {
     await certify()
     for (const peer of peers) {
       expect(peer.activeSnapshot.revision).toBe(3n)
-      expect(peer.node.outcome(delayed.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
+      expect(peer.node.outcome(delayed.txId)?.rejectionCode).toBe('FINALITY_TIMESTAMP_CLOSED')
       expect(peer.node.outcome(staleAgain.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
       expect(peer.node.outcome(fresh.txId)?.outcome).toBe('accepted')
       expect(peer.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows).toEqual([
@@ -235,7 +243,7 @@ describe('governed coordinated native replicas', () => {
     await reopened.node.waitForIdle()
     expect((await reopened.node.status()).lastError).toBeUndefined()
     expect(reopened.activeSnapshot.revision).toBe(3n)
-    expect(reopened.node.outcome(delayed.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
+    expect(reopened.node.outcome(delayed.txId)?.rejectionCode).toBe('FINALITY_TIMESTAMP_CLOSED')
     expect(reopened.node.outcome(staleAgain.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
     expect(reopened.node.outcome(fresh.txId)?.outcome).toBe('accepted')
     expect(reopened.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows)

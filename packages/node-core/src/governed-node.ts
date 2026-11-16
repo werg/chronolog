@@ -12,13 +12,17 @@ import { EnrollmentIssuer, verifyEnrollmentDescriptor, type EnrollmentDescriptor
 import type { FeedForkRegistry } from './feed-forks.js'
 import { GovernanceActivationIndex } from './governance-activation.js'
 import { GovernanceControlPlane, isInvalidGovernanceRecord } from './governance.js'
-import { CoordinatedHistoryPolicy } from './history-policy.js'
+import { SignedInclusionFinalityProvider, encodeHistoryConfiguration, type CoordinatedHistoryConfiguration } from './history-policy.js'
+import type { FinalityProvider } from './finality.js'
 import { ChronologNode } from './node.js'
 import type { DurableOperationStore } from './operations.js'
 import { PeerGovernanceController } from './peer-governance.js'
 import type { Clock, OperationalMembershipState, RandomSource, ValidatorOptions } from './types.js'
 
 export interface GovernedNodeOptions {
+  /** Verifiers are selected by the provider ID and parameters signed in genesis. */
+  readonly finalityProviders?: Readonly<Record<string, (configuration: CoordinatedHistoryConfiguration,
+    store: DurableOperationStore) => Promise<FinalityProvider>>>
   readonly genesis: SignedGenesis
   readonly groupRoute: Uint8Array
   readonly identity: Ed25519KeyPair
@@ -50,9 +54,15 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
       }), groupId: genesis.manifest.groupId,
       genesisDigest: await hashDomain(DOMAINS.genesis, encodeGenesisManifest(genesis.manifest)),
       executionManifestDigest: options.materialization.queries.executionManifestDigest,
+      ...(configured.providerId === undefined ? {} : { providerId: configured.providerId }),
+      ...(configured.providerParameters === undefined ? {} : { providerParameters: configured.providerParameters }),
     },
   }
   await verifyEnrollmentDescriptor(descriptor)
+  const futureAdmissionWindowMs = Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs)
+  if (configured.kind === 'coordinated' && (!Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0)) {
+    throw new Error('FINALITY_FUTURE_ADMISSION_WINDOW_INVALID')
+  }
   const governance = await GovernanceControlPlane.create({
     genesis, groupRoute: options.groupRoute, transport: options.transport,
     identity: options.identity, operationStore: options.operationStore,
@@ -61,8 +71,18 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
   const initial = governance.snapshot
   const validationPolicy = await validationPolicyId(genesis.manifest.validationPolicies[0]!)
   const activation = new GovernanceActivationIndex(initial, configured.kind)
-  const coordinated = descriptor.history.kind === 'coordinated'
-    ? await CoordinatedHistoryPolicy.open(descriptor.history, options.operationStore) : undefined
+  let coordinated: FinalityProvider | undefined
+  if (descriptor.history.kind === 'coordinated') {
+    const providerId = descriptor.history.providerId ?? 'signed-inclusion-v1'
+    const factory = options.finalityProviders?.[providerId]
+    if (factory !== undefined) coordinated = await factory(structuredClone(descriptor.history), options.operationStore)
+    else if (providerId === 'signed-inclusion-v1') {
+      coordinated = await SignedInclusionFinalityProvider.open(descriptor.history, options.operationStore)
+    } else throw new Error('FINALITY_PROVIDER_UNAVAILABLE')
+    if (!equalBytes(encodeHistoryConfiguration(coordinated.configuration), encodeHistoryConfiguration(descriptor.history))) {
+      throw new Error('FINALITY_PROVIDER_CONFIGURATION_MISMATCH')
+    }
+  }
   const peer = configured.kind === 'peer' ? new PeerGovernanceController({
     genesis: initial, governance, groupRoute: options.groupRoute, transport: options.transport,
     identity: options.identity, store: options.operationStore, cipher: governance.cipherRing,
@@ -81,7 +101,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
       membershipRevision: snapshot.revisionDigest, validationPolicy,
       ...(writer === undefined ? {} : { writerCapability: writer.id }),
       ...(validator === undefined ? {} : { validatorCapability: validator.id }),
-      ...(peer === undefined ? {} : { minimumAuthorTimestampMs: peer.minimumAuthorTimestampMs }),
+      minimumAuthorTimestampMs: peer?.minimumAuthorTimestampMs ?? activation.activationBoundary + 1n,
     }
   }
   const membership = new CapabilityMembershipResolver({
@@ -90,7 +110,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
       if (peer !== undefined) return peer.ready
         ? context.authorTimestampMs === undefined ? peer.activeSnapshot : peer.snapshotFor(context)
         : null
-      return context.canonicalPosition === undefined ? activation.activeSnapshot : activation.snapshotFor(context)
+      return context.authorTimestampMs === undefined ? activation.activeSnapshot : activation.snapshotFor(context)
     },
   })
   const validatorCapability = membershipState().validatorCapability
@@ -108,20 +128,21 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
       validator: { ...options.validator, capabilityId: validatorCapability },
     }),
     historyPolicy: coordinated === undefined ? { kind: 'peer' } : {
-      kind: 'coordinated', policy: coordinated,
-      applyGovernanceRecord: async (entry) => {
+      kind: 'coordinated', policy: coordinated, futureAdmissionWindowMs,
+      applyGovernanceRecord: async (entry, cutoffMs) => {
         try {
-          const snapshot = await governance.ingestCanonical(entry, activation.activeSnapshot)
+          const snapshot = await governance.ingestFinalized(entry, activation.activeSnapshot, cutoffMs)
           if (snapshot !== null && snapshot.revision > activation.activeSnapshot.revision) {
             activation.observe(snapshot)
-            activation.activateCoordinated(snapshot, BigInt(entry.position))
+            activation.activateFinalized(snapshot, cutoffMs)
           }
         } catch (error) {
           if (!isInvalidGovernanceRecord(error)) throw error
-          // Known invalid administrative bytes occupy their canonical position.
+          // Known invalid control bytes are excluded without changing chronology.
         }
       },
-      encryptionEpochStatusAt: (position, epochId) => governance.canonicalEpochStatusAt(position, epochId),
+      hasEncryptionEpoch: (epochId, includedThrough) => governance.hasFinalizedEpoch(epochId, includedThrough),
+      encryptionEpochStatusAt: (timestamp, epochId) => governance.finalizedEpochStatusAt(timestamp, epochId),
     },
   })
   const abort = new AbortController()

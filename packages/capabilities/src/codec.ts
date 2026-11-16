@@ -174,26 +174,35 @@ function genesisToCbor(value: GenesisManifest): CborValue {
 function historyPolicyToCbor(value: NonNullable<GenesisManifest['historyPolicy']>): CborValue {
   protocolInvariant(value.executionManifestDigest.length === 32, 'SCHEMA_INVALID', 'History requires an execution manifest digest')
   protocolInvariant(value.kind === 'peer' || value.kind === 'coordinated', 'SCHEMA_INVALID', 'Unknown history policy')
+  const providerId = value.providerId ?? (value.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v1')
+  protocolInvariant(/^[a-z][a-z0-9._-]{0,127}$/u.test(providerId), 'SCHEMA_INVALID', 'Invalid finality provider')
+  const parameters = value.providerParameters ?? new Uint8Array()
+  protocolInvariant(parameters instanceof Uint8Array && parameters.length <= 16384, 'SCHEMA_INVALID', 'Invalid finality parameters')
   if (value.kind === 'coordinated') {
     protocolInvariant(typeof value.historyId === 'string' && /^h_[0-9a-f]{32}$/u.test(value.historyId), 'SCHEMA_INVALID', 'History identity is invalid')
     protocolInvariant(value.authorityPublicKey?.length === 32, 'SCHEMA_INVALID', 'Authority public key is invalid')
-    return [1n, value.executionManifestDigest, value.historyId, value.authorityPublicKey]
+    return [1n, value.executionManifestDigest, value.historyId, value.authorityPublicKey, providerId, parameters]
   }
   protocolInvariant(value.historyId === undefined && value.authorityPublicKey === undefined, 'SCHEMA_INVALID', 'Peer policy cannot carry an authority')
-  return [0n, value.executionManifestDigest]
+  protocolInvariant(providerId === 'peer-validators-v1' && parameters.length === 0, 'SCHEMA_INVALID', 'Unknown validator finality provider')
+  return [0n, value.executionManifestDigest, providerId, parameters]
 }
 
 function historyPolicyFromCbor(value: CborValue): NonNullable<GenesisManifest['historyPolicy']> {
   const fields = expectArray(value, 'genesis.history_policy')
-  if (fields[0] === 0n && fields.length === 2) return {
+  if (fields[0] === 0n && fields.length === 4) return {
     kind: 'peer', executionManifestDigest: expectBytes(fields[1]!, 'genesis.history_policy.manifest', 32),
+    providerId: expectString(fields[2]!, 'genesis.history_policy.provider'),
+    providerParameters: expectBytes(fields[3]!, 'genesis.history_policy.parameters'),
   }
-  protocolInvariant(fields[0] === 1n && fields.length === 4, 'SCHEMA_INVALID', 'History policy is invalid')
+  protocolInvariant(fields[0] === 1n && fields.length === 6, 'SCHEMA_INVALID', 'History policy is invalid')
   const policy = {
     kind: 'coordinated' as const,
     executionManifestDigest: expectBytes(fields[1]!, 'genesis.history_policy.manifest', 32),
     historyId: expectString(fields[2]!, 'genesis.history_policy.history'),
     authorityPublicKey: expectBytes(fields[3]!, 'genesis.history_policy.authority', 32),
+    providerId: expectString(fields[4]!, 'genesis.history_policy.provider'),
+    providerParameters: expectBytes(fields[5]!, 'genesis.history_policy.parameters'),
   }
   historyPolicyToCbor(policy)
   return policy

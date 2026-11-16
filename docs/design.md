@@ -164,20 +164,23 @@ replica verifies the complete preceding admission records before activating the
 next one. An admission published after that validator's closure cannot count
 for the closed revision.
 
-### Coordinated policy
+### Signed inclusion and pluggable finality
 
-The configuration fixes the group and genesis, execution manifest, history ID
-and authority key. Ordered entries bind exact record bytes to contiguous
-positions through a rolling hash. The authority reads its configured log's
-committed head and signs a prefix certificate; it does not execute SQL.
+The configuration fixes the group, execution manifest and finality verifier
+ID/parameters. An injected verifier proves inclusion and a closed author-time
+frontier; the core always uses the chronological comparator above.
 
-A replica accepts a final prefix only after verifying that certificate and
-every preceding entry. Canonical position determines order. Author timestamps
-remain deterministic SQL inputs and metadata; backdating cannot insert a
-later submission into an earlier prefix or bypass a revocation.
+The built-in signed-inclusion verifier uses exact receipt bytes, a rolling hash
+and prefix certificates. Independently signed closure records commit a complete
+included head and a monotone timestamp cutoff. Receipt positions are proof
+enumeration, never application execution order. All prior closures are retained,
+so a new first inclusion below its earlier cutoff is rejected consistently on
+reconnect and restart. Future-dated included proposals remain pending until a
+later closure covers their signed time. SQL and event finality require complete
+proofs, required payloads/keys and successful local replay of that prefix.
 
 Certificates are immutable evidence outside the log they certify. The
-optional Tendriller adapter maps its public record format to this policy;
+optional Tendriller adapter maps its public receipt format to this verifier;
 the same verifier works against an independent reference log. A stored append
 acknowledgment proves neither finality nor SQL success.
 
@@ -225,8 +228,8 @@ required keys, the matching engine and application of the captured final
 target. A descriptor supplies authenticated bootstrap configuration, not a
 bearer grant. Database membership and a relay's host permissions are distinct.
 
-Receiving governance does not activate it. Peer closures or a certified
-canonical position determine when a new revision takes effect. Revocation is
+Receiving governance does not activate it. Verified chronological closure
+boundaries determine when a new revision takes effect. Revocation is
 prospective in that order: earlier final outcomes remain unchanged, and a later
 regrant does not revive a revoked capability or a previously rejected proposal.
 
@@ -235,11 +238,11 @@ and wraps each epoch key to every reader's HPKE key; historical epochs are
 given to a reader only by an explicit administrator action. A replica can
 receive verified governance and historical keys from a complete certified
 prefix before replaying its earlier encrypted SQL. Membership activation still
-occurs at each control record's canonical position.
+follows its signed causal chain and proved author-time closure boundary.
 
 ## 8. Materialization
 
-The node passes its selected policy's order to one materializer, which does
+The node passes the fixed chronological order to one materializer, which does
 not independently re-sort it. Each published revision is a
 Dolt commit (`chronolog_head`, `chronolog_rev_*`); checkpoints
 (`chronolog_cp_*`) are kept every N transactions so a late arrival replays

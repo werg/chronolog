@@ -6,7 +6,8 @@ import { ChronologClient, OWNER_FOR_KEY_SQL } from '@chronolog/client'
 import {
   createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer,
 } from '@chronolog/materializer-doltlite'
-import { ChronologNode } from '@chronolog/node-core'
+import { ChronologNode, Mutex } from '@chronolog/node-core'
+import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
 import {
   CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog,
   type CoordinatedHistoryConfiguration,
@@ -41,6 +42,7 @@ async function hub(executionManifestDigest: Uint8Array) {
     groupId: bytes32(11), genesisDigest: bytes32(12), executionManifestDigest, authorityPublicKey: identity.publicKeyBytes,
   }
   const log = await ReferenceRecordLog.open(configuration.historyId, storage())
+  const writes = new Mutex(), clock = { now: 1_000 }
   let online = true
   const wire = (entry: Awaited<ReturnType<typeof log.append>>) => ({
     historyId: entry.historyId, position: entry.position, recordId: entry.recordId,
@@ -51,9 +53,19 @@ async function hub(executionManifestDigest: Uint8Array) {
     if (request.headers.get('Authorization') !== 'Bearer owner') return new Response(null, { status: 403 })
     const url = new URL(request.url)
     if (request.method === 'POST' && url.pathname.endsWith('/entries')) {
-      const { record, historyId } = await request.json() as { record: string; historyId: string }
+      const { record, historyId, expectedHead } = await request.json() as {
+        record: string; historyId: string; expectedHead?: { position: number; root: string }
+      }
       if (historyId !== configuration.historyId) return new Response(null, { status: 409 })
-      return Response.json(wire(await log.append(decodeRecord(record))))
+      return writes.run(async () => {
+        const previous = (await log.read()).find((entry) => encodeRecord(entry.bytes) === record)
+        if (previous !== undefined) return Response.json(wire(previous))
+        const head = await log.head()
+        if (expectedHead !== undefined && (head.position !== expectedHead.position || head.root !== expectedHead.root)) {
+          return Response.json({ error: { code: 'record_head_conflict', message: 'Retained head changed' } }, { status: 409 })
+        }
+        return Response.json(wire(await log.append(decodeRecord(record))))
+      })
     }
     const entries = await log.read()
     const head = { ...await log.head(), bytes: entries.reduce((size, entry) => size + entry.bytes.length, 0) }
@@ -70,16 +82,16 @@ async function hub(executionManifestDigest: Uint8Array) {
     request: (url, init) => new Request(url, init), response: (body, init) => new Response(body, init),
   }
   const handler = withTendrillerAuthority({ fetch: (request: Request, _env: object, _context: object) => serve(request) }, {
-    configuration, identity, records, http,
+    configuration, identity, records, http, now: () => clock.now, cutoffLagMs: 0,
     authorize: (request) => request.headers.get('Authorization') === 'Bearer owner',
   })
   const certificate = createCertificateFetcher({ url: 'https://hub.test/_chronolog/certificate', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => handler.fetch(new Request(input, init), {}, {}) })
-  return { configuration, records, certificate, log, offline: () => { online = false } }
+  return { configuration, records, certificate, log, clock, offline: () => { online = false } }
 }
 
 describe('Tendriller coordinated SQL connection', () => {
-  it('resolves two collective members claiming one task and replays certified SQL through a peer without the hub', async () => {
+  it('uses signed author time despite reversed claim receipts and replays final SQL through a peer without the hub', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-tendriller-sql-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true, maxRetries: 5 }))
     const executionManifest = createDoltLiteExecutionManifest()
@@ -100,6 +112,7 @@ describe('Tendriller coordinated SQL connection', () => {
       const node = new ChronologNode({
         groupId: authority.configuration.groupId, membershipRevision: bytes32(13), validationPolicy: bytes32(14), identity,
         transport, operationStore: saved, historyPolicy: { kind: 'coordinated', policy },
+        clock: { now: () => authority.clock.now + (name === 'alice' ? 2 : 1) },
         materialization: createDoltLiteMaterializationRuntime(materializer),
         membership: {
           canWrite: ({ writerId }) => [aliceKey, bobKey].some((key) => equalBytes(key.publicKeyBytes, writerId)),
@@ -118,6 +131,7 @@ describe('Tendriller coordinated SQL connection', () => {
     connectInProcess(alice.local, bob.local)
     const participants = [alice, bob]
     const sync = async () => {
+      authority.clock.now += 100
       for (const peer of participants) {
         await peer.adapter!.catchUp()
         for (const item of await peer.transport.evidenceHistory()) {
@@ -126,6 +140,13 @@ describe('Tendriller coordinated SQL connection', () => {
       }
     }
     const created = await alice.client.transaction(['CREATE TABLE tasks (id INTEGER PRIMARY KEY, claimed_by TEXT) STRICT'])
+    // The proposal is two milliseconds ahead of the first closure. It stays
+    // pending until time advances, without another application submission.
+    await alice.adapter!.catchUp()
+    for (const item of await alice.transport.evidenceHistory()) {
+      await alice.node.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes))
+    }
+    expect((await alice.client.getTransactionOutcome(created.transactionId)).outcome.type).toBe('pending')
     await sync(); await created.accepted()
     const team = await alice.client.ownership.createTeam({ invite: [bobKey.publicKeyBytes] })
     await sync(); await team.handle.accepted()
@@ -140,24 +161,25 @@ describe('Tendriller coordinated SQL connection', () => {
       "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",
       { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = 1', params: [name] },
     ]
-    const [aliceClaim, bobClaim] = await Promise.all([
-      alice.client.transaction(claim('alice')), bob.client.transaction(claim('bob')),
-    ])
+    // Alice reaches the receipt log first. Bob's signed author time is earlier,
+    // so every replica must execute Bob's claim first after the shared closure.
+    const aliceClaim = await alice.client.transaction(claim('alice'))
+    const bobClaim = await bob.client.transaction(claim('bob'))
     // A stored append is not finality: both claims are still pending locally.
     expect((await alice.client.getTransactionOutcome(aliceClaim.transactionId)).outcome.type).toBe('pending')
     expect((await bob.client.getTransactionOutcome(bobClaim.transactionId)).outcome.type).toBe('pending')
     await sync()
     const outcomes = await Promise.all([aliceClaim.settled(), bobClaim.settled()])
-    expect(outcomes.map((outcome) => outcome.outcome.type).sort()).toEqual(['accepted', 'rejected'])
+    expect(outcomes.map((outcome) => outcome.outcome.type)).toEqual(['rejected', 'accepted'])
     const losing = outcomes.find((outcome) => outcome.outcome.type === 'rejected')!
     expect(losing.outcome).toMatchObject({ type: 'rejected', rejection: { code: 'assert:already_claimed' } })
-    const winner = outcomes[0].outcome.type === 'accepted' ? 'alice' : 'bob'
     const finalRows = (node: ChronologNode) => node.localSql('SELECT id, claimed_by FROM tasks', [], { view: 'final' })
-    const expectedRows = [[{ kind: 'integer', value: '1' }, { kind: 'text', value: winner }]]
+    const expectedRows = [[{ kind: 'integer', value: '1' }, { kind: 'text', value: 'bob' }]]
+    const proof = await evaluateFinalitySnapshot(authority.configuration, await authority.log.read())
     for (const peer of participants) {
       expect(finalRows(peer.node).rows).toEqual(expectedRows)
       expect(peer.node.finalOrderLength).toBe(6)
-      expect(peer.node.finalThrough).toBe(6)
+      expect(peer.node.finalThrough).toBe(proof.closedReceiptThrough)
     }
     // Re-encapsulating an existing signed proposal in another author's feed
     // preserves its exact log identity and cannot create another SQL effect.
@@ -165,7 +187,8 @@ describe('Tendriller coordinated SQL connection', () => {
     const forwarded = await bob.adapter!.publish(repeated.payload)
     expect(forwarded.author).not.toBe(repeated.author)
     await sync()
-    expect((await authority.log.head()).position).toBe(6)
+    const afterRetry = await evaluateFinalitySnapshot(authority.configuration, await authority.log.read())
+    expect(afterRetry.records).toHaveLength(6)
     expect(alice.node.finalOrderLength).toBe(6)
 
     // The new reader has no adapter, record client, or authority endpoint. It
@@ -176,12 +199,12 @@ describe('Tendriller coordinated SQL connection', () => {
     await reader.local.catchUp()
     for (const item of await reader.local.evidenceHistory()) await reader.node.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes))
     expect(finalRows(reader.node).rows).toEqual(expectedRows)
-    expect(reader.node.finalThrough).toBe(6)
+    expect(reader.node.finalThrough).toBe(afterRetry.closedReceiptThrough)
     expect(reader.node.finalOrderLength).toBe(6)
     for (const handle of [aliceClaim, bobClaim]) {
       expect((await reader.client.getTransactionOutcome(handle.transactionId)).outcome)
         .toEqual((await alice.client.getTransactionOutcome(handle.transactionId)).outcome)
     }
-    expect((await authority.log.head()).position).toBe(6)
+    expect((await evaluateFinalitySnapshot(authority.configuration, await authority.log.read())).records).toHaveLength(6)
   }, 30_000)
 })

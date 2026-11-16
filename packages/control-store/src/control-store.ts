@@ -495,7 +495,9 @@ export class ControlStore {
   }
 
   #insertOrder(candidate: StoredCandidate): ControlStoreDelta {
-    let low = this.orderPolicy === 'coordinated' ? this.#orderedTxIds.length : 0
+    // Inclusion/finality providers never select execution order. All replicas
+    // use the same signed chronological key, regardless of evidence arrival.
+    let low = 0
     let high = this.#orderedTxIds.length
     while (low < high) {
       const middle = (low + high) >>> 1
@@ -663,7 +665,7 @@ export class ControlStore {
       const key = idKey(txId)
       if (seen.has(key)) throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_DUPLICATE_ORDER')
       seen.add(key)
-      if (this.orderPolicy === 'peer' && previous !== null && compareTransactionOrder(previous.orderKey, candidate.orderKey) >= 0) {
+      if (previous !== null && compareTransactionOrder(previous.orderKey, candidate.orderKey) >= 0) {
         throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_ORDER')
       }
       previous = candidate

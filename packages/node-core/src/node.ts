@@ -41,8 +41,10 @@ import {
 import { ChangeSignal, type TransportRecord } from '@chronolog/records'
 import { readEffectiveEvents, type EventBatch, type EventReadOptions, type EventHistorySnapshot, type EventHistoryItem } from './events.js'
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
-import { decodeOrderingEvidence, encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
+import { encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
 import { decodeLedgerRecord, LedgerRecordError, verifyLedgerPayload, type LedgerRecord } from './ledger-record.js'
+import { orderFinalizedGovernanceRecords } from './governance.js'
+import type { FinalityClosureBoundary, IncludedRecord } from './finality.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import type {
@@ -65,8 +67,11 @@ export class ChronologNode {
   readonly #validatorClosures: ValidatorRevisionClosures
   #evidenceTask: Promise<void> | null = null
   #coordinatedProcessed = 0
-  #coordinatedControlReceivedThrough = 0
+  readonly #finalizedControls = new Set<number>()
+  readonly #resolvedInclusionRecords = new Set<number>()
   #coordinatedAppliedThrough = 0
+  #processedClosedThroughMs = -1n
+  #appliedClosedThroughMs = -1n
   readonly #canonicalPositions = new Map<string, number>()
   readonly #mutex = new Mutex()
   readonly #events = new RevisionBroadcaster<NodeRevisionEvent>()
@@ -127,12 +132,16 @@ export class ChronologNode {
     })
     if (options.historyPolicy?.kind === 'coordinated') {
       const configured = options.historyPolicy.policy.configuration
-      if (!equalBytes(configured.groupId, options.groupId) || !equalBytes(configured.executionManifestDigest, options.materialization.queries.executionManifestDigest)) {
+      if (configured.kind !== 'coordinated' || !equalBytes(configured.groupId, options.groupId) || !equalBytes(configured.executionManifestDigest, options.materialization.queries.executionManifestDigest)) {
         throw new Error('NODE_HISTORY_CONFIGURATION_MISMATCH')
       }
       if (options.validator !== undefined) throw new Error('COORDINATED_NODE_CANNOT_ATTEST')
       if (options.envelopeCipher !== undefined && options.historyPolicy.encryptionEpochStatusAt === undefined) {
         throw new Error('COORDINATED_ENCRYPTION_POLICY_REQUIRED')
+      }
+      const futureAdmissionWindowMs = options.historyPolicy.futureAdmissionWindowMs ?? 31_000
+      if (!Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0) {
+        throw new Error('FINALITY_FUTURE_ADMISSION_WINDOW_INVALID')
       }
     }
     this.#maximumRetryRecords = options.maximumRetryRecords ?? 4_096
@@ -184,6 +193,14 @@ export class ChronologNode {
   get finalRevision(): bigint { return this.#options.materialization.queries.finalRevision ?? 0n }
   get historyPolicy(): 'peer' | 'coordinated' { return this.#options.historyPolicy?.kind ?? 'peer' }
   get finalThrough(): number { return this.#coordinatedAppliedThrough }
+
+  #finalityHistoryId(): string {
+    const selected = this.#options.historyPolicy
+    if (selected?.kind !== 'coordinated' || selected.policy.configuration.kind !== 'coordinated') {
+      throw new Error('NODE_HISTORY_CONFIGURATION_MISMATCH')
+    }
+    return selected.policy.configuration.historyId
+  }
 
   reserveTransactionContext(): ReservedTransactionContext {
     this.#assertReady()
@@ -349,26 +366,17 @@ export class ChronologNode {
 
   #eventSnapshot(view: 'local' | 'final'): EventHistorySnapshot {
     const policy = this.#options.historyPolicy
-    const historyId = `${bytesToHex(this.groupId)}/${bytesToHex(this.executionManifestDigest)}/${policy?.kind === 'coordinated' ? policy.policy.configuration.historyId : 'peer'}`
+    const historyId = `${bytesToHex(this.groupId)}/${bytesToHex(this.executionManifestDigest)}/${policy?.kind === 'coordinated' ? this.#finalityHistoryId() : 'peer'}`
     const item = (id: Uint8Array, anchor: string): EventHistoryItem => {
       const core = this.#candidateCores.get(this.#idKey(id)) ?? null
       const outcome = this.outcome(id)
       return { anchor, proposalId: new TextDecoder().decode(id),
         ...(core === null ? {} : { program: core.program }), outcome: outcome?.outcome ?? 'unresolved' }
     }
-    let items: EventHistoryItem[]
-    if (policy?.kind === 'coordinated' && view === 'final') {
-      const candidates = new Map(this.#control.listCandidates().map((candidate) => [this.#idKey(candidate.txId), candidate.txId]))
-      const positions = new Map([...this.#canonicalPositions].map(([id, position]) => [position, id]))
-      items = policy.policy.entries(this.#coordinatedAppliedThrough).map((entry) => {
-        const id = positions.get(entry.position)
-        const txId = id === undefined ? undefined : candidates.get(id)
-        return txId === undefined ? { anchor: entry.root, outcome: 'skipped' as const } : item(txId, entry.root)
-      })
-    } else {
-      const ids = this.#control.orderedTransactionIds().slice(0, view === 'final' ? this.finalOrderLength : this.orderLength)
-      items = ids.map((id) => item(id, this.#idKey(id)))
-    }
+    // Event cursors follow the same chronological application prefix as SQL.
+    // Receipt positions and administrative traffic are separate provider progress.
+    const ids = this.#control.orderedTransactionIds().slice(0, view === 'final' ? this.finalOrderLength : this.orderLength)
+    const items = ids.map((id) => item(id, this.#idKey(id)))
     const revision = bytesToBase64Url(encodeCanonicalCbor(['chronolog/view/v1', historyId, view,
       view === 'final' ? this.finalRevision : this.materializedRevision, BigInt(items.length), items.at(-1)?.anchor ?? null,
       view === 'local' ? this.#revision : null]))
@@ -598,7 +606,12 @@ export class ChronologNode {
   isFinal(txId: Uint8Array): boolean {
     if (this.historyPolicy === 'coordinated') {
       const position = this.#canonicalPositions.get(this.#idKey(txId))
-      return position !== undefined && position <= this.#coordinatedAppliedThrough
+      const candidate = this.#control.getCandidate(txId)
+      if (candidate?.state === 'unauthorized') {
+        return position !== undefined && position <= this.#coordinatedAppliedThrough &&
+          (candidate.stateReason === 'FINALITY_TIMESTAMP_FUTURE' ||
+            candidate.orderKey.authorTimestampMs <= this.#appliedClosedThroughMs)
+      }
     }
     const index = this.#control.orderedTransactionIds().findIndex((id) => equalBytes(id, txId))
     return index >= 0 && index < this.finalOrderLength
@@ -607,9 +620,10 @@ export class ChronologNode {
   async finalTarget(): Promise<Uint8Array> {
     const policy = this.#options.historyPolicy
     if (policy?.kind === 'coordinated') {
-      return encodeCanonicalCbor([3n, this.groupId, 'coordinated', policy.policy.configuration.historyId,
-        BigInt(this.#coordinatedAppliedThrough), policy.policy.entries(this.#coordinatedAppliedThrough).at(-1)?.root ??
-          await orderedGenesisRoot(policy.policy.configuration.historyId)])
+      const closure = policy.policy.snapshot().closures.find((item) => item.includedThrough === this.#coordinatedAppliedThrough)
+      return encodeCanonicalCbor([4n, this.groupId, 'chronological', this.#finalityHistoryId(),
+        BigInt(this.#coordinatedAppliedThrough), closure?.includedRoot ?? await orderedGenesisRoot(this.#finalityHistoryId()),
+        this.#appliedClosedThroughMs])
     }
     const ids = this.#control.orderedTransactionIds().slice(0, this.finalOrderLength)
     return encodeCanonicalCbor([2n, this.groupId, this.historyPolicy, BigInt(ids.length), await sha256(encodeCanonicalCbor(ids)),
@@ -621,11 +635,12 @@ export class ChronologNode {
     const value = assertCanonicalCbor(frontier)
     const policy = this.#options.historyPolicy
     if (policy?.kind === 'coordinated') {
-      if (!Array.isArray(value) || value.length !== 6 || value[0] !== 3n || !(value[1] instanceof Uint8Array) ||
-          !equalBytes(value[1], this.groupId) || value[2] !== 'coordinated' || value[3] !== policy.policy.configuration.historyId ||
+      if (!Array.isArray(value) || value.length !== 7 || value[0] !== 4n || !(value[1] instanceof Uint8Array) ||
+          !equalBytes(value[1], this.groupId) || value[2] !== 'chronological' || value[3] !== this.#finalityHistoryId() ||
           typeof value[4] !== 'bigint' || value[4] < 0n || value[4] > BigInt(this.#coordinatedAppliedThrough) ||
-          typeof value[5] !== 'string') return false
-      const root = policy.policy.entries(Number(value[4])).at(-1)?.root ?? await orderedGenesisRoot(policy.policy.configuration.historyId)
+          typeof value[5] !== 'string' || typeof value[6] !== 'bigint' || value[6] > this.#appliedClosedThroughMs) return false
+      const closure = policy.policy.snapshot().closures.find((item) => item.includedThrough === Number(value[4]) && item.closedThroughMs === value[6])
+      const root = closure?.includedRoot ?? (value[4] === 0n && value[6] === -1n ? await orderedGenesisRoot(this.#finalityHistoryId()) : null)
       return root === value[5]
     }
     if (!Array.isArray(value) || value.length !== 7 || value[0] !== 2n || !(value[1] instanceof Uint8Array) ||
@@ -637,11 +652,17 @@ export class ChronologNode {
   }
 
   async ingestOrderingEvidence(evidence: OrderingEvidence): Promise<void> {
+    return this.ingestFinalityEvidence(encodeOrderingEvidence(evidence))
+  }
+
+  /** The injected verifier interprets proof bytes; it cannot supply a sorter. */
+  async ingestFinalityEvidence(bytes: Uint8Array): Promise<void> {
     if (this.#options.historyPolicy?.kind !== 'coordinated') throw new Error('NODE_HISTORY_POLICY_MISMATCH')
     const policy = this.#options.historyPolicy.policy
+    const exact = bytes.slice()
     await this.#mutex.run(async () => {
-      await policy.ingest(evidence)
-      await this.#options.transport.putEvidence?.(encodeOrderingEvidence(evidence))
+      await policy.ingestEvidence(exact)
+      await this.#options.transport.putEvidence?.(exact)
       this.#materializationPending = true
       await this.#reconcileMaterializer()
     })
@@ -657,13 +678,11 @@ export class ChronologNode {
   }
 
   async #ingestSharedEvidence(bytes: Uint8Array): Promise<void> {
-    let evidence: OrderingEvidence
-    try { evidence = decodeOrderingEvidence(bytes) } catch { return }
-    try { await this.ingestOrderingEvidence(evidence) }
+    try { await this.ingestFinalityEvidence(bytes) }
     catch (error) {
       // Immutable peer storage may contain unrelated or forged evidence. Only
       // validated proofs enter the policy store; invalid bytes cannot poison restart.
-      if (error instanceof Error && /^(HISTORY_(ID_MISMATCH|ID_INVALID|HASH_INVALID|POSITION_INVALID|POSITION_CONFLICT|CERTIFICATE_CONFIGURATION_MISMATCH|CERTIFICATE_SIGNATURE_INVALID)|ORDERED_RECORD_(BYTES_INVALID|TOO_LARGE|DIGEST_MISMATCH|ROOT_MISMATCH))$/u.test(error.message)) return
+      if (error instanceof Error && /^(ORDERING_EVIDENCE_INVALID|HISTORY_(ID_MISMATCH|ID_INVALID|HASH_INVALID|POSITION_INVALID|POSITION_CONFLICT|CERTIFICATE_CONFIGURATION_MISMATCH|CERTIFICATE_SIGNATURE_INVALID)|ORDERED_RECORD_(BYTES_INVALID|TOO_LARGE|DIGEST_MISMATCH|ROOT_MISMATCH))$/u.test(error.message)) return
       this.#recordError(error)
       this.#scheduleMaterializationRetry()
     }
@@ -672,32 +691,42 @@ export class ChronologNode {
   async #processCoordinatedHistory(): Promise<void> {
     const selected = this.#options.historyPolicy
     if (selected?.kind !== 'coordinated') return
-    const entries = selected.policy.entries(selected.policy.progress.finalThrough)
-    // Membership follows the complete certified descriptor prefix, without
-    // waiting for application bodies or SQL. Each candidate still authorizes
-    // against the membership at its own canonical position. A late reader can
-    // obtain its grant and wrapped keys before opening a reader peer connection.
-    for (const entry of entries.slice(this.#coordinatedControlReceivedThrough)) {
-      let record: LedgerRecord
-      try { record = decodeLedgerRecord(entry.bytes) }
-      catch { this.#coordinatedControlReceivedThrough = entry.position; continue }
-      if (equalBytes(record.groupRoute, this.#groupRoute()) && record.kind !== 'candidate') {
-        if (selected.applyGovernanceRecord === undefined) throw new Error('COORDINATED_GOVERNANCE_HANDLER_UNAVAILABLE')
-        await selected.applyGovernanceRecord(entry)
-      }
-      this.#coordinatedControlReceivedThrough = entry.position
+    const snapshot = structuredClone(selected.policy.snapshot())
+    if (snapshot.closedThroughMs < this.#appliedClosedThroughMs || snapshot.closedReceiptThrough < this.#coordinatedAppliedThrough) {
+      throw new Error('FINALITY_PROVIDER_REGRESSION')
     }
-    for (const entry of entries.slice(this.#coordinatedProcessed)) {
+    // Inline controls are causal ledger events. Receipt order is not their
+    // activation order, and controls can supply bootstrap keys before bodies.
+    const controls = await orderFinalizedGovernanceRecords(snapshot.records
+      .filter((item) => item.closureBoundary !== null && !this.#finalizedControls.has(item.entry.position))
+      .map((item) => ({ entry: item.entry, cutoffMs: item.closedThroughMs })), this.#groupRoute())
+    for (const { entry, cutoffMs } of controls) {
+      if (selected.applyGovernanceRecord === undefined) throw new Error('COORDINATED_GOVERNANCE_HANDLER_UNAVAILABLE')
+      await selected.applyGovernanceRecord(entry, cutoffMs)
+      this.#finalizedControls.add(entry.position)
+    }
+    type PreparedCandidate = {
+      readonly inclusion: IncludedRecord
+      readonly record: TransportRecord
+      readonly canonical: Uint8Array
+      readonly signer: Uint8Array
+      readonly decision: FinalityClosureBoundary | null
+      readonly rejection: string | undefined
+    }
+    const proposals = new Map<string, PreparedCandidate[]>()
+    for (const inclusion of snapshot.records) {
+      const { entry } = inclusion
+      if (inclusion.closureBoundary === null || this.#resolvedInclusionRecords.has(entry.position)) continue
       let ledger: LedgerRecord
       try { ledger = decodeLedgerRecord(entry.bytes) }
-      catch { this.#coordinatedProcessed = entry.position; continue }
+      catch { this.#resolvedInclusionRecords.add(entry.position); continue }
       if (!equalBytes(ledger.groupRoute, this.#groupRoute())) {
-        this.#coordinatedProcessed = entry.position
+        this.#resolvedInclusionRecords.add(entry.position)
         continue
       }
       if (ledger.kind === 'candidate') {
-        // The certified descriptor selects the type. A missing body blocks
-        // application progress; it cannot hide governance or become a rejection.
+        // Unknown body/key/execution inputs block progress. They never become
+        // rejection evidence, and an inclusion receipt alone is not finality.
         const detached = await this.#options.transport.getPayload(ledger.payloadHash)
         if (detached === null) throw new LedgerRecordError('LEDGER_PAYLOAD_UNAVAILABLE', ledger.payloadHash)
         let payload: Uint8Array
@@ -707,32 +736,75 @@ export class ChronologNode {
           // That contradiction is permanent; a missing or corrupt peer reply
           // remains retryable and cannot make us skip a valid position.
           if (!(error instanceof LedgerRecordError) || error.code !== 'LEDGER_PAYLOAD_METADATA_MISMATCH') throw error
-          this.#coordinatedProcessed = entry.position
+          this.#resolvedInclusionRecords.add(entry.position)
           continue
         }
-        const epochStatus = selected.encryptionEpochStatusAt?.(entry.position, ledger.encryptionEpoch)
-        if (epochStatus === 'unissued') {
-          // No valid candidate could use this epoch at the fixed position.
-          // Do not wait for a nonexistent key or claim an unverified identity.
-          this.#coordinatedProcessed = entry.position
+        if (selected.hasEncryptionEpoch?.(ledger.encryptionEpoch, inclusion.closureBoundary.includedThrough) === false) {
+          // A complete finalized control prefix proves this epoch was not
+          // issued. No unverified body may manufacture a proposal identity.
+          this.#resolvedInclusionRecords.add(entry.position)
           continue
         }
         const record: TransportRecord = {
-          id: `ordered:${entry.historyId}:${entry.position}`, author: '', sequence: 0n,
+          id: `included:${entry.historyId}:${entry.position}`, author: '', sequence: 0n,
           receivedAtMs: 0, payload,
         }
         try {
           const wire = await this.#decodeRecord(record)
-          await this.#ingestCandidate(record, wire.payload, wire.signer, entry.position,
-            epochStatus === 'closed' ? 'ENCRYPTION_EPOCH_CLOSED' : undefined)
+          const core = this.#decodeCandidate(wire.payload)
+          // Invalid alternate signatures must not claim a legitimate proposal's
+          // identity while we resolve its independently encrypted envelopes.
+          if (!equalBytes(core.groupId, this.groupId)) invalid('CANDIDATE_WRONG_GROUP')
+          if (!equalBytes(core.authorId, wire.signer)) invalid('CANDIDATE_SIGNER_MISMATCH')
+          try { assertValidChangeProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
+          const tooFuture = core.authorTimestampMs > inclusion.closureBoundary.closedThroughMs +
+            BigInt(selected.futureAdmissionWindowMs ?? 31_000)
+          const decision = tooFuture ? inclusion.closureBoundary : snapshot.closures.find(closure =>
+            entry.position <= closure.includedThrough && core.authorTimestampMs <= closure.closedThroughMs) ?? null
+          if (decision === null && core.authorTimestampMs <= snapshot.closedThroughMs) {
+            throw new Error('FINALITY_PROVIDER_CLOSURE_INCOMPLETE')
+          }
+          const epochStatus = selected.encryptionEpochStatusAt?.(core.authorTimestampMs, ledger.encryptionEpoch)
+          const rejection = tooFuture ? 'FINALITY_TIMESTAMP_FUTURE'
+            : core.authorTimestampMs <= inclusion.admissionFloorMs ? 'FINALITY_TIMESTAMP_CLOSED'
+            : epochStatus === 'closed' || epochStatus === 'unissued' ? 'ENCRYPTION_EPOCH_CLOSED' : undefined
+          const proposalId = bytesToHex(await transactionDigest(wire.payload))
+          const alternatives = proposals.get(proposalId) ?? []
+          alternatives.push({ inclusion, record, canonical: wire.payload, signer: wire.signer, decision, rejection })
+          proposals.set(proposalId, alternatives)
+          continue
         } catch (error) {
           // A known invalid record occupies its fixed position without stealing
           // a valid proposal identity. Missing keys/engines/storage still block.
           if (!(error instanceof TerminalIngestError)) throw error
         }
       }
-      this.#coordinatedProcessed = entry.position
+      this.#resolvedInclusionRecords.add(entry.position)
     }
+    // A signed proposal may have several legitimate encrypted envelopes. Its
+    // first decision batch is the first closure covering inclusion AND author
+    // time, or its first inclusion closure for an excessive future timestamp.
+    // Resolve that whole immutable batch before changing admission: a
+    // stale wrapping must not win merely because the provider received it first.
+    for (const [, alternatives] of [...proposals].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
+      const decided = alternatives.filter(item => item.decision !== null)
+      if (decided.length === 0) {
+        // Membership may still change before this future timestamp closes.
+        const pending = alternatives[0]!
+        await this.#ingestCandidate(pending.record, pending.canonical, pending.signer)
+        continue
+      }
+      const firstDecision = decided.reduce((minimum, item) => Math.min(minimum, item.decision!.position), Number.MAX_SAFE_INTEGER)
+      const eligible = decided.filter(item => item.decision!.position === firstDecision)
+      eligible.sort((left, right) => Number(left.rejection !== undefined) - Number(right.rejection !== undefined) ||
+        (left.inclusion.entry.recordId < right.inclusion.entry.recordId ? -1 : left.inclusion.entry.recordId > right.inclusion.entry.recordId ? 1 : 0))
+      const representative = eligible[0]!
+      await this.#ingestCandidate(representative.record, representative.canonical, representative.signer,
+        representative.inclusion.entry.position, representative.rejection)
+      for (const alternative of alternatives) this.#resolvedInclusionRecords.add(alternative.inclusion.entry.position)
+    }
+    this.#coordinatedProcessed = snapshot.closedReceiptThrough
+    this.#processedClosedThroughMs = snapshot.closedThroughMs
   }
 
   outcomeChangedByReplay(txId: Uint8Array): boolean {
@@ -942,12 +1014,10 @@ export class ChronologNode {
     const existing = this.#control.getCandidate(txId)
     this.#candidateCores.set(this.#idKey(txId), core)
     if (existing !== null && (existing.state !== 'pending_validation' || (this.historyPolicy === 'coordinated' && canonicalPosition === undefined))) return
-    const canWrite = this.historyPolicy === 'coordinated' && canonicalPosition === undefined
-      ? true : await this.#options.membership.canWrite({
-        ...writerContext,
-        ...(canonicalPosition === undefined ? {} : { canonicalPosition: BigInt(canonicalPosition) }),
-      })
-    const rejection = canWrite ? foreignProfile ? 'EXECUTION_PROFILE_MISMATCH' : canonicalRejection : 'WRITER_UNAUTHORIZED'
+    const canWrite = canonicalRejection !== undefined || (this.historyPolicy === 'coordinated' && canonicalPosition === undefined)
+      ? true : await this.#options.membership.canWrite({ ...writerContext,
+        ...(canonicalPosition === undefined ? {} : { finalityClosed: true }) })
+    const rejection = canonicalRejection ?? (canWrite ? foreignProfile ? 'EXECUTION_PROFILE_MISMATCH' : undefined : 'WRITER_UNAUTHORIZED')
     const authorized = rejection === undefined
     const state = authorized ? 'pending_validation' as const : 'unauthorized' as const
     const candidate: StoredCandidate = {
@@ -1215,7 +1285,13 @@ export class ChronologNode {
       throw new Error('MATERIALIZATION_RECONCILIATION_RESULT_MISMATCH')
     }
     let finalLength = this.finalOrderLength
-    if (this.historyPolicy === 'coordinated') finalLength = ordered.length
+    if (this.historyPolicy === 'coordinated') {
+      for (let index = finalLength; index < ordered.length; index += 1) {
+        const candidate = this.#control.getCandidate(ordered[index]!.txId)
+        if (candidate === null || candidate.orderKey.authorTimestampMs > this.#processedClosedThroughMs) break
+        finalLength = index + 1
+      }
+    }
     else if (this.#retryRecords.size === 0 && !this.#retryOverflow) {
       for (let index = finalLength; index < ordered.length; index += 1) {
         const evidence = await this.settlementEvidence(ordered[index]!.txId)
@@ -1226,7 +1302,10 @@ export class ChronologNode {
     if (this.#options.materialization.coordinator.publishFinal !== undefined) {
       await this.#options.materialization.coordinator.publishFinal(finalLength)
     } else if (finalLength > 0) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
-    if (this.historyPolicy === 'coordinated') this.#coordinatedAppliedThrough = this.#coordinatedProcessed
+    if (this.historyPolicy === 'coordinated') {
+      this.#coordinatedAppliedThrough = this.#coordinatedProcessed
+      this.#appliedClosedThroughMs = this.#processedClosedThroughMs
+    }
     this.#materializationPending = false
     this.#materializationRetryMs = 100
     if (this.#materializationDebounceTimer) {
@@ -1544,7 +1623,10 @@ export class ChronologNode {
   #nextAuthorTimestamp(): bigint {
     const wallClock = BigInt(Math.max(0, Math.trunc(this.#clockNow())))
     const next = wallClock > this.#lastAuthoredTimestampMs ? wallClock : this.#lastAuthoredTimestampMs + 1n
-    const floor = this.#membershipState().minimumAuthorTimestampMs ?? 0n
+    const membershipFloor = this.#membershipState().minimumAuthorTimestampMs ?? 0n
+    const selected = this.#options.historyPolicy
+    const closedFloor = selected?.kind === 'coordinated' ? selected.policy.snapshot().closedThroughMs + 1n : 0n
+    const floor = membershipFloor > closedFloor ? membershipFloor : closedFloor
     return next < floor ? floor : next
   }
   #allocateTransactionContext(): ReservedTransactionContext {

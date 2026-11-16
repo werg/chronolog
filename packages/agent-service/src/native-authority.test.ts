@@ -3,9 +3,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence, verifyPrefixCertificate } from '@chronolog/node-core'
+import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence,
+  evaluateFinalitySnapshot, verifyPrefixCertificate } from '@chronolog/node-core'
 import type { CoordinatedHistoryConfiguration, DurableOperationStore } from '@chronolog/node-core'
 import { encodeEnvelope, generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
+import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { NativeAuthority } from './authority.js'
@@ -28,7 +30,8 @@ async function fixture() {
   const path = join(directory, 'agent.sqlite')
   const store = new NativeAgentStore(path)
   cleanup.push(() => store.close())
-  return { configuration, identity, store, path }
+  const clock = { now: 1_000 }
+  return { configuration, identity, store, path, clock, now: () => clock.now, cutoffLagMs: 0 }
 }
 
 describe('native fixed authority', () => {
@@ -48,7 +51,7 @@ describe('native fixed authority', () => {
     expect(await reopened.getPayload(descriptor.payloadHash)).toEqual(payload)
   })
 
-  it('fences another process and durably reopens exact retry identities, order and head', async () => {
+  it('fences another process and durably reopens exact retry identities, closures and receipt head', async () => {
     const f = await fixture()
     const authority = await NativeAuthority.open(f)
     const entry = await authority.append(envelope('one'))
@@ -67,9 +70,9 @@ describe('native fixed authority', () => {
     cleanup.push(() => reopenedStore.close())
     const reopened = await NativeAuthority.open({ ...f, store: reopenedStore, continuity: certificate })
     expect(await reopened.append(envelope('one'))).toEqual(entry)
-    expect(await reopened.head()).toEqual({ historyId: entry.historyId, position: 1, root: entry.root })
+    expect(await reopened.head()).toEqual({ historyId: certificate.historyId, position: 2, root: certificate.root })
     await verifyPrefixCertificate(await reopened.certify(), f.configuration)
-    expect((await reopened.append(envelope('two'))).position).toBe(2)
+    expect((await reopened.append(envelope('two'))).position).toBe(3)
   })
 
   it('atomically refuses exhausted quotas without consuming a position', async () => {
@@ -135,11 +138,88 @@ describe('native fixed authority', () => {
     const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
     for (const bytes of captured.splice(0)) await peer.ingest(decodeOrderingEvidence(bytes))
     expect(peer.progress.finalThrough).toBe(0)
-    await authority.share(sink, { after: first.position, limit: 2 })
+    await authority.share(sink, { after: first.position, limit: 3 })
     for (const bytes of captured.reverse()) await peer.ingest(decodeOrderingEvidence(bytes))
-    expect(peer.progress.finalThrough).toBe(3)
+    expect(peer.progress.finalThrough).toBe(4)
+    expect(peer.snapshot().closedThroughMs).toBe(1_000n)
     const third = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
     for (const evidence of [...peer.evidence()].reverse()) await third.ingest(evidence)
     expect(third.progress).toEqual(peer.progress)
+  })
+
+  it('recovers a durable closure after certificate publication fails and the provider clock moves backward', async () => {
+    const f = await fixture()
+    let failCertificate = true
+    const store: DurableOperationStore = {
+      get: (key) => f.store.get(key),
+      put: async (key, bytes) => {
+        if (key.endsWith('/certificate') && failCertificate) throw new Error('certificate response lost')
+        await f.store.put(key, bytes)
+      },
+    }
+    const authority = await NativeAuthority.open({ ...f, store })
+    const original = await authority.append(envelope('one'))
+    await expect(authority.certify()).rejects.toThrow('certificate response lost')
+    expect((await authority.head()).position).toBe(2)
+    failCertificate = false
+    f.clock.now = 500
+    const reopened = await NativeAuthority.open({ ...f, store })
+    expect(await reopened.append(envelope('one'))).toEqual(original)
+    const proof = await reopened.certifiedRead()
+    expect(proof.certificate.position).toBe(2)
+    expect(proof.hasMore).toBe(false)
+    expect((await evaluateFinalitySnapshot(f.configuration, proof.entries)).closedThroughMs).toBe(1_000n)
+  })
+
+  it('publishes complete closure evidence while the application receipt head is idle', async () => {
+    const f = await fixture(), authority = await NativeAuthority.open({ ...f, cutoffLagMs: 100,
+      futureAdmissionWindowMs: 200, closureIntervalMs: 5 })
+    await authority.certify()
+    expect((await authority.head()).position).toBe(0)
+    const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(new MemoryOperationStore(), webFeedCrypto),
+      signer: webFeedSigner(feedIdFromPublicKey(f.identity.publicKeyBytes), f.identity.privateKey), crypto: webFeedCrypto })
+    cleanup.push(() => transport.close())
+    await transport.publish(envelope('queued-before-service'))
+    const stopped = new AbortController(), running = authority.serve(transport, stopped.signal)
+    const policy = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const frontier = async () => {
+      for (const item of await transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
+      return policy.snapshot().closedThroughMs
+    }
+    try {
+      await expect.poll(frontier).toBe(900n)
+      expect(policy.snapshot().records).toHaveLength(1)
+      f.clock.now = 1_200
+      await expect.poll(frontier).toBe(1_100n)
+      expect(policy.snapshot().records).toHaveLength(1)
+      const closedHead = await authority.head()
+      f.clock.now = 10_000
+      for (let idle = 0; idle < 20; idle += 1) {
+        f.clock.now += 1_000
+        expect(await authority.certify()).toMatchObject(closedHead)
+      }
+      const reopened = await NativeAuthority.open({ ...f, cutoffLagMs: 100, futureAdmissionWindowMs: 200 })
+      expect(await reopened.certify()).toMatchObject(closedHead)
+      expect((await evaluateFinalitySnapshot(f.configuration, (await reopened.read()).entries)).closedThroughMs).toBe(1_100n)
+    } finally { stopped.abort(); await running }
+  })
+
+  it('does not close additional author time merely to replay exact retained submissions', async () => {
+    const f = await fixture(), authority = await NativeAuthority.open({ ...f,
+      now: () => f.clock.now++, closureIntervalMs: 60_000 })
+    const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(new MemoryOperationStore(), webFeedCrypto),
+      signer: webFeedSigner(feedIdFromPublicKey(f.identity.publicKeyBytes), f.identity.privateKey), crypto: webFeedCrypto })
+    cleanup.push(() => transport.close())
+    const payload = envelope('same-retained-submission')
+    await transport.publish(payload)
+    await transport.publish(payload)
+    // End this replaying subscription after its retained history, before the
+    // independent closure timer. Duplicate feed records have one receipt.
+    transport.subscribe = async function* () { yield* await transport.history() }
+    await authority.serve(transport)
+    const proof = await evaluateFinalitySnapshot(f.configuration, (await authority.read()).entries)
+    expect(proof.records).toHaveLength(1)
+    expect(proof.closures).toHaveLength(1)
+    expect(proof.closedThroughMs).toBe(1_000n)
   })
 })

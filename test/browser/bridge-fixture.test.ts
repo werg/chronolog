@@ -66,5 +66,5 @@ it('bootstraps the public retained-log bridge before fetching SQL bodies from it
   }).toBe(true)
   expect(replica.node.localSql('SELECT id, value FROM history', [], { view: 'final' }).rows)
     .toEqual([[{ kind: 'integer', value: '1' }, { kind: 'text', value: 'before-enrollment' }]])
-  expect(replica.node.finalThrough).toBe((await native.sync()).finalThrough)
+  expect(replica.node.finalThrough).toBeGreaterThanOrEqual((await native.snapshot()).finalThrough)
 }, 30_000)

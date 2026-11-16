@@ -24,6 +24,8 @@ export interface TendrillerTransportOptions {
   readonly certificate?: (signal?: AbortSignal) => Promise<PrefixCertificate>
   /** Defaults to true; false lets an application schedule explicit catch-up. */
   readonly watch?: boolean
+  /** Poll finality even when application receipt hints remain quiet. */
+  readonly finalityPollIntervalMs?: number
 }
 
 export function adaptRecordEntry(entry: RecordLogEntry): OrderedRecordEntry {
@@ -44,10 +46,10 @@ export class TendrillerTransport implements ChronologTransport {
   readonly #groupRoute: Uint8Array
   readonly #certificate: ((signal?: AbortSignal) => Promise<PrefixCertificate>) | undefined
   readonly #watch: boolean
+  readonly #finalityPollIntervalMs: number
   readonly #controller = new AbortController()
   readonly #acknowledged = new Set<string>()
   #previous: RecordLogHead | undefined
-  #certifiedThrough: number | undefined
   #pending: Promise<void> = Promise.resolve()
   #stopWatch: (() => void) | undefined
   #retry: ReturnType<typeof setTimeout> | undefined
@@ -68,6 +70,9 @@ export class TendrillerTransport implements ChronologTransport {
     this.#groupRoute = options.groupRoute.slice()
     this.#certificate = options.certificate
     this.#watch = options.watch !== false
+    this.#finalityPollIntervalMs = options.finalityPollIntervalMs ?? 1_000
+    if (!Number.isSafeInteger(this.#finalityPollIntervalMs) || this.#finalityPollIntervalMs < 1 ||
+        this.#finalityPollIntervalMs > 60_000) throw new Error('TENDRILLER_FINALITY_POLL_INVALID')
     if (this.#watch) {
       this.#stopWatch = this.#records.watch({
         historyId: this.#configuration.historyId, after: 0,
@@ -108,16 +113,15 @@ export class TendrillerTransport implements ChronologTransport {
     return this.#serial(async () => {
       await this.#flushLocal()
       await this.#pull()
-      if (this.#certificate !== undefined && this.#previous !== undefined &&
-          (this.#certifiedThrough === undefined || this.#previous.position > this.#certifiedThrough)) {
+      if (this.#certificate !== undefined && this.#previous !== undefined) {
         const certificate = await this.#certificate(this.#controller.signal)
         await verifyPrefixCertificate(certificate, this.#configuration)
         await this.#local.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate }))
-        this.#certifiedThrough = Math.max(this.#certifiedThrough ?? 0, certificate.position)
-        // The authority may observe a newer head while the prior range is read.
+        // Certification may append an idle-time closure marker. Its retained
+        // bytes must arrive before the policy can use the covering certificate.
         await this.#pull(certificate.position)
       }
-    })
+    }).finally(() => this.#scheduleRetry())
   }
 
   get(id: string): Promise<TransportRecord | undefined> { return this.#local.get(id) }
@@ -172,12 +176,12 @@ export class TendrillerTransport implements ChronologTransport {
 
   #scheduleRetry(): void {
     if (!this.#watch || this.#closed || this.#retry !== undefined) return
-    // A lost certificate response does not advance the head. Retrying only on
-    // new-head hints would leave otherwise complete durable work stuck forever.
+    // A quiet receipt head still needs author-time closure. The same bounded
+    // poll also retries a lost certificate response without a new head hint.
     this.#retry = setTimeout(() => {
       this.#retry = undefined
       void this.catchUp().catch(() => undefined)
-    }, 1_000)
+    }, this.#finalityPollIntervalMs)
   }
 
   #isSubmission(bytes: Uint8Array): boolean {

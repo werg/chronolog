@@ -7,12 +7,13 @@ import { decodeSignedGenesis } from '@chronolog/capabilities'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import {
-  createGovernedNode, decodeLedgerRecord, decodeOrderingEvidence, loadOrCreateEnrollmentIdentity,
+  createGovernedNode, decodeFinalityClosureRecord, decodeLedgerRecord, decodeOrderingEvidence,
+  isFinalityClosureRecord, loadOrCreateEnrollmentIdentity,
   ReferenceRecordLog, verifyPrefixCertificate,
   type DurableOperationStore, type OrderedRecordHead,
 } from '@chronolog/node-core'
 import {
-  bytesToBase64Url, bytesToHex, decodeEnvelope, emit, executionManifestArtifacts, program, sqlStatement,
+  assertCanonicalCbor, bytesToBase64Url, bytesToHex, decodeEnvelope, emit, executionManifestArtifacts, program, sqlStatement,
 } from '@chronolog/protocol'
 import { DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 
@@ -21,7 +22,8 @@ import { loadOrCreateGovernanceBootstrap } from '../../apps/chronologd/src/gover
 
 export const AUTHORITY_CRASH_POINTS = [
   'before_payload_commit', 'after_payload_commit', 'before_record_commit',
-  'after_record_commit', 'after_certificate_commit', 'before_acknowledgement',
+  'after_record_commit', 'before_closure_commit', 'after_closure_commit',
+  'before_certificate_commit', 'after_certificate_commit', 'before_acknowledgement',
 ] as const
 export type AuthorityCrashPoint = typeof AUTHORITY_CRASH_POINTS[number]
 export type RecoveryOperation = 'accepted' | 'rejected'
@@ -45,21 +47,41 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
   const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
   const control = new NodeStateDatabase(join(directory, 'control.sqlite'))
   let armed = false
-  let targetPayload = false, targetRecordCommitted = false
+  let targetPayloadKey: string | undefined
+  let targetRecordCommitted = false, targetClosureCommitted = false
   const authorityStore: DurableOperationStore = {
     get: key => store.get(key),
     async put(key, bytes) {
       const payload = key.startsWith('agent/authority/') && key.includes('/payload/')
       const record = key.startsWith('record-log/')
+      const certificate = key.startsWith('agent/authority/') && key.endsWith('/certificate')
       // serve() may still replay old duplicate payloads/certificates. Trigger
       // only after the new operation's first distinct detached payload arrives.
-      if (armed && payload && await store.get(key) === null) targetPayload = true
-      if (armed && targetPayload && payload) options.fault?.('before_payload_commit')
-      if (armed && targetPayload && record) options.fault?.('before_record_commit')
+      if (armed && payload && targetPayloadKey === undefined && await store.get(key) === null) targetPayloadKey = key
+      const targetPayload = armed && payload && key === targetPayloadKey
+      let targetRecord = false, targetClosure = false
+      if (armed && targetPayloadKey !== undefined && record) {
+        const encoded = assertCanonicalCbor(bytes)
+        assert(Array.isArray(encoded) && encoded.at(-1) instanceof Uint8Array)
+        const tail = decodeOrderingEvidence(encoded.at(-1) as Uint8Array)
+        assert.equal(tail.kind, 'ordered-entry')
+        if (tail.kind === 'ordered-entry') {
+          targetClosure = targetRecordCommitted && isFinalityClosureRecord(tail.entry.bytes)
+          if (!isFinalityClosureRecord(tail.entry.bytes)) {
+            const descriptor = decodeLedgerRecord(tail.entry.bytes)
+            targetRecord = descriptor.kind === 'candidate' && targetPayloadKey.endsWith(`/payload/${descriptor.payloadHash}`)
+          }
+        }
+      }
+      if (targetPayload) options.fault?.('before_payload_commit')
+      if (targetRecord) options.fault?.('before_record_commit')
+      if (targetClosure) options.fault?.('before_closure_commit')
+      if (armed && targetClosureCommitted && certificate) options.fault?.('before_certificate_commit')
       await store.put(key, bytes)
-      if (armed && targetPayload && payload) options.fault?.('after_payload_commit')
-      if (armed && targetPayload && record) { targetRecordCommitted = true; options.fault?.('after_record_commit') }
-      if (armed && targetRecordCommitted && key.startsWith('agent/authority/') && key.endsWith('/certificate')) options.fault?.('after_certificate_commit')
+      if (targetPayload) options.fault?.('after_payload_commit')
+      if (targetRecord) { targetRecordCommitted = true; options.fault?.('after_record_commit') }
+      if (targetClosure) { targetClosureCommitted = true; options.fault?.('after_closure_commit') }
+      if (armed && targetClosureCommitted && certificate) options.fault?.('after_certificate_commit')
     },
   }
   let governed: Awaited<ReturnType<typeof createGovernedNode>> | undefined
@@ -93,6 +115,9 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
     agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing,
       history: governed.descriptor.history, store: authorityStore, transport,
       activeMembership: () => governed!.activeSnapshot,
+      // Keep an explicit author-time window open while a real process signs,
+      // persists and delivers a proposal. Idle closures remain exercised.
+      cutoffLagMs: 250, closureIntervalMs: 25,
       ...(options.continuity === undefined ? {} : { continuity: options.continuity }) })
     assert(agent.authority !== null)
     const authority = agent.authority, node = governed.node, activeTransport = transport
@@ -105,8 +130,12 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
       await eventually(async () => {
         healthy()
         const eligible = (await activeTransport.history()).filter(record => ['candidate', 'capability', 'epoch-manifest'].includes(decodeEnvelope(record.payload).messageType))
-        if ((await authority.head()).position !== eligible.length) return false
+        const range = await authority.read({ limit: 256 })
+        assert(!range.hasMore, 'RECOVERY_FIXTURE_RECEIPT_LIMIT')
+        const applicationRecords = range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes))
+        if (applicationRecords.length !== eligible.length) return false
         await node.waitForIdle()
+        if (!governed!.governance.hasFinalizedEpoch(governed!.governance.cipherRing.current().epochId)) return false
         for (const kind of ['schema', 'accepted', 'rejected', 'after-backup', 'authority-offline'] as const) {
           const operation = await node.operation(`recovery-${kind}`)
           if (operation !== null && !operation.final) return false
@@ -131,15 +160,22 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
     }
     const inspect = async () => {
       await settle()
-      const range = await authority.read({ limit: 256 }), certificate = await authority.certify()
+      const range = await authority.certifiedRead({ limit: 256 }), certificate = range.certificate
+      assert(!range.hasMore, 'RECOVERY_FIXTURE_RECEIPT_LIMIT')
       await verifyPrefixCertificate(certificate, authority.configuration)
-      const payloads = await Promise.all(range.entries.map(async entry => {
+      const payloads = await Promise.all(range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes)).map(async entry => {
         const descriptor = decodeLedgerRecord(entry.bytes)
         const body = descriptor.inlinePayload ?? await authority.getPayload(descriptor.payloadHash)
         return { position: entry.position, recordId: entry.recordId, kind: descriptor.kind, hash: descriptor.payloadHash,
           descriptorBytes: entry.bytes.length, payloadBytes: body?.length ?? null, detached: descriptor.inlinePayload === null }
       }))
-      return { head: range.head, authorityIdentity: bytesToBase64Url(identity.signing.publicKeyBytes),
+      const receipts = range.entries.map(entry => ({ position: entry.position, root: entry.root, recordId: entry.recordId,
+        kind: isFinalityClosureRecord(entry.bytes) ? 'closure' as const : decodeLedgerRecord(entry.bytes).kind }))
+      return { head: { historyId: certificate.historyId, position: certificate.position, root: certificate.root },
+        receipts, proposalCount: payloads.filter(payload => payload.kind === 'candidate').length,
+        closedThroughMs: range.entries.filter(entry => isFinalityClosureRecord(entry.bytes))
+          .map(entry => decodeFinalityClosureRecord(entry.bytes).closedThroughMs).at(-1) ?? -1n,
+        authorityIdentity: bytesToBase64Url(identity.signing.publicKeyBytes),
         executionManifestDigest: bytesToHex(executionManifestDigest),
         certificate: { historyId: certificate.historyId, position: certificate.position, root: certificate.root,
           signature: bytesToBase64Url(certificate.signature), configuration: bytesToBase64Url(certificate.configuration) },
@@ -175,7 +211,7 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
   }
 }
 
-/** Read the post-crash disk before starting the replay/order loops. */
+/** Read the post-crash disk before starting inclusion/finality or replay loops. */
 export async function inspectStoppedAuthority(directory: string) {
   const document = JSON.parse(await readFile(join(directory, 'governance.json'), 'utf8')) as { signedGenesis: string }
   const genesis = decodeSignedGenesis(Uint8Array.from(Buffer.from(document.signedGenesis, 'base64')))
@@ -185,7 +221,12 @@ export async function inspectStoppedAuthority(directory: string) {
   try {
     const log = await ReferenceRecordLog.open(historyId, store)
     const entries = await log.read(), certificate = await store.get(`agent/authority/${historyId}/certificate`)
-    return { head: await log.head(), entries: entries.map(entry => ({ position: entry.position, root: entry.root, recordId: entry.recordId })),
+    return { head: await log.head(), entries: entries.map(entry => ({ position: entry.position, root: entry.root, recordId: entry.recordId,
+      kind: isFinalityClosureRecord(entry.bytes) ? 'closure' as const : decodeLedgerRecord(entry.bytes).kind })),
+      closures: entries.filter(entry => isFinalityClosureRecord(entry.bytes)).map(entry => ({
+        position: entry.position, ...decodeFinalityClosureRecord(entry.bytes),
+      })),
+      proposalCount: entries.filter(entry => !isFinalityClosureRecord(entry.bytes) && decodeLedgerRecord(entry.bytes).kind === 'candidate').length,
       certificate: certificate === null ? null : decodeOrderingEvidence(certificate) }
   } finally { store.close() }
 }

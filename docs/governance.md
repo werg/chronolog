@@ -17,7 +17,7 @@ change live. Static membership is an explicit fixture/operator override.
 manages the roster. Tendriller runs it by default inside the existing Cloudflare
 Durable Object for a configured resident peer application. The same component
 can run on another administrator's machine: it needs Web Crypto, durable byte
-storage and a connection to the group's pinned ordering authority. It does not
+storage and a connection to the group's pinned inclusion/finality service. It does not
 need a SQL engine, an application replica or a separate deployed service.
 
 The existing ordered ledger contains small typed records. A roster grant,
@@ -39,7 +39,7 @@ access. This design does not claim that the administrator is unable to decrypt
 application data if it separately obtains the ciphertext.
 
 The signed genesis names the roster issuer (`rootAdminPublicKey`), initial SQL
-schema administrator (`schemaAdminPublicKey`), and native ordering authority
+schema administrator (`schemaAdminPublicKey`), and native inclusion/finality signer
 explicitly. Cloudflare's roster signer receives no implicit SQL membership.
 The native application peer can own the schema and order the ledger while
 Cloudflare only manages enrollment and delivers wrapped keys.
@@ -354,7 +354,7 @@ the certified history. A replica may receive snapshots and key envelopes ahead
 of activation; its active authorization still follows the history policy.
 The fixed-history restrictions also apply to received root-signed revisions,
 before they can mutate the received snapshot. An unsupported control occupies
-its canonical position without preventing a later valid revision from activating.
+its receipt without preventing a later valid revision from activating.
 
 ## Removal and history policy
 
@@ -365,9 +365,10 @@ snapshot happens to arrive:
   evidence. A replica verifies their complete preceding feed admissions and
   the resulting timestamp boundary before activating the next revision.
   Validators durably seal the old revision before publishing its closure.
-- In coordinated mode, the capability record's certified canonical position
-  is the boundary. The new revision governs later positions. Backdating an
-  author timestamp cannot restore a grant at a later position.
+- With a signed-inclusion provider, controls are reduced in their signed causal
+  revision order and activate after their verified closed timestamp boundary.
+  Receipt order does not choose membership or SQL order. Newly included
+  backdated proposals at or below an already-closed cutoff are excluded.
 
 Earlier final outcomes remain unchanged. A later regrant to the same signing
 key creates a new capability; it cannot reactivate the revoked capability or
@@ -378,15 +379,17 @@ Rotate the epoch after removing a reader: the removed device may retain
 plaintext and old epoch keys it already possessed, but it is not included in
 the new manifest and cannot decrypt traffic encrypted with that new key.
 
-Coordinated histories also fence application acceptance by the epoch selected
-at each canonical position. A verified rotation governs later positions, even
+Application acceptance also checks the epoch selected at the signed author
+timestamp. A verified rotation governs timestamps after its closed boundary, even
 when an earlier reader key remains available for historical replay. A still
 authorized writer's envelope prepared under a closed epoch receives the final
-rejection `ENCRYPTION_EPOCH_CLOSED` if it is ordered after that rotation. Its
+rejection `ENCRYPTION_EPOCH_CLOSED` if its signed time is after that rotation.
+A new inclusion behind an earlier closed cutoff instead receives
+`FINALITY_TIMESTAMP_CLOSED`. Its
 durable operation keeps the original signed bytes and proposal ID; retries do
 not silently re-encrypt or create a new application operation. An application
 can deliberately submit a fresh operation with a new ID after synchronizing.
-An exact retry already ordered before the rotation retains its original outcome.
+An exact retry already finalized before the rotation retains its original outcome.
 
 This is a rule for canonical acceptance. It cannot prevent a participant from
 disclosing plaintext or old-key ciphertext it already knows. An unavailable

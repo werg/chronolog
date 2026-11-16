@@ -27,9 +27,18 @@ describe('native authority process crash recovery', () => {
         expect(crashed.signal === 'SIGKILL' || crashed.status === 137, `${crashed.stdout}\n${crashed.stderr}`).toBe(true)
         expect(crashed.stdout).toContain(`"point":"${point}"`)
         const raw = await inspectStoppedAuthority(directory)
-        const committed = ['after_record_commit', 'after_certificate_commit', 'before_acknowledgement'].includes(point)
-        expect(raw.head.position).toBe(before.head.position + (committed ? 1 : 0))
-        expect(raw.entries.slice(0, before.head.position).map(entry => entry.recordId)).toEqual(before.payloads.map(entry => entry.recordId))
+        const committed = !['before_payload_commit', 'after_payload_commit', 'before_record_commit'].includes(point)
+        expect(raw.proposalCount).toBe(before.proposalCount + (committed ? 1 : 0))
+        expect(raw.entries.slice(0, before.head.position).map(entry => entry.recordId)).toEqual(before.receipts.map(entry => entry.recordId))
+        const target = raw.entries.filter(entry => entry.kind === 'candidate')[before.proposalCount]
+        const coveringClosure = target === undefined ? undefined : raw.closures.find(closure => closure.includedHead.position >= target.position)
+        const closureCommitted = ['after_closure_commit', 'before_certificate_commit', 'after_certificate_commit', 'before_acknowledgement'].includes(point)
+        expect(coveringClosure !== undefined).toBe(closureCommitted)
+        if (coveringClosure !== undefined) {
+          expect(raw.certificate?.kind).toBe('prefix-certificate')
+          const certifiedThrough = raw.certificate?.kind === 'prefix-certificate' ? raw.certificate.certificate.position : -1
+          expect(certifiedThrough >= coveringClosure.position).toBe(['after_certificate_commit', 'before_acknowledgement'].includes(point))
+        }
         if (point === 'after_certificate_commit' || point === 'before_acknowledgement') {
           expect(raw.certificate).toMatchObject({ kind: 'prefix-certificate', certificate: raw.head })
         }
@@ -42,14 +51,21 @@ describe('native authority process crash recovery', () => {
           expect(outcome.outcome?.outcome).toBe(operation)
           if (operation === 'rejected') expect(outcome.outcome?.rejectionCode).toBe('assert:recovery_probe')
           const state = await recovered.inspect()
-          expect(state.head.position).toBe(before.head.position + 1)
+          expect(state.proposalCount).toBe(before.proposalCount + 1)
+          expect(state.payloads).toHaveLength(before.payloads.length + 1)
+          expect(state.receipts.slice(0, before.head.position).map(entry => entry.recordId)).toEqual(before.receipts.map(entry => entry.recordId))
           expect(state.rows).toEqual([[{ kind: 'integer', value: '1' }, { kind: 'integer', value: operation === 'accepted' ? '20' : '10' }]])
           expect(state.events.flatMap(transaction => transaction.events)).toHaveLength(operation === 'accepted' ? 1 : 0)
           await recovered.submit(operation)
-          expect((await recovered.inspect()).head).toEqual(state.head)
+          const retried = await recovered.inspect()
+          expect(retried.payloads).toEqual(state.payloads)
+          expect(retried.receipts.slice(0, state.head.position).map(entry => entry.recordId)).toEqual(state.receipts.map(entry => entry.recordId))
+          expect(retried.operations[operation]).toEqual(state.operations[operation])
+          expect(retried.rows).toEqual(state.rows)
+          expect(retried.events).toEqual(state.events)
           await expect(recovered.node.publish({ operationId: `recovery-${operation}`,
             program: program(emit('recovery.changed', { changed: true })) })).rejects.toThrow('OPERATION_ID_CONFLICT')
-          expect((await recovered.inspect()).head).toEqual(state.head)
+          expect((await recovered.inspect()).payloads).toEqual(state.payloads)
           expect(state.payloads.every(payload => payload.payloadBytes !== null)).toBe(true)
         } finally { await recovered.close() }
       }, 40_000)

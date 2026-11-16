@@ -1,10 +1,12 @@
-# Tendriller connection and prefix authority
+# Tendriller connection and finality provider
 
 `@chronolog/transport-tendriller` is an optional connection for the coordinated
 history policy. The portable record store, Chronolog protocol and history policy
 remain usable without it. Tendriller stores opaque bytes and supplies a retained,
-ordered log; this package supplies the wire adaptation and the optional signed
-prefix endpoint.
+receipt log; this package supplies wire adaptation and an optional signed
+inclusion/closure endpoint. `coordinated` names the signed-inclusion protocol,
+not a different execution order. All replicas execute the same signed author-time
+order with deterministic tie-breakers.
 
 ## Connect a replica
 
@@ -69,15 +71,19 @@ Each returned entry and prefix certificate is encoded as immutable evidence in
 the same local record store. Other peer connections relay these bytes without
 changing their identity or adding a new proof-author feed. A peer can verify and
 apply complete certified history while Tendriller is unavailable. New coordinated
-finality still needs a valid covering certificate and every preceding record.
+finality still needs a valid covering certificate, every preceding receipt and
+the signed author-time closures retained among those records.
 
 `catchUp()` reads retained ranges from the public API, checks the shared hash chain,
 saves the entries and requests an authenticated certificate. The replica's history
-policy verifies that certificate and decides which complete prefix is final. The
+provider verifies the complete inclusion and closure evidence. The replica
+applies the resulting closed prefix in canonical author-time order. The
 adapter never equates an append acknowledgment with final SQL success. Reopening
 revalidates retained history from genesis; its in-memory cursor is only an
 optimization. Watch hints and polling trigger catch-up, and transient failures
-retry even if the committed head has not changed. Set `watch: false` when the host
+retry even if the committed head has not changed. With `watch: true`,
+`finalityPollIntervalMs` also requests closure while no new proposal arrives
+(one second by default). Set `watch: false` when the host
 owns scheduling. Relay failures are exposed through `status().lastCatchUpError`.
 
 ## Compose the authority with the public engine
@@ -104,6 +110,8 @@ export default withTendrillerAuthority(engine, {
   configuration,
   identity: stableAuthorityKey,
   records: authenticatedRecordsClient,
+  cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
+  futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
   http,
   authorize: authorizeThroughRecordLog(engine, {
     base: fixedTendrilRecordApiBase,
@@ -121,10 +129,26 @@ Web API types, including Cloudflare-specific request/response properties, withou
 casting them to browser DOM types. Authorization runs before
 reading the head or signing. The default endpoint is `POST /_chronolog/certificate`
 with no request body; a caller cannot supply a root to sign. The authority reads
-its own configured log's committed head through the public record API and returns
-a signed CBOR prefix certificate. Ordinary requests and additional handler methods
+its own configured log's committed prefix through the public record API. It
+derives a monotone timestamp cutoff from `now` and `cutoffLagMs` (one second by
+default; deployments should use their signed genesis clock policy), signs a closure
+marker for that exact predecessor and appends it using the public generic
+`expectedHead` condition. A concurrent append causes a reread and retry, without
+retaining a marker for the wrong predecessor. The marker is durable before the
+covering CBOR prefix certificate is returned. The complete marker history makes
+late-proposal decisions recoverable after restart. Ordinary requests and additional handler methods
 such as scheduled work remain delegated to the supplied engine. Signing does not
-execute SQL and certificates never enter the log they certify.
+execute SQL. Prefix certificates stay outside the log; closure markers are
+ordinary retained opaque bytes. Receipt positions never select SQL order.
+
+`futureAdmissionWindowMs` defaults to 31,000 and **must equal signed genesis
+`maxFutureSkewMs + cutoffLagMs`** on both provider and replicas. Replicas reject
+author timestamps beyond the first covering closure plus that window. The provider
+can then stop idle closure markers after that bounded horizon, without reading
+application bodies. Empty histories add no marker. Restart recovers the bound
+from retained closure history; an unchanged verified head reuses its evaluated
+snapshot. Receipt hints and repeated certificate polling cannot grow a fully
+closed idle history.
 
 ## Public artifact boundary and verification
 
@@ -141,7 +165,8 @@ against an independent reference log through the packed public SDK. They cover
 lost replies and reopen, governance ordering, offline proof relay, authority access
 checks and delegation. The SQL integration test runs two independent native peers,
 creates an explicit shared collective, accepts its invitation and has both members
-claim one task. Both replicas agree on one accepted transaction, one deterministic
+claim one task with author time reversed relative to receipt order. Both replicas
+choose the earlier authored claim and agree on one accepted transaction, one deterministic
 SQL assertion rejection and the actual final SQL revision. Re-encapsulating the
 same signed proposal does not repeat its SQL effects. A fresh third replica then
 rebuilds those outcomes through an ordinary peer link with the hub unavailable.

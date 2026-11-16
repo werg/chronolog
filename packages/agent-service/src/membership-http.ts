@@ -15,8 +15,8 @@ export const MEMBERSHIP_LEDGER_PATH = '/_chronolog/membership'
 export const MAX_MEMBERSHIP_PAGE_ENTRY_BYTES = 1024 * 1024
 
 /**
- * A root-signed control-plane route to the pinned native ordering authority.
- * Reads contain every ordered descriptor, but never fetch detached application
+ * A root-signed control-plane route to the pinned native finality authority.
+ * Reads contain every receipt and closure marker, but never fetch detached application
  * payloads. Appends accept only complete inline governance records.
  */
 export function createMembershipLedgerHandler(options: {
@@ -69,10 +69,11 @@ export function createMembershipLedgerHandler(options: {
         // A failed response or evidence delivery does not undo a durable append.
         // Retrying these exact bytes returns the original position and root.
         const entry = await authority.appendLedgerRecord(operation.recordBytes)
-        await mirror([entry], await authority.certify())
+        const proof = await authority.certifiedRead({ after: entry.position - 1, limit: 128 })
+        await mirror(proof.entries, proof.certificate)
         encoded = encodeMembershipLedgerResponse(entry)
       } else {
-        const range = await authority.read({ after: operation.after, limit: operation.limit })
+        const range = await authority.certifiedRead({ after: operation.after, limit: operation.limit })
         const entries: OrderedRecordEntry[] = []
         let length = 0
         for (const entry of range.entries) {
@@ -82,7 +83,7 @@ export function createMembershipLedgerHandler(options: {
           entries.push(entry)
           length += size
         }
-        const certificate = await authority.certify()
+        const certificate = range.certificate
         // A read also heals delivery interrupted after a durable administrative
         // append. It never needs to republish the entire retained history.
         await mirror(entries, certificate)

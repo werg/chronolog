@@ -5,13 +5,17 @@ import {
 } from '@chronolog/protocol'
 
 import { Mutex } from './async.js'
+import { evaluateFinalitySnapshot, type FinalityProvider, type FinalitySnapshot } from './finality.js'
 import type { DurableOperationStore } from './operations.js'
 
-/** Exactly two built-in policies; the chosen configuration is immutable. */
+/** Immutable group/provider binding. Execution always uses chronological order. */
 export type HistoryConfiguration = {
   readonly groupId: Uint8Array
   readonly genesisDigest: Uint8Array
   readonly executionManifestDigest: Uint8Array
+  readonly providerId?: string
+  /** Opaque bounded parameters authenticated with the selected provider. */
+  readonly providerParameters?: Uint8Array
 } & ({ readonly kind: 'peer' } | {
   readonly kind: 'coordinated'
   readonly historyId: string
@@ -22,6 +26,7 @@ export type CoordinatedHistoryConfiguration = Extract<HistoryConfiguration, { ki
 
 export interface OrderedRecordEntry {
   readonly historyId: string
+  /** Inclusion receipt position, never an application execution position. */
   readonly position: number
   readonly recordId: string
   readonly previousRoot: string
@@ -48,6 +53,7 @@ export interface CoordinatedProgress {
   readonly receivedThrough: number
   readonly verifiedThrough: number
   readonly certifiedThrough: number
+  /** Complete certified receipt prefix; application finality also needs a closure. */
   readonly finalThrough: number
   readonly root: string
   readonly missing: readonly number[]
@@ -69,14 +75,18 @@ export function encodeHistoryConfiguration(configuration: HistoryConfiguration):
   for (const bytes of [configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest]) {
     if (!(bytes instanceof Uint8Array) || bytes.length !== 32) throw new Error('HISTORY_CONFIGURATION_INVALID')
   }
+  const providerId = configuration.providerId ?? (configuration.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v1')
+  if (!/^[a-z][a-z0-9._-]{0,127}$/u.test(providerId)) throw new Error('HISTORY_PROVIDER_ID_INVALID')
+  const parameters = configuration.providerParameters ?? new Uint8Array()
+  if (!(parameters instanceof Uint8Array) || parameters.length > 16_384) throw new Error('HISTORY_PROVIDER_PARAMETERS_INVALID')
   if (configuration.kind === 'peer') {
-    return encodeCanonicalCbor([1n, 'peer', configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest])
+    return encodeCanonicalCbor([2n, 'peer', configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest, providerId, parameters])
   }
   assertHistoryId(configuration.historyId)
   if (configuration.authorityPublicKey.length !== 32) throw new Error('HISTORY_AUTHORITY_KEY_INVALID')
   return encodeCanonicalCbor([
-    1n, 'coordinated', configuration.groupId, configuration.genesisDigest,
-    configuration.executionManifestDigest, configuration.historyId, configuration.authorityPublicKey,
+    2n, 'coordinated', configuration.groupId, configuration.genesisDigest,
+    configuration.executionManifestDigest, configuration.historyId, configuration.authorityPublicKey, providerId, parameters,
   ])
 }
 
@@ -196,9 +206,10 @@ export function decodeOrderingEvidence(bytes: Uint8Array): OrderingEvidence {
 
 /**
  * Shared durable control storage retains the exact entry mapping and portable
- * certificates. A certified root without every preceding byte is not finality.
+ * certificates. Receipt order enumerates inclusion evidence only. Application
+ * finality additionally requires the independently signed closure markers.
  */
-export class CoordinatedHistoryPolicy {
+export class CoordinatedHistoryPolicy implements FinalityProvider {
   readonly #configuration: CoordinatedHistoryConfiguration
   readonly #store: DurableOperationStore
   readonly #key: string
@@ -210,6 +221,7 @@ export class CoordinatedHistoryPolicy {
   #selectedEntries = new Map<number, OrderedRecordEntry>()
   #certificates = new Map<number, PrefixCertificate>()
   #progress: CoordinatedProgress
+  #finality: FinalitySnapshot
 
   private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, root: string, quotaBytes: number) {
     this.#configuration = structuredClone(configuration)
@@ -217,6 +229,8 @@ export class CoordinatedHistoryPolicy {
     this.#key = `history/${bytesToHex(configuration.groupId)}/coordinated`
     this.#quotaBytes = quotaBytes
     this.#progress = { receivedThrough: 0, verifiedThrough: 0, certifiedThrough: 0, finalThrough: 0, root, missing: [] }
+    this.#finality = { checkpointId: root, receivedThrough: 0, includedThrough: 0,
+      closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [] }
   }
 
   static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore,
@@ -239,6 +253,7 @@ export class CoordinatedHistoryPolicy {
       const evaluated = await policy.#evaluate(policy.#entries, policy.#certificates)
       policy.#progress = evaluated.progress
       policy.#selectedEntries = evaluated.selectedEntries
+      policy.#finality = evaluated.finality
       discardUncommittedAlternatives(policy.#entries, evaluated.selectedEntries)
     }
     return policy
@@ -246,6 +261,31 @@ export class CoordinatedHistoryPolicy {
 
   get progress(): CoordinatedProgress { return structuredClone(this.#progress) }
   get configuration(): CoordinatedHistoryConfiguration { return structuredClone(this.#configuration) }
+  get closedThroughMs(): bigint { return this.#finality.closedThroughMs }
+  get closedReceiptThrough(): number { return this.#finality.closedReceiptThrough }
+
+  snapshot(): FinalitySnapshot { return structuredClone(this.#finality) }
+
+  async ingestEvidence(bytes: Uint8Array): Promise<CoordinatedProgress> {
+    let evidence: OrderingEvidence
+    try { evidence = decodeOrderingEvidence(bytes.slice()) }
+    catch { throw new Error('ORDERING_EVIDENCE_INVALID') }
+    return this.ingest(evidence)
+  }
+
+  evidenceBytes(): readonly Uint8Array[] { return this.evidence().map(encodeOrderingEvidence) }
+
+  boundaryForEntry(position: number): bigint | null {
+    return this.#finality.records.find(record => record.entry.position === position)?.closureBoundary?.closedThroughMs ?? null
+  }
+
+  admissionFloor(position: number): bigint {
+    const record = this.#finality.records.find(record => record.entry.position === position)
+    if (record === undefined) throw new Error('FINALITY_RECORD_NOT_INCLUDED')
+    return record.admissionFloorMs
+  }
+
+  isClosure(position: number): boolean { return this.#finality.closures.some(closure => closure.position === position) }
 
   entries(through = this.#progress.verifiedThrough): readonly OrderedRecordEntry[] {
     assertPosition(through, true)
@@ -279,7 +319,7 @@ export class CoordinatedHistoryPolicy {
       // Exact retries still pass hash/signature/configuration validation, but
       // do not rewrite retained history or turn a read into a storage write.
       if (!changed) return this.progress
-      const { progress, selectedEntries } = await this.#evaluate(entries, certificates)
+      const { progress, selectedEntries, finality } = await this.#evaluate(entries, certificates)
       if (progress.finalThrough < this.#progress.finalThrough) throw new Error('HISTORY_FINAL_PREFIX_REGRESSION')
       discardUncommittedAlternatives(entries, selectedEntries)
       const all: OrderingEvidence[] = [
@@ -296,6 +336,7 @@ export class CoordinatedHistoryPolicy {
       this.#certificates = certificates
       this.#selectedEntries = selectedEntries
       this.#progress = progress
+      this.#finality = finality
       return this.progress
     })
   }
@@ -330,6 +371,7 @@ export class CoordinatedHistoryPolicy {
   async #evaluate(entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<{
     readonly progress: CoordinatedProgress
     readonly selectedEntries: Map<number, OrderedRecordEntry>
+    readonly finality: FinalitySnapshot
   }> {
     const genesisRoot = await orderedGenesisRoot(this.#configuration.historyId)
     let finalThrough = 0
@@ -370,15 +412,23 @@ export class CoordinatedHistoryPolicy {
       if (!entries.has(position)) missing.add(position)
     }
     const gaps = [...missing].filter((position) => position > finalThrough).sort((a, b) => a - b).slice(0, 1_024)
+    const finality = finalThrough === this.#finality.includedThrough && finalRoot === this.#finality.checkpointId
+      ? { ...this.#finality, receivedThrough }
+      : await evaluateFinalitySnapshot(this.#configuration,
+        [...selectedEntries.values()].sort((left, right) => left.position - right.position), receivedThrough)
     return {
       progress: {
         receivedThrough, verifiedThrough: finalThrough, certifiedThrough,
         finalThrough, root: finalRoot, missing: gaps,
       },
       selectedEntries,
+      finality,
     }
   }
 }
+
+/** Preferred name: this provider certifies inclusion and closes author time. */
+export { CoordinatedHistoryPolicy as SignedInclusionFinalityProvider }
 
 function allEntries(entries: ReadonlyMap<number, ReadonlyMap<string, OrderedRecordEntry>>): OrderedRecordEntry[] {
   const result: OrderedRecordEntry[] = []

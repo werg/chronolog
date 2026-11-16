@@ -25,6 +25,10 @@ export interface DaemonAgentRuntimeOptions {
   readonly history: HistoryConfiguration
   readonly activeMembership?: () => CapabilitySnapshot
   readonly authorityQuotaBytes?: number
+  readonly finalityClock?: () => number
+  readonly cutoffLagMs?: number
+  readonly futureAdmissionWindowMs?: number
+  readonly closureIntervalMs?: number
   readonly continuity?: OrderedRecordHead
   readonly modulePath?: string
   /** Dependency injection for native integration tests and embedded deployments. */
@@ -37,6 +41,10 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
     ? options.history.historyId : bytesToHex(options.history.genesisDigest)}`
   const authority = options.history.kind === 'coordinated' && equalBytes(options.history.authorityPublicKey, options.identity.publicKeyBytes)
     ? await NativeAuthority.open({ configuration: options.history, identity: options.identity, store: options.store,
+      ...(options.finalityClock === undefined ? {} : { now: options.finalityClock }),
+      ...(options.cutoffLagMs === undefined ? {} : { cutoffLagMs: options.cutoffLagMs }),
+      ...(options.futureAdmissionWindowMs === undefined ? {} : { futureAdmissionWindowMs: options.futureAdmissionWindowMs }),
+      ...(options.closureIntervalMs === undefined ? {} : { closureIntervalMs: options.closureIntervalMs }),
       ...(options.authorityQuotaBytes === undefined ? {} : { quotaBytes: options.authorityQuotaBytes }),
       ...(options.continuity === undefined ? {} : { continuity: options.continuity }) })
     : null

@@ -15,9 +15,9 @@ import {
   type EnrollmentDescriptor, type EnrollmentFinalTarget, type SignedEnrollmentRequest,
 } from './enrollment.js'
 import { GovernanceActivationIndex } from './governance-activation.js'
-import { GovernanceControlPlane, isInvalidGovernanceRecord } from './governance.js'
+import { GovernanceControlPlane, GovernanceRecordPendingError, isInvalidGovernanceRecord, orderFinalizedGovernanceRecords } from './governance.js'
 import { CoordinatedHistoryPolicy, verifyOrderedEntry, type CoordinatedProgress } from './history-policy.js'
-import { createLedgerRecord, decodeLedgerRecord, LedgerRecordError, type LedgerRecord } from './ledger-record.js'
+import { createLedgerRecord } from './ledger-record.js'
 import { DurableOperationJournal, validateOperationId, type DurableOperationStore } from './operations.js'
 import type { MembershipLedger, MembershipLedgerPage } from './membership-wire.js'
 
@@ -36,6 +36,9 @@ export interface MembershipProvisionOptions {
   /** Application schema authority is distinct from the membership administrator. */
   readonly schemaAdministratorPublicKey: Uint8Array
   readonly nativeAuthority: { readonly historyId: string; readonly publicKey: Uint8Array }
+  /** Signed selection of the finality verifier; omitted values select the built-in provider. */
+  readonly providerId?: string
+  readonly providerParameters?: Uint8Array
   /** Public bootstrap grants; joining devices keep their private keys. */
   readonly initialCapabilities?: readonly CapabilityGrant[]
   readonly groupId?: Uint8Array
@@ -60,6 +63,7 @@ function provisionLock(store: DurableOperationStore): Mutex {
 export async function provisionMembership(options: MembershipProvisionOptions): Promise<ProvisionedMembership> {
   const store = options.store, now = options.now ?? Date.now
   const input = structuredClone({ executionManifestDigest: options.executionManifestDigest, schemaAdministratorPublicKey: options.schemaAdministratorPublicKey, nativeAuthority: options.nativeAuthority,
+    providerId: options.providerId, providerParameters: options.providerParameters,
     initialCapabilities: options.initialCapabilities ?? [], groupId: options.groupId, groupRoute: options.groupRoute })
   for (const value of [input.executionManifestDigest, input.schemaAdministratorPublicKey, input.nativeAuthority.publicKey, input.groupId, input.groupRoute]) {
     if (value !== undefined && (!(value instanceof Uint8Array) || value.length !== 32)) throw new Error('MEMBERSHIP_CONFIGURATION_INVALID')
@@ -73,7 +77,9 @@ export async function provisionMembership(options: MembershipProvisionOptions): 
       groupId, schemaId: input.executionManifestDigest, rootAdminPublicKey: identity.publicKeyBytes, schemaAdminPublicKey: input.schemaAdministratorPublicKey,
       capabilityLogFeed: utf8(feedIdFromPublicKey(identity.publicKeyBytes)),
       historyPolicy: { kind: 'coordinated', executionManifestDigest: input.executionManifestDigest,
-        historyId: input.nativeAuthority.historyId, authorityPublicKey: input.nativeAuthority.publicKey },
+        historyId: input.nativeAuthority.historyId, authorityPublicKey: input.nativeAuthority.publicKey,
+        ...(input.providerId === undefined ? {} : { providerId: input.providerId }),
+        ...(input.providerParameters === undefined ? {} : { providerParameters: input.providerParameters }) },
       initialCapabilities: [{ subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes,
         transportAuthor: feedIdFromPublicKey(identity.publicKeyBytes), role: 'administrator', validFromRevision: 0n }, ...input.initialCapabilities],
       validationPolicies: [{ version: 1n, minimumValidators: 1n }],
@@ -103,7 +109,7 @@ export async function provisionMembership(options: MembershipProvisionOptions): 
 
 /** Signed genesis is the execution-profile source; no materializer is loaded to describe a group. */
 export async function membershipDescriptor(genesis: EnrollmentDescriptor['genesis'], groupRoute: Uint8Array): Promise<EnrollmentDescriptor> {
-  genesis = structuredClone(genesis); groupRoute = groupRoute.slice()
+  genesis = decodeSignedGenesis(encodeSignedGenesis(genesis)); groupRoute = groupRoute.slice()
   const history = genesis.manifest.historyPolicy
   if (history?.kind !== 'coordinated' || history.historyId === undefined || history.authorityPublicKey === undefined) {
     throw new Error('MEMBERSHIP_COORDINATED_HISTORY_REQUIRED')
@@ -112,16 +118,19 @@ export async function membershipDescriptor(genesis: EnrollmentDescriptor['genesi
     kind: 'coordinated', historyId: history.historyId, authorityPublicKey: history.authorityPublicKey,
     groupId: genesis.manifest.groupId, executionManifestDigest: history.executionManifestDigest,
     genesisDigest: await hashDomain(DOMAINS.genesis, encodeGenesisManifest(genesis.manifest)),
+    ...(history.providerId === undefined ? {} : { providerId: history.providerId }),
+    ...(history.providerParameters === undefined ? {} : { providerParameters: history.providerParameters }),
   } }
   await verifyEnrollmentDescriptor(descriptor)
   return descriptor
 }
 
-export function encodeMembershipFinalTarget(descriptor: EnrollmentDescriptor, position: number, root: string): Uint8Array {
-  if (descriptor.history.kind !== 'coordinated' || !Number.isSafeInteger(position) || position < 0 || !/^[0-9a-f]{64}$/u.test(root)) {
+export function encodeMembershipFinalTarget(descriptor: EnrollmentDescriptor, position: number, root: string, closedThroughMs: bigint): Uint8Array {
+  if (descriptor.history.kind !== 'coordinated' || !Number.isSafeInteger(position) || position < 0 ||
+      !/^[0-9a-f]{64}$/u.test(root) || closedThroughMs < 0n) {
     throw new Error('MEMBERSHIP_TARGET_INVALID')
   }
-  return encodeCanonicalCbor([3n, descriptor.history.groupId, 'coordinated', descriptor.history.historyId, BigInt(position), root])
+  return encodeCanonicalCbor([4n, descriptor.history.groupId, 'chronological', descriptor.history.historyId, BigInt(position), root, closedThroughMs])
 }
 
 export interface MembershipRevocation {
@@ -149,7 +158,8 @@ export class MembershipAdministrator {
   readonly #mutex = new Mutex()
   readonly #abort = new AbortController()
   #signal: AbortSignal
-  #applied = 0
+  readonly #handledControls = new Set<number>()
+  #pendingControls = false
   #published = 0
   #closed = false
 
@@ -164,7 +174,7 @@ export class MembershipAdministrator {
       rootPrivateKey: options.identity.privateKey, captureFinalTarget: async () => {
         await this.#sync()
         if (this.#activation.activeSnapshot.revision !== this.#governance.snapshot.revision ||
-            this.#policy.progress.verifiedThrough < this.#published) throw new Error('MEMBERSHIP_PREFIX_PENDING')
+            this.#policy.closedReceiptThrough < this.#published || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
         return this.#target()
       } })
   }
@@ -174,6 +184,7 @@ export class MembershipAdministrator {
     const descriptor = structuredClone(input.descriptor), identity = { ...input.identity, publicKeyBytes: input.identity.publicKeyBytes.slice() }
     await verifyEnrollmentDescriptor(descriptor)
     if (descriptor.history.kind !== 'coordinated') throw new Error('MEMBERSHIP_COORDINATED_HISTORY_REQUIRED')
+    if ((descriptor.history.providerId ?? 'signed-inclusion-v1') !== 'signed-inclusion-v1') throw new Error('FINALITY_PROVIDER_UNAVAILABLE')
     const history = descriptor.history
     if (!equalBytes(identity.publicKeyBytes, descriptor.genesis.manifest.rootAdminPublicKey) ||
         new TextDecoder().decode(descriptor.genesis.manifest.capabilityLogFeed) !== feedIdFromPublicKey(identity.publicKeyBytes)) {
@@ -309,30 +320,28 @@ export class MembershipAdministrator {
       if (cursor < target && page.entries.length === 0) throw new Error('MEMBERSHIP_RANGE_GAP')
       this.#signal.throwIfAborted()
     } while (cursor < target)
-    for (const entry of this.#policy.entries()) {
-      if (entry.position <= this.#applied) continue
-      let record: LedgerRecord
-      try { record = decodeLedgerRecord(entry.bytes) }
-      catch (error) {
-        if (!(error instanceof LedgerRecordError)) throw error
-        this.#applied = entry.position
-        continue
+    const controls = await orderFinalizedGovernanceRecords(this.#policy.snapshot().records.flatMap(record =>
+      record.closureBoundary === null || this.#handledControls.has(record.entry.position) ? []
+        : [{ entry: record.entry, cutoffMs: record.closureBoundary.closedThroughMs }]), this.#descriptor.groupRoute)
+    this.#pendingControls = false
+    for (const { entry, cutoffMs } of controls) {
+      try {
+        const snapshot = await this.#governance.ingestFinalized(entry, this.#activation.activeSnapshot, cutoffMs)
+        if (snapshot !== null && snapshot.revision > this.#activation.activeSnapshot.revision) {
+          this.#activation.observe(snapshot); this.#activation.activateFinalized(snapshot, cutoffMs)
+        }
+      } catch (error) {
+        if (error instanceof GovernanceRecordPendingError) { this.#pendingControls = true; continue }
+        if (!isInvalidGovernanceRecord(error)) throw error
       }
-      if (equalBytes(record.groupRoute, this.#descriptor.groupRoute) && record.kind !== 'candidate') {
-        try {
-          const snapshot = await this.#governance.ingestCanonical(entry, this.#activation.activeSnapshot)
-          if (snapshot !== null && snapshot.revision > this.#activation.activeSnapshot.revision) {
-            this.#activation.observe(snapshot); this.#activation.activateCoordinated(snapshot, BigInt(entry.position))
-          }
-        } catch (error) { if (!isInvalidGovernanceRecord(error)) throw error }
-      }
-      this.#applied = entry.position
+      this.#handledControls.add(entry.position)
     }
   }
 
   #target(): EnrollmentFinalTarget {
-    const progress = this.#policy.progress
-    return { frontier: encodeMembershipFinalTarget(this.#descriptor, progress.verifiedThrough, progress.root),
+    const closure = this.#policy.snapshot().closures.at(-1)
+    if (closure === undefined || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
+    return { frontier: encodeMembershipFinalTarget(this.#descriptor, closure.includedThrough, closure.includedRoot, closure.closedThroughMs),
       requiredEpochs: this.#governance.knownEpochs, executionManifestDigest: this.#descriptor.history.executionManifestDigest.slice() }
   }
 
@@ -342,7 +351,7 @@ export class MembershipAdministrator {
     const revision = await this.#governance.revoke(ids, this.#identity.privateKey, { operationId: `revoke:${key}` })
     const epoch = await this.#governance.rotateEpoch(this.#identity.privateKey, undefined, { operationId: `rotate:${key}` })
     await this.#sync()
-    if (this.#policy.progress.verifiedThrough < this.#published) throw new Error('MEMBERSHIP_PREFIX_PENDING')
+    if (this.#policy.closedReceiptThrough < this.#published || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
     const target = this.#target()
     await this.#store.put(resultKey, encodeCanonicalCbor([1n, await capabilityRevisionDigest(revision.revision),
       epoch.manifest.epoch, target.frontier, target.requiredEpochs, target.executionManifestDigest]))
