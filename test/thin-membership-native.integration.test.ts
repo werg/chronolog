@@ -25,6 +25,8 @@ const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 describe('thin membership qualification native boundary', () => {
+  // Large-body replay, lost-reply recovery and two revocations take about 64 s
+  // under V8 coverage; retain headroom for shared CI runners without shortcuts.
   it('keeps large SQL payloads off the administrator and recovers a lost enrollment append through the real native handler', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-thin-membership-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true }))
@@ -50,6 +52,7 @@ describe('thin membership qualification native boundary', () => {
     const small = await native.publishWorkload({ namespace: 'small', count: 4, payloadBytes: 16 })
     await administrator.sync()
     const large = await native.publishWorkload({ namespace: 'large', count: 4, payloadBytes: 196_608 })
+    const beforeJoinSnapshot = await native.snapshot()
     await administrator.sync()
     expect(small.count).toBe(4); expect(large.count).toBe(4)
     expect(large.detachedEnvelopeBytes).toBeGreaterThan(700_000)
@@ -62,8 +65,9 @@ describe('thin membership qualification native boundary', () => {
     expect(beforeJoin.inlineControlEnvelopeBytes).toBeGreaterThan(0)
     expect(beforeJoin.applicationEnvelopeBytesToAdministrator).toBe(0)
     expect(beforeJoin.unexpectedAdministratorRequests).toBe(0)
-    expect(administrator.progress.verifiedThrough).toBe((await native.snapshot()).head.position)
-    expect((await native.snapshot()).schemaRoles).toEqual({ nativeSchemaAdministrators: 1, membershipRootGroupMembers: 0 })
+    expect(administrator.progress.verifiedThrough).toBeGreaterThanOrEqual(beforeJoinSnapshot.head.position)
+    expect(administrator.read({ after: beforeJoinSnapshot.head.position - 1, limit: 1 }).entries[0]?.root).toBe(beforeJoinSnapshot.head.root)
+    expect(beforeJoinSnapshot.schemaRoles).toEqual({ nativeSchemaAdministrators: 1, membershipRootGroupMembers: 0 })
 
     const deviceStore = new NativeAgentStore(join(directory, 'device.sqlite'))
     cleanup.push(() => deviceStore.close())
@@ -169,5 +173,5 @@ describe('thin membership qualification native boundary', () => {
     expect(native.traffic().applicationEnvelopeBytesToAdministrator).toBe(0)
     expect(native.traffic().unexpectedAdministratorRequests).toBe(0)
     native.assertHealthy()
-  }, 60_000)
+  }, 120_000)
 })

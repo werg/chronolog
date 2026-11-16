@@ -2,4 +2,5 @@
 // It does not import either core's private implementation into the Worker.
 export { decodeSignedGenesis } from '@chronolog/capabilities'
 export { base64UrlToBytes, bytesToBase64Url } from '@chronolog/protocol'
+export { isFinalityClosureRecord } from '@chronolog/node-core/finality'
 export { decodeMembershipLedgerResponse } from '@chronolog/node-core/membership'

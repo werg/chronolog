@@ -20,7 +20,7 @@ export interface PilotDiagnostics {
   reconnect(): Promise<void>
   setRoute(connection: NonNullable<BrowserEventBootstrap['connection']>): Promise<void>
   routeStats(): Promise<readonly { readonly route: string; readonly authenticatedMs: number; readonly sentBytes?: number; readonly receivedBytes?: number; readonly queuedBytes?: number }[]>
-  routeState(): Promise<{ readonly records: number; readonly recordDigest: string; readonly capabilityDigest: string; readonly finalThrough: number }>
+  routeState(): Promise<{ readonly records: number; readonly recordDigest: string; readonly capabilityDigest: string; readonly finalOrderLength: number }>
   sync(): Promise<void>
   events(): Promise<EventBatch>
   operation(operationId: string): Promise<ApplicationOperation | null>

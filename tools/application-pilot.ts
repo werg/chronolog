@@ -12,7 +12,7 @@ import type { AgentApplicationModule } from '@chronolog/agent-service'
 import { OWNER_FOR_KEY_SQL, type TransactionHandle } from '@chronolog/client'
 import { DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite'
 import { decodeLedgerRecord, isFinalityClosureRecord } from '@chronolog/node-core'
-import { base64UrlToBytes, bytesToBase64Url, compareTransactionOrder, program, sqlStatement, utf8, type EffectiveEvent, type EventBatch } from '@chronolog/protocol'
+import { base64UrlToBytes, bytesToBase64Url, compareTransactionOrder, emit, program, sqlStatement, utf8, type EffectiveEvent, type EventBatch } from '@chronolog/protocol'
 import { chromium, expect, type Browser, type Page } from '@playwright/test'
 import { build } from 'esbuild'
 
@@ -356,23 +356,30 @@ try {
       routes.enableRelay()
       const catchUp = await native.client.events.publish('conversation', { type: 'message.posted', version: 1, messageId: 'route-catchup-message', text: 'History added during a route interruption' }, { operationId: 'route-catchup-message' })
       await accepted(catchUp)
-      const bodySize = 192 * 1024, bodyCount = 4
-      for (let i = 0; i < bodyCount; i++) await accepted(await native.client.events.publish('route-benchmark',
-        { sample: i, body: 'x'.repeat(bodySize) }, { operationId: `route-catchup-body-${i}` }))
+      // Keep four large proposals while respecting the public 16 KiB event
+      // payload cap: each atomic program carries sixteen 12 KiB event bodies.
+      const eventBodySize = 12 * 1024, eventsPerProposal = 16, bodyCount = 4
+      const bodySize = eventBodySize * eventsPerProposal
+      for (let i = 0; i < bodyCount; i++) await accepted(await native.client.submit(program(
+        ...Array.from({ length: eventsPerProposal }, (_, chunk) => emit('route-benchmark',
+          { sample: i, chunk, body: 'x'.repeat(eventBodySize) })),
+      ), { operationId: `route-catchup-body-${i}` }))
       const resumeStarted = performance.now()
       await Promise.all(all.map((page, index) => page.evaluate(connection => (globalThis as unknown as PilotWindow).applicationPilot.setRoute(connection), routes!.endpoint(index === 0 ? 'relay' : 'direct'))))
       const finalNative = await native.client.events.read()
+      assert.equal(finalNative.hasMore, false, 'route benchmark must compare the complete final event history')
       const lastProposal = finalNative.transactions.at(-1)!.proposalId
       await Promise.all(all.map(page => browserHasProposal(page, lastProposal)))
       report.timingsMs.routeReconnectCatchUp = performance.now() - resumeStarted
       const finalViews = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.events())))
+      assert(finalViews.every(view => !view.hasMore), 'both browser histories must include every benchmark proposal')
       assert.deepEqual(sharedHistory(finalViews[0]!), sharedHistory(finalViews[1]!))
       assert.deepEqual(sharedHistory(finalViews[0]!), sharedHistory(finalNative))
       const finalOperations = await Promise.all(all.map((page, index) => page.evaluate(async ids => Promise.all(ids.map(id =>
         (globalThis as unknown as PilotWindow).applicationPilot.operation(id))), authoredIds[index]!)))
       assert.deepEqual(finalOperations, capturedOutcomes, 'changing the selected byte route cannot change original operation outcomes')
       const replicaStates = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeState())))
-      const nativeState = await routeState(native.transport, native.governed.activeSnapshot, native.node.finalThrough)
+      const nativeState = await routeState(native.transport, native.governed.activeSnapshot, native.node.finalOrderLength)
       assert.deepEqual(replicaStates[0], nativeState)
       assert.deepEqual(replicaStates[1], nativeState)
       const routeStats = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.routeStats())))
@@ -382,7 +389,7 @@ try {
         finally { await session.detach() }
       }))
       report.diagnostics.routes = { ...routes.snapshot(), browserSessions: routeStats, pagePerformanceMetrics: memory, replicaStates, nativeState,
-        catchUp: { applicationStringBytes: bodySize * bodyCount, elapsedMs: report.timingsMs.routeReconnectCatchUp,
+        catchUp: { applicationStringBytes: bodySize * bodyCount, eventsPerProposal, eventBodyBytes: eventBodySize, elapsedMs: report.timingsMs.routeReconnectCatchUp,
           applicationBytesPerSecond: bodySize * bodyCount * 1000 / report.timingsMs.routeReconnectCatchUp },
         nativeHarnessPeakRssBytes: process.resourceUsage().maxRSS * 1024, finalEventDigest: createHash('sha256').update(JSON.stringify(sharedHistory(finalNative))).digest('hex'),
         notes: ['Page JS heap snapshots exclude Worker/WASM memory; native peak RSS includes this qualification harness and excludes workerd/browser child processes.',

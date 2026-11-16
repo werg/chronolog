@@ -2,7 +2,7 @@
 import { beforeAll, expect, inject, it } from 'vitest';
 import { createTestPage, initializeTestService } from '@tendriller/engine/testing';
 import { createMembersClient } from '@tendriller/core/members';
-import { base64UrlToBytes, bytesToBase64Url, decodeMembershipLedgerResponse, decodeSignedGenesis } from './membership-api.mjs';
+import { base64UrlToBytes, bytesToBase64Url, decodeMembershipLedgerResponse, decodeSignedGenesis, isFinalityClosureRecord } from './membership-api.mjs';
 
 beforeAll(() => initializeTestService(inject('d1Migrations')));
 const fixtureBase = inject('fixtureBase');
@@ -54,6 +54,27 @@ async function until(read, accept, label, timeout = 75_000) {
   throw new Error(`${label}: ${JSON.stringify(value)}`);
 }
 
+async function decision(client, method, input, timeout = 30_000) {
+  // Retrying a pending durable action must use exactly the original operation
+  // identity and contents. Conflicts, authorization failures and lost replies
+  // keep their original errors; only the named host progress wait is retried.
+  const encoded = JSON.stringify(input), deadline = performance.now() + timeout;
+  let pending;
+  do {
+    try { return await client[method](JSON.parse(encoded)); }
+    catch (error) {
+      if (error?.status !== 503 || error?.code !== 'membership_pending') throw error;
+      pending = error;
+    }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining)));
+  } while (performance.now() < deadline);
+  throw new Error(`Membership ${method} ${input.operationId} remained pending after ${timeout}ms`, { cause: pending });
+}
+
+const entries = pages => pages.flatMap(bytes => decodeMembershipLedgerResponse(base64UrlToBytes(bytes), 'read').entries);
+
 it('administers an independently ordered native/browser group through the actual Cloudflare membership provider', async () => {
   const setup = await fixture('configuration');
   const page = await createTestPage({ application: { kind: 'peer', id: setup.nativeAuthority.historyId }, lifetime: 'resident' });
@@ -101,7 +122,7 @@ it('administers an independently ordered native/browser group through the actual
   await expect(applicantMembers.approve({ operationId: 'self-approve', requestId: submitted.id,
     roles: ['reader', 'writer'], grantFullHistory: true, writerProgram })).rejects.toMatchObject({ status: 403 });
 
-  const decision = { operationId: 'host-approve-device', requestId: submitted.id,
+  const approvalDecision = { operationId: 'host-approve-device', requestId: submitted.id,
     roles: ['reader', 'writer'], grantFullHistory: true, writerProgram };
   let dropReply = true;
   const lostReplyOwner = members(page.ownerApi, async (path, response) => {
@@ -111,15 +132,15 @@ it('administers an independently ordered native/browser group through the actual
       throw new TypeError('Qualification dropped the committed approval response');
     }
   });
-  await expect(lostReplyOwner.approve(decision)).rejects.toThrow('dropped');
+  await expect(decision(lostReplyOwner, 'approve', approvalDecision)).rejects.toThrow('dropped');
   const retained = await applicantMembers.requestStatus(submitted.id);
   expect(retained.status).toBe('approved');
   await page.restart();
   expect((await owner.info()).descriptor).toEqual(configured.descriptor);
-  const approval = await owner.approve(decision);
+  const approval = await decision(owner, 'approve', approvalDecision);
   expect(approval.signedApproval).toBe(retained.signedApproval);
   expect(approval.capabilityIds).toEqual(retained.capabilityIds);
-  await expect(owner.approve({ ...decision, roles: ['reader'] })).rejects.toMatchObject({ status: 409 });
+  await expect(owner.approve({ ...approvalDecision, roles: ['reader'] })).rejects.toMatchObject({ status: 409 });
   await passed('host authentication binds device ownership and exact approval survives a lost reply plus real Durable Object eviction');
 
   const pending = await device({ method: 'approval', requestId, signedApproval: approval.signedApproval });
@@ -142,7 +163,8 @@ it('administers an independently ordered native/browser group through the actual
   const active = await device({ method: 'status' }), writer = active.grants.find(grant => grant.role === 'writer' && grant.active);
   expect(writer).toBeDefined();
   await device({ method: 'disconnect' });
-  const writerRemoved = await owner.revoke({ operationId: 'host-revoke-writer', capabilityIds: [writer.id] });
+  const writerDecision = { operationId: 'host-revoke-writer', capabilityIds: [writer.id] };
+  const writerRemoved = await decision(owner, 'revoke', writerDecision);
   expect((await applicantMembers.info()).identity.accountId).toBe(applicantInfo.identity.accountId);
   const rejected = await device({ method: 'publish', operationId: 'device-after-writer-revocation', text: 'must fail through direct peer path' });
   await device({ method: 'connect' });
@@ -160,7 +182,8 @@ it('administers an independently ordered native/browser group through the actual
 
   const reader = reopened.grants.find(grant => grant.role === 'reader' && grant.active);
   expect(reader).toBeDefined();
-  const removed = await owner.revoke({ operationId: 'host-revoke-reader', capabilityIds: [reader.id] });
+  const readerDecision = { operationId: 'host-revoke-reader', capabilityIds: [reader.id] };
+  const removed = await decision(owner, 'revoke', readerDecision);
   await expect(applicantMembers.history({ after: 0 })).rejects.toMatchObject({ status: 403 });
   // An owner can relay public certified controls even when the removed account
   // can no longer bootstrap through its own host membership endpoint.
@@ -175,30 +198,37 @@ it('administers an independently ordered native/browser group through the actual
     { identity: prepared.signingPublicKey, removedEpoch: removed.epoch, knownEpochs: afterRemoval.knownEpochs,
       availableEpochs: afterRemoval.availableEpochs, cannotReadPostRevocationEvent: true });
 
-  const beforeRestore = await owner.sync(), controlsBeforeRestore = await history(owner);
+  await owner.sync();
+  const controlsBeforeRestore = await history(owner), beforeRestore = await owner.info();
+  const entriesBeforeRestore = entries(controlsBeforeRestore);
   const nativeBeforeRestore = (await fixture('snapshot')).head;
   expect(beforeRestore.pendingActions).toBe(0);
   expect(beforeRestore.requests.find(row => row.id === submitted.id).status).toBe('revoked');
   await page.restart();
   const restored = await owner.info();
   expect(restored).toEqual(beforeRestore);
-  expect(await history(owner)).toEqual(controlsBeforeRestore);
-  expect(await owner.approve(decision)).toEqual(approval);
-  expect(await owner.revoke({ operationId: 'host-revoke-writer', capabilityIds: [writer.id] })).toEqual(writerRemoved);
-  expect(await owner.revoke({ operationId: 'host-revoke-reader', capabilityIds: [reader.id] })).toEqual(removed);
+  expect(await decision(owner, 'approve', approvalDecision)).toEqual(approval);
+  expect(await decision(owner, 'revoke', writerDecision)).toEqual(writerRemoved);
+  expect(await decision(owner, 'revoke', readerDecision)).toEqual(removed);
   await expect(owner.revoke({ operationId: 'host-revoke-reader', capabilityIds: [writer.id] })).rejects.toMatchObject({ status: 409 });
   await expect(applicantMembers.history({ after: 0 })).rejects.toMatchObject({ status: 403 });
-  expect((await fixture('snapshot')).head).toEqual(nativeBeforeRestore);
-  await passed('reopened actual Cloudflare metadata retains root, certified descriptor prefix, revoked roster, epoch decisions and exact action receipts without new native positions',
+  const entriesAfterRestore = entries(await history(owner));
+  expect(entriesAfterRestore.slice(0, entriesBeforeRestore.length)).toEqual(entriesBeforeRestore);
+  expect(entriesAfterRestore[nativeBeforeRestore.position - 1]?.root).toBe(nativeBeforeRestore.root);
+  const newReceipts = entriesAfterRestore.slice(entriesBeforeRestore.length);
+  expect(newReceipts.every(entry => isFinalityClosureRecord(entry.bytes))).toBe(true);
+  const nativeAfterRestore = (await fixture('snapshot')).head;
+  expect(nativeAfterRestore.position).toBeGreaterThanOrEqual(nativeBeforeRestore.position);
+  await passed('reopened actual Cloudflare metadata retains root, certified descriptor prefix, revoked roster, epoch decisions and exact action receipts without new application or control entries',
     { before: beforeRestore, after: restored, writerRevocation: writerRemoved, readerRevocation: removed,
-      nativeHead: nativeBeforeRestore, exactControlPages: controlsBeforeRestore.length });
+      nativeBeforeRestore, nativeAfterRestore, retainedReceipts: entriesBeforeRestore.length, newClosureRecords: newReceipts.length });
 
   const fresh = await fixture('new-device', { name: 'thin-membership-restored-reader', bootstrap });
   expect(fresh.prepared.signingPublicKey).not.toBe(prepared.signingPublicKey);
   const readerInfo = await otherMembers.info(), readerRequestId = readerInfo.identity.requestPrefix + 'after-admin-restart';
   const readerRequest = await device({ method: 'request', requestId: readerRequestId });
   const readerSubmission = await otherMembers.requestEnrollment(readerRequest.signedRequest);
-  const readerApproval = await owner.approve({ operationId: 'approve-reader-after-admin-restart', requestId: readerSubmission.id,
+  const readerApproval = await decision(owner, 'approve', { operationId: 'approve-reader-after-admin-restart', requestId: readerSubmission.id,
     roles: ['reader'], grantFullHistory: true });
   await device({ method: 'approval', requestId: readerRequestId, signedApproval: readerApproval.signedApproval });
   const readerActivated = await device({ method: 'history', pages: await history(otherMembers) });

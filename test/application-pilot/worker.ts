@@ -82,7 +82,7 @@ endpoint.addEventListener('message', (event) => {
       case 'disconnect': await disconnect(); return null
       case 'reconnect': await connect(); return null
       case 'routeStats': return [...connectionHistory, ...(connection === undefined ? [] : [connection.stats()])]
-      case 'routeState': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return routeState(peer!.transport, peer!.governed!.activeSnapshot, peer!.node.finalThrough)
+      case 'routeState': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return routeState(peer!.transport, peer!.governed!.activeSnapshot, peer!.node.finalOrderLength)
       case 'setRoute': await disconnect(); bootstrap = { ...bootstrap!, connection: request.connection! }; await connect(); return null
       case 'signalPublish': return signals!.publish(request.topic!, request.payload!, { ttlMs: request.ttlMs ?? 2500 })
       case 'signalNext': {
