@@ -372,6 +372,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
           authorTimestampMs: transaction.core.authorTimestampMs,
           txId: transaction.txId,
           actor: transaction.core.authorId,
+          groupId: transaction.core.groupId,
         }, this.#executionManifest.limits)
       }
     } catch (error) {

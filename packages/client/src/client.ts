@@ -49,6 +49,7 @@ import {
   type ShareInput,
 } from './ownership.js'
 import { StreamResource } from './stream-resource.js'
+import { SealedDataActions } from './sealed.js'
 
 export interface ChronologClientOptions {
   readonly transport: RpcTransport
@@ -155,6 +156,8 @@ export class ChronologClient {
   #closed = false
   /** Sharing, teams and transfers of owned rows; each call submits one transaction. */
   readonly ownership: OwnershipActions = new OwnershipActions(this)
+  /** Explicit reader policies and client-encrypted BLOB columns. */
+  readonly sealed: SealedDataActions = new SealedDataActions(this)
 
   constructor(options: ChronologClientOptions) {
     this.groupId = options.groupId
@@ -420,10 +423,15 @@ export class OwnershipActions {
 
   /**
    * Offer every row you (or a team you administer) own, across all tables:
-   * the key-change path. Rows written before the recipient accepts move too.
+   * the key-change path. The offered row set and contents must remain unchanged.
    */
   async offerAll(input: OfferAllInput, options?: TransactionOptions): Promise<OwnershipChange<Uint8Array>> {
     return this.#create(ownershipSteps.offerAll(input), options)
+  }
+
+  /** Cancel your offer, or decline an offer addressed to you (team admins may act for teams). */
+  async cancelOffer(offerId: Uint8Array, options?: TransactionOptions): Promise<OwnershipChange> {
+    return this.#submit(platformOp.cancelTransfer(offerId), options)
   }
 
   async acceptOffer(offerId: Uint8Array, options?: TransactionOptions): Promise<OwnershipChange> {

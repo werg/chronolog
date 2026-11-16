@@ -48,7 +48,7 @@ export interface Ed25519KeyPair {
 const ED25519: AlgorithmIdentifier = { name: 'Ed25519' }
 
 function bufferSource(value: Uint8Array): ArrayBuffer {
-  return value.slice().buffer
+  return Uint8Array.from(value).buffer
 }
 
 export async function generateEd25519KeyPair(extractable = true): Promise<Ed25519KeyPair> {

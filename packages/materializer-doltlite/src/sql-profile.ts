@@ -132,6 +132,8 @@ export type SqlAuthorizationMode =
 export interface SqlAuthorizationOptions {
   /** The signer is an admin of the `group` collective and may run DDL. */
   readonly schemaAdmin?: boolean
+  /** Exact generated trigger names; their privilege is restricted to lifecycle metadata columns. */
+  readonly lifecycleTriggers?: ReadonlySet<string>
   /**
    * Lower-case names of tables that carry no owner checks (virtual tables and
    * sqlite-vec chunk tables). App SQL may write them only from app triggers,
@@ -424,6 +426,14 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
       const moduleShadowWrite = (action === ACTION.INSERT || action === ACTION.UPDATE || action === ACTION.DELETE) &&
         caller === '' && database === 'main' && options.shadowTables?.has(objectName) === true
       return moduleShadowWrite ? SQLITE_OK : SQLITE_DENY
+    }
+    // Exact generated lifecycle callers may invalidate grants/offers and
+    // close or migrate a sealed reader policy's row binding.
+    // No application trigger/view inherits this permission.
+    if (action === ACTION.UPDATE && database === 'main' && options.lifecycleTriggers?.has(caller) === true) {
+      if ((objectName === 'chronolog_grants' && secondaryName === 'revoked_tx') ||
+          (objectName === 'chronolog_transfers' && (secondaryName === 'state' || secondaryName === 'closed_tx')) ||
+          (objectName === 'chronolog_reader_policies' && (secondaryName === 'closed_tx' || secondaryName === 'row_key'))) return SQLITE_OK
     }
     // ── consensus writes ──
     if (action === ACTION.INSERT || action === ACTION.UPDATE || action === ACTION.DELETE) {

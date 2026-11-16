@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_DECODE_LIMITS, HASH_DOMAINS, assertCanonicalCbor, bytesToHex, bytesToInt64,
   bytesToUint32, bytesToUint64, decodeCanonicalCbor, domainSeparatedBytes, encodeCanonicalCbor,
-  hashDomain, int64Bytes, uint32Bytes, uint64Bytes, utf8,
+  hashDomain, int64Bytes, sha256, uint32Bytes, uint64Bytes, utf8,
 } from './index.js'
 
 describe('canonical primitives', () => {
@@ -64,5 +64,15 @@ describe('canonical primitives', () => {
     expect(new DataView(framed.buffer).getUint32(0, false)).toBe(utf8(HASH_DOMAINS.schema).length)
     expect(await hashDomain('schema', Uint8Array.of(1))).not.toEqual(await hashDomain('schema', Uint8Array.of(2)))
     expect(await hashDomain('schema', Uint8Array.of(1))).not.toEqual(await hashDomain('transaction', Uint8Array.of(1)))
+  })
+
+  it('hashes only the supplied Buffer byte range, including an empty view', async () => {
+    const allocation = Buffer.alloc(64, 0x5a)
+    const payload = allocation.subarray(17, 20)
+    payload.set(utf8('abc'))
+    const original = Uint8Array.from(allocation)
+    expect(bytesToHex(await sha256(payload))).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+    expect(bytesToHex(await sha256(allocation.subarray(17, 17)))).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+    expect(Uint8Array.from(allocation)).toEqual(original)
   })
 })

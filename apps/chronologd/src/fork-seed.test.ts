@@ -89,6 +89,21 @@ async function seed(writer: Writer, plan: ForkSeedPlan): Promise<string[]> {
 }
 
 describe('fork seed plan', () => {
+  it.each([
+    ['active', null],
+    ['closed', new Uint8Array([1])],
+  ] as const)('refuses a snapshot with a reader-policy generation that is %s before producing a cross-group seed plan', (_state, closedTx) => {
+    const database = new DatabaseSync(':memory:')
+    try {
+      // Even a generation without current values cannot be silently relabeled:
+      // its group-bound policy id and historical ciphertext remain significant.
+      database.exec('CREATE TABLE chronolog_reader_policies (policy_id BLOB PRIMARY KEY, closed_tx BLOB) STRICT')
+      database.prepare('INSERT INTO chronolog_reader_policies VALUES (?, ?)').run(testKey(0x70), closedTx)
+      expect(() => buildForkSeedPlan(database as unknown as ReadableDatabase, ORIGIN))
+        .toThrow('SEALED_DATA_REQUIRES_EXPLICIT_REENCRYPTION')
+    } finally { database.close() }
+  })
+
   it('recreates tables, rows, owners, teams and grants exactly, and is idempotent', async () => {
     const sourcePath = await sourceGroup()
     const plan = readOnly(sourcePath, (database) => buildForkSeedPlan(database, ORIGIN))

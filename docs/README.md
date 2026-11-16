@@ -42,6 +42,7 @@ resolves.
 | [security-threat-review.md](security-threat-review.md) | Status | Internal authorizer/protocol review and open findings. |
 | [design-owner-rows.md](design-owner-rows.md) | Implemented | Owner-controlled rows: the signing key owns its rows; generated write checks, app triggers narrow (write half of Namlu design K). |
 | [app-ownership.md](app-ownership.md) | Guide | Owned rows in app code: identity, typed rejections, sharing, teams, transfers, ownership queries and React hooks. |
+| [sealed-data.md](sealed-data.md) | Guide | Explicit per-row reader policies, encrypted BLOB columns, key rotation, finality and confidentiality limits. |
 | [production-execution.md](production-execution.md) | Decision record | Why the first pilot is the native daemon, and criteria to reconsider workerd. |
 
 ## Operational

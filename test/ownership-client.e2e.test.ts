@@ -1,5 +1,4 @@
-// The app-facing ownership API (ChronologClient.ownership, ownershipQueries,
-// ownerKeySql, TransactionRejectedError) against two real nodes in one group.
+// App-facing ownership and sealed-data APIs against two real nodes in one group.
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,13 +12,14 @@ import {
   type OwnershipQuery,
   type TransactionHandle,
 } from '@chronolog/client'
+import { generateX25519KeyPair } from '@chronolog/crypto'
 import {
   DeterministicMaterializer,
   createDoltLiteExecutionManifest,
   createDoltLiteMaterializationRuntime,
 } from '@chronolog/materializer-doltlite'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
-import { equalBytes, generateEd25519KeyPair, type Ed25519KeyPair } from '@chronolog/protocol'
+import { encodeRowKey, encodeSealedEnvelope, equalBytes, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -57,7 +57,7 @@ describe('ownership client API', () => {
     await seenBy(bob, share.handle)
     const received = await list(bob, ownershipQueries.grantsReceived(bobKey))
     expect(received).toEqual([{
-      grantId: share.id, table: 'notes', grantor: aliceKey, grantee: bobKey, rowKey: '1', operations: ['update'], columns: ['status'],
+      grantId: share.id, table: 'notes', grantor: aliceKey, grantee: bobKey, rowKey: encodeRowKey([1n]), operations: ['update'], columns: ['status'],
     }])
     expect(await list(alice, ownershipQueries.grantsGiven(aliceKey))).toEqual(received)
     await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).accepted()
@@ -95,7 +95,7 @@ describe('ownership client API', () => {
     await offer.handle.accepted()
     await seenBy(bob, offer.handle)
     expect(await list(bob, ownershipQueries.incomingOffers(bobKey))).toEqual([
-      { offerId: offer.id, table: 'notes', rowKey: '1', from: aliceKey, to: bobKey, carry: false },
+      { offerId: offer.id, table: 'notes', rowKey: encodeRowKey([1n]), from: aliceKey, to: bobKey, carry: false },
     ])
     expect((await list(alice, ownershipQueries.outgoingOffers(aliceKey))).map((entry) => entry.offerId)).toEqual([offer.id])
     await (await bob.ownership.acceptOffer(offer.id)).handle.accepted()
@@ -108,6 +108,90 @@ describe('ownership client API', () => {
     // Alice is the schema administrator; Bob is not.
     expect(await list(alice, ownershipQueries.schemaAdmin(aliceKey))).toEqual([true])
     expect(await list(bob, ownershipQueries.schemaAdmin(bobKey))).toEqual([false])
+  }, 60_000)
+
+  it('replicates sealed BLOB columns with explicit readers, scoped writers and future-only reader removal', async () => {
+    const { alice, bob } = await twoNodes()
+    const [aliceId, bobId, aliceReader, bobReader] = await Promise.all([
+      alice.identity(), bob.identity(), generateX25519KeyPair(), generateX25519KeyPair(),
+    ])
+    const created = await alice.transaction([
+      'CREATE TABLE docs (id INTEGER PRIMARY KEY, body BLOB, label TEXT NOT NULL) STRICT',
+      "INSERT INTO docs (id, label) VALUES (1, 'private document')",
+    ])
+    await created.accepted()
+    await seenBy(bob, created)
+
+    // Each node signs its own reader-key registration; policies snapshot those keys.
+    const aliceRegistration = await alice.sealed.registerKey(aliceReader.publicKeyBytes)
+    await aliceRegistration.accepted()
+    await seenBy(bob, aliceRegistration)
+    const bobRegistration = await bob.sealed.registerKey(bobReader.publicKeyBytes)
+    await bobRegistration.accepted()
+    await seenBy(alice, bobRegistration)
+    const readers = await alice.sealed.setReaders({ table: 'docs', row: [1n], readers: [bobId], expectedVersion: 0n })
+    await readers.handle.accepted()
+    await seenBy(bob, readers.handle)
+    expect(await bob.sealed.getPolicy('docs', [1n])).toMatchObject({
+      policyId: readers.id, table: 'docs', rowKey: encodeRowKey([1n]), version: 1n, closed: false,
+      readers: [{ readerId: bobId, publicKey: bobReader.publicKeyBytes }],
+    })
+
+    // This fixture has no policy watermark. Production defaults refuse to encrypt
+    // until the policy is final; the override is explicit for this development fixture.
+    await expect(alice.sealed.put(readers.id, 'body', utf8('first secret')))
+      .rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
+    const first = await alice.sealed.put(readers.id, 'body', utf8('first secret'), {
+      allowProvisionalPolicy: true, expectedPolicyVersion: 1n, expectedDataVersion: 0n,
+    })
+    await first.handle.accepted()
+    await seenBy(bob, first.handle)
+    const saved = await bob.sealed.get(readers.id, 'body')
+    expect(saved).not.toBeNull()
+    expect(saved).toMatchObject({ policyVersion: 1n, dataVersion: 1n })
+    const encoded = encodeSealedEnvelope(saved!.envelope)
+    expect(await rows(alice, 'SELECT body FROM docs WHERE id = 1')).toEqual([[encoded]])
+    expect(await rows(bob, 'SELECT body FROM docs WHERE id = 1')).toEqual([[encoded]])
+    expect(await bob.sealed.decrypt(saved!, bobReader.privateKey, undefined, first.context)).toEqual(utf8('first secret'))
+    // Ownership and schema administration add no implicit reader key wrap.
+    await expect(alice.sealed.decrypt(saved!, aliceReader.privateKey)).rejects.toMatchObject({ code: 'INVALID_KEY' })
+
+    // The ordinary column grant authorizes sealed writes through the normal UPDATE path.
+    const share = await alice.ownership.share({ table: 'docs', row: [1n], with: bobId, operations: ['update'], columns: ['body'] })
+    await share.handle.accepted()
+    await seenBy(bob, share.handle)
+    const edited = await bob.sealed.put(readers.id, 'body', utf8('edited by the granted writer'), {
+      allowProvisionalPolicy: true, expectedPolicyVersion: 1n, expectedDataVersion: 1n,
+    })
+    await edited.handle.accepted()
+    await seenBy(alice, edited.handle)
+    const updated = await alice.sealed.get(readers.id, 'body')
+    expect(updated).toMatchObject({ policyVersion: 1n, dataVersion: 2n })
+    expect(await bob.sealed.decrypt(updated!, bobReader.privateKey)).toEqual(utf8('edited by the granted writer'))
+    const outsideGrant = await bob.transaction(["UPDATE docs SET label = 'outside the grant' WHERE id = 1"])
+    await expect(outsideGrant.accepted()).rejects.toMatchObject({ code: 'policy:docs:update' })
+
+    // Replace the exact policy generation/version. The next value receives a new
+    // content key and Alice's wrap only; Bob's saved historical value still opens.
+    const removed = await alice.sealed.setReaders({
+      table: 'docs', row: [1n], readers: [aliceId], expectedPolicyId: readers.id, expectedVersion: 1n,
+    })
+    await removed.handle.accepted()
+    await seenBy(bob, removed.handle)
+    expect(await bob.sealed.getPolicy('docs', [1n])).toMatchObject({
+      policyId: readers.id, version: 2n, readers: [{ readerId: aliceId, publicKey: aliceReader.publicKeyBytes }],
+    })
+    const future = await alice.sealed.put(readers.id, 'body', utf8('new audience only'), {
+      allowProvisionalPolicy: true, expectedPolicyVersion: 2n, expectedDataVersion: 2n,
+    })
+    await future.handle.accepted()
+    await seenBy(bob, future.handle)
+    const latest = await bob.sealed.get(readers.id, 'body')
+    expect(latest).toMatchObject({ policyVersion: 2n, dataVersion: 3n })
+    expect(latest!.envelope.wraps.map((wrap) => wrap.readerId)).toEqual([aliceId])
+    expect(await alice.sealed.decrypt(latest!, aliceReader.privateKey, undefined, future.context)).toEqual(utf8('new audience only'))
+    await expect(bob.sealed.decrypt(latest!, bobReader.privateKey)).rejects.toMatchObject({ code: 'INVALID_KEY' })
+    expect(await bob.sealed.decrypt(saved!, bobReader.privateKey, undefined, first.context)).toEqual(utf8('first secret'))
   }, 60_000)
 })
 

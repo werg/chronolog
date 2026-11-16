@@ -64,7 +64,7 @@ export type PlatformRejectionReason =
   | 'not_owner' | 'not_recipient' | 'not_schema_admin' | 'not_collective_admin' | 'not_invited' | 'not_member'
   | 'last_admin' | 'no_such_table' | 'unregistered_table' | 'no_such_row' | 'no_such_grant' | 'grant_revoked'
   | 'no_such_collective' | 'no_such_offer' | 'offer_closed' | 'offer_stale' | 'has_dependents' | 'invalid_grant'
-  | 'invalid_transfer' | 'invalid_member' | 'unknown_column' | 'row_key_arity' | 'fk_action' | 'seed_closed' | 'not_root'
+  | 'nullable_primary_key' | 'invalid_transfer' | 'invalid_member' | 'unknown_column' | 'row_key_arity' | 'fk_action' | 'seed_closed' | 'not_root'
 
 const SCHEMA_CODES: ReadonlySet<string> = new Set(['schema_unregistered', 'trigger_ignore'])
 const OWNED_OPERATIONS: ReadonlySet<string> = new Set(['insert', 'update', 'delete'])
@@ -156,6 +156,7 @@ export const ownershipSteps = Object.freeze({
     platformOp.setMembers(teamId, members.map((member): MemberChange => ({ member, role: 'remove' }))),
   offerRow: (input: OfferRowInput) =>
     platformOp.transferRow({ table: input.table, rowKey: input.row, toOwner: input.to, carry: input.carry ?? false }),
+  cancelOffer: (offerId: Uint8Array) => platformOp.cancelTransfer(offerId),
   offerAll: (input: OfferAllInput) =>
     platformOp.transferAll({ toOwner: input.to, ...(input.from === undefined ? {} : { fromOwner: input.from }) }),
 })
@@ -189,7 +190,7 @@ export interface Grant {
   /** Whose rows: a key or a team id. */
   readonly grantor: Uint8Array
   readonly grantee: Uint8Array
-  /** The row's primary key as SQL literals (e.g. `1` or `'a',2`), or null for the whole table. */
+  /** Opaque versioned typed primary-key tuple (rk1:...), or null for the whole table. */
   readonly rowKey: string | null
   readonly operations: readonly GrantOperation[]
   /** Columns an update may change, or null for every column. */
@@ -198,7 +199,7 @@ export interface Grant {
 
 export interface TransferOffer {
   readonly offerId: Uint8Array
-  /** null with `rowKey` null: every row the sender owns (a key change). */
+  /** null with rowKey null: a snapshot of the sender's rows when the offer was created. */
   readonly table: string | null
   readonly rowKey: string | null
   readonly from: Uint8Array
