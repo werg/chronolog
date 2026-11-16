@@ -32,12 +32,12 @@ describe('native publication crash recovery', () => {
       directories.push(directory)
       const path = join(directory, 'application.db')
       const result = spawnSync(
-        resolve('node_modules/.bin/tsx'),
-        [resolve('test/fixtures/materializer-publication-crash.ts'), path, point],
+        process.execPath,
+        ['--import', 'tsx', resolve('test/fixtures/materializer-publication-crash.ts'), path, point],
         { cwd: resolve('.'), encoding: 'utf8', timeout: 20_000 },
       )
-      // tsx forwards the worker's signal as the conventional shell status on
-      // some platforms and as ChildProcess.signal on others.
+      // Load the TypeScript hook in the process under test. No CLI wrapper or
+      // auxiliary IPC server is needed to observe its real abrupt death.
       expect(
         result.signal === 'SIGKILL' || result.status === 128 + 9,
         `${result.stdout}\n${result.stderr}`,

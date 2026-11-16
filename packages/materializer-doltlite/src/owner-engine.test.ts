@@ -189,7 +189,7 @@ describe('row keys', () => {
       db.exec("CREATE TABLE k (a, b, c, d, PRIMARY KEY (a, b, c, d))")
       db.prepare('INSERT INTO k VALUES (?, ?, ?, ?)').run(-42n, "it's, odd", Buffer.from([0, 255]), Float64Array.of(1.5))
       const key = String((db.prepare(`SELECT ${rowKeyExpression('k', ['a', 'b', 'c', 'd'])} AS key FROM k`).get() as { key: unknown }).key)
-      expect(parseRowKey(key)).toEqual([-42n, "it's, odd", Buffer.from([0, 255]), Float64Array.of(1.5)])
+      expect(parseRowKey(key)).toEqual([-42n, "it's, odd", Uint8Array.of(0, 255), Float64Array.of(1.5)])
       expect(db.prepare(`SELECT count(*) AS n FROM k WHERE ${rowKeyFilter('k', ['a', 'b', 'c', 'd'])}`).get(...rowKeyBindings(key, ['a', 'b', 'c', 'd'])))
         .toEqual({ n: 1 })
       expect(parseRowKey('NULL,7')).toEqual([null, 7n])
