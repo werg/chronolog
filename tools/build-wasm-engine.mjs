@@ -3,8 +3,8 @@
 /* global console, process */
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, statSync, utimesSync, existsSync, chmodSync } from 'node:fs'
-import { dirname, resolve, join } from 'node:path'
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, cpSync, rmSync, statSync, utimesSync, existsSync, chmodSync } from 'node:fs'
+import { dirname, relative, resolve, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const workspace = resolve(import.meta.dirname, '..')
@@ -20,7 +20,8 @@ if (!emsdk) throw new Error('Pass --emsdk with an installed Emscripten 4.0.20 SD
 const output = option('--output', join(workspace, 'artifacts/wasm'))
 const nativeRequire = createRequire(join(workspace, 'packages/materializer-doltlite/package.json'))
 const nativeRoot = dirname(nativeRequire.resolve('@dolthub/doltlite'))
-const source = join(nativeRoot, 'amalgamation/.source')
+const packageSource = join(nativeRoot, 'amalgamation/.source')
+const source = join(output, 'source')
 const wasmRoot = join(source, 'ext/wasm')
 const emcc = join(emsdk, 'upstream/emscripten/emcc')
 const env = { ...process.env, TMPDIR: join(output, 'tmp') }
@@ -36,6 +37,22 @@ const compilerVersion = spawnSync(emcc, ['--version'], { env, encoding: 'utf8' }
 if (compilerVersion.status !== 0 || !compilerVersion.stdout.includes('4.0.20')) throw new Error('WASM_TOOLCHAIN_VERSION_MISMATCH')
 const nativeManifest = nativeRequire('@dolthub/doltlite').chronologNativeManifest()
 if (nativeManifest.doltliteVersion !== '0.11.29' || nativeManifest.sqliteVecVersion !== '0.1.9') throw new Error('WASM_SOURCE_VERSION_MISMATCH')
+// pnpm's side-effect cache deduplicates generated copies as hardlinks. Running
+// configure/make in that cache can make `cp tool/lempar.c .` copy onto itself,
+// and would mutate files shared with other installations. Detach the source
+// tree into this build's output and regenerate its location-specific config.
+const sourceMarker = join(output, 'source-profile.json')
+const sourceProfile = JSON.stringify({ version: 1, source: packageSource, sha256: nativeManifest.doltliteSourceSha256 })
+if (!existsSync(sourceMarker) || readFileSync(sourceMarker, 'utf8') !== sourceProfile || !existsSync(source)) {
+  rmSync(source, { recursive: true, force: true })
+  const generated = new Set([
+    'Makefile', 'config.status', 'config.log', 'config.defines', 'sqlite_cfg.h', '.target_source', 'tsrc',
+    'ext/wasm/config.make', 'ext/wasm/bld', 'ext/wasm/jswasm', 'ext/wasm/c-pp', 'ext/wasm/version-info',
+  ])
+  cpSync(packageSource, source, { recursive: true,
+    filter: (path) => !generated.has(relative(packageSource, path).split('\\').join('/')) })
+  writeFileSync(sourceMarker, sourceProfile)
+}
 const nativeProbe = new (nativeRequire('@dolthub/doltlite').DatabaseSync)(':memory:')
 const runtimeVersions = nativeProbe.prepare('SELECT dolt_version() AS doltlite, sqlite_version() AS sqlite, vec_version() AS vec').get()
 nativeProbe.close()
@@ -124,6 +141,14 @@ const portableAmalgamation = join(output, 'doltlite-wasm.c')
 writeIfChanged(portableAmalgamation, amalgamation
   .replaceAll(sectorCall, 'sqlite3OsSectorSize(cs->file.pFile)')
   .replace(movedCheck, movedCheck.replace('if( rc!=SQLITE_OK )', 'if( rc!=SQLITE_OK && rc!=SQLITE_NOTFOUND )')))
+for (const header of ['sqlite3.h', 'sqlite3ext.h']) {
+  const destination = join(output, header)
+  const bytes = readFileSync(join(nativeRoot, 'amalgamation', header))
+  if (!existsSync(destination) || !readFileSync(destination).equals(bytes)) {
+    if (existsSync(destination)) chmodSync(destination, 0o644)
+    writeFileSync(destination, bytes)
+  }
+}
 if (!existsSync(join(source, 'Makefile'))) run('./configure', [`--with-emsdk=${emsdk}`, '--disable-tcl', '--disable-readline'], source)
 run('make', ['parse.h', 'opcodes.h'], source)
 // Upstream exports assume its optional session extension. The native profile
@@ -134,25 +159,25 @@ writeIfChanged(exportsPath, exportSource.split('\n').filter((line) => !/^_sqlite
 // configure generates makefiles; keep them from regenerating the already
 // checksum-pinned released amalgamation/header as a side effect.
 const makefileTime = statSync(join(source, 'Makefile')).mtimeMs
-for (const file of ['sqlite3.h', 'doltlite.c']) {
-  const path = join(nativeRoot, 'amalgamation', file)
+for (const file of ['sqlite3.h', 'doltlite-wasm.c']) {
+  const path = join(output, file)
   if (statSync(path).mtimeMs <= makefileTime) utimesSync(path, new Date(), new Date())
 }
 const nativeFlags = [
   '-DSQLITE_THREADSAFE=1', '-DSQLITE_TEMP_STORE=2', '-DSQLITE_USE_URI=1',
   '-DSQLITE_OMIT_DEPRECATED', '-DSQLITE_OMIT_UTF16',
-  '-DSQLITE_OMIT_LOAD_EXTENSION', '-DSQLITE_WASM_ENABLE_C_TESTS',
+  '-DSQLITE_OMIT_LOAD_EXTENSION',
   '-DSQLITE_ENABLE_FTS5', '-DSQLITE_ENABLE_JSON1', '-DSQLITE_ENABLE_RTREE',
   '-DSQLITE_ENABLE_COLUMN_METADATA', '-DDOLTLITE_PROLLY=1',
   '-DSQLITE_WASM_SPLIT_BUILD', '-DSQLITE_PRIVATE=', '-DSQLITE_EXTRA_INIT_MUTEXED=sqlite3_wasm_extra_init',
   '-DBLAKE3_NO_SSE2=1', '-DBLAKE3_NO_SSE41=1', '-DBLAKE3_NO_AVX2=1', '-DBLAKE3_NO_AVX512=1',
   `-DSQLITE_C=${portableAmalgamation}`,
 ].join(' ')
-run('make', [
+const buildArguments = [
   'b-esm', 'jswasm/sqlite3-opfs-async-proxy.js', 'DOLTLITE_WASM=0', `bin.emcc=${emcc}`, 'bin.wasm-strip=true', 'bin.wasm-opt=',
   'emcc_opt=-O1', 'emcc_opt_full=-O1 -g2', 'emcc.environment.esm=web,worker,node',
   'emcc.flags=-sSTACK_SIZE=2097152 -sSTACK_OVERFLOW_CHECK=2',
-  `sqlite3.c=${join(nativeRoot, 'amalgamation/doltlite.c')}`,
+  `sqlite3.c=${portableAmalgamation}`,
   `SQLITE_OPT=${nativeFlags}`,
   `EXPORTED_FUNCTIONS.api.in=${exportsPath}`,
   // The amalgamator elides os_unix's fcntl.h because os.c already includes it,
@@ -160,7 +185,16 @@ run('make', [
   `cflags.common=-I. -I${join(nativeRoot, 'amalgamation')} -I${join(source, 'src')} -I${source} -include fcntl.h -include unistd.h -fPIC`,
   `sqlite3_wasm_extra_init.c=${shimPath}`,
   `sqlite3-wasm.c.in=api/sqlite3-wasm.c ${shimPath} ${portableAmalgamation} ${join(nativeRoot, 'amalgamation/doltlite_orig.c')} ${join(nativeRoot, 'amalgamation/sqlite_vec_static.c')}`,
-], wasmRoot)
+]
+// Make does not track command-line flag changes. A recorded configuration
+// invalidates the shim input so switching build flags cannot reuse stale WASM.
+const configurationPath = join(output, 'build-configuration.json')
+const configuration = JSON.stringify({ compiler: compilerVersion.stdout, arguments: buildArguments })
+if (!existsSync(configurationPath) || readFileSync(configurationPath, 'utf8') !== configuration) {
+  writeFileSync(configurationPath, configuration)
+  utimesSync(shimPath, new Date(), new Date())
+}
+run('make', buildArguments, wasmRoot)
 function copyArtifact(sourcePath, targetPath) {
   if (existsSync(targetPath)) chmodSync(targetPath, 0o644)
   copyFileSync(sourcePath, targetPath)

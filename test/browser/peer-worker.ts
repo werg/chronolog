@@ -1,6 +1,7 @@
 import { decodeSignedGenesis, encodeSignedGenesis, signGenesis } from '@chronolog/capabilities'
 import { assertCanonicalCbor, bytesToBase64Url, decodeExecutionManifest, encodeCanonicalCbor, executionManifestArtifacts } from '@chronolog/protocol'
-import { openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
+import { BrowserControlPersistence, WasmDatabase, openBrowserPeer, serveBrowserPeer,
+  type BrowserPeer, type ChronologWasmModule, type WorkerEndpoint } from '@chronolog/runtime-browser'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 const groupId = new Uint8Array(32).fill(71)
@@ -9,9 +10,10 @@ let now = 1_700_000_000_000
 let pauseOperation: string | null = null
 let pauseApplication = false
 let persistClock: (() => Promise<void>) | undefined
+let engineModule: ChronologWasmModule | undefined
 
 endpoint.addEventListener('message', (event) => {
-  const request = event.data as { fixture?: string; id?: number; name?: string; operationId?: string }
+  const request = event.data as { fixture?: string; id?: number; name?: string; operationId?: string; cutoff?: string }
   if (request.fixture === undefined) return
   const run = async (): Promise<unknown> => {
     switch (request.fixture) {
@@ -19,8 +21,9 @@ endpoint.addEventListener('message', (event) => {
         peer = await openBrowserPeer({
           name: request.name!, engineUrl: new URL('/engine/', globalThis.location.href),
           async configure(context) {
+            engineModule = context.engine.module
             const savedClock = await context.operations.get('fixture/clock')
-            if (savedClock !== null) now = Number(assertCanonicalCbor(savedClock)) + 1_000
+            if (savedClock !== null) now = Number(assertCanonicalCbor(savedClock))
             persistClock = () => context.operations.put('fixture/clock', encodeCanonicalCbor(BigInt(now)))
             await persistClock()
             const response = await fetch('/execution-manifest.cbor')
@@ -89,6 +92,15 @@ endpoint.addEventListener('message', (event) => {
         }
       }
       case 'advanceFinal': now += 1000; await persistClock!(); await peer!.node.publishHeartbeat(); await peer!.node.waitForIdle(); return null
+      case 'privateCutoff': {
+        // A private cutoff with no corresponding feed record must persist by
+        // its own SQL commit. Replay cannot reconstruct this test value.
+        const control = new BrowserControlPersistence(new WasmDatabase(engineModule!, '/private-cutoff-probe.db'))
+        try {
+          if (request.cutoff !== undefined) control.saveValidatorCutoff({ validatorId: peer!.node.identity, acceptedAboveMs: BigInt(request.cutoff) })
+          return control.loadValidatorCutoffs().map((value) => String(value.acceptedAboveMs))
+        } finally { control.close() }
+      }
       case 'armPrepared': pauseOperation = request.operationId!; return null
       case 'armApplication': pauseApplication = true; return null
       default: throw new Error('UNKNOWN_TEST_COMMAND')

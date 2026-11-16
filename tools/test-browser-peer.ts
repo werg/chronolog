@@ -62,6 +62,7 @@ const browser = await chromium.launch({
 })
 const context = await browser.newContext()
 const page = await context.newPage()
+const overallDeadline = setTimeout(() => { void page.close() }, 120_000)
 page.setDefaultTimeout(30_000)
 page.on('console', (message) => { if (message.type() === 'error') process.stderr.write(`browser: ${message.text()}\n`) })
 page.on('pageerror', (error) => process.stderr.write(`page error: ${error.message}\n`))
@@ -111,16 +112,20 @@ try {
   assert.equal(await page.evaluate(({ schema }) => (globalThis as unknown as TestWindow).chronologBrowserTest.submit('reopened', schema, 'schema'), { schema }), transactionId)
   assert.equal((await snapshot('reopened')).records.length, first.records.length)
   passed('OPFS keys, signed records, control index, SQL and durable operation identity survive reopening')
+  await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.privateCutoff('reopened', '987654321'))
+  await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.privateCutoff('reopened', '987654320')), /CUTOFF_REGRESSION/u)
 
   const preparedSteps = ["INSERT INTO notes(id,value) VALUES(2,'prepared')"]
   const prepared = await page.evaluate(({ steps }) => (globalThis as unknown as TestWindow).chronologBrowserTest.crash('reopened', steps, 'crash-prepared', 'prepared'), { steps: preparedSteps }) as { canonical: string }
   await page.evaluate(({ name }) => (globalThis as unknown as TestWindow).chronologBrowserTest.open('recovered', name), { name })
   await page.evaluate(({ steps }) => (globalThis as unknown as TestWindow).chronologBrowserTest.submit('recovered', steps, 'crash-prepared'), { steps: preparedSteps })
   const recovered = await snapshot('recovered')
+  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.privateCutoff('recovered')), ['987654321'])
   assert.equal(recovered.transactions.filter((row) => row.canonical === prepared.canonical).length, 1)
   assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('recovered', 'SELECT count(*) FROM notes WHERE id=2')), [[1n]])
   await compare(recovered)
   passed('termination after durable preparation recovers the original exact canonical transaction once')
+  passed('private validator cutoff survives Worker termination without any reconstructing feed record')
 
   const applicationSteps = ["INSERT INTO notes(id,value) VALUES(3,'application')"]
   await page.evaluate(({ steps }) => (globalThis as unknown as TestWindow).chronologBrowserTest.crash('recovered', steps, 'crash-application', 'application'), { steps: applicationSteps })
@@ -134,6 +139,7 @@ try {
   await writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
   process.stdout.write(`Browser qualification passed (${checks.length} checks), Chromium ${browser.version()}\n`)
 } finally {
+  clearTimeout(overallDeadline)
   native?.close()
   await context.close()
   await browser.close()

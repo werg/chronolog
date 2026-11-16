@@ -83,7 +83,9 @@ Portable records, both integrated native history policies, live enrollment,
 actual final SQL/RPC/client interfaces, and the public Tendriller integration are
 implemented and covered by executable acceptance tests. The patched WASM engine
 passes native/WASM differential replay tests. Real Chromium Worker/OPFS
-qualification passes all six checks, including exclusive ownership, actual final
+qualification passes all seven checks, including exclusive ownership, actual final
 SQL, persistent identity, and termination after durable preparation and candidate
-commit. Clean-runner CI is the remaining delivery check. See
+commit, and a private validator cutoff that cannot be reconstructed from feed
+replay. The required workflow repeats these gates from a clean checkout; the PR
+description records its latest result. See
 [portable peers](../portable-peers.md) for the verification map.

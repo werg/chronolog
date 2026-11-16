@@ -6,6 +6,7 @@ class TestPeer {
   readonly #pending = new Map<number, { resolve(value: unknown): void; reject(error: unknown): void }>()
   readonly #pauses: Array<(value: unknown) => void> = []
   #next = 1
+  #name = ''
   client!: ChronologClient
   readonly rpc = new WorkerRpcTransport(this.worker)
 
@@ -21,6 +22,7 @@ class TestPeer {
     })
   }
   async open(name: string) {
+    this.#name = name
     const identity = await this.command('open', { name }) as { groupId: string; identity: string }
     this.client = new ChronologClient({ transport: this.rpc, groupId: identity.groupId, unaryRetryAttempts: 1 })
     return identity
@@ -53,6 +55,9 @@ class TestPeer {
       const submitted = this.submit(steps, operationId).then(() => { throw new Error(`Crash boundary not reached: ${point}`) })
       const evidence = await Promise.race([paused, submitted])
       this.worker.terminate()
+      // terminate() has no completion promise. Observe release of the actual
+      // ownership lock before asking a replacement Worker to claim it.
+      await navigator.locks.request(`chronolog:${this.#name}`, { mode: 'exclusive' }, () => undefined)
       return evidence
     } finally { if (timer !== undefined) clearTimeout(timer) }
   }
@@ -69,6 +74,7 @@ const test = {
   async query(id: string, sql: string, options: QueryOptions = {}) { return (await peers.get(id)!.query(sql, options)).result.rows },
   state(id: string) { return peers.get(id)!.command('state') },
   advanceFinal(id: string) { return peers.get(id)!.command('advanceFinal') },
+  privateCutoff(id: string, cutoff?: string) { return peers.get(id)!.command('privateCutoff', cutoff === undefined ? {} : { cutoff }) },
   async stop(id: string) { await peers.get(id)!.stop(); peers.delete(id) },
   crash(id: string, steps: string[], operationId: string, point: 'prepared' | 'application') { return peers.get(id)!.crash(steps, operationId, point) },
 }

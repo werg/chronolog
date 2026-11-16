@@ -52,7 +52,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       const setup = await admitted(1n, 'setup', [
         'CREATE TABLE balances (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)',
         'INSERT INTO balances (id, balance) VALUES (1, 10)',
-        'CREATE TABLE probes (id INTEGER PRIMARY KEY, now TEXT, local TEXT, random INTEGER, blob BLOB, real REAL, integer INTEGER, empty BLOB, last_rowid INTEGER, changed INTEGER)',
+        'CREATE TABLE probes (id INTEGER PRIMARY KEY, now TEXT, local TEXT, random INTEGER, blob BLOB, real REAL, integer INTEGER, empty BLOB, last_rowid INTEGER, changed INTEGER, vector_distance REAL)',
       ], digest)
       const late = await admitted(3n, 'late', ['UPDATE balances SET balance = balance + 100 WHERE id = 1'], digest)
       const spend = await admitted(5n, 'spend', [
@@ -60,7 +60,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         'UPDATE balances SET balance=balance-50 WHERE id=1',
       ], digest)
       const probe = await admitted(1_700_000_000_000n, 'probe', [sqlStatement(
-        "INSERT INTO probes (id,now,local,random,blob,real,integer,empty,last_rowid,changed) VALUES (1,datetime('now'),datetime('now','localtime'),random(),randomblob(12),?,?,?,last_insert_rowid(),changes())",
+        "INSERT INTO probes (id,now,local,random,blob,real,integer,empty,last_rowid,changed,vector_distance) VALUES (1,datetime('now'),datetime('now','localtime'),random(),randomblob(12),?,?,?,last_insert_rowid(),changes(),vec_distance_L2('[1.2,3.4]','[5.6,7.8]'))",
         [sqlValue.real(1), 9_223_372_036_854_775_807n, new Uint8Array()],
       )], digest)
       for (const history of [[setup, spend, probe], [setup, late, spend, probe]]) {
@@ -69,7 +69,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         expect(w?.outcomeChanges).toEqual(n?.outcomeChanges)
         expect(browser.transactionLog()).toEqual(native.transactionLog())
         expect(browser.databaseContentHash).toBe(native.databaseContentHash)
-        for (const query of ['SELECT * FROM balances', 'SELECT id,now,local,random,hex(blob),typeof(real),integer,typeof(empty),length(empty),last_rowid,changed FROM probes']) {
+        for (const query of ['SELECT * FROM balances', 'SELECT id,now,local,random,hex(blob),typeof(real),integer,typeof(empty),length(empty),last_rowid,changed,vector_distance FROM probes']) {
           expect(browser.localSql(query).rows).toEqual(native.localSql(query).rows)
         }
       }
@@ -105,7 +105,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         ...await Promise.all([
           "SELECT sqlite_compileoption_used('OMIT_UTF16')", 'SELECT sqlite_compileoption_get(0)', 'SELECT sqlite_source_id()',
           'SELECT * FROM pragma_compile_options', 'SELECT * FROM pragma_function_list', 'SELECT * FROM pragma_module_list',
-          'SELECT * FROM pragma_pragma_list', 'SELECT * FROM pragma_collation_list', "SELECT load_extension('x')",
+          'SELECT * FROM pragma_pragma_list', 'SELECT * FROM pragma_collation_list', "SELECT load_extension('x')", 'SELECT load_extension(1,2,3)',
         ].map((sql, index) => admitted(BigInt(index + 9), `host-probe-${index}`, [sql], digest))),
       ]
       await native.materialize(programs)
@@ -155,6 +155,14 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         const n = native.prepare(sql); const w = browser.prepare(sql)
         try { expect(w.all()).toEqual(n.all()) } finally { n.finalize?.(); w.finalize?.() }
       }
+      const vectors = [
+        JSON.stringify(Array.from({ length: 64 }, (_, index) => (index % 3 === 0 ? 1e5 : 1e-3) * (index + 1))),
+        JSON.stringify(Array.from({ length: 64 }, (_, index) => (index % 2 === 0 ? -1 : 1) / (index + 1))),
+      ]
+      const sql = 'SELECT vec_distance_L2(vec_f32(?),vec_f32(?)) AS l2, vec_distance_cosine(vec_f32(?),vec_f32(?)) AS cosine'
+      const n = native.prepare(sql); const w = browser.prepare(sql)
+      try { expect(w.get(...vectors, ...vectors)).toEqual(n.get(...vectors, ...vectors)) }
+      finally { n.finalize?.(); w.finalize?.() }
     } finally { native.close(); browser.close() }
   })
 })
