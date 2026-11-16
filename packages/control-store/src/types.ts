@@ -144,6 +144,7 @@ export type ControlStoreDelta =
     }
 
 export interface ControlStoreSnapshot {
+  readonly orderPolicy?: 'peer' | 'coordinated'
   readonly format: 'chronolog-control-store/v1'
   readonly sequence: bigint
   readonly candidates: readonly StoredCandidate[]

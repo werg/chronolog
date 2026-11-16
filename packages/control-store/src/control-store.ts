@@ -1,4 +1,4 @@
-import { compareTransactionOrder } from '@chronolog/protocol'
+import { bytesToHex, hexToBytes, compareTransactionOrder } from '@chronolog/protocol'
 
 import type {
   AdmissionEvaluation,
@@ -37,6 +37,7 @@ export class ControlStoreConflictError extends Error {
 }
 
 export class ControlStore {
+  readonly orderPolicy: 'peer' | 'coordinated'
   readonly #persistence: ControlStorePersistence | null
   #sequence = 0n
   #deltaFloor = 0n
@@ -54,15 +55,19 @@ export class ControlStore {
 
   constructor(
     persistence: ControlStorePersistence | null = null,
-    options: { readonly maximumRetainedDeltas?: number } = {},
+    options: { readonly maximumRetainedDeltas?: number; readonly orderPolicy?: 'peer' | 'coordinated' } = {},
   ) {
     this.#persistence = persistence
+    this.orderPolicy = options.orderPolicy ?? 'peer'
     this.#maximumRetainedDeltas = options.maximumRetainedDeltas ?? 2_048
     if (!Number.isSafeInteger(this.#maximumRetainedDeltas) || this.#maximumRetainedDeltas < 1) {
       throw new RangeError('CONTROL_STORE_INVALID_DELTA_RETENTION')
     }
     const journalCutoffs = persistence?.loadValidatorCutoffs?.() ?? null
     const snapshot = persistence?.load()
+    if (snapshot != null && (snapshot.orderPolicy ?? 'peer') !== this.orderPolicy) {
+      throw new ControlStoreConflictError('CONTROL_STORE_HISTORY_POLICY_MISMATCH')
+    }
     try {
       if (snapshot !== null && snapshot !== undefined) this.#restore(snapshot)
       this.#replayJournal(persistence?.loadJournal?.() ?? [])
@@ -466,6 +471,7 @@ export class ControlStore {
   snapshot(): ControlStoreSnapshot {
     return {
       format: 'chronolog-control-store/v1',
+      orderPolicy: this.orderPolicy,
       sequence: this.#sequence,
       candidates: this.listCandidates(),
       attestations: [...this.#attestations.values()].map(cloneAttestation),
@@ -476,7 +482,7 @@ export class ControlStore {
       materializedHead: this.materializedHead(),
       checkpoints: [...this.#checkpoints.values()].map(clone),
       validatorCutoffs: [...this.#validatorCutoffs.entries()].map(([key, acceptedAboveMs]) => ({
-        validatorId: Uint8Array.from(Buffer.from(key, 'base64url')),
+        validatorId: hexToBytes(key),
         acceptedAboveMs,
       })),
     }
@@ -489,7 +495,7 @@ export class ControlStore {
   }
 
   #insertOrder(candidate: StoredCandidate): ControlStoreDelta {
-    let low = 0
+    let low = this.orderPolicy === 'coordinated' ? this.#orderedTxIds.length : 0
     let high = this.#orderedTxIds.length
     while (low < high) {
       const middle = (low + high) >>> 1
@@ -657,7 +663,7 @@ export class ControlStore {
       const key = idKey(txId)
       if (seen.has(key)) throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_DUPLICATE_ORDER')
       seen.add(key)
-      if (previous !== null && compareTransactionOrder(previous.orderKey, candidate.orderKey) >= 0) {
+      if (this.orderPolicy === 'peer' && previous !== null && compareTransactionOrder(previous.orderKey, candidate.orderKey) >= 0) {
         throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_ORDER')
       }
       previous = candidate
@@ -712,7 +718,7 @@ export class ControlStore {
 
   #listValidatorCutoffs(): ValidatorCutoffState[] {
     return [...this.#validatorCutoffs.entries()].map(([key, acceptedAboveMs]) => ({
-      validatorId: Uint8Array.from(Buffer.from(key, 'base64url')),
+      validatorId: hexToBytes(key),
       acceptedAboveMs,
     }))
   }
@@ -739,7 +745,7 @@ function validateStateTransition(previous: CandidateState, next: CandidateState)
 }
 
 function idKey(value: Uint8Array): string {
-  return Buffer.from(value).toString('base64url')
+  return bytesToHex(value)
 }
 
 function heartbeatKey(membershipRevision: Uint8Array, validatorId: Uint8Array): string {

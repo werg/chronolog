@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite'
 
-import type { TransportRecord } from '@chronolog/transport-ssb'
+import type { TransportRecord } from '@chronolog/records'
 
 export interface FeedForkEvidence {
   readonly feedId: string
