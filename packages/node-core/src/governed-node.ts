@@ -111,7 +111,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
       kind: 'coordinated', policy: coordinated,
       applyGovernanceRecord: async (entry) => {
         try {
-          const snapshot = await governance.ingestCanonical(entry)
+          const snapshot = await governance.ingestCanonical(entry, activation.activeSnapshot)
           if (snapshot !== null && snapshot.revision > activation.activeSnapshot.revision) {
             activation.observe(snapshot)
             activation.activateCoordinated(snapshot, BigInt(entry.position))
@@ -121,6 +121,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
           // Known invalid administrative bytes occupy their canonical position.
         }
       },
+      encryptionEpochAt: (position) => governance.canonicalEpochAt(position),
     },
   })
   const abort = new AbortController()

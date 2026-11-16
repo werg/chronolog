@@ -123,6 +123,8 @@ export interface ChronologNodeOptions {
     readonly policy: CoordinatedHistoryPolicy
     /** Apply verified inline governance at its certified position, independently of application bodies. */
     readonly applyGovernanceRecord?: (entry: OrderedRecordEntry) => Promise<void>
+    /** Epoch selected by preceding verified controls; null means no epoch is active. */
+    readonly encryptionEpochAt?: (position: number) => Uint8Array | null
   }
   readonly groupId: Uint8Array
   readonly groupRoute?: Uint8Array

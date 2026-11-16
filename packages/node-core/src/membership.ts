@@ -318,7 +318,7 @@ export class MembershipAdministrator {
       }
       if (equalBytes(record.groupRoute, this.#descriptor.groupRoute) && record.kind !== 'candidate') {
         try {
-          const snapshot = await this.#governance.ingestCanonical(entry)
+          const snapshot = await this.#governance.ingestCanonical(entry, this.#activation.activeSnapshot)
           if (snapshot !== null && snapshot.revision > this.#activation.activeSnapshot.revision) {
             this.#activation.observe(snapshot); this.#activation.activateCoordinated(snapshot, BigInt(entry.position))
           }

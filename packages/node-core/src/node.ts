@@ -694,7 +694,11 @@ export class ChronologNode {
         }
         try {
           const wire = await this.#decodeRecord(record)
-          await this.#ingestCandidate(record, wire.payload, wire.signer, entry.position)
+          const expectedEpoch = selected.encryptionEpochAt?.(entry.position)
+          const staleEpoch = expectedEpoch !== undefined && (expectedEpoch === null || ledger.encryptionEpoch === null ||
+            !equalBytes(expectedEpoch, ledger.encryptionEpoch))
+          await this.#ingestCandidate(record, wire.payload, wire.signer, entry.position,
+            staleEpoch ? 'ENCRYPTION_EPOCH_CLOSED' : undefined)
         } catch (error) {
           // A known invalid record occupies its fixed position without stealing
           // a valid proposal identity. Missing keys/engines/storage still block.
@@ -880,7 +884,8 @@ export class ChronologNode {
     }
   }
 
-  async #ingestCandidate(record: TransportRecord, canonical: Uint8Array, signer: Uint8Array, canonicalPosition?: number): Promise<void> {
+  async #ingestCandidate(record: TransportRecord, canonical: Uint8Array, signer: Uint8Array, canonicalPosition?: number,
+    canonicalRejection?: string): Promise<void> {
     const core = this.#decodeCandidate(canonical)
     if (!equalBytes(core.groupId, this.#options.groupId)) invalid('CANDIDATE_WRONG_GROUP')
     if (!equalBytes(core.authorId, signer)) invalid('CANDIDATE_SIGNER_MISMATCH')
@@ -911,7 +916,9 @@ export class ChronologNode {
         ...writerContext,
         ...(canonicalPosition === undefined ? {} : { canonicalPosition: BigInt(canonicalPosition) }),
       })
-    const state = canWrite ? 'pending_validation' as const : 'unauthorized' as const
+    const rejection = canWrite ? canonicalRejection : 'WRITER_UNAUTHORIZED'
+    const authorized = rejection === undefined
+    const state = authorized ? 'pending_validation' as const : 'unauthorized' as const
     const candidate: StoredCandidate = {
       txId,
       groupId: core.groupId,
@@ -920,21 +927,21 @@ export class ChronologNode {
       orderKey: transactionOrderKey(core, { authorFeedSequence: 0n, txId }),
       canonicalPayload: canonical,
       state,
-      ...(canWrite ? {} : { stateReason: 'WRITER_UNAUTHORIZED' }),
+      ...(rejection === undefined ? {} : { stateReason: rejection }),
       proofAttestationIds: [],
     }
     const inserted = existing === null ? this.#control.putCandidate(candidate) : { added: false }
-    if (existing !== null && !canWrite) this.#control.setCandidateState(txId, 'unauthorized', { reason: 'WRITER_UNAUTHORIZED' })
+    if (existing !== null && rejection !== undefined) this.#control.setCandidateState(txId, 'unauthorized', { reason: rejection })
     this.#candidateCores.set(this.#idKey(txId), core)
     if (inserted.added) this.#emit('candidate', txId)
-    if (canWrite && this.historyPolicy === 'coordinated') {
+    if (authorized && this.historyPolicy === 'coordinated') {
       if (canonicalPosition !== undefined) {
         this.#control.setCandidateState(txId, 'admissible')
         this.#materializationPending = true
       }
       return
     }
-    if (canWrite) {
+    if (authorized) {
       await this.#evaluateAdmission(txId, core)
       this.#setConsumerPhase('attesting')
       await this.#maybeAttest(txId, candidate, core)

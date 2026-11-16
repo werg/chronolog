@@ -366,6 +366,24 @@ Rotate the epoch after removing a reader: the removed device may retain
 plaintext and old epoch keys it already possessed, but it is not included in
 the new manifest and cannot decrypt traffic encrypted with that new key.
 
+Coordinated histories also fence application acceptance by the epoch selected
+at each canonical position. A verified rotation governs later positions, even
+when an earlier reader key remains available for historical replay. A still
+authorized writer's envelope prepared under a closed epoch receives the final
+rejection `ENCRYPTION_EPOCH_CLOSED` if it is ordered after that rotation. Its
+durable operation keeps the original signed bytes and proposal ID; retries do
+not silently re-encrypt or create a new application operation. An application
+can deliberately submit a fresh operation with a new ID after synchronizing.
+An exact retry already ordered before the rotation retains its original outcome.
+
+This is a rule for canonical acceptance. It cannot prevent a participant from
+disclosing plaintext or old-key ciphertext it already knows. An unavailable
+application body or key still blocks replay; it is not treated as a stale-epoch
+rejection. The full envelope must be retrieved, checked and decrypted first.
+Unknown or future membership revisions in an already verified canonical prefix
+are unauthorized at that position. Malformed or out-of-order inline control
+operations occupy their positions without holding up later valid controls.
+
 Every active reader receives each new epoch at rotation. Earlier epochs reach
 a reader only through an explicit `grantHistoricalAccess`. Historical access
 never changes old transaction bytes.

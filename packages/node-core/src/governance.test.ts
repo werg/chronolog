@@ -27,6 +27,7 @@ describe('replicated governance control plane', () => {
     const participant = await GovernanceControlPlane.create({ genesis: fixture.genesis, groupRoute: fixture.groupRoute,
       transport: fixture.network.createNode('canonical-reader'), identity: await generateEd25519KeyPair() })
     controllers.push(participant)
+    let active = participant.snapshot
     const log = await ReferenceRecordLog.open('h_0123456789abcdef0123456789abcdef', new MemoryOperationStore())
     const appendControl = async (type: 'capability' | 'epoch-manifest', body: Uint8Array, tag = 1n, signer = fixture.root) => {
       const payload = encodeCanonicalCbor([tag, body])
@@ -38,24 +39,56 @@ describe('replicated governance control plane', () => {
     const future = { groupId: fixture.groupId, revision: 999n, previousRevisionDigest: bytes32(90),
       issuerRootPublicKey: fixture.root.publicKeyBytes, grants: [], revocations: [], validationPolicies: [] }
     const forged = await appendControl('capability', encodeSignedCapabilityRevision(await signCapabilityRevision(future, attacker.privateKey)), 1n, attacker)
-    await expect(participant.ingestCanonical(forged)).rejects.toThrow('GOVERNANCE_REVISION_CONFLICT')
+    await expect(participant.ingestCanonical(forged, active)).rejects.toThrow('GOVERNANCE_REVISION_CONFLICT')
     const misplaced = await appendControl('capability', encodeSignedCapabilityRevision(await signCapabilityRevision(future, fixture.root.privateKey)))
-    await expect(participant.ingestCanonical(misplaced)).rejects.toThrow('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
+    await expect(participant.ingestCanonical(misplaced, active)).rejects.toThrow('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
     const capability = await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(44), 'writer')] }, fixture.root.privateKey)
     const accepted = await appendControl('capability', encodeSignedCapabilityRevision(capability))
-    expect((await participant.ingestCanonical(accepted))?.revision).toBe(1n)
+    active = (await participant.ingestCanonical(accepted, active))!
+    expect(active.revision).toBe(1n)
     const futureEpoch = await createEpochManifest({ groupId: fixture.groupId, epoch: 1n, previousEpochDigest: bytes32(91),
       createdAtMs: 1n, recipients: [], signerPublicKey: fixture.root.publicKeyBytes, signerPrivateKey: fixture.root.privateKey })
     for (const tag of [1n, 2n]) {
       const entry = await appendControl('epoch-manifest', encodeSignedEpochManifest(futureEpoch.signedManifest), tag)
-      const failure = await participant.ingestCanonical(entry).catch((error: unknown) => error)
+      const failure = await participant.ingestCanonical(entry, active).catch((error: unknown) => error)
       expect(isInvalidGovernanceRecord(failure)).toBe(true)
       expect(failure).toMatchObject({ message: 'GOVERNANCE_CANONICAL_PREDECESSOR_MISSING' })
     }
     const firstEpoch = await fixture.admin.rotateEpoch(fixture.root.privateKey)
-    await participant.ingestCanonical(await appendControl('epoch-manifest', encodeSignedEpochManifest(firstEpoch)))
+    await participant.ingestCanonical(await appendControl('epoch-manifest', encodeSignedEpochManifest(firstEpoch)), active)
     expect(participant.currentEpoch).toBe(0n)
     expect(participant.pendingRecordCount).toBe(0)
+  })
+
+  it('selects canonical control predecessors and epoch positions when received feed state is ahead', async () => {
+    const f = await governanceFixture()
+    await f.admin.publishCapabilityChange({ grants: [grant(bytes32(45), 'writer')] }, f.root.privateKey)
+    await f.admin.publishCapabilityChange({ grants: [grant(bytes32(46), 'writer')] }, f.root.privateKey)
+    await f.admin.rotateEpoch(f.root.privateKey)
+    await f.admin.rotateEpoch(f.root.privateKey)
+    const transport = f.network.createNode('canonical-ahead-reader')
+    const participant = await GovernanceControlPlane.create({ genesis: f.genesis, groupRoute: f.groupRoute,
+      transport, identity: await generateEd25519KeyPair() })
+    controllers.push(participant)
+    let active = participant.snapshot
+    const records = await f.adminTransport.history()
+    for (const record of records) { transport.receive(record); await participant.ingest(record) }
+    expect(participant.snapshot.revision).toBe(2n)
+    expect(participant.currentEpoch).toBe(1n)
+    expect(participant.canonicalEpochAt(100)).toBeNull()
+    const log = await ReferenceRecordLog.open('h_0123456789abcdef0123456789abcdef', new MemoryOperationStore())
+    const order = async (index: number) => log.append((await createLedgerRecord(records[index]!.payload)).recordBytes)
+    await expect(participant.ingestCanonical(await order(1), active)).rejects.toThrow('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
+    active = (await participant.ingestCanonical(await order(0), active))!
+    expect(active.revision).toBe(1n)
+    await expect(participant.ingestCanonical(await order(3), active)).rejects.toThrow('GOVERNANCE_CANONICAL_PREDECESSOR_MISSING')
+    const initialEpoch = await order(2)
+    await participant.ingestCanonical(initialEpoch, active)
+    expect(participant.canonicalEpochAt(initialEpoch.position)).toBeNull()
+    expect(participant.canonicalEpochAt(initialEpoch.position + 1)).toEqual(encodeCanonicalCbor(0n))
+    // Replaying the same already ordered rotation cannot move its activation.
+    await participant.ingestCanonical(initialEpoch, active)
+    expect(participant.canonicalEpochAt(initialEpoch.position + 1)).toEqual(encodeCanonicalCbor(0n))
   })
 
   it('keeps a relayed governance successor pending until its authenticated predecessor arrives', async () => {

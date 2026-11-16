@@ -56,6 +56,14 @@ failure. Neither means that the application position may be skipped or that the
 proposal was rejected. Certified ordering, body availability, effective roster
 state and applied application state are separate progress conditions.
 
+For coordinated application admission, the epoch on the fetched and verified
+envelope must match the rotation effective at its canonical position. Receiving
+a later key wrap does not change earlier positions. A stale prepared operation
+gets the durable `ENCRYPTION_EPOCH_CLOSED` result under its original proposal ID;
+an exact retry that already obtained an earlier position preserves that outcome.
+Unavailable bytes remain pending. This fence does not prevent an authorized
+participant from separately disclosing data or keys it already possesses.
+
 The descriptor format does not promise payload replication or availability. Its
 payload store and peer transport must enforce their own durability, authorization,
 bounded requests and retention rules. It also does not declare an application

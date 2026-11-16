@@ -131,6 +131,7 @@ describe('CapabilityMembershipResolver revision pinning', () => {
   it('denies everything when the revision is unknown', async () => {
     const resolver = resolverFor(null)
     await expect(resolver.canWrite(context())).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
+    expect(await resolver.canWrite({ ...context(), canonicalPosition: 1n })).toBe(false)
     expect(await resolver.canValidate({ ...context(), validatorId: validatorKeys[0], validatorCapability: capabilities.validator0.id })).toBe(false)
     expect(await resolver.canHeartbeat({ groupId, membershipRevision: revisionDigest, validatorId: validatorKeys[0], validatorCapability: capabilities.validator0.id })).toBe(false)
     expect(await resolver.threshold(context())).toBe(Number.MAX_SAFE_INTEGER)
@@ -149,6 +150,12 @@ describe('CapabilityMembershipResolver revision pinning', () => {
     expect(await resolver.selectAdmission(foreign, [attestation(capabilities.validator0), attestation(capabilities.validator2)])).toEqual([])
     expect(await resolver.watermarkPolicy(core({ groupId: otherGroupId }))).toBeNull()
     expect(await resolver.canUseTransportAuthor({ groupId: otherGroupId, membershipRevision: revisionDigest, role: 'writer', signingId: writerKey, transportAuthor: '@writer.feed' })).toBe(false)
+  })
+
+  it('rejects a received future revision at a fixed position without waiting for later activation', async () => {
+    const resolver = resolverFor(snapshot(), { authorizationSnapshot: () => null })
+    await expect(resolver.canWrite(context())).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
+    expect(await resolver.canWrite({ ...context(), canonicalPosition: 1n })).toBe(false)
   })
 
   it('denies a source that returns a snapshot for a different revision than requested', async () => {

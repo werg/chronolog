@@ -65,6 +65,9 @@ export class CapabilityMembershipResolver implements MembershipResolver {
   async canWrite(context: WriterAuthorizationContext): Promise<boolean> {
     const snapshot = await this.#snapshot(context)
     if (!snapshot) {
+      // A canonical position comes with its complete preceding control prefix.
+      // An unknown author-selected revision cannot arrive before that position.
+      if (context.canonicalPosition !== undefined) return false
       if (await this.#snapshots(context.membershipRevision) === null) throw new GovernanceEvidencePendingError()
       return false
     }
@@ -75,7 +78,10 @@ export class CapabilityMembershipResolver implements MembershipResolver {
         !equalBytes(grant.grant.signingPublicKey, context.writerId)) return false
     if (context.program !== undefined && !programAllowed(grant.grant, context.program)) return false
     const effective = this.#authorizationSnapshot === undefined ? snapshot : await this.#authorizationSnapshot(context)
-    if (effective === null) throw new GovernanceEvidencePendingError()
+    if (effective === null) {
+      if (context.canonicalPosition !== undefined) return false
+      throw new GovernanceEvidencePendingError()
+    }
     const active = effective.capabilities.get(id)
     return equalBytes(effective.groupId, context.groupId) && snapshot.revision <= effective.revision &&
       active !== undefined && this.#activeRole(active, effective, 'writer') &&
