@@ -11,6 +11,7 @@
     "@chronolog/crypto": "workspace:*",
     "@chronolog/materializer": "workspace:*",
     "@chronolog/protocol": "workspace:*",
+    "@chronolog/records": "workspace:*",
     "@chronolog/transport-ssb": "workspace:*"
   },
   "devDependencies": {

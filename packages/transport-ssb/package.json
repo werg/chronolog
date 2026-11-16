@@ -5,6 +5,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
+    "@chronolog/records": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "secret-stack": "6.4.1",
     "ssb-caps": "1.1.0",

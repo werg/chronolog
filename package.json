@@ -44,6 +44,7 @@
     "prepare": "husky"
   },
   "devDependencies": {
+    "@chronolog/records": "workspace:*",
     "@chronolog/client": "workspace:*",
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/runtime-workerd": "workspace:*",

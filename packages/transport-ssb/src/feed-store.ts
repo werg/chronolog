@@ -8,65 +8,33 @@
 import { createHash, createPrivateKey, createPublicKey, sign, verify, type KeyObject } from 'node:crypto'
 import { DatabaseSync, type StatementSync } from 'node:sqlite'
 
-import { decodeCanonicalCbor, encodeCanonicalCbor, type CborValue } from '@chronolog/protocol'
-
+import {
+  DEFAULT_MAX_RECORD_BYTES, FeedRecordError, decodeSignedFeedRecord, encodeSignedFeedRecord,
+  feedIdFromPublicKey, publicKeyFromFeedId, feedRecordId, feedSigningBytes, classifyFeedAppend,
+  type FeedRecord,
+} from '@chronolog/records'
 import type { TransportRecord } from './types.js'
 
-const RECORD_DOMAIN = Buffer.from('chronolog/feed-record/v1\0', 'utf8')
+export { DEFAULT_MAX_RECORD_BYTES, FeedRecordError, feedIdFromPublicKey, publicKeyFromFeedId }
+export type { FeedRecord }
+
 const PKCS8_ED25519_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex')
 const SPKI_ED25519_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
 
-export const DEFAULT_MAX_RECORD_BYTES = 64 * 1024 * 1024
-
-/** The parts of an ssb-keys secret this store needs. */
+/** The native key-file adapter's only dependency on the SSB key representation. */
 export interface FeedKeys {
   readonly id: string
   readonly private: string
-}
-
-export class FeedRecordError extends Error {
-  constructor(readonly code: string) {
-    super(code)
-    this.name = 'FeedRecordError'
-  }
-}
-
-export interface FeedRecord {
-  readonly id: string
-  readonly author: string
-  readonly sequence: bigint
-  readonly previous: string | null
-  readonly timestampMs: bigint
-  readonly payload: Uint8Array
-  /** The exact signed bytes; what peers exchange. */
-  readonly raw: Uint8Array
 }
 
 export type AppendResult =
   | { readonly kind: 'appended'; readonly record: TransportRecord }
   | { readonly kind: 'duplicate' }
   | { readonly kind: 'fork'; readonly record: TransportRecord }
-  /** The record does not extend the local head; the caller is behind or ahead. */
   | { readonly kind: 'out_of_order'; readonly head: bigint }
 
-export function feedIdFromPublicKey(publicKey: Uint8Array): string {
-  return `@${Buffer.from(publicKey).toString('base64')}.ed25519`
-}
-
-export function publicKeyFromFeedId(feedId: string): Uint8Array {
-  const match = /^@([A-Za-z0-9+/]{43}=)\.ed25519$/u.exec(feedId)
-  if (match === null) throw new FeedRecordError('FEED_ID_INVALID')
-  return Uint8Array.from(Buffer.from(match[1]!, 'base64'))
-}
-
 function recordId(raw: Uint8Array): string {
-  return `%${createHash('sha256').update(raw).digest('base64')}.sha256`
-}
-
-function idHash(id: string): Uint8Array {
-  const match = /^%([A-Za-z0-9+/]{43}=)\.sha256$/u.exec(id)
-  if (match === null) throw new FeedRecordError('FEED_RECORD_ID_INVALID')
-  return Uint8Array.from(Buffer.from(match[1]!, 'base64'))
+  return feedRecordId(createHash('sha256').update(raw).digest())
 }
 
 function privateKeyObject(keys: FeedKeys): KeyObject {
@@ -86,60 +54,21 @@ function publicKeyObject(feedId: string): KeyObject {
   return key
 }
 
-function signedFields(author: string, sequence: bigint, previous: string | null, timestampMs: bigint, payload: Uint8Array): CborValue {
-  return [1n, publicKeyFromFeedId(author), sequence, previous === null ? null : idHash(previous), timestampMs, payload]
-}
-
-function signingBytes(fields: CborValue): Buffer {
-  return Buffer.concat([RECORD_DOMAIN, encodeCanonicalCbor(fields)])
-}
-
 export function createFeedRecord(
-  keys: FeedKeys,
-  sequence: bigint,
-  previous: string | null,
-  timestampMs: bigint,
-  payload: Uint8Array,
+  keys: FeedKeys, sequence: bigint, previous: string | null, timestampMs: bigint, payload: Uint8Array,
 ): FeedRecord {
-  const fields = signedFields(keys.id, sequence, previous, timestampMs, payload)
-  const signature = sign(null, signingBytes(fields), privateKeyObject(keys))
-  const raw = encodeCanonicalCbor([fields, Uint8Array.from(signature)])
-  return { id: recordId(raw), author: keys.id, sequence, previous, timestampMs, payload: Uint8Array.from(payload), raw }
+  const fields = { author: keys.id, sequence, previous, timestampMs, payload: payload.slice() }
+  const raw = encodeSignedFeedRecord(fields, sign(null, feedSigningBytes(fields), privateKeyObject(keys)))
+  return { ...fields, id: recordId(raw), raw }
 }
 
-/** Decode and verify a record received from a peer. */
 export function decodeFeedRecord(raw: Uint8Array, maxRecordBytes = DEFAULT_MAX_RECORD_BYTES): FeedRecord {
-  if (raw.length > maxRecordBytes) throw new FeedRecordError('FEED_RECORD_TOO_LARGE')
-  let decoded: CborValue
-  try {
-    decoded = decodeCanonicalCbor(raw, { maxBytes: maxRecordBytes, maxByteStringBytes: maxRecordBytes })
-  } catch {
-    throw new FeedRecordError('FEED_RECORD_MALFORMED')
+  const decoded = decodeSignedFeedRecord(raw, maxRecordBytes)
+  if (!verify(null, decoded.signingBytes, publicKeyObject(decoded.author), decoded.signature)) {
+    throw new FeedRecordError('FEED_RECORD_SIGNATURE_INVALID')
   }
-  if (!Array.isArray(decoded) || decoded.length !== 2) throw new FeedRecordError('FEED_RECORD_MALFORMED')
-  const [fields, signature] = decoded as readonly CborValue[]
-  if (!Array.isArray(fields) || fields.length !== 6 || !(signature instanceof Uint8Array) || signature.length !== 64) {
-    throw new FeedRecordError('FEED_RECORD_MALFORMED')
-  }
-  const [version, publicKey, sequence, previousHash, timestampMs, payload] = fields as readonly CborValue[]
-  if (version !== 1n || !(publicKey instanceof Uint8Array) || publicKey.length !== 32 ||
-      typeof sequence !== 'bigint' || sequence < 1n ||
-      !(previousHash === null || (previousHash instanceof Uint8Array && previousHash.length === 32)) ||
-      typeof timestampMs !== 'bigint' || !(payload instanceof Uint8Array)) {
-    throw new FeedRecordError('FEED_RECORD_MALFORMED')
-  }
-  if ((sequence === 1n) !== (previousHash === null)) throw new FeedRecordError('FEED_RECORD_PREVIOUS_INVALID')
-  const author = feedIdFromPublicKey(publicKey)
-  if (!verify(null, signingBytes(fields), publicKeyObject(author), signature)) throw new FeedRecordError('FEED_RECORD_SIGNATURE_INVALID')
-  return {
-    id: recordId(raw),
-    author,
-    sequence,
-    previous: previousHash === null ? null : `%${Buffer.from(previousHash).toString('base64')}.sha256`,
-    timestampMs,
-    payload: Uint8Array.from(payload),
-    raw: Uint8Array.from(raw),
-  }
+  const { author, sequence, previous, timestampMs, payload } = decoded
+  return { id: recordId(decoded.raw), author, sequence, previous, timestampMs, payload, raw: decoded.raw }
 }
 
 interface RecordRow {
@@ -239,13 +168,14 @@ export class FeedStore {
   /** Append the author's next record. Durable when this returns. */
   append(record: FeedRecord, receivedAtMs = Date.now()): AppendResult {
     const existing = this.#statements.bySequence.get(record.author, record.sequence) as { id: string } | undefined
-    if (existing !== undefined) {
-      if (existing.id === record.id) return { kind: 'duplicate' }
+    const head = this.head(record.author)
+    const disposition = classifyFeedAppend(record, head, existing?.id)
+    if (disposition === 'duplicate') return { kind: 'duplicate' }
+    if (disposition === 'fork') {
       this.#statements.fork.run(record.id, record.author, record.sequence, record.raw, receivedAtMs)
       return { kind: 'fork', record: toTransportRecord(record, receivedAtMs) }
     }
-    const head = this.head(record.author)
-    if (record.sequence !== head.sequence + 1n || record.previous !== head.id) {
+    if (disposition === 'out_of_order') {
       return { kind: 'out_of_order', head: head.sequence }
     }
     this.#statements.insert.get(
