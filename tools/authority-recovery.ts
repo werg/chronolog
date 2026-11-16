@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { cp, mkdir, mkdtemp, open, readdir, rm, stat, statfs, writeFile } from 'node:fs/promises'
+import { spawn, spawnSync } from 'node:child_process'
+import { copyFile, cp, mkdir, mkdtemp, open, readdir, rm, stat, statfs, writeFile } from 'node:fs/promises'
 import { arch, platform, release } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
-import { decodeLedgerRecord, ReferenceRecordLog, type OrderedRecordHead } from '@chronolog/node-core'
+import { createDoltLiteExecutionManifest, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
+import { CoordinatedHistoryPolicy, decodeLedgerRecord, decodeOrderingEvidence, ReferenceRecordLog,
+  type CoordinatedHistoryConfiguration, type OrderedRecordHead } from '@chronolog/node-core'
+import { base64UrlToBytes } from '@chronolog/protocol'
 
 import { AUTHORITY_CRASH_POINTS, inspectStoppedAuthority, recoveryJson, type RecoveryOperation } from './lib/authority-recovery-fixture.js'
 import { fileSha256, git } from './lib/common.js'
@@ -25,6 +28,12 @@ interface RecoveryState {
     readonly hash: string; readonly descriptorBytes: number; readonly payloadBytes: number | null; readonly detached: boolean }[]
 }
 interface ChildResult { readonly status: number | null; readonly signal: NodeJS.Signals | null; readonly stdout: string; readonly stderr: string }
+interface HoldingAuthority {
+  readonly state: RecoveryState
+  readonly configuration: { readonly kind: 'coordinated'; readonly historyId: string; readonly authorityPublicKey: string;
+    readonly groupId: string; readonly genesisDigest: string; readonly executionManifestDigest: string }
+  readonly evidence: readonly string[]
+}
 
 const { values } = parseArgs({ options: { output: { type: 'string' }, 'volume-root': { type: 'string' } } })
 const workspace = resolve(import.meta.dirname, '..')
@@ -40,7 +49,7 @@ const transcript: { readonly command: readonly string[]; readonly elapsedMs: num
 const checks: { readonly id: string; readonly details: unknown }[] = []
 const report = { format: 'chronolog-authority-recovery/v1', passed: false, startedAt: new Date().toISOString(), completedAt: '',
   source: { commit: git(workspace, ['rev-parse', 'HEAD']).trim(), tree: git(workspace, ['rev-parse', 'HEAD^{tree}']).trim(),
-    dirty: git(workspace, ['status', '--porcelain', '--untracked-files=no']).trim().length > 0 },
+    dirty: git(workspace, ['status', '--porcelain', '--untracked-files=normal']).trim().length > 0 },
   environment: { node: process.version, platform: platform(), arch: arch(), osRelease: release(),
     filesystemTypeHex: `0x${(await statfs(volumes)).type.toString(16)}`,
     storage: 'disposable directory on selected volume root; SQLite WAL, synchronous=FULL, exclusive connection fence', volumeRoot,
@@ -135,6 +144,42 @@ try {
   assertSameState(state(child('submit', restored, 'rejected', 'none', floor)), final)
   checked('consistent-whole-volume-restore', { manifest: backupManifest, trustedContinuity: final.head,
     restoredHead: recovered.head, preserved: ['identity', 'configuration', 'certificates', 'deduplication', 'operation journal', 'feed history', 'SQL projection', 'effective events', 'detached bodies'] })
+
+  // A separate SQL projection and two persistent public-evidence observers are
+  // open while the real authority process runs. They receive no signing key.
+  const projectionPath = join(volumes, 'independent-application.db')
+  await copyFile(join(restored, 'application.db'), projectionPath)
+  const held = await holdAuthority(restored)
+  let one: NativeAgentStore | undefined, two: NativeAgentStore | undefined
+  let projection: DeterministicMaterializer | undefined
+  try {
+    one = new NativeAgentStore(join(volumes, 'retained-observer-one.sqlite'))
+    two = new NativeAgentStore(join(volumes, 'retained-observer-two.sqlite'))
+    const publicConfiguration: CoordinatedHistoryConfiguration = { kind: 'coordinated', historyId: held.value.configuration.historyId,
+      authorityPublicKey: base64UrlToBytes(held.value.configuration.authorityPublicKey), groupId: base64UrlToBytes(held.value.configuration.groupId),
+      genesisDigest: base64UrlToBytes(held.value.configuration.genesisDigest), executionManifestDigest: base64UrlToBytes(held.value.configuration.executionManifestDigest) }
+    const first = await CoordinatedHistoryPolicy.open(publicConfiguration, one)
+    const second = await CoordinatedHistoryPolicy.open(publicConfiguration, two)
+    projection = await DeterministicMaterializer.open({ path: projectionPath, executionManifest: createDoltLiteExecutionManifest(),
+      rootAdministrator: base64UrlToBytes(held.value.state.authorityIdentity) })
+    for (const bytes of [...held.value.evidence].reverse()) await first.ingest(decodeOrderingEvidence(base64UrlToBytes(bytes)))
+    assert.equal(first.progress.finalThrough, held.value.state.head.position)
+    assert.deepEqual(projection.localSql('SELECT id, value FROM recovery_probe ORDER BY id', [], { view: 'final' }).rows, held.value.state.rows)
+    const killed = await held.kill()
+    assert.equal(killed.signal, 'SIGKILL')
+    // The process has exited. Only the first peer's retained public evidence is used.
+    for (const evidence of [...first.evidence()].reverse()) await second.ingest(evidence)
+    assert.deepEqual(second.progress, first.progress)
+    const rows = projection.localSql('SELECT id, value FROM recovery_probe ORDER BY id', [], { view: 'final' }).rows
+    assert.deepEqual(rows, held.value.state.rows)
+    checked('authority-process-loss-with-independent-retained-readers', { termination: killed.signal, authorityProcessExited: true,
+      previouslyAcknowledgedHead: held.value.state.head, independentlyOpenStores: 3, authorityPrivateKeysCopied: 0,
+      finalSqlRowsAfterProcessExit: rows, relayedProgress: second.progress,
+      evidenceBytes: held.value.evidence.reduce((sum, item) => sum + base64UrlToBytes(item).length, 0),
+      applicationBodiesNeededForCertificateRelay: 0, publicNetworkClaim: false })
+  } finally {
+    await held.kill(); projection?.close(); two?.close(); one?.close()
+  }
 
   const offline = completed(child('offline', restored))
   const offlineLine = offline.stdout.trim().split('\n').findLast(value => value.startsWith('{"event":"offline",'))
@@ -247,4 +292,39 @@ async function manifest(directory: string, prefix = ''): Promise<{ readonly path
     }
   }
   return rows
+}
+
+async function holdAuthority(directory: string) {
+  const args = ['--import', 'tsx', join(workspace, 'tools/lib/authority-recovery-child.ts'), 'hold', directory]
+  const started = Date.now()
+  const running = spawn(process.execPath, args, { cwd: workspace, stdio: ['pipe', 'pipe', 'pipe'] })
+  let stdout = '', stderr = '', recorded = false
+  let resolveReady!: (value: HoldingAuthority) => void, rejectReady!: (error: Error) => void
+  const ready = new Promise<HoldingAuthority>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
+  running.stdout.setEncoding('utf8'); running.stderr.setEncoding('utf8')
+  running.stdout.on('data', (chunk: string) => {
+    stdout += chunk
+    if (stdout.length > 4 * 1024 * 1024) { running.kill('SIGKILL'); rejectReady(new Error('RECOVERY_CHILD_OUTPUT_TOO_LARGE')); return }
+    const line = stdout.split('\n').find(value => value.startsWith('{"event":"holding",') && value.endsWith('}'))
+    if (line !== undefined) {
+      try { resolveReady(JSON.parse(line) as HoldingAuthority) }
+      catch (error) { rejectReady(error instanceof Error ? error : new Error('RECOVERY_CHILD_READY_INVALID', { cause: error })) }
+    }
+  })
+  running.stderr.on('data', (chunk: string) => { stderr += chunk })
+  running.once('error', rejectReady)
+  const exited = new Promise<ChildResult>(resolve => { running.once('close', (status, signal) => {
+    rejectReady(new Error(`RECOVERY_CHILD_EXITED_BEFORE_READY:${status}:${signal}\n${stderr}`))
+    resolve({ status, signal, stdout, stderr })
+  }) })
+  const kill = async () => {
+    if (running.exitCode === null && running.signalCode === null) running.kill('SIGKILL')
+    const result = await exited
+    if (!recorded) { transcript.push({ command: [process.execPath, ...args], elapsedMs: Date.now() - started, result }); recorded = true }
+    return result
+  }
+  const timeout = setTimeout(() => { rejectReady(new Error('RECOVERY_CHILD_START_TIMEOUT')); running.kill('SIGKILL') }, 15_000)
+  try { return { value: await ready, kill } }
+  catch (error) { await kill(); throw error }
+  finally { clearTimeout(timeout) }
 }

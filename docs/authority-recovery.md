@@ -74,7 +74,7 @@ its proposal, position, final outcome, SQL values and effective events, without
 another ordered record. Changing contents under the original operation ID fails.
 The rejected program's attempted row update and event never become final.
 
-The operational command also runs six separate checks:
+The operational command also runs seven separate checks:
 
 - A second real process is refused while the first process owns the same store.
 - Ordinary restart preserves identity, configuration, certificate, feed records,
@@ -83,6 +83,11 @@ The operational command also runs six separate checks:
   checked by size/hash, the old owner is removed, and a restored process reopens
   under an independently retained continuity floor. Accepted and rejected
   retries still return their originals.
+- The actual authority runs in a separate process while two independently
+  stored descriptor/certificate observers and a copied native SQL projection
+  remain open. After **SIGKILL** and confirmed process exit, SQL reads still
+  return the same final rows and one observer relays retained public evidence
+  to the other. The observers/projection receive no authority signing key.
 - Stopping the authority task preserves final SQL reads. Two independent
   ordering-policy stores verify and relay retained public evidence in reverse
   delivery order without supplied application bodies. A newly submitted

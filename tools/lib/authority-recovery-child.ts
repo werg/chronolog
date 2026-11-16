@@ -4,7 +4,7 @@ import { writeSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
-import { emit, program } from '@chronolog/protocol'
+import { bytesToBase64Url, emit, program } from '@chronolog/protocol'
 import { CoordinatedHistoryPolicy, decodeOrderingEvidence, MemoryOperationStore, type OrderedRecordHead } from '@chronolog/node-core'
 
 import {
@@ -24,7 +24,7 @@ if (action === 'raw') {
   store.close()
   process.stdout.write('{"opened":true}\n')
 } else {
-  assert(['initialize', 'inspect', 'submit', 'crash', 'offline', 'fencing', 'after-backup'].includes(action ?? ''), 'RECOVERY_CHILD_ACTION_INVALID')
+  assert(['initialize', 'inspect', 'submit', 'crash', 'offline', 'fencing', 'after-backup', 'hold'].includes(action ?? ''), 'RECOVERY_CHILD_ACTION_INVALID')
   const operation: RecoveryOperation = operationArgument === 'rejected' ? 'rejected' : 'accepted'
   if (action === 'crash') assert(AUTHORITY_CRASH_POINTS.includes(faultArgument as AuthorityCrashPoint), 'RECOVERY_CHILD_CRASH_POINT_INVALID')
   const continuity = continuityFile === undefined ? undefined : JSON.parse(await readFile(continuityFile, 'utf8')) as OrderedRecordHead
@@ -58,7 +58,16 @@ if (action === 'raw') {
       assert.match(second.stderr, /AGENT_STORE_IN_USE/u)
       process.stdout.write(`${recoveryJson({ event: 'fence', status: second.status, reason: 'AGENT_STORE_IN_USE' })}\n`)
     }
-    if (action === 'offline') {
+    if (action === 'hold') {
+      const configuration = fixture.authority.configuration
+      writeSync(1, `${recoveryJson({ event: 'holding', state: await fixture.inspect(), configuration: {
+        kind: configuration.kind, historyId: configuration.historyId,
+        authorityPublicKey: bytesToBase64Url(configuration.authorityPublicKey), groupId: bytesToBase64Url(configuration.groupId),
+        genesisDigest: bytesToBase64Url(configuration.genesisDigest), executionManifestDigest: bytesToBase64Url(configuration.executionManifestDigest),
+      }, evidence: (await fixture.transport.evidenceHistory()).map(item => bytesToBase64Url(item.bytes)) })}\n`)
+      process.stdin.resume()
+      await new Promise<void>(resolve => { process.stdin.once('end', resolve) })
+    } else if (action === 'offline') {
       const before = await fixture.inspect()
       const retained = await fixture.transport.evidenceHistory()
       await fixture.agent.close()
