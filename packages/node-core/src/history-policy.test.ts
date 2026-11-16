@@ -144,6 +144,71 @@ describe('portable coordinated prefix evidence', () => {
     expect(peer.progress.verifiedThrough).toBe(0)
   })
 
+  it('retains a complete bounded page once and validates exact retries without writing', async () => {
+    const f = await fixture(), storage = new MemoryOperationStore()
+    let writes = 0
+    const peer = await CoordinatedHistoryPolicy.open(f.configuration, {
+      get: key => storage.get(key), put: async (key, value) => { await storage.put(key, value); writes += 1 },
+    })
+    const entries = await Promise.all(Array.from({ length: 128 }, (_, i) => f.log.append(utf8(`entry-${i}`))))
+    const certificate = await f.authority.certify()
+    const batch = [...entries.map(entry => ({ kind: 'ordered-entry' as const, entry })), { kind: 'prefix-certificate' as const, certificate }]
+    await peer.ingestBatch(batch)
+    expect(writes).toBe(1)
+    expect(peer.entries()).toEqual(entries)
+    expect((await CoordinatedHistoryPolicy.open(f.configuration, storage)).progress).toEqual(peer.progress)
+    await peer.ingestBatch(batch)
+    await peer.ingest({ kind: 'prefix-certificate', certificate })
+    expect(writes).toBe(1)
+    const altered = structuredClone(certificate); altered.signature[0]! ^= 1
+    await expect(peer.ingest({ kind: 'prefix-certificate', certificate: altered })).rejects.toThrow('SIGNATURE_INVALID')
+    await expect(peer.ingestBatch([...batch, batch[0]!])).rejects.toThrow('HISTORY_EVIDENCE_BATCH_INVALID')
+    expect(writes).toBe(1)
+  })
+
+  it('rejects an invalid late item without retaining an earlier part of its batch', async () => {
+    const f = await fixture()
+    const one = await f.log.append(utf8('one')), two = await f.log.append(utf8('two'))
+    await expect(f.peer.ingestBatch([
+      { kind: 'ordered-entry', entry: one },
+      { kind: 'ordered-entry', entry: { ...two, bytes: utf8('tampered') } },
+      { kind: 'prefix-certificate', certificate: await f.authority.certify() },
+    ])).rejects.toThrow('DIGEST_MISMATCH')
+    expect(f.peer.evidence()).toEqual([])
+    expect((await CoordinatedHistoryPolicy.open(f.configuration, f.peerStorage)).evidence()).toEqual([])
+  })
+
+  it('refuses a conflicting certified batch without replacing the existing final prefix', async () => {
+    const f = await fixture()
+    const first = await f.log.append(utf8('original'))
+    await f.peer.ingestBatch([{ kind: 'ordered-entry', entry: first }, { kind: 'prefix-certificate', certificate: await f.authority.certify() }])
+    const fork = await ReferenceRecordLog.open(historyId, new MemoryOperationStore())
+    await fork.append(utf8('forked first'))
+    const successor = await fork.append(utf8('forked successor'))
+    const authority = createPrefixAuthority({ configuration: f.configuration, identity: f.identity, readHead: () => fork.head() })
+    await expect(f.peer.ingestBatch([
+      { kind: 'ordered-entry', entry: successor }, { kind: 'prefix-certificate', certificate: await authority.certify() },
+    ])).rejects.toThrow('HISTORY_AUTHORITY_EQUIVOCATION')
+    expect(f.peer.entries()).toEqual([first])
+    expect((await CoordinatedHistoryPolicy.open(f.configuration, f.peerStorage)).entries()).toEqual([first])
+  })
+
+  it('keeps a failed batch unpublished and permits the exact page after storage recovery', async () => {
+    const f = await fixture(), storage = new MemoryOperationStore()
+    let full = true
+    const peer = await CoordinatedHistoryPolicy.open(f.configuration, {
+      get: key => storage.get(key), put: async (key, value) => { if (full) throw new Error('disk full'); await storage.put(key, value) },
+    })
+    const entry = await f.log.append(utf8('one')), certificate = await f.authority.certify()
+    const batch = [{ kind: 'ordered-entry' as const, entry }, { kind: 'prefix-certificate' as const, certificate }]
+    await expect(peer.ingestBatch(batch)).rejects.toThrow('disk full')
+    expect(peer.evidence()).toEqual([])
+    expect((await CoordinatedHistoryPolicy.open(f.configuration, storage)).progress.finalThrough).toBe(0)
+    full = false
+    await peer.ingestBatch(batch)
+    expect(peer.progress.finalThrough).toBe(1)
+  })
+
   it('signs a head it reads and binds empty histories', async () => {
     const f = await fixture()
     const certificate = await f.authority.certify()

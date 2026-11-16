@@ -261,10 +261,24 @@ export class CoordinatedHistoryPolicy {
   }
 
   async ingest(evidence: OrderingEvidence): Promise<CoordinatedProgress> {
+    return this.ingestBatch([evidence])
+  }
+
+  /** Atomically retain one bounded page (up to 128 entries plus its certificate). */
+  async ingestBatch(evidence: readonly OrderingEvidence[]): Promise<CoordinatedProgress> {
+    if (!Array.isArray(evidence) || evidence.length > 129) throw new Error('HISTORY_EVIDENCE_BATCH_INVALID')
+    const captured: readonly OrderingEvidence[] = structuredClone(evidence)
     return this.#mutex.run(async () => {
       const entries = new Map([...this.#entries].map(([position, alternatives]) => [position, new Map(alternatives)]))
       const certificates = new Map(this.#certificates)
-      await this.#validateAndInsert(structuredClone(evidence), entries, certificates)
+      let changed = false
+      for (const item of captured) {
+        const inserted = await this.#validateAndInsert(item, entries, certificates)
+        changed ||= inserted
+      }
+      // Exact retries still pass hash/signature/configuration validation, but
+      // do not rewrite retained history or turn a read into a storage write.
+      if (!changed) return this.progress
       const { progress, selectedEntries } = await this.#evaluate(entries, certificates)
       if (progress.finalThrough < this.#progress.finalThrough) throw new Error('HISTORY_FINAL_PREFIX_REGRESSION')
       discardUncommittedAlternatives(entries, selectedEntries)
@@ -286,7 +300,7 @@ export class CoordinatedHistoryPolicy {
     })
   }
 
-  async #validateAndInsert(evidence: OrderingEvidence, entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<void> {
+  async #validateAndInsert(evidence: OrderingEvidence, entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<boolean> {
     if (evidence.kind === 'ordered-entry') {
       const entry = evidence.entry
       if (entry.historyId !== this.#configuration.historyId) throw new Error('HISTORY_ID_MISMATCH')
@@ -302,12 +316,14 @@ export class CoordinatedHistoryPolicy {
       if (previous !== undefined && !equalBytes(previous.bytes, entry.bytes)) throw new Error('HISTORY_RECORD_HASH_COLLISION')
       alternatives.set(entry.root, entry)
       entries.set(entry.position, alternatives)
+      return previous === undefined
     } else {
       const certificate = evidence.certificate
       await verifyPrefixCertificate(certificate, this.#configuration)
       const previous = certificates.get(certificate.position)
       if (previous !== undefined && previous.root !== certificate.root) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
       certificates.set(certificate.position, certificate)
+      return previous === undefined
     }
   }
 

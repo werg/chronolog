@@ -299,10 +299,12 @@ export class MembershipAdministrator {
         // Ordering authenticates exact bytes, including positions whose
         // descriptor is invalid or belongs to another group. Retain them for
         // the prefix proof; application interpretation cannot create a gap.
-        await this.#policy.ingest({ kind: 'ordered-entry', entry })
         cursor = entry.position
       }
-      await this.#policy.ingest({ kind: 'prefix-certificate', certificate: page.certificate })
+      await this.#policy.ingestBatch([
+        ...page.entries.map(entry => ({ kind: 'ordered-entry' as const, entry })),
+        { kind: 'prefix-certificate', certificate: page.certificate },
+      ])
       target ??= page.certificate.position
       if (cursor < target && page.entries.length === 0) throw new Error('MEMBERSHIP_RANGE_GAP')
       this.#signal.throwIfAborted()
