@@ -459,20 +459,48 @@ export class PlatformSession {
     const dependents = this.#dependents({ table, key }, fromId)
     if (!carry && dependents.length > 0) reject('has_dependents')
     const moved = [{ table, key }, ...dependents]
-    // The exemption admits exactly these owner changes, from `from` to `to`.
-    for (const row of moved) {
-      this.#run(`INSERT INTO chronolog_exemptions (kind, tbl, row_key, from_owner, to_owner) VALUES ('transfer', ?, ?, ?, ?)`, row.table, row.key, fromId, toId)
-    }
+    // Admit these owner changes and guard the captured row generations for
+    // the entire update, including application triggers and FK cascades.
+    for (const row of moved) this.#transferExemption(row, fromId, toId, to)
     try {
       const result = this.#run(`UPDATE ${quoteIdentifier(table)} SET ${quoteIdentifier(OWNER_COLUMN)} = ?
         WHERE ${rowKeyFilter(quoteIdentifier(table), shape.primaryKey)}`, toId, ...rowKeyBindings(key, shape.primaryKey))
       if (Number(result.changes) !== 1) reject('offer_stale')
+      this.#assertTransferComplete(to)
     } finally {
       this.#run('DELETE FROM chronolog_exemptions')
     }
     // Row grants were given by the previous owner.
     for (const row of moved) {
       this.#run('UPDATE chronolog_grants SET revoked_tx = ? WHERE revoked_tx IS NULL AND tbl = ? AND row_key = ?', this.#context.txId, row.table, row.key)
+    }
+  }
+
+  /** Guard both identities of one row while permitting its owner transition. */
+  #transferExemption(row: RowRef, fromId: bigint, toId: bigint, to: Uint8Array): void {
+    const shape = tableShape(this.#database, row.table)
+    let toKey = row.key
+    if (shape.primaryKey.some((column) => column.toLowerCase() === OWNER_COLUMN)) {
+      // Encode directly from SQLite storage: converting TEXT/REAL components
+      // through JavaScript would lose invalid UTF-8 bytes or storage types.
+      const values = shape.primaryKey.map((column) => column.toLowerCase() === OWNER_COLUMN ? '?' : `t.${quoteIdentifier(column)}`)
+      const target = this.#get(`SELECT chronolog_row_key(${values.join(', ')}) AS row_key
+        FROM ${quoteIdentifier(row.table)} AS t WHERE ${rowKeyFilter('t', shape.primaryKey)}`,
+      to, ...rowKeyBindings(row.key, shape.primaryKey)) ?? reject('offer_stale')
+      toKey = asText(target.row_key)
+    }
+    this.#run(`INSERT INTO chronolog_exemptions (kind, tbl, row_key, to_row_key, from_owner, to_owner)
+      VALUES ('transfer', ?, ?, ?, ?, ?)`, row.table, row.key, toKey, fromId, toId)
+  }
+
+  /** A schema-level ON CONFLICT IGNORE must not silently skip an owner change. */
+  #assertTransferComplete(to: Uint8Array): void {
+    for (const row of this.#all("SELECT tbl, row_key, to_row_key FROM chronolog_exemptions WHERE kind = 'transfer' ORDER BY tbl, row_key")) {
+      const shape = tableShape(this.#database, asText(row.tbl))
+      const fromKey = asText(row.row_key)
+      const toKey = asText(row.to_row_key)
+      const owner = this.#ownerOf(shape, toKey)
+      if (owner === null || !sameBytes(owner, to) || (fromKey !== toKey && this.#ownerOf(shape, fromKey) !== null)) reject('offer_stale')
     }
   }
 
@@ -521,9 +549,7 @@ export class PlatformSession {
     const tables = this.#parentFirst(this.#registeredTables().map((name) => tableShape(this.#database, name)))
     const fromId = this.#principal(from)
     const toId = this.#principal(to)
-    for (const row of scope) {
-      this.#run(`INSERT INTO chronolog_exemptions (kind, tbl, row_key, from_owner, to_owner) VALUES ('transfer', ?, ?, ?, ?)`, row.table, row.key, fromId, toId)
-    }
+    for (const row of scope) this.#transferExemption(row, fromId, toId, to)
     try {
       for (const shape of tables) {
         for (const row of scope.filter((entry) => entry.table === shape.name)) {
@@ -535,6 +561,7 @@ export class PlatformSession {
           toId, fromId, ...rowKeyBindings(row.key, shape.primaryKey))
         }
       }
+      this.#assertTransferComplete(to)
     } finally {
       this.#run('DELETE FROM chronolog_exemptions')
     }
@@ -776,43 +803,30 @@ export function cachedInternalStatement(database: DatabaseLike, sql: string): St
   return statement
 }
 
-const lifecycleCache = new WeakMap<DatabaseLike, { readonly version: number; readonly names: ReadonlySet<string> }>()
-
-/** Exact generated lifecycle callers, read while no authorizer is installed. */
+/**
+ * Exact generated lifecycle callers, read while no authorizer is installed.
+ * Re-read authorization inventories on every use: schema_version is a
+ * rollbackable cookie, not a unique identity for the current catalog. Caching
+ * results by that cookie makes authorization depend on prior failed work.
+ * Only the fixed SQL statements themselves are cached.
+ */
 export function lifecycleTriggerNames(database: DatabaseLike): ReadonlySet<string> {
-  const version = Number((cachedInternalStatement(database, 'PRAGMA schema_version').get() as Row).schema_version)
-  const cached = lifecycleCache.get(database)
-  if (cached?.version === version) return cached.names
   const tables = cachedInternalStatement(database, 'SELECT name FROM chronolog_tables').all() as Row[]
-  const names = new Set(tables.flatMap((row) => (['life_ins', 'upd', 'del'] as const).map((event) => platformTriggerName(String(row.name), event).replace(/[A-Z]/gu, (letter) => letter.toLowerCase()))))
-  lifecycleCache.set(database, { version, names })
-  return names
+  return new Set(tables.flatMap((row) => (['life_ins', 'upd', 'del'] as const).map((event) => platformTriggerName(String(row.name), event).replace(/[A-Z]/gu, (letter) => letter.toLowerCase()))))
 }
 
-const shadowCache = new WeakMap<DatabaseLike, { readonly version: number; readonly tables: ReadonlySet<string> }>()
-
-/** Lower-case names of SQLite shadow tables, cached per schema version; read while no authorizer is installed. */
+/** Current lower-case SQLite shadow table names; read while no authorizer is installed. */
 export function shadowTables(database: DatabaseLike): ReadonlySet<string> {
-  const version = Number((cachedInternalStatement(database, 'PRAGMA schema_version').get() as Row).schema_version)
-  const cached = shadowCache.get(database)
-  if (cached?.version === version) return cached.tables
   const rows = cachedInternalStatement(database, `SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'shadow'`).all() as Row[]
-  const tables = new Set(rows.map((row) => String(row.name).toLowerCase()))
-  shadowCache.set(database, { version, tables })
-  return tables
+  return new Set(rows.map((row) => String(row.name).toLowerCase()))
 }
-
-const writeProtectedCache = new WeakMap<DatabaseLike, { readonly version: number; readonly tables: ReadonlySet<string> }>()
 
 /**
  * Lower-case names of the tables that carry no owner checks: virtual tables
- * (FTS5, R-tree, sqlite-vec) and sqlite-vec's chunk tables. Cached per
- * schema version; read while no authorizer is installed.
+ * (FTS5, R-tree, sqlite-vec) and sqlite-vec's chunk tables. Recomputed from the
+ * current catalog while no authorizer is installed.
  */
 export function writeProtectedTables(database: DatabaseLike): ReadonlySet<string> {
-  const version = Number((cachedInternalStatement(database, 'PRAGMA schema_version').get() as Row).schema_version)
-  const cached = writeProtectedCache.get(database)
-  if (cached?.version === version) return cached.tables
   const schema = cachedInternalStatement(database, `SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND sql IS NOT NULL`).all() as Row[]
   const vecTables = new Map<string, number>()
   const tables = new Set<string>()
@@ -826,7 +840,6 @@ export function writeProtectedTables(database: DatabaseLike): ReadonlySet<string
   for (const row of schema) {
     if (isVecChunkTable(database, String(row.name), vecTables)) tables.add(String(row.name).toLowerCase())
   }
-  writeProtectedCache.set(database, { version, tables })
   return tables
 }
 

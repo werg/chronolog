@@ -8,7 +8,8 @@ import {
 
 import { hpkeOpenBase, hpkeSealBase } from './hpke.js'
 
-function source(value: Uint8Array): ArrayBuffer { return value.slice().buffer }
+// Buffer.slice() retains the backing pool. Copy exactly this view for WebCrypto.
+function source(value: Uint8Array): ArrayBuffer { return Uint8Array.from(value).buffer }
 const isList = (value: unknown): boolean => Array.isArray(value)
 
 function payloadContext(context: SealedContext): Uint8Array {
@@ -32,7 +33,7 @@ function copyRecipients(recipients: readonly SealedRecipient[]): SealedRecipient
     protocolInvariant(recipient.readerId instanceof Uint8Array && recipient.readerId.length === 32 &&
       recipient.publicKey instanceof Uint8Array && recipient.publicKey.length === 32,
     'SCHEMA_INVALID', 'Sealed readers require a 32-byte id and a 32-byte HPKE public key')
-    return { readerId: recipient.readerId.slice(), publicKey: recipient.publicKey.slice() }
+    return { readerId: Uint8Array.from(recipient.readerId), publicKey: Uint8Array.from(recipient.publicKey) }
   }).sort((left, right) => compareBytes(left.readerId, right.readerId))
   for (let index = 1; index < sorted.length; index += 1) {
     protocolInvariant(!equalBytes(sorted[index - 1]!.readerId, sorted[index]!.readerId), 'SCHEMA_INVALID', 'Sealed reader ids must be unique')
@@ -56,7 +57,7 @@ export async function sealSealedValue(input: {
   // context, readers or plaintext while WebCrypto is running.
   const context = copyContext(input.context)
   const recipients = copyRecipients(input.recipients)
-  const plaintext = input.plaintext.slice()
+  const plaintext = Uint8Array.from(input.plaintext)
   const contentKey = globalThis.crypto.getRandomValues(new Uint8Array(32))
   const nonce = globalThis.crypto.getRandomValues(new Uint8Array(12))
   try {
@@ -95,7 +96,7 @@ export async function openSealedValue(input: {
   const expected = encodeSealedContext(input.expectedContext)
   protocolInvariant(equalBytes(encodeSealedContext(envelope.context), expected), 'INVALID_SIGNATURE', 'Sealed value does not match the expected context')
   protocolInvariant(input.readerId instanceof Uint8Array && input.readerId.length === 32, 'INVALID_KEY', 'Sealed reader id must contain 32 bytes')
-  const readerId = input.readerId.slice()
+  const readerId = Uint8Array.from(input.readerId)
   const wrap = envelope.wraps.find((candidate) => equalBytes(candidate.readerId, readerId))
   protocolInvariant(wrap !== undefined, 'INVALID_KEY', 'Sealed value has no key wrap for this reader')
   const authenticated = wrapContext(envelope.context, wrap)

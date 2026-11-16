@@ -86,6 +86,15 @@ row-specific grants, so an old offer cannot revive after ownership returns.
 Deleting/replacing a row or changing its primary key also ends row-specific
 grants. Whole-table grants continue to apply to that owner's current rows.
 
+While acceptance runs, captured rows cannot be deleted or have their non-owner
+primary-key components changed by application triggers. The source and
+destination keys are also reserved against inserts and rekeying other rows into
+them, including owner-composite keys, so a trigger cannot substitute a different
+row for one the sender offered. Before accepting, the platform verifies that
+every captured row reached its destination owner and left any old owner-specific
+key. A skipped update, including one suppressed by `ON CONFLICT IGNORE`, rejects
+the entire acceptance. Ordinary ownership cascades still work.
+
 Column grants compare exact stored values: a case change in a NOCASE column,
 or a numeric storage-type change, needs permission for that column too.
 

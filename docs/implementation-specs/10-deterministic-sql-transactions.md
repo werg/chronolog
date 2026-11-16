@@ -256,6 +256,22 @@ between steps. Exact generated lifecycle triggers also have column-scoped
 permission to invalidate grants/offers and close or migrate policy bindings;
 application triggers never inherit that metadata privilege.
 
+Transfer exemptions identify both the captured source key and its destination
+key. While acceptance is executing, generated guards reject deleting a captured
+row, inserting at either key, or changing non-owner primary-key components into
+or out of either key, including from application triggers. Ownership-only FK
+cascades remain permitted. Before clearing the exemptions, the platform checks
+that every destination exists with the recipient owner and every distinct
+source key is absent. These guards prevent replacement generations from consuming
+an offered row's exemption, and reject incomplete transfers even when schema
+conflict handling silently ignores an update. Failure rolls back the entire
+acceptance, including reader-policy migrations.
+
+Authorization inventories for lifecycle triggers, virtual write protection
+and shadow-table access are read from the current catalog on each use. A
+rollbackable schema cookie is not a unique catalog identity and must not key
+cached authorization results; fixed prepared statements may still be reused.
+
 | Operation | Authority and effect | Refusals (`platform:…`) |
 | --- | --- | --- |
 | `Grant` | The grantor (default: the signer; for a row grant, the row's owner) is the signer or a collective it administers. `columns` require `update`; row grants cannot include `insert`. | `unregistered_table`, `no_such_row`, `row_key_arity`, `unknown_column`, `invalid_grant`, `not_owner` |
@@ -306,8 +322,9 @@ tx_id = :earlier AND outcome = 'accepted'), 'needs_earlier')`.
 
 Local query SQL runs on an immutable materialized revision, is not signed or
 replayed, and returns plain SQLite values. It may use any read-only function,
-including the real clock. There are no read policies: every reader node holds
-every row. `chronolog_actor()` is NULL in local reads.
+including the real clock. There is no SELECT filtering: every reader node holds
+every row's stored public fields and ciphertext. Explicit sealed-data policies
+control access to encrypted plaintext. `chronolog_actor()` is NULL in local reads.
 
 ## 10. Execution manifest
 

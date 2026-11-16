@@ -106,7 +106,7 @@ export class SealedDataActions {
 
   /** Owner/owning-team administration, with explicit generation and version compare-and-swap. */
   async setReaders(input: SetReadersInput, options?: TransactionOptions): Promise<SealedPolicyChange> {
-    const expectedPolicyId = input.expectedPolicyId?.slice()
+    const expectedPolicyId = input.expectedPolicyId === undefined ? undefined : Uint8Array.from(input.expectedPolicyId)
     const step = sealedOp.readerPolicy({
       table: input.table, rowKey: input.row, readers: input.readers, expectedVersion: input.expectedVersion,
       ...(expectedPolicyId === undefined ? {} : { expectedPolicyId }),
@@ -117,7 +117,7 @@ export class SealedDataActions {
 
   /** Read a policy generation, including a closed generation retained for historical ciphertext. */
   async policy(policyId: Uint8Array, options?: QueryOptions): Promise<SealedReaderPolicy | null> {
-    const requestedPolicyId = policyId.slice()
+    const requestedPolicyId = Uint8Array.from(policyId)
     const response = await this.client.query(`${POLICY_SELECT} WHERE p.policy_id = ? ORDER BY r.reader_key`, [requestedPolicyId], options)
     const policy = readPolicy(response)
     if (policy !== null && !equalBytes(policy.policyId, requestedPolicyId)) throw new Error('SEALED_POLICY_ID_MISMATCH')
@@ -155,9 +155,10 @@ export class SealedDataActions {
    */
   async put(policyId: Uint8Array, slot: string, plaintext: Uint8Array, options: SealedPutOptions = {}): Promise<SealedPutChange> {
     if (!(plaintext instanceof Uint8Array) || plaintext.length > MAX_SEALED_PLAINTEXT_BYTES) throw new TypeError('Sealed plaintext must be bytes of at most 1 MiB')
-    const plaintextCopy = plaintext.slice()
+    // Buffer.slice() aliases caller memory; cleanup must only clear our own copy.
+    const plaintextCopy = Uint8Array.from(plaintext)
     try {
-      return await this.#putCopied(policyId.slice(), slot, plaintextCopy, { ...options })
+      return await this.#putCopied(Uint8Array.from(policyId), slot, plaintextCopy, { ...options })
     } finally {
       plaintextCopy.fill(0)
     }
@@ -184,7 +185,7 @@ export class SealedDataActions {
     }
     assertNotAborted(options.signal)
     const context: SealedContext = {
-      groupId: groupId(this.client.groupId), policyId: policy.policyId.slice(),
+      groupId: groupId(this.client.groupId), policyId: Uint8Array.from(policy.policyId),
       policyVersion: policy.version, slot, dataVersion: dataVersion + 1n,
     }
     const envelope = await sealSealedValue({ context, plaintext, recipients: policy.readers })
@@ -199,7 +200,7 @@ export class SealedDataActions {
 
   /** Read ciphertext and externally stored version metadata; this performs no decryption. */
   async get(policyId: Uint8Array, slot: string, options?: QueryOptions): Promise<StoredSealedValue | null> {
-    const requestedPolicyId = policyId.slice()
+    const requestedPolicyId = Uint8Array.from(policyId)
     const response = await this.client.query(`SELECT data_version, policy_version, envelope, updated_tx
       FROM chronolog_sealed_values WHERE policy_id = ? AND slot = ?`, [requestedPolicyId, slot], options)
     if (response.result.truncated) throw new Error('SEALED_QUERY_TRUNCATED')
@@ -292,6 +293,6 @@ function localInput(input: unknown): LocalSqlInput {
     case 'integer': return value.value
     case 'real': return { kind: 'real', value: value.value }
     case 'text': return value.value
-    case 'blob': return value.value.slice()
+    case 'blob': return Uint8Array.from(value.value)
   }
 }

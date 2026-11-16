@@ -206,6 +206,14 @@ export function platformTriggers(shape: TableShape): readonly PlatformTrigger[] 
   // match, and only a matching arm yields 0; anything else is a violation.
   const ownedBy = (ownerSql: string, operation: OwnerOperation): string =>
     `EXISTS (SELECT 1 FROM ${ownerIdsView(operation)} WHERE id = ${ownerSql})`
+  // Keep every captured row generation alive until all acceptance triggers
+  // have finished. An owner-composite key moves from row_key to to_row_key;
+  // guard both identities so a later trigger cannot replace an already moved
+  // row or rebind a pending exemption to a newly inserted row at the same key.
+  const transferring = (key: string): string => `EXISTS (SELECT 1 FROM chronolog_exemptions AS e WHERE e.kind = 'transfer' AND e.tbl = ${tableText}
+    AND (e.row_key = ${key} OR e.to_row_key = ${key}))`
+  const rekeyed = shape.primaryKey.filter((column) => column.toLowerCase() !== OWNER_COLUMN)
+    .map((column) => `NOT chronolog_value_equal(OLD.${quoteIdentifier(column)}, NEW.${quoteIdentifier(column)})`).join(' OR ') || '0'
   const insert = `${header('ins', 'INSERT')}
   ${violation('insert')} WHERE CASE
     WHEN NEW.${owner} = chronolog_actor_id() THEN 0
@@ -213,6 +221,7 @@ export function platformTriggers(shape: TableShape): readonly PlatformTrigger[] 
     WHEN EXISTS (SELECT 1 FROM ${grantsToMeView('insert')} AS g WHERE g.tbl = ${tableText} AND g.grantor = NEW.${owner} AND g.row_key IS NULL) THEN 0
     WHEN EXISTS (SELECT 1 FROM chronolog_exemptions AS e WHERE e.kind = 'seed' AND e.tbl = ${tableText}) THEN 0
     ELSE 1 END;
+  ${violation('insert')} WHERE ${transferring(newKey)};
 END`
   const update = `${header('upd', 'UPDATE')}
   ${violation('update')} WHERE CASE
@@ -222,8 +231,9 @@ END`
       AND (g.row_key IS NULL OR g.row_key = ${oldKey})
       AND (g.columns IS NULL OR NOT ${changed})) THEN 0
     WHEN EXISTS (SELECT 1 FROM chronolog_exemptions AS e WHERE e.kind = 'transfer' AND e.tbl = ${tableText}
-      AND e.from_owner = OLD.${owner} AND e.to_owner = NEW.${owner} AND (e.row_key IS NULL OR e.row_key = ${oldKey})) THEN 0
+      AND e.from_owner = OLD.${owner} AND e.to_owner = NEW.${owner} AND e.row_key = ${oldKey}) THEN 0
     ELSE 1 END;
+  ${violation('update')} WHERE (${rekeyed}) AND (${transferring(oldKey)} OR ${transferring(newKey)});
 END`
   const remove = `${header('del', 'DELETE')}
   ${violation('delete')} WHERE CASE
@@ -232,6 +242,7 @@ END`
     WHEN EXISTS (SELECT 1 FROM ${grantsToMeView('delete')} AS g WHERE g.tbl = ${tableText} AND g.grantor = OLD.${owner}
       AND (g.row_key IS NULL OR g.row_key = ${oldKey})) THEN 0
     ELSE 1 END;
+  ${violation('delete')} WHERE ${transferring(oldKey)};
 END`
   // Invalidate before a DELETE/key/owner change can expose a replacement row
   // to application AFTER triggers. Only these exact generated callers have

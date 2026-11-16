@@ -53,6 +53,35 @@ function fixture(publicKey: Uint8Array) {
 }
 
 describe('sealed client helpers', () => {
+  it('preserves caller-owned Buffer plaintext when policy preflight rejects', async () => {
+    const { actions, state } = fixture(bytes(8))
+    state.confidence = 'provisional'
+    const plaintext = Buffer.from('the caller still owns these bytes')
+    const expected = Uint8Array.from(plaintext)
+    await expect(actions.put(bytes(2), 'body', plaintext)).rejects.toBeInstanceOf(SealedPolicyNotFinalError)
+    expect(Uint8Array.from(plaintext)).toEqual(expected)
+  })
+
+  it('copies Buffer plaintext and policy ids before awaiting preflight without clearing caller memory', async () => {
+    const reader = await generateX25519KeyPair()
+    const { actions, client } = fixture(reader.publicKeyBytes)
+    const plaintext = Buffer.from('the selected view only')
+    const expected = Uint8Array.from(plaintext)
+    const policyId = Buffer.from(bytes(2))
+    const pending = actions.put(policyId, 'body', plaintext)
+    // put() has started its asynchronous policy query. Later caller changes
+    // must not change the chosen policy or the bytes that will be encrypted.
+    plaintext.fill(0xa5)
+    policyId.fill(0xa6)
+    const change = await pending
+    const step = client.transaction.mock.calls[0]![0][0] as SealedPlatformOp
+    if (step.op !== 'sealed_put') throw new Error('Expected sealed put')
+    expect(step.envelope.ciphertext.byteLength).toBe(expected.byteLength + 16)
+    expect(await sealedCrypto.openSealedValue({ envelope: step.envelope, expectedContext: change.context, readerId: bytes(4), recipientPrivateKey: reader.privateKey })).toEqual(expected)
+    expect(plaintext.every((byte) => byte === 0xa5)).toBe(true)
+    expect(policyId.every((byte) => byte === 0xa6)).toBe(true)
+  })
+
   it('submits explicit key registration and versioned reader policy changes', async () => {
     const reader = await generateX25519KeyPair()
     const { actions, client, handle } = fixture(reader.publicKeyBytes)

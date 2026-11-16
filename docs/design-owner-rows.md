@@ -215,7 +215,7 @@ chronolog_collective_members (collective_id, member_key, role: admin|member, sta
 chronolog_grants             (grant_id, tbl, grantor, grantee_key, row_key NULL, op_insert, op_update, op_delete, columns NULL, created_tx, revoked_tx)
 chronolog_transfers          (offer_id, tbl NULL, row_key NULL, from_owner, to_owner, carry, scope_digest, state: open|accepted|cancelled, created_tx, closed_tx)
 chronolog_transfer_scope     (offer_id, tbl, row_key) -- exact rows covered by each offer
-chronolog_exemptions         (kind, tbl, row_key, from_owner, to_owner)   -- empty between steps
+chronolog_exemptions         (kind, tbl, row_key, to_row_key, from_owner, to_owner)   -- empty between steps
 ```
 
 A collective's governance names the least role (`member` or `admin`) for
@@ -373,8 +373,13 @@ run with an elevated actor:
 - The platform trigger admits the owner-column change under an exemption
   (a row of `chronolog_exemptions`, written and deleted inside the operation)
   keyed to the offer's row, its old and new owner, and each same-owner
-  dependent found by walking owner-composite FKs. A bulk transfer's
-  exemption covers every row of the old owner, per table.
+  dependent found by walking owner-composite FKs. A bulk transfer has one
+  exemption for each captured row. Each exemption also records the destination
+  row key: DELETE, INSERT or a non-owner rekey into or out of either identity
+  rejects acceptance, preventing application triggers from substituting a
+  replacement generation. Before clearing the exemptions, the platform verifies
+  every destination owner and the absence of any distinct source key. Silent
+  conflict handling must not turn an incomplete transfer into an accepted one.
 - Every other write, including writes by app triggers, is checked as the
   signer.
 - Platform statements run under a `platform` authorizer mode that may write
@@ -528,7 +533,11 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
 - `scope: all` snapshots every row the old key owns *when offered*, across all
   registered tables. Acquiring another row cancels an open bulk offer.
   Acceptance moves only the captured rows, parent tables first; rows an app
-  trigger inserts during acceptance are never silently added. Live whole-table
+  trigger inserts during acceptance are never silently added. Captured rows
+  remain protected against deletion and non-owner rekeying until all acceptance
+  triggers finish; their source and destination keys also reject inserts or
+  rekeying another row into them. Acceptance requires all captured rows to have
+  completed the owner transition, including those moved by cascades. Live whole-table
   grants the old key **gave** are re-pointed to the new key; row grants end on
   transfer. This is the key-change path (§2).
   - Grants the old key **received** do not move: the recipient of a bulk

@@ -87,8 +87,11 @@ export const PLATFORM_TABLES_SQL: readonly string[] = [
     kind TEXT NOT NULL CHECK (kind IN ('transfer', 'seed')),
     tbl TEXT NOT NULL,
     row_key TEXT,
+    to_row_key TEXT,
     from_owner INTEGER,
-    to_owner INTEGER
+    to_owner INTEGER,
+    CHECK (kind = 'seed' OR (row_key IS NOT NULL AND to_row_key IS NOT NULL
+      AND from_owner IS NOT NULL AND to_owner IS NOT NULL))
   ) STRICT`,
   ...SEALED_TABLES_SQL,
 ]

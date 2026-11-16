@@ -8,6 +8,43 @@ const bytes = (seed: number): Uint8Array => new Uint8Array(32).fill(seed)
 const context = (): SealedContext => ({ groupId: bytes(1), policyId: bytes(2), policyVersion: 1n, slot: 'body', dataVersion: 1n })
 
 describe('sealed row values', () => {
+  it('encrypts exactly a pooled Buffer subview and does not zero caller-owned memory', async () => {
+    const reader = await generateX25519KeyPair()
+    const backing = Buffer.allocUnsafe(128).fill(0xa5)
+    const plaintext = backing.subarray(37, 48)
+    plaintext.set(utf8('private row'))
+    const original = Uint8Array.from(backing)
+    const expected = Uint8Array.from(plaintext)
+    expect(plaintext.byteOffset).toBeGreaterThan(0)
+    expect(plaintext.buffer.byteLength).toBeGreaterThan(plaintext.byteLength)
+    const expectedContext = context()
+    const envelope = await sealSealedValue({ context: expectedContext, plaintext, recipients: [{ readerId: bytes(4), publicKey: reader.publicKeyBytes }] })
+    // Check lengths first: a regression must not print unrelated pooled bytes.
+    expect(envelope.ciphertext.byteLength).toBe(expected.byteLength + 16)
+    const opened = await openSealedValue({ envelope, expectedContext, readerId: bytes(4), recipientPrivateKey: reader.privateKey })
+    expect(opened.byteLength).toBe(expected.byteLength)
+    expect(opened).toEqual(expected)
+    expect(Uint8Array.from(backing)).toEqual(original)
+  })
+
+  it('snapshots Buffer plaintext, recipient ids and public keys before asynchronous sealing', async () => {
+    const reader = await generateX25519KeyPair()
+    const plaintext = Buffer.from('immutable buffer input')
+    const expected = Uint8Array.from(plaintext)
+    const recipient = { readerId: Buffer.from(bytes(4)), publicKey: Buffer.from(reader.publicKeyBytes) }
+    const expectedContext = context()
+    const pending = sealSealedValue({ context: expectedContext, plaintext, recipients: [recipient] })
+    plaintext.fill(0xa5)
+    recipient.readerId.fill(0xa6)
+    recipient.publicKey.fill(0xa7)
+    const envelope = await pending
+    expect(envelope.wraps[0]!.readerId).toEqual(bytes(4))
+    expect(envelope.wraps[0]!.publicKey).toEqual(reader.publicKeyBytes)
+    expect(envelope.ciphertext.byteLength).toBe(expected.byteLength + 16)
+    expect(await openSealedValue({ envelope, expectedContext, readerId: bytes(4), recipientPrivateKey: reader.privateKey })).toEqual(expected)
+    expect(plaintext.every((byte) => byte === 0xa5)).toBe(true)
+  })
+
   it('opens only for explicit recipients, encrypts afresh, and never implicitly includes an owner', async () => {
     const [alice, bob, owner] = await Promise.all([generateX25519KeyPair(), generateX25519KeyPair(), generateX25519KeyPair()])
     const plaintext = utf8('secret notes for Alice and Bob')

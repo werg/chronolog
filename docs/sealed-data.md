@@ -94,6 +94,11 @@ if (value !== null) {
 
 `put()` returns `{ handle, context }`. The context identifies the exact group,
 policy generation, policy version, column and data version that were encrypted.
+`put()` and `sealSealedValue()` take independent snapshots of their byte inputs
+before asynchronous work. Node `Buffer` values and subviews are supported:
+encryption consumes only the supplied view, and temporary plaintext cleanup
+does not erase the caller's buffer.
+
 An application that requires this exact version can retain that context and
 pass it as the fourth argument to `decrypt(value, privateKey, readerId,
 expectedContext)`. An ordinary latest-value read uses the independently stored

@@ -2,6 +2,7 @@ import {
   GROUP_COLLECTIVE_ID,
   platformObjectId,
   platformOp,
+  sealedOp,
   sqlStatement,
   sqlValue,
   type ProgramStep,
@@ -543,6 +544,166 @@ describe('owner-controlled rows: transfer', () => {
     `)).toEqual([[hex(BOB), '1'], [hex(CAROL), '3']].sort((left, right) => String(left[0]).localeCompare(String(right[0]))))
     await book.expectOutcome('policy:notes:update', ALICE, "UPDATE notes SET body = 'old key' WHERE id = 1")
     expect(rows(book.materializer, 'SELECT hex(grantor) FROM chronolog_grants')).toEqual([[hex(CAROL)]])
+  })
+})
+
+describe('owner-controlled rows: transfer acceptance row generations', () => {
+  it.each(['DELETE then INSERT', 'REPLACE'])('rejects same-key, same-content recreation of a later bulk-transfer row with %s', async (replacement) => {
+    const book = await notesLedger()
+    await book.expectOutcome('accepted', ROOT_KEY, 'CREATE TABLE tags (id INTEGER PRIMARY KEY, body TEXT)')
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO tags (id, body) VALUES (1, 'offered')",
+      platformOp.grant({ table: 'tags', grantee: BOB, operations: ['insert', 'delete'] }))
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER replace_during_move AFTER UPDATE OF chronolog_owner ON notes
+      WHEN OLD.id = 1 AND OLD.chronolog_owner IS NOT NEW.chronolog_owner BEGIN
+        ${replacement === 'REPLACE' ? 'REPLACE' : 'DELETE FROM tags WHERE id = 1; INSERT'}
+          INTO tags (id, body, chronolog_owner) VALUES (1, 'offered', OLD.chronolog_owner);
+      END`)
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    const offerId = await platformObjectId(offer, 0)
+    await book.expectOutcome(replacement === 'REPLACE' ? 'policy:tags:insert' : 'policy:tags:delete', BOB, platformOp.acceptTransfer(offerId))
+    expect(rows(book.materializer, 'SELECT body, hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM tags'))
+      .toEqual([['offered', hex(ALICE)]])
+    expect(rows(book.materializer, 'SELECT state FROM chronolog_transfers')).toEqual([['open']])
+    // A rejected acceptance rolls back every row and guard; removing the app
+    // trigger permits a fresh acceptance of the unchanged original snapshot.
+    await book.expectOutcome('accepted', ROOT_KEY, 'DROP TRIGGER replace_during_move')
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(offerId))
+    expect(rows(book.materializer, 'SELECT count(*) FROM chronolog_exemptions')).toEqual([['0']])
+  })
+
+  it('rejects a carried dependent replaced by a BEFORE owner-change trigger', async () => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY,
+      'CREATE TABLE parents (id INTEGER PRIMARY KEY, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), UNIQUE(id, chronolog_owner))',
+      'CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, body TEXT, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), FOREIGN KEY(parent_id, chronolog_owner) REFERENCES parents(id, chronolog_owner) ON UPDATE CASCADE)')
+    await book.expectOutcome('accepted', ALICE, 'INSERT INTO parents(id) VALUES(1)', "INSERT INTO children(id,parent_id,body) VALUES(1,1,'offered')",
+      platformOp.grant({ table: 'children', grantee: BOB, operations: ['insert', 'delete'] }))
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER replace_child BEFORE UPDATE OF chronolog_owner ON parents
+      WHEN OLD.chronolog_owner IS NOT NEW.chronolog_owner BEGIN
+        DELETE FROM children WHERE id = 1;
+        INSERT INTO children (id, parent_id, body, chronolog_owner) VALUES (1, 1, 'offered', OLD.chronolog_owner);
+      END`)
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'parents', rowKey: [1n], toOwner: BOB, carry: true }))
+    await book.expectOutcome('policy:children:delete', BOB, platformOp.acceptTransfer(await platformObjectId(offer, 0)))
+    expect(rows(book.materializer, 'SELECT hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM children'))
+      .toEqual([[hex(ALICE)]])
+  })
+
+  it.each([
+    ['61006F6E65', 'chronolog_owner'],
+    ['80FF00C3', 'CHRONOLOG_OWNER'],
+  ])('protects an owner-composite destination with raw TEXT %s, a REAL key and a %s PK reference', async (idHex, ownerColumn) => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY,
+      `CREATE TABLE entries (id TEXT NOT NULL, stamp REAL NOT NULL, body TEXT, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), PRIMARY KEY(id, stamp, ${ownerColumn})) WITHOUT ROWID`)
+    await book.expectOutcome('accepted', ALICE, `INSERT INTO entries(id,stamp,body) VALUES(CAST(X'${idHex}' AS TEXT),1.0000000000000002,'offered')`)
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER replace_received AFTER UPDATE OF chronolog_owner ON entries
+      WHEN OLD.chronolog_owner IS NOT NEW.chronolog_owner BEGIN
+        DELETE FROM entries WHERE id = NEW.id AND stamp = NEW.stamp AND chronolog_owner = NEW.chronolog_owner;
+        INSERT INTO entries (id, stamp, body, chronolog_owner) VALUES (NEW.id, NEW.stamp, NEW.body, NEW.chronolog_owner);
+      END`)
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    const offerId = await platformObjectId(offer, 0)
+    await book.expectOutcome('policy:entries:delete', BOB, platformOp.acceptTransfer(offerId))
+    await book.expectOutcome('accepted', ROOT_KEY, 'DROP TRIGGER replace_received')
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(offerId))
+    expect(rows(book.materializer, 'SELECT hex(id), typeof(stamp), chronolog_value_equal(stamp, 1.0000000000000002), hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM entries'))
+      .toEqual([[idHex, 'real', '1', hex(BOB)]])
+  })
+
+  it('rejects re-keying a captured row away and back during bulk acceptance', async () => {
+    const book = await notesLedger()
+    await book.expectOutcome('accepted', ROOT_KEY, 'CREATE TABLE tags (id INTEGER PRIMARY KEY, body TEXT)')
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO tags(id,body) VALUES(1,'offered')",
+      platformOp.grant({ table: 'tags', grantee: BOB, operations: ['update'] }))
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER rekey_during_move AFTER UPDATE OF chronolog_owner ON notes
+      WHEN OLD.id = 1 AND OLD.chronolog_owner IS NOT NEW.chronolog_owner BEGIN
+        UPDATE tags SET id = 99 WHERE id = 1;
+        UPDATE tags SET id = 1 WHERE id = 99;
+      END`)
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    await book.expectOutcome('policy:tags:update', BOB, platformOp.acceptTransfer(await platformObjectId(offer, 0)))
+    expect(rows(book.materializer, 'SELECT id, body FROM tags')).toEqual([['1', 'offered']])
+  })
+
+  it.each([
+    ['owner-composite primary key', 'PRIMARY KEY(id, chronolog_owner) ON CONFLICT IGNORE', 1],
+    ['non-key unique owner', 'PRIMARY KEY(id), UNIQUE(chronolog_owner) ON CONFLICT IGNORE', 2],
+  ] as const)('rejects a bulk owner change silently skipped by an existing %s conflict', async (name, constraints, bobId) => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY,
+      `CREATE TABLE entries (id INTEGER NOT NULL, body TEXT, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), ${constraints}) WITHOUT ROWID`)
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO entries(id,body) VALUES(1,'offered')")
+    await book.expectOutcome('accepted', BOB, `INSERT INTO entries(id,body) VALUES(${bobId},'existing')`)
+    const ownerId = BigInt(String(rows(book.materializer, "SELECT chronolog_owner FROM entries WHERE body = 'offered'")[0]![0]))
+    await book.expectOutcome('accepted', ALICE, sealedOp.readerPolicy({ table: 'entries',
+      rowKey: name === 'owner-composite primary key' ? [1n, ownerId] : [1n], expectedVersion: 0n, readers: [] }))
+    const policyBefore = rows(book.materializer, 'SELECT hex(policy_id), row_key, version, closed_tx FROM chronolog_reader_policies')
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    const offerId = await platformObjectId(offer, 0)
+    await book.expectOutcome('platform:offer_stale', BOB, platformOp.acceptTransfer(offerId))
+    expect(rows(book.materializer, 'SELECT body, hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM entries ORDER BY body'))
+      .toEqual([['existing', hex(BOB)], ['offered', hex(ALICE)]])
+    expect(rows(book.materializer, 'SELECT state FROM chronolog_transfers')).toEqual([['open']])
+    expect(rows(book.materializer, 'SELECT hex(policy_id), row_key, version, closed_tx FROM chronolog_reader_policies')).toEqual(policyBefore)
+    // A rolled-back conflict leaves the original snapshot available. Removing
+    // the recipient's unrelated row makes the same offer transferable.
+    await book.expectOutcome('accepted', BOB, "DELETE FROM entries WHERE body = 'existing'")
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(offerId))
+    expect(rows(book.materializer, 'SELECT body, hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM entries'))
+      .toEqual([['offered', hex(BOB)]])
+  })
+
+  it.each(['insert', 'update'] as const)('rejects a BEFORE-trigger %s into a reserved destination', async (operation) => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY,
+      'CREATE TABLE entries (id INTEGER NOT NULL, body TEXT, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), PRIMARY KEY(id, chronolog_owner) ON CONFLICT IGNORE) WITHOUT ROWID')
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO entries(id,body) VALUES(1,'offered')")
+    if (operation === 'update') await book.expectOutcome('accepted', BOB, "INSERT INTO entries(id,body) VALUES(2,'existing')")
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER fill_destination BEFORE UPDATE OF chronolog_owner ON entries
+      WHEN OLD.chronolog_owner IS NOT NEW.chronolog_owner BEGIN
+        ${operation === 'insert'
+          ? 'INSERT INTO entries(id,body,chronolog_owner) VALUES(OLD.id,OLD.body,NEW.chronolog_owner);'
+          : 'UPDATE entries SET id = OLD.id WHERE id = 2 AND chronolog_owner = NEW.chronolog_owner;'}
+      END`)
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    await book.expectOutcome(`policy:entries:${operation}`, BOB, platformOp.acceptTransfer(await platformObjectId(offer, 0)))
+    expect(rows(book.materializer, 'SELECT state FROM chronolog_transfers')).toEqual([['open']])
+    expect(rows(book.materializer, 'SELECT id, body FROM entries ORDER BY id'))
+      .toEqual(operation === 'insert' ? [['1', 'offered']] : [['1', 'offered'], ['2', 'existing']])
+  })
+
+  it.each(['insert', 'update'] as const)('rejects an AFTER-trigger %s into the vacated source identity', async (operation) => {
+    const book = await ledger()
+    await book.expectOutcome('accepted', ROOT_KEY,
+      'CREATE TABLE entries (id INTEGER NOT NULL, body TEXT, chronolog_owner INTEGER NOT NULL DEFAULT (chronolog_actor_id()), PRIMARY KEY(id, chronolog_owner)) WITHOUT ROWID')
+    await book.expectOutcome('accepted', ALICE, "INSERT INTO entries(id,body) VALUES(1,'offered'),(2,'unoffered')",
+      platformOp.grant({ table: 'entries', grantee: BOB, operations: [operation] }))
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER fill_source AFTER UPDATE OF chronolog_owner ON entries
+      WHEN OLD.chronolog_owner IS NOT NEW.chronolog_owner BEGIN
+        ${operation === 'insert'
+          ? 'INSERT INTO entries(id,body,chronolog_owner) VALUES(OLD.id,OLD.body,OLD.chronolog_owner);'
+          : 'UPDATE entries SET id = OLD.id WHERE id = 2 AND chronolog_owner = OLD.chronolog_owner;'}
+      END`)
+    const ownerId = BigInt(String(rows(book.materializer, 'SELECT chronolog_owner FROM entries WHERE id = 1')[0]![0]))
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferRow({ table: 'entries', rowKey: [1n, ownerId], toOwner: BOB }))
+    await book.expectOutcome(`policy:entries:${operation}`, BOB, platformOp.acceptTransfer(await platformObjectId(offer, 0)))
+    expect(rows(book.materializer, 'SELECT id, body, hex((SELECT key FROM chronolog_principals WHERE id = chronolog_owner)) FROM entries ORDER BY id'))
+      .toEqual([['1', 'offered', hex(ALICE)], ['2', 'unoffered', hex(ALICE)]])
+  })
+
+  it('preserves unrelated application-trigger INSERT OR IGNORE behavior during acceptance', async () => {
+    const book = await notesLedger()
+    await book.expectOutcome('accepted', ROOT_KEY, 'CREATE TABLE audit (id INTEGER PRIMARY KEY, body TEXT)')
+    await book.expectOutcome('accepted', BOB, "INSERT INTO audit(id,body) VALUES(1,'existing')")
+    await book.expectOutcome('accepted', ROOT_KEY, `CREATE TRIGGER record_move AFTER UPDATE OF chronolog_owner ON notes BEGIN
+      INSERT OR IGNORE INTO audit(id,body) VALUES(1,'duplicate');
+    END`)
+    const offer = await book.expectOutcome('accepted', ALICE, platformOp.transferAll({ toOwner: BOB }))
+    await book.expectOutcome('accepted', BOB, platformOp.acceptTransfer(await platformObjectId(offer, 0)))
+    expect(rows(book.materializer, 'SELECT body FROM audit')).toEqual([['existing']])
+    expect(rows(book.materializer, 'SELECT count(*) FROM notes WHERE chronolog_owner = (SELECT id FROM chronolog_principals WHERE key = ?)', [{ kind: 'blob', value: BOB }]))
+      .toEqual([['3']])
   })
 })
 

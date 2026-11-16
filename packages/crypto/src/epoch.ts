@@ -60,7 +60,8 @@ export interface EncryptedEpochPayload {
 }
 
 function source(value: Uint8Array): ArrayBuffer {
-  return value.slice().buffer
+  // A Node Buffer may be a small view into a larger shared allocation.
+  return Uint8Array.from(value).buffer
 }
 
 function wrapContext(groupId: Uint8Array, epoch: bigint, previous: Uint8Array | null, recipientId: Uint8Array): Uint8Array {
@@ -148,7 +149,9 @@ export async function createEpochManifest(input: {
   readonly signerPrivateKey: CryptoKey
   readonly contentKey?: Uint8Array
 }): Promise<CreatedEpoch> {
-  const contentKey = input.contentKey?.slice() ?? globalThis.crypto.getRandomValues(new Uint8Array(32))
+  const contentKey = input.contentKey === undefined
+    ? globalThis.crypto.getRandomValues(new Uint8Array(32))
+    : Uint8Array.from(input.contentKey)
   protocolInvariant(contentKey.length === 32, 'SCHEMA_INVALID', 'Epoch content key must contain 32 bytes')
   const recipients = [...input.recipients].sort((a, b) => compareBytes(a.recipientId, b.recipientId))
   protocolInvariant(recipients.length > 0, 'SCHEMA_INVALID', 'Epoch requires at least one reader recipient')
