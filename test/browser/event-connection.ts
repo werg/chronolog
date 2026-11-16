@@ -34,7 +34,7 @@ export async function openHttpPeerConnection(base: string, token: string): Promi
 }
 
 export async function connectGovernedBrowserPeer(options: {
-  readonly bootstrap: BrowserEventBootstrap
+  readonly bootstrap: Pick<BrowserEventBootstrap, 'peerUrl' | 'peerToken' | 'nativeIdentity'>
   readonly identity: EnrollmentIdentity
   readonly transport: PortableFeedTransport
   readonly activeMembership: () => CapabilitySnapshot
