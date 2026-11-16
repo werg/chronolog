@@ -156,11 +156,7 @@ export class NodeRpcService implements ChronologRpcService {
 
   async *streamStatus(request: StreamStatusRequest, context: RpcCallContext): AsyncIterable<NodeStatus> {
     this.#assertGroupOptional(request.groupId)
-    yield await this.getStatus(request, context)
-    const after = BigInt(request.resumeAfterEventSetRevision ?? this.#node.revision)
-    for await (const _event of this.#node.events(after, context.signal)) {
-      yield await this.getStatus(request, context)
-    }
+    yield* this.#snapshots(request.resumeAfterEventSetRevision, context.signal, () => this.getStatus(request, context))
   }
 
   async localSql(request: LocalSqlRequest, _context: RpcCallContext): Promise<LocalSqlResponse> {
@@ -306,10 +302,8 @@ export class NodeRpcService implements ChronologRpcService {
   }
 
   async *streamOutcome(request: StreamOutcomeRequest, context: RpcCallContext): AsyncIterable<TransactionOutcome> {
-    const after = BigInt(request.resumeAfterEventSetRevision ?? this.#node.revision)
-    const events = this.#node.events(after, context.signal)
-    yield await this.getOutcome(request, context)
-    for await (const _event of events) yield await this.getOutcome(request, context)
+    this.#assertGroup(request.groupId)
+    yield* this.#snapshots(request.resumeAfterEventSetRevision, context.signal, () => this.getOutcome(request, context))
   }
 
   async getSettlementEvidence(request: GetSettlementEvidenceRequest, context: RpcCallContext): Promise<SettlementEvidence> {
@@ -336,9 +330,8 @@ export class NodeRpcService implements ChronologRpcService {
   }
 
   async *streamSettlementEvidence(request: StreamSettlementEvidenceRequest, context: RpcCallContext): AsyncIterable<SettlementEvidence> {
-    yield await this.getSettlementEvidence(request, context)
-    const after = BigInt(request.resumeAfterEventSetRevision ?? this.#node.revision)
-    for await (const _event of this.#node.events(after, context.signal)) yield await this.getSettlementEvidence(request, context)
+    this.#assertGroup(request.groupId)
+    yield* this.#snapshots(request.resumeAfterEventSetRevision, context.signal, () => this.getSettlementEvidence(request, context))
   }
 
   async getValidatorWatermark(request: GetValidatorWatermarkRequest, _context: RpcCallContext): Promise<ValidatorWatermark> {
@@ -387,9 +380,25 @@ export class NodeRpcService implements ChronologRpcService {
   }
 
   async *streamReplicationStatus(request: StreamReplicationStatusRequest, context: RpcCallContext): AsyncIterable<ReplicationStatus> {
-    yield await this.getReplicationStatus(request, context)
-    const after = BigInt(request.resumeAfterEventSetRevision ?? this.#node.revision)
-    for await (const _event of this.#node.events(after, context.signal)) yield await this.getReplicationStatus(request, context)
+    this.#assertGroup(request.groupId)
+    yield* this.#snapshots(request.resumeAfterEventSetRevision, context.signal, () => this.getReplicationStatus(request, context))
+  }
+
+  async *#snapshots<T>(resume: string | undefined, signal: AbortSignal | undefined, read: () => Promise<T>): AsyncIterable<T> {
+    if (resume !== undefined) parseRevision(resume)
+    const controller = new AbortController()
+    const subscriptionSignal = signal === undefined ? controller.signal : AbortSignal.any([controller.signal, signal])
+    // These streams send the complete current state first. A cursor from a
+    // previous process is only a resume hint: the node's local event counter
+    // can restart below it. Subscribe at the current barrier before reading so
+    // neither a restart nor an update during the initial read hides finality.
+    const events = this.#node.events(this.#node.revision, subscriptionSignal)
+    try {
+      yield await read()
+      for await (const _event of events) yield await read()
+    } finally {
+      controller.abort()
+    }
   }
 
   #revision(materializedRevision: bigint, orderLength: number, view: SqlView = 'local'): RevisionMetadata {

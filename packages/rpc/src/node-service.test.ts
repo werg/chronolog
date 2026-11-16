@@ -2,6 +2,7 @@ import { bytesToBase64Url } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 
 import { InProcessRpcTransport } from './in-process.js'
+import { AsyncQueue } from './async-queue.js'
 import { NodeRpcService } from './node-service.js'
 import type { ChronologRpcNodeService, EnrollmentRpcService } from './service-contract.js'
 
@@ -23,6 +24,36 @@ function readerNode(): ChronologRpcNodeService {
 }
 
 describe('NodeRpcService policy views and enrollment', () => {
+  it('delivers new finality after reconnecting with a cursor from an older process', async () => {
+    let revision = 1n
+    let finalized = false
+    let released = false
+    const events = new AsyncQueue<bigint>()
+    const node: ChronologRpcNodeService = {
+      ...readerNode(),
+      get revision() { return revision },
+      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, authorFeedSequence: 1n, txId: groupId } }),
+      outcome: () => ({ outcome: 'accepted', rejectionCode: null, failingStatementIndex: null }),
+      isFinal: () => finalized,
+      outcomeChangedByReplay: () => false,
+      events(after = 0n, signal) {
+        signal?.addEventListener('abort', () => { released = true; events.close() }, { once: true })
+        return { async *[Symbol.asyncIterator]() { for await (const event of events) if (event > after) yield event } }
+      },
+    }
+    const service = new NodeRpcService({ node })
+    const stream = service.streamOutcome({ groupId: group, requestId: 'watch', transactionId: 'tx-1', resumeAfterEventSetRevision: '1000' },
+      { method: 'transaction.streamOutcome', signal: AbortSignal.timeout(1_000) })[Symbol.asyncIterator]()
+    expect((await stream.next()).value).toMatchObject({ final: false, eventSetRevision: '1' })
+    const next = stream.next()
+    revision = 2n
+    finalized = true
+    events.push(revision)
+    expect((await next).value).toMatchObject({ final: true, eventSetRevision: '2' })
+    await stream.return?.()
+    expect(released).toBe(true)
+  })
+
   it('does not label a stale speculative result final across an asynchronous status refresh', async () => {
     let finalized = false
     const node = readerNode()

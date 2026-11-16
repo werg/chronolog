@@ -12,7 +12,6 @@ export type RpcErrorCode =
   | 'revision_unavailable'
   | 'revision_not_retained'
   | 'result_not_available'
-  | 'draft_expired'
   | 'node_starting'
   | 'node_replaying'
   | 'protocol_rejected'
