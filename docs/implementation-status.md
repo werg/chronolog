@@ -187,7 +187,9 @@ bridge, two-layout application and packaged Cloudflare thin-administrator gates
 exercise their actual Worker/OPFS paths. The required workflow builds artifacts
 and fails if the WASM artifact is absent. Historical complete passes and their
 exact revisions are recorded in the [application-log evidence](plans/application-log.md);
-complete CI for the newly merged runtime and final package pins remains pending.
+complete quality, cross-platform, chaos and browser qualification passed for
+authored head `1b5b8f26` with the final package pins. The evidence map records the
+actual tested PR merge, raw reports and subsequent documentation-only checkpoint.
 
 The combined public-adapter gate enrolls a real browser peer into a native
 issuer's coordinated group, including encrypted pre-enrollment history. The two

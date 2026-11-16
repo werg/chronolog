@@ -43,9 +43,34 @@ The integration pin checkpoint `764a57d1` consumes public Tendriller
 and contrib `8449017159b2657a2b0d9bde398322dac78ee2d1`. The eighteen public-adapter
 tests, both independent bundle builds and the exact built scope recipe passed
 with those inputs; the application build contains 63 explicit assets.
-Complete Quality, cross-platform replay, chaos and browser/pilot CI for the final
-runtime pins is still pending; current run links and final results belong on
-[PR #1](https://github.com/werg/chronolog-db/pull/1). Public-network, recovery and
+Complete qualification passed for authored head
+`1b5b8f26c0e36c7cff3534d4ae465eaa57154c9c` as clean PR merge
+`3780499f18435a8eddfa3dcecf511ca908e57087`. The subsequent evidence checkpoint
+only records these results; it does not change runtime or package inputs.
+
+| Required gate | Observed result |
+| --- | --- |
+| [Quality and tests](https://github.com/werg/chronolog-db/actions/runs/43957113773) | 772 tests passed; six WASM tests skipped in this job and passed in the browser gate. All nine native SSB tests, including durable fork replay, passed. Lint, types, build, documentation links and coverage passed; statements/lines 79.63%, branches 82.44%, functions 85.06%. |
+| Linux/macOS replay comparison in that workflow | Linux x64 and macOS arm64 produced identical execution, replay and portable semantic digests. Portable semantic digest: `224e7ee7691e7cbe579478171c9493c8d543870398f4eedfe8cd7611f579150e`. |
+| [Browser, application and thin administrator](https://github.com/werg/chronolog-db/actions/runs/43957113710) | Six native/WASM comparisons, seven SQL-free checks, eight SQL/OPFS checks and five enrolled public-bridge checks passed. The application report has nine checks: build, native captured-scope qualification and seven browser/runtime assertions. Thin membership passed seven runtime assertions plus its independent build/import audit. |
+| [Container chaos](https://github.com/werg/chronolog-db/actions/runs/43957113669) | Three nodes and six controlled SSB links healed and converged; all fourteen invariants passed. All 79 published workload operations resolved. Three other submissions failed locally during the deliberate restart, out of 82 attempted publications. |
+
+Both application reports record no page errors. The task/chat pilot dispatched
+one effect with zero host application writes. Its native scope result retained
+three effective events at generation 1, rejected the stale proposal with
+`assert:scope_generation_changed`, and added zero records for the accepted exact
+retry. The thin administrator received zero application-envelope bytes across
+21 signed native requests. Four large application envelopes totaled 789,092
+bytes while their candidate descriptors totaled 576 bytes; descriptor and key-wrap
+traffic still grows with operation and recipient counts.
+
+[Artifact 14273111973](https://github.com/werg/chronolog-db/actions/runs/43957113710/artifacts/14273111973)
+has SHA-256 `0be4f8fdbad4bfb47b0db0cc8c35528f62c27cdc1ebe178807ca476c95ca7d48`.
+The [durable contrib review note](https://github.com/werg/tendriller-contrib/blob/feat/chronolog-application-log/cookbooks/run-a-peer-application/notes/qualification-review-43957113710.md)
+preserves the exact new reports, package hashes, scope diagnostics and traffic
+limits separately from the historical pairing below. These are actual local
+workerd/native/Chromium scenarios with synthetic authenticated accounts, not a
+deployed Cloudflare or public-network measurement. Public-network, recovery and
 deployed application gates remain in the contrib issues below.
 
 ## Delivery phases

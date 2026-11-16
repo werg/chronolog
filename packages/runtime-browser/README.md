@@ -59,11 +59,13 @@ termination; a private validator cutoff surviving termination without a
 reconstructing feed record; and recovery after candidate SQL commit. It writes
 `artifacts/browser-qualification/report.json`.
 
-The six native/WASM tests passed locally after the upstream merge. Historical
-complete browser results remain tied to the source and package hashes in the
-[application-log evidence](../../docs/plans/application-log.md). Complete CI for
-the latest merged runtime and final package pins is pending; a local engine test
-or bundle build does not establish that browser result.
+The six native/WASM tests passed locally and in the complete required
+[browser qualification](https://github.com/werg/chronolog-db/actions/runs/43957113710)
+for authored head `1b5b8f26`, tested as clean PR merge `3780499f`. That run also
+passed all eight SQL/OPFS checks, the SQL-free and enrolled public-peer gates,
+both application layouts, and the real workerd thin-administrator scenario.
+The [application-log evidence](../../docs/plans/application-log.md) records exact
+source/package hashes and raw reports; historical runs retain their own inputs.
 
 The [SQL-free browser gate](../../tools/test-browser-events.ts) serves no engine
 assets and no cross-origin isolation headers. It checks the emitted browser
