@@ -5,6 +5,12 @@ daemon. Stop `chronologd` cleanly before running them; a live daemon causes a
 fail-closed `DATA_DIRECTORY_LOCKED` error. A stale crash lock is quarantined,
 not silently reused.
 
+These are application projection snapshots, not complete fixed-authority
+backups. Coordinated histories also need the authority identity, ordered prefix,
+deduplication/operation journals, certificates and retained payload/feed state.
+Use the [fixed-authority recovery runbook](authority-recovery.md) for the
+whole-state and independently verified continuity procedure.
+
 ## Export and import
 
 ```sh

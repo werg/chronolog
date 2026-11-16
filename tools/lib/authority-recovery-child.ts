@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { emit, program } from '@chronolog/protocol'
-import type { OrderedRecordHead } from '@chronolog/node-core'
+import { CoordinatedHistoryPolicy, decodeOrderingEvidence, MemoryOperationStore, type OrderedRecordHead } from '@chronolog/node-core'
 
 import {
   AUTHORITY_CRASH_POINTS, inspectStoppedAuthority, openAuthorityRecoveryFixture, recoveryJson,
@@ -60,15 +60,25 @@ if (action === 'raw') {
     }
     if (action === 'offline') {
       const before = await fixture.inspect()
+      const retained = await fixture.transport.evidenceHistory()
       await fixture.agent.close()
+      const observer = await CoordinatedHistoryPolicy.open(fixture.authority.configuration, new MemoryOperationStore())
+      for (const evidence of [...retained].reverse()) await observer.ingest(decodeOrderingEvidence(evidence.bytes))
+      const secondObserver = await CoordinatedHistoryPolicy.open(fixture.authority.configuration, new MemoryOperationStore())
+      for (const evidence of [...observer.evidence()].reverse()) await secondObserver.ingest(evidence)
+      assert.equal(observer.progress.finalThrough, before.head.position)
+      assert.deepEqual(secondObserver.progress, observer.progress)
       const receipt = await fixture.node.publish({ operationId: 'recovery-authority-offline', program: program(emit('recovery.changed', { pending: true })) })
       await fixture.node.waitForIdle()
       const pending = await fixture.node.operation('recovery-authority-offline')
       assert(pending !== null && !pending.final)
       assert.equal((await fixture.authority.head()).position, before.head.position)
       assert.deepEqual(fixture.node.localSql('SELECT id, value FROM recovery_probe ORDER BY id', [], { view: 'final' }).rows, before.rows)
+      assert.deepEqual((await fixture.node.events.read()).transactions, before.events)
       process.stdout.write(`${recoveryJson({ event: 'offline', previousHead: before.head, proposalId: receipt.txIdText,
-        operation: pending, finalRows: before.rows, finalEvents: (await fixture.node.events.read()).transactions })}\n`)
+        operation: pending, finalRows: before.rows, finalEvents: (await fixture.node.events.read()).transactions,
+        relayedEvidence: { bytes: retained.reduce((sum, item) => sum + item.bytes.length, 0),
+          independentObservers: 2, progress: secondObserver.progress, applicationBodiesSupplied: 0 } })}\n`)
     } else process.stdout.write(`${recoveryJson({ event: 'state', state: await fixture.inspect() })}\n`)
   } finally { await fixture.close() }
 }

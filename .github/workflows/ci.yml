@@ -28,7 +28,17 @@ jobs:
       - run: pnpm docs:check
       - run: pnpm typecheck
       - run: pnpm test:coverage
+      - name: Rehearse native authority crash and storage recovery
+        run: pnpm exec tsx tools/authority-recovery.ts --output artifacts/authority-recovery/ci
       - run: pnpm build
+      - name: Preserve authority recovery report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: authority-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/authority-recovery/ci
+          if-no-files-found: warn
+          retention-days: 30
       - name: Preserve coverage summary
         if: always()
         uses: actions/upload-artifact@v6

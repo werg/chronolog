@@ -63,6 +63,14 @@ established continuity, create an explicit new history lineage. Neither this
 package nor a missing newer peer certificate proves that a restored backup was
 the latest acknowledged state.
 
+The [authority recovery rehearsal](../../docs/authority-recovery.md) executes
+real process kills at payload/record/certificate/acknowledgment boundaries,
+accepted and rejected exact retries, whole-state backup/restore, same-file
+writer fencing, an authority-task outage and explicit refusal of a stale backup
+after the current disk is deleted. It emits public evidence separately from
+secret-bearing disposable stores and lists the deployed-volume and Cloudflare
+recovery checks still required.
+
 ## Trusted application modules
 
 Set `CHRONOLOG_AGENT_MODULE` to a local module exporting `createAgent(context)`.

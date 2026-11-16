@@ -30,6 +30,9 @@ describe('native authority process crash recovery', () => {
         const committed = ['after_record_commit', 'after_certificate_commit', 'before_acknowledgement'].includes(point)
         expect(raw.head.position).toBe(before.head.position + (committed ? 1 : 0))
         expect(raw.entries.slice(0, before.head.position).map(entry => entry.recordId)).toEqual(before.payloads.map(entry => entry.recordId))
+        if (point === 'after_certificate_commit' || point === 'before_acknowledgement') {
+          expect(raw.certificate).toMatchObject({ kind: 'prefix-certificate', certificate: raw.head })
+        }
         const recovered = await openAuthorityRecoveryFixture(directory, { continuity: before.head })
         try {
           const original = await recovered.node.operation(`recovery-${operation}`)
