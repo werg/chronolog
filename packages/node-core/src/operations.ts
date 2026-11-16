@@ -100,7 +100,7 @@ export class DurableOperationJournal {
 }
 
 export function validateOperationId(value: string): void {
-  if (value.length === 0 || value.length > 512 || /[\u0000-\u001f]/u.test(value)) {
+  if (value.length === 0 || value.length > 512 || [...value].some((character) => character.charCodeAt(0) < 32)) {
     throw new Error('OPERATION_ID_INVALID')
   }
 }

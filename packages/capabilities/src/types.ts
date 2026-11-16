@@ -35,6 +35,13 @@ export interface ResourcePolicy {
 }
 
 export interface GenesisManifest {
+  /** Immutable history semantics and SQL profile, authenticated by the root. */
+  readonly historyPolicy?: {
+    readonly kind: 'peer' | 'coordinated'
+    readonly executionManifestDigest: Uint8Array
+    readonly historyId?: string
+    readonly authorityPublicKey?: Uint8Array
+  }
   readonly groupId: Uint8Array
   readonly schemaId: Uint8Array
   readonly rootAdminPublicKey: Uint8Array

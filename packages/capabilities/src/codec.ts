@@ -144,7 +144,36 @@ function genesisToCbor(value: GenesisManifest): CborValue {
       [1, value.forkedFrom.snapshotManifestSha256],
       [2, value.forkedFrom.materializedRevision],
     ])],
+    [14, value.historyPolicy === undefined ? undefined : historyPolicyToCbor(value.historyPolicy)],
   ])
+}
+
+function historyPolicyToCbor(value: NonNullable<GenesisManifest['historyPolicy']>): CborValue {
+  protocolInvariant(value.executionManifestDigest.length === 32, 'SCHEMA_INVALID', 'History requires an execution manifest digest')
+  protocolInvariant(value.kind === 'peer' || value.kind === 'coordinated', 'SCHEMA_INVALID', 'Unknown history policy')
+  if (value.kind === 'coordinated') {
+    protocolInvariant(typeof value.historyId === 'string' && /^h_[0-9a-f]{32}$/u.test(value.historyId), 'SCHEMA_INVALID', 'History identity is invalid')
+    protocolInvariant(value.authorityPublicKey?.length === 32, 'SCHEMA_INVALID', 'Authority public key is invalid')
+    return [1n, value.executionManifestDigest, value.historyId, value.authorityPublicKey]
+  }
+  protocolInvariant(value.historyId === undefined && value.authorityPublicKey === undefined, 'SCHEMA_INVALID', 'Peer policy cannot carry an authority')
+  return [0n, value.executionManifestDigest]
+}
+
+function historyPolicyFromCbor(value: CborValue): NonNullable<GenesisManifest['historyPolicy']> {
+  const fields = expectArray(value, 'genesis.history_policy')
+  if (fields[0] === 0n && fields.length === 2) return {
+    kind: 'peer', executionManifestDigest: expectBytes(fields[1]!, 'genesis.history_policy.manifest', 32),
+  }
+  protocolInvariant(fields[0] === 1n && fields.length === 4, 'SCHEMA_INVALID', 'History policy is invalid')
+  const policy = {
+    kind: 'coordinated' as const,
+    executionManifestDigest: expectBytes(fields[1]!, 'genesis.history_policy.manifest', 32),
+    historyId: expectString(fields[2]!, 'genesis.history_policy.history'),
+    authorityPublicKey: expectBytes(fields[3]!, 'genesis.history_policy.authority', 32),
+  }
+  historyPolicyToCbor(policy)
+  return policy
 }
 
 function forkOriginFromCbor(value: CborValue): ForkOrigin {
@@ -164,9 +193,10 @@ export function encodeGenesisManifest(value: GenesisManifest): Uint8Array {
 export function decodeGenesisManifest(bytes: Uint8Array): GenesisManifest {
   const map = expectMap(assertCanonicalCbor(bytes), 'genesis')
   // Keys 5 and 6 are retired (formerly recovery keys and threshold).
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13], 'genesis')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14], 'genesis')
   expectVersion(map, 1n, 'genesis')
   const forkedFrom = optional(map, 13)
+  const historyPolicy = optional(map, 14)
   const manifest: GenesisManifest = {
     groupId: expectBytes(required(map, 1, 'genesis.group_id'), 'genesis.group_id'),
     schemaId: expectBytes(required(map, 2, 'genesis.schema_id'), 'genesis.schema_id'),
@@ -179,6 +209,7 @@ export function decodeGenesisManifest(bytes: Uint8Array): GenesisManifest {
     encryptionSuite: expectString(required(map, 11, 'genesis.encryption_suite'), 'genesis.encryption_suite'),
     createdAtMs: expectUint64(required(map, 12, 'genesis.created_at'), 'genesis.created_at'),
     ...(forkedFrom === undefined ? {} : { forkedFrom: forkOriginFromCbor(forkedFrom) }),
+    ...(historyPolicy === undefined ? {} : { historyPolicy: historyPolicyFromCbor(historyPolicy) }),
   }
   genesisToCbor(manifest)
   return manifest

@@ -377,6 +377,9 @@ export class GovernanceControlPlane {
       const history = await this.#options.transport.history()
       const existing = history.find((record) => record.author === this.#options.transport.identity && equalBytes(record.payload, envelope))
       const record = existing ?? await this.#options.transport.publish(envelope, { timestampMs: this.#options.now?.() ?? Date.now() })
+      // A relay can persist the local record before its remote append succeeds.
+      // Do not release this lane's successor until the canonical append is durable.
+      await this.#options.transport.ensurePublished?.(record)
       await this.ingest(record)
     }
   }
@@ -481,7 +484,7 @@ function decodePrepared(bytes: Uint8Array): {
         !(entry[1] instanceof Uint8Array) || entry[1].length !== 32) throw new Error('GOVERNANCE_OPERATION_INVALID')
     keys.push([entry[0], entry[1]])
   }
-  return { result: value[1], envelopes: value[2] as Uint8Array[], keys }
+  return { result: value[1], envelopes: value[2], keys }
 }
 
 function preparedResult(bytes: Uint8Array): Uint8Array { return decodePrepared(bytes).result }

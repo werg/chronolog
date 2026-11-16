@@ -3,7 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./history": "./src/history-policy.ts"
+  },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
     "@chronolog/capabilities": "workspace:*",

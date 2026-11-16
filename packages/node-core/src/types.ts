@@ -10,8 +10,10 @@ import type {
   SqlTransactionProgram,
   TransactionCore,
 } from '@chronolog/protocol'
-import type { ChronologTransport, TransportStatus } from '@chronolog/transport-ssb'
+import type { ChronologTransport, TransportStatus } from '@chronolog/records'
 import type { FeedForkRegistry } from './feed-forks.js'
+import type { CoordinatedHistoryPolicy, OrderedRecordEntry } from './history-policy.js'
+import type { DurableOperationStore } from './operations.js'
 
 export interface Clock {
   now(): number
@@ -34,6 +36,10 @@ export interface EnvelopeCipherResolver {
 }
 
 export interface CandidateAdmissionContext {
+  readonly writerCapability?: Uint8Array
+  readonly authorTimestampMs?: bigint
+  readonly canonicalPosition?: bigint
+  readonly txId?: Uint8Array
   readonly groupId: Uint8Array
   readonly membershipRevision: Uint8Array
   readonly validationPolicy: Uint8Array
@@ -50,6 +56,7 @@ export interface ValidatorAuthorityContext {
 }
 
 export interface TransportAuthorContext {
+  readonly writerCapability?: Uint8Array
   readonly groupId: Uint8Array
   readonly membershipRevision: Uint8Array
   readonly role: 'writer' | 'validator'
@@ -96,12 +103,20 @@ export interface ValidatorOptions {
 }
 
 export interface OperationalMembershipState {
+  readonly writerCapability?: Uint8Array
   readonly membershipRevision: Uint8Array
   readonly validationPolicy: Uint8Array
   readonly validatorCapability?: Uint8Array
 }
 
 export interface ChronologNodeOptions {
+  readonly operationStore?: DurableOperationStore
+  readonly historyPolicy?: { readonly kind: 'peer' } | {
+    readonly kind: 'coordinated'
+    readonly policy: CoordinatedHistoryPolicy
+    /** Applies verified governance records at their certified position. */
+    readonly applyControlRecord?: (entry: OrderedRecordEntry) => Promise<void>
+  }
   readonly groupId: Uint8Array
   readonly groupRoute?: Uint8Array
   readonly membershipRevision: Uint8Array
@@ -123,6 +138,8 @@ export interface ChronologNodeOptions {
 }
 
 export interface PublishTransactionInput {
+  readonly operationId?: string
+  readonly writerCapability?: Uint8Array
   readonly program: SqlTransactionProgram
   readonly authorTimestampMs?: bigint
   readonly nonce?: Uint8Array
@@ -151,6 +168,9 @@ export interface NodeRevisionEvent {
 }
 
 export interface NodeStatus {
+  readonly historyPolicy?: 'peer' | 'coordinated'
+  readonly finalOrderLength?: number
+  readonly finalRevision?: bigint
   readonly started: boolean
   readonly closed: boolean
   readonly eventSetRevision: bigint

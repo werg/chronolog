@@ -18,6 +18,23 @@ const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('replicated governance control plane', () => {
+  it('does not author a successor before a locally retained predecessor reaches the canonical relay', async () => {
+    const fixture = await governanceFixture(new MemoryOperationStore())
+    let relayAvailable = false
+    Object.assign(fixture.adminTransport, {
+      ensurePublished: async () => { if (!relayAvailable) throw new Error('relay offline') },
+    })
+    await expect(fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(40), 'writer')] }, fixture.root.privateKey, { operationId: 'first' }))
+      .rejects.toThrow('relay offline')
+    await expect(fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(41), 'writer')] }, fixture.root.privateKey, { operationId: 'second' }))
+      .rejects.toThrow('relay offline')
+    expect(await fixture.adminTransport.history()).toHaveLength(1)
+    relayAvailable = true
+    const successor = await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(41), 'writer')] }, fixture.root.privateKey, { operationId: 'second' })
+    expect(successor.revision.revision).toBe(2n)
+    expect(await fixture.adminTransport.history()).toHaveLength(2)
+  })
+
   it('recovers the original grant after a lost append response and restart', async () => {
     const operationStore = new MemoryOperationStore()
     const fixture = await governanceFixture(operationStore)
