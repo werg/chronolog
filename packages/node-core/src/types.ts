@@ -103,6 +103,7 @@ export interface ValidatorOptions {
 }
 
 export interface OperationalMembershipState {
+  readonly minimumAuthorTimestampMs?: bigint
   readonly writerCapability?: Uint8Array
   readonly membershipRevision: Uint8Array
   readonly validationPolicy: Uint8Array
@@ -110,6 +111,11 @@ export interface OperationalMembershipState {
 }
 
 export interface ChronologNodeOptions {
+  readonly peerGovernance?: {
+    isRevisionClosed(revision: Uint8Array): boolean
+    closureAdmissions(revision: Uint8Array): readonly Uint8Array[]
+    allowsAttestation(revision: Uint8Array, validatorId: Uint8Array, sequence: bigint): Promise<boolean>
+  }
   readonly operationStore?: DurableOperationStore
   readonly historyPolicy?: { readonly kind: 'peer' } | {
     readonly kind: 'coordinated'

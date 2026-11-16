@@ -37,7 +37,7 @@ import {
 } from '@chronolog/protocol'
 import type { TransportRecord } from '@chronolog/records'
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
-import { decodeOrderingEvidence, encodeOrderingEvidence, type OrderingEvidence } from './history-policy.js'
+import { decodeOrderingEvidence, encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import type {
@@ -50,11 +50,13 @@ import type {
 } from './types.js'
 import { WIRE_ENCRYPTION_EPOCH_UNAVAILABLE, decodeSignedEnvelope, encodeSignedEnvelope } from './wire.js'
 import { FeedForkRegistry } from './feed-forks.js'
+import { ValidatorRevisionClosures } from './validator-closures.js'
 
 export class ChronologNode {
   readonly #options: ChronologNodeOptions
   readonly #control: ControlStore
   readonly #operations: DurableOperationJournal
+  readonly #validatorClosures: ValidatorRevisionClosures
   #evidenceTask: Promise<void> | null = null
   #coordinatedProcessed = 0
   #coordinatedAppliedThrough = 0
@@ -99,7 +101,13 @@ export class ChronologNode {
     const policy = options.historyPolicy?.kind ?? 'peer'
     this.#control = options.controlStore ?? new ControlStore(null, { orderPolicy: policy })
     if (this.#control.orderPolicy !== policy) throw new Error('NODE_HISTORY_POLICY_MISMATCH')
-    this.#operations = new DurableOperationJournal(options.operationStore ?? new MemoryOperationStore(), `transactions/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
+    const operationStore = options.operationStore ?? new MemoryOperationStore()
+    this.#operations = new DurableOperationJournal(operationStore, `transactions/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
+    this.#validatorClosures = new ValidatorRevisionClosures({
+      groupId: options.groupId, groupRoute: options.groupRoute ?? options.groupId,
+      identity: options.identity, transport: options.transport, store: operationStore,
+      ...(options.envelopeCipher === undefined ? {} : { cipher: options.envelopeCipher }),
+    })
     if (options.historyPolicy?.kind === 'coordinated') {
       const configured = options.historyPolicy.policy.configuration
       if (!equalBytes(configured.groupId, options.groupId) || !equalBytes(configured.executionManifestDigest, options.materialization.queries.executionManifestDigest)) {
@@ -165,6 +173,7 @@ export class ChronologNode {
   async start(): Promise<void> {
     if (this.#closed) throw new Error('NODE_CLOSED')
     if (this.#started) return
+    await this.#validatorClosures.recover()
     const history = await this.#options.transport.history()
     await this.#recoverValidatorCutoff(history)
     this.#started = true
@@ -175,7 +184,7 @@ export class ChronologNode {
     await this.#operations.recover(async (bytes) => { await this.#applyPreparedTransaction(bytes) })
     if (this.#options.historyPolicy?.kind === 'coordinated') {
       for (const evidence of await this.#options.transport.evidenceHistory?.() ?? []) {
-        await this.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
+        await this.#ingestSharedEvidence(evidence.bytes)
       }
       this.#evidenceTask = this.#consumeEvidence()
     }
@@ -225,6 +234,37 @@ export class ChronologNode {
     return { txId: utf8(txIdText), txIdText, candidateDigest, core }
   }
 
+  /** Permanently stops old-revision admission before publishing its signed promise. */
+  async closeGovernanceRevision(previous: Uint8Array, next: Uint8Array): Promise<TransportRecord> {
+    if (this.historyPolicy !== 'peer' || this.#options.validator === undefined) throw new Error('NODE_NOT_VALIDATOR')
+    return this.#mutex.run(async () => {
+      const capability = this.#validatorCapability()
+      if (capability === undefined) throw new Error('NODE_VALIDATOR_CAPABILITY_UNAVAILABLE')
+      return this.#validatorClosures.close(previous, next, capability, BigInt(Math.trunc(this.#clockNow())))
+    })
+  }
+
+  /** Re-evaluates records that were waiting for governance or historical keys. */
+  async refreshMembership(): Promise<void> {
+    if (!this.#started || this.#closed) return
+    try {
+      for (const record of [...this.#retryRecords.values()]) await this.ingest(record)
+      await this.#mutex.run(async () => {
+      for (const candidate of this.#control.listCandidates()) {
+        const core = this.#candidateCores.get(this.#idKey(candidate.txId))
+        if (core === undefined || candidate.state !== 'pending_validation' || this.historyPolicy !== 'peer') continue
+        await this.#evaluateAdmission(candidate.txId, core)
+        await this.#maybeAttest(candidate.txId, candidate, core)
+      }
+      this.#materializationPending = true
+      await this.#reconcileMaterializer()
+      })
+    } catch (error) {
+      this.#recordError(error)
+      this.#scheduleMaterializationRetry()
+    }
+  }
+
   #decodePreparedTransaction(bytes: Uint8Array): { canonical: Uint8Array; envelope: Uint8Array } {
     const value = assertCanonicalCbor(bytes)
     if (!Array.isArray(value) || value.length !== 2 || !(value[0] instanceof Uint8Array) || !(value[1] instanceof Uint8Array)) {
@@ -236,7 +276,8 @@ export class ChronologNode {
   async #applyPreparedTransaction(bytes: Uint8Array): Promise<void> {
     const { canonical, envelope } = this.#decodePreparedTransaction(bytes)
     const core = decodeTransactionCore(canonical)
-    const previous = (await this.#options.transport.history()).find((record) => equalBytes(record.payload, envelope))
+    const previous = (await this.#options.transport.history()).find((record) =>
+      record.author === this.#options.transport.identity && equalBytes(record.payload, envelope))
     const record = previous ?? await this.#options.transport.publish(envelope, { timestampMs: Number(core.authorTimestampMs) })
     if (previous !== undefined) await this.#options.transport.ensurePublished?.(record)
     await this.ingest(record)
@@ -349,7 +390,8 @@ export class ChronologNode {
           this.#recordError(error)
           return
         }
-        const envelope = decodeEnvelope(record.payload)
+        let envelope: ReturnType<typeof decodeEnvelope>
+        try { envelope = decodeEnvelope(record.payload) } catch { invalid('NODE_ENVELOPE_INVALID') }
         if (envelope.messageType !== 'candidate' && envelope.messageType !== 'attestation' && envelope.messageType !== 'heartbeat') {
           this.#seen.add(record.id)
           return
@@ -413,24 +455,35 @@ export class ChronologNode {
 
   async finalTarget(): Promise<Uint8Array> {
     const ids = this.#control.orderedTransactionIds().slice(0, this.finalOrderLength)
-    return encodeCanonicalCbor([1n, this.groupId, this.historyPolicy, BigInt(ids.length), await sha256(encodeCanonicalCbor(ids))])
+    const policy = this.#options.historyPolicy
+    return encodeCanonicalCbor([2n, this.groupId, this.historyPolicy, BigInt(ids.length), await sha256(encodeCanonicalCbor(ids)),
+      policy?.kind === 'coordinated' ? BigInt(this.#coordinatedAppliedThrough) : null,
+      policy?.kind === 'coordinated' ? policy.policy.entries(this.#coordinatedAppliedThrough).at(-1)?.root ??
+        await orderedGenesisRoot(policy.policy.configuration.historyId) : null,
+    ])
   }
 
   async isFinalTargetApplied(frontier: Uint8Array): Promise<boolean> {
     const value = assertCanonicalCbor(frontier)
-    if (!Array.isArray(value) || value.length !== 5 || value[0] !== 1n || !(value[1] instanceof Uint8Array) ||
+    if (!Array.isArray(value) || value.length !== 7 || value[0] !== 2n || !(value[1] instanceof Uint8Array) ||
         !equalBytes(value[1], this.groupId) || value[2] !== this.historyPolicy || typeof value[3] !== 'bigint' ||
         value[3] < 0n || value[3] > BigInt(this.finalOrderLength) || !(value[4] instanceof Uint8Array)) return false
     const ids = this.#control.orderedTransactionIds().slice(0, Number(value[3]))
+    const policy = this.#options.historyPolicy
+    if (policy?.kind === 'coordinated') {
+      if (typeof value[5] !== 'bigint' || value[5] < 0n || value[5] > BigInt(this.#coordinatedAppliedThrough) || typeof value[6] !== 'string') return false
+      const root = policy.policy.entries(Number(value[5])).at(-1)?.root ?? await orderedGenesisRoot(policy.policy.configuration.historyId)
+      if (root !== value[6]) return false
+    } else if (value[5] !== null || value[6] !== null) return false
     return equalBytes(await sha256(encodeCanonicalCbor(ids)), value[4])
   }
 
   async ingestOrderingEvidence(evidence: OrderingEvidence): Promise<void> {
     if (this.#options.historyPolicy?.kind !== 'coordinated') throw new Error('NODE_HISTORY_POLICY_MISMATCH')
     const policy = this.#options.historyPolicy.policy
-    await this.#options.transport.putEvidence?.(encodeOrderingEvidence(evidence))
     await this.#mutex.run(async () => {
       await policy.ingest(evidence)
+      await this.#options.transport.putEvidence?.(encodeOrderingEvidence(evidence))
       this.#materializationPending = true
       await this.#reconcileMaterializer()
     })
@@ -441,8 +494,20 @@ export class ChronologNode {
     if (subscribe === undefined) return
     for await (const item of subscribe.call(this.#options.transport, this.#abort.signal)) {
       if (this.#closed) return
-      try { await this.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes)) }
-      catch (error) { this.#recordError(error); this.#scheduleMaterializationRetry() }
+      await this.#ingestSharedEvidence(item.bytes)
+    }
+  }
+
+  async #ingestSharedEvidence(bytes: Uint8Array): Promise<void> {
+    let evidence: OrderingEvidence
+    try { evidence = decodeOrderingEvidence(bytes) } catch { return }
+    try { await this.ingestOrderingEvidence(evidence) }
+    catch (error) {
+      // Immutable peer storage may contain unrelated or forged evidence. Only
+      // validated proofs enter the policy store; invalid bytes cannot poison restart.
+      if (error instanceof Error && /^(HISTORY_(ID_MISMATCH|ID_INVALID|HASH_INVALID|POSITION_INVALID|POSITION_CONFLICT|CERTIFICATE_CONFIGURATION_MISMATCH|CERTIFICATE_SIGNATURE_INVALID)|ORDERED_RECORD_(BYTES_INVALID|TOO_LARGE|DIGEST_MISMATCH|ROOT_MISMATCH))$/u.test(error.message)) return
+      this.#recordError(error)
+      this.#scheduleMaterializationRetry()
     }
   }
 
@@ -496,7 +561,29 @@ export class ChronologNode {
     if (!core) return null
     const policy = await this.#options.membership.watermarkPolicy?.(core)
     if (!policy) return null
-    return this.#control.settlementEvidence(txId, policy, core.membershipRevision)
+    const evidence = this.#control.settlementEvidence(txId, policy, core.membershipRevision)
+    if (evidence !== null && await this.#closedRevisionEvidenceApplied(core.membershipRevision)) {
+      return { ...evidence, belowWatermark: evidence.unresolvedAttestationIds.length === 0,
+        watermark: { ...evidence.watermark, cutoffMs: core.authorTimestampMs, explanation: 'established' } }
+    }
+    return evidence
+  }
+
+  async #closedRevisionEvidenceApplied(revision: Uint8Array): Promise<boolean> {
+    const governance = this.#options.peerGovernance
+    if (governance?.isRevisionClosed(revision) !== true ||
+        !governance.closureAdmissions(revision).every((id) => this.#candidateCores.has(this.#idKey(id)))) return false
+    // The governance verifier and SQL node subscribe independently. Complete
+    // transport feeds are necessary, but the admission index must also have
+    // consumed every available proof before freezing a SQL prefix.
+    for (const record of await this.#options.transport.history()) {
+      if (this.#seen.has(record.id)) continue
+      try {
+        const envelope = decodeEnvelope(record.payload)
+        if (envelope.messageType === 'attestation' && equalBytes(envelope.groupRoute, this.#groupRoute())) return false
+      } catch { /* unrelated malformed records carry no admission */ }
+    }
+    return true
   }
 
   async watermark(txId?: Uint8Array): Promise<WatermarkEvidence | null> {
@@ -564,7 +651,7 @@ export class ChronologNode {
   async waitForIdle(): Promise<void> {
     if (this.historyPolicy === 'coordinated') {
       for (const evidence of await this.#options.transport.evidenceHistory?.() ?? []) {
-        await this.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
+        await this.#ingestSharedEvidence(evidence.bytes)
       }
     }
     await this.#mutex.run(async () => {
@@ -655,7 +742,7 @@ export class ChronologNode {
     if (canonicalPosition !== undefined && !this.#canonicalPositions.has(this.#idKey(txId))) this.#canonicalPositions.set(this.#idKey(txId), canonicalPosition)
     const existing = this.#control.getCandidate(txId)
     this.#candidateCores.set(this.#idKey(txId), core)
-    if (existing !== null && (existing.state !== 'pending_validation' || canonicalPosition === undefined)) return
+    if (existing !== null && (existing.state !== 'pending_validation' || (this.historyPolicy === 'coordinated' && canonicalPosition === undefined))) return
     const canWrite = this.historyPolicy === 'coordinated' && canonicalPosition === undefined
       ? true : await this.#options.membership.canWrite({
         ...writerContext,
@@ -694,6 +781,7 @@ export class ChronologNode {
   async #maybeAttest(txId: Uint8Array, candidate: StoredCandidate, core: TransactionCore): Promise<void> {
     const validator = this.#options.validator
     if (!validator) return
+    if (this.#validatorClosures.isClosed(core.membershipRevision)) return
     const validatorCapability = this.#validatorCapability()
     if (validatorCapability === undefined) return
     const now = this.#clockNow()
@@ -783,6 +871,8 @@ export class ChronologNode {
     const inserted = this.#control.putAttestation(stored)
     if (inserted.added) this.#emit('attestation', value.txId)
     if (core) await this.#evaluateAdmission(value.txId, core)
+    this.#materializationPending = true
+    this.#scheduleMaterialization()
   }
 
   async #evaluateAdmission(txId: Uint8Array, core: TransactionCore): Promise<void> {
@@ -1205,6 +1295,9 @@ export class ChronologNode {
       equalBytes(attestation.validatorId, this.identity)
     )
     if (!transportAuthorized) return false
+    if (this.#options.peerGovernance !== undefined && !await this.#options.peerGovernance.allowsAttestation(
+      core.membershipRevision, attestation.validatorId, attestation.validatorFeedSequence,
+    )) return false
     return this.#options.membership.canValidate({
       groupId: core.groupId,
       membershipRevision: core.membershipRevision,
@@ -1228,7 +1321,9 @@ export class ChronologNode {
   }
   #nextAuthorTimestamp(): bigint {
     const wallClock = BigInt(Math.max(0, Math.trunc(this.#clockNow())))
-    return wallClock > this.#lastAuthoredTimestampMs ? wallClock : this.#lastAuthoredTimestampMs + 1n
+    const next = wallClock > this.#lastAuthoredTimestampMs ? wallClock : this.#lastAuthoredTimestampMs + 1n
+    const floor = this.#membershipState().minimumAuthorTimestampMs ?? 0n
+    return next < floor ? floor : next
   }
   #allocateTransactionContext(): ReservedTransactionContext {
     const authorTimestampMs = this.#nextAuthorTimestamp()
