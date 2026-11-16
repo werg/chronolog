@@ -165,6 +165,7 @@ new snapshot alone does not establish a revocation boundary.
 | --- | --- |
 | Original signed bytes, feed continuity, common replication and evidence | `packages/records/src/*.test.ts`; `packages/transport-ssb/src/feed-transport.test.ts` |
 | Durable proposal identity through a lost response and whole-node reopen | `test/rpc-durable-submit.e2e.test.ts` |
+| Complete startup restoration and health recovery after transient SQL failures | `test/node-recovery.e2e.test.ts` |
 | Final readers, final waits, and finality-only live-query updates | `test/sql-client-node.e2e.test.ts`; `packages/client/src/transaction-handle.test.ts` |
 | Signed closure barriers and interrupted validator publication | `packages/node-core/src/peer-governance.test.ts`; `validator-closures.test.ts` |
 | Live native enrollment, historical keys, revocation and retained final SQL | `test/governed-peer.e2e.test.ts` |

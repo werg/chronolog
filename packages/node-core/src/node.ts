@@ -87,6 +87,7 @@ export class ChronologNode {
   #backlogAtWindowStart = 0
   #lastResyncAt: number | undefined
   #lastError: Error | undefined
+  #materializationError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
   #heartbeatTimer: ReturnType<typeof setInterval> | undefined
@@ -95,6 +96,7 @@ export class ChronologNode {
   #ingestionRetryTimer: ReturnType<typeof setTimeout> | undefined
   #materializationRetryMs = 100
   #materializationPending = false
+  #materializationReady = false
   #lastAuthoredTimestampMs = -1n
 
   constructor(options: ChronologNodeOptions) {
@@ -189,6 +191,9 @@ export class ChronologNode {
       }
       this.#evidenceTask = this.#consumeEvidence()
     }
+    // A restored admission index can refer to records later in the retained
+    // history. Do not run SQL until all of those payloads have been restored.
+    this.#materializationReady = true
     // The control store is authoritative and is committed before the derived
     // DoltLite revision. A crash between those two writes can therefore leave
     // an admissible order ahead of the materializer. Reconcile even when replay
@@ -623,7 +628,7 @@ export class ChronologNode {
   }
 
   async status(): Promise<NodeStatus> {
-    const error = this.#lastError ?? this.#ingestionError
+    const error = this.#lastError ?? this.#materializationError ?? this.#ingestionError
     const status: NodeStatus = {
       historyPolicy: this.historyPolicy, finalOrderLength: this.finalOrderLength, finalRevision: this.finalRevision,
       started: this.#started,
@@ -974,6 +979,16 @@ export class ChronologNode {
   }
 
   async #reconcileMaterializer(): Promise<void> {
+    if (!this.#materializationReady) return
+    try {
+      await this.#applyMaterializedOrder()
+    } catch (error) {
+      if (error instanceof ControlStoreConflictError) throw error
+      throw new MaterializationProgressError(error)
+    }
+  }
+
+  async #applyMaterializedOrder(): Promise<void> {
     if (!this.#materializationPending) return
     const previousFinalLength = this.finalOrderLength
     await this.#processCoordinatedHistory()
@@ -1044,11 +1059,13 @@ export class ChronologNode {
         }
       }
     }
-    if (coordinated !== null || this.finalOrderLength !== previousFinalLength) this.#emit('materialized')
+    const recovered = this.#materializationError !== undefined
+    this.#materializationError = undefined
+    if (coordinated !== null || this.finalOrderLength !== previousFinalLength || recovered) this.#emit('materialized')
   }
 
   #scheduleMaterialization(): void {
-    if (this.#closed || !this.#materializationPending) return
+    if (this.#closed || !this.#materializationReady || !this.#materializationPending) return
     if (this.#materializationDebounceTimer) clearTimeout(this.#materializationDebounceTimer)
     this.#materializationDebounceTimer = setTimeout(() => {
       this.#materializationDebounceTimer = undefined
@@ -1119,6 +1136,7 @@ export class ChronologNode {
   }
 
   #emit(reason: NodeRevisionEvent['reason'], txId?: Uint8Array, error?: Error): void {
+    if (this.#closed) return
     this.#revision = this.#revision + 1n > this.#control.sequence
       ? this.#revision + 1n
       : this.#control.sequence
@@ -1132,7 +1150,8 @@ export class ChronologNode {
 
   #recordError(value: unknown): void {
     const error = value instanceof Error ? value : new Error(String(value))
-    this.#lastError = error
+    if (error instanceof MaterializationProgressError) this.#materializationError = error
+    else this.#lastError = error
     this.#emit('error', undefined, error)
   }
 
@@ -1441,6 +1460,14 @@ class TerminalIngestError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
     this.name = 'TerminalIngestError'
+  }
+}
+
+/** An unavailable derived SQL view remains retryable; integrity faults stay separate. */
+class MaterializationProgressError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause })
+    this.name = 'MaterializationProgressError'
   }
 }
 

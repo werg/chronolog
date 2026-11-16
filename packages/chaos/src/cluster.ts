@@ -7,7 +7,7 @@ import Docker from 'dockerode'
 import { GenericContainer, Network, type StartedNetwork, type StartedTestContainer, Wait } from 'testcontainers'
 
 import type { PreparedCluster } from './bootstrap.js'
-import type { RunArtifacts } from './artifacts.js'
+import { errorText, type RunArtifacts } from './artifacts.js'
 import type { ChaosScenario, FaultSpec, LinkName, NodeName, NodeResourceSample } from './types.js'
 import { HttpRpcTransport } from '@chronolog/rpc'
 import { readDockerSystemInfo } from './docker-info.js'
@@ -283,14 +283,19 @@ export class ChaosCluster {
     const node = this.#node(name)
     const deadline = Date.now() + timeoutMs
     let lastError: unknown
+    let lastResponse: string | undefined
     while (Date.now() < deadline) {
       try {
         const response = await fetch(`${node.url}/health`, { signal: AbortSignal.timeout(2_000) })
         if (response.ok) return
+        lastResponse = `HTTP_${response.status}`
+        lastResponse += `:${(await response.text()).slice(0, 4_096)}`
       } catch (error) { lastError = error }
       await delay(200)
     }
-    throw new Error(`CHAOS_NODE_HEALTH_TIMEOUT:${name}:${lastError instanceof Error ? lastError.message : String(lastError)}`)
+    const details = [lastResponse, lastError === undefined ? undefined : errorText(lastError)]
+      .filter((value) => value !== undefined).join('; ')
+    throw new Error(`CHAOS_NODE_HEALTH_TIMEOUT:${name}:${details || 'no response'}`)
   }
 
   async applyFault(fault: FaultSpec, token: string): Promise<FaultHandle> {
