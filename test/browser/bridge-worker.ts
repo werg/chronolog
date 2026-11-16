@@ -1,0 +1,163 @@
+import { decodeSignedGenesis, encodeGenesisManifest } from '@chronolog/capabilities'
+import {
+  DOMAINS, base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest,
+  digestExecutionManifest, hashDomain,
+} from '@chronolog/protocol'
+import { ChangeSignal, type FeedLink } from '@chronolog/records'
+import { openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
+import { createCertificateFetcher, TendrillerTransport } from '@chronolog/transport-tendriller'
+import { createRecordLogClient } from '@tendriller/core/records'
+
+import type { BrowserBridgeBootstrap, BrowserBridgeIdentity, BrowserBridgeSnapshot } from './bridge-contract.js'
+
+const endpoint = globalThis as unknown as WorkerEndpoint
+const closing = new AbortController()
+const ports = new Set<MessagePort>()
+let peer: BrowserPeer | undefined
+let relay: TendrillerTransport | undefined
+
+interface FixtureRequest {
+  readonly fixture?: string
+  readonly id?: number
+  readonly name?: string
+  readonly bootstrap?: BrowserBridgeBootstrap
+  readonly relay?: boolean
+  readonly port?: MessagePort
+  readonly identity?: string
+}
+
+interface LinkRequest {
+  readonly id: number
+  readonly method: 'read' | 'evidence'
+  readonly feed?: string
+  readonly after: bigint
+  readonly limit: number
+}
+interface LinkResponse {
+  readonly id?: number
+  readonly hint?: true
+  readonly bytes?: readonly Uint8Array[]
+  readonly error?: string
+}
+
+/** A real peer range link; the receiver verifies and persists every returned byte. */
+function receiveLink(port: MessagePort, identity: string): FeedLink {
+  ports.add(port)
+  const changes = new ChangeSignal()
+  let next = 0
+  const pending = new Map<number, { resolve(value: readonly Uint8Array[]): void; reject(error: Error): void }>()
+  port.addEventListener('message', (event: MessageEvent<LinkResponse>) => {
+    const message = event.data
+    if (message.hint) { changes.notify(); return }
+    if (message.id === undefined) return
+    const request = pending.get(message.id)
+    pending.delete(message.id)
+    if (message.error !== undefined) request?.reject(new Error(message.error))
+    else request?.resolve(message.bytes ?? [])
+  })
+  port.start()
+  closing.signal.addEventListener('abort', () => {
+    changes.close()
+    for (const request of pending.values()) request.reject(new Error('BROWSER_PEER_LINK_CLOSED'))
+    pending.clear()
+  }, { once: true })
+  const request = (fields: Omit<LinkRequest, 'id'>): Promise<readonly Uint8Array[]> => new Promise((resolve, reject) => {
+    const id = ++next
+    pending.set(id, { resolve, reject })
+    port.postMessage({ id, ...fields } satisfies LinkRequest)
+  })
+  return {
+    identity,
+    read: (feed, after, limit) => request({ method: 'read', feed, after, limit }),
+    readEvidence: (after, limit) => request({ method: 'evidence', after, limit }),
+    watch: (signal) => changes.watch(signal),
+  }
+}
+
+function serveLink(port: MessagePort): void {
+  ports.add(port)
+  const link = peer!.transport.asLink()
+  port.addEventListener('message', (event: MessageEvent<LinkRequest>) => {
+    const { id, method, feed, after, limit } = event.data
+    const result = method === 'read' ? link.read(feed!, after, limit) : link.readEvidence(after, limit)
+    void result.then((bytes) => port.postMessage({ id, bytes } satisfies LinkResponse),
+      (error: unknown) => port.postMessage({ id, error: error instanceof Error ? error.message : String(error) } satisfies LinkResponse))
+  })
+  port.start()
+  void (async () => {
+    for await (const _hint of link.watch(closing.signal)) {
+      if (closing.signal.aborted) return
+      port.postMessage({ hint: true } satisfies LinkResponse)
+    }
+  })()
+}
+
+endpoint.addEventListener('message', (event) => {
+  const request = event.data as FixtureRequest
+  if (request.fixture === undefined) return
+  const run = async (): Promise<unknown> => {
+    switch (request.fixture) {
+      case 'open': {
+        const bootstrap = request.bootstrap!
+        const genesis = decodeSignedGenesis(base64UrlToBytes(bootstrap.genesis))
+        const executionManifest = decodeExecutionManifest(base64UrlToBytes(bootstrap.executionManifest))
+        const policy = genesis.manifest.historyPolicy
+        if (policy?.kind !== 'coordinated' || policy.historyId === undefined || policy.authorityPublicKey === undefined) {
+          throw new Error('BROWSER_BRIDGE_REQUIRES_COORDINATED_GENESIS')
+        }
+        const configuration = {
+          kind: 'coordinated' as const, historyId: policy.historyId, authorityPublicKey: policy.authorityPublicKey,
+          groupId: genesis.manifest.groupId,
+          genesisDigest: await hashDomain(DOMAINS.genesis, encodeGenesisManifest(genesis.manifest)),
+          executionManifestDigest: await digestExecutionManifest(executionManifest),
+        }
+        const groupRoute = base64UrlToBytes(bootstrap.groupRoute)
+        peer = await openBrowserPeer({
+          name: request.name!, engineUrl: new URL('/engine/', globalThis.location.href),
+          configure(context) {
+            if (request.relay) {
+              const headers = () => ({ Authorization: `Bearer ${bootstrap.token}` })
+              relay = new TendrillerTransport({
+                local: context.transport, groupRoute, configuration, watch: false,
+                records: createRecordLogClient({ base: bootstrap.hubUrl, headers }),
+                certificate: createCertificateFetcher({ url: `${bootstrap.hubUrl}/_chronolog/certificate`, headers }),
+              })
+            }
+            return {
+              materializer: { executionManifest, rootAdministrator: genesis.manifest.rootAdminPublicKey, checkpointEvery: 1 },
+              governed: { genesis, groupRoute },
+              ...(relay === undefined ? {} : { transport: relay, start: () => relay!.catchUp() }),
+              async close() { closing.abort(); for (const port of ports) port.close() },
+            }
+          },
+        })
+        serveBrowserPeer(endpoint, peer)
+        return {
+          identity: bytesToBase64Url(peer.node.identity), groupId: bytesToBase64Url(peer.node.groupId),
+          transportAuthor: peer.transport.identity,
+        } satisfies BrowserBridgeIdentity
+      }
+      case 'sync': {
+        if (relay !== undefined) await relay.catchUp()
+        await peer!.transport.catchUp()
+        await peer!.node.waitForIdle()
+        return null
+      }
+      case 'state': {
+        await peer!.node.waitForIdle()
+        const status = await peer!.node.status()
+        return {
+          identity: bytesToBase64Url(peer!.node.identity), hash: peer!.materializer.databaseContentHash,
+          finalOrderLength: peer!.node.finalOrderLength, finalThrough: peer!.node.finalThrough,
+          rows: peer!.node.localSql('SELECT id, claimed_by FROM tasks ORDER BY id', [], { view: 'final' }).rows,
+          ...(status.lastError === undefined ? {} : { lastError: status.lastError }),
+        } satisfies Omit<BrowserBridgeSnapshot, 'outcomes'>
+      }
+      case 'serveLink': serveLink(request.port!); return null
+      case 'receiveLink': peer!.transport.connect(receiveLink(request.port!, request.identity!)); return null
+      default: throw new Error('UNKNOWN_BROWSER_BRIDGE_COMMAND')
+    }
+  }
+  void run().then((value) => endpoint.postMessage({ fixture: 'response', id: request.id, value }),
+    (error: unknown) => endpoint.postMessage({ fixture: 'response', id: request.id, error: error instanceof Error ? error.stack : String(error) }))
+})
