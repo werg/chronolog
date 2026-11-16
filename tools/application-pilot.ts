@@ -1,0 +1,318 @@
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { once } from 'node:events'
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { createServer, type IncomingMessage } from 'node:http'
+import { tmpdir } from 'node:os'
+import { extname, join, relative, resolve } from 'node:path'
+import { parseArgs } from 'node:util'
+
+import type { AgentApplicationModule } from '@chronolog/agent-service'
+import { OWNER_FOR_KEY_SQL, type TransactionHandle } from '@chronolog/client'
+import { DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite'
+import { base64UrlToBytes, bytesToBase64Url, program, sqlStatement, type EffectiveEvent } from '@chronolog/protocol'
+import { chromium, expect, type Browser, type Page } from '@playwright/test'
+import { build } from 'esbuild'
+
+import { createAgent } from '../examples/resident-agent.js'
+import type { PilotBootstrap, PilotRegistration, PilotWindow } from '../test/application-pilot/contract.js'
+import { createNativeBrowserFixture, type NativeBrowserFixture } from './browser-event-fixture.js'
+
+/** Real public runtime + independent OPFS replicas + native final-intent worker. */
+const workspace = resolve(import.meta.dirname, '..')
+const { values } = parseArgs({ options: {
+  contrib: { type: 'string' }, 'tendriller-runtime': { type: 'string' }, wasm: { type: 'string' },
+  output: { type: 'string' }, browser: { type: 'string' }, 'build-only': { type: 'boolean', default: false },
+} })
+if (values.contrib === undefined || values['tendriller-runtime'] === undefined) {
+  throw new Error('Usage: application-pilot.ts --contrib /checkout --tendriller-runtime /packaged/runtime [--wasm /engine] [--output /new/directory] [--browser /chromium] [--build-only]')
+}
+const contrib = resolve(values.contrib), runtime = resolve(values['tendriller-runtime'])
+const wasm = resolve(values.wasm ?? process.env.CHRONOLOG_WASM_DIRECTORY ?? join(workspace, 'artifacts/wasm'))
+const output = resolve(values.output ?? join(workspace, `artifacts/application-pilot/run-${Date.now()}`))
+await mkdir(resolve(output, '..'), { recursive: true })
+await mkdir(output) // Never mix an earlier run's assets or evidence into this run.
+const deployment = join(output, 'deployment'), pages = join(output, 'pages')
+await mkdir(deployment)
+const report = { format: 'chronolog-application-pilot/v1', status: 'building', passed: false,
+  startedAt: new Date().toISOString(), command: process.argv.slice(1), checks: [] as string[],
+  revisions: { chronolog: gitState(workspace), contrib: gitState(contrib), tendrillerRuntime: gitState(runtime) },
+  publicArtifacts: {} as Record<string, unknown>, counts: { effectDispatches: 0, hostApplicationWrites: 0 },
+  browser: '', pageErrors: [] as string[], error: '' }
+const record = async () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
+const passed = (check: string) => { report.checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
+let native: NativeBrowserFixture | undefined, browser: Browser | undefined, directory: string | undefined
+let closeServer: (() => Promise<void>) | undefined
+let deadline: ReturnType<typeof setTimeout> | undefined
+try {
+  const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap(name =>
+    ['', '/browser'].map(suffix => [`@chronolog/${name}${suffix}`, join(workspace, `packages/${name}/src/browser.ts`)])))
+  alias['@chronolog/node-core/history'] = join(workspace, 'packages/node-core/src/history-policy.ts')
+  const publicBundle = await build({ absWorkingDir: workspace, entryPoints: ['test/application-pilot/public.ts'],
+    outfile: join(output, 'public-application.mjs'), bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })
+  const deploymentBundle = await build({ absWorkingDir: workspace,
+    entryPoints: { bootstrap: 'test/application-pilot/bootstrap.ts', worker: 'test/application-pilot/worker.ts' }, outdir: deployment,
+    outExtension: { '.js': '.mjs' }, bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })
+  // These are the packaged runtime's public assets, never sibling runtime source.
+  await cp(join(runtime, 'assets'), join(deployment, 'tendriller'), { recursive: true, dereference: false })
+  await mkdir(join(deployment, 'engine'))
+  for (const name of ['sqlite3.mjs', 'sqlite3.wasm', 'sqlite3-opfs-async-proxy.js', 'manifest.json']) {
+    await cp(join(wasm, name), join(deployment, 'engine', name), { dereference: false })
+  }
+  process.stdout.write(execFileSync(process.execPath, [join(contrib, 'cookbooks/run-a-peer-application/checks/build-pages.mjs'),
+    '--public-module', join(output, 'public-application.mjs'), '--deployment', deployment, '--output', pages], { encoding: 'utf8' }))
+  const packageMetadata: unknown = JSON.parse(await readFile(join(runtime, 'package.json'), 'utf8'))
+  report.publicArtifacts = { runtimePackage: packageMetadata, kernelSha256: await sha256(join(runtime, 'assets/kernel.mjs')),
+    wasmManifestSha256: await sha256(join(wasm, 'manifest.json')), wasmSha256: await sha256(join(wasm, 'sqlite3.wasm')),
+    publicModuleSha256: await sha256(join(output, 'public-application.mjs')), specimenManifestSha256: await sha256(join(pages, 'specimen-manifest.json')) }
+  await writeFile(join(output, 'bundles.json'), JSON.stringify({ public: publicBundle.metafile, deployment: deploymentBundle.metafile }, null, 2) + '\n')
+  passed('both contrib layouts compile from an explicit public application bundle, packaged Tendriller runtime and pinned WASM assets')
+  if (values['build-only']) {
+    report.status = 'built; browser scenarios not run'
+    await record()
+    process.stdout.write(`Built graph and provenance: ${output}\n`)
+  } else {
+    report.status = 'browser launch'
+    await record()
+    const executable = values.browser ?? process.env.CHRONOLOG_CHROMIUM_EXECUTABLE
+    browser = await chromium.launch({ headless: true, ...(executable === undefined ? {} : { executablePath: executable }) })
+    report.browser = browser.version()
+    directory = await mkdtemp(join(tmpdir(), 'chronolog-application-pilot-'))
+    const nativeDirectory = directory
+    const registrations = new Map<string, PilotRegistration>()
+    let resolveBootstrap!: (value: PilotBootstrap) => void, rejectBootstrap!: (error: unknown) => void
+    const bootstrapped = new Promise<PilotBootstrap>((resolve, reject) => { resolveBootstrap = resolve; rejectBootstrap = reject })
+    void bootstrapped.catch(() => undefined)
+    let starting = false
+    const application: AgentApplicationModule = { createAgent(context) {
+      const app = createAgent(context)
+      return { ...app, effects: (app.effects ?? []).map(effect => ({ ...effect, handler: { ...effect.handler,
+        async dispatch(input) { report.counts.effectDispatches++; return effect.handler.dispatch(input) },
+      } })) }
+    } }
+    const startNative = async (): Promise<PilotBootstrap> => {
+      const executionManifest = createDoltLiteExecutionManifest()
+      native = await createNativeBrowserFixture({ directory: nativeDirectory, browsers: [...registrations.values()].map(value => value.identity),
+        manifest: executionManifest, application,
+        materialization: async ({ identity }) => createDoltLiteMaterializationRuntime(await DeterministicMaterializer.open({
+          path: join(nativeDirectory, 'application.db'), executionManifest, rootAdministrator: identity.signing.publicKeyBytes,
+        })) })
+      await accepted(await native.client.submit(program(sqlStatement("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL CHECK(status IN ('open','done'))) STRICT")), { operationId: 'pilot-schema' }))
+      const team = await native.client.ownership.createTeam({ invite: [...registrations.values()].map(value => base64UrlToBytes(value.identity.identity)) }, { idempotencyKey: 'pilot-team' })
+      await accepted(team.handle)
+      await accepted(await native.client.submit(program(sqlStatement(`INSERT INTO tasks (id, title, claimed_by, status, chronolog_owner) VALUES (?, ?, NULL, 'open', ${OWNER_FOR_KEY_SQL})`,
+        ['task-1', 'Review the shared inspection evidence', team.id])), { operationId: 'pilot-task' }))
+      return { peer: native.bootstrap, teamId: bytesToBase64Url(team.id), applicationId: `inspection-${bytesToBase64Url(native.node.groupId)}` }
+    }
+    const files = await staticFiles(pages)
+    const server = createServer((request, response) => {
+      response.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
+      response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+      response.setHeader('Cache-Control', 'no-store')
+      response.setHeader('X-Content-Type-Options', 'nosniff')
+      const run = async () => {
+        const path = new URL(request.url ?? '/', 'http://localhost').pathname
+        if (path === '/pilot/register' && request.method === 'POST') {
+          const registration = validateRegistration(await jsonBody(request))
+          const prior = registrations.get(registration.device)
+          if (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(registration)) throw new Error('PILOT_DEVICE_IDENTITY_CHANGED')
+          registrations.set(registration.device, registration)
+          if (registrations.size === 2 && !starting) { starting = true; void startNative().then(resolveBootstrap, rejectBootstrap) }
+          const bootstrap = await bootstrapped
+          response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(bootstrap)); return
+        }
+        if (path.startsWith('/host/')) {
+          if (request.method !== 'GET' && request.method !== 'HEAD') report.counts.hostApplicationWrites++
+          response.writeHead(503); response.end('Host application persistence is offline'); return
+        }
+        const file = files.get(path)
+        if (file === undefined || request.method !== 'GET') { response.writeHead(404); response.end(); return }
+        response.setHeader('Content-Type', mime(file))
+        response.end(await readFile(file))
+      }
+      void run().catch((error: unknown) => {
+        rejectBootstrap(error)
+        response.writeHead(500, { 'Content-Type': 'text/plain' }); response.end(error instanceof Error ? error.message : String(error))
+      })
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    closeServer = async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error))) }
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('PILOT_SERVER_ADDRESS_UNAVAILABLE')
+    const base = `http://127.0.0.1:${address.port}`
+    const contexts = await Promise.all([browser.newContext({ viewport: { width: 1365, height: 1000 } }), browser.newContext({ viewport: { width: 430, height: 932 } })])
+    const [board, compact] = await Promise.all(contexts.map(context => context.newPage())) as [Page, Page]
+    const all = [board, compact]
+    for (const page of all) {
+      page.setDefaultTimeout(40_000)
+      page.on('pageerror', error => { report.pageErrors.push(error.message); process.stderr.write(`pilot browser: ${error.message}\n`) })
+    }
+    deadline = setTimeout(() => { void browser?.close() }, 240_000)
+    report.status = 'real browser scenarios'
+    await Promise.all([board.goto(`${base}/board.html?device=board`), compact.goto(`${base}/compact.html?device=compact`)])
+    await Promise.all(all.map(ready))
+    assert(native !== undefined)
+    const identities = await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.identity)))
+    assert.notEqual(identities[0], identities[1])
+    await Promise.all(all.map(page => expect(page.locator('#tasks [data-task="task-1"] h3')).toHaveText('Review the shared inspection evidence')))
+    assert.equal(report.counts.hostApplicationWrites, 0)
+    passed('independent browser identities and OPFS replicas render one shared team-owned task through the actual selected Tendriller backend')
+
+    const beforeTyping = (await native.client.events.read()).transactions
+    await board.locator('#message').fill('Typing only; not submitted')
+    await expect(compact.locator('#typing')).toHaveText('Someone is typing…')
+    await expect(compact.locator('#typing')).toBeEmpty({ timeout: 8_000 })
+    assert.deepEqual((await native.client.events.read()).transactions, beforeTyping)
+    passed('typing traverses authenticated ephemeral frames, expires and leaves no durable event')
+
+    await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.disconnect())))
+    await Promise.all(all.map(page => page.locator('#tasks [data-action="claim"]').click()))
+    await Promise.all(all.map(page => page.waitForFunction(() => {
+      const row = document.querySelector('#operations li'); return row !== null && row.getAttribute('data-status') !== 'unknown'
+    })))
+    const claimIds = await Promise.all(all.map(page => page.locator('#operations > li').first().getAttribute('data-operation')))
+    assert(claimIds.every(id => id !== null))
+    await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.reconnect())))
+    await Promise.all(all.map((page, index) => page.waitForFunction(id => {
+      const row = document.querySelector(`[data-operation="${id}"]`); return ['final', 'rejected'].includes(row?.getAttribute('data-status') ?? '')
+    }, claimIds[index]!)))
+    const claimStates = await Promise.all(all.map((page, index) => page.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), claimIds[index]!)))
+    assert.deepEqual(claimStates.map(state => state?.status).sort(), ['final', 'rejected'])
+    const winner = all[claimStates[0]?.status === 'final' ? 0 : 1]!
+    const loser = all[claimStates[0]?.status === 'final' ? 1 : 0]!
+    await Promise.all(all.map(page => expect(page.locator('#tasks [data-action="claim"]')).toBeDisabled()))
+    assert.equal(await board.locator('#tasks .task > p').textContent(), await compact.locator('#tasks .task > p').textContent())
+    passed('both disconnected browsers author original competing claims; real authority reconnect produces one final acceptance and one retained final rejection')
+
+    await loser.locator('#tasks [data-action="job"]').click()
+    await expect(loser.locator('#operations > li').first()).toHaveAttribute('data-status', 'rejected')
+    assert.equal(report.counts.effectDispatches, 0)
+    await winner.locator('#tasks [data-action="job"]').click()
+    await Promise.all(all.map(page => expect(page.locator('#jobs')).toContainText('completed · task-1')))
+    assert.equal(report.counts.effectDispatches, 1)
+    await assert.rejects(board.evaluate(async () => (globalThis as unknown as PilotWindow).tendril.application.backend.events.publish('job-results',
+      { type: 'forged-result', version: 1 }, { operationId: 'forged-pilot-result' })), /authoriz|capabilit|scope|permission|PROGRAM/iu)
+    passed('a failed SQL guard emits no intent; the final winning intent runs the native worker once and records a correlated result that browser scope cannot forge')
+
+    await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.holdNextSubmission())
+    await board.locator('#message').fill('A note whose append reply is delayed')
+    await board.locator('#send').click()
+    await board.waitForFunction(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission() !== null)
+    const delayed = await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission())
+    assert(delayed !== null)
+    await expect(compact.locator('#conversation')).toContainText('A note whose append reply is delayed')
+    await expect(board.locator(`#operations > li[data-operation="${delayed.operationId}"]`)).toHaveAttribute('data-status', 'final')
+    await board.locator('#message').fill('Newer unsent text must survive')
+    await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.releaseSubmission())
+    await expect(board.locator('#send')).toBeEnabled()
+    await expect(board.locator('#message')).toHaveValue('Newer unsent text must survive')
+    await expect(board.locator(`#operations > li[data-operation="${delayed.operationId}"]`)).toHaveAttribute('data-status', 'final')
+    passed('a delayed durable append reply preserves newer typing and cannot regress the already observed final receipt')
+
+    await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.holdNextSubmission())
+    await board.locator('#message').fill('One original intent across abrupt reload')
+    await board.locator('#send').click()
+    await board.waitForFunction(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission() !== null)
+    const interrupted = await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission())
+    assert(interrupted !== null)
+    await board.reload()
+    await ready(board)
+    assert.equal(await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.identity), identities[0])
+    await expect(board.locator(`#operations > li[data-operation="${interrupted.operationId}"]`)).toHaveAttribute('data-status', 'final')
+    const recovered = await board.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), interrupted.operationId)
+    assert.equal(recovered?.proposalId, interrupted.proposalId)
+    await expect(compact.locator('#conversation')).toContainText('One original intent across abrupt reload')
+    await expect(board.locator('#message')).toHaveValue('One original intent across abrupt reload')
+    const events = (await native.client.events.read()).transactions.flatMap(transaction => transaction.events)
+    assert.equal(events.filter(event => event.proposalId === interrupted.proposalId).length, 1)
+    assert.equal(events.filter(event => event.topic === 'conversation').length, 2)
+    passed('Worker termination before reply delivery reopens durable identity and original operation; one message survives with its saved draft and original proposal ID')
+
+    await compact.reload(); await ready(compact)
+    await Promise.all(all.map(page => page.locator('#refresh').click()))
+    await Promise.all(all.map(page => expect(page.locator('#jobs')).toContainText('completed · task-1')))
+    assert.equal(report.counts.effectDispatches, 1)
+    assert.equal(report.counts.hostApplicationWrites, 0)
+    assert.deepEqual(report.pageErrors, [])
+    for (const page of all) assert.deepEqual(await page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.connectionErrors), [])
+    native.assertHealthy()
+    assertResultOrigins(events)
+    await Promise.all([board.screenshot({ path: join(output, 'board.png'), fullPage: true }), compact.screenshot({ path: join(output, 'compact.png'), fullPage: true })])
+    passed('both layouts rebuild from retained final events without redispatching the worker or writing host application state')
+    await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.close())))
+    report.status = 'passed'; report.passed = true
+    await record()
+    process.stdout.write(`Application pilot evidence: ${output}\n`)
+  }
+} catch (error) {
+  report.error = error instanceof Error ? error.stack ?? error.message : String(error)
+  report.status = `failed during ${report.status}`
+  await record()
+  throw error
+} finally {
+  if (deadline !== undefined) clearTimeout(deadline)
+  await browser?.close()
+  await native?.close()
+  await closeServer?.()
+  if (directory !== undefined) await rm(directory, { recursive: true, force: true })
+}
+
+function gitState(directory: string) {
+  try { return { head: execFileSync('git', ['-C', directory, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+    dirty: execFileSync('git', ['-C', directory, 'status', '--porcelain'], { encoding: 'utf8' }).trim().length !== 0 } }
+  catch { return { head: 'not-a-git-checkout', dirty: true } }
+}
+async function sha256(file: string) { return createHash('sha256').update(await readFile(file)).digest('hex') }
+async function accepted(handle: TransactionHandle) {
+  try { assert.equal((await handle.final({ signal: AbortSignal.timeout(30_000) })).outcome.type, 'accepted') }
+  finally { handle.dispose() }
+}
+async function ready(page: Page) {
+  await page.waitForFunction(() => 'applicationPilot' in globalThis)
+  await expect(page.locator('#message')).toBeEnabled()
+  await expect(page.locator('#status')).toHaveAttribute('data-failure', 'false')
+}
+async function jsonBody(request: IncomingMessage): Promise<unknown> {
+  let bytes = 0
+  const chunks: Buffer[] = []
+  for await (const chunk of request) {
+    const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
+    bytes += next.length
+    if (bytes > 4096) throw new Error('PILOT_REGISTRATION_TOO_LARGE')
+    chunks.push(next)
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown
+}
+function validateRegistration(value: unknown): PilotRegistration {
+  if (typeof value !== 'object' || value === null || !('device' in value) || !['board', 'compact'].includes(String(value.device)) ||
+    !('identity' in value) || typeof value.identity !== 'object' || value.identity === null) throw new Error('PILOT_REGISTRATION_INVALID')
+  const identity = value.identity
+  if (!('identity' in identity) || typeof identity.identity !== 'string' || base64UrlToBytes(identity.identity).length !== 32 ||
+    !('readerKey' in identity) || typeof identity.readerKey !== 'string' || base64UrlToBytes(identity.readerKey).length !== 32 ||
+    !('transportAuthor' in identity) || typeof identity.transportAuthor !== 'string' || identity.transportAuthor.length > 128) throw new Error('PILOT_REGISTRATION_INVALID')
+  return { device: String(value.device), identity: { identity: identity.identity, readerKey: identity.readerKey, transportAuthor: identity.transportAuthor } }
+}
+async function staticFiles(directory: string, root = directory): Promise<Map<string, string>> {
+  const files = new Map<string, string>()
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    assert(!entry.isSymbolicLink(), 'Pilot publication cannot follow a symlink')
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) for (const [name, file] of await staticFiles(path, root)) files.set(name, file)
+    else files.set(`/${relative(root, path).replaceAll('\\', '/')}`, path)
+  }
+  return files
+}
+function mime(file: string) {
+  return ({ '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.mjs': 'application/javascript', '.js': 'application/javascript',
+    '.json': 'application/json', '.wasm': 'application/wasm', '.png': 'image/png', '.svg': 'image/svg+xml' } as Record<string, string>)[extname(file)] ?? 'application/octet-stream'
+}
+function assertResultOrigins(events: readonly EffectiveEvent[]) {
+  const requests = new Set(events.filter(event => event.topic === 'job-requests').map(event => event.id))
+  const results = events.filter(event => event.topic === 'job-results')
+  assert.equal(requests.size, 1); assert.equal(results.length, 1)
+  const payload = results[0]!.payload
+  assert(payload !== null && typeof payload === 'object' && 'originEventId' in payload && typeof payload.originEventId === 'string')
+  assert(requests.has(payload.originEventId))
+}

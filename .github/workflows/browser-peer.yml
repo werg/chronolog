@@ -44,6 +44,32 @@ jobs:
         run: node --import tsx tools/test-browser-peer.ts
       - name: Qualify enrolled browser and native agents claiming one shared task
         run: node --import tsx tools/test-browser-bridge.ts
+      - name: Check out the exact public Tendriller runtime source
+        uses: actions/checkout@v6
+        with:
+          repository: werg/tendriller
+          ref: f9197a6c06b52c3c2905c59497815b36b3e817df
+          path: artifacts/pilot-source/tendriller
+          persist-credentials: false
+      - name: Check out the exact contrib application specimens
+        uses: actions/checkout@v6
+        with:
+          repository: werg/tendriller-contrib
+          ref: 41f0f44b7dd48e80f049d38dad7f8d6c0e452ae8
+          path: artifacts/pilot-source/contrib
+          persist-credentials: false
+      - name: Build the packaged public Tendriller runtime
+        working-directory: artifacts/pilot-source/tendriller
+        run: |
+          npm ci
+          node scripts/build.mjs --artifacts-only
+      - name: Qualify both contrib layouts with native agents and independent browser peers
+        run: |
+          node --import tsx tools/application-pilot.ts \
+            --contrib artifacts/pilot-source/contrib \
+            --tendriller-runtime artifacts/pilot-source/tendriller/dist/runtime \
+            --wasm artifacts/wasm \
+            --output artifacts/application-pilot/ci
       - name: Preserve the qualification and engine provenance
         if: always()
         uses: actions/upload-artifact@v6
@@ -55,5 +81,10 @@ jobs:
             artifacts/browser-bridge/report.json
             artifacts/browser-events/report.json
             artifacts/browser-events/bundle.json
+            artifacts/application-pilot/ci/report.json
+            artifacts/application-pilot/ci/bundles.json
+            artifacts/application-pilot/ci/board.png
+            artifacts/application-pilot/ci/compact.png
+            artifacts/application-pilot/ci/pages/specimen-manifest.json
           if-no-files-found: error
           retention-days: 30

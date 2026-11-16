@@ -33,6 +33,10 @@ await build({
   absWorkingDir: workspace, entryPoints: { 'peer-worker': 'test/browser/peer-worker.ts', page: 'test/browser/page.ts' },
   outdir: output, bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias,
 })
+if (process.argv.includes('--build-only')) {
+  process.stdout.write('SQL/events browser qualification bundle built.\n')
+  process.exit(0)
+}
 const executionManifest = createDoltLiteExecutionManifest()
 const manifestBytes = encodeExecutionManifest(executionManifest)
 const html = '<!doctype html><meta charset="utf-8"><title>Chronolog browser qualification</title><script type="module" src="/page.js"></script>'
