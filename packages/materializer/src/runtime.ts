@@ -52,6 +52,8 @@ export interface MaterializationCoordinator {
   materialize(
     orderedTransactions: readonly AdmittedTransaction[],
   ): Promise<CoordinatedMaterialization | null>
+  /** Materialize and pin an actual immutable final prefix, independently of local state. */
+  publishFinal?(prefixLength: number): Promise<void>
 }
 
 export type MaterializedLocalSqlValue =
@@ -64,6 +66,8 @@ export type MaterializedLocalSqlValue =
 export interface MaterializedLocalSqlResult {
   readonly revision: bigint
   readonly orderLength: number
+  readonly view?: 'local' | 'final'
+  readonly finalOrderLength?: number
   readonly columns: readonly { readonly name: string; readonly declaredType?: string }[]
   readonly rows: readonly (readonly MaterializedLocalSqlValue[])[]
 }
@@ -78,11 +82,13 @@ export interface MaterializedRevisionSnapshot {
 export interface MaterializedQueryService {
   readonly revision: bigint
   readonly orderLength: number
+  readonly finalRevision?: bigint
+  readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
   localSql(
     sql: string,
     parameters?: readonly MaterializedLocalSqlValue[],
-    options?: { readonly atRevision?: bigint },
+    options?: { readonly atRevision?: bigint; readonly view?: 'local' | 'final' },
   ): MaterializedLocalSqlResult
   outcome(txId: Uint8Array): MaterializedTransactionOutcome | null
   subscribe(subscriber: (revision: MaterializedRevisionSnapshot) => void): () => void

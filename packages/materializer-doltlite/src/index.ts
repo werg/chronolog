@@ -1,4 +1,4 @@
-export * from './materializer.js'
+export * from './native.js'
 export * from './runtime-adapter.js'
 export * from './portable.js'
 export {

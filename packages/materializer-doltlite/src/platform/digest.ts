@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createSha256, utf8 } from '@chronolog/canonical'
 
 import { PLATFORM_TABLES_SQL, PLATFORM_VIEWS_SQL } from './schema.js'
 import { platformTriggers, type TableShape } from './tables.js'
@@ -26,11 +26,11 @@ const REFERENCE_TABLE: TableShape = {
 
 /** SHA-256 over the operation version, the platform schema, and the generated views and triggers. */
 export function computePlatformDigest(): Uint8Array {
-  const hash = createHash('sha256')
+  const hash = createSha256()
   hash.update('chronolog-platform-digest-v1\n')
   hash.update(`${PLATFORM_CODE_VERSION}\n`)
   for (const sql of [...PLATFORM_TABLES_SQL, ...PLATFORM_VIEWS_SQL, ...platformTriggers(REFERENCE_TABLE).map((trigger) => trigger.sql)]) {
-    hash.update(`${Buffer.byteLength(sql, 'utf8')}\n${sql}\n`)
+    hash.update(`${utf8(sql).length}\n${sql}\n`)
   }
   return Uint8Array.from(hash.digest())
 }

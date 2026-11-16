@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { bytesToHex, createSha256 } from '@chronolog/canonical'
 
 import type {
   DatabaseLike,
@@ -8,6 +8,9 @@ import type {
 } from './types.js'
 
 export const HEAD_BRANCH = 'chronolog_head' as const
+export const FINAL_BRANCH = 'chronolog_final' as const
+const FINAL_PREFIX = 'chronolog_final_rev_'
+const FINAL_PATTERN = /^chronolog_final_rev_r([0-9]+)_p([0-9]+)_([0-9a-f]{16})$/u
 const CHECKPOINT_PREFIX = 'chronolog_cp_'
 const REVISION_PREFIX = 'chronolog_rev_'
 const REPLAY_PREFIX = 'chronolog_replay_'
@@ -22,6 +25,33 @@ export interface PublishedRef {
   readonly doltCommitHash: string
   readonly contentHash: string
   readonly orderDigest: string
+}
+
+export function discoverFinalRef(database: DatabaseLike): PublishedRef | null {
+  const branches = database.doltBranches()
+  const head = branches.find((branch) => branch.name === FINAL_BRANCH)
+  if (head === undefined) return null
+  const matches = branches.filter((branch) => branch.hash === head.hash && FINAL_PATTERN.test(branch.name))
+  if (matches.length !== 1) throw new Error('MATERIALIZER_FINAL_REVISION_REF_INVALID')
+  const marker = matches[0]!
+  const match = FINAL_PATTERN.exec(marker.name)!
+  return {
+    revision: BigInt(match[1]!), prefixLength: safeInteger(match[2]!, 'MATERIALIZER_FINAL_PREFIX_INVALID'),
+    branchRef: marker.name, doltCommitHash: marker.hash,
+    contentHash: database.doltHashOf(FINAL_BRANCH), orderDigest: match[3]!,
+  }
+}
+
+export function publishFinalRef(database: DatabaseLike, revision: bigint, log: readonly TransactionLogRow[], commitHash: string): PublishedRef {
+  const digest = orderDigest(log)
+  const branchRef = `${FINAL_PREFIX}r${revision}_p${log.length}_${digest}`
+  if (!database.doltBranches().some((branch) => branch.name === branchRef)) database.doltBranch(branchRef, commitHash)
+  const result: PublishedRef = {
+    revision, prefixLength: log.length, branchRef, doltCommitHash: commitHash,
+    contentHash: database.doltHashOf(commitHash), orderDigest: digest,
+  }
+  database.doltForceBranch(FINAL_BRANCH, commitHash)
+  return result
 }
 
 export function discoverPublishedRef(database: DatabaseLike): PublishedRef | null {
@@ -109,7 +139,7 @@ export function createRevisionRef(
 }
 
 export function createReplayBranch(database: DatabaseLike, revision: bigint, fromRef: string): string {
-  const nonce = randomBytes(6).toString('hex')
+  const nonce = bytesToHex(globalThis.crypto.getRandomValues(new Uint8Array(6)))
   const branch = `${REPLAY_PREFIX}r${revision}_${nonce}`
   database.doltBranch(branch, fromRef)
   return branch
@@ -148,14 +178,14 @@ export function cleanupOrphanBranches(
 }
 
 export function orderDigest(log: readonly Pick<TransactionLogRow, 'txId'>[]): string {
-  const hash = createHash('sha256')
+  const hash = createSha256()
   for (const row of log) {
-    const length = Buffer.allocUnsafe(4)
-    length.writeUInt32BE(row.txId.length)
+    const length = new Uint8Array(4)
+    new DataView(length.buffer).setUint32(0, row.txId.length, false)
     hash.update(length)
     hash.update(row.txId)
   }
-  return hash.digest('hex').slice(0, 16)
+  return bytesToHex(hash.digest()).slice(0, 16)
 }
 
 export function verifyPublishedLog(published: PublishedRef, log: readonly TransactionLogRow[]): void {

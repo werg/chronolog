@@ -14,7 +14,7 @@ import {
 } from '@chronolog/protocol'
 
 import { createDoltLiteExecutionManifest } from './manifest.js'
-import { DeterministicMaterializer } from './materializer.js'
+import { DeterministicMaterializer } from './native.js'
 import type { AdmittedTransaction, LocalSqlValue, MaterializerOptions } from './types.js'
 
 /** Test-only helpers for driving a real materializer with signed-looking transactions. */

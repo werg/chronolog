@@ -127,12 +127,15 @@ export type LocalSqlValue =
 export interface LocalSqlQueryResult {
   readonly revision: bigint
   readonly orderLength: number
+  readonly view?: 'local' | 'final'
+  readonly finalOrderLength?: number
   readonly columns: readonly { readonly name: string; readonly declaredType?: string }[]
   readonly rows: readonly (readonly LocalSqlValue[])[]
 }
 
 export interface LocalSqlOptions {
   readonly atRevision?: bigint
+  readonly view?: 'local' | 'final'
 }
 
 export interface MaterializerSqlBackend {
@@ -159,6 +162,8 @@ export interface StatementLike {
 }
 
 export interface DatabaseLike {
+  /** Engine tokenizer inspection, identical in native and WASM profiles. */
+  triggerUsesIgnore(sql: string): boolean
   readonly inTransaction: boolean
   exec(sql: string): void
   prepare(sql: string): StatementLike
@@ -195,6 +200,12 @@ export interface DatabaseLike {
 }
 
 export interface MaterializerOptions {
+  /** Runtime-owned engine factory; browser and native use the same reducer. */
+  readonly openDatabase?: (options: Pick<MaterializerOptions, 'path'>) => {
+    readonly database: DatabaseLike
+    readonly backend: MaterializerBackendInfo
+    readonly security: SecurityConfiguration
+  }
   readonly path?: string
   readonly executionManifest: ExecutionManifest
   /**

@@ -1,3 +1,4 @@
+import { hexToBytes } from '@chronolog/canonical'
 import { OWNER_COLUMN, POLICY_VIOLATION_FUNCTION } from '../sql-profile.js'
 import type { DatabaseLike } from '../types.js'
 import { grantsToMeView, ownerIdsView, type OwnerOperation } from './schema.js'
@@ -143,7 +144,7 @@ export function parseRowKey(key: string): unknown[] {
     let match: RegExpExecArray | null
     if ((match = /^NULL/u.exec(rest)) !== null) values.push(null)
     else if ((match = /^'((?:[^']|'')*)'/u.exec(rest)) !== null) values.push(match[1]!.replaceAll("''", "'"))
-    else if ((match = /^X'([0-9A-Fa-f]*)'/u.exec(rest)) !== null) values.push(Buffer.from(match[1]!, 'hex'))
+    else if ((match = /^X'([0-9A-Fa-f]*)'/u.exec(rest)) !== null) values.push(hexToBytes(match[1]!))
     else if ((match = /^-?\d+(?![.eE\d])/u.exec(rest)) !== null) values.push(BigInt(match[0]))
     else if ((match = /^-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|Inf)/u.exec(rest)) !== null) values.push(Float64Array.of(Number(match[0].replace('Inf', 'Infinity'))))
     else throw new Error('MATERIALIZER_ROW_KEY_INVALID')

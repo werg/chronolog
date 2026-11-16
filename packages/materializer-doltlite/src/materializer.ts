@@ -1,5 +1,6 @@
 import {
   compareTransactionOrder,
+  decodeTransactionCore,
   encodeTransactionCore,
   executionManifestArtifacts,
   transactionDigest,
@@ -17,13 +18,14 @@ import {
   createRevisionRef,
   discoverCheckpoints,
   discoverPublishedRef,
+  discoverFinalRef,
+  publishFinalRef,
   orderDigest,
   publishRef,
   removeBranchIfPresent,
   verifyPublishedLog,
   type PublishedRef,
 } from './checkpoints.js'
-import { openDatabase } from './driver.js'
 import { withAuthorizer } from './sql-profile.js'
 import { executeTransactionProgram, SqlRejection } from './sql-executor.js'
 import { executeLocalSql } from './sql-values.js'
@@ -66,6 +68,9 @@ export class MaterializerInputError extends Error {
 export class DeterministicMaterializer implements MaterializerSqlBackend {
   readonly #writer: DatabaseLike
   #reader: DatabaseLike
+  #finalReader: DatabaseLike
+  #finalPublished: PublishedRef
+  #finalLog: TransactionLogRow[]
   readonly #sourceOptions: MaterializerOptions
   readonly #options: Required<Pick<MaterializerOptions, 'checkpointEvery' | 'retainCheckpoints'>>
   readonly #backend: MaterializerBackendInfo
@@ -91,9 +96,15 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     published: PublishedRef,
     checkpoints: MaterializerCheckpointInfo[],
     log: TransactionLogRow[],
+    finalReader: DatabaseLike,
+    finalPublished: PublishedRef,
+    finalLog: TransactionLogRow[],
   ) {
     this.#writer = writer
     this.#reader = reader
+    this.#finalReader = finalReader
+    this.#finalPublished = finalPublished
+    this.#finalLog = finalLog
     this.#sourceOptions = options
     this.#backend = backend
     this.#executionManifest = structuredClone(executionManifest)
@@ -120,6 +131,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator }
     const opened = openDatabase(options)
     let reader: DatabaseLike | null = null
+    let finalReader: DatabaseLike | null = null
     try {
       if (!bytesEqual(opened.backend.engineDigest, options.executionManifest.engineDigest)) {
         throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
@@ -149,6 +161,15 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       if (reader.doltHashOf(published.branchRef) !== published.contentHash) {
         throw new Error('MATERIALIZER_READER_CONTENT_MISMATCH')
       }
+      const finalPublished = discoverFinalRef(opened.database) ?? publishFinalRef(
+        opened.database, 0n, [], checkpoints.find((checkpoint) => checkpoint.prefixLength === 0)!.doltCommitHash,
+      )
+      finalReader = openDatabase(options).database
+      finalReader.doltCheckout(finalPublished.branchRef)
+      verifyDatabaseState(finalReader, expected)
+      const finalLog = readSystemLog(finalReader)
+      verifyPublishedLog(finalPublished, finalLog)
+      verifyFinalPrefix(finalLog, readerLog)
       return new DeterministicMaterializer(
         opened.database,
         reader,
@@ -159,9 +180,13 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         published,
         checkpoints,
         readerLog,
+        finalReader,
+        finalPublished,
+        finalLog,
       )
     } catch (error) {
       reader?.close()
+      finalReader?.close()
       opened.database.close()
       throw error
     }
@@ -169,6 +194,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
   get revision(): bigint { return this.#published.revision }
   get orderLength(): number { return this.#order.length }
+  get finalRevision(): bigint { return this.#finalPublished.revision }
+  get finalOrderLength(): number { return this.#finalLog.length }
   get executionManifestDigest(): Uint8Array { return copyBytes(this.#artifacts.executionManifestDigest) }
   get executionManifest(): ExecutionManifest { return structuredClone(this.#executionManifest) }
   get backend(): MaterializerBackendInfo { return structuredClone(this.#backend) }
@@ -202,9 +229,13 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     options: LocalSqlOptions = {},
   ): LocalSqlQueryResult {
     this.#assertOpen()
-    this.#assertRevision(options.atRevision)
-    const result = executeLocalSql(this.#reader, sql, parameters)
-    return { revision: this.revision, orderLength: this.orderLength, ...result }
+    const final = options.view === 'final'
+    const revision = final ? this.finalRevision : this.revision
+    if (options.atRevision !== undefined && options.atRevision !== revision) {
+      throw new MaterializerInputError('MATERIALIZER_REVISION_UNAVAILABLE')
+    }
+    const result = executeLocalSql(final ? this.#finalReader : this.#reader, sql, parameters)
+    return { revision, orderLength: final ? this.finalOrderLength : this.orderLength, view: final ? 'final' : 'local', finalOrderLength: this.finalOrderLength, ...result }
   }
 
   localQuery(
@@ -237,6 +268,12 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       // byte-identical rows are not re-verified, so an append costs O(1)
       // verification work instead of O(history).
       await validateTransactionSet(transactions, this.#log)
+      for (const transaction of transactions) {
+        if (!bytesEqual(transaction.core.executionManifestDigest, this.#artifacts.executionManifestDigest)) {
+          throw new MaterializerInputError('MATERIALIZER_EXECUTION_MANIFEST_UNAVAILABLE')
+        }
+      }
+      verifyFinalTransactions(this.#finalLog, transactions)
       ensureMonotonicSet(this.#order, transactions.map((transaction) => transaction.txId))
       validateExistingIdentities(this.#log, transactions)
       const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
@@ -352,11 +389,69 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     }
   }
 
+  async publishFinal(prefixLength: number): Promise<void> {
+    this.#assertOpen()
+    if (!Number.isSafeInteger(prefixLength) || prefixLength < this.finalOrderLength || prefixLength > this.orderLength) {
+      throw new MaterializerInputError('MATERIALIZER_FINAL_PREFIX_INVALID')
+    }
+    if (prefixLength === this.finalOrderLength) return
+    if (this.#materializing) throw new Error('MATERIALIZER_REENTRANT_CALL')
+    this.#materializing = true
+    let replayBranch: string | null = null
+    let reader: DatabaseLike | null = null
+    try {
+      const prefix = this.#log.slice(0, prefixLength)
+      let commitHash: string
+      if (prefixLength === this.#log.length) {
+        commitHash = this.#published.doltCommitHash
+      } else {
+        const checkpoint = this.#checkpointAtOrBefore(prefixLength)
+        if (checkpoint === null) throw new Error('MATERIALIZER_GENESIS_CHECKPOINT_MISSING')
+        replayBranch = createReplayBranch(this.#writer, this.revision, checkpoint.doltCommitHash)
+        this.#writer.doltCheckout(replayBranch)
+        verifyDatabaseState(this.#writer, this.#expected)
+        for (let index = checkpoint.prefixLength; index < prefixLength; index += 1) {
+          const row = prefix[index]!
+          this.#applyTransaction({
+            txId: row.txId, authorFeedSequence: row.authorFeedSequence,
+            candidateDigest: row.candidateDigest, canonicalCandidate: row.canonicalCandidate,
+            core: decodeTransactionCore(row.canonicalCandidate),
+          }, index)
+        }
+        verifyFinalPrefix(prefix, readSystemLog(this.#writer))
+        commitHash = this.#writer.doltCommit(`chronolog final prefix ${prefixLength}`)
+      }
+      // Read and validate the exact SQL commit before publishing its final ref.
+      const temporary = replayBranch ?? this.#published.branchRef
+      reader = openDatabase(this.#sourceOptions).database
+      reader.doltCheckout(temporary)
+      verifyDatabaseState(reader, this.#expected)
+      const log = readSystemLog(reader)
+      if (log.length !== prefixLength) throw new Error('MATERIALIZER_FINAL_LOG_LENGTH_MISMATCH')
+      verifyFinalPrefix(prefix, log)
+      const published = publishFinalRef(this.#writer, this.finalRevision + 1n, log, commitHash)
+      reader.doltCheckout(published.branchRef)
+      const oldReader = this.#finalReader
+      this.#finalReader = reader
+      reader = null
+      this.#finalPublished = published
+      this.#finalLog = log
+      oldReader.close()
+    } finally {
+      reader?.close()
+      rollbackIfActive(this.#writer)
+      this.#writer.doltCheckout(HEAD_BRANCH)
+      if (replayBranch !== null) removeBranchIfPresent(this.#writer, replayBranch)
+      this.#materializing = false
+    }
+  }
+
   close(): void {
     if (this.#closed) return
     this.#closed = true
     this.#subscribers.clear()
     this.#reader.close()
+    this.#finalReader.close()
     this.#writer.close()
   }
 
@@ -365,15 +460,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#writer.exec('SAVEPOINT chronolog_program')
     let rejection: { readonly code: string; readonly statementIndex: number | null } | null = null
     try {
-      if (!bytesEqual(transaction.core.executionManifestDigest, this.#artifacts.executionManifestDigest)) {
-        rejection = { code: 'manifest_mismatch', statementIndex: null }
-      } else {
-        executeTransactionProgram(this.#writer, transaction.core.program, {
+      executeTransactionProgram(this.#writer, transaction.core.program, {
           authorTimestampMs: transaction.core.authorTimestampMs,
           txId: transaction.txId,
           actor: transaction.core.authorId,
         }, this.#executionManifest.limits)
-      }
     } catch (error) {
       if (!(error instanceof SqlRejection)) {
         rollbackIfActive(this.#writer)
@@ -420,12 +511,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     const retained = new Set(keep.map((checkpoint) => checkpoint.branchRef))
     for (const checkpoint of sorted) if (!retained.has(checkpoint.branchRef)) removeBranchIfPresent(this.#writer, checkpoint.branchRef)
     return keep
-  }
-
-  #assertRevision(atRevision: bigint | undefined): void {
-    if (atRevision !== undefined && atRevision !== this.revision) {
-      throw new MaterializerInputError('MATERIALIZER_REVISION_UNAVAILABLE')
-    }
   }
 
   #assertOpen(): void { if (this.#closed) throw new Error('MATERIALIZER_CLOSED') }
@@ -522,8 +607,8 @@ async function validateTransactionSet(
   transactions: readonly AdmittedTransaction[],
   verified: readonly TransactionLogRow[],
 ): Promise<void> {
-  let previous: TransactionOrderKey | null = null
   const seen = new Set<string>()
+  const proposals = new Set<string>()
   for (const [index, transaction] of transactions.entries()) {
     if (transaction.txId.length === 0) throw new MaterializerInputError('MATERIALIZER_TRANSACTION_ID_INVALID')
     if (transaction.authorFeedSequence < 0n || transaction.authorFeedSequence > (1n << 63n) - 1n) {
@@ -544,14 +629,35 @@ async function validateTransactionSet(
         throw new MaterializerInputError('MATERIALIZER_CANDIDATE_DIGEST_MISMATCH')
       }
     }
-    const key = orderKeyOf(transaction)
-    if (previous !== null && compareTransactionOrder(previous, key) >= 0) {
-      throw new MaterializerInputError('MATERIALIZER_ORDER_NOT_STRICT')
-    }
     const txKey = idKey(transaction.txId)
     if (seen.has(txKey)) throw new MaterializerInputError('MATERIALIZER_DUPLICATE_TRANSACTION')
     seen.add(txKey)
-    previous = key
+    const proposal = idKey(transaction.candidateDigest)
+    if (proposals.has(proposal)) throw new MaterializerInputError('MATERIALIZER_DUPLICATE_PROPOSAL')
+    proposals.add(proposal)
+  }
+}
+
+function openDatabase(options: MaterializerOptions): ReturnType<NonNullable<MaterializerOptions['openDatabase']>> {
+  if (options.openDatabase === undefined) throw new Error('MATERIALIZER_ENGINE_FACTORY_REQUIRED')
+  return options.openDatabase(options)
+}
+
+function verifyFinalTransactions(final: readonly TransactionLogRow[], transactions: readonly AdmittedTransaction[]): void {
+  if (transactions.length < final.length) throw new Error('MATERIALIZER_FINAL_PREFIX_CHANGED')
+  for (let index = 0; index < final.length; index += 1) {
+    if (!sameIdentity(final[index]!, transactions[index]!)) throw new Error('MATERIALIZER_FINAL_PREFIX_CHANGED')
+  }
+}
+
+function verifyFinalPrefix(final: readonly TransactionLogRow[], current: readonly TransactionLogRow[]): void {
+  if (current.length < final.length) throw new Error('MATERIALIZER_FINAL_PREFIX_CHANGED')
+  for (let index = 0; index < final.length; index += 1) {
+    const a = final[index]!, b = current[index]!
+    if (!bytesEqual(a.txId, b.txId) || !bytesEqual(a.candidateDigest, b.candidateDigest) ||
+        a.outcome !== b.outcome || a.rejectionCode !== b.rejectionCode || a.failingStatementIndex !== b.failingStatementIndex) {
+      throw new Error('MATERIALIZER_FINAL_PREFIX_CHANGED')
+    }
   }
 }
 

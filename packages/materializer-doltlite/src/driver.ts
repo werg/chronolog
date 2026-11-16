@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 
-import { DatabaseSync, chronologNativeManifest } from '@dolthub/doltlite'
+import { DatabaseSync, chronologNativeManifest, chronologTriggerUsesIgnore } from '@dolthub/doltlite'
 
 import type {
   DatabaseLike,
@@ -41,7 +41,7 @@ export function readNativeEngineInfo(): NativeEngineInfo {
  * never participates in consensus execution.
  */
 export function openReadOnlyDatabase(path: string): DatabaseLike {
-  const database = new DatabaseSync(path, { readOnly: true }) as unknown as DatabaseLike
+  const database = nativeDatabase(path, true)
   try {
     assertNativeSecurityConfiguration(database.configureSecurity())
     const published = discoverPublishedRef(database)
@@ -68,7 +68,7 @@ export function openDatabase(options: Pick<MaterializerOptions, 'path'>): Opened
   if (path === undefined || path === ':memory:') {
     throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
   }
-  const database = new DatabaseSync(path) as unknown as DatabaseLike
+  const database = nativeDatabase(path)
   try {
     assertNativeContract(database)
     const security = database.configureSecurity()
@@ -188,4 +188,8 @@ function stableJson(value: unknown): string {
     return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`
   }
   throw new Error('MATERIALIZER_NATIVE_MANIFEST_INVALID')
+}
+
+function nativeDatabase(path: string, readOnly = false): DatabaseLike {
+  return Object.assign(new DatabaseSync(path, { readOnly }), { triggerUsesIgnore: chronologTriggerUsesIgnore }) as unknown as DatabaseLike
 }

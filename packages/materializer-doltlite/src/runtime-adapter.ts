@@ -18,8 +18,11 @@ import type {
 export interface DoltLiteMaterializerRuntimeBackend {
   readonly revision: bigint
   readonly orderLength: number
+  readonly finalRevision?: bigint
+  readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
   materialize(orderedTransactions: readonly AdmittedTransaction[]): Promise<MaterializedRevision | null>
+  publishFinal?(prefixLength: number): Promise<void>
   localSql(
     sql: string,
     parameters?: readonly LocalSqlValue[],
@@ -55,6 +58,10 @@ export function createDoltLiteMaterializationRuntime(
 
   return {
     coordinator: {
+      async publishFinal(prefixLength) {
+        if (materializer.publishFinal === undefined) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
+        await materializer.publishFinal(prefixLength)
+      },
       async materialize(orderedTransactions) {
         const revision = await materializer.materialize(orderedTransactions)
         if (revision === null) return null
@@ -66,6 +73,8 @@ export function createDoltLiteMaterializationRuntime(
     queries: {
       get revision() { return materializer.revision },
       get orderLength() { return materializer.orderLength },
+      get finalRevision() { return materializer.finalRevision ?? 0n },
+      get finalOrderLength() { return materializer.finalOrderLength ?? 0 },
       get executionManifestDigest() { return materializer.executionManifestDigest },
       localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
       outcome(txId) { return materializer.outcome(txId) },
