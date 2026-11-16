@@ -30,11 +30,18 @@ export interface AuthenticatedPeerLinkOptions {
   /** Check an active read grant for this group, independently of host/relay login. */
   readonly authorizePeer: (peer: PeerAuthorization) => boolean | Promise<boolean>
   readonly receiveSignal?: (frame: Uint8Array) => void | Promise<void>
-  readonly timeoutMs?: number
+  /** Absolute identity-proof deadline, default 10 seconds. */
+  readonly handshakeTimeoutMs?: number
+  /** Time allowed to dispatch a request through local framing, default 30 seconds. */
+  readonly sendTimeoutMs?: number
+  /** Silence after dispatch or validated response progress, default 30 seconds. */
+  readonly responseIdleTimeoutMs?: number
+  /** Absolute request lifetime, including dispatch and progress, default 120 seconds. */
+  readonly requestTimeoutMs?: number
 }
 
 interface RemoteHello extends PeerAuthorization { readonly nonce: Uint8Array; readonly encoded: Uint8Array }
-interface PendingRange {
+interface PendingRequest {
   readonly limit: number
   readonly records: Uint8Array[]
   /** Non-null requests exactly one detached payload by content address. */
@@ -42,7 +49,10 @@ interface PendingRange {
   bytes: number
   readonly resolve: (values: readonly Uint8Array[]) => void
   readonly reject: (error: unknown) => void
-  readonly timer: ReturnType<typeof setTimeout>
+  responseStarted: boolean
+  sendTimer: ReturnType<typeof setTimeout> | undefined
+  idleTimer: ReturnType<typeof setTimeout> | undefined
+  readonly lifetimeTimer: ReturnType<typeof setTimeout>
 }
 
 /**
@@ -61,29 +71,53 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     if (!(bytes instanceof Uint8Array) || bytes.length !== 32) throw new Error('PEER_IDENTITY_INVALID')
   }
   if (options.local.identity.length === 0 || options.local.identity.length > 256) throw new Error('PEER_FEED_ID_INVALID')
-  const timeoutMs = options.timeoutMs ?? 10_000
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw new Error('PEER_TIMEOUT_INVALID')
+  const handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000
+  const sendTimeoutMs = options.sendTimeoutMs ?? 30_000
+  const responseIdleTimeoutMs = options.responseIdleTimeoutMs ?? 30_000
+  const requestTimeoutMs = options.requestTimeoutMs ?? 120_000
+  if (!Number.isSafeInteger(handshakeTimeoutMs) || handshakeTimeoutMs < 1 || handshakeTimeoutMs > 60_000 ||
+      ![sendTimeoutMs, responseIdleTimeoutMs, requestTimeoutMs].every(value => Number.isSafeInteger(value) && value >= 1 && value <= 120_000)) {
+    throw new Error('PEER_TIMEOUT_INVALID')
+  }
   const groupId = options.groupId.slice(), authorId = options.identity.publicKeyBytes.slice(), grantId = options.grantId.slice()
   const nonce = crypto.getRandomValues(new Uint8Array(32))
   const localHello = encodeCanonicalCbor([1n, PEER_DOMAIN, 'hello', groupId, options.local.identity, authorId, grantId, nonce])
   const controller = new AbortController(), changes = new ChangeSignal()
-  const pending = new Map<number, PendingRange>()
+  const pending = new Map<number, PendingRequest>()
   let remote: RemoteHello | null = null, authenticated = false, nextRequest = 0, inbound = 0, signalsInFlight = 0
   let failure: Error | null = null
   let resolveReady!: () => void, rejectReady!: (error: unknown) => void
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
+  let rejectOpening: ((error: Error) => void) | undefined
+  const openingFailure = new Promise<never>((_resolve, reject) => { rejectOpening = reject })
   // The opening caller observes readiness errors; retain a handler while the
   // transport concurrently sends its first handshake frame.
   void ready.catch(() => undefined)
+  void openingFailure.catch(() => undefined)
 
+  const clearRequestTimers = (request: PendingRequest): void => {
+    clearTimeout(request.sendTimer); clearTimeout(request.idleTimer); clearTimeout(request.lifetimeTimer)
+    request.sendTimer = undefined; request.idleTimer = undefined
+  }
   const fail = (error: unknown): void => {
     if (controller.signal.aborted) return
     failure = error instanceof Error ? error : new Error(String(error))
+    clearTimeout(handshakeTimer)
     rejectReady(failure)
-    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(failure) }
+    rejectOpening?.(failure)
+    for (const request of pending.values()) { clearRequestTimers(request); request.reject(failure) }
     pending.clear()
     controller.abort(); changes.close()
     void options.connection.close().catch(() => undefined)
+  }
+  const responseProgress = (request: PendingRequest): void => {
+    // A response can arrive before the local send promise settles. From its
+    // first validated record onward, only response progress owns the idle
+    // deadline. Neither progress nor late send completion extends the lifetime.
+    request.responseStarted = true
+    clearTimeout(request.sendTimer); request.sendTimer = undefined
+    clearTimeout(request.idleTimer)
+    request.idleTimer = setTimeout(() => fail(new Error('PEER_RESPONSE_IDLE_TIMEOUT')), responseIdleTimeoutMs)
   }
   const send = (fields: readonly CborValue[]): Promise<void> => options.connection.send(encodeCanonicalCbor([1n, PEER_DOMAIN, ...fields]))
   const authorized = async (): Promise<boolean> => remote !== null &&
@@ -202,17 +236,21 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
           bytesToHex(await sha256(frame[4])) !== request.payloadHash)) throw new Error('PEER_PAYLOAD_HASH_MISMATCH')
       request.bytes += frame[4].length
       if (request.bytes > MAX_RANGE_BYTES) throw new Error('PEER_RANGE_TOO_LARGE')
+      // Payload verification may suspend beyond a timeout or explicit close.
+      // Never resurrect timers for a request already disposed by that lifetime.
+      if (pending.get(id) !== request) return
       request.records.push(frame[4].slice())
+      responseProgress(request)
     } else if (frame[2] === 'done') {
       if (frame.length !== 4) throw new Error('PEER_RESPONSE_INVALID')
-      clearTimeout(request.timer); pending.delete(id); request.resolve(request.records)
+      clearRequestTimers(request); pending.delete(id); request.resolve(request.records)
     } else if (frame[2] === 'error') {
       if (frame.length !== 5 || typeof frame[4] !== 'string' || frame[4].length > 256) throw new Error('PEER_RESPONSE_INVALID')
-      clearTimeout(request.timer); pending.delete(id); request.reject(new Error(`PEER_REMOTE_ERROR: ${frame[4]}`))
+      clearRequestTimers(request); pending.delete(id); request.reject(new Error(`PEER_REMOTE_ERROR: ${frame[4]}`))
     } else throw new Error('PEER_RESPONSE_INVALID')
   }
 
-  const handshakeTimeout = setTimeout(() => fail(new Error('PEER_HANDSHAKE_TIMEOUT')), timeoutMs)
+  const handshakeTimer = setTimeout(() => fail(new Error('PEER_HANDSHAKE_TIMEOUT')), handshakeTimeoutMs)
   const reading = (async () => {
     try {
       for await (const bytes of options.connection.frames(controller.signal)) {
@@ -233,31 +271,39 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   })()
   const completion = Promise.all([reading, hints]).then(() => { if (failure !== null) throw failure })
   void completion.catch(() => undefined)
-  try { await options.connection.send(localHello); await ready }
-  catch (error) { fail(error); throw error }
-  finally { clearTimeout(handshakeTimeout) }
+  // Proof validation can finish before local HELLO dispatch settles. Its ready
+  // promise then cannot reject, so opening failures need an independent gate.
+  try {
+    await Promise.race([Promise.all([options.connection.send(localHello), ready]), openingFailure])
+    if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
+  }
+  catch (error) { fail(error); throw failure ?? error }
+  finally { clearTimeout(handshakeTimer); rejectOpening = undefined }
 
-  const requestRange = (feed: string | null, after: bigint, limit: number): Promise<readonly Uint8Array[]> => {
-    validateRange(after, limit)
+  const request = (limit: number, payloadHash: string | null,
+    fields: (id: number) => readonly CborValue[]): Promise<readonly Uint8Array[]> => {
     if (controller.signal.aborted) return Promise.reject(failure ?? new Error('PEER_CONNECTION_CLOSED'))
     if (pending.size >= 4 || nextRequest >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error('PEER_REQUEST_LIMIT_EXCEEDED'))
     const id = ++nextRequest
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => fail(new Error('PEER_RANGE_TIMEOUT')), timeoutMs)
-      pending.set(id, { limit, payloadHash: null, records: [], bytes: 0, resolve, reject, timer })
-      void send(['range', BigInt(id), feed, after, BigInt(limit)]).catch(fail)
+      const state: PendingRequest = { limit, payloadHash, records: [], bytes: 0, resolve, reject, responseStarted: false,
+        sendTimer: setTimeout(() => fail(new Error('PEER_REQUEST_SEND_TIMEOUT')), sendTimeoutMs), idleTimer: undefined,
+        lifetimeTimer: setTimeout(() => fail(new Error('PEER_REQUEST_LIFETIME_TIMEOUT')), requestTimeoutMs) }
+      pending.set(id, state)
+      void Promise.resolve().then(() => send(fields(id))).then(() => {
+        if (pending.get(id) !== state) return
+        clearTimeout(state.sendTimer); state.sendTimer = undefined
+        if (!state.responseStarted) responseProgress(state)
+      }).catch(fail)
     })
+  }
+  const requestRange = (feed: string | null, after: bigint, limit: number): Promise<readonly Uint8Array[]> => {
+    validateRange(after, limit)
+    return request(limit, null, id => ['range', BigInt(id), feed, after, BigInt(limit)])
   }
   const requestPayload = async (hash: string): Promise<Uint8Array | null> => {
     if (!validPayloadHash(hash)) throw new Error('PEER_PAYLOAD_REQUEST_INVALID')
-    if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
-    if (pending.size >= 4 || nextRequest >= Number.MAX_SAFE_INTEGER) throw new Error('PEER_REQUEST_LIMIT_EXCEEDED')
-    const id = ++nextRequest
-    const values = await new Promise<readonly Uint8Array[]>((resolve, reject) => {
-      const timer = setTimeout(() => fail(new Error('PEER_PAYLOAD_TIMEOUT')), timeoutMs)
-      pending.set(id, { limit: 1, payloadHash: hash, records: [], bytes: 0, resolve, reject, timer })
-      void send(['payload', BigInt(id), hash]).catch(fail)
-    })
+    const values = await request(1, hash, id => ['payload', BigInt(id), hash])
     return values[0] ?? null
   }
   const peer = remote as RemoteHello | null
@@ -277,7 +323,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     },
     async close() {
       if (!controller.signal.aborted) {
-        for (const request of pending.values()) { clearTimeout(request.timer); request.reject(new Error('PEER_CONNECTION_CLOSED')) }
+        for (const request of pending.values()) { clearRequestTimers(request); request.reject(new Error('PEER_CONNECTION_CLOSED')) }
         pending.clear(); controller.abort(); changes.close()
         await options.connection.close()
       }

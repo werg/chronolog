@@ -12,10 +12,13 @@ import { FeedTransport } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { framePeerStream } from './framing.js'
-import { openAuthenticatedPeerLink } from './peer-link.js'
+import { openAuthenticatedPeerLink, type AuthenticatedPeerLinkOptions } from './peer-link.js'
 
 const cleanup: Array<() => Promise<void>> = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+afterEach(async () => {
+  try { for (const close of cleanup.splice(0).reverse()) await close() }
+  finally { vi.useRealTimers() }
+})
 
 function connections() {
   const leftToRight = new TransformStream<Uint8Array, Uint8Array>(), rightToLeft = new TransformStream<Uint8Array, Uint8Array>()
@@ -56,7 +59,12 @@ async function payloadSession(readPayload: (hash: string) => Promise<Uint8Array 
 }
 
 async function rangeSession(range: 'records' | 'evidence', read: () => Promise<readonly Uint8Array[]>,
-  afterRecord?: () => Promise<void>) {
+  afterRecord?: () => Promise<void>, options: {
+    readonly beforeRequest?: () => Promise<void>
+    readonly afterRequest?: () => Promise<void>
+    readonly timeouts?: Pick<AuthenticatedPeerLinkOptions,
+      'handshakeTimeoutMs' | 'sendTimeoutMs' | 'responseIdleTimeoutMs' | 'requestTimeoutMs'>
+  } = {}) {
   const server = await portable(), client = await portable(), [outgoing, incoming] = connections()
   let active = true
   const sent: Uint8Array[] = []
@@ -68,17 +76,25 @@ async function rangeSession(range: 'records' | 'evidence', read: () => Promise<r
       await afterRecord?.()
     }
   } }
+  const clientConnection = { ...incoming, async send(bytes: Uint8Array) {
+    const frame = assertCanonicalCbor(bytes)
+    const request = Array.isArray(frame) && frame[2] === 'range'
+    if (request) await options.beforeRequest?.()
+    await incoming.send(bytes)
+    if (request) await options.afterRequest?.()
+  } }
   const local: FeedLink = { ...server.transport.asLink(), ...(range === 'records' ? { read } : { readEvidence: read }) }
   const groupId = new Uint8Array(32).fill(13), grantId = new Uint8Array(32).fill(14)
   const [serverLink, clientLink] = await Promise.all([
     openAuthenticatedPeerLink({ connection, local, groupId, grantId, identity: server.identity,
       authorizePeer: peer => active && equalBytes(peer.authorId, client.identity.publicKeyBytes) }),
-    openAuthenticatedPeerLink({ connection: incoming, local: client.transport.asLink(), groupId, grantId, identity: client.identity,
-      authorizePeer: peer => equalBytes(peer.authorId, server.identity.publicKeyBytes) }),
+    openAuthenticatedPeerLink({ connection: clientConnection, local: client.transport.asLink(), groupId, grantId, identity: client.identity,
+      authorizePeer: peer => equalBytes(peer.authorId, server.identity.publicKeyBytes), ...options.timeouts }),
   ])
   cleanup.push(async () => { await Promise.all([serverLink.close(), clientLink.close()]) })
-  return { sent, revoke: () => { active = false }, read: () => range === 'records'
-    ? clientLink.link.read(server.transport.identity, 0n, 8) : clientLink.link.readEvidence(0n, 8) }
+  return { sent, client: clientLink, hint: () => outgoing.send(encodeCanonicalCbor([1n, 'chronolog/peer/v1', 'changed'])),
+    revoke: () => { active = false }, read: (limit = 8) => range === 'records'
+    ? clientLink.link.read(server.transport.identity, 0n, limit) : clientLink.link.readEvidence(0n, limit) }
 }
 
 describe('authenticated framed range synchronization', () => {
@@ -191,6 +207,167 @@ describe('authenticated framed range synchronization', () => {
     session.revoke(); release()
     await expect(result).rejects.toThrow('PEER_READ_UNAUTHORIZED')
     expect(session.sent).toEqual([records[0]])
+  })
+
+  it.each(['records', 'evidence'] as const)('accepts a bounded %s range that keeps progressing beyond ten seconds', async range => {
+    const records = Array.from({ length: 64 }, (_, index) => utf8(`retained record ${index}`))
+    const session = await rangeSession(range, async () => records,
+      () => new Promise(resolve => { setTimeout(resolve, 250) }))
+    // Complete the real signature handshake before controlling time. Every
+    // validated response arrives within 250 ms, but the full legal range takes
+    // 16 seconds. An absolute ten-second range timer rejects healthy progress.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = session.read(64).then(value => ({ value }), error => ({ error }))
+    await vi.advanceTimersByTimeAsync(16_000)
+    expect(await result).toEqual({ value: records })
+  })
+
+  it('does not spend the response deadline waiting for local framed-send admission', async () => {
+    const records = [utf8('response after the request reaches its peer')]
+    const session = await rangeSession('records', async () => records, undefined,
+      { beforeRequest: () => new Promise(resolve => { setTimeout(resolve, 20_000) }) })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = session.read().then(value => ({ value }), error => ({ error }))
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(await result).toEqual({ value: records })
+  })
+
+  it('keeps the identity-proof deadline separate from request deadlines', async () => {
+    const client = await portable(), [clientConnection, unused] = connections()
+    cleanup.push(async () => { await Promise.all([clientConnection.close(), unused.close()]) })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = openAuthenticatedPeerLink({ connection: clientConnection, local: client.transport.asLink(),
+      groupId: new Uint8Array(32).fill(15), grantId: new Uint8Array(32).fill(16), identity: client.identity,
+      authorizePeer: () => true }).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(await result).toEqual(new Error('PEER_HANDSHAKE_TIMEOUT'))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('rejects opening when proof succeeds but local HELLO dispatch misses its deadline', async () => {
+    const client = await portable(), server = await portable(), [clientConnection, serverConnection] = connections()
+    let release!: () => void, verified!: () => void, outcome = 'pending'
+    const heldSend = new Promise<void>(resolve => { release = resolve })
+    const proofVerified = new Promise<void>(resolve => { verified = resolve })
+    cleanup.push(async () => { release(); await Promise.all([clientConnection.close(), serverConnection.close()]) })
+    const delayed = { ...clientConnection, async send(bytes: Uint8Array) {
+      await clientConnection.send(bytes)
+      const frame = assertCanonicalCbor(bytes)
+      if (Array.isArray(frame) && frame[2] === 'hello') await heldSend
+    } }
+    const groupId = new Uint8Array(32).fill(17), grantId = new Uint8Array(32).fill(18)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const opening = openAuthenticatedPeerLink({ connection: delayed, local: client.transport.asLink(),
+      groupId, grantId, identity: client.identity, authorizePeer: () => { verified(); return true } })
+      .then(session => { outcome = 'opened'; return session }, (error: unknown) => { outcome = 'failed'; return error })
+    const remote = await openAuthenticatedPeerLink({ connection: serverConnection, local: server.transport.asLink(),
+      groupId, grantId, identity: server.identity, authorizePeer: () => true })
+    cleanup.push(() => remote.close())
+    await proofVerified
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(outcome).toBe('failed')
+    expect(await opening).toEqual(new Error('PEER_HANDSHAKE_TIMEOUT'))
+    release()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(outcome).toBe('failed')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('expires a dispatched request after response silence', async () => {
+    const session = await rangeSession('records', () => new Promise(() => undefined))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    let settled = false
+    const result = session.read().catch((error: unknown) => { settled = true; return error })
+    await vi.advanceTimersByTimeAsync(29_999)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await result).toEqual(new Error('PEER_RESPONSE_IDLE_TIMEOUT'))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not let hints or another request refresh a silent request', async () => {
+    let reads = 0
+    const session = await rangeSession('records', () => ++reads === 1 ? new Promise(() => undefined)
+      : Promise.resolve(Array.from({ length: 64 }, () => utf8('unrelated response'))),
+    () => new Promise(resolve => { setTimeout(resolve, 250) }), { timeouts: { responseIdleTimeoutMs: 1_000 } })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const silent = session.read().catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    const progressing = session.read(64).catch((error: unknown) => error)
+    for (let index = 0; index < 3; index += 1) { await vi.advanceTimersByTimeAsync(300); await session.hint() }
+    await vi.advanceTimersByTimeAsync(100)
+    expect(await silent).toEqual(new Error('PEER_RESPONSE_IDLE_TIMEOUT'))
+    expect(await progressing).toEqual(new Error('PEER_RESPONSE_IDLE_TIMEOUT'))
+  })
+
+  it('keeps the hard request lifetime fixed despite valid progress', async () => {
+    const records = Array.from({ length: 64 }, (_, index) => utf8(`slow record ${index}`))
+    const session = await rangeSession('records', async () => records,
+      () => new Promise(resolve => { setTimeout(resolve, 2_500) }))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = session.read(64).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(await result).toEqual(new Error('PEER_REQUEST_LIFETIME_TIMEOUT'))
+    expect(session.sent.length).toBeGreaterThan(40)
+    expect(session.sent.length).toBeLessThan(64)
+  })
+
+  it('bounds a blocked local dispatch and clears its request timers', async () => {
+    const session = await rangeSession('records', async () => [], undefined,
+      { beforeRequest: () => new Promise(() => undefined) })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = session.read().catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(await result).toEqual(new Error('PEER_REQUEST_SEND_TIMEOUT'))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('clears every deadline on close while a request is still queued', async () => {
+    let release!: () => void
+    const queued = new Promise<void>(resolve => { release = resolve })
+    const session = await rangeSession('records', async () => [], undefined, { beforeRequest: () => queued })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = session.read().catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.getTimerCount()).toBe(2)
+    await session.client.close()
+    expect(await result).toEqual(new Error('PEER_CONNECTION_CLOSED'))
+    expect(vi.getTimerCount()).toBe(0)
+    release()
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not revive deadlines when a completed response precedes send resolution', async () => {
+    let release!: () => void, sends = 0
+    const queued = new Promise<void>(resolve => { release = resolve })
+    const records = [utf8('response completed before local send resolved')]
+    const session = await rangeSession('records', async () => records, undefined,
+      { afterRequest: async () => { if (++sends === 1) await queued } })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = session.read()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await result).toEqual(records)
+    expect(vi.getTimerCount()).toBe(0)
+    release()
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(await session.read()).toEqual(records)
+  })
+
+  it('does not extend response silence when local send resolves after the first record', async () => {
+    let release!: () => void
+    const queued = new Promise<void>(resolve => { release = resolve })
+    const session = await rangeSession('records', async () => [utf8('first record; completion stalls')],
+      () => new Promise(() => undefined), { afterRequest: () => queued, timeouts: { responseIdleTimeoutMs: 1_000 } })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const result = session.read().catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(900)
+    expect(session.sent).toHaveLength(1)
+    release()
+    await vi.advanceTimersByTimeAsync(100)
+    expect(await result).toEqual(new Error('PEER_RESPONSE_IDLE_TIMEOUT'))
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('verifies a received body independently of the authenticated sender', async () => {

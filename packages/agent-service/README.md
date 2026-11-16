@@ -272,20 +272,30 @@ admission. A previously final intent and an in-flight external action need the
 provider's explicit cancellation/reconciliation policy; the log does not make
 an external call atomic with a later cancellation.
 
-## Direct and relayed connections
+## Authenticated peer connections
+
+The default browser/native composition uses the reliable ordered data channel
+from [`@chronolog/transport-webrtc`](../transport-webrtc/README.md). The page
+negotiates the connection and synchronously transfers its untouched channel to
+the exclusive replica Worker. The Worker frames the channel, awaits the bounded
+framing handshake, then authenticates the Chronolog peer and attaches replication.
+A reachable resident accepts one direct HTTPS offer/answer; optional Tendriller
+rendezvous requires both endpoints to join the same attempt. Neither introduction
+path carries application frames or supplies an automatic hosted data fallback.
 
 `framePeerStream` adapts a reliable `ReadableStream`/`WritableStream` pair to
 bounded length-prefixed frames, backpressure, cancellation, and truncated-frame
-errors. Use an appropriate encrypted production transport such as WSS/QUIC; the
-framing code is not a replacement for transport security or a NAT traversal
-implementation.
+errors when a deployment explicitly selects a generic stream transport. Supply
+appropriate transport security, such as WSS/QUIC; length framing does not provide
+encryption or NAT traversal.
 
 `openAuthenticatedPeerLink` adds a mutual nonce/signature handshake bound to
 group identity and each participant's active read grant. It creates an ordinary
 `FeedLink` for the existing retained feed/evidence pull protocol. It never trusts
-rendezvous hints or a relay login as database membership. Every range request
-rechecks the receiver's known active grant. A connection can carry records by
-other original authors; endpoint and record identities remain distinct.
+rendezvous hints or a host login as database membership. Each record or payload
+release rechecks the receiver's known active grant, including after asynchronous
+storage reads or previous writes. A connection can carry records by other
+original authors; endpoint and record identities remain distinct.
 
 `readPayload(hash)` requests one detached application envelope by its SHA-256
 address. Header/evidence synchronization does not request these bodies. The
@@ -315,6 +325,29 @@ handling. There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement
 before making direct-connect, relay-bandwidth, or cost claims.
+
+`openAuthenticatedPeerLink` separates four deadline options:
+
+| Option | Default | Bound being enforced |
+| --- | --- | --- |
+| `handshakeTimeoutMs` | 10 seconds | Absolute identity-proof deadline, including a blocked initial send. |
+| `sendTimeoutMs` | 30 seconds | Local request dispatch through the framed connection. |
+| `responseIdleTimeoutMs` | 30 seconds | Silence after dispatch or the last validated record for that request. |
+| `requestTimeoutMs` | 120 seconds | Absolute request lifetime, including dispatch and every response. |
+
+Values are positive integer milliseconds. Authentication permits at most
+60 seconds; each other option permits at most 120 seconds. The dispatch and
+idle defaults allow the RTC adapter's ordinary 30-second frame-send budget.
+These limits apply to feed ranges, evidence ranges and detached payload reads.
+
+Validated record progress restarts only that request's idle deadline. Change
+hints, ephemeral signals and another request's responses do not extend it, and
+no progress extends the original hard lifetime. Responses may arrive before the
+local send promise settles; a late send completion cannot restart their idle
+deadline or revive a completed request. Silence, blocked dispatch or lifetime
+expiry fails the session and rejects its pending requests. Completion, remote
+errors, cancellation and session failure clear every request timer. Reconnection
+resumes from retained verified history with the original operation identities.
 
 `EphemeralChannel` signs group/topic/grant/session/sequence/expiry and checks the
 receiver's current capabilities. It bounds active replay sessions, send/receive
