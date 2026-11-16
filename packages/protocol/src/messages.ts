@@ -59,7 +59,7 @@ function metadataFromCbor(value: CborValue): ReadonlyMap<string, Uint8Array> {
 
 function transactionToCbor(value: TransactionCore): CborValue {
   protocolInvariant(typeof value.operationId === 'string' && value.operationId.length > 0 && value.operationId.length <= 512 &&
-    !/[\u0000-\u001f]/u.test(value.operationId), 'SCHEMA_INVALID', 'Operation identity must be bounded nonempty text')
+    [...value.operationId].every((character) => character.charCodeAt(0) >= 32), 'SCHEMA_INVALID', 'Operation identity must be bounded nonempty text')
   for (const [field, bytes] of [
     ['groupId', value.groupId], ['membershipRevision', value.membershipRevision],
     ['validationPolicy', value.validationPolicy], ['authorId', value.authorId],

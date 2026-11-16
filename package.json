@@ -70,7 +70,8 @@
     "vitest": "^3.2.4",
     "@chronolog/agent-service": "workspace:*",
     "@chronolog/control-store": "workspace:*",
-    "@chronolog/materializer": "workspace:*"
+    "@chronolog/materializer": "workspace:*",
+    "@chronolog/capabilities": "workspace:*"
   },
   "pnpm": {
     "ignoredBuiltDependencies": [

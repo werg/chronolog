@@ -21,7 +21,8 @@ export interface AgentApplicationContext {
   readonly publisher: FinalEventPublisher
   readonly sourceId: string
   createSignals(options: { readonly grantId: Uint8Array; readonly send: (frame: Uint8Array) => Promise<void> }): Promise<EphemeralChannel>
-  connectPeer(options: { readonly connection: FramedPeerConnection; readonly grantId?: Uint8Array; readonly signals?: EphemeralChannel }): Promise<{
+  connectPeer(options: { readonly connection: FramedPeerConnection; readonly grantId?: Uint8Array;
+    readonly signals?: Pick<EphemeralChannel, 'receive'> }): Promise<{
     readonly completion: Promise<void>
     sendSignal(frame: Uint8Array): Promise<void>
     close(): Promise<void>

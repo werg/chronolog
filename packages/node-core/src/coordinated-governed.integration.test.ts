@@ -168,13 +168,24 @@ describe('governed coordinated native replicas', () => {
     expect(newcomer.governance.snapshot.revision).toBe(2n)
     expect(newcomer.activeSnapshot.revision).toBe(1n)
     await newcomer.transport.publish(delayed.envelope)
-    await certify()
+    // Consume the unfinalized proposal before recording notification progress.
+    // Its later authorization rejection changes finality without changing SQL.
     for (const peer of peers) {
+      await peer.transport.catchUp()
+      for (const record of await peer.transport.history()) await peer.node.ingest(record)
+      await peer.node.waitForIdle()
+    }
+    const beforeRejection = peers.map((peer) => ({ revision: peer.node.revision, sql: peer.node.materializedRevision, final: peer.node.finalOrderLength }))
+    await certify()
+    for (const [index, peer] of peers.entries()) {
       expect(peer.activeSnapshot.revision).toBe(2n)
       expect(peer.node.outcome(delayed.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'WRITER_UNAUTHORIZED' })
       expect(peer.node.isFinal(delayed.txId)).toBe(true)
       expect(peer.node.outcome(accepted.txId)?.outcome).toBe('accepted')
       expect(peer.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows).toEqual(priorRows)
+      expect(peer.node.materializedRevision).toBe(beforeRejection[index]!.sql)
+      expect(peer.node.finalOrderLength).toBe(beforeRejection[index]!.final)
+      expect(peer.node.revision).toBeGreaterThan(beforeRejection[index]!.revision)
     }
     expect((await progress()).state).toBe('revoked')
 

@@ -272,7 +272,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     const release = (): void => {
       if (released) return
       released = true
-      try { reader!.close() }
+      try { reader.close() }
       finally { try { removeBranchIfPresent(this.#writer, branch) } finally { this.#readLeases.delete(release) } }
     }
     this.#readLeases.add(release)

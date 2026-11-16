@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url'
 
 import { DeterministicMaterializer as NativeMaterializer, createDoltLiteExecutionManifest } from '@chronolog/materializer-doltlite'
 import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/browser'
-import { sqlStatement, sqlValue } from '@chronolog/protocol'
+import { emit, sqlStatement, sqlValue } from '@chronolog/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { admitted, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
@@ -163,6 +163,48 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       const n = native.prepare(sql); const w = browser.prepare(sql)
       try { expect(w.get(...vectors, ...vectors)).toEqual(n.get(...vectors, ...vectors)) }
       finally { n.finalize?.(); w.finalize?.() }
+    } finally { native.close(); browser.close() }
+  })
+
+  it('executes mixed SQL/events atomically and retains a read view across later accepted changes', async () => {
+    const executionManifest = createDoltLiteExecutionManifest()
+    const options = { executionManifest, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
+    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'events.db') })
+    const browser = await DeterministicMaterializer.open({ ...options, path: '/events.db', openDatabase: factory })
+    try {
+      const digest = native.executionManifestDigest
+      const setup = await admitted(1n, 'events-schema', [
+        'CREATE TABLE tasks(id INTEGER PRIMARY KEY, value TEXT NOT NULL)',
+        "INSERT INTO tasks(id,value) VALUES(1,'initial')",
+      ], digest)
+      const accepted = await admitted(2n, 'events-mixed', [
+        "UPDATE tasks SET value='accepted' WHERE id=1", emit('tasks.changed', { id: 1, value: 'accepted' }),
+      ], digest)
+      const rejected = await admitted(3n, 'events-rollback', [
+        "UPDATE tasks SET value='rollback' WHERE id=1", emit('tasks.changed', { id: 1, value: 'rollback' }),
+        "SELECT chronolog_assert(0,'rollback_sql_and_event')",
+      ], digest)
+      const successor = await admitted(4n, 'events-successor', [
+        "UPDATE tasks SET value='successor' WHERE id=1", emit('tasks.changed', { id: 1, value: 'successor' }),
+      ], digest)
+      for (const engine of [native, browser]) {
+        await engine.materialize([setup, accepted, rejected])
+        await engine.publishFinal(3)
+        expect(engine.outcome(accepted.txId)?.outcome).toBe('accepted')
+        expect(engine.outcome(rejected.txId)?.outcome).toBe('rejected')
+        const held = engine.captureRead({ view: 'final' })
+        const captured = held.query('SELECT value FROM tasks').rows
+        try {
+          await engine.materialize([setup, accepted, rejected, successor])
+          await engine.publishFinal(4)
+          expect(held.query('SELECT value FROM tasks').rows).toEqual(captured)
+          expect(engine.localSql('SELECT value FROM tasks').rows).not.toEqual(captured)
+        } finally { held.release() }
+        expect(() => held.query('SELECT value FROM tasks')).toThrow('SNAPSHOT_RELEASED')
+      }
+      expect(browser.transactionLog()).toEqual(native.transactionLog())
+      expect(browser.databaseContentHash).toBe(native.databaseContentHash)
+      expect(browser.localSql('SELECT value FROM tasks').rows).toEqual(native.localSql('SELECT value FROM tasks').rows)
     } finally { native.close(); browser.close() }
   })
 })

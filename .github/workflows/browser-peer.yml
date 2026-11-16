@@ -38,6 +38,8 @@ jobs:
         run: pnpm exec vitest run packages/runtime-browser/src/wasm-conformance.test.ts
       - name: Install real Chromium with platform dependencies
         run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify SQL-free events, native framed authority and abrupt OPFS checkpoints
+        run: node --import tsx tools/test-browser-events.ts
       - name: Qualify Worker ownership, OPFS recovery and the public client
         run: node --import tsx tools/test-browser-peer.ts
       - name: Qualify enrolled browser and native agents claiming one shared task
@@ -51,5 +53,7 @@ jobs:
             artifacts/wasm/manifest.json
             artifacts/browser-qualification/report.json
             artifacts/browser-bridge/report.json
+            artifacts/browser-events/report.json
+            artifacts/browser-events/bundle.json
           if-no-files-found: error
           retention-days: 30

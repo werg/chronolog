@@ -16,6 +16,9 @@ importers:
       '@chronolog/agent-service':
         specifier: workspace:*
         version: link:packages/agent-service
+      '@chronolog/capabilities':
+        specifier: workspace:*
+        version: link:packages/capabilities
       '@chronolog/client':
         specifier: workspace:*
         version: link:packages/client

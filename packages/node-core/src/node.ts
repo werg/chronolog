@@ -1128,6 +1128,7 @@ export class ChronologNode {
   async #applyMaterializedOrder(): Promise<void> {
     if (!this.#materializationPending) return
     const previousFinalLength = this.finalOrderLength
+    const previousAppliedThrough = this.#coordinatedAppliedThrough
     await this.#processCoordinatedHistory()
     const ordered: AdmittedTransaction[] = this.#control.orderedCandidates().map((candidate) => {
       const core = this.#candidateCores.get(this.#idKey(candidate.txId))
@@ -1199,7 +1200,8 @@ export class ChronologNode {
     const recovered = this.#materializationError !== undefined
     this.#materializationError = undefined
     this.#applicationChanges.notify()
-    if (coordinated !== null || this.finalOrderLength !== previousFinalLength || recovered) this.#emit('materialized')
+    if (coordinated !== null || this.finalOrderLength !== previousFinalLength ||
+        this.#coordinatedAppliedThrough !== previousAppliedThrough || recovered) this.#emit('materialized')
   }
 
   #scheduleMaterialization(): void {

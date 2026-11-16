@@ -1,0 +1,103 @@
+import { ChronologClient, type ClientReadView } from '@chronolog/client'
+import { emit, program, type EventPayload, type EventReadOptions } from '@chronolog/protocol'
+import { WorkerRpcTransport } from '@chronolog/runtime-browser/events'
+
+import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contract.js'
+
+class EventPeer {
+  readonly worker = new Worker('/event-worker.js', { type: 'module' })
+  readonly rpc = new WorkerRpcTransport(this.worker)
+  readonly views = new Map<string, ClientReadView>()
+  readonly #pending = new Map<number, { resolve(value: unknown): void; reject(error: unknown): void }>()
+  readonly #pauses: Array<(value: unknown) => void> = []
+  #next = 1
+  #name = ''
+  client!: ChronologClient
+  constructor() {
+    this.worker.addEventListener('message', (event: MessageEvent) => {
+      const response = event.data as { fixture?: string; id?: number; value?: unknown; error?: string }
+      if (response.fixture === 'paused') { this.#pauses.shift()?.(response); return }
+      if (response.fixture !== 'response' || response.id === undefined) return
+      const pending = this.#pending.get(response.id)
+      this.#pending.delete(response.id)
+      if (response.error === undefined) pending?.resolve(response.value)
+      else pending?.reject(new Error(response.error))
+    })
+  }
+  async open(name: string, bootstrap: BrowserEventBootstrap) {
+    this.#name = name
+    const result = await this.command('open', { name, bootstrap }) as { groupId: string; identity: string; isolated: boolean }
+    this.client = new ChronologClient({ groupId: result.groupId, transport: this.rpc, unaryRetryAttempts: 1 })
+    return result
+  }
+  command(fixture: string, fields: Record<string, unknown> = {}): Promise<unknown> {
+    const id = this.#next++
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.#pending.delete(id); reject(new Error(`Event Worker fixture timed out: ${fixture}`)) }, 30_000)
+      this.#pending.set(id, { resolve(value) { clearTimeout(timer); resolve(value) }, reject(error) { clearTimeout(timer); reject(error) } })
+      this.worker.postMessage({ fixture, id, ...fields })
+    })
+  }
+  async publish(events: readonly { topic: string; payload: EventPayload }[], operationId: string) {
+    const handle = await this.client.submit(program(...events.map((event) => emit(event.topic, event.payload))), { operationId })
+    try { return { proposalId: handle.proposalId, outcome: await handle.final({ signal: AbortSignal.timeout(20_000) }) } }
+    finally { handle.dispose() }
+  }
+  async crash(fixture: string, fields: Record<string, unknown>) {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      const paused = new Promise((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Event Worker crash point not reached: ${fixture}`)), 30_000)
+        this.#pauses.push(resolve)
+      })
+      const running = this.command(fixture, fields)
+      // Killing a Worker deliberately prevents its command response.
+      void running.catch(() => undefined)
+      const result = await Promise.race([paused, running.then(() => { throw new Error('EVENT_BROWSER_PAUSE_NOT_REACHED') })])
+      this.worker.terminate()
+      for (const pending of this.#pending.values()) pending.reject(new Error('FIXTURE_WORKER_TERMINATED'))
+      this.#pending.clear()
+      await navigator.locks.request(`chronolog:${this.#name}`, { mode: 'exclusive' }, () => undefined)
+      return result
+    } finally { if (timeout !== undefined) clearTimeout(timeout) }
+  }
+  async close() { try { await this.client?.close(); await this.rpc.close() } finally { this.worker.terminate() } }
+}
+
+const peers = new Map<string, EventPeer>()
+const api = {
+  async prepare(name: string): Promise<BrowserEventIdentity> {
+    const peer = new EventPeer()
+    try { return await peer.command('prepare', { name }) as BrowserEventIdentity }
+    finally { peer.worker.terminate() }
+  },
+  async open(id: string, name: string, bootstrap: BrowserEventBootstrap) {
+    const peer = new EventPeer()
+    try { const result = await peer.open(name, bootstrap); peers.set(id, peer); return result }
+    catch (error) { peer.worker.terminate(); throw error }
+  },
+  publish(id: string, events: readonly { topic: string; payload: EventPayload }[], operationId: string) { return peers.get(id)!.publish(events, operationId) },
+  read(id: string, options: EventReadOptions = {}) { return peers.get(id)!.client.events.read(options) },
+  async readNext(id: string, options: EventReadOptions) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 20_000)
+    try { for await (const batch of peers.get(id)!.client.events.subscribe({ ...options, signal: controller.signal })) return batch }
+    finally { clearTimeout(timeout); controller.abort() }
+    throw new Error('EVENT_BROWSER_SUBSCRIPTION_ENDED')
+  },
+  async capture(id: string, viewId: string) { const view = await peers.get(id)!.client.readView(); peers.get(id)!.views.set(viewId, view); return view.revision },
+  viewEvents(id: string, viewId: string) { return peers.get(id)!.views.get(viewId)!.readEvents() },
+  async release(id: string, viewId: string) { await peers.get(id)!.views.get(viewId)!.release() },
+  async sql(id: string) { return peers.get(id)!.client.query('SELECT 1') },
+  state(id: string) { return peers.get(id)!.command('state') },
+  checkpoint(id: string, fields: { cursor: string; revision: string; state: string }) { return peers.get(id)!.command('checkpoint', fields) },
+  checkpointState(id: string) { return peers.get(id)!.command('checkpointState') },
+  cutoff(id: string, cutoff?: string) { return peers.get(id)!.command('privateCutoff', cutoff === undefined ? {} : { cutoff }) },
+  crashCheckpoint(id: string, fields: { cursor: string; revision: string; state: string; pause: 'before' | 'after' }) {
+    return peers.get(id)!.crash('checkpoint', fields)
+  },
+  crashCutoff(id: string, cutoff: string) { return peers.get(id)!.crash('crashCutoff', { cutoff }) },
+  async close(id: string) { await peers.get(id)!.close(); peers.delete(id) },
+}
+Object.assign(globalThis, { chronologEventTest: api })
+export type BrowserEventTestApi = typeof api

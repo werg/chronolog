@@ -27,7 +27,7 @@ describe('SQL-free durable event execution', () => {
     expect(first.queries.outcome(one.txId)?.outcome).toBe('accepted')
     expect(first.queries.outcome(conflict.txId)?.rejectionCode).toBe('operation_conflict')
     expect(first.queries.outcome(sql.txId)?.rejectionCode).toBe('profile:sql-disabled')
-    first.close()
+    await first.close()
     const reopened = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
     expect(reopened.queries.finalOrderLength).toBe(3)
     expect(reopened.queries.outcome(one.txId)?.outcome).toBe('accepted')

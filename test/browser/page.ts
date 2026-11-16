@@ -1,4 +1,5 @@
-import { ChronologClient, type QueryOptions } from '@chronolog/client'
+import { ChronologClient, type ClientReadView, type QueryOptions } from '@chronolog/client'
+import { emit, program, sqlStatement } from '@chronolog/protocol'
 import { WorkerRpcTransport } from '@chronolog/runtime-browser'
 
 class TestPeer {
@@ -8,6 +9,7 @@ class TestPeer {
   #next = 1
   #name = ''
   client!: ChronologClient
+  readonly views = new Map<string, ClientReadView>()
   readonly rpc = new WorkerRpcTransport(this.worker)
 
   constructor() {
@@ -43,6 +45,15 @@ class TestPeer {
     try { await handle.accepted(); return handle.transactionId } finally { handle.dispose() }
   }
   async query(sql: string, options: QueryOptions = {}) { return this.client.query(sql, [], options) }
+  async change(value: string, operationId: string, reject = false) {
+    const handle = await this.client.submit(program(
+      sqlStatement('UPDATE notes SET value=? WHERE id=1', [value]),
+      emit('notes.changed', { id: 1, value }),
+      ...(reject ? [sqlStatement("SELECT chronolog_assert(0,'mixed_event_rollback')")] : []),
+    ), { operationId })
+    try { return { proposalId: handle.proposalId, outcome: await handle.settled() } }
+    finally { handle.dispose() }
+  }
   async stop() { try { await this.rpc.close() } finally { this.worker.terminate() } }
   async crash(steps: string[], operationId: string, point: 'prepared' | 'application'): Promise<unknown> {
     await this.command(point === 'prepared' ? 'armPrepared' : 'armApplication', { operationId })
@@ -71,6 +82,18 @@ const test = {
     catch (error) { peer.worker.terminate(); throw error }
   },
   submit(id: string, steps: string[], operationId: string) { return peers.get(id)!.submit(steps, operationId) },
+  change(id: string, value: string, operationId: string, reject = false) { return peers.get(id)!.change(value, operationId, reject) },
+  events(id: string) { return peers.get(id)!.client.events.read() },
+  async capture(id: string, viewId: string) {
+    const view = await peers.get(id)!.client.readView()
+    peers.get(id)!.views.set(viewId, view)
+    return view.revision
+  },
+  async view(id: string, viewId: string) {
+    const view = peers.get(id)!.views.get(viewId)!
+    return { rows: (await view.query('SELECT value FROM notes WHERE id=1')).rows, events: await view.readEvents() }
+  },
+  async release(id: string, viewId: string) { await peers.get(id)!.views.get(viewId)!.release() },
   async query(id: string, sql: string, options: QueryOptions = {}) { return (await peers.get(id)!.query(sql, options)).result.rows },
   state(id: string) { return peers.get(id)!.command('state') },
   advanceFinal(id: string) { return peers.get(id)!.command('advanceFinal') },

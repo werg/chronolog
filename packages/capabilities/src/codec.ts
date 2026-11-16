@@ -41,7 +41,8 @@ function grantToCbor(grant: CapabilityGrant): CborValue {
   if (grant.program !== undefined) {
     protocolInvariant(grant.role === 'writer' && typeof grant.program.sql === 'boolean', 'SCHEMA_INVALID', 'Only writer grants carry program rights')
     for (const topics of [grant.program.topics, grant.program.signals]) {
-      protocolInvariant(Array.isArray(topics) && topics.length <= 128 && new Set(topics).size === topics.length, 'SCHEMA_INVALID', 'Invalid publication scopes')
+      const input: unknown = topics
+      protocolInvariant(Array.isArray(input) && topics.length <= 128 && new Set(topics).size === topics.length, 'SCHEMA_INVALID', 'Invalid publication scopes')
       topics.forEach((topic) => { if (topic !== '*') assertEventTopic(topic) })
     }
     protocolInvariant(grant.program.forwarded === undefined || typeof grant.program.forwarded === 'boolean', 'SCHEMA_INVALID', 'Invalid forwarding right')
