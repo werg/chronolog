@@ -60,7 +60,7 @@ export function createGovernanceRpcAdmin(options: {
       if (grant.role !== 'reader' && grant.hpkePublicKey !== undefined) {
         throw invalid('hpkePublicKey is valid only for reader grants')
       }
-      const signed = await operation(() => options.governance.publishCapabilityChange({ grants: [grant] }, options.rootPrivateKey))
+      const signed = await operation(() => options.governance.publishCapabilityChange({ grants: [grant] }, options.rootPrivateKey, { operationId: request.requestId }))
       return {
         revision: signed.revision.revision.toString(10),
         capabilityId: base64url(await capabilityId(signed.revision.grants[0]!)),
@@ -70,12 +70,12 @@ export function createGovernanceRpcAdmin(options: {
     async revokeCapabilities(request) {
       if (request.capabilityIds.length === 0) throw invalid('capabilityIds must not be empty')
       const ids = request.capabilityIds.map((value) => bytes(value, 'capabilityId', 32))
-      const signed = await operation(() => options.governance.revoke(ids, options.rootPrivateKey))
+      const signed = await operation(() => options.governance.revoke(ids, options.rootPrivateKey, { operationId: request.requestId }))
       return { revision: signed.revision.revision.toString(10), revokedCapabilityIds: ids.map(base64url) }
     },
 
-    async rotateEpoch() {
-      const signed = await operation(() => options.governance.rotateEpoch(options.rootPrivateKey))
+    async rotateEpoch(request) {
+      const signed = await operation(() => options.governance.rotateEpoch(options.rootPrivateKey, undefined, { operationId: request.requestId }))
       return { epoch: signed.manifest.epoch.toString(10) }
     },
 
@@ -83,6 +83,7 @@ export function createGovernanceRpcAdmin(options: {
       const published = await operation(() => options.governance.grantHistoricalAccess(
         publicKey(request.subjectId, 'subjectId'),
         options.rootPrivateKey,
+        { operationId: request.requestId },
       ))
       return { epochManifestsPublished: published }
     },

@@ -8,15 +8,45 @@ import {
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { CapabilityMembershipResolver } from './capability-membership.js'
 import { GovernanceControlPlane } from './governance.js'
+import { MemoryOperationStore, type DurableOperationStore } from './operations.js'
 
 const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('replicated governance control plane', () => {
+  it('recovers the original grant after a lost append response and restart', async () => {
+    const operationStore = new MemoryOperationStore()
+    const fixture = await governanceFixture(operationStore)
+    const publish = fixture.adminTransport.publish.bind(fixture.adminTransport)
+    let loseResponse = true
+    vi.spyOn(fixture.adminTransport, 'publish').mockImplementation(async (...args) => {
+      const record = await publish(...args)
+      if (loseResponse) { loseResponse = false; throw new Error('lost append response') }
+      return record
+    })
+    const change = { grants: [grant(bytes32(45), 'writer')] }
+    await expect(fixture.admin.publishCapabilityChange(change, fixture.root.privateKey, { operationId: 'approval-1' }))
+      .rejects.toThrow('lost append response')
+    await fixture.admin.close()
+    const reopened = await GovernanceControlPlane.create({
+      genesis: fixture.genesis, groupRoute: fixture.groupRoute,
+      transport: fixture.adminTransport, identity: fixture.root, operationStore,
+      recipient: { id: fixture.root.publicKeyBytes, privateKey: fixture.rootHpke.privateKey },
+    })
+    controllers.push(reopened)
+    await reopened.start()
+    const original = await reopened.publishCapabilityChange(change, fixture.root.privateKey, { operationId: 'approval-1' })
+    expect(original.revision.revision).toBe(1n)
+    expect(reopened.snapshot.revision).toBe(1n)
+    expect(await fixture.adminTransport.history()).toHaveLength(1)
+    await expect(reopened.publishCapabilityChange({ grants: [grant(bytes32(46), 'writer')] }, fixture.root.privateKey, { operationId: 'approval-1' }))
+      .rejects.toThrow('OPERATION_ID_CONFLICT')
+  })
+
   it('serializes concurrent authoring across signing and durable publication', async () => {
     const fixture = await governanceFixture()
     const [first, second] = await Promise.all([
@@ -60,11 +90,14 @@ describe('replicated governance control plane', () => {
     const resolver = new CapabilityMembershipResolver({
       snapshotForRevision: (digest) => participant.snapshotForRevision(digest),
     })
+    const writerCapability = [...participant.snapshot.capabilities.values()].find((item) =>
+      item.grant.role === 'writer' && Buffer.from(item.grant.signingPublicKey).equals(participantSigning.publicKeyBytes))!.id
     expect(await resolver.canWrite({
       groupId: fixture.groupId,
       membershipRevision: participant.snapshot.revisionDigest,
       validationPolicy: policyId,
       writerId: participantSigning.publicKeyBytes,
+      writerCapability,
     })).toBe(true)
 
     await fixture.admin.rotateEpoch(fixture.root.privateKey, bytes32(90))
@@ -82,6 +115,7 @@ describe('replicated governance control plane', () => {
       membershipRevision: participant.snapshot.revisionDigest,
       validationPolicy: policyId,
       writerId: participantSigning.publicKeyBytes,
+      writerCapability,
     })).toBe(false)
     const revokedValidator = participantCapabilities.find((id) => {
       const capability = participant.snapshot.capabilities.get(Buffer.from(id).toString('hex'))
@@ -120,7 +154,7 @@ describe('replicated governance control plane', () => {
   })
 })
 
-async function governanceFixture() {
+async function governanceFixture(operationStore?: DurableOperationStore) {
   const network = new MemoryTransportNetwork()
   const adminTransport = network.createNode('admin')
   const root = await generateEd25519KeyPair()
@@ -152,10 +186,11 @@ async function governanceFixture() {
     transport: adminTransport,
     identity: root,
     recipient: { id: root.publicKeyBytes, privateKey: rootHpke.privateKey },
+    ...(operationStore === undefined ? {} : { operationStore }),
   })
   controllers.push(admin)
   await admin.start()
-  return { network, root, genesis, admin, groupId, groupRoute, policy }
+  return { network, root, rootHpke, adminTransport, genesis, admin, groupId, groupRoute, policy }
 }
 
 function grant(

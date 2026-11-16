@@ -44,7 +44,7 @@ describe('governance admin RPC adapter', () => {
     expect(publishCapabilityChange).toHaveBeenCalledWith({ grants: [expect.objectContaining({
       role: 'validator',
       minimumAuthorTimestampMs: 12_345n,
-    })] }, expect.anything())
+    })] }, expect.anything(), { operationId: 'grant' })
   })
 
   it('rejects ambiguous keys and invalid reader grants', async () => {

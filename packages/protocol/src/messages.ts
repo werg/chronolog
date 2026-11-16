@@ -19,6 +19,8 @@ export interface TransactionCore {
   readonly membershipRevision: Uint8Array
   readonly validationPolicy: Uint8Array
   readonly authorId: Uint8Array
+  /** Exact writer grant; required by governed groups, unused by static membership. */
+  readonly writerCapability?: Uint8Array
   readonly authorTimestampMs: bigint
   readonly nonce: Uint8Array
   readonly executionManifestDigest: Uint8Array
@@ -62,11 +64,12 @@ function transactionToCbor(value: TransactionCore): CborValue {
   protocolInvariant(value.authorTimestampMs >= 0n && value.authorTimestampMs <= (1n << 63n) - 1n, 'INTEGER_OUT_OF_RANGE', 'Author timestamp must be a nonnegative int64')
   protocolInvariant(value.nonce.length >= 16, 'SCHEMA_INVALID', 'Transaction nonce must contain at least 16 bytes')
   protocolInvariant(value.executionManifestDigest.length === 32, 'SCHEMA_INVALID', 'Execution-manifest digest must contain 32 bytes')
+  if (value.writerCapability !== undefined) protocolInvariant(value.writerCapability.length === 32, 'SCHEMA_INVALID', 'Writer capability must contain 32 bytes')
   assertValidSqlTransactionProgram(value.program)
   return integerMap([
     [0, 1n], [1, value.groupId], [2, value.membershipRevision], [3, value.validationPolicy],
     [4, value.authorId], [5, value.authorTimestampMs], [6, value.nonce], [7, value.executionManifestDigest],
-    [8, sqlTransactionProgramToCanonicalCbor(value.program)], [9, metadataToCbor(value.metadata)],
+    [8, sqlTransactionProgramToCanonicalCbor(value.program)], [9, metadataToCbor(value.metadata)], [10, value.writerCapability],
   ])
 }
 
@@ -74,7 +77,7 @@ export function encodeTransactionCore(value: TransactionCore): Uint8Array { retu
 
 export function decodeTransactionCore(bytes: Uint8Array): TransactionCore {
   const map = expectMap(assertCanonicalCbor(bytes), 'transaction')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 'transaction')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'transaction')
   expectVersion(map, 1n, 'transaction')
   const authorTimestampMs = expectUint64(required(map, 5, 'transaction.author_timestamp_ms'), 'transaction.author_timestamp_ms')
   protocolInvariant(authorTimestampMs <= (1n << 63n) - 1n, 'INTEGER_OUT_OF_RANGE', 'Author timestamp is outside nonnegative int64')
@@ -83,6 +86,7 @@ export function decodeTransactionCore(bytes: Uint8Array): TransactionCore {
   const program = sqlTransactionProgramFromCanonicalCbor(required(map, 8, 'transaction.program'))
   assertValidSqlTransactionProgram(program)
   const metadata = optional(map, 9)
+  const writerCapability = optional(map, 10)
   return {
     groupId: expectBytes(required(map, 1, 'transaction.group_id'), 'transaction.group_id', 32),
     membershipRevision: expectBytes(required(map, 2, 'transaction.membership_revision'), 'transaction.membership_revision', 32),
@@ -92,6 +96,7 @@ export function decodeTransactionCore(bytes: Uint8Array): TransactionCore {
     executionManifestDigest: expectBytes(required(map, 7, 'transaction.execution_manifest_digest'), 'transaction.execution_manifest_digest', 32),
     program,
     ...(metadata === undefined ? {} : { metadata: metadataFromCbor(metadata) }),
+    ...(writerCapability === undefined ? {} : { writerCapability: expectBytes(writerCapability, 'transaction.writer_capability', 32) }),
   }
 }
 

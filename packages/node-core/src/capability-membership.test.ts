@@ -87,11 +87,12 @@ function resolverFor(
   })
 }
 
-const context = (overrides: Partial<{ groupId: Uint8Array, membershipRevision: Uint8Array, validationPolicy: Uint8Array, writerId: Uint8Array }> = {}) => ({
+const context = (overrides: Partial<{ groupId: Uint8Array, membershipRevision: Uint8Array, validationPolicy: Uint8Array, writerId: Uint8Array, writerCapability: Uint8Array }> = {}) => ({
   groupId,
   membershipRevision: revisionDigest,
   validationPolicy: policyId,
   writerId: writerKey,
+  writerCapability: capabilities.writer.id,
   ...overrides,
 })
 
@@ -121,6 +122,7 @@ function core(overrides: Partial<TransactionCore> = {}): TransactionCore {
     membershipRevision: revisionDigest,
     validationPolicy: policyId,
     authorId: writerKey,
+    writerCapability: capabilities.writer.id,
     ...overrides,
   } as unknown as TransactionCore
 }
@@ -128,7 +130,7 @@ function core(overrides: Partial<TransactionCore> = {}): TransactionCore {
 describe('CapabilityMembershipResolver revision pinning', () => {
   it('denies everything when the revision is unknown', async () => {
     const resolver = resolverFor(null)
-    expect(await resolver.canWrite(context())).toBe(false)
+    await expect(resolver.canWrite(context())).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
     expect(await resolver.canValidate({ ...context(), validatorId: validatorKeys[0], validatorCapability: capabilities.validator0.id })).toBe(false)
     expect(await resolver.canHeartbeat({ groupId, membershipRevision: revisionDigest, validatorId: validatorKeys[0], validatorCapability: capabilities.validator0.id })).toBe(false)
     expect(await resolver.threshold(context())).toBe(Number.MAX_SAFE_INTEGER)
@@ -165,6 +167,40 @@ describe('CapabilityMembershipResolver writer authority', () => {
     expect(await resolver.canWrite(context())).toBe(true)
   })
 
+  it('does not revive an old grant when the same key is regranted', async () => {
+    const old = snapshot()
+    const revoked = { ...capabilities.writer, revokedAtRevision: REVISION + 1n }
+    const regrant = capability(0x64, { role: 'writer', signingPublicKey: writerKey, validFromRevision: REVISION + 2n })
+    const current = snapshot(policy(), [regrant], {
+      revision: REVISION + 2n,
+      revisionDigest: otherRevisionDigest,
+      capabilities: new Map([...old.capabilities, [bytesToHex(revoked.id), revoked], [bytesToHex(regrant.id), regrant]]),
+    })
+    const resolver = new CapabilityMembershipResolver({
+      snapshotForRevision: (digest) => bytesToHex(digest) === bytesToHex(revisionDigest) ? old : current,
+      authorizationSnapshot: () => current,
+    })
+    expect(await resolver.canWrite(context())).toBe(false)
+    expect(await resolver.canWrite(context({ membershipRevision: otherRevisionDigest, writerCapability: regrant.id }))).toBe(true)
+    // A historical author-selected snapshot cannot borrow the newer grant.
+    expect(await resolver.canWrite(context({ writerCapability: regrant.id }))).toBe(false)
+  })
+
+  it('keeps missing activation evidence pending and checks the exact ordering point', async () => {
+    const original = snapshot()
+    const revoked = { ...capabilities.writer, revokedAtRevision: REVISION + 1n }
+    const after = snapshot(policy(), [], {
+      revision: REVISION + 1n,
+      capabilities: new Map([...original.capabilities, [bytesToHex(revoked.id), revoked]]),
+    })
+    const resolver = resolverFor(original, {
+      authorizationSnapshot: (input) => input.canonicalPosition === undefined ? null : input.canonicalPosition < 10n ? original : after,
+    })
+    await expect(resolver.canWrite(context())).rejects.toThrow('GOVERNANCE_EVIDENCE_PENDING')
+    expect(await resolver.canWrite({ ...context(), canonicalPosition: 9n })).toBe(true)
+    expect(await resolver.canWrite({ ...context(), canonicalPosition: 10n })).toBe(false)
+  })
+
   it('denies revoked, expired, not-yet-valid, unknown and non-writer keys', async () => {
     for (const writerId of [revokedWriterKey, futureWriterKey, outsiderKey, validatorKeys[0]]) {
       expect(await resolver.canWrite(context({ writerId }))).toBe(false)
@@ -173,7 +209,7 @@ describe('CapabilityMembershipResolver writer authority', () => {
 
   it('treats revocation as effective from the revoking revision', async () => {
     const before = resolverFor(snapshot(policy(), [], { revision: REVISION - 1n }))
-    expect(await before.canWrite(context({ writerId: revokedWriterKey }))).toBe(true)
+    expect(await before.canWrite(context({ writerId: revokedWriterKey, writerCapability: capabilities.revokedWriter.id }))).toBe(true)
   })
 })
 
@@ -212,6 +248,7 @@ describe('CapabilityMembershipResolver transport author binding', () => {
       membershipRevision: revisionDigest,
       role: 'writer',
       signingId: writerKey,
+      writerCapability: capabilities.writer.id,
       transportAuthor: '@writer.feed',
       ...overrides,
     })
@@ -247,7 +284,7 @@ describe('CapabilityMembershipResolver transport author binding', () => {
         return bytesToHex(item.id) === bytesToHex(capabilities.writer.id) ? '@recovered.feed' : null
       },
     })
-    const input = { groupId, membershipRevision: revisionDigest, role: 'writer' as const, signingId: writerKey }
+    const input = { groupId, membershipRevision: revisionDigest, role: 'writer' as const, signingId: writerKey, writerCapability: capabilities.writer.id }
     expect(await recovery.canUseTransportAuthor({ ...input, transportAuthor: '@recovered.feed' })).toBe(true)
     expect(await recovery.canUseTransportAuthor({ ...input, transportAuthor: '@writer.feed' })).toBe(false)
     // An unauthorized signer never reaches the recovery binding.

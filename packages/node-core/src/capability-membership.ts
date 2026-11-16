@@ -20,6 +20,14 @@ export interface CapabilityMembershipResolverOptions {
     revisionDigest: Uint8Array,
   ) => CapabilitySnapshot | null | Promise<CapabilitySnapshot | null>
   readonly maximumWatermarkValidators?: number
+  /**
+   * Policy-selected snapshot at the transaction's ordering/activation point.
+   * A null result means required closure/order evidence has not arrived.
+   * Governed production runtimes must provide this; the pinned-only default is
+   * useful for isolated revision verification, not revocation activation.
+   */
+  readonly authorizationSnapshot?: (context: WriterAuthorizationContext) =>
+    CapabilitySnapshot | null | Promise<CapabilitySnapshot | null>
   /** Recovery-controlled binding from a capability to its authenticated SSB feed. */
   readonly transportAuthorForCapability?: (
     capability: EffectiveCapability,
@@ -27,24 +35,49 @@ export interface CapabilityMembershipResolverOptions {
   ) => string | null | Promise<string | null>
 }
 
+export type WriterAuthorizationContext = Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'> & {
+  readonly writerCapability?: Uint8Array
+  readonly authorTimestampMs?: bigint
+  readonly canonicalPosition?: bigint
+  readonly txId?: Uint8Array
+}
+
+export class GovernanceEvidencePendingError extends Error {
+  readonly code = 'GOVERNANCE_EVIDENCE_PENDING'
+  constructor() { super('GOVERNANCE_EVIDENCE_PENDING'); this.name = 'GovernanceEvidencePendingError' }
+}
+
 /** Bridges the signed capability log to revision-pinned node authorization. */
 export class CapabilityMembershipResolver implements MembershipResolver {
   readonly #snapshots: CapabilityMembershipResolverOptions['snapshotForRevision']
   readonly #maximumWatermarkValidators: number
   readonly #transportAuthorForCapability: CapabilityMembershipResolverOptions['transportAuthorForCapability']
+  readonly #authorizationSnapshot: CapabilityMembershipResolverOptions['authorizationSnapshot']
 
   constructor(options: CapabilityMembershipResolverOptions) {
     this.#snapshots = options.snapshotForRevision
     this.#maximumWatermarkValidators = options.maximumWatermarkValidators ?? 20
     this.#transportAuthorForCapability = options.transportAuthorForCapability
+    this.#authorizationSnapshot = options.authorizationSnapshot
   }
 
-  async canWrite(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): Promise<boolean> {
+  async canWrite(context: WriterAuthorizationContext): Promise<boolean> {
     const snapshot = await this.#snapshot(context)
-    if (!snapshot) return false
-    return [...snapshot.capabilities.values()].some((capability) =>
-      this.#activeRole(capability, snapshot, 'writer') &&
-      equalBytes(capability.grant.signingPublicKey, context.writerId))
+    if (!snapshot) {
+      if (await this.#snapshots(context.membershipRevision) === null) throw new GovernanceEvidencePendingError()
+      return false
+    }
+    if (context.writerCapability === undefined) return false
+    const id = bytesToHex(context.writerCapability)
+    const grant = snapshot.capabilities.get(id)
+    if (grant === undefined || !this.#activeRole(grant, snapshot, 'writer') ||
+        !equalBytes(grant.grant.signingPublicKey, context.writerId)) return false
+    const effective = this.#authorizationSnapshot === undefined ? snapshot : await this.#authorizationSnapshot(context)
+    if (effective === null) throw new GovernanceEvidencePendingError()
+    const active = effective.capabilities.get(id)
+    return equalBytes(effective.groupId, context.groupId) && snapshot.revision <= effective.revision &&
+      active !== undefined && this.#activeRole(active, effective, 'writer') &&
+      equalBytes(active.grant.signingPublicKey, context.writerId)
   }
 
   async canValidate(context: CandidateAdmissionContext): Promise<boolean> {
@@ -89,9 +122,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     if (!snapshot) return false
     const capability = context.role === 'validator'
       ? snapshot.capabilities.get(bytesToHex(context.validatorCapability ?? new Uint8Array()))
-      : [...snapshot.capabilities.values()].find((candidate) =>
-          this.#activeRole(candidate, snapshot, 'writer') &&
-          equalBytes(candidate.grant.signingPublicKey, context.signingId))
+      : snapshot.capabilities.get(bytesToHex(context.writerCapability ?? new Uint8Array()))
     if (
       capability === undefined ||
       !this.#activeRole(capability, snapshot, context.role) ||
@@ -143,6 +174,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
       membershipRevision: core.membershipRevision,
       validationPolicy: core.validationPolicy,
       writerId: core.authorId,
+      ...(core.writerCapability === undefined ? {} : { writerCapability: core.writerCapability }),
     }
     const snapshot = await this.#snapshot(context)
     const effective = snapshot?.policies.get(bytesToHex(core.validationPolicy))

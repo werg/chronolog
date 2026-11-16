@@ -2,6 +2,7 @@ import {
   applyCapabilityRevision,
   capabilityId,
   decodeSignedCapabilityRevision as decodeSignedCapabilityRevisionBytes,
+  encodeCapabilityRevision,
   encodeSignedCapabilityRevision as encodeSignedCapabilityRevisionBytes,
   isCapabilityActive,
   reduceCapabilityLog,
@@ -42,6 +43,7 @@ import type { ChronologTransport, TransportRecord } from '@chronolog/transport-s
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import { EpochCipherRing } from './cipher.js'
+import { DurableOperationJournal, MemoryOperationStore, type DurableOperationStore } from './operations.js'
 
 type GovernanceMessageType = Extract<EnvelopeMessageType, 'capability' | 'epoch-manifest'>
 
@@ -64,7 +66,11 @@ export interface GovernanceControlPlaneOptions {
     readonly privateKey: CryptoKey
   }
   readonly now?: () => number
+  /** Required for crash-safe authoring; production runtimes provide persistent storage. */
+  readonly operationStore?: DurableOperationStore
 }
+
+export interface GovernanceOperationOptions { readonly operationId?: string }
 
 export interface CapabilityChange {
   readonly grants?: readonly Omit<CapabilityGrant, 'validFromRevision'>[]
@@ -83,6 +89,9 @@ export class GovernanceControlPlane {
   // Ingestion and authoring have different locks: publish awaits ingestion,
   // while revision/epoch selection, signing and publication must be one turn.
   readonly #authoring = new Mutex()
+  readonly #operationStore: DurableOperationStore
+  readonly #operations: DurableOperationJournal
+  readonly #operationPrefix: string
   readonly #events = new RevisionBroadcaster<GovernanceEvent>()
   readonly #epochManifests = new Map<bigint, SignedEpochManifest>()
   readonly #epochDigests = new Map<bigint, Uint8Array>()
@@ -98,6 +107,9 @@ export class GovernanceControlPlane {
     this.#options = options
     this.#snapshot = snapshot
     this.#cipherRing = options.cipherRing ?? new EpochCipherRing()
+    this.#operationStore = options.operationStore ?? new MemoryOperationStore()
+    this.#operationPrefix = `governance/${bytesToHex(snapshot.groupId)}`
+    this.#operations = new DurableOperationJournal(this.#operationStore, this.#operationPrefix)
     this.#rememberSnapshot(snapshot)
   }
 
@@ -108,6 +120,8 @@ export class GovernanceControlPlane {
   get snapshot(): CapabilitySnapshot { return structuredClone(this.#snapshot) }
   get cipherRing(): EpochCipherRing { return this.#cipherRing }
   get currentEpoch(): bigint | null { return this.#currentEpoch < 0n ? null : this.#currentEpoch }
+  get knownEpochs(): readonly bigint[] { return [...this.#epochManifests.keys()].sort(compareBigint) }
+  get missingHistoricalEpochs(): readonly bigint[] { return this.knownEpochs.filter((epoch) => !this.#contentKeys.has(epoch)) }
   /** Whether this node's transport feed is the current administration feed. */
   get ownsCapabilityFeed(): boolean { return this.#options.transport.identity === feedAuthor(this.#snapshot.capabilityLogFeed) }
 
@@ -121,6 +135,7 @@ export class GovernanceControlPlane {
     this.#started = true
     const history = await this.#options.transport.history()
     for (const record of history) await this.ingest(record)
+    if (this.ownsCapabilityFeed) await this.#authoring.run(() => this.#operations.recover((prepared) => this.#applyPrepared(prepared)))
     this.#consumeTask = this.#consume(this.#options.transport.subscribe(this.#abort.signal))
   }
 
@@ -139,89 +154,122 @@ export class GovernanceControlPlane {
     }
   }
 
-  async publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey): Promise<SignedCapabilityRevision> {
-    return this.#authoring.run(() => this.#publishCapabilityChange(change, rootPrivateKey))
+  async publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions = {}): Promise<SignedCapabilityRevision> {
+    return this.#authoring.run(() => this.#publishCapabilityChange(change, rootPrivateKey, options))
   }
 
-  async #publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey): Promise<SignedCapabilityRevision> {
+  async #publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions): Promise<SignedCapabilityRevision> {
     this.#assertCapabilityFeedOwner()
-    const revisionNumber = this.#snapshot.revision + 1n
-    const revision: CapabilityRevision = {
-      groupId: this.#snapshot.groupId,
-      revision: revisionNumber,
-      previousRevisionDigest: this.#snapshot.revisionDigest,
-      issuerRootPublicKey: this.#snapshot.rootAdminPublicKey,
-      grants: (change.grants ?? []).map((grant) => ({ ...grant, validFromRevision: revisionNumber })),
-      revocations: (change.revocations ?? []).map((id) => id.slice()),
-      validationPolicies: [...(change.validationPolicies ?? [])],
+    const fingerprint = encodeCapabilityRevision({
+      groupId: this.#snapshot.groupId, revision: 1n,
+      previousRevisionDigest: new Uint8Array(32), issuerRootPublicKey: this.#options.genesis.manifest.rootAdminPublicKey,
+      grants: (change.grants ?? []).map((grant) => ({ ...grant, validFromRevision: 1n })),
+      revocations: [...(change.revocations ?? [])], validationPolicies: [...(change.validationPolicies ?? [])],
       ...(change.successorRootPublicKey === undefined ? {} : { successorRootPublicKey: change.successorRootPublicKey }),
       ...(change.successorCapabilityLogFeed === undefined ? {} : { successorCapabilityLogFeed: change.successorCapabilityLogFeed }),
-    }
-    const signed = await signCapabilityRevision(revision, rootPrivateKey)
-    await this.#publish('capability', encodeCanonicalCbor([1n, encodeSignedCapabilityRevisionBytes(signed)]))
-    return signed
-  }
-
-  async revoke(capabilityIds: readonly Uint8Array[], rootPrivateKey: CryptoKey): Promise<SignedCapabilityRevision> {
-    return this.publishCapabilityChange({ revocations: capabilityIds }, rootPrivateKey)
-  }
-
-  async rotateEpoch(rootPrivateKey: CryptoKey, contentKey?: Uint8Array): Promise<SignedEpochManifest> {
-    return this.#authoring.run(() => this.#rotateEpoch(rootPrivateKey, contentKey))
-  }
-
-  async #rotateEpoch(rootPrivateKey: CryptoKey, contentKey?: Uint8Array): Promise<SignedEpochManifest> {
-    this.#assertCapabilityFeedOwner()
-    const recipients = [...this.#snapshot.capabilities.values()]
-      .filter((capability) => capability.grant.role === 'reader' && isCapabilityActive(capability, this.#snapshot.revision))
-      .map((capability) => ({
-        recipientId: capability.grant.subjectId,
-        publicKey: capability.grant.hpkePublicKey!,
-      }))
-    const epoch = this.#currentEpoch + 1n
-    const created = await createEpochManifest({
-      groupId: this.#snapshot.groupId,
-      epoch,
-      previousEpochDigest: this.#currentEpoch < 0n ? null : this.#epochDigests.get(this.#currentEpoch) ?? null,
-      createdAtMs: BigInt(Math.trunc(this.#options.now?.() ?? Date.now())),
-      recipients,
-      signerPublicKey: this.#snapshot.rootAdminPublicKey,
-      signerPrivateKey: rootPrivateKey,
-      ...(contentKey === undefined ? {} : { contentKey }),
     })
-    this.#contentKeys.set(epoch, created.contentKey.slice())
-    await this.#publish('epoch-manifest', encodeCanonicalCbor([1n, encodeSignedEpochManifest(created.signedManifest)]))
-    return created.signedManifest
+    const prepared = await this.#operations.run({
+      operationId: options.operationId ?? crypto.randomUUID(),
+      fingerprint: encodeCanonicalCbor(['capability', fingerprint]),
+      prepare: async () => {
+        const revisionNumber = this.#snapshot.revision + 1n
+        const revision: CapabilityRevision = {
+          groupId: this.#snapshot.groupId,
+          revision: revisionNumber,
+          previousRevisionDigest: this.#snapshot.revisionDigest,
+          issuerRootPublicKey: this.#snapshot.rootAdminPublicKey,
+          grants: (change.grants ?? []).map((grant) => ({ ...grant, validFromRevision: revisionNumber })),
+          revocations: (change.revocations ?? []).map((id) => id.slice()),
+          validationPolicies: [...(change.validationPolicies ?? [])],
+          ...(change.successorRootPublicKey === undefined ? {} : { successorRootPublicKey: change.successorRootPublicKey }),
+          ...(change.successorCapabilityLogFeed === undefined ? {} : { successorCapabilityLogFeed: change.successorCapabilityLogFeed }),
+        }
+        const signed = await signCapabilityRevision(revision, rootPrivateKey)
+        const result = encodeSignedCapabilityRevisionBytes(signed)
+        return this.#prepare(result, [await this.#envelope('capability', encodeCanonicalCbor([1n, result]))])
+      },
+      apply: (bytes) => this.#applyPrepared(bytes),
+    })
+    return decodeSignedCapabilityRevisionBytes(preparedResult(prepared))
   }
 
-  async grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey): Promise<number> {
-    return this.#authoring.run(() => this.#grantHistoricalAccess(subjectId, rootPrivateKey))
+  async revoke(capabilityIds: readonly Uint8Array[], rootPrivateKey: CryptoKey, options: GovernanceOperationOptions = {}): Promise<SignedCapabilityRevision> {
+    return this.publishCapabilityChange({ revocations: capabilityIds }, rootPrivateKey, options)
   }
 
-  async #grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey): Promise<number> {
+  async rotateEpoch(rootPrivateKey: CryptoKey, contentKey?: Uint8Array, options: GovernanceOperationOptions = {}): Promise<SignedEpochManifest> {
+    return this.#authoring.run(() => this.#rotateEpoch(rootPrivateKey, contentKey, options))
+  }
+
+  async #rotateEpoch(rootPrivateKey: CryptoKey, contentKey: Uint8Array | undefined, options: GovernanceOperationOptions): Promise<SignedEpochManifest> {
     this.#assertCapabilityFeedOwner()
-    const reader = [...this.#snapshot.capabilities.values()].find((capability) =>
-      capability.grant.role === 'reader' &&
-      equalBytes(capability.grant.subjectId, subjectId) && isCapabilityActive(capability, this.#snapshot.revision))
-    if (reader === undefined) throw new Error('GOVERNANCE_READER_REQUIRED')
-    let published = 0
-    for (const [epoch, key] of [...this.#contentKeys].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
-      const original = this.#epochManifests.get(epoch)
-      if (original === undefined) continue
-      const created = await createEpochManifest({
-        groupId: this.#snapshot.groupId,
-        epoch,
-        previousEpochDigest: original.manifest.previousEpochDigest,
-        createdAtMs: BigInt(Math.trunc(this.#options.now?.() ?? Date.now())),
-        recipients: [{ recipientId: subjectId, publicKey: reader.grant.hpkePublicKey! }],
-        signerPublicKey: this.#snapshot.rootAdminPublicKey,
-        signerPrivateKey: rootPrivateKey,
-        contentKey: key,
-      })
-      await this.#publish('epoch-manifest', encodeCanonicalCbor([2n, encodeSignedEpochManifest(created.signedManifest)]))
-      published += 1
-    }
-    return published
+    const prepared = await this.#operations.run({
+      operationId: options.operationId ?? crypto.randomUUID(),
+      fingerprint: encodeCanonicalCbor(['rotate-epoch', contentKey ?? null]),
+      prepare: async () => {
+        const recipients = [...this.#snapshot.capabilities.values()]
+          .filter((capability) => capability.grant.role === 'reader' && isCapabilityActive(capability, this.#snapshot.revision))
+          .map((capability) => ({
+            recipientId: capability.grant.subjectId,
+            publicKey: capability.grant.hpkePublicKey!,
+          }))
+        const epoch = this.#currentEpoch + 1n
+        const created = await createEpochManifest({
+          groupId: this.#snapshot.groupId,
+          epoch,
+          previousEpochDigest: this.#currentEpoch < 0n ? null : this.#epochDigests.get(this.#currentEpoch) ?? null,
+          createdAtMs: BigInt(Math.trunc(this.#options.now?.() ?? Date.now())),
+          recipients,
+          signerPublicKey: this.#snapshot.rootAdminPublicKey,
+          signerPrivateKey: rootPrivateKey,
+          ...(contentKey === undefined ? {} : { contentKey }),
+        })
+        const result = encodeSignedEpochManifest(created.signedManifest)
+        return this.#prepare(result, [await this.#envelope('epoch-manifest', encodeCanonicalCbor([1n, result]))], [[epoch, created.contentKey]])
+      },
+      apply: (bytes) => this.#applyPrepared(bytes),
+    })
+    return decodeSignedEpochManifest(preparedResult(prepared))
+  }
+
+  async grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions = {}): Promise<number> {
+    return this.#authoring.run(() => this.#grantHistoricalAccess(subjectId, rootPrivateKey, options))
+  }
+
+  async #grantHistoricalAccess(subjectId: Uint8Array, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions): Promise<number> {
+    this.#assertCapabilityFeedOwner()
+    const prepared = await this.#operations.run({
+      operationId: options.operationId ?? crypto.randomUUID(),
+      fingerprint: encodeCanonicalCbor(['historical-access', subjectId]),
+      prepare: async () => {
+        const reader = [...this.#snapshot.capabilities.values()].find((capability) =>
+          capability.grant.role === 'reader' &&
+          equalBytes(capability.grant.subjectId, subjectId) && isCapabilityActive(capability, this.#snapshot.revision))
+        if (reader === undefined) throw new Error('GOVERNANCE_READER_REQUIRED')
+        if (this.missingHistoricalEpochs.length !== 0) throw new Error('GOVERNANCE_HISTORICAL_KEY_UNAVAILABLE')
+        let published = 0
+        const envelopes: Uint8Array[] = []
+        for (const [epoch, key] of [...this.#contentKeys].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
+          const original = this.#epochManifests.get(epoch)
+          if (original === undefined) continue
+          const created = await createEpochManifest({
+            groupId: this.#snapshot.groupId,
+            epoch,
+            previousEpochDigest: original.manifest.previousEpochDigest,
+            createdAtMs: BigInt(Math.trunc(this.#options.now?.() ?? Date.now())),
+            recipients: [{ recipientId: subjectId, publicKey: reader.grant.hpkePublicKey! }],
+            signerPublicKey: this.#snapshot.rootAdminPublicKey,
+            signerPrivateKey: rootPrivateKey,
+            contentKey: key,
+          })
+          envelopes.push(await this.#envelope('epoch-manifest', encodeCanonicalCbor([2n, encodeSignedEpochManifest(created.signedManifest)])))
+          published += 1
+        }
+        return this.#prepare(encodeCanonicalCbor(BigInt(published)), envelopes)
+      },
+      apply: (bytes) => this.#applyPrepared(bytes),
+    })
+    return Number(assertCanonicalCbor(preparedResult(prepared)))
   }
 
   async ingest(record: TransportRecord): Promise<boolean> {
@@ -294,18 +342,43 @@ export class GovernanceControlPlane {
         // snapshot-scoped readers intentionally retain only prior epochs.
       }
     }
+    const retained = this.#contentKeys.get(signed.manifest.epoch) ??
+      await this.#operationStore.get(`${this.#operationPrefix}/epoch-key/${signed.manifest.epoch}`)
+    if (retained !== null && retained !== undefined) {
+      if (retained.length !== 32) throw new Error('GOVERNANCE_STORED_KEY_INVALID')
+      this.#contentKeys.set(signed.manifest.epoch, retained.slice())
+      this.#cipherRing.install(retained, signed.manifest.epoch, !historical)
+    }
     this.#emit(historical ? 'historical_access_granted' : 'epoch_rotated', recordId, signed.manifest.epoch)
   }
 
-  async #publish(type: GovernanceMessageType, payload: Uint8Array): Promise<void> {
-    const envelope = await encodeGovernanceEnvelope(
+  async #envelope(type: GovernanceMessageType, payload: Uint8Array): Promise<Uint8Array> {
+    return encodeGovernanceEnvelope(
       this.#options.groupRoute,
       type,
       payload,
       this.#options.identity,
     )
-    const record = await this.#options.transport.publish(envelope, { timestampMs: this.#options.now?.() ?? Date.now() })
-    await this.ingest(record)
+  }
+
+  #prepare(result: Uint8Array, envelopes: readonly Uint8Array[], keys: readonly (readonly [bigint, Uint8Array])[] = []): Uint8Array {
+    return encodeCanonicalCbor([1n, result, [...envelopes], keys.map(([epoch, key]) => [epoch, key])])
+  }
+
+  async #applyPrepared(bytes: Uint8Array): Promise<void> {
+    const prepared = decodePrepared(bytes)
+    for (const [epoch, key] of prepared.keys) {
+      await this.#operationStore.put(`${this.#operationPrefix}/epoch-key/${epoch}`, key)
+      this.#contentKeys.set(epoch, key.slice())
+    }
+    for (const envelope of prepared.envelopes) {
+      // Transport acknowledgments can be lost after durable append. Reconcile
+      // against exact locally authored bytes before creating any new feed item.
+      const history = await this.#options.transport.history()
+      const existing = history.find((record) => record.author === this.#options.transport.identity && equalBytes(record.payload, envelope))
+      const record = existing ?? await this.#options.transport.publish(envelope, { timestampMs: this.#options.now?.() ?? Date.now() })
+      await this.ingest(record)
+    }
   }
 
   async #consume(records: AsyncIterable<TransportRecord>): Promise<void> {
@@ -391,3 +464,25 @@ function feedAuthor(value: Uint8Array): string { return new TextDecoder().decode
 function nullableBytesEqual(left: Uint8Array | null, right: Uint8Array | null): boolean {
   return left === null ? right === null : right !== null && equalBytes(left, right)
 }
+
+function decodePrepared(bytes: Uint8Array): {
+  readonly result: Uint8Array
+  readonly envelopes: readonly Uint8Array[]
+  readonly keys: readonly (readonly [bigint, Uint8Array])[]
+} {
+  const value = assertCanonicalCbor(bytes)
+  if (!Array.isArray(value) || value.length !== 4 || value[0] !== 1n || !(value[1] instanceof Uint8Array) ||
+      !Array.isArray(value[2]) || !value[2].every((item) => item instanceof Uint8Array) || !Array.isArray(value[3])) {
+    throw new Error('GOVERNANCE_OPERATION_INVALID')
+  }
+  const keys: Array<readonly [bigint, Uint8Array]> = []
+  for (const entry of value[3]) {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'bigint' || entry[0] < 0n ||
+        !(entry[1] instanceof Uint8Array) || entry[1].length !== 32) throw new Error('GOVERNANCE_OPERATION_INVALID')
+    keys.push([entry[0], entry[1]])
+  }
+  return { result: value[1], envelopes: value[2] as Uint8Array[], keys }
+}
+
+function preparedResult(bytes: Uint8Array): Uint8Array { return decodePrepared(bytes).result }
+function compareBigint(left: bigint, right: bigint): number { return left < right ? -1 : left > right ? 1 : 0 }
