@@ -146,6 +146,8 @@ export interface MaterializerSqlBackend {
 }
 
 export interface StatementLike {
+  /** Release the prepared engine handle when the owning scope exits. */
+  finalize?(): void
   run(...parameters: unknown[]): { changes: number | bigint; lastInsertRowid: number | bigint }
   get(...parameters: unknown[]): Record<string, unknown> | unknown[] | undefined
   all(...parameters: unknown[]): Array<Record<string, unknown> | unknown[]>

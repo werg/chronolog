@@ -289,9 +289,13 @@ export function withProfiledStatement<T>(
       if (isOperationalSqliteError(error)) throw error
       throw new SqlProfileError('SQL_PREPARE_FAILED')
     }
-    validateSingleStatement(sql, statement)
-    phase.stepping = true
-    return operation(statement)
+    try {
+      validateSingleStatement(sql, statement)
+      phase.stepping = true
+      return operation(statement)
+    } finally {
+      statement.finalize?.()
+    }
   }, phase)
 }
 
