@@ -13,8 +13,8 @@ import { isCapabilityActive } from '@chronolog/capabilities'
 import { bytesToHex, equalBytes } from '@chronolog/protocol'
 import type { EventBatch } from '@chronolog/protocol'
 import type { TransactionOutcome } from '@chronolog/rpc'
-import { openWebRtcConnection, WEBRTC_LIMITS } from '@chronolog/transport-webrtc'
-import type { DataChannelStats, PeerDescription } from '@chronolog/transport-webrtc'
+import { createWebRtcOfferHandler, WEBRTC_HTTP_LIMITS } from '@chronolog/transport-webrtc'
+import type { DataChannelConnection, DataChannelStats, PeerDescription, WebRtcOfferHandler } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
 import { chromium } from '@playwright/test'
 import { build } from 'esbuild'
@@ -52,35 +52,39 @@ assert.deepEqual(forbidden, [], 'browser RTC data plane imports native or hosted
 await writeFile(join(output, 'bundle.json'), JSON.stringify(bundle.metafile, null, 2) + '\n')
 if (process.argv.includes('--build-only')) { process.stdout.write('WebRTC page/Worker bundles built; runtime qualification was not run.\n'); process.exit(0) }
 
-let resolveOffer!: (description: PeerDescription) => void, rejectOffer!: (error: unknown) => void
-const offer = new Promise<PeerDescription>((resolve, reject) => { resolveOffer = resolve; rejectOffer = reject })
-void offer.catch(() => undefined)
-let resolveAnswer!: (description: PeerDescription) => void, rejectAnswer!: (error: unknown) => void
-const answer = new Promise<PeerDescription>((resolve, reject) => { resolveAnswer = resolve; rejectAnswer = reject })
-void answer.catch(() => undefined)
 const host = { requests: 0, requestBytes: 0, responseBytes: 0, applicationRequests: 0, signalingMessages: 0, signalingBytes: 0 }
-let signaled = false, hostClosed = false, nativeSignalingClosed = false
+let introduction: WebRtcOfferHandler | undefined, hostClosed = false
+const introductionToken = crypto.randomUUID()
 const server = createServer((request, response) => {
   host.requests += 1
   response.setHeader('Cache-Control', 'no-store')
   const path = new URL(request.url ?? '/', 'http://localhost').pathname
   const run = async (): Promise<void> => {
     if (path === '/signal' && request.method === 'POST') {
-      if (signaled) { response.writeHead(409); response.end(); return }
-      signaled = true
+      if (introduction === undefined) { response.writeHead(503); response.end(); return }
       const chunks: Buffer[] = []; let bytes = 0
       for await (const chunk of request) {
         const value = Buffer.from(chunk as Uint8Array); bytes += value.length
-        if (bytes > WEBRTC_LIMITS.sdpBytes + 1024) throw new Error('WEBRTC_SIGNAL_TOO_LARGE')
+        if (bytes > WEBRTC_HTTP_LIMITS.messageBytes) throw new Error('WEBRTC_SIGNAL_TOO_LARGE')
         chunks.push(value)
       }
       host.requestBytes += bytes
-      const description = JSON.parse(Buffer.concat(chunks).toString('utf8')) as PeerDescription
-      host.signalingMessages += 1; host.signalingBytes += Buffer.byteLength(description.sdp)
-      resolveOffer(description)
-      const returned = await answer, body = JSON.stringify(returned)
-      host.responseBytes += Buffer.byteLength(body); host.signalingMessages += 1; host.signalingBytes += Buffer.byteLength(returned.sdp)
-      response.setHeader('Content-Type', 'application/json'); response.end(body); return
+      const headers = new Headers()
+      for (const [name, value] of Object.entries(request.headers)) {
+        if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(', ') : value)
+      }
+      const body = Buffer.concat(chunks)
+      const result = await introduction.fetch(new Request(`${base}/signal`, { method: 'POST', headers, body }))
+      const returned = new Uint8Array(await result.arrayBuffer())
+      host.responseBytes += returned.length
+      if (result.ok) {
+        const offer = JSON.parse(body.toString('utf8')) as { description: PeerDescription }
+        const answer = JSON.parse(new TextDecoder().decode(returned)) as { description: PeerDescription }
+        host.signalingMessages += 2
+        host.signalingBytes += Buffer.byteLength(offer.description.sdp) + Buffer.byteLength(answer.description.sdp)
+      }
+      result.headers.forEach((value, name) => response.setHeader(name, value))
+      response.writeHead(result.status); response.end(returned); return
     }
     const file = new Map([['/webrtc-page.js', 'webrtc-page.js'], ['/webrtc-worker.js', 'webrtc-worker.js']]).get(path)
     const bytes = path === '/' ? Buffer.from('<!doctype html><meta charset="utf-8"><title>Chronolog WebRTC qualification</title><script type="module" src="/webrtc-page.js"></script>')
@@ -89,11 +93,12 @@ const server = createServer((request, response) => {
     response.setHeader('Content-Type', path === '/' ? 'text/html' : 'application/javascript')
     host.responseBytes += bytes.length; response.end(bytes)
   }
-  void run().catch((error: unknown) => { rejectOffer(error); rejectAnswer(error); response.writeHead(500); response.end(String(error)) })
+  void run().catch((error: unknown) => { response.writeHead(500); response.end(String(error)) })
 })
 server.listen(0, '127.0.0.1'); await once(server, 'listening')
 const address = server.address()
 if (address === null || typeof address === 'string') throw new Error('WEBRTC_FIXTURE_ADDRESS_MISSING')
+const base = `http://127.0.0.1:${address.port}`
 const browser = await chromium.launch({ headless: true,
   ...(process.env.CHRONOLOG_CHROMIUM_EXECUTABLE === undefined ? {} : { executablePath: process.env.CHRONOLOG_CHROMIUM_EXECUTABLE }) }).catch(async (error: unknown) => {
   server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()))
@@ -104,7 +109,7 @@ const browser = await chromium.launch({ headless: true,
 const context = await browser.newContext(), page = await context.newPage()
 const directory = await mkdtemp(join(tmpdir(), 'chronolog-webrtc-'))
 let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
-let nativeConnection: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
+let nativeConnection: DataChannelConnection | undefined
 let nativeSession: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined, detach: (() => void) | undefined
 const errors: string[] = [], checks: Array<{ id: string; passed: boolean }> = []
 page.on('pageerror', error => errors.push(error.message))
@@ -117,7 +122,7 @@ const closeHost = async (): Promise<void> => {
 const digest = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex')
 const payload = Uint8Array.from({ length: 512 * 1024 + 37 }, (_, i) => i % 251), payloadHash = digest(payload)
 try {
-  await page.goto(`http://127.0.0.1:${address.port}`)
+  await page.goto(base)
   await page.waitForFunction(() => 'chronologWebRtcTest' in globalThis)
   const name = `rtc-${crypto.randomUUID()}`
   const identity = await page.evaluate(name => (globalThis as unknown as TestWindow).chronologWebRtcTest.prepare(name), name)
@@ -128,27 +133,32 @@ try {
   const enumerate = os.networkInterfaces
   os.networkInterfaces = () => ({})
   syncBuiltinESMExports()
-  const nativeOpening = (async () => {
-    nativeConnection = await openWebRtcConnection({ role: 'answerer', signaling: {
-      messages: { async *[Symbol.asyncIterator]() { yield await offer } }, async send(description) { resolveAnswer(description) }, close() { nativeSignalingClosed = true },
-    }, createPeerConnection: configuration => createNativePeerConnection(configuration,
-      { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] } })
-    const snapshot = native.governed.activeSnapshot
+  introduction = createWebRtcOfferHandler({ allowedOrigins: [base],
+    authorize: request => request.headers.get('Authorization') === `Bearer ${introductionToken}`,
+    createPeerConnection: configuration => createNativePeerConnection(configuration,
+      { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
+    onError: error => { errors.push(String(error)) }, async accept(connection) {
+    nativeConnection = connection
+    const snapshot = native!.governed.activeSnapshot
     const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
       equalBytes(capability.grant.signingPublicKey, native!.identity.signing.publicKeyBytes))!
     nativeSession = await openAuthenticatedPeerLink({ connection: nativeConnection,
-      local: { ...native.transport.asLink(), readPayload: hash => hash === payloadHash ? Promise.resolve(payload) : native!.transport.asLink().readPayload(hash) },
-      groupId: snapshot.groupId, identity: native.identity.signing, grantId: reader.id,
+      local: { ...native!.transport.asLink(), readPayload: hash => hash === payloadHash ? Promise.resolve(payload) : native!.transport.asLink().readPayload(hash) },
+      groupId: snapshot.groupId, identity: native!.identity.signing, grantId: reader.id,
       authorizePeer: ({ authorId, grantId }) => {
         const current = native!.governed.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
         return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
           equalBytes(capability.grant.signingPublicKey, authorId)
       } })
-    detach = native.transport.connect(nativeSession.link)
-  })()
-  const [negotiation] = await Promise.all([page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.connect()), nativeOpening])
+    detach = native!.transport.connect(nativeSession.link)
+    return { completion: nativeSession.completion, async close() { detach?.(); await nativeSession?.close() } }
+  } })
+  const negotiation = await page.evaluate(options => (globalThis as unknown as TestWindow).chronologWebRtcTest.connect(options),
+    { url: `${base}/signal`, token: introductionToken })
     .finally(() => { os.networkInterfaces = enumerate; syncBuiltinESMExports() })
+  const nativeSignalingClosed = introduction.stats.accepted === 1 && introduction.stats.pending === 0
   assert.equal(negotiation.workerOwnsChannel, true); assert.equal(nativeSignalingClosed, true); assert.equal(negotiation.signalingClosed, true)
+  assert.equal(negotiation.http.requests, 1)
   assert.equal(host.signalingMessages, 2)
   passed('native-browser-rtc-and-worker-ownership')
   const before = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
@@ -204,6 +214,7 @@ try {
   assert.equal(host.applicationRequests, 0)
   const signalingAfter = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.signaling())
   assert.equal(signalingAfter.sentMessages, negotiation.sentMessages)
+  assert.deepEqual(signalingAfter.http, negotiation.http)
   assert.deepEqual(errors, [])
   native.assertHealthy()
   passed('final-events-and-original-records-converge-with-host-unavailable')
@@ -217,14 +228,14 @@ try {
     payload: { bytes: payload.length, expectedSha256: payloadHash, receivedSha256: receivedPayload.sha256 },
     outcomes: { browser: first, retry, native: nativeOutcome, events: final.events },
     retry: { browserAuthoredBefore, browserAuthoredAfter },
-    channels: { browser: final.stats, native: nativeConnection!.stats },
+    channels: { browser: final.stats, native: nativeConnection!.stats }, introduction: introduction.stats,
     byteBoundary: 'Logical authenticated peer frame payload bytes; excludes framing headers/credit and SCTP/DTLS/IP overhead.' }
   assert(metrics.bytesAfterSignalingClosed.browserSent > 0); assert(metrics.bytesAfterSignalingClosed.nativeSent >= payload.length)
   const source = { chronolog: { head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim(),
     dirty: execFileSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).trim().length > 0 } }
   await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v1', passed: true, source,
     runtime: { node: process.version, browser: browser.version(), native: 'werift@0.27.0' },
-    topology: { transport: 'webrtc', nativeImplementation: 'werift', signaling: 'loopback HTTP offer/answer fixture',
+    topology: { transport: 'webrtc', nativeImplementation: 'werift', signaling: 'public direct HTTP offer/answer client and native handler on loopback',
       networkDiscovery: 'native binds loopback explicitly; optional interface enumeration disabled in fixture', browserStorage: 'OPFS', channelOwner: 'DedicatedWorker', hostStoppedAfterNegotiation: true,
       excludes: ['packaged Tendriller signaling host', 'public NAT connectivity', 'TURN interoperability', 'provider billing'] },
     checks, metrics }, null, 2) + '\n')
@@ -234,6 +245,7 @@ try {
     error: error instanceof Error ? error.stack : String(error) }, null, 2) + '\n')
   throw error
 } finally {
+  await introduction?.close()
   detach?.(); await nativeSession?.close(); await nativeConnection?.close()
   try { await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.close()) } catch { /* Preserve qualification errors. */ }
   await context.close(); await browser.close(); await native?.close(); await closeHost()
