@@ -40,25 +40,27 @@ export class DurableOperationJournal {
     readonly prepare: () => Promise<Uint8Array>
     readonly apply: (payload: Uint8Array) => Promise<void>
   }): Promise<Uint8Array> {
-    validateOperationId(options.operationId)
+    const { operationId, prepare, apply } = options
+    const fingerprint = options.fingerprint.slice()
+    validateOperationId(operationId)
     return this.#mutex.run(async () => {
-      const previous = await this.#completed(options.operationId)
-      if (previous !== null) return matching(previous, options.fingerprint)
+      const previous = await this.#completed(operationId)
+      if (previous !== null) return matching(previous, fingerprint)
 
       const pending = await this.#pending()
       if (pending !== null) {
-        if (pending.id === options.operationId) matching(pending, options.fingerprint)
-        await this.#finish(pending, options.apply)
-        if (pending.id === options.operationId) return pending.payload.slice()
+        if (pending.id === operationId) matching(pending, fingerprint)
+        await this.#finish(pending, apply)
+        if (pending.id === operationId) return pending.payload.slice()
       }
 
       const prepared: PreparedOperation = {
-        id: options.operationId,
-        fingerprint: options.fingerprint.slice(),
-        payload: (await options.prepare()).slice(),
+        id: operationId,
+        fingerprint,
+        payload: (await prepare()).slice(),
       }
       await this.#store.put(`${this.#prefix}/pending`, encode(prepared))
-      await this.#finish(prepared, options.apply)
+      await this.#finish(prepared, apply)
       return prepared.payload.slice()
     })
   }

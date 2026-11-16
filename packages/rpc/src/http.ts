@@ -90,7 +90,7 @@ export class HttpRpcServer {
     if (options.publisherIngress === true && (options.token === undefined || options.token.length === 0)) {
       throw new TypeError('publisherIngress requires a non-empty owner RPC token')
     }
-    this.#options = options
+    this.#options = Object.freeze({ ...options })
     this.#shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000
     if (!Number.isSafeInteger(this.#shutdownTimeoutMs) || this.#shutdownTimeoutMs < 0) {
       throw new TypeError('shutdownTimeoutMs must be a non-negative safe integer')

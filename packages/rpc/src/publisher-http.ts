@@ -13,6 +13,7 @@ export interface HttpPublisherIngressOptions {
  * The publisher's durable outbox owns retry/recovery of these exact bytes.
  */
 export function createHttpPublisherIngress(options: HttpPublisherIngressOptions) {
+  const groupId = options.groupId
   const base = new URL(options.baseUrl)
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
     throw new TypeError('Publisher ingress requires an HTTP(S) URL without credentials, query or fragment')
@@ -34,7 +35,7 @@ export function createHttpPublisherIngress(options: HttpPublisherIngressOptions)
       try {
         const response = await send(endpoint, { method: 'POST', credentials: 'omit', redirect: 'error',
           headers: { 'content-type': 'application/json' }, signal,
-          body: JSON.stringify({ groupId: options.groupId, requestId: crypto.randomUUID(), signedWire: { $chronologRpc: ['bytes', btoa(binary)] } }),
+          body: JSON.stringify({ groupId, requestId: crypto.randomUUID(), signedWire: { $chronologRpc: ['bytes', btoa(binary)] } }),
         })
         const body: unknown = await response.json()
         if (typeof body !== 'object' || body === null || !('ok' in body)) throw new ChronologRpcError('internal', 'Malformed publisher ingress response')

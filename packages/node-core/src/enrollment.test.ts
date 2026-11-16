@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   EnrollmentIssuer, decodeSignedEnrollmentRequest, encodeEnrollmentApproval, encodeSignedEnrollmentRequest, enrollmentProgress,
-  loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest, verifyEnrollmentApproval, verifySignedEnrollmentRequest,
+  loadEnrollmentApproval, loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest, saveEnrollmentApproval, verifyEnrollmentApproval, verifySignedEnrollmentRequest,
   type EnrollmentDescriptor, type EnrollmentFinalTarget,
 } from './enrollment.js'
 import { GovernanceControlPlane } from './governance.js'
@@ -15,6 +15,57 @@ const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('live durable group enrollment', () => {
+  it('captures one request before asynchronous signing and preserves its exact retry identity', async () => {
+    const fixture = await setup(), store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'captured-request')
+    const signingKey = identity.signing.publicKeyBytes.slice(), readerKey = identity.reader.publicKeyBytes.slice()
+    const input = { descriptor: fixture.descriptor, store, requestId: 'original-request', identity: identity.signing,
+      readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'original-feed', requestedRoles: ['reader', 'writer'] as const }
+    const pending = prepareEnrollmentRequest(input)
+    input.requestId = 'changed-request'; input.transportAuthor = 'changed-feed'
+    identity.signing.publicKeyBytes.fill(0); identity.reader.publicKeyBytes.fill(0)
+    const request = await pending
+    expect(request.request).toMatchObject({ requestId: 'original-request', transportAuthor: 'original-feed', signingPublicKey: signingKey, readerPublicKey: readerKey })
+    expect(await verifySignedEnrollmentRequest(request)).toBe(true)
+    const reopened = await loadOrCreateEnrollmentIdentity(store, 'captured-request')
+    const retry = await prepareEnrollmentRequest({ ...input, identity: reopened.signing, readerPublicKey: reopened.reader.publicKeyBytes,
+      requestId: 'original-request', transportAuthor: 'original-feed' })
+    expect(retry).toEqual(request)
+  })
+
+  it('keeps reviewed permissions and history access independent of subsequent decision edits', async () => {
+    const fixture = await setup(), store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'reviewed-decision')
+    const request = await prepareEnrollmentRequest({ descriptor: fixture.descriptor, store, requestId: 'join', identity: identity.signing,
+      readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'reviewed-feed', requestedRoles: ['reader', 'writer'],
+      writerProgram: { sql: true, topics: ['*'], signals: ['*'] } })
+    const writerProgram = { sql: false, topics: ['chat/message'], signals: [] as string[] }
+    const decision = { operationId: 'reviewed-approval', roles: ['reader', 'writer'] as const, grantFullHistory: false, writerProgram }
+    const pending = fixture.issuer.approve(request, decision)
+    decision.operationId = 'other-approval'; decision.grantFullHistory = true
+    writerProgram.sql = true; writerProgram.topics[0] = '*'; writerProgram.signals.push('*')
+    const approval = await pending
+    expect(approval.approval).toMatchObject({ fullHistoryGranted: false, writerProgram: { sql: false, topics: ['chat/message'], signals: [], forwarded: false } })
+    const grant = fixture.governance.snapshot.capabilities.get(Buffer.from(approval.approval.capabilityIds[1]!).toString('hex'))!.grant
+    expect(grant.program).toEqual(approval.approval.writerProgram)
+    const retry = await fixture.issuer.approve(request, { operationId: 'reviewed-approval', roles: ['reader', 'writer'], grantFullHistory: false,
+      writerProgram: { sql: false, topics: ['chat/message'], signals: [] } })
+    expect(retry).toEqual(approval)
+  })
+
+  it('persists exactly the approval that was verified when caller data changes during verification', async () => {
+    const fixture = await setup(), store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'verified-approval')
+    const request = await prepareEnrollmentRequest({ descriptor: fixture.descriptor, store, requestId: 'join', identity: identity.signing,
+      readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'verified-feed', requestedRoles: ['reader'] })
+    const approval = await fixture.issuer.approve(request, { operationId: 'approve', roles: ['reader'], grantFullHistory: true })
+    const original = structuredClone(approval)
+    const editableApproval = approval.approval as { fullHistoryGranted: boolean }
+    const pending = saveEnrollmentApproval({ descriptor: fixture.descriptor, request, approval, store })
+    editableApproval.fullHistoryGranted = false
+    await pending
+    const saved = await loadEnrollmentApproval(store, request.request)
+    expect(saved).toEqual(original)
+    await expect(verifyEnrollmentApproval(fixture.descriptor, request, saved!)).resolves.toBeUndefined()
+  })
+
   it('binds explicit SQL, durable topic and signal rights to the signed request and approved grant', async () => {
     const fixture = await setup(), store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'scoped')
     const writerProgram = { sql: true, topics: ['task/claimed', 'chat/message'], signals: ['chat/typing'] }

@@ -42,4 +42,29 @@ describe('durable operation journal', () => {
     await journal.run({ ...base, fingerprint: Uint8Array.of(1) })
     await expect(journal.run({ ...base, fingerprint: Uint8Array.of(2) })).rejects.toThrow('OPERATION_ID_CONFLICT')
   })
+
+  it('owns the retry identity, fingerprint and publication callbacks before entering the journal lane', async () => {
+    const store = new MemoryOperationStore()
+    const journal = new DurableOperationJournal(store, 'owned-input')
+    const published: number[] = []
+    const options = {
+      operationId: 'original', fingerprint: Uint8Array.of(1),
+      prepare: async () => Uint8Array.of(40),
+      apply: async (payload: Uint8Array) => { published.push(payload[0]!) },
+    }
+    const submission = journal.run(options)
+    options.operationId = 'changed'
+    options.fingerprint[0] = 2
+    options.prepare = async () => Uint8Array.of(99)
+    options.apply = async () => { throw new Error('changed callback must not run') }
+    expect(await submission).toEqual(Uint8Array.of(40))
+    expect(published).toEqual([40])
+    const reopened = new DurableOperationJournal(store, 'owned-input')
+    expect(await reopened.lookup('original')).toEqual(Uint8Array.of(40))
+    expect(await reopened.lookup('changed')).toBeNull()
+    expect(await reopened.run({ operationId: 'original', fingerprint: Uint8Array.of(1),
+      prepare: async () => { throw new Error('must not reauthor') },
+      apply: async () => { throw new Error('must not republish') },
+    })).toEqual(Uint8Array.of(40))
+  })
 })

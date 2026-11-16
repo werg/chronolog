@@ -20,7 +20,10 @@ describe('limited publisher HTTP ingress', () => {
     const fixture = service()
     expect(() => new HttpRpcServer({ service: fixture.rpc, publisherIngress: true })).toThrow('owner RPC token')
     expect(() => new HttpRpcServer({ service: fixture.rpc, publisherIngress: true, token: '' })).toThrow('owner RPC token')
-    const server = new HttpRpcServer({ service: fixture.rpc, token: 'owner-secret', port: 0 })
+    const settings = { service: fixture.rpc, token: 'owner-secret', publisherIngress: false, port: 0 }
+    const server = new HttpRpcServer(settings)
+    settings.publisherIngress = true
+    settings.token = ''
     const { url } = await server.listen()
     const authenticated = new HttpRpcTransport({ baseUrl: url, token: 'owner-secret' })
     try {
@@ -35,7 +38,9 @@ describe('limited publisher HTTP ingress', () => {
     const server = new HttpRpcServer({ service: fixture.rpc, token: 'owner-secret', publisherIngress: true, port: 0 })
     const { url } = await server.listen()
     const sent = vi.fn<typeof fetch>((input, init) => fetch(input, init))
-    const publisher = createHttpPublisherIngress({ baseUrl: url, groupId: group, fetch: sent })
+    const settings = { baseUrl: url, groupId: group, fetch: sent }
+    const publisher = createHttpPublisherIngress(settings)
+    settings.groupId = 'mutated-after-construction'
     const original = new Uint8Array(512).map((_, index) => index % 256)
     try {
       expect(Object.keys(publisher)).toEqual(['submitSigned'])

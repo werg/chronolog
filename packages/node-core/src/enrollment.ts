@@ -128,28 +128,33 @@ export async function prepareEnrollmentRequest(options: {
   readonly requestedRoles: readonly EnrollmentRole[]
   readonly writerProgram?: ProgramRights
 }): Promise<SignedEnrollmentRequest> {
-  await verifyEnrollmentDescriptor(options.descriptor)
+  const descriptor = structuredClone(options.descriptor), store = options.store
+  const identity = { ...options.identity, publicKeyBytes: options.identity.publicKeyBytes.slice() }
+  const readerPublicKey = options.readerPublicKey.slice(), requestId = options.requestId, transportAuthor = options.transportAuthor
+  const requestedRoles = roles(options.requestedRoles)
+  const writerProgram = options.writerProgram === undefined ? undefined : normalizeProgramRights(options.writerProgram)
+  await verifyEnrollmentDescriptor(descriptor)
   const request: EnrollmentRequest = {
-    requestId: options.requestId, groupId: options.descriptor.history.groupId,
-    genesisDigest: options.descriptor.history.genesisDigest,
-    policyDigest: await historyConfigurationDigest(options.descriptor.history),
-    executionManifestDigest: options.descriptor.history.executionManifestDigest,
-    signingPublicKey: options.identity.publicKeyBytes, readerPublicKey: options.readerPublicKey,
-    transportAuthor: options.transportAuthor, requestedRoles: roles(options.requestedRoles), historyAccess: 'full',
-    ...(options.writerProgram === undefined ? {} : { writerProgram: normalizeProgramRights(options.writerProgram) }),
+    requestId, groupId: descriptor.history.groupId,
+    genesisDigest: descriptor.history.genesisDigest,
+    policyDigest: await historyConfigurationDigest(descriptor.history),
+    executionManifestDigest: descriptor.history.executionManifestDigest,
+    signingPublicKey: identity.publicKeyBytes, readerPublicKey,
+    transportAuthor, requestedRoles, historyAccess: 'full',
+    ...(writerProgram === undefined ? {} : { writerProgram }),
   }
   const payload = encodeEnrollmentRequest(request)
-  return storeLock(options.store).run(async () => {
+  return storeLock(store).run(async () => {
     const key = `enrollment/request/${bytesToHex(request.groupId)}/${encodeURIComponent(request.requestId)}`
-    const saved = await options.store.get(key)
+    const saved = await store.get(key)
     if (saved !== null) {
       const original = decodeSignedEnrollmentRequest(saved)
       if (!equalBytes(encodeEnrollmentRequest(original.request), payload)) throw new Error('ENROLLMENT_REQUEST_ID_CONFLICT')
       if (!await verifySignedEnrollmentRequest(original)) throw new Error('ENROLLMENT_STORED_REQUEST_INVALID')
       return original
     }
-    const signed = { request, signature: await signDomain(DOMAINS.enrollmentRequest, payload, options.identity.privateKey) }
-    await options.store.put(key, encodeSignedEnrollmentRequest(signed))
+    const signed = { request, signature: await signDomain(DOMAINS.enrollmentRequest, payload, identity.privateKey) }
+    await store.put(key, encodeSignedEnrollmentRequest(signed))
     return signed
   })
 }
@@ -166,13 +171,16 @@ export async function saveEnrollmentApproval(options: {
   readonly approval: SignedEnrollmentApproval
   readonly store: DurableOperationStore
 }): Promise<void> {
-  await verifyEnrollmentApproval(options.descriptor, options.request, options.approval)
-  const key = approvalKey(options.request.request)
-  const encoded = encodeSignedEnrollmentApproval(options.approval)
-  await storeLock(options.store).run(async () => {
-    const saved = await options.store.get(key)
+  const descriptor = structuredClone(options.descriptor), store = options.store
+  const request = decodeSignedEnrollmentRequest(encodeSignedEnrollmentRequest(options.request))
+  const approval = decodeSignedEnrollmentApproval(encodeSignedEnrollmentApproval(options.approval))
+  await verifyEnrollmentApproval(descriptor, request, approval)
+  const key = approvalKey(request.request)
+  const encoded = encodeSignedEnrollmentApproval(approval)
+  await storeLock(store).run(async () => {
+    const saved = await store.get(key)
     if (saved !== null && !equalBytes(saved, encoded)) throw new Error('ENROLLMENT_APPROVAL_CONFLICT')
-    await options.store.put(key, encoded)
+    await store.put(key, encoded)
   })
 }
 
@@ -186,6 +194,7 @@ function approvalKey(request: EnrollmentRequest): string {
 }
 
 export async function verifyEnrollmentDescriptor(descriptor: EnrollmentDescriptor): Promise<void> {
+  descriptor = structuredClone(descriptor)
   const { genesis, history } = descriptor
   if (!await verifySignedGenesis(genesis) || descriptor.groupRoute.length !== 32 ||
       !equalBytes(genesis.manifest.groupId, history.groupId) ||
@@ -238,6 +247,7 @@ export function decodeSignedEnrollmentRequest(encoded: Uint8Array): SignedEnroll
 }
 
 export async function verifySignedEnrollmentRequest(signed: SignedEnrollmentRequest): Promise<boolean> {
+  signed = decodeSignedEnrollmentRequest(encodeSignedEnrollmentRequest(signed))
   return verifyDomain(DOMAINS.enrollmentRequest, encodeEnrollmentRequest(signed.request), signed.signature, signed.request.signingPublicKey)
 }
 
@@ -261,7 +271,10 @@ export class EnrollmentIssuer {
   readonly #options: EnrollmentIssuerOptions
   readonly #mutex: Mutex
 
-  constructor(options: EnrollmentIssuerOptions) { this.#options = options; this.#mutex = storeLock(options.store) }
+  constructor(options: EnrollmentIssuerOptions) {
+    this.#options = { ...options, descriptor: structuredClone(options.descriptor) }
+    this.#mutex = storeLock(options.store)
+  }
 
   async approve(signed: SignedEnrollmentRequest, decision: {
     readonly operationId: string
@@ -269,6 +282,10 @@ export class EnrollmentIssuer {
     readonly grantFullHistory: boolean
     readonly writerProgram?: ProgramRights
   }): Promise<SignedEnrollmentApproval> {
+    // A reviewed decision and its signed request remain one immutable operation
+    // even when a caller edits its form while verification or storage is pending.
+    signed = decodeSignedEnrollmentRequest(encodeSignedEnrollmentRequest(signed))
+    decision = structuredClone(decision)
     validateOperationId(decision.operationId)
     await verifyEnrollmentDescriptor(this.#options.descriptor)
     const request = signed.request
@@ -316,7 +333,7 @@ export class EnrollmentIssuer {
         await this.#options.governance.grantHistoricalAccess(request.signingPublicKey, this.#options.rootPrivateKey, { operationId: `${operationId}:history` })
       }
       if (state.target === null) {
-        const captured = await this.#options.captureFinalTarget()
+        const captured = structuredClone(await this.#options.captureFinalTarget())
         if (!equalBytes(captured.executionManifestDigest, request.executionManifestDigest)) throw new Error('ENROLLMENT_ENGINE_MISMATCH')
         const target = { ...captured, requiredEpochs: uniqueEpochs([...captured.requiredEpochs, ...this.#options.governance.knownEpochs]) }
         state = { ...state, target }
@@ -357,6 +374,8 @@ export async function enrollmentProgress(options: {
 }): Promise<EnrollmentProgress> {
   const progress = (state: EnrollmentState, missingEpochs: readonly bigint[] = [], granted: readonly EnrollmentRole[] = []): EnrollmentProgress =>
     ({ state, missingEpochs, roles: granted })
+  const { isFinalTargetApplied, ...evidence } = options
+  options = { ...structuredClone(evidence), isFinalTargetApplied }
   if (options.approval === null) return progress('requested')
   const { approval } = options.approval
   const request = options.request.request
@@ -386,6 +405,9 @@ export async function enrollmentProgress(options: {
 }
 
 export async function verifyEnrollmentApproval(descriptor: EnrollmentDescriptor, signedRequest: SignedEnrollmentRequest, signed: SignedEnrollmentApproval): Promise<void> {
+  descriptor = structuredClone(descriptor)
+  signedRequest = decodeSignedEnrollmentRequest(encodeSignedEnrollmentRequest(signedRequest))
+  signed = decodeSignedEnrollmentApproval(encodeSignedEnrollmentApproval(signed))
   const { approval, signature } = signed
   const request = signedRequest.request
   if (!await verifyDomain(DOMAINS.enrollmentApproval, encodeEnrollmentApproval(approval), signature, descriptor.genesis.manifest.rootAdminPublicKey) ||
