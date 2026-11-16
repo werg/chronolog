@@ -1,10 +1,13 @@
 # Application log follow-up: implementation and qualification
 
 The 16 November 2026 follow-up extends portable peer core with one signed
-application history for SQL, durable events and resident agent work. New pilot
-groups select a fixed authority on durable native agent storage. Tendriller hosts
-the application and supplies a connection adapter; its retained Cloudflare log
-remains an optional authority adapter for a separately selected deployment.
+application history for SQL, durable events and resident agent work. The revised
+deployment places portable membership administration on Cloudflare by default,
+with a separate fixed native ordering authority and full application replicas.
+Small typed descriptors commit detached application envelopes; capability and
+epoch records stay inline. Full peers fetch the application bodies through their
+authorized peer path. The earlier event/application qualification is retained
+below with its original scope; it does not qualify this new placement.
 
 This is a recovery map for
 [Chronolog PR #1](https://github.com/werg/chronolog-db/pull/1),
@@ -19,7 +22,7 @@ bidirectional old/new mirrors, or automatic authority/policy cutovers.
 
 | Roadmap phase | Implemented boundary | Evidence and next qualification |
 | --- | --- | --- |
-| A. Native authority placement | Fixed native authority, pinned profile, atomic fenced store, exact append retries, retained certificate/range exchange and ordinary reader/writer enrollment. | Actual native store/daemon/framed fixtures. Volume loss and restore remain [contrib #16](https://github.com/werg/tendriller-contrib/issues/16). |
+| A. Authority and administration placement | Fixed native ordering authority, portable Cloudflare membership administrator, separately signed schema administrator, typed descriptor history and detached envelopes. | Native late-join/revocation and exact-retry fixture; complete public host/browser gate pending. Separate administrator/native volume recovery remains [contrib #16](https://github.com/werg/tendriller-contrib/issues/16). |
 | B. General durable events | Version 3 `ChangeProgram` contains SQL, platform operations and bounded literal emits. Event-only and mixed execution, stable event IDs and final durable cursors. | Actual native SQL rollback/reopen and event-only restart. Actual SQL-free Chromium/OPFS qualification passed at the recorded head below. |
 | C. Projections, workers and timers | Pinned combined views, keyed operation status, atomic projection checkpoints, final-intent worker journal, explicit provider recovery, signed signals and generation-fenced SQL timer publication. | Native rebase/finality, SQLite checkpoint rollback, worker ambiguity/deadline and SQL timer integration. Complete two-layout UI gate is separately reported. |
 | D. Production connection path | Bounded framing and mutual grant-checked sessions carry records, evidence, wake hints and ephemeral frames. Real loopback HTTP fixture; Tendriller bounded hosted peer relay. | This proves the protocol over actual native/browser streams, not public-network NAT traversal. Select production direct/fallback routes through [contrib #14](https://github.com/werg/tendriller-contrib/issues/14). |
@@ -31,6 +34,83 @@ arbitrary-code consensus, global pub/sub discovery, per-topic consensus/private
 sublogs and full meshes remain outside this first scope. Authority loss pauses
 new coordinated finality while peers retain local reads and certified history.
 An outage never changes history lineage implicitly.
+
+## Revised thin-administration boundary
+
+The [typed ledger format](../typed-ledger-records.md) commits exact application
+envelope hash, length, group route, record type and epoch. Candidate bodies are
+detached; small signed capability/epoch envelopes are inline and verified against
+their descriptor. This replaces opaque payload-sized entries directly. There is
+no legacy decoder fallback, mirrored log, new page outbox or automatic policy
+switch.
+
+The portable `MembershipAdministrator` follows certified descriptors, verifies
+and applies control records, retains exact approval/revocation decisions and
+distributes authorized epoch material. It has no application-body fetch port or
+application SQL engine. Its default Tendriller host supplies authenticated
+owner/device routes and a durable private metadata store. Cloudflare's SQLite
+storage for that metadata is distinct from the application materializer.
+
+Signed genesis independently names `rootAdminPublicKey` for membership and
+`schemaAdminPublicKey` for the initial application schema group administrator.
+Every full replica initializes application ownership from the latter key. A
+separate native schema signer can create tables without turning the Cloudflare
+root into an application group member or SQL writer. A local-only materializer
+override would break deterministic agreement and is not permitted.
+
+| Public boundary | Responsibility |
+| --- | --- |
+| `@chronolog/node-core/ledger` | Canonical descriptors, exact envelope binding and verified detached-body resolution. |
+| `@chronolog/node-core/membership` and independently packed `@chronolog/membership` | Portable provisioning, administrator, enrollment verification and signed bounded ledger protocol. |
+| `@tendriller/core/members` | Public host client for configuration, account-bound requests, owner approval/revocation, status and certified control-history pages. |
+| `PUT /members`, then `POST /members/sync` | Persist the host root and signed descriptor before starting the native participant; then open administration and synchronize control history. |
+| `GET /members/history` | Approved reader account or administrator obtains bounded certified descriptor/control history to bootstrap device verification. |
+| Signed `POST /_chronolog/membership` on the native host | Authenticate the immutable root signer, read bounded descriptors/certificates, or append exact inline control records. No local SQL signing or application body route is granted. |
+
+A joining device generates its own signing and reader keys. Its signed request
+binds the authenticated host account prefix; another logged-in account cannot
+reassign it by forwarding the same signature. An approval receipt alone is not
+readiness. The device first verifies certified controls and its grant/key wraps,
+then opens its reader-authenticated peer connection and fetches the missing
+application envelopes. Governance can advance through the certified descriptor
+prefix while application execution is pending. Each candidate still authorizes
+against membership at its own canonical position, so later revocation cannot
+rewrite an older final result.
+
+Missing payloads remain explicit `LEDGER_PAYLOAD_UNAVAILABLE` progress. They do
+not become rejection or permit an applied event cursor to skip the missing
+input. The qualification handles only this typed unavailable condition while
+asserting verified grant/key readiness; it preserves all other integrity,
+key, materialization and infrastructure failures.
+
+The [native qualification](../../test/thin-membership-native.integration.test.ts)
+uses actual durable administrator storage, the signed HTTP handler, a separate
+native SQL authority and a late full SQL replica. It exercises large envelopes,
+small descriptors, lost append/reopen/exact approval retry, membership activation
+before body catch-up, direct writer revocation, accepted retry after revocation,
+and reader removal followed by a future epoch. It also queries the actual SQL
+group to distinguish the schema administrator from the membership root. This
+native boundary is not evidence of Cloudflare or Chromium execution.
+
+The complete public host/browser gate is
+[tools/thin-membership-pilot.ts](../../tools/thin-membership-pilot.ts):
+
+```sh
+node --import tsx tools/thin-membership-pilot.ts \
+  --tendriller-artifacts /exact/tendriller-public-dist \
+  --wasm /exact/chronolog-wasm-artifacts \
+  --output /new/thin-membership-evidence
+```
+
+It installs copied SDK/engine tarballs into an independent consumer, checks the
+engine's exact membership provenance/import audit, runs the real default host
+provider in workerd, and uses an actual Chromium/OPFS device. The fixture does
+not inject capabilities, raw epoch keys or a replacement roster provider.
+Candidate count and payload size vary independently. Reports retain encoded
+descriptor/control and full-peer payload counters, exact package hashes,
+per-stage evidence and failures. `--build-only` explicitly records that workerd
+and browser scenarios were not run. The complete gate remains pending until its
+exact CI report is attached; deployment evidence stays in the contrib issues.
 
 ## Public application model
 
@@ -220,19 +300,29 @@ actual gate on an environment that can launch Chromium.
 
 ## Recorded evidence and acceptance map
 
-At immutable Chronolog head `98dffed4b44e1ef49d5823586114f7bda011793f`:
+The prior event/application qualification completed at authored Chronolog head
+`db235e61231ed5b41b785390cfb15d6eea3371c6`, tested clean merge
+`f6a6b63bb9bed7f8d224450ffccbc3100aa55a91`. This is historical evidence for the
+earlier administration/record format, not the new thin-membership gate.
 
-- The [native quality job](https://github.com/werg/chronolog-db/actions/runs/43922334294/job/133492604239)
-  succeeded: 606 tests passed, four optional WASM tests skipped, 110 files passed.
-  The separate native SSB gate passed eight tests and Ubuntu conformance passed.
-  Coverage was 78.04% statements/lines, 81.64% branches and 83.98% functions.
-  Later commits require their own CI result.
-- The [browser job](https://github.com/werg/chronolog-db/actions/runs/43922334173/job/133492598759)
-  passed all seven SQL-free Chromium/OPFS scenarios and four actual native/WASM
-  comparison tests using Chromium 158.0.8127.18. The mixed SQL/event gate also
-  passed ownership/client, atomic rollback, pinned view, native hash, reopen,
-  prepared-write crash and cutoff checks before a subsequent push canceled the
-  workflow. This is not a complete green workflow or a completed pilot run.
+- [Quality and cross-platform conformance](https://github.com/werg/chronolog-db/actions/runs/43925461758)
+  passed 631 tests, the eight-test native SSB gate, Linux/macOS conformance and
+  their digest comparison.
+- The complete [browser workflow](https://github.com/werg/chronolog-db/actions/runs/43925461545)
+  passed four actual native/WASM comparison tests, seven SQL-free OPFS scenarios,
+  eight mixed SQL/OPFS scenarios, five public bridge checks and all eight
+  two-layout task/chat pilot checks. The pilot observed one worker dispatch,
+  zero host application-state writes and no page errors in Chromium
+  158.0.8127.18. Native final result took 224 ms and the browser applied frontiers
+  took 7,524 and 8,841 ms; these are run observations, not a production promise.
+- Exact public inputs were Tendriller
+  `4eb9a4fec0892378574324675611d0e0e3eecb55` and contrib
+  `41f0f44b7dd48e80f049d38dad7f8d6c0e452ae8`. The workflow's artifact
+  `14256401547` has SHA-256
+  `b1d7bedb51f4d5cf25bc14cb7cd4dfc8645ca2aace71680ed393d7d9eeff8dcc`.
+- [Chaos qualification](https://github.com/werg/chronolog-db/actions/runs/43925461418)
+  also passed at that head. Every later core/format change requires its own
+  regression result; earlier browser evidence is not relabeled.
 
 | Acceptance item | Executable evidence | Qualification boundary |
 | --- | --- | --- |
@@ -259,15 +349,21 @@ draft/receipt behavior and content boundaries, not native/browser semantics.
 - [Contrib #14](https://github.com/werg/tendriller-contrib/issues/14): actual
   browser/native direct/fallback routes on home/mobile/corporate networks,
   interruption/suspension, warm hosting outage and direct/relayed byte accounting.
+  Count descriptor/inline-control traffic separately from detached envelopes.
 - [Contrib #15](https://github.com/werg/tendriller-contrib/issues/15): paired hosted
   and peer workloads, request/storage/relay costs, startup/catch-up/replay,
   latency and memory. Moving authority does not establish transport savings.
+  Include administrator metadata cost and separate size/count workloads.
 - [Contrib #16](https://github.com/werg/tendriller-contrib/issues/16): persistent
   volume fencing, commit/ack crash, disk loss, trusted independent continuity,
   backup restoration and explicit new-lineage decisions.
+  Rehearse Cloudflare root/roster recovery separately from native ordering and
+  detached payload recovery.
 - [Contrib #17](https://github.com/werg/tendriller-contrib/issues/17): deployed
   enrollment, device suspension/OPFS/quota/clearing, publisher/signal grant
   boundaries, private context/bytes and backup availability.
+  Include live Cloudflare approval, direct writer revocation despite valid host
+  login, reader future-key removal and browser readiness after certified bootstrap.
 
 These issues contain concrete completion criteria and remain open until actual
 deployment evidence is attached. A fixture, screenshot or passing local unit

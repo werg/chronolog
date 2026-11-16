@@ -48,21 +48,21 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller
-          ref: 4eb9a4fec0892378574324675611d0e0e3eecb55
+          ref: 43cac4e75b0bbe1e422f4879b7249d6db5988440
           path: artifacts/pilot-source/tendriller
           persist-credentials: false
       - name: Check out the exact contrib application specimens
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 41f0f44b7dd48e80f049d38dad7f8d6c0e452ae8
+          ref: a3797d528d3bbbc649cda637e1e465105ea86c1c
           path: artifacts/pilot-source/contrib
           persist-credentials: false
-      - name: Build the packaged public Tendriller runtime
+      - name: Build the packaged public Tendriller SDK, runtime and engine
         working-directory: artifacts/pilot-source/tendriller
         run: |
           npm ci
-          node scripts/build.mjs --artifacts-only
+          npm run build
       - name: Qualify both contrib layouts with native agents and independent browser peers
         run: |
           node --import tsx tools/application-pilot.ts \
@@ -70,6 +70,12 @@ jobs:
             --tendriller-runtime artifacts/pilot-source/tendriller/dist/runtime \
             --wasm artifacts/wasm \
             --output artifacts/application-pilot/ci
+      - name: Qualify thin Cloudflare membership with a separate native authority and browser device
+        run: |
+          node --import tsx tools/thin-membership-pilot.ts \
+            --tendriller-artifacts artifacts/pilot-source/tendriller/dist \
+            --wasm artifacts/wasm \
+            --output artifacts/thin-membership/ci
       - name: Preserve the qualification and engine provenance
         if: always()
         uses: actions/upload-artifact@v6
@@ -85,5 +91,10 @@ jobs:
             artifacts/application-pilot/ci/bundles.json
             artifacts/application-pilot/ci/*.png
             artifacts/application-pilot/ci/pages/specimen-manifest.json
+            artifacts/thin-membership/ci/report.json
+            artifacts/thin-membership/ci/bundles.json
+            artifacts/thin-membership/ci/membership-provenance.json
+            artifacts/thin-membership/ci/host/host-results.json
+            artifacts/thin-membership/ci/*.png
           if-no-files-found: error
           retention-days: 30
