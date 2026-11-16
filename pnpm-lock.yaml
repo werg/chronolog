@@ -22,12 +22,12 @@ importers:
       '@chronolog/node-core':
         specifier: workspace:*
         version: link:packages/node-core
-      '@chronolog/records':
-        specifier: workspace:*
-        version: link:packages/records
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:packages/protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:packages/records
       '@chronolog/rpc':
         specifier: workspace:*
         version: link:packages/rpc
@@ -129,13 +129,11 @@ importers:
         specifier: ^4.20.3
         version: 4.23.1
 
-  packages/records:
+  packages/canonical:
     dependencies:
-      '@chronolog/canonical':
-        specifier: workspace:*
-        version: link:../canonical
-
-  packages/canonical: {}
+      '@noble/hashes':
+        specifier: 1.8.0
+        version: 1.8.0
 
   packages/capabilities:
     dependencies:
@@ -223,6 +221,9 @@ importers:
 
   packages/materializer-doltlite:
     dependencies:
+      '@chronolog/canonical':
+        specifier: workspace:*
+        version: link:../canonical
       '@chronolog/materializer':
         specifier: workspace:*
         version: link:../materializer
@@ -250,12 +251,12 @@ importers:
       '@chronolog/materializer':
         specifier: workspace:*
         version: link:../materializer
-      '@chronolog/records':
-        specifier: workspace:*
-        version: link:../records
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
       '@chronolog/transport-ssb':
         specifier: workspace:*
         version: link:../transport-ssb
@@ -289,6 +290,12 @@ importers:
         specifier: ^19.1.0
         version: 19.2.7(react@19.2.7)
 
+  packages/records:
+    dependencies:
+      '@chronolog/canonical':
+        specifier: workspace:*
+        version: link:../canonical
+
   packages/rpc:
     dependencies:
       '@chronolog/canonical':
@@ -297,6 +304,15 @@ importers:
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
+
+  packages/runtime-browser:
+    dependencies:
+      '@chronolog/canonical':
+        specifier: workspace:*
+        version: link:../canonical
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
 
   packages/runtime-workerd:
     dependencies:
@@ -328,12 +344,12 @@ importers:
 
   packages/transport-ssb:
     dependencies:
-      '@chronolog/records':
-        specifier: workspace:*
-        version: link:../records
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
       secret-stack:
         specifier: 6.4.1
         version: 6.4.1
@@ -690,6 +706,10 @@ packages:
 
   '@kwsites/file-exists@1.1.1':
     resolution: {integrity: sha512-m9/5YGR18lIwxSFDwfE3oA7bWuq9kdau6ugN4H2rJeyhFQZcG9AgSHkQtSD15a8WvTgfz9aikZMrKPHvbpqFiw==}
+
+  '@noble/hashes@1.8.0':
+    resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
+    engines: {node: ^14.21.3 || >=16}
 
   '@npmcli/agent@3.0.0':
     resolution: {integrity: sha512-S79NdEgDQd/NGCay6TCoVzXSj74skRZIKJcpJjC5lOq34SZzyI6MqtiiWoiVWoVrTcGjNeC4ipbh1VIHlpfF5Q==}
@@ -2815,6 +2835,8 @@ snapshots:
       debug: 4.4.3
     transitivePeerDependencies:
       - supports-color
+
+  '@noble/hashes@1.8.0': {}
 
   '@npmcli/agent@3.0.0':
     dependencies:
