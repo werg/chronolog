@@ -134,6 +134,14 @@ The provider's recovery policy is explicit:
 external effects. Result payloads and their metadata must fit the bounded event
 contract; store large provider outputs as explicit blob references.
 
+Handlers receive `signal` and `deadlineAtMs`; pass cancellation through to the
+provider SDK. Each dispatch or reconciliation has a bounded `timeoutMs` (60
+seconds by default, at most five minutes). Shutdown cancels the call and stops
+waiting even when an asynchronous provider ignores cancellation. Its checkpoint
+remains `dispatching`; a late completion is not published by the stopped worker.
+Timeout or cancellation does not prove that the external action was prevented,
+so the same explicit recovery policy still applies on restart.
+
 One designated worker owns each handler. A changed handler version, topic filter,
 or source cannot silently reuse its checkpoint. Pure UI caches may rebuild;
 discarding an external-effect checkpoint can repeat actions and requires an
@@ -145,26 +153,74 @@ version. One `commit` atomically replaces state, revision, and processed cursor.
 
 ## Timers and cancellation
 
-`DurableTimerScheduler` consumes final configuration events:
+`DurableTimerScheduler` consumes final configuration events with explicit,
+preallocated schedule generations:
 
 ```ts
-{ type: 'timer.scheduled', timerId, dueAtMs, intervalMs, payload }
-{ type: 'timer.cancelled', timerId, scheduleEventId }
+{ type: 'timer.scheduled', version: 1, timerId, generation, dueAtMs, intervalMs, payload }
+{ type: 'timer.cancelled', version: 1, timerId, generation }
 ```
 
-The schedule event ID is the generation. Cancellation of an older generation
-cannot cancel its replacement. Recurring occurrences derive from scheduled time,
-so late processing does not drift the schedule. Catch-up is bounded per turn.
-Occurrence ID, scheduled time, and observed time are persisted before publication
-and reused after a lost response or restart.
+Allocate the generation before the signed SQL + event program. The resulting
+content-derived event ID cannot be inserted into that same program without a
+hash cycle. The scheduler separately preserves `configurationEventId` as audit
+provenance. Occurrences bind source/history, timer, generation, and scheduled time;
+their ID and observed time are durable before publication and survive retries.
+An older cancellation cannot cancel a replacement generation. Recurrence uses
+scheduled time, not dispatch time, so bounded catch-up does not drift the schedule.
 
-The application's `TimerOccurrencePublisher` must validate that the generation
-is still active and publish the occurrence at one canonical boundary, returning
-a final `accepted` or `cancelled` result. An SQL assertion plus `emit` is one
-implementation. This explicit port prevents a local clock check from being
-mistaken for fencing against a concurrent cancellation. Accepted exact retries
-keep their original result even after later cancellation. Timers publish intent;
-effect workers perform any outside action.
+Mixed SQL/event deployments use the concrete `createSqlTimerPublisher` export:
+
+```ts
+const publisher = createSqlTimerPublisher({
+  node: context.node,
+  configurationTopic: 'timers.configuration',
+  occurrenceTopic: 'timers.fired',
+});
+
+// Run after the resident authority/replication loops have started. Persist these
+// operation IDs with the reviewed requests; do not mint new IDs on retry.
+await publisher.initialize({ operationId: 'timer-schema-1', signal });
+const proposalId = await publisher.schedule({
+  timerId: 'review-reminder', generation, dueAtMs, payload: { taskId },
+}, { operationId, expectedGeneration: null, signal });
+// Replacement supplies the exact prior generation, and a fresh generation above.
+await publisher.cancel({ timerId: 'review-reminder', generation }, {
+  operationId: cancelOperationId, signal,
+});
+```
+
+These methods return the original proposal ID only after final acceptance and
+throw `SqlTimerRejectedError` for final rejection. They use ordinary public
+`node.publish`, `node.operation`, and `node.revisions`; no private authority
+hooks or local acceptance shortcut is used. Schema initialization is an explicit
+one-time application program under a stable operation ID. The default tables are
+`agent_timer_heads`, `agent_timer_generations`, and `agent_timer_occurrences`;
+`tablePrefix` can name an isolated application namespace. The permanent generation
+ledger prevents a new schedule from reusing an old generation and reviving stale
+pending work. No backward schema migration is supplied for this prerelease API.
+
+The occurrence publisher validates the active generation, exact next due time,
+and canonical payload with SQL assertions. It inserts the occurrence, advances
+or retires the schedule, and emits `timer.fired` in one program. A cancellation
+ordered first causes final `cancelled` without an effective occurrence event.
+An accepted exact retry keeps its earlier result after a later cancellation.
+Only the defined inactive-generation assertion maps to `cancelled`; SQL failures,
+permission refusals, time overflow, and unrelated rejections remain visible
+errors. Clock observation alone never supplies canonical fencing.
+
+Supply this publisher to a module's `timers` entry or a directly opened
+`DurableTimerScheduler`. The scheduler passes shutdown cancellation into finality
+waits and retains an unfinished occurrence for exact retry. Do not await final
+publication from `createAgent` before the daemon starts its resident loops.
+Event-only groups can use the smaller `TimerOccurrencePublisher` port with their
+own defined atomic acceptance model; they cannot use the SQL implementation.
+
+Timers emit final intent, and an effect worker performs any outside action.
+Cancellation prevents an occurrence that has not already won canonical
+admission. A previously final intent and an in-flight external action need the
+provider's explicit cancellation/reconciliation policy; the log does not make
+an external call atomic with a later cancellation.
 
 ## Direct and relayed connections
 

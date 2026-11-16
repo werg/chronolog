@@ -13,6 +13,9 @@ export interface EffectContext {
   /** Pass unchanged to a provider that supports durable idempotency keys. */
   readonly idempotencyKey: string
   readonly event: FinalEvent
+  /** Cooperative provider cancellation; an aborted call still has an uncertain external outcome. */
+  readonly signal: AbortSignal
+  readonly deadlineAtMs: number
 }
 
 export type EffectReconciliation =
@@ -26,6 +29,8 @@ export interface EffectHandler {
   readonly topics: readonly string[]
   /** `idempotent` is a provider guarantee, never inferred from a local retry key. */
   readonly recovery: 'idempotent' | 'reconcile' | 'manual'
+  /** Bound each provider dispatch/reconciliation. Defaults to 60 seconds. */
+  readonly timeoutMs?: number
   dispatch(context: EffectContext): Promise<EventPayload>
   reconcile?(context: EffectContext): Promise<EffectReconciliation>
 }
@@ -74,6 +79,7 @@ export class DurableEffectWorker {
   readonly #topics: readonly string[]
   readonly #checkpoint: CheckpointStore
   readonly #limit: number
+  readonly #timeoutMs: number
   readonly #mutex = new Mutex()
   #running = false
 
@@ -84,6 +90,8 @@ export class DurableEffectWorker {
     if (this.#topics.includes(options.resultTopic)) throw new Error('EFFECT_RESULT_TOPIC_IS_INPUT')
     if (options.handler.recovery === 'reconcile' && options.handler.reconcile === undefined) throw new Error('EFFECT_RECONCILER_REQUIRED')
     this.#limit = options.batchLimit ?? 8
+    this.#timeoutMs = options.handler.timeoutMs ?? 60_000
+    if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs < 1 || this.#timeoutMs > 300_000) throw new Error('EFFECT_TIMEOUT_INVALID')
     if (!Number.isSafeInteger(this.#limit) || this.#limit < 1 || this.#limit > 64) throw new Error('CONSUMER_BATCH_LIMIT_INVALID')
     this.#options = options
     this.#checkpoint = new CheckpointStore(options.store, {
@@ -115,19 +123,20 @@ export class DurableEffectWorker {
   }
 
   /** One bounded read; useful for resident scheduling and deterministic tests. */
-  async processNext(): Promise<{ readonly progressed: boolean; readonly hasMore: boolean }> {
+  async processNext(options: { readonly signal?: AbortSignal } = {}): Promise<{ readonly progressed: boolean; readonly hasMore: boolean }> {
     if (this.#running) throw new Error('EFFECT_WORKER_ALREADY_RUNNING')
     return this.#mutex.run(async () => {
+      options.signal?.throwIfAborted()
       let state = await this.#load()
       if (state.pending !== null) {
-        await this.#finish(state)
+        await this.#finish(state, options.signal)
         return { progressed: true, hasMore: true }
       }
       const batch = await this.#options.source.read({ topics: this.#topics, limit: this.#limit,
         ...(state.cursor === null ? {} : { cursor: state.cursor }) })
       const before = state.cursor
       state = await this.#accept(state, batch)
-      await this.#finish(state)
+      await this.#finish(state, options.signal)
       return { progressed: batch.scannedThrough !== before, hasMore: batch.hasMore }
     })
   }
@@ -136,13 +145,17 @@ export class DurableEffectWorker {
     if (this.#running) throw new Error('EFFECT_WORKER_ALREADY_RUNNING')
     this.#running = true
     try {
-      const state = await this.#mutex.run(async () => this.#finish(await this.#load()))
+      const state = await this.#mutex.run(async () => this.#finish(await this.#load(), signal))
       if (signal?.aborted) return
       for await (const batch of this.#options.source.subscribe({ topics: this.#topics, limit: this.#limit,
         ...(state.cursor === null ? {} : { cursor: state.cursor }), ...(signal === undefined ? {} : { signal }) })) {
         if (signal?.aborted) return
-        await this.#mutex.run(async () => this.#finish(await this.#accept(await this.#load(), batch)))
+        await this.#mutex.run(async () => this.#finish(await this.#accept(await this.#load(), batch), signal))
       }
+    } catch (error) {
+      // The durable dispatching state remains for explicit recovery. Shutdown
+      // cannot infer that cancellation stopped an external provider action.
+      if (signal?.aborted !== true) throw error
     } finally { this.#running = false }
   }
 
@@ -168,9 +181,10 @@ export class DurableEffectWorker {
     return next
   }
 
-  async #finish(input: WorkerState): Promise<WorkerState> {
+  async #finish(input: WorkerState, signal?: AbortSignal): Promise<WorkerState> {
     let state = input
     while (state.pending !== null) {
+      signal?.throwIfAborted()
       let pending = state.pending
       if (pending.next === pending.events.length) {
         state = { cursor: pending.scannedThrough, revision: pending.revision, pending: null }
@@ -187,11 +201,13 @@ export class DurableEffectWorker {
         await this.#save(state)
       }
       if (active.effectId !== effectId) throw new Error('EFFECT_CHECKPOINT_ID_MISMATCH')
-      const context: EffectContext = { effectId, idempotencyKey: effectId, event: cloneFinalEvent(event) }
+      const context = { effectId, idempotencyKey: effectId, event: cloneFinalEvent(event) }
       if (active.stage === 'dispatching') {
         if (this.#options.handler.recovery === 'manual') throw new EffectUncertainError(effectId)
         if (this.#options.handler.recovery === 'reconcile') {
-          const reconciliation = await this.#options.handler.reconcile!(context)
+          let reconciliation: EffectReconciliation
+          try { reconciliation = await this.#provider(context, signal, (request) => this.#options.handler.reconcile!(request)) }
+          catch (cause) { throw new EffectUncertainError(effectId, cause) }
           if (reconciliation.kind === 'uncertain') throw new EffectUncertainError(effectId)
           active = reconciliation.kind === 'completed'
             ? { effectId, stage: 'result', result: clonePayload(reconciliation.result) }
@@ -207,7 +223,7 @@ export class DurableEffectWorker {
         pending = { ...pending, active }; state = { ...state, pending }
         await this.#save(state)
         let result: EventPayload
-        try { result = clonePayload(await this.#options.handler.dispatch(context)) }
+        try { result = clonePayload(await this.#provider(context, signal, (request) => this.#options.handler.dispatch(request))) }
         catch (cause) { throw new EffectUncertainError(effectId, cause) }
         active = { effectId, stage: 'result', result }
         pending = { ...pending, active }; state = { ...state, pending }
@@ -224,6 +240,34 @@ export class DurableEffectWorker {
       await this.#save(state)
     }
     return state
+  }
+
+  async #provider<T>(context: Omit<EffectContext, 'signal' | 'deadlineAtMs'>, parent: AbortSignal | undefined,
+    operation: (context: EffectContext) => Promise<T>): Promise<T> {
+    const controller = new AbortController()
+    const deadlineAtMs = Date.now() + this.#timeoutMs
+    const cancel = (): void => controller.abort(parent?.reason)
+    let onAbort: (() => void) | undefined
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new Error('EFFECT_PROVIDER_INTERRUPTED', { cause: controller.signal.reason }))
+      controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
+    parent?.addEventListener('abort', cancel, { once: true })
+    const timeout = setTimeout(() => controller.abort(new Error('EFFECT_PROVIDER_DEADLINE_EXCEEDED')), this.#timeoutMs)
+    try {
+      if (parent?.aborted) cancel()
+      // Promise.race observes a late provider rejection without publishing a
+      // late result or advancing the checkpoint after the owner has stopped.
+      const call = Promise.resolve().then(() => {
+        controller.signal.throwIfAborted()
+        return operation({ ...context, signal: controller.signal, deadlineAtMs })
+      })
+      return await Promise.race([call, interrupted])
+    } finally {
+      clearTimeout(timeout)
+      parent?.removeEventListener('abort', cancel)
+      if (onAbort !== undefined) controller.signal.removeEventListener('abort', onAbort)
+    }
   }
 
   async #load(): Promise<WorkerState> {

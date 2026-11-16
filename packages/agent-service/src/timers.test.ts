@@ -32,19 +32,19 @@ function fixture() {
 describe('durable agent timers', () => {
   it('keeps one-shot schedules and handled occurrences across restart', async () => {
     const f = fixture()
-    f.source.entries.push({ type: 'timer.scheduled', timerId: 'morning', dueAtMs: 100, payload: { message: 'hello' } })
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'morning', dueAtMs: 100, payload: { message: 'hello' } })
     const scheduler = await DurableTimerScheduler.open(f.options)
     expect(await scheduler.tick(99)).toEqual({ emitted: 0, needsCatchUp: false })
     expect(await scheduler.tick(100)).toEqual({ emitted: 1, needsCatchUp: false })
     const reopened = await DurableTimerScheduler.open(f.options)
     expect(await reopened.tick(200)).toEqual({ emitted: 0, needsCatchUp: false })
     expect(f.delivered).toHaveLength(1)
-    expect(f.delivered[0]!.occurrence).toMatchObject({ timerId: 'morning', scheduleEventId: 'proposal-0:0', scheduledAtMs: 100 })
+    expect(f.delivered[0]!.occurrence).toMatchObject({ timerId: 'morning', generation: 'generation-1', configurationEventId: 'proposal-0:0', scheduledAtMs: 100 })
   })
 
   it('catches up recurring occurrences in bounded turns without drifting schedule time', async () => {
     const f = fixture()
-    f.source.entries.push({ type: 'timer.scheduled', timerId: 'interval', dueAtMs: 10, intervalMs: 10 })
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'interval', dueAtMs: 10, intervalMs: 10 })
     const scheduler = await DurableTimerScheduler.open({ ...f.options, maxOccurrencesPerTick: 2 })
     expect((await scheduler.tick(35)).emitted).toBe(2)
     expect((await scheduler.tick(35)).emitted).toBe(1)
@@ -55,21 +55,21 @@ describe('durable agent timers', () => {
   it('consumes all known cancellations before firing and does not cancel a replacement generation', async () => {
     const f = fixture()
     f.source.maxRead = 1
-    f.source.entries.push({ type: 'timer.scheduled', timerId: 'job', dueAtMs: 10 },
-      { type: 'timer.cancelled', timerId: 'job', scheduleEventId: 'proposal-0:0' })
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'job', dueAtMs: 10 },
+      { type: 'timer.cancelled', version: 1, timerId: 'job', generation: 'generation-1' })
     const scheduler = await DurableTimerScheduler.open(f.options)
     expect(await scheduler.tick(20)).toEqual({ emitted: 0, needsCatchUp: true })
     expect(await scheduler.tick(20)).toEqual({ emitted: 0, needsCatchUp: false })
-    f.source.entries.push({ type: 'timer.scheduled', timerId: 'job', dueAtMs: 30 },
-      { type: 'timer.cancelled', timerId: 'job', scheduleEventId: 'proposal-0:0' })
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-2', timerId: 'job', dueAtMs: 30 },
+      { type: 'timer.cancelled', version: 1, timerId: 'job', generation: 'generation-1' })
     await scheduler.tick(40)
     expect((await scheduler.tick(40)).emitted).toBe(1)
-    expect(f.delivered[0]!.occurrence.scheduleEventId).toBe('proposal-2:0')
+    expect(f.delivered[0]!.occurrence.generation).toBe('generation-2')
   })
 
   it('uses the canonical publisher to resolve a cancellation racing a clock tick', async () => {
     const f = fixture()
-    f.source.entries.push({ type: 'timer.scheduled', timerId: 'job', dueAtMs: 10, intervalMs: 10 })
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'job', dueAtMs: 10, intervalMs: 10 })
     let calls = 0
     const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
       publishOccurrence: async () => { calls += 1; return 'cancelled' },
@@ -81,7 +81,7 @@ describe('durable agent timers', () => {
 
   it('preserves exact occurrence identity and captured time after a lost response', async () => {
     const f = fixture()
-    f.source.entries.push({ type: 'timer.scheduled', timerId: 'job', dueAtMs: 10 })
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'job', dueAtMs: 10 })
     let fail = true
     const publisher = { publishOccurrence: async (occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> => {
       f.delivered.push({ occurrence: structuredClone(occurrence), operationId })
@@ -94,5 +94,37 @@ describe('durable agent timers', () => {
     await reopened.tick(200)
     expect(f.delivered).toHaveLength(2)
     expect(f.delivered[1]).toEqual(f.delivered[0])
+  })
+})
+
+describe('timer shutdown and explicit generations', () => {
+  it('aborts a finality wait while preserving the exact pending occurrence for restart', async () => {
+    const f = fixture(), stop = new AbortController()
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, timerId: 'job', generation: 'reviewed-generation', dueAtMs: 10 })
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
+      publishOccurrence: async (_occurrence, { signal }) => {
+        entered()
+        return new Promise<'accepted'>((_, reject) => signal?.addEventListener('abort', () => reject(new Error('stopped')), { once: true }))
+      },
+    } })
+    const tick = scheduler.tick(20, stop.signal)
+    await started; stop.abort()
+    await expect(tick).rejects.toThrow('stopped')
+    const pending = (await scheduler.status()).pending
+    expect(pending).toMatchObject({ generation: 'reviewed-generation', configurationEventId: 'proposal-0:0', observedAtMs: 20 })
+    const reopened = await DurableTimerScheduler.open(f.options)
+    await reopened.tick(100)
+    expect(f.delivered[0]!.occurrence).toEqual(pending)
+  })
+
+  it('rejects an event without a preallocated generation before advancing its checkpoint', async () => {
+    const f = fixture()
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, timerId: 'job', dueAtMs: 10 })
+    const scheduler = await DurableTimerScheduler.open(f.options)
+    await expect(scheduler.tick(20)).rejects.toThrow('TIMER_CONFIGURATION_INVALID')
+    expect(await scheduler.status()).toEqual({ cursor: null, active: 0, pending: null })
+    expect(f.delivered).toHaveLength(0)
   })
 })

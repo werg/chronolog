@@ -147,4 +147,46 @@ describe('durable final-intent workers', () => {
       .rejects.toThrow('CHECKPOINT_BINDING_MISMATCH')
     expect(await effectIdentity('history', 'event', 'handler', '1')).not.toBe(await effectIdentity('history', 'event', 'handler', '2'))
   })
+
+  it('stops a hung provider on service cancellation and preserves uncertain dispatch state for recovery', async () => {
+    const f = fixture()
+    const controller = new AbortController()
+    let started!: () => void, finish!: (result: EventPayload) => void
+    const entered = new Promise<void>((resolve) => { started = resolve })
+    let providerSignal: AbortSignal | undefined
+    const configuration: EffectWorkerOptions = { ...f.configuration,
+      source: { ...f.configuration.source, async *subscribe() { yield await f.configuration.source.read() } },
+      handler: { ...f.configuration.handler, dispatch: async ({ signal, deadlineAtMs }) => {
+        providerSignal = signal
+        expect(deadlineAtMs).toBeGreaterThan(Date.now())
+        started()
+        return new Promise<EventPayload>((resolve) => { finish = resolve })
+      } } }
+    const worker = await DurableEffectWorker.open(configuration)
+    const running = worker.run(controller.signal)
+    await entered
+    controller.abort()
+    await running
+    expect(providerSignal?.aborted).toBe(true)
+    expect(await worker.status()).toMatchObject({ cursor: null, remaining: 2, effect: { stage: 'dispatching' } })
+    finish({ late: 'completed after shutdown' })
+    await Promise.resolve()
+    expect(f.results).toHaveLength(0)
+    const reopened = await DurableEffectWorker.open(configuration)
+    await expect(reopened.processNext()).rejects.toThrow('EFFECT_OUTCOME_UNCERTAIN')
+  })
+
+  it('bounds provider time without treating timeout as proof that no external effect happened', async () => {
+    const f = fixture()
+    let providerSignal: AbortSignal | undefined
+    const worker = await DurableEffectWorker.open({ ...f.configuration,
+      handler: { ...f.configuration.handler, timeoutMs: 10, dispatch: async ({ signal }) => {
+        providerSignal = signal
+        return new Promise(() => { /* Deliberately non-cooperative provider. */ })
+      } } })
+    await expect(worker.processNext()).rejects.toThrow('EFFECT_OUTCOME_UNCERTAIN')
+    expect(providerSignal?.aborted).toBe(true)
+    expect(await worker.status()).toMatchObject({ cursor: null, effect: { stage: 'dispatching' } })
+    expect(f.results).toHaveLength(0)
+  })
 })

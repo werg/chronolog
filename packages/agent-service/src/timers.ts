@@ -13,8 +13,10 @@ export interface TimerOccurrence {
   readonly type: 'timer.fired'
   readonly version: 1
   readonly timerId: string
-  /** The original final schedule event is the cancellation/fencing generation. */
-  readonly scheduleEventId: string
+  /** Caller allocates this identity before the SQL + emit schedule program. */
+  readonly generation: string
+  /** Original final configuration event, preserved as audit provenance. */
+  readonly configurationEventId: string
   readonly occurrenceId: string
   readonly scheduledAtMs: number
   readonly observedAtMs: number
@@ -23,13 +25,13 @@ export interface TimerOccurrence {
 
 export interface TimerOccurrencePublisher {
   /**
-   * Atomically validate that scheduleEventId is still the active generation and
+   * Atomically validate that generation is still the active schedule and
    * publish the occurrence, then resolve its final accepted/cancelled outcome.
    * A mixed SQL assertion + emit is one implementation. A local-only check is
    * insufficient: a final cancellation may race the timer's clock observation.
    * Exact accepted retries retain their result after a later cancellation.
    */
-  publishOccurrence(occurrence: TimerOccurrence, options: { readonly operationId: string }): Promise<'accepted' | 'cancelled'>
+  publishOccurrence(occurrence: TimerOccurrence, options: { readonly operationId: string; readonly signal?: AbortSignal }): Promise<'accepted' | 'cancelled'>
 }
 
 export interface TimerSchedulerOptions {
@@ -47,7 +49,8 @@ export interface TimerSchedulerOptions {
 
 interface Schedule {
   readonly timerId: string
-  readonly scheduleEventId: string
+  readonly generation: string
+  readonly configurationEventId: string
   readonly nextDueAtMs: number
   readonly intervalMs: number | null
   readonly payload: EventPayload
@@ -94,9 +97,10 @@ export class DurableTimerScheduler {
    * Capture time once for a bounded turn. Catch up configuration before selecting
    * new occurrences; a publisher resolves races at the final history boundary.
    */
-  async tick(now = this.#options.now?.() ?? Date.now()): Promise<{ readonly emitted: number; readonly needsCatchUp: boolean }> {
+  async tick(now = this.#options.now?.() ?? Date.now(), signal?: AbortSignal): Promise<{ readonly emitted: number; readonly needsCatchUp: boolean }> {
     assertTimestamp(now)
     return this.#mutex.run(async () => {
+      signal?.throwIfAborted()
       let state = await this.#load()
       const batch = await this.#options.source.read({ topics: [this.#options.configurationTopic], limit: 64,
         ...(state.cursor === null ? {} : { cursor: state.cursor }) })
@@ -115,24 +119,24 @@ export class DurableTimerScheduler {
         let occurrence = state.pending
         if (occurrence === null) {
           const due = [...state.schedules.values()].filter((timer) => !timer.cancelled && timer.nextDueAtMs <= now)
-            .sort((a, b) => a.nextDueAtMs - b.nextDueAtMs || a.timerId.localeCompare(b.timerId))[0]
+            .sort((a, b) => a.nextDueAtMs - b.nextDueAtMs || (a.timerId < b.timerId ? -1 : a.timerId > b.timerId ? 1 : 0))[0]
           if (due === undefined) break
           const occurrenceId = `occurrence_${bytesToHex(await sha256(encodeCanonicalCbor([
-            'chronolog/timer-occurrence/v1', this.#options.sourceId, due.timerId, due.scheduleEventId, BigInt(due.nextDueAtMs),
+            'chronolog/timer-occurrence/v1', this.#options.sourceId, due.timerId, due.generation, BigInt(due.nextDueAtMs),
           ])))}`
-          occurrence = { type: 'timer.fired', version: 1, timerId: due.timerId, scheduleEventId: due.scheduleEventId,
+          occurrence = { type: 'timer.fired', version: 1, timerId: due.timerId, generation: due.generation, configurationEventId: due.configurationEventId,
             occurrenceId, scheduledAtMs: due.nextDueAtMs, observedAtMs: now, payload: due.payload }
           state = { ...state, pending: occurrence }
           await this.#save(state)
         }
         // This final result, including a rejection, is stable for exact retries.
         const result = await this.#options.publisher.publishOccurrence(structuredClone(occurrence),
-          { operationId: `timer-occurrence:${occurrence.occurrenceId}` })
+          { operationId: `timer-occurrence:${occurrence.occurrenceId}`, ...(signal === undefined ? {} : { signal }) })
         if (result !== 'accepted' && result !== 'cancelled') throw new Error('TIMER_PUBLICATION_OUTCOME_INVALID')
         if (result === 'accepted') emitted += 1
         const updated = new Map(state.schedules)
         const timer = updated.get(occurrence.timerId)
-        if (timer?.scheduleEventId === occurrence.scheduleEventId && timer.nextDueAtMs === occurrence.scheduledAtMs) {
+        if (timer?.generation === occurrence.generation && timer.nextDueAtMs === occurrence.scheduledAtMs) {
           const next = timer.intervalMs === null ? null : timer.nextDueAtMs + timer.intervalMs
           if (next !== null) assertTimestamp(next)
           updated.set(timer.timerId, { ...timer, nextDueAtMs: next ?? timer.nextDueAtMs,
@@ -150,7 +154,7 @@ export class DurableTimerScheduler {
     this.#running = true
     try {
       while (signal?.aborted !== true) {
-        const result = await this.tick()
+        const result = await this.tick(this.#options.now?.() ?? Date.now(), signal)
         if (!result.needsCatchUp) await waitForAbortableDelay(this.#pollMs, signal)
       }
     } finally { this.#running = false }
@@ -173,12 +177,12 @@ export class DurableTimerScheduler {
     }
     const schedules = new Map<string, Schedule>()
     for (const row of value[1]) {
-      if (!Array.isArray(row) || row.length !== 7 || typeof row[0] !== 'string' || typeof row[1] !== 'string' ||
-          typeof row[2] !== 'bigint' || (row[3] !== null && typeof row[3] !== 'bigint') ||
-          typeof row[4] !== 'string' || typeof row[5] !== 'boolean' || row[6] !== 1n) throw new Error('TIMER_CHECKPOINT_INVALID')
-      const schedule: Schedule = { timerId: row[0], scheduleEventId: row[1], nextDueAtMs: Number(row[2]),
-        intervalMs: row[3] === null ? null : Number(row[3]), payload: parsePayload(row[4]), cancelled: row[5] }
-      validateConsumerId(schedule.timerId); validateConsumerId(schedule.scheduleEventId); assertTimestamp(schedule.nextDueAtMs)
+      if (!Array.isArray(row) || row.length !== 8 || typeof row[0] !== 'string' || typeof row[1] !== 'string' || typeof row[2] !== 'string' ||
+          typeof row[3] !== 'bigint' || (row[4] !== null && typeof row[4] !== 'bigint') ||
+          typeof row[5] !== 'string' || typeof row[6] !== 'boolean' || row[7] !== 1n) throw new Error('TIMER_CHECKPOINT_INVALID')
+      const schedule: Schedule = { timerId: row[0], generation: row[1], configurationEventId: row[2], nextDueAtMs: Number(row[3]),
+        intervalMs: row[4] === null ? null : Number(row[4]), payload: parsePayload(row[5]), cancelled: row[6] }
+      validateConsumerId(schedule.timerId); validateConsumerId(schedule.generation); validateConsumerId(schedule.configurationEventId); assertTimestamp(schedule.nextDueAtMs)
       if (schedule.intervalMs !== null && (!Number.isSafeInteger(schedule.intervalMs) || schedule.intervalMs < 1)) throw new Error('TIMER_CHECKPOINT_INVALID')
       if (schedules.has(schedule.timerId)) throw new Error('TIMER_CHECKPOINT_INVALID')
       schedules.set(schedule.timerId, schedule)
@@ -189,8 +193,8 @@ export class DurableTimerScheduler {
 
   async #save(state: TimerState): Promise<void> {
     await this.#checkpoint.commit({ cursor: state.cursor, revision: state.revision, state: encodeCanonicalCbor([
-      1n, [...state.schedules.values()].sort((a, b) => a.timerId.localeCompare(b.timerId)).map((timer) => [
-        timer.timerId, timer.scheduleEventId, BigInt(timer.nextDueAtMs), timer.intervalMs === null ? null : BigInt(timer.intervalMs),
+      1n, [...state.schedules.values()].sort((a, b) => (a.timerId < b.timerId ? -1 : a.timerId > b.timerId ? 1 : 0)).map((timer) => [
+        timer.timerId, timer.generation, timer.configurationEventId, BigInt(timer.nextDueAtMs), timer.intervalMs === null ? null : BigInt(timer.intervalMs),
         canonicalEventPayload(timer.payload), timer.cancelled, 1n,
       ]), state.pending === null ? null : encodeOccurrence(state.pending),
     ]) })
@@ -201,21 +205,20 @@ function applyConfiguration(schedules: Map<string, Schedule>, event: FinalEvent)
   const payload = event.payload
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('TIMER_CONFIGURATION_INVALID')
   const fields = payload as { readonly [key: string]: EventPayload }
-  if (typeof fields.timerId !== 'string') throw new Error('TIMER_CONFIGURATION_INVALID')
-  validateConsumerId(fields.timerId)
+  if (fields.version !== 1 || typeof fields.timerId !== 'string' || typeof fields.generation !== 'string') throw new Error('TIMER_CONFIGURATION_INVALID')
+  validateConsumerId(fields.timerId); validateConsumerId(fields.generation)
   if (fields.type === 'timer.scheduled') {
     if (typeof fields.dueAtMs !== 'number' || (fields.intervalMs !== undefined && fields.intervalMs !== null &&
         (typeof fields.intervalMs !== 'number' || !Number.isSafeInteger(fields.intervalMs) || fields.intervalMs < 1))) {
       throw new Error('TIMER_CONFIGURATION_INVALID')
     }
     assertTimestamp(fields.dueAtMs)
-    schedules.set(fields.timerId, { timerId: fields.timerId, scheduleEventId: event.id, nextDueAtMs: fields.dueAtMs,
+    schedules.set(fields.timerId, { timerId: fields.timerId, generation: fields.generation, configurationEventId: event.id, nextDueAtMs: fields.dueAtMs,
       intervalMs: typeof fields.intervalMs === 'number' ? fields.intervalMs : null,
       payload: parsePayload(canonicalEventPayload(fields.payload ?? null)), cancelled: false })
   } else if (fields.type === 'timer.cancelled') {
-    if (typeof fields.scheduleEventId !== 'string') throw new Error('TIMER_CONFIGURATION_INVALID')
     const timer = schedules.get(fields.timerId)
-    if (timer?.scheduleEventId === fields.scheduleEventId) schedules.set(timer.timerId, { ...timer, cancelled: true })
+    if (timer?.generation === fields.generation) schedules.set(timer.timerId, { ...timer, cancelled: true })
   } else throw new Error('TIMER_CONFIGURATION_INVALID')
 }
 
@@ -228,15 +231,23 @@ function parsePayload(value: string): EventPayload {
   return parsed
 }
 function encodeOccurrence(value: TimerOccurrence): CborValue {
-  return [value.timerId, value.scheduleEventId, value.occurrenceId, BigInt(value.scheduledAtMs), BigInt(value.observedAtMs), canonicalEventPayload(value.payload)]
+  return [value.timerId, value.generation, value.configurationEventId, value.occurrenceId, BigInt(value.scheduledAtMs), BigInt(value.observedAtMs), canonicalEventPayload(value.payload)]
 }
 function decodeOccurrence(value: unknown): TimerOccurrence {
-  if (!Array.isArray(value) || value.length !== 6 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
-      typeof value[2] !== 'string' || typeof value[3] !== 'bigint' || typeof value[4] !== 'bigint' || typeof value[5] !== 'string') {
+  if (!Array.isArray(value) || value.length !== 7 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
+      typeof value[2] !== 'string' || typeof value[3] !== 'string' || typeof value[4] !== 'bigint' || typeof value[5] !== 'bigint' || typeof value[6] !== 'string') {
     throw new Error('TIMER_CHECKPOINT_INVALID')
   }
-  for (const id of [value[0], value[1], value[2]]) validateConsumerId(id)
-  assertTimestamp(Number(value[3])); assertTimestamp(Number(value[4]))
-  return { type: 'timer.fired', version: 1, timerId: value[0], scheduleEventId: value[1], occurrenceId: value[2],
-    scheduledAtMs: Number(value[3]), observedAtMs: Number(value[4]), payload: parsePayload(value[5]) }
+  const occurrence: TimerOccurrence = { type: 'timer.fired', version: 1, timerId: value[0], generation: value[1], configurationEventId: value[2], occurrenceId: value[3],
+    scheduledAtMs: Number(value[4]), observedAtMs: Number(value[5]), payload: parsePayload(value[6]) }
+  validateTimerOccurrence(occurrence)
+  return occurrence
+}
+
+export function validateTimerOccurrence(value: TimerOccurrence): void {
+  if (value.type !== 'timer.fired' || value.version !== 1) throw new Error('TIMER_OCCURRENCE_INVALID')
+  for (const id of [value.timerId, value.generation, value.configurationEventId, value.occurrenceId]) validateConsumerId(id)
+  assertTimestamp(value.scheduledAtMs); assertTimestamp(value.observedAtMs)
+  if (value.observedAtMs < value.scheduledAtMs) throw new Error('TIMER_TIME_INVALID')
+  canonicalEventPayload(value.payload)
 }
