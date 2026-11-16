@@ -46,6 +46,55 @@ function expectAllowed(db: DatabaseLike, sql: string, mode: Mode = 'consensus', 
 }
 
 describe('SQL authorization block-list', () => {
+  it('keeps host/build catalogs out of replicated SQL while preserving local diagnostics', () => {
+    const db = database()
+    try {
+      for (const sql of [
+        "SELECT sqlite_compileoption_used('OMIT_UTF16')",
+        'SELECT sqlite_compileoption_get(0)',
+        'SELECT sqlite_source_id()',
+        'SELECT "SQLITE_COMPILEOPTION_GET" /* resolved function name */ (0)',
+        'PRAGMA compile_options',
+        'PRAGMA function_list',
+        'PRAGMA module_list',
+        'PRAGMA pragma_list',
+        'PRAGMA collation_list',
+        'SELECT * FROM pragma_compile_options',
+        'SELECT * FROM pragma_function_list',
+        'SELECT * FROM pragma_module_list',
+        'SELECT * FROM pragma_pragma_list',
+        'SELECT * FROM pragma_collation_list',
+      ]) {
+        expectProfileViolation(db, sql)
+        expectAllowed(db, sql, 'local_read')
+      }
+      for (const sql of [
+        'SELECT * FROM dbstat', 'SELECT * FROM sqlite_dbpage', 'SELECT * FROM sqlite_stmt',
+      ]) expectProfileViolation(db, sql)
+      for (const sql of [
+        "SELECT name FROM pragma_table_info('accounts')",
+        "SELECT name FROM pragma_table_xinfo('accounts')",
+        "SELECT name FROM pragma_index_list('accounts')",
+        "SELECT * FROM pragma_foreign_key_list('accounts')",
+        'SELECT sqlite_version()',
+        "SELECT 'sqlite_compileoption_get(0)' AS text",
+        'SELECT 1 AS "sqlite_compileoption_get"',
+        'WITH sqlite_compileoption_get(value) AS (VALUES(1)) SELECT value FROM sqlite_compileoption_get',
+      ]) expectAllowed(db, sql)
+    } finally { db.close() }
+  })
+
+  it('enforces the diagnostic boundary inside application views and platform-triggered SQL', () => {
+    const db = database()
+    try {
+      db.exec(`CREATE VIEW host_build AS SELECT sqlite_compileoption_used('OMIT_UTF16') AS value;
+        CREATE TRIGGER host_trigger AFTER UPDATE ON accounts BEGIN SELECT sqlite_source_id(); END;`)
+      expectProfileViolation(db, 'SELECT value FROM host_build')
+      expectAllowed(db, 'SELECT value FROM host_build', 'local_read')
+      expectProfileViolation(db, 'UPDATE accounts SET value = value', 'platform')
+    } finally { db.close() }
+  })
+
   it('allows ordinary SQLite in consensus, including formerly gated functions', () => {
     const db = database()
     try {
