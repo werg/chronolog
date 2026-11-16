@@ -111,6 +111,12 @@
       ],
       "@chronolog/agent-service/membership-http": [
         "packages/agent-service/src/membership-http.ts"
+      ],
+      "@chronolog/transport-webrtc": [
+        "packages/transport-webrtc/src/index.ts"
+      ],
+      "@chronolog/transport-webrtc/native": [
+        "packages/transport-webrtc/src/native.ts"
       ]
     }
   }
