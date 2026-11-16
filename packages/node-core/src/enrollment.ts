@@ -84,7 +84,17 @@ function storeLock(store: DurableOperationStore): Mutex {
   return mutex
 }
 
-/** Generate once on the joining device; private material never enters a request. */
+/** Reopen a known device. Missing keys require recovery or deliberate enrollment. */
+export async function loadEnrollmentIdentity(store: DurableOperationStore, namespace: string): Promise<EnrollmentIdentity> {
+  validateOperationId(namespace)
+  return storeLock(store).run(async () => {
+    const saved = await store.get(`enrollment/identity/${encodeURIComponent(namespace)}`)
+    if (saved === null) throw new Error('ENROLLMENT_IDENTITY_MISSING')
+    return decodeEnrollmentIdentity(saved)
+  })
+}
+
+/** Generate once during explicit device setup; private material never enters a request. */
 export async function loadOrCreateEnrollmentIdentity(store: DurableOperationStore, namespace: string): Promise<EnrollmentIdentity> {
   validateOperationId(namespace)
   return storeLock(store).run(async () => {
@@ -99,22 +109,26 @@ export async function loadOrCreateEnrollmentIdentity(store: DurableOperationStor
       ])
       await store.put(key, saved)
     }
-    const value = array(saved, 5)
-    if (value[0] !== 1n) throw new Error('ENROLLMENT_IDENTITY_INVALID')
-    const signingPublicKey = bytes(value[1], 32)
-    const readerPublicKey = bytes(value[3], 32)
-    const signing = {
-      publicKeyBytes: signingPublicKey,
-      publicKey: await importEd25519PublicKey(signingPublicKey),
-      privateKey: await importEd25519PrivateKey(bytes(value[2])),
-    }
-    const reader = {
-      publicKeyBytes: readerPublicKey,
-      publicKey: await importX25519PublicKey(readerPublicKey),
-      privateKey: await importX25519PrivateKey(bytes(value[4])),
-    }
-    return { signing, reader }
+    return decodeEnrollmentIdentity(saved)
   })
+}
+
+async function decodeEnrollmentIdentity(saved: Uint8Array): Promise<EnrollmentIdentity> {
+  const value = array(saved, 5)
+  if (value[0] !== 1n) throw new Error('ENROLLMENT_IDENTITY_INVALID')
+  const signingPublicKey = bytes(value[1], 32)
+  const readerPublicKey = bytes(value[3], 32)
+  const signing = {
+    publicKeyBytes: signingPublicKey,
+    publicKey: await importEd25519PublicKey(signingPublicKey),
+    privateKey: await importEd25519PrivateKey(bytes(value[2])),
+  }
+  const reader = {
+    publicKeyBytes: readerPublicKey,
+    publicKey: await importX25519PublicKey(readerPublicKey),
+    privateKey: await importX25519PrivateKey(bytes(value[4])),
+  }
+  return { signing, reader }
 }
 
 /** Persist the signed request before returning bytes that can be delivered. */

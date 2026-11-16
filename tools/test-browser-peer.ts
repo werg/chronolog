@@ -96,7 +96,7 @@ try {
   await page.goto(`http://127.0.0.1:${address.port}/`)
   await page.waitForFunction(() => 'chronologBrowserTest' in globalThis)
   const name = `qualification-${crypto.randomUUID()}`
-  const initial = await page.evaluate(({ name }) => (globalThis as unknown as TestWindow).chronologBrowserTest.open('owner', name), { name })
+  const initial = await page.evaluate(({ name }) => (globalThis as unknown as TestWindow).chronologBrowserTest.open('owner', name, true), { name })
   await assert.rejects(page.evaluate(({ name }) => (globalThis as unknown as TestWindow).chronologBrowserTest.open('contender', name), { name }), /BROWSER_STORAGE_IN_USE/u)
   passed('one effective Worker storage owner')
   const schema = [

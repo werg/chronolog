@@ -87,7 +87,7 @@ try {
   await page.waitForFunction(() => 'chronologBrowserBridge' in globalThis)
   const name = `bridge-${crypto.randomUUID()}`
   const identity = await page.evaluate(({ name, bootstrap }) =>
-    (globalThis as unknown as TestWindow).chronologBrowserBridge.open('browser', name, bootstrap), { name, bootstrap: fixture.bootstrap })
+    (globalThis as unknown as TestWindow).chronologBrowserBridge.open('browser', name, bootstrap, true, true), { name, bootstrap: fixture.bootstrap })
   assert.notEqual(identity.identity, fixture.bootstrap.rootIdentity)
   const request = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserBridge.request('browser', 'join-browser', ['reader', 'writer']))
   assert.equal((await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserBridge.enrollmentStatus('browser', 'join-browser'))).state, 'requested')
@@ -157,7 +157,7 @@ try {
   passed('page reload retains OPFS signer, reader key, signed enrollment request, final SQL, and exact durable claim identity')
 
   const third = await page.evaluate(({ name, bootstrap }) =>
-    (globalThis as unknown as TestWindow).chronologBrowserBridge.open('reader', `${name}-reader`, bootstrap, false), { name, bootstrap: fixture.bootstrap })
+    (globalThis as unknown as TestWindow).chronologBrowserBridge.open('reader', `${name}-reader`, bootstrap, false, true), { name, bootstrap: fixture.bootstrap })
   assert.notEqual(third.identity, identity.identity)
   assert.notEqual(third.identity, fixture.bootstrap.rootIdentity)
   const readerRequest = await page.evaluate(() =>

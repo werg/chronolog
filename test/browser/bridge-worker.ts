@@ -38,6 +38,7 @@ interface FixtureRequest {
   readonly fixture?: string
   readonly id?: number
   readonly name?: string
+  readonly createIdentity?: true
   readonly bootstrap?: BrowserBridgeBootstrap
   readonly relay?: boolean
   readonly port?: MessagePort
@@ -138,7 +139,7 @@ endpoint.addEventListener('message', (event) => {
         }
         const groupRoute = base64UrlToBytes(bootstrap.groupRoute)
         peer = await openBrowserPeer({
-          name: request.name!, engineUrl: new URL('/engine/', globalThis.location.href),
+          name: request.name!, ...(request.createIdentity === true ? { createIdentity: true } : {}), engineUrl: new URL('/engine/', globalThis.location.href),
           configure(context) {
             localIdentity = context.identity
             if (request.relay) {

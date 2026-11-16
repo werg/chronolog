@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   EnrollmentIssuer, decodeSignedEnrollmentRequest, encodeEnrollmentApproval, encodeSignedEnrollmentRequest, enrollmentProgress,
-  loadEnrollmentApproval, loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest, saveEnrollmentApproval, verifyEnrollmentApproval, verifySignedEnrollmentRequest,
+  loadEnrollmentApproval, loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest, saveEnrollmentApproval, verifyEnrollmentApproval, verifySignedEnrollmentRequest,
   type EnrollmentDescriptor, type EnrollmentFinalTarget,
 } from './enrollment.js'
 import { GovernanceControlPlane } from './governance.js'
@@ -15,6 +15,25 @@ const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('live durable group enrollment', () => {
+  it('never generates replacement keys while reopening a missing or corrupt device identity', async () => {
+    const values = new Map<string, Uint8Array>()
+    let writes = 0
+    const store = {
+      async get(key: string) { return values.get(key)?.slice() ?? null },
+      async put(key: string, value: Uint8Array) { writes += 1; values.set(key, value.slice()) },
+    }
+    await expect(loadEnrollmentIdentity(store, 'peer')).rejects.toThrow('ENROLLMENT_IDENTITY_MISSING')
+    expect(writes).toBe(0)
+    const identity = await loadOrCreateEnrollmentIdentity(store, 'peer')
+    const reopened = await loadEnrollmentIdentity(store, 'peer')
+    expect(reopened.signing.publicKeyBytes).toEqual(identity.signing.publicKeyBytes)
+    expect(reopened.reader.publicKeyBytes).toEqual(identity.reader.publicKeyBytes)
+    expect(writes).toBe(1)
+    values.set('enrollment/identity/peer', Uint8Array.of(0))
+    await expect(loadEnrollmentIdentity(store, 'peer')).rejects.toThrow()
+    expect(writes).toBe(1)
+  })
+
   it('captures one request before asynchronous signing and preserves its exact retry identity', async () => {
     const fixture = await setup(), store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'captured-request')
     const signingKey = identity.signing.publicKeyBytes.slice(), readerKey = identity.reader.publicKeyBytes.slice()

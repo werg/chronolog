@@ -13,13 +13,13 @@ let persistClock: (() => Promise<void>) | undefined
 let engineModule: ChronologWasmModule | undefined
 
 endpoint.addEventListener('message', (event) => {
-  const request = event.data as { fixture?: string; id?: number; name?: string; operationId?: string; cutoff?: string }
+  const request = event.data as { fixture?: string; id?: number; name?: string; createIdentity?: true; operationId?: string; cutoff?: string }
   if (request.fixture === undefined) return
   const run = async (): Promise<unknown> => {
     switch (request.fixture) {
       case 'open': {
         peer = await openBrowserPeer({
-          name: request.name!, engineUrl: new URL('/engine/', globalThis.location.href),
+          name: request.name!, ...(request.createIdentity === true ? { createIdentity: true } : {}), engineUrl: new URL('/engine/', globalThis.location.href),
           async configure(context) {
             engineModule = context.engine.module
             const savedClock = await context.operations.get('fixture/clock')

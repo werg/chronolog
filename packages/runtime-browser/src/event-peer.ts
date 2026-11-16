@@ -1,7 +1,7 @@
 import { ControlStore } from '@chronolog/control-store/browser'
 import { createEventMaterializationRuntime, type ChronologMaterializationRuntime } from '@chronolog/materializer'
 import {
-  ChronologNode, createGovernedNode, createEnrollmentService, loadOrCreateEnrollmentIdentity,
+  ChronologNode, createGovernedNode, createEnrollmentService, loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity,
   type ChronologNodeOptions, type EnrollmentIdentity, type GovernedNodeOptions,
 } from '@chronolog/node-core/browser'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type AtomicBytesStore, type ChronologTransport } from '@chronolog/records'
@@ -34,6 +34,8 @@ export type BrowserEventPeerConfiguration = ConfigurationBase & ({
 /** A durable browser peer whose dependency graph contains no SQL/WASM engine. */
 export async function openBrowserEventPeer(options: {
   readonly name: string
+  /** Only explicit first-device setup may create keys. Reopening fails if they are missing. */
+  readonly createIdentity?: true
   readonly maxHistoryBytes?: number
   readonly configure: (context: BrowserEventPeerContext) => BrowserEventPeerConfiguration | Promise<BrowserEventPeerConfiguration>
 }) {
@@ -45,7 +47,7 @@ export async function openBrowserEventPeer(options: {
   let configuration: BrowserEventPeerConfiguration | undefined
   let service: NodeRpcService | undefined
   try {
-    const identity = await loadOrCreateEnrollmentIdentity(storage.bytes, 'peer')
+    const identity = await (options.createIdentity === true ? loadOrCreateEnrollmentIdentity : loadEnrollmentIdentity)(storage.bytes, 'peer')
     const records = await DurableFeedStore.open(storage.bytes, webFeedCrypto)
     transport = new PortableFeedTransport({ store: records,
       signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey), crypto: webFeedCrypto })

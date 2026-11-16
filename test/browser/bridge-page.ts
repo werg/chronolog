@@ -26,9 +26,9 @@ class BrowserClaimPeer {
     })
   }
 
-  async open(name: string, bootstrap: BrowserBridgeBootstrap, relay: boolean): Promise<BrowserBridgeIdentity> {
+  async open(name: string, bootstrap: BrowserBridgeBootstrap, relay: boolean, createIdentity?: true): Promise<BrowserBridgeIdentity> {
     this.#name = name
-    this.identity = await this.command('open', { name, bootstrap, relay }) as BrowserBridgeIdentity
+    this.identity = await this.command('open', { name, bootstrap, relay, createIdentity }) as BrowserBridgeIdentity
     this.client = new ChronologClient({ transport: this.rpc, groupId: this.identity.groupId, unaryRetryAttempts: 0 })
     return this.identity
   }
@@ -76,9 +76,9 @@ class BrowserClaimPeer {
 
 const peers = new Map<string, BrowserClaimPeer>()
 const api = {
-  async open(id: string, name: string, bootstrap: BrowserBridgeBootstrap, relay = true) {
+  async open(id: string, name: string, bootstrap: BrowserBridgeBootstrap, relay = true, createIdentity?: true) {
     const peer = new BrowserClaimPeer()
-    try { const identity = await peer.open(name, bootstrap, relay); peers.set(id, peer); return identity }
+    try { const identity = await peer.open(name, bootstrap, relay, createIdentity); peers.set(id, peer); return identity }
     catch (error) { peer.worker.terminate(); throw error }
   },
   sync(id: string) { return peers.get(id)!.command('sync') },

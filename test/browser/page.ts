@@ -23,9 +23,9 @@ class TestPeer {
       else pending?.reject(new Error(response.error))
     })
   }
-  async open(name: string) {
+  async open(name: string, createIdentity?: true) {
     this.#name = name
-    const identity = await this.command('open', { name }) as { groupId: string; identity: string }
+    const identity = await this.command('open', { name, createIdentity }) as { groupId: string; identity: string }
     this.client = new ChronologClient({ transport: this.rpc, groupId: identity.groupId, unaryRetryAttempts: 1 })
     return identity
   }
@@ -76,9 +76,9 @@ class TestPeer {
 
 const peers = new Map<string, TestPeer>()
 const test = {
-  async open(id: string, name: string) {
+  async open(id: string, name: string, createIdentity?: true) {
     const peer = new TestPeer()
-    try { const result = await peer.open(name); peers.set(id, peer); return result }
+    try { const result = await peer.open(name, createIdentity); peers.set(id, peer); return result }
     catch (error) { peer.worker.terminate(); throw error }
   },
   submit(id: string, steps: string[], operationId: string) { return peers.get(id)!.submit(steps, operationId) },

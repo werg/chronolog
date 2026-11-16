@@ -4,7 +4,7 @@ import {
   type MaterializerOptions,
 } from '@chronolog/materializer-doltlite/browser'
 import {
-  ChronologNode, createGovernedNode, createEnrollmentService, loadOrCreateEnrollmentIdentity,
+  ChronologNode, createGovernedNode, createEnrollmentService, loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity,
   type ChronologNodeOptions, type EnrollmentIdentity, type GovernedNodeOptions,
 } from '@chronolog/node-core/browser'
 import {
@@ -63,6 +63,8 @@ export interface BrowserPeer {
  */
 export async function openBrowserPeer(options: {
   readonly name: string
+  /** Only explicit first-device setup may create keys. Reopening fails if they are missing. */
+  readonly createIdentity?: true
   readonly engineUrl: string | URL
   readonly configure: (context: BrowserPeerContext) => BrowserPeerConfiguration | Promise<BrowserPeerConfiguration>
 }): Promise<BrowserPeer> {
@@ -76,8 +78,8 @@ export async function openBrowserPeer(options: {
   let configuration: BrowserPeerConfiguration | undefined
   let sqlStorage: OpfsSqlitePool | undefined
   try {
+    const identity = await (options.createIdentity === true ? loadOrCreateEnrollmentIdentity : loadEnrollmentIdentity)(storage.bytes, 'peer')
     const engine = await loadBrowserEngine(options.engineUrl)
-    const identity = await loadOrCreateEnrollmentIdentity(storage.bytes, 'peer')
     const records = await DurableFeedStore.open(storage.bytes, webFeedCrypto)
     transport = new PortableFeedTransport({ store: records, signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey), crypto: webFeedCrypto })
     configuration = await options.configure({ identity, operations: storage.bytes, transport, engine })

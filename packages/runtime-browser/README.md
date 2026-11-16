@@ -114,6 +114,18 @@ engine is needed to recover durable events, operation identity, or cutoffs.
 
 The application supplies its verified group descriptor, execution manifest and routing identity. `configure` runs inside the Worker after opening the durable identity and feed store. It can connect the local `PortableFeedTransport` to a retained-history `FeedLink`, or wrap it in a transport adapter such as the optional Tendriller bridge.
 
+Opening either browser profile loads an existing device identity. Missing keys
+fail with `ENROLLMENT_IDENTITY_MISSING` before application bootstrap; malformed
+keys also fail. Only deliberate first-device setup passes `createIdentity: true`
+(or prepares keys in an explicit enrollment stage). Never add that flag in an
+automatic recovery catch block. After browser storage is cleared, show that the
+device needs recovery or new enrollment, retain any externally saved original
+operation references, and require an explicit decision before creating a new
+identity. A new identity has no inherited grants or local operation journal.
+Use a new peer name when enrolling a replacement device; revoke the lost device
+through the administrator. A surviving replica can supply authorized history,
+but cannot reconstruct that device's erased private keys or unpublished drafts.
+
 ```ts
 // peer-worker.ts
 import { openBrowserPeer, serveBrowserPeer } from '@chronolog/runtime-browser'
