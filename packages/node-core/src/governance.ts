@@ -177,6 +177,15 @@ export class GovernanceControlPlane {
 
   async #publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions): Promise<SignedCapabilityRevision> {
     this.#assertCapabilityFeedOwner()
+    if (this.#options.genesis.manifest.historyPolicy !== undefined) {
+      if (change.successorRootPublicKey !== undefined) throw new Error('GOVERNANCE_FIXED_ROOT')
+      if (change.successorCapabilityLogFeed !== undefined) throw new Error('GOVERNANCE_FIXED_ADMINISTRATION_FEED')
+      if ((change.validationPolicies?.length ?? 0) > 0) throw new Error('GOVERNANCE_FIXED_VALIDATION_POLICY')
+      if (change.grants?.some((grant) => grant.role === 'validator') === true ||
+          change.revocations?.some((id) => this.#snapshot.capabilities.get(bytesToHex(id))?.grant.role === 'validator') === true) {
+        throw new Error('GOVERNANCE_FIXED_VALIDATORS')
+      }
+    }
     const fingerprint = encodeCapabilityRevision({
       groupId: this.#snapshot.groupId, revision: 1n,
       previousRevisionDigest: new Uint8Array(32), issuerRootPublicKey: this.#options.genesis.manifest.rootAdminPublicKey,

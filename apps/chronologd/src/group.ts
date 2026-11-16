@@ -189,11 +189,10 @@ async function initialize(
       node: { signingPublicKey: subject, transportAuthor, readerHpkePublicKey: b64(loaded.recipientPublicKey) },
       // Submit the roles this node should hold with `chronolog governance grant`
       // on the administrator node, then `chronolog governance rotate` so the new
-      // reader receives the current epoch key. Validator floors default to grant time.
+      // reader receives the current epoch key. Validators stay fixed at genesis.
       suggestedGrants: {
         reader: grant('reader', { hpkePublicKey: b64(loaded.recipientPublicKey) }),
         writer: grant('writer'),
-        validator: grant('validator'),
       },
       next: 'Add the administrator node to CHRONOLOG_SSB_PEERS, then start chronologd.',
     })

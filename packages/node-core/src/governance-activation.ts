@@ -177,6 +177,11 @@ export class GovernanceActivationIndex {
     if (!equalBytes(snapshot.groupId, this.#groupId) || snapshot.revision !== active.revision + 1n) {
       throw new Error('GOVERNANCE_ACTIVATION_CHAIN_INVALID')
     }
+    if (!equalBytes(snapshot.rootAdminPublicKey, active.rootAdminPublicKey) ||
+        !equalBytes(snapshot.capabilityLogFeed, active.capabilityLogFeed)) throw new Error('GOVERNANCE_AUTHORITY_RECONFIGURATION_UNSUPPORTED')
+    if (snapshot.policies.size !== active.policies.size || [...snapshot.policies.keys()].some((key) => !active.policies.has(key))) {
+      throw new Error('GOVERNANCE_POLICY_RECONFIGURATION_UNSUPPORTED')
+    }
     // Initial enrollment changes application membership, never consensus roles.
     const validators = activeValidators(snapshot)
     if (validators.length !== this.#validators.length || validators.some((item, index) =>
