@@ -190,16 +190,19 @@ export function decodeOrderingEvidence(bytes: Uint8Array): OrderingEvidence {
  * certificates. A certified root without every preceding byte is not finality.
  */
 export class CoordinatedHistoryPolicy {
-  readonly configuration: CoordinatedHistoryConfiguration
+  readonly #configuration: CoordinatedHistoryConfiguration
   readonly #store: DurableOperationStore
   readonly #key: string
   readonly #mutex = new Mutex()
-  #entries = new Map<number, OrderedRecordEntry>()
+  // Entry roots authenticate bytes, not the authority's choice of position.
+  // Retain competing untrusted alternatives until a certificate selects one.
+  #entries = new Map<number, Map<string, OrderedRecordEntry>>()
+  #selectedEntries = new Map<number, OrderedRecordEntry>()
   #certificates = new Map<number, PrefixCertificate>()
   #progress: CoordinatedProgress
 
   private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, root: string) {
-    this.configuration = structuredClone(configuration)
+    this.#configuration = structuredClone(configuration)
     this.#store = store
     this.#key = `history/${bytesToHex(configuration.groupId)}/coordinated`
     this.#progress = { receivedThrough: 0, verifiedThrough: 0, certifiedThrough: 0, finalThrough: 0, root, missing: [] }
@@ -218,100 +221,164 @@ export class CoordinatedHistoryPolicy {
         if (!(bytes instanceof Uint8Array)) throw new Error('HISTORY_STORED_EVIDENCE_INVALID')
         await policy.#validateAndInsert(decodeOrderingEvidence(bytes), policy.#entries, policy.#certificates)
       }
-      policy.#progress = await policy.#evaluate(policy.#entries, policy.#certificates)
+      const evaluated = await policy.#evaluate(policy.#entries, policy.#certificates)
+      policy.#progress = evaluated.progress
+      policy.#selectedEntries = evaluated.selectedEntries
+      discardUncommittedAlternatives(policy.#entries, evaluated.selectedEntries)
     }
     return policy
   }
 
   get progress(): CoordinatedProgress { return structuredClone(this.#progress) }
+  get configuration(): CoordinatedHistoryConfiguration { return structuredClone(this.#configuration) }
 
   entries(through = this.#progress.verifiedThrough): readonly OrderedRecordEntry[] {
     assertPosition(through, true)
     if (through > this.#progress.verifiedThrough) throw new Error('HISTORY_PREFIX_INCOMPLETE')
-    return Array.from({ length: through }, (_, i) => structuredClone(this.#entries.get(i + 1)!))
+    return Array.from({ length: through }, (_, i) => structuredClone(this.#selectedEntries.get(i + 1)!))
   }
 
   evidence(): readonly OrderingEvidence[] {
     return [
-      ...[...this.#entries.values()].sort((a, b) => a.position - b.position).map((entry): OrderingEvidence => ({ kind: 'ordered-entry', entry: structuredClone(entry) })),
+      ...allEntries(this.#entries).sort((a, b) => a.position - b.position || a.root.localeCompare(b.root)).map((entry): OrderingEvidence => ({ kind: 'ordered-entry', entry: structuredClone(entry) })),
       ...[...this.#certificates.values()].sort((a, b) => a.position - b.position).map((certificate): OrderingEvidence => ({ kind: 'prefix-certificate', certificate: structuredClone(certificate) })),
     ]
   }
 
   async ingest(evidence: OrderingEvidence): Promise<CoordinatedProgress> {
     return this.#mutex.run(async () => {
-      const entries = new Map(this.#entries)
+      const entries = new Map([...this.#entries].map(([position, alternatives]) => [position, new Map(alternatives)]))
       const certificates = new Map(this.#certificates)
       await this.#validateAndInsert(structuredClone(evidence), entries, certificates)
-      const progress = await this.#evaluate(entries, certificates)
+      const { progress, selectedEntries } = await this.#evaluate(entries, certificates)
       if (progress.finalThrough < this.#progress.finalThrough) throw new Error('HISTORY_FINAL_PREFIX_REGRESSION')
+      discardUncommittedAlternatives(entries, selectedEntries)
       const all: OrderingEvidence[] = [
-        ...[...entries.values()].map((entry): OrderingEvidence => ({ kind: 'ordered-entry', entry })),
+        ...allEntries(entries).map((entry): OrderingEvidence => ({ kind: 'ordered-entry', entry })),
         ...[...certificates.values()].map((certificate): OrderingEvidence => ({ kind: 'prefix-certificate', certificate })),
       ]
       await this.#store.put(this.#key, encodeCanonicalCbor([
-        1n, encodeHistoryConfiguration(this.configuration), all.map(encodeOrderingEvidence),
+        1n, encodeHistoryConfiguration(this.#configuration), all.map(encodeOrderingEvidence),
       ]))
       this.#entries = entries
       this.#certificates = certificates
+      this.#selectedEntries = selectedEntries
       this.#progress = progress
       return this.progress
     })
   }
 
-  async #validateAndInsert(evidence: OrderingEvidence, entries: Map<number, OrderedRecordEntry>, certificates: Map<number, PrefixCertificate>): Promise<void> {
+  async #validateAndInsert(evidence: OrderingEvidence, entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<void> {
     if (evidence.kind === 'ordered-entry') {
       const entry = evidence.entry
-      if (entry.historyId !== this.configuration.historyId) throw new Error('HISTORY_ID_MISMATCH')
+      if (entry.historyId !== this.#configuration.historyId) throw new Error('HISTORY_ID_MISMATCH')
       await verifyOrderedEntry(entry)
-      const previous = entries.get(entry.position)
-      if (previous !== undefined && (previous.root !== entry.root || !equalBytes(previous.bytes, entry.bytes))) {
+      const final = this.#selectedEntries.get(entry.position)
+      if (final !== undefined && final.root !== entry.root) {
+        // A conflicting unauthenticated entry cannot replace a final entry.
+        // Only contradictory signed certificates are authority equivocation.
         throw new Error('HISTORY_POSITION_CONFLICT')
       }
-      entries.set(entry.position, entry)
+      const alternatives = entries.get(entry.position) ?? new Map<string, OrderedRecordEntry>()
+      const previous = alternatives.get(entry.root)
+      if (previous !== undefined && !equalBytes(previous.bytes, entry.bytes)) throw new Error('HISTORY_RECORD_HASH_COLLISION')
+      alternatives.set(entry.root, entry)
+      entries.set(entry.position, alternatives)
     } else {
       const certificate = evidence.certificate
-      await verifyPrefixCertificate(certificate, this.configuration)
+      await verifyPrefixCertificate(certificate, this.#configuration)
       const previous = certificates.get(certificate.position)
       if (previous !== undefined && previous.root !== certificate.root) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
       certificates.set(certificate.position, certificate)
     }
   }
 
-  async #evaluate(entries: Map<number, OrderedRecordEntry>, certificates: Map<number, PrefixCertificate>): Promise<CoordinatedProgress> {
-    let root = await orderedGenesisRoot(this.configuration.historyId)
-    let verifiedThrough = 0
+  async #evaluate(entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<{
+    readonly progress: CoordinatedProgress
+    readonly selectedEntries: Map<number, OrderedRecordEntry>
+  }> {
+    const genesisRoot = await orderedGenesisRoot(this.#configuration.historyId)
     let finalThrough = 0
-    let finalRoot = root
+    let finalRoot = genesisRoot
+    const selectedEntries = new Map<number, OrderedRecordEntry>()
+    const missing = new Set<number>()
     const genesisCertificate = certificates.get(0)
-    if (genesisCertificate !== undefined && genesisCertificate.root !== root) throw new Error('HISTORY_CERTIFICATE_ROOT_MISMATCH')
-    while (entries.has(verifiedThrough + 1)) {
-      const entry = entries.get(verifiedThrough + 1)!
-      if (entry.previousRoot !== root) throw new Error('HISTORY_CHAIN_CONFLICT')
-      root = entry.root
-      verifiedThrough += 1
-      const certificate = certificates.get(verifiedThrough)
-      if (certificate !== undefined) {
-        if (certificate.root !== root) throw new Error('HISTORY_CERTIFICATE_ROOT_MISMATCH')
-        finalThrough = verifiedThrough
-        finalRoot = root
+    if (genesisCertificate !== undefined && genesisCertificate.root !== genesisRoot) throw new Error('HISTORY_CERTIFICATE_ROOT_MISMATCH')
+    for (const certificate of [...certificates.values()].sort((a, b) => a.position - b.position)) {
+      if (certificate.position === 0) continue
+      let root = certificate.root
+      let position = certificate.position
+      const path = new Map<number, OrderedRecordEntry>()
+      let complete = true
+      // Work backwards from a signed commitment. A fabricated but internally
+      // consistent entry received first can never select the canonical branch.
+      while (position > finalThrough) {
+        const covered = certificates.get(position)
+        if (covered !== undefined && covered.root !== root) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
+        const entry = entries.get(position)?.get(root)
+        if (entry === undefined) { missing.add(position); complete = false; break }
+        path.set(position, entry)
+        root = entry.previousRoot
+        position -= 1
       }
+      if (!complete) continue
+      if (root !== finalRoot) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
+      for (const [index, entry] of path) selectedEntries.set(index, entry)
+      finalThrough = certificate.position
+      finalRoot = certificate.root
     }
-    const receivedThrough = Math.max(0, ...entries.keys())
-    const certifiedThrough = Math.max(0, ...certificates.keys())
-    // Report a bounded gap window; do not allocate a caller-selected huge range.
-    const missing: number[] = []
-    for (let p = verifiedThrough + 1; p <= Math.min(certifiedThrough, verifiedThrough + 1_024); p += 1) {
-      if (!entries.has(p)) missing.push(p)
+    const receivedThrough = maximumPosition(entries.keys())
+    const certifiedThrough = maximumPosition(certificates.keys())
+    // This is a bounded diagnostic window. Wrong alternatives at a known gap
+    // remain a gap, even though some bytes for that position were received.
+    const windowEnd = Math.min(certifiedThrough, finalThrough + 1_024)
+    for (let position = finalThrough + 1; position <= windowEnd; position += 1) {
+      if (!entries.has(position)) missing.add(position)
     }
-    return { receivedThrough, verifiedThrough, certifiedThrough, finalThrough, root: finalRoot, missing }
+    const gaps = [...missing].filter((position) => position > finalThrough).sort((a, b) => a - b).slice(0, 1_024)
+    return {
+      progress: {
+        receivedThrough, verifiedThrough: finalThrough, certifiedThrough,
+        finalThrough, root: finalRoot, missing: gaps,
+      },
+      selectedEntries,
+    }
   }
+}
+
+function allEntries(entries: ReadonlyMap<number, ReadonlyMap<string, OrderedRecordEntry>>): OrderedRecordEntry[] {
+  const result: OrderedRecordEntry[] = []
+  for (const alternatives of entries.values()) {
+    for (const entry of alternatives.values()) result.push(entry)
+  }
+  return result
+}
+
+function discardUncommittedAlternatives(entries: Map<number, Map<string, OrderedRecordEntry>>, selected: ReadonlyMap<number, OrderedRecordEntry>): void {
+  for (const [position, entry] of selected) entries.set(position, new Map([[entry.root, entry]]))
+}
+
+function maximumPosition(values: Iterable<number>): number {
+  let maximum = 0
+  for (const value of values) if (value > maximum) maximum = value
+  return maximum
+}
+
+const referenceLogLocks = new WeakMap<DurableOperationStore, Map<string, Mutex>>()
+function referenceLogLock(store: DurableOperationStore, historyId: string): Mutex {
+  let locks = referenceLogLocks.get(store)
+  if (locks === undefined) { locks = new Map(); referenceLogLocks.set(store, locks) }
+  let mutex = locks.get(historyId)
+  if (mutex === undefined) { mutex = new Mutex(); locks.set(historyId, mutex) }
+  return mutex
 }
 
 /** A reference durable log uses one atomic value in the replica's storage port. */
 export class ReferenceRecordLog {
-  readonly #mutex = new Mutex()
-  private constructor(readonly historyId: string, readonly store: DurableOperationStore, readonly quotaBytes: number) {}
+  readonly #mutex: Mutex
+  private constructor(readonly historyId: string, readonly store: DurableOperationStore, readonly quotaBytes: number) {
+    this.#mutex = referenceLogLock(store, historyId)
+  }
 
   static async open(historyId: string, store: DurableOperationStore, quotaBytes = 64 * 1024 * 1024): Promise<ReferenceRecordLog> {
     assertHistoryId(historyId)

@@ -22,7 +22,7 @@ async function fixture() {
   const authority = createPrefixAuthority({ configuration, identity, readHead: () => log.head() })
   const peerStorage = new MemoryOperationStore()
   const peer = await CoordinatedHistoryPolicy.open(configuration, peerStorage)
-  return { configuration, storage, log, authority, peer, peerStorage }
+  return { configuration, storage, log, authority, peer, peerStorage, identity }
 }
 
 describe('portable coordinated prefix evidence', () => {
@@ -42,7 +42,7 @@ describe('portable coordinated prefix evidence', () => {
     await f.peer.ingest({ kind: 'prefix-certificate', certificate })
     await f.peer.ingest({ kind: 'ordered-entry', entry: entries[2]! })
     await f.peer.ingest({ kind: 'ordered-entry', entry: entries[0]! })
-    expect(f.peer.progress).toMatchObject({ verifiedThrough: 1, certifiedThrough: 3, finalThrough: 0, missing: [2] })
+    expect(f.peer.progress).toMatchObject({ verifiedThrough: 0, certifiedThrough: 3, finalThrough: 0, missing: [2] })
     await f.peer.ingest({ kind: 'ordered-entry', entry: entries[1]! })
     expect(f.peer.progress).toMatchObject({ verifiedThrough: 3, finalThrough: 3, root: certificate.root })
   })
@@ -69,7 +69,54 @@ describe('portable coordinated prefix evidence', () => {
     await f.peer.ingest({ kind: 'ordered-entry', entry: one })
     await f.peer.ingest({ kind: 'ordered-entry', entry: two })
     await f.peer.ingest({ kind: 'prefix-certificate', certificate: old })
-    expect(f.peer.progress).toMatchObject({ verifiedThrough: 2, finalThrough: 1 })
+    expect(f.peer.progress).toMatchObject({ receivedThrough: 2, verifiedThrough: 1, finalThrough: 1 })
+  })
+
+  it('selects the certified chain when a self-consistent counterfeit entry arrived first', async () => {
+    const f = await fixture()
+    const fakeLog = await ReferenceRecordLog.open(historyId, new MemoryOperationStore())
+    const fake = await fakeLog.append(utf8('fabricated first position'))
+    await f.peer.ingest({ kind: 'ordered-entry', entry: fake })
+    expect(f.peer.progress.finalThrough).toBe(0)
+    const first = await f.log.append(utf8('authentic first'))
+    const second = await f.log.append(utf8('authentic second'))
+    await f.peer.ingest({ kind: 'prefix-certificate', certificate: await f.authority.certify() })
+    await f.peer.ingest({ kind: 'ordered-entry', entry: second })
+    expect(f.peer.progress).toMatchObject({ finalThrough: 0, missing: [1] })
+    await f.peer.ingest({ kind: 'ordered-entry', entry: first })
+    expect(f.peer.entries()).toEqual([first, second])
+    const reopened = await CoordinatedHistoryPolicy.open(f.configuration, f.peerStorage)
+    expect(reopened.entries()).toEqual([first, second])
+    expect(reopened.evidence().filter((item) => item.kind === 'ordered-entry')).toHaveLength(2)
+  })
+
+  it('does not permit contradictory authority commitments at the same or later positions', async () => {
+    const f = await fixture()
+    const first = await f.log.append(utf8('original'))
+    await f.peer.ingest({ kind: 'ordered-entry', entry: first })
+    await f.peer.ingest({ kind: 'prefix-certificate', certificate: await f.authority.certify() })
+    const fork = await ReferenceRecordLog.open(historyId, new MemoryOperationStore())
+    await fork.append(utf8('forked original'))
+    const forkAuthority = createPrefixAuthority({ configuration: f.configuration, identity: f.identity, readHead: () => fork.head() })
+    await expect(f.peer.ingest({ kind: 'prefix-certificate', certificate: await forkAuthority.certify() }))
+      .rejects.toThrow('HISTORY_AUTHORITY_EQUIVOCATION')
+    const second = await fork.append(utf8('forked successor'))
+    await f.peer.ingest({ kind: 'prefix-certificate', certificate: await forkAuthority.certify() })
+    await expect(f.peer.ingest({ kind: 'ordered-entry', entry: second })).rejects.toThrow('HISTORY_AUTHORITY_EQUIVOCATION')
+    expect(f.peer.entries()).toEqual([first])
+  })
+
+  it('serializes independent log handles sharing one storage owner and protects configuration pins', async () => {
+    const f = await fixture()
+    const secondHandle = await ReferenceRecordLog.open(historyId, f.storage)
+    await Promise.all([f.log.append(utf8('one')), secondHandle.append(utf8('two'))])
+    expect((await f.log.read()).map((entry) => entry.position)).toEqual([1, 2])
+    const exposed = f.peer.configuration
+    exposed.authorityPublicKey.fill(0)
+    exposed.executionManifestDigest.fill(0)
+    for (const entry of await f.log.read()) await f.peer.ingest({ kind: 'ordered-entry', entry })
+    await f.peer.ingest({ kind: 'prefix-certificate', certificate: await f.authority.certify() })
+    expect(f.peer.progress.finalThrough).toBe(2)
   })
 
   it('rejects altered bytes, configuration, signature and conflicting committed positions', async () => {
