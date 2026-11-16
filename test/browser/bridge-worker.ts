@@ -1,7 +1,9 @@
-import { decodeSignedGenesis, encodeGenesisManifest } from '@chronolog/capabilities'
+import { decodeSignedGenesis, encodeGenesisManifest, isCapabilityActive } from '@chronolog/capabilities'
+import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
+import { LedgerRecordError } from '@chronolog/node-core/ledger'
 import {
   DOMAINS, base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest,
-  digestExecutionManifest, hashDomain,
+  digestExecutionManifest, equalBytes, hashDomain,
 } from '@chronolog/protocol'
 import { ChangeSignal, type FeedLink } from '@chronolog/records'
 import { openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
@@ -9,12 +11,28 @@ import { createCertificateFetcher, TendrillerTransport } from '@chronolog/transp
 import { createRecordLogClient } from '@tendriller/core/records'
 
 import type { BrowserBridgeBootstrap, BrowserBridgeIdentity, BrowserBridgeSnapshot } from './bridge-contract.js'
+import { connectGovernedBrowserPeer } from './event-connection.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 const closing = new AbortController()
 const ports = new Set<MessagePort>()
 let peer: BrowserPeer | undefined
 let relay: TendrillerTransport | undefined
+let nativeBootstrap: BrowserBridgeBootstrap | undefined
+let localIdentity: EnrollmentIdentity | undefined
+let nativePeer: Awaited<ReturnType<typeof connectGovernedBrowserPeer>> | undefined
+
+async function connectNative(): Promise<void> {
+  if (nativeBootstrap === undefined || nativePeer !== undefined || peer?.governed === undefined || localIdentity === undefined) return
+  const snapshot = peer.governed.activeSnapshot
+  const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
+    isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, localIdentity!.signing.publicKeyBytes))
+  if (reader === undefined) return
+  const connected = await connectGovernedBrowserPeer({ bootstrap: nativeBootstrap, identity: localIdentity,
+    transport: peer.transport, activeMembership: () => peer!.governed!.activeSnapshot })
+  nativePeer = connected
+  void connected.completion.finally(() => { if (nativePeer === connected) nativePeer = undefined }).catch(() => undefined)
+}
 
 interface FixtureRequest {
   readonly fixture?: string
@@ -122,7 +140,9 @@ endpoint.addEventListener('message', (event) => {
         peer = await openBrowserPeer({
           name: request.name!, engineUrl: new URL('/engine/', globalThis.location.href),
           configure(context) {
+            localIdentity = context.identity
             if (request.relay) {
+              nativeBootstrap = bootstrap
               const headers = () => ({ Authorization: `Bearer ${bootstrap.token}` })
               relay = new TendrillerTransport({
                 local: context.transport, groupRoute, configuration, watch: false,
@@ -134,10 +154,11 @@ endpoint.addEventListener('message', (event) => {
               materializer: { executionManifest, rootAdministrator: genesis.manifest.schemaAdminPublicKey, checkpointEvery: 1 },
               governed: { genesis, groupRoute },
               ...(relay === undefined ? {} : { transport: relay, start: () => relay!.catchUp() }),
-              async close() { closing.abort(); for (const port of ports) port.close() },
+              async close() { closing.abort(); await nativePeer?.close(); for (const port of ports) port.close() },
             }
           },
         })
+        await connectNative()
         serveBrowserPeer(endpoint, peer)
         return {
           identity: bytesToBase64Url(peer.node.identity), groupId: bytesToBase64Url(peer.node.groupId),
@@ -146,6 +167,13 @@ endpoint.addEventListener('message', (event) => {
       }
       case 'sync': {
         if (relay !== undefined) await relay.catchUp()
+        // Certified inline controls establish the reader grant before the
+        // authenticated peer link can supply any detached application bodies.
+        try { await peer!.node.waitForIdle() }
+        catch (error) {
+          if (!(error instanceof Error && error.cause instanceof LedgerRecordError && error.cause.code === 'LEDGER_PAYLOAD_UNAVAILABLE')) throw error
+        }
+        await connectNative()
         await peer!.transport.catchUp()
         await peer!.node.waitForIdle()
         return null

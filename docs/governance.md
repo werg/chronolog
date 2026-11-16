@@ -11,6 +11,61 @@ Both built-in policies keep the root, administration feed, validator set and
 validation policy fixed. Reader/writer membership and encryption epochs can
 change live. Static membership is an explicit fixture/operator override.
 
+## Thin membership administration
+
+`MembershipAdministrator` is the portable implementation for a host that only
+manages the roster. Tendriller runs it by default inside the existing Cloudflare
+Durable Object for a configured resident peer application. The same component
+can run on another administrator's machine: it needs Web Crypto, durable byte
+storage and a connection to the group's pinned ordering authority. It does not
+need a SQL engine, an application replica or a separate deployed service.
+
+The existing ordered ledger contains small typed records. A roster grant,
+revocation or encrypted key delivery is a signed operation in that ledger.
+An application operation contributes a descriptor with its hash, length and
+encryption epoch; full replicas fetch its original envelope from peers by hash.
+The administrator verifies every descriptor and processes inline roster and key
+operations. It never asks for application bodies. Bandwidth therefore grows with
+the number of descriptors and the number of recipients, independently of the
+size of detached application bodies. See [typed ledger records](typed-ledger-records.md)
+for byte limits and the exact verification rules.
+
+Each device generates and retains its own signing key pair and HPKE reader key
+pair. Its signed enrollment request contains the public keys. The administrator
+generates shared content keys and encrypts each key to the approved readers'
+public keys; it never needs their private keys. The administrator is trusted with
+these shared content keys so it can rotate them and grant explicit historical
+access. This design does not claim that the administrator is unable to decrypt
+application data if it separately obtains the ciphertext.
+
+The signed genesis names the roster issuer (`rootAdminPublicKey`), initial SQL
+schema administrator (`schemaAdminPublicKey`), and native ordering authority
+explicitly. Cloudflare's roster signer receives no implicit SQL membership.
+The native application peer can own the schema and order the ledger while
+Cloudflare only manages enrollment and delivers wrapped keys.
+
+To bootstrap, `provisionMembership` durably creates the roster signer and public
+descriptor from the native authority, execution profile, schema administrator
+and optional initial **public** reader/writer grants. The native peer starts
+from that descriptor. `MembershipAdministrator.open` then uses
+`createMembershipLedgerClient` to append signed inline operations and read
+certified descriptors through `POST /_chronolog/membership`. No reader grant is
+required for this independently signed administration endpoint.
+
+A joining device first verifies its grant and encrypted key delivery from that
+small history. It can then authenticate a peer connection and fetch application
+bodies. Governance activation continues while application replay waits for a
+missing body; the missing body is pending progress, never a rejected operation.
+Approvals and revocations retain their exact operation identities across lost
+responses and restarts. Revocation and key rotation resume as one durable
+administration operation.
+
+`npm run package:membership` builds the standalone `@chronolog/membership`
+artifact with bundled JavaScript, self-contained declarations and source/input
+provenance. The package has no application engine or native transport dependency.
+The Tendriller host consumes this public artifact, rather than another
+repository's source files or an application-supplied implementation registry.
+
 ## Live enrollment
 
 The joining device first loads the intended signed group descriptor and opens

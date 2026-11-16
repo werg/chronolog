@@ -3,7 +3,8 @@ import { mkdir } from 'node:fs/promises'
 import { createServer, type IncomingMessage } from 'node:http'
 import { join } from 'node:path'
 
-import { decodeSignedGenesis, encodeGenesisManifest, encodeSignedGenesis, signGenesis } from '@chronolog/capabilities'
+import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
+import { decodeSignedGenesis, encodeGenesisManifest, encodeSignedGenesis, isCapabilityActive, signGenesis } from '@chronolog/capabilities'
 import { ChronologClient, OWNER_FOR_KEY_SQL, type TransactionHandle } from '@chronolog/client'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import {
@@ -18,7 +19,7 @@ import {
   type CoordinatedHistoryConfiguration, type OrderedRecordEntry,
 } from '@chronolog/node-core/history'
 import {
-  base64UrlToBytes, bytesToBase64Url, digestExecutionManifest, DOMAINS, encodeExecutionManifest,
+  base64UrlToBytes, bytesToBase64Url, bytesToHex, digestExecutionManifest, DOMAINS, encodeExecutionManifest,
   equalBytes, hashDomain, utf8,
 } from '@chronolog/protocol'
 import { DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner } from '@chronolog/records'
@@ -33,6 +34,7 @@ import {
 
 import { SqliteOperationStore } from '../apps/chronologd/src/operation-store.js'
 import type { BrowserBridgeBootstrap } from '../test/browser/bridge-contract.js'
+import { createPeerHttpFixture } from './lib/peer-http-fixture.js'
 
 /**
  * Native half of the browser acceptance gate. All proposals, capabilities and
@@ -78,6 +80,27 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       !equalBytes(history.authorityPublicKey, authority.signing.publicKeyBytes)) throw new Error('BRIDGE_FIXTURE_CONFIGURATION_MISMATCH')
   const log = await ReferenceRecordLog.open(history.historyId, new SqliteOperationStore(logState.database))
   const token = crypto.randomUUID()
+  let governed: GovernedNode | undefined
+  const peerToken = crypto.randomUUID()
+  const peerHttp = createPeerHttpFixture({ token: peerToken, async connect(connection) {
+    if (governed === undefined) throw new Error('BRIDGE_NATIVE_NOT_STARTED')
+    const native = governed
+    const snapshot = native.activeSnapshot
+    const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
+      isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, administrator.signing.publicKeyBytes))
+    if (reader === undefined) throw new Error('BRIDGE_NATIVE_READER_MISSING')
+    const peer = await openAuthenticatedPeerLink({ connection, identity: administrator.signing,
+      local: local.asLink(), groupId: snapshot.groupId, grantId: reader.id,
+      authorizePeer: ({ authorId, grantId }) => {
+        const current = native.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
+        return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
+          equalBytes(capability.grant.signingPublicKey, authorId)
+      },
+    })
+    local.connect(peer.link)
+    void peer.completion.finally(() => local.disconnect(peer.link.identity)).catch(() => undefined)
+    return peer
+  } })
   let online = true
   let loseAppendResponse = false
   let lostAppend: { readonly position: number; readonly recordId: string } | undefined
@@ -141,11 +164,12 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
   const server = createServer((incoming, outgoing) => {
     outgoing.setHeader('Access-Control-Allow-Origin', '*')
     outgoing.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type')
-    outgoing.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    outgoing.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
     outgoing.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
     outgoing.setHeader('Cache-Control', 'no-store')
     if (incoming.method === 'OPTIONS') { outgoing.writeHead(204); outgoing.end(); return }
     const respond = async () => {
+      if (await peerHttp.handle(incoming, outgoing)) return
       const request = await webRequest(incoming)
       const path = new URL(request.url).pathname
       if (path === '/_chronolog/certificate') requests.certificates += 1
@@ -175,13 +199,13 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
   })
   const materializer = await DeterministicMaterializer.open({ path: join(options.rootDirectory, 'native-application.db'),
     executionManifest, rootAdministrator: genesis.manifest.schemaAdminPublicKey, checkpointEvery: 1 })
-  let governed: GovernedNode | undefined
   let client: ChronologClient | undefined
   let closed = false
   const close = async () => {
     if (closed) return
     closed = true
     try {
+      await peerHttp.close()
       await client?.close()
       if (governed !== undefined) await governed.close()
       else { materializer.close(); await local.close() }
@@ -222,6 +246,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       transport: new InProcessRpcTransport(new NodeRpcService({ node: root.node, enrollment })), unaryRetryAttempts: 1 })
     const native = client
     const syncEvidence = async () => {
+      peerHttp.assertHealthy()
       await adapter.catchUp()
       for (const evidence of await local.evidenceHistory()) await root.node.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
       await root.node.waitForIdle()
@@ -248,6 +273,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       hubUrl, token, genesis: bytesToBase64Url(savedGenesis), groupRoute: bytesToBase64Url(groupRoute),
       executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
       rootIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes),
+      nativeIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes), peerUrl: `${hubUrl}/peer`, peerToken,
     }
     const snapshot = async (transactionIds: readonly string[] = []) => {
       await root.node.waitForIdle()

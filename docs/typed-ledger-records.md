@@ -34,8 +34,8 @@ length, envelope kind, group route and encryption epoch. The ordinary Chronolog
 wire and governance verifiers still check signatures and authorization. A valid
 descriptor by itself does not establish the inner message's validity.
 
-`decodeLedgerRecord` validates inline control bytes immediately, so a control
-participant can scan every certified descriptor and every governance operation
+`decodeLedgerRecord` validates inline control bytes immediately, so a membership
+administrator can scan every certified descriptor and every governance operation
 without requesting application ciphertext. It must still verify the complete
 descriptor prefix. Filtering out descriptors on the server would not establish
 the absence of an omitted membership change. Unknown or malformed descriptors

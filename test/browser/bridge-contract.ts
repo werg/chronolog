@@ -9,6 +9,9 @@ export interface BrowserBridgeBootstrap {
   readonly groupRoute: string
   readonly executionManifest: string
   readonly rootIdentity: string
+  readonly nativeIdentity: string
+  readonly peerUrl: string
+  readonly peerToken: string
 }
 
 export interface BrowserBridgeIdentity {
