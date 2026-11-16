@@ -98,10 +98,10 @@ async function fixture() {
 describe('public Tendriller adapter', () => {
   it('pins the built public SDK/engine artifacts and provenance', async () => {
     for (const name of ['sdk', 'engine']) {
-      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-160393ee.tgz`, import.meta.url)
-      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-160393ee.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
+      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-0200f3b7.tgz`, import.meta.url)
+      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-0200f3b7.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
       expect(createHash('sha256').update(await readFile(artifact)).digest('hex')).toBe(provenance.sha256)
-      expect(provenance.sourceCommit).toBe('160393ee92bb36b3f8feba15d0d7c219e6bb3cb8')
+      expect(provenance.sourceCommit).toBe('0200f3b7942d8aea7144c1764677a6e203e7716c')
     }
     expect(RECORD_LOG_FORMAT).toBe('record-log/v1')
   })

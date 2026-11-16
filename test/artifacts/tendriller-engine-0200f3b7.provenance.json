@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/werg/tendriller",
-  "sourceCommit": "160393ee92bb36b3f8feba15d0d7c219e6bb3cb8",
+  "sourceCommit": "0200f3b7942d8aea7144c1764677a6e203e7716c",
   "buildCommand": "npm ci && npm run build",
   "package": "@tendriller/engine",
-  "version": "0.3.0-rc.6",
-  "artifact": "tendriller-engine-160393ee.tgz",
-  "sha256": "c2e15293b98cc2d4aa9c2d950631f207bccff106f2ef72b732b69020c8dcba20",
+  "version": "0.3.0-rc.8",
+  "artifact": "tendriller-engine-0200f3b7.tgz",
+  "sha256": "7746676d874782bfd76cbbcc1e8247e8698016750a34a535b346de6661c5243a",
   "purpose": "Public engine declaration fixture for typed optional authority composition; no private Tendriller source imports."
 }

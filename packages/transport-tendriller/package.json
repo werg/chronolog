@@ -9,12 +9,12 @@
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*"
   },
-  "peerDependencies": { "@tendriller/core": "0.3.0-rc.6" },
+  "peerDependencies": { "@tendriller/core": "0.3.0-rc.8" },
   "devDependencies": {
     "@chronolog/client": "workspace:*",
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/rpc": "workspace:*",
-    "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-160393ee.tgz",
-    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-160393ee.tgz"
+    "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-0200f3b7.tgz",
+    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-0200f3b7.tgz"
   }
 }
