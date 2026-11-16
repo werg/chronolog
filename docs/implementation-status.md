@@ -135,6 +135,14 @@ from all feed records, and replay after termination following candidate SQL
 commit. The required browser workflow builds the artifacts and runs both
 execution and browser lifecycle gates; it fails when the WASM artifact is absent.
 
+The combined public-adapter gate enrolls a real browser peer into a native
+issuer's coordinated group, including encrypted pre-enrollment history. The two
+distinct writers join an explicit collective and compete for one SQL task; native
+and browser replicas agree on the final winner, assertion rejection, and database
+content hash. A page reload preserves the exact claim identity. A fresh approved
+browser reader then receives records, keys and certificates through an ordinary
+peer link while the hub is offline, with zero hub or authority requests.
+
 ## Daemon operational profile
 
 The generated daemon configuration bootstraps a signed single-participant

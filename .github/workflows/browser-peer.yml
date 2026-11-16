@@ -40,6 +40,8 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
       - name: Qualify Worker ownership, OPFS recovery and the public client
         run: node --import tsx tools/test-browser-peer.ts
+      - name: Qualify enrolled browser and native agents claiming one shared task
+        run: node --import tsx tools/test-browser-bridge.ts
       - name: Preserve the qualification and engine provenance
         if: always()
         uses: actions/upload-artifact@v6
@@ -48,5 +50,6 @@ jobs:
           path: |
             artifacts/wasm/manifest.json
             artifacts/browser-qualification/report.json
+            artifacts/browser-bridge/report.json
           if-no-files-found: error
           retention-days: 30

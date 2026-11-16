@@ -61,7 +61,7 @@ Any engine conformance gap remains visible until resolved and exercised.
 - [x] Exercise shared SQL, a contested claim, lost replies, reconnection, third
       device enrollment, and peer delivery during authority unavailability.
 - [x] Check that neither core depends on the other repository's private files.
-- [ ] Qualify one real browser/native scenario combining public enrollment,
+- [x] Qualify one real browser/native scenario combining public enrollment,
       collective SQL contention, durable retry, and offline third-peer replay.
 
 ## Acceptance and delivery
@@ -91,3 +91,8 @@ commit, and a private validator cutoff that cannot be reconstructed from feed
 replay. The required workflow repeats these gates from a clean checkout; the PR
 description records its latest result. See
 [portable peers](../portable-peers.md) for the verification map.
+
+The combined browser/native public-adapter gate also passes five checks: live
+enrollment with historical keys, explicit collective ownership, one final SQL
+claim winner, page-reload retry identity, and a fresh approved browser reader
+replaying from another browser peer with no hub requests while the hub is offline.

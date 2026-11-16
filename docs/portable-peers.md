@@ -173,6 +173,7 @@ new snapshot alone does not establish a revocation boundary.
 | Packed public Tendriller API, retry/restore errors, contested collective SQL and offline third-peer replay | `packages/transport-tendriller/src/*.test.ts` |
 | Native/WASM replay hashes, outcome equality, SQL policy and reopen | `packages/runtime-browser/src/wasm-conformance.test.ts` |
 | Real Chromium Worker, OPFS, exclusive owner, public client, final SQL and termination recovery | `tools/test-browser-peer.ts`; `test/browser/page.ts`; `test/browser/peer-worker.ts` |
+| Combined browser/native public enrollment, collective claim, reload retry and offline third-peer replay | `tools/test-browser-bridge.ts`; `tools/browser-bridge-fixture.ts`; `test/browser/bridge-worker.ts` |
 | Native abrupt process death at each publication boundary | `test/materializer-publication-crash.integration.test.ts` |
 
 The initial scope does not add log compaction, authority failover, dynamic
