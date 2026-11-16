@@ -27,6 +27,37 @@ SQL BLOBs are `Uint8Array` in the TypeScript API. The HTTP adapter preserves the
 with its explicit JSON byte encoding. Digests, public keys, signed enrollment
 requests and signed approvals use canonical unpadded base64url strings.
 
+### Limited publisher ingress
+
+An operator can set `HttpRpcServer({ service, token, publisherIngress: true })`
+(daemon environment `CHRONOLOG_PUBLISHER_INGRESS=true`) to accept anonymous
+**only** at the exact `POST /rpc/unary/ingress.submit` route. Enabling it requires
+a non-empty owner RPC token. Read, query, enrollment, governance and local
+authoring routes still require that token. The ordinary body bound still
+applies. The node validates the original proposal's signature, group, execution
+profile and granted topic scope; this route never signs on the publisher's
+behalf. A submitted receipt reports durable ingress, not final acceptance.
+
+The browser-safe helper exposes no general RPC or bearer-token parameter:
+
+```ts
+import { createHttpPublisherIngress } from '@chronolog/rpc/browser'
+import { createLimitedPublisher } from '@chronolog/node-core/browser'
+
+const ingress = createHttpPublisherIngress({ baseUrl: 'https://replica.example', groupId })
+const publisher = await createLimitedPublisher({
+  descriptor, request, approval, identity, store,
+  send: signed => ingress.submitSigned(signed),
+})
+await publisher.publish('conversation', message, { operationId })
+```
+
+The helper omits ambient credentials and rejects redirects. Retry belongs to
+the publisher's durable original-signer outbox. Do not give a limited publisher
+the owner bearer token or a full `ChronologClient`; those authorize other local
+replica operations. A cross-origin deployment must separately configure its
+HTTP gateway's allowed origins; the library does not install permissive CORS.
+
 ## Queries and immutable results
 
 `query.localSql` and `query.liveSql` accept `view: 'local' | 'final'`; the default

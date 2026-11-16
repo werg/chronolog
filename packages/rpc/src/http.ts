@@ -61,6 +61,8 @@ export interface HttpRpcServerOptions {
   readonly host?: string
   readonly port?: number
   readonly token?: string
+  /** Permit only original signed publisher proposals without the owner bearer. */
+  readonly publisherIngress?: boolean
   readonly maxBodyBytes?: number
   /** Maximum wait for graceful connection drain before sockets are destroyed. */
   readonly shutdownTimeoutMs?: number
@@ -85,6 +87,9 @@ export class HttpRpcServer {
   #closePromise: Promise<void> | undefined
 
   constructor(options: HttpRpcServerOptions) {
+    if (options.publisherIngress === true && (options.token === undefined || options.token.length === 0)) {
+      throw new TypeError('publisherIngress requires a non-empty owner RPC token')
+    }
     this.#options = options
     this.#shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000
     if (!Number.isSafeInteger(this.#shutdownTimeoutMs) || this.#shutdownTimeoutMs < 0) {
@@ -162,7 +167,10 @@ export class HttpRpcServer {
       return
     }
     if (request.method !== 'POST' || request.url === undefined) throw new ChronologRpcError('not_found', 'RPC route not found')
-    this.#authorize(request)
+    // Match the raw path exactly: query strings, encoded aliases and stream
+    // routes must never inherit the limited publisher's anonymous exception.
+    const publicIngress = this.#options.publisherIngress === true && request.url === '/rpc/unary/ingress.submit'
+    if (!publicIngress) this.#authorize(request)
     const match = /^\/rpc\/(unary|stream)\/([^/?]+)$/u.exec(new URL(request.url, 'http://localhost').pathname)
     if (!match) throw new ChronologRpcError('not_found', 'RPC route not found')
     const mode = match[1]

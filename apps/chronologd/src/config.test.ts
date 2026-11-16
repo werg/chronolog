@@ -96,4 +96,14 @@ describe('daemon configuration', () => {
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_AGENT_MODULE: '' })).toThrow('CHRONOLOG_AGENT_MODULE_INVALID')
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_AUTHORITY_QUOTA_BYTES: '0' })).toThrow('CHRONOLOG_AUTHORITY_QUOTA_BYTES_INVALID')
   })
+
+  it('enables only explicitly configured publisher ingress while retaining remote owner authentication', () => {
+    expect(parseDaemonRuntimeConfig({}).publisherIngress).toBe(false)
+    expect(parseDaemonRuntimeConfig({ CHRONOLOG_PUBLISHER_INGRESS: 'true', CHRONOLOG_TOKEN: 'owner-secret' }).publisherIngress).toBe(true)
+    expect(parseDaemonRuntimeConfig({ CHRONOLOG_PUBLISHER_INGRESS: 'false' }).publisherIngress).toBe(false)
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_PUBLISHER_INGRESS: 'yes' })).toThrow('CHRONOLOG_PUBLISHER_INGRESS_INVALID')
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_PUBLISHER_INGRESS: 'true' })).toThrow('CHRONOLOG_PUBLISHER_INGRESS_REQUIRES_OWNER_TOKEN')
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_HOST: '0.0.0.0', CHRONOLOG_PUBLISHER_INGRESS: 'true' }))
+      .toThrow('CHRONOLOG_TOKEN_REQUIRED_FOR_REMOTE_HOST')
+  })
 })

@@ -66,6 +66,7 @@ process.stdout.write(`${JSON.stringify({
   encryptionEpoch: governance?.currentEpoch?.toString() ?? config.epoch,
   historyPolicy: node.historyPolicy,
   executionProfile: runtime.executionProfile,
+  publisherIngress: runtime.publisherIngress,
   agentTasks: agent?.taskIds ?? [],
   nativeAuthority: agent?.authority !== null && agent?.authority !== undefined,
 })}\n`)
@@ -226,6 +227,7 @@ async function startRuntime() {
       host: runtime.host,
       port: runtime.port,
       ...(runtime.token === undefined ? {} : { token: runtime.token }),
+      publisherIngress: runtime.publisherIngress,
       health: async () => daemonHealth(await node!.status(), stopping, traversalError(runtime.ssbScope, reachability)),
       metrics: async () => prometheusMetrics(await node!.status(), traversalError(runtime.ssbScope, reachability)),
     })

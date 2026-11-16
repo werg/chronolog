@@ -44,6 +44,7 @@ export interface DaemonRuntimeConfig {
   readonly host: string
   readonly port: number
   readonly token?: string
+  readonly publisherIngress: boolean
   readonly ssbHost: string
   readonly ssbPort: number
   readonly ssbScope: 'device' | 'local' | 'public'
@@ -77,10 +78,14 @@ export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): Daemon
   if (historyPolicy !== undefined && historyPolicy !== 'peer' && historyPolicy !== 'coordinated') throw new Error('CHRONOLOG_HISTORY_POLICY_INVALID')
   const executionProfile = environment.CHRONOLOG_EXECUTION_PROFILE ?? 'sql'
   if (executionProfile !== 'sql' && executionProfile !== 'events') throw new Error('CHRONOLOG_EXECUTION_PROFILE_INVALID')
+  const publisherIngress = environment.CHRONOLOG_PUBLISHER_INGRESS ?? 'false'
+  if (publisherIngress !== 'false' && publisherIngress !== 'true') throw new Error('CHRONOLOG_PUBLISHER_INGRESS_INVALID')
+  if (publisherIngress === 'true' && token === undefined) throw new Error('CHRONOLOG_PUBLISHER_INGRESS_REQUIRES_OWNER_TOKEN')
   return {
     host,
     port: integer(environment.CHRONOLOG_PORT ?? '8787', 0, 65_535, 'CHRONOLOG_PORT'),
     ...(token === undefined ? {} : { token }),
+    publisherIngress: publisherIngress === 'true',
     ssbHost,
     ssbPort: integer(environment.CHRONOLOG_SSB_PORT ?? '0', 0, 65_535, 'CHRONOLOG_SSB_PORT'),
     ssbScope: scope,
