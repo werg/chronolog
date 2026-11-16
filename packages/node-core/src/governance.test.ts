@@ -4,6 +4,7 @@ import {
   signGenesis,
   validationPolicyId,
   type CapabilityGrant,
+  type CapabilityRevision,
   type GenesisManifest,
   type ValidationPolicy,
 } from '@chronolog/capabilities'
@@ -13,6 +14,7 @@ import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { CapabilityMembershipResolver } from './capability-membership.js'
+import { GovernanceActivationIndex } from './governance-activation.js'
 import { GovernanceControlPlane, isInvalidGovernanceRecord } from './governance.js'
 import { ReferenceRecordLog } from './history-policy.js'
 import { createLedgerRecord } from './ledger-record.js'
@@ -22,6 +24,51 @@ const controllers: GovernanceControlPlane[] = []
 afterEach(async () => { await Promise.all(controllers.splice(0).map((controller) => controller.close())) })
 
 describe('replicated governance control plane', () => {
+  it.each(['root', 'feed', 'policy', 'validator-grant', 'validator-revoke'] as const)(
+    'rejects a root-signed fixed-history %s change before mutating received or canonical membership', async (change) => {
+      const f = await governanceFixture(undefined, true)
+      await f.admin.close()
+      const received = await GovernanceControlPlane.create({ genesis: f.genesis, groupRoute: f.groupRoute,
+        transport: f.adminTransport, identity: f.root })
+      const canonical = await GovernanceControlPlane.create({ genesis: f.genesis, groupRoute: f.groupRoute,
+        transport: f.network.createNode('canonical-fixed-reader'), identity: await generateEd25519KeyPair() })
+      controllers.push(received, canonical)
+      const initial = received.snapshot, activation = new GovernanceActivationIndex(canonical.snapshot, 'coordinated')
+      const validator = [...initial.capabilities.values()].find(capability => capability.grant.role === 'validator')!
+      const changes: Record<typeof change, Partial<CapabilityRevision>> = {
+        root: { successorRootPublicKey: bytes32(101), successorCapabilityLogFeed: initial.capabilityLogFeed },
+        feed: { successorRootPublicKey: initial.rootAdminPublicKey, successorCapabilityLogFeed: new TextEncoder().encode('replacement-admin') },
+        policy: { validationPolicies: [{ version: 2n, minimumValidators: 1n }] },
+        'validator-grant': { grants: [{ ...grant(bytes32(102), 'validator', { minimumAuthorTimestampMs: 0n }), validFromRevision: 1n }] },
+        'validator-revoke': { revocations: [validator.id] },
+      }
+      const log = await ReferenceRecordLog.open('h_0123456789abcdef0123456789abcdef', new MemoryOperationStore())
+      const publish = async (fields: Partial<CapabilityRevision>) => {
+        const signed = await signCapabilityRevision({ groupId: f.groupId, revision: 1n,
+          previousRevisionDigest: initial.revisionDigest, issuerRootPublicKey: f.root.publicKeyBytes,
+          grants: [], revocations: [], validationPolicies: [], ...fields }, f.root.privateKey)
+        const payload = encodeCanonicalCbor([1n, encodeSignedCapabilityRevision(signed)])
+        const signature = await signDomain(DOMAINS.capabilityRevision, payload, f.root.privateKey)
+        const envelope = encodeEnvelope({ groupRoute: f.groupRoute, messageType: 'capability', encryptionEpoch: null,
+          payload: encodeCanonicalCbor([1n, payload, f.root.publicKeyBytes, signature]) })
+        return { record: await f.adminTransport.publish(envelope), entry: await log.append((await createLedgerRecord(envelope)).recordBytes) }
+      }
+      const invalid = await publish(changes[change])
+      const receivedError = await received.ingest(invalid.record).catch((error: unknown) => error)
+      const canonicalError = await canonical.ingestCanonical(invalid.entry, activation.activeSnapshot).catch((error: unknown) => error)
+      expect(isInvalidGovernanceRecord(receivedError)).toBe(true)
+      expect(isInvalidGovernanceRecord(canonicalError)).toBe(true)
+      expect(received.snapshot).toEqual(initial)
+      expect(canonical.snapshot).toEqual(initial)
+      const valid = await publish({ grants: [{ ...grant(bytes32(103), 'writer'), validFromRevision: 1n }] })
+      expect(await received.ingest(valid.record)).toBe(true)
+      const next = await canonical.ingestCanonical(valid.entry, activation.activeSnapshot)
+      expect(next?.revision).toBe(1n)
+      activation.activateCoordinated(next!, BigInt(valid.entry.position))
+      expect(activation.activeSnapshot).toEqual(received.snapshot)
+      expect(received.snapshot.rootAdminPublicKey).toEqual(f.root.publicKeyBytes)
+    })
+
   it('skips forged and out-of-order canonical controls while unordered successors still wait for delivery', async () => {
     const fixture = await governanceFixture(), attacker = await generateEd25519KeyPair()
     const participant = await GovernanceControlPlane.create({ genesis: fixture.genesis, groupRoute: fixture.groupRoute,
@@ -279,7 +326,7 @@ describe('replicated governance control plane', () => {
   })
 })
 
-async function governanceFixture(operationStore?: DurableOperationStore) {
+async function governanceFixture(operationStore?: DurableOperationStore, fixedHistory = false) {
   const network = new MemoryTransportNetwork()
   const adminTransport = network.createNode('admin')
   const root = await generateEd25519KeyPair()
@@ -303,6 +350,8 @@ async function governanceFixture(operationStore?: DurableOperationStore) {
     resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 100n, maxMutations: 100n },
     encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM',
     createdAtMs: 1n,
+    ...(fixedHistory ? { historyPolicy: { kind: 'coordinated' as const, executionManifestDigest: bytes32(3),
+      historyId: 'h_0123456789abcdef0123456789abcdef', authorityPublicKey: root.publicKeyBytes } } : {}),
   }
   const genesis = await signGenesis(manifest, root.privateKey)
   const admin = await GovernanceControlPlane.create({
