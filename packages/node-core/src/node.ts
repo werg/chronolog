@@ -892,7 +892,12 @@ export class ChronologNode {
     if (this.historyPolicy === 'peer' && !await this.#canUseTransportAuthor(record, 'writer', signer, core.membershipRevision, undefined, core.writerCapability)) {
       invalid('CANDIDATE_TRANSPORT_AUTHOR_UNAUTHORIZED')
     }
-    if (!equalBytes(core.executionManifestDigest, this.executionManifestDigest)) {
+    const foreignProfile = !equalBytes(core.executionManifestDigest, this.executionManifestDigest)
+    if (foreignProfile && canonicalPosition === undefined) {
+      // A coordinated history already pins this runtime's immutable profile.
+      // Defer a raw feed proposal until its certified position can record a
+      // final rejection, without leaving an unresolvable feed retry behind.
+      if (this.historyPolicy === 'coordinated') return
       throw new Error('CANDIDATE_EXECUTION_MANIFEST_UNAVAILABLE')
     }
     try { assertValidChangeProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
@@ -916,7 +921,7 @@ export class ChronologNode {
         ...writerContext,
         ...(canonicalPosition === undefined ? {} : { canonicalPosition: BigInt(canonicalPosition) }),
       })
-    const rejection = canWrite ? canonicalRejection : 'WRITER_UNAUTHORIZED'
+    const rejection = canWrite ? foreignProfile ? 'EXECUTION_PROFILE_MISMATCH' : canonicalRejection : 'WRITER_UNAUTHORIZED'
     const authorized = rejection === undefined
     const state = authorized ? 'pending_validation' as const : 'unauthorized' as const
     const candidate: StoredCandidate = {

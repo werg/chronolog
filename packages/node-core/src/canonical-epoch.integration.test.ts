@@ -13,6 +13,7 @@ import { createGovernedNode } from './governed-node.js'
 import { createPrefixAuthority, encodeOrderingEvidence, ReferenceRecordLog, type CoordinatedHistoryConfiguration } from './history-policy.js'
 import { createLedgerRecord } from './ledger-record.js'
 import { MemoryOperationStore } from './operations.js'
+import { ChronologNode } from './node.js'
 import { encodeSignedEnvelope } from './wire.js'
 
 class ControlledTransport extends PortableFeedTransport {
@@ -82,6 +83,55 @@ async function fixture() {
 }
 
 describe('canonical encryption epoch acceptance fence', () => {
+  it('rejects a foreign execution profile at its certified position and continues across restart', async () => {
+    const f = await fixture(), peer = await f.open()
+    const first = await peer.node.publish({ operationId: 'profile-before', program: program(emit('chat', 'before')) })
+    const foreignCore = { ...first.core, operationId: 'foreign-profile', nonce: new Uint8Array(32).fill(121),
+      executionManifestDigest: new Uint8Array(32).fill(122), program: program(emit('chat', 'must not execute')) }
+    const canonical = encodeTransactionCore(foreignCore)
+    const proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
+    const envelope = await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing, peer.governance.cipherRing)
+    const record = await peer.transport.publish(envelope)
+    await peer.node.ingest(record)
+    expect(peer.node.outcome(proposalId)).toBeNull()
+    expect((await peer.node.status()).ingest?.retryRecords).toBe(0)
+    const following = await peer.node.publish({ operationId: 'profile-after', program: program(emit('chat', 'after')) })
+    await f.certify(peer)
+    expect(peer.node.outcome(proposalId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'EXECUTION_PROFILE_MISMATCH' })
+    expect(peer.node.isFinal(proposalId)).toBe(true)
+    expect(peer.node.outcome(following.txId)?.outcome).toBe('accepted')
+    expect((await peer.node.events.read()).transactions.map(transaction => transaction.proposalId)).toEqual([first.txIdText, following.txIdText])
+    const head = await f.log.head()
+    await peer.transport.ensurePublished(record)
+    expect(await f.log.head()).toEqual(head)
+    await peer.close()
+    const reopened = await f.open()
+    await f.certify(reopened)
+    expect(reopened.node.outcome(proposalId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'EXECUTION_PROFILE_MISMATCH' })
+    expect(reopened.node.isFinal(proposalId)).toBe(true)
+    expect((await reopened.node.status()).lastError).toBeUndefined()
+  })
+
+  it('keeps an unavailable profile pending in the low-level unordered peer path', async () => {
+    const store = new MemoryOperationStore(), identity = await generateEd25519KeyPair()
+    const groupId = new Uint8Array(32).fill(131), membershipRevision = new Uint8Array(32).fill(132), validationPolicy = new Uint8Array(32).fill(133)
+    const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
+      signer: webFeedSigner(feedIdFromPublicKey(identity.publicKeyBytes), identity.privateKey) })
+    const node = new ChronologNode({ groupId, membershipRevision, validationPolicy, identity, transport,
+      materialization: await createEventMaterializationRuntime({ store, namespace: 'unordered-profile' }),
+      membership: { canWrite: () => true, canValidate: () => false, threshold: () => 1 } })
+    cleanup.push(() => node.close())
+    await node.start()
+    const canonical = encodeTransactionCore({ operationId: 'unordered-foreign-profile', groupId, membershipRevision, validationPolicy,
+      authorId: identity.publicKeyBytes, authorTimestampMs: 1n, nonce: new Uint8Array(32).fill(134),
+      executionManifestDigest: new Uint8Array(32).fill(135), program: program(emit('chat', 'waiting')) })
+    const proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
+    await node.ingest(await transport.publish(await encodeSignedEnvelope(groupId, 'candidate', canonical, identity)))
+    expect(await node.status()).toMatchObject({ lastError: 'CANDIDATE_EXECUTION_MANIFEST_UNAVAILABLE', ingest: { retryRecords: 1 } })
+    expect(node.outcome(proposalId)).toBeNull()
+    expect(node.isFinal(proposalId)).toBe(false)
+  })
+
   it('preserves earlier ordered lost replies and rejects stale prepared bytes durably without reauthoring', async () => {
     const f = await fixture(), peer = await f.open()
     const acceptedInput = { operationId: 'ordered-before-rotation', program: program(emit('chat', { text: 'accepted once' })) }
