@@ -6,7 +6,7 @@ import {
   type ValidatorEvidence,
 } from '@chronolog/capabilities'
 import type { StoredAttestation, WatermarkPolicy } from '@chronolog/control-store'
-import { bytesToHex, equalBytes, type TransactionCore } from '@chronolog/protocol'
+import { bytesToHex, equalBytes, isEmitStep, type TransactionCore, type ChangeProgram } from '@chronolog/protocol'
 
 import type {
   CandidateAdmissionContext,
@@ -72,6 +72,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     const grant = snapshot.capabilities.get(id)
     if (grant === undefined || !this.#activeRole(grant, snapshot, 'writer') ||
         !equalBytes(grant.grant.signingPublicKey, context.writerId)) return false
+    if (!programAllowed(grant, context.program)) return false
     const effective = this.#authorizationSnapshot === undefined ? snapshot : await this.#authorizationSnapshot(context)
     if (effective === null) throw new GovernanceEvidencePendingError()
     const active = effective.capabilities.get(id)
@@ -134,7 +135,10 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     const authorized = this.#transportAuthorForCapability === undefined
       ? capability.grant.transportAuthor ?? null
       : await this.#transportAuthorForCapability(capability, snapshot)
-    return authorized === context.transportAuthor
+    if (authorized === context.transportAuthor) return true
+    return context.role === 'writer' && capability.grant.program?.forwarded === true &&
+      [...snapshot.capabilities.values()].some((relay) => isCapabilityActive(relay, snapshot.revision) &&
+        (relay.grant.role === 'reader' || relay.grant.role === 'writer') && relay.grant.transportAuthor === context.transportAuthor)
   }
 
   async selectAdmission(
@@ -208,5 +212,13 @@ export class CapabilityMembershipResolver implements MembershipResolver {
   #activeRole(capability: EffectiveCapability, snapshot: CapabilitySnapshot, role: 'writer' | 'validator'): boolean {
     return capability.grant.role === role && isCapabilityActive(capability, snapshot.revision)
   }
+}
+
+function programAllowed(capability: EffectiveCapability, program?: ChangeProgram): boolean {
+  if (program === undefined) return true
+  const rights = capability.grant.program
+  return program.steps.every((step) => isEmitStep(step)
+    ? rights !== undefined && (rights.topics.includes('*') || rights.topics.includes(step.topic))
+    : rights?.sql !== false)
 }
 

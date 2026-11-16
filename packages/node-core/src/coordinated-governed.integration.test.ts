@@ -9,9 +9,9 @@ import {
 } from '@chronolog/materializer-doltlite'
 import {
   bytesToHex, decodeEnvelope, digestExecutionManifest, DOMAINS, encodeTransactionCore,
-  generateEd25519KeyPair, hashDomain, sqlProgram, transactionDigest, utf8,
+  generateEd25519KeyPair, hashDomain, program, transactionDigest, utf8,
 } from '@chronolog/protocol'
-import type { SqlTransactionProgram, TransactionCore } from '@chronolog/protocol'
+import type { ChangeProgram, TransactionCore } from '@chronolog/protocol'
 import {
   connectInProcess, DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner,
 } from '@chronolog/records'
@@ -110,7 +110,7 @@ describe('governed coordinated native replicas', () => {
       }
     }
     await certify()
-    const schema = await admin.node.publish({ operationId: 'schema', program: sqlProgram(
+    const schema = await admin.node.publish({ operationId: 'schema', program: program(
       'CREATE TABLE notes (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT',
       'INSERT INTO notes (id, value) VALUES (1, 10)',
     ) })
@@ -136,21 +136,22 @@ describe('governed coordinated native replicas', () => {
       isFinalTargetApplied: (target) => newcomer.node.isFinalTargetApplied(target.frontier),
     })
     expect((await progress()).state).toBe('approved')
-    await expect(newcomer.node.publish({ operationId: 'before-certified-grant', program: sqlProgram('INSERT INTO notes VALUES (2, 20)') }))
+    await expect(newcomer.node.publish({ operationId: 'before-certified-grant', program: program('INSERT INTO notes VALUES (2, 20)') }))
       .rejects.toThrow('WRITER_UNAUTHORIZED')
 
     await certify()
     expect(newcomer.activeSnapshot.revision).toBe(1n)
     expect((await progress()).state).toBe('ready')
     const accepted = await newcomer.node.publish({ operationId: 'first-member-write', authorTimestampMs: 100n,
-      program: sqlProgram('INSERT INTO notes (id, value) VALUES (2, 20)') })
+      program: program('INSERT INTO notes (id, value) VALUES (2, 20)') })
     await certify()
     expect(newcomer.node.outcome(accepted.txId)?.outcome).toBe('accepted')
     const oldRevision = newcomer.node.membershipRevision
     const oldWriter = [...newcomer.activeSnapshot.capabilities.values()].find((capability) =>
       capability.grant.role === 'writer' && bytesToHex(capability.grant.signingPublicKey) === bytesToHex(joining.signing.publicKeyBytes))!
-    const staleProposal = async (nonce: number, program: SqlTransactionProgram) => {
+    const staleProposal = async (nonce: number, program: ChangeProgram) => {
       const core: TransactionCore = {
+        operationId: `stale-${nonce}`,
         groupId: manifest.groupId, membershipRevision: oldRevision, validationPolicy: newcomer.node.validationPolicy,
         authorId: joining.signing.publicKeyBytes, authorTimestampMs: 0n, nonce: bytes32(nonce),
         executionManifestDigest, writerCapability: oldWriter.id, program,
@@ -159,7 +160,7 @@ describe('governed coordinated native replicas', () => {
       const envelope = await encodeSignedEnvelope(groupRoute, 'candidate', canonical, joining.signing, newcomer.governance.cipherRing)
       return { envelope, txId: utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`) }
     }
-    const delayed = await staleProposal(23, sqlProgram('INSERT INTO notes (id, value) VALUES (3, 999)'))
+    const delayed = await staleProposal(23, program('INSERT INTO notes (id, value) VALUES (3, 999)'))
     const priorRows = admin.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows
     await admin.governance.revoke([oldWriter.id], administrator.signing.privateKey, { operationId: 'revoke-writer' })
     await newcomer.transport.catchUp()
@@ -181,9 +182,9 @@ describe('governed coordinated native replicas', () => {
       signingPublicKey: joining.signing.publicKeyBytes, transportAuthor: newcomer.transport.identity, role: 'writer' }] },
     administrator.signing.privateKey, { operationId: 'regrant-same-key' })
     await certify()
-    const staleAgain = await staleProposal(24, sqlProgram('INSERT INTO notes (id, value) VALUES (3, 999)'))
+    const staleAgain = await staleProposal(24, program('INSERT INTO notes (id, value) VALUES (3, 999)'))
     await newcomer.transport.publish(staleAgain.envelope)
-    const fresh = await newcomer.node.publish({ operationId: 'new-grant-write', program: sqlProgram('INSERT INTO notes (id, value) VALUES (4, 40)') })
+    const fresh = await newcomer.node.publish({ operationId: 'new-grant-write', program: program('INSERT INTO notes (id, value) VALUES (4, 40)') })
     await certify()
     for (const peer of peers) {
       expect(peer.activeSnapshot.revision).toBe(3n)

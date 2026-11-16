@@ -15,6 +15,7 @@ export function initializeSystemLog(database: DatabaseLike): void {
       tx_id BLOB PRIMARY KEY NOT NULL,
       order_index INTEGER NOT NULL UNIQUE,
       author_id BLOB NOT NULL,
+      operation_id TEXT NOT NULL,
       author_timestamp_ms INTEGER NOT NULL,
       author_feed_sequence INTEGER NOT NULL,
       candidate_digest BLOB NOT NULL,
@@ -26,7 +27,8 @@ export function initializeSystemLog(database: DatabaseLike): void {
         (outcome = 'accepted' AND rejection_code IS NULL AND failing_statement_index IS NULL)
         OR (outcome = 'rejected' AND rejection_code IS NOT NULL)
       )
-    ) STRICT
+    ) STRICT;
+    CREATE INDEX chronolog_operation_identity ON ${TRANSACTION_LOG_TABLE}(author_id, operation_id)
   `)
 }
 
@@ -46,7 +48,7 @@ export function readExecutionManifest(database: DatabaseLike): StoredExecutionMa
 
 export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
   const statement = database.prepare(`
-    SELECT tx_id, order_index, author_id, author_timestamp_ms, author_feed_sequence,
+    SELECT tx_id, order_index, author_id, operation_id, author_timestamp_ms, author_feed_sequence,
            candidate_digest, canonical_candidate, outcome, rejection_code, failing_statement_index
       FROM ${TRANSACTION_LOG_TABLE}
      ORDER BY order_index
@@ -62,6 +64,7 @@ export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
     const authorFeedSequence = asBigint(raw.author_feed_sequence)
     return {
       txId,
+      operationId: asString(raw.operation_id),
       orderIndex: Number(raw.order_index),
       authorId,
       authorTimestampMs,
@@ -79,13 +82,14 @@ export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
 export function insertSystemLogRow(database: DatabaseLike, row: Omit<TransactionLogRow, 'orderKey'>): void {
   database.prepare(`
     INSERT INTO ${TRANSACTION_LOG_TABLE} (
-      tx_id, order_index, author_id, author_timestamp_ms, author_feed_sequence,
+      tx_id, order_index, author_id, operation_id, author_timestamp_ms, author_feed_sequence,
       candidate_digest, canonical_candidate, outcome, rejection_code, failing_statement_index
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     row.txId,
     BigInt(row.orderIndex),
     row.authorId,
+    row.operationId,
     row.authorTimestampMs,
     row.authorFeedSequence,
     row.candidateDigest,

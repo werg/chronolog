@@ -13,3 +13,5 @@ export * from './node.js'
 export * from './types.js'
 export * from './wire.js'
 export { FeedForkRegistry } from './feed-forks.js'
+
+export * from './events.js'

@@ -1,4 +1,4 @@
-import { isPlatformOp, type SqlStatement, type SqlTransactionProgram } from '@chronolog/protocol'
+import { isEmitStep, isPlatformOp, type SqlStatement, type ChangeProgram } from '@chronolog/protocol'
 
 import { cachedInternalStatement, PlatformRejection, PlatformSession, toDatabaseValue, writeProtectedTables } from './platform/session.js'
 import { isOperationalSqliteError, SqlProfileError, sqlitePrimaryCode, withProfiledStatement, type SqlAuthorizationOptions } from './sql-profile.js'
@@ -42,7 +42,7 @@ const POLICY_PREFIX = 'chronolog_policy:'
  */
 export function executeTransactionProgram(
   database: DatabaseLike,
-  program: SqlTransactionProgram,
+  program: ChangeProgram,
   context: DeterministicContext,
   limits: Partial<SqlRuntimeLimits> = {},
 ): void {
@@ -67,6 +67,9 @@ export function executeTransactionProgram(
       reconciledVersion = schemaVersion(database)
     }
     for (const [index, step] of program.steps.entries()) {
+      // Literal events are indexed from the signed program only after its
+      // durable outcome commits. A later SQL failure therefore exposes none.
+      if (isEmitStep(step)) continue
       if (isPlatformOp(step)) {
         try {
           platform.execute(step, index)

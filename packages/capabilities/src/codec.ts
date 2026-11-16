@@ -14,6 +14,7 @@ import {
   protocolInvariant,
   required,
   type CborValue,
+  assertEventTopic,
 } from '@chronolog/protocol'
 import type {
   CapabilityGrant,
@@ -37,6 +38,14 @@ function roleIndex(role: CapabilityGrant['role']): bigint {
 }
 
 function grantToCbor(grant: CapabilityGrant): CborValue {
+  if (grant.program !== undefined) {
+    protocolInvariant(grant.role === 'writer' && typeof grant.program.sql === 'boolean', 'SCHEMA_INVALID', 'Only writer grants carry program rights')
+    for (const topics of [grant.program.topics, grant.program.signals]) {
+      protocolInvariant(Array.isArray(topics) && topics.length <= 128 && new Set(topics).size === topics.length, 'SCHEMA_INVALID', 'Invalid publication scopes')
+      topics.forEach((topic) => { if (topic !== '*') assertEventTopic(topic) })
+    }
+    protocolInvariant(grant.program.forwarded === undefined || typeof grant.program.forwarded === 'boolean', 'SCHEMA_INVALID', 'Invalid forwarding right')
+  }
   protocolInvariant(grant.signingPublicKey.length === 32, 'SCHEMA_INVALID', 'Capability signing key must contain 32 bytes')
   protocolInvariant(grant.validFromRevision >= 0n, 'INTEGER_OUT_OF_RANGE', 'Capability revision cannot be negative')
   if (grant.role === 'validator') {
@@ -58,12 +67,13 @@ function grantToCbor(grant: CapabilityGrant): CborValue {
     [0, grant.subjectId], [1, grant.signingPublicKey], [2, roleIndex(grant.role)],
     [3, grant.validFromRevision], [7, grant.minimumAuthorTimestampMs], [9, grant.hpkePublicKey],
     [10, grant.transportAuthor],
+    [11, grant.program === undefined ? undefined : [grant.program.sql, [...grant.program.topics].sort(), [...grant.program.signals].sort(), grant.program.forwarded ?? false]],
   ])
 }
 
 function grantFromCbor(value: CborValue, field: string): CapabilityGrant {
   const map = expectMap(value, field)
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 7, 9, 10], field)
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 7, 9, 10, 11], field)
   const roleValue = expectUint64(required(map, 2, `${field}.role`), `${field}.role`)
   protocolInvariant(roleValue < BigInt(ROLES.length), 'SCHEMA_INVALID', `${field}.role is unknown`)
   const role = ROLES[Number(roleValue)]
@@ -71,17 +81,27 @@ function grantFromCbor(value: CborValue, field: string): CapabilityGrant {
   const floor = optional(map, 7)
   const hpkeKey = optional(map, 9)
   const transportAuthor = optional(map, 10)
+  const programValue = optional(map, 11)
+  const program = programValue === undefined ? undefined : decodeProgramRights(programValue)
   const grant: CapabilityGrant = {
     subjectId: expectBytes(required(map, 0, `${field}.subject_id`), `${field}.subject_id`),
     signingPublicKey: expectBytes(required(map, 1, `${field}.signing_key`), `${field}.signing_key`, 32),
     role,
     validFromRevision: expectUint64(required(map, 3, `${field}.valid_from`), `${field}.valid_from`),
+    ...(program === undefined ? {} : { program }),
     ...(floor === undefined ? {} : { minimumAuthorTimestampMs: expectUint64(floor, `${field}.minimum_timestamp`) }),
     ...(hpkeKey === undefined ? {} : { hpkePublicKey: expectBytes(hpkeKey, `${field}.hpke_key`, 32) }),
     ...(transportAuthor === undefined ? {} : { transportAuthor: expectString(transportAuthor, `${field}.transport_author`) }),
   }
   grantToCbor(grant)
   return grant
+}
+
+function decodeProgramRights(value: CborValue): NonNullable<CapabilityGrant['program']> {
+  const tuple = expectArray(value, 'grant.program')
+  protocolInvariant(tuple.length === 4 && typeof tuple[0] === 'boolean' && typeof tuple[3] === 'boolean', 'SCHEMA_INVALID', 'Invalid program rights')
+  const topics = (index: number): string[] => expectArray(tuple[index]!, 'grant.topics').map((topic) => expectString(topic, 'grant.topic'))
+  return { sql: tuple[0], topics: topics(1), signals: topics(2), forwarded: tuple[3] }
 }
 
 function policyToCbor(policy: ValidationPolicy): CborValue {

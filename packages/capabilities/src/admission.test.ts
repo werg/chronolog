@@ -60,6 +60,7 @@ async function fixture(extraGrants: readonly CapabilityGrant[] = []) {
 
 function coreFor(snapshot: CapabilitySnapshot, policyId: Uint8Array, overrides: Partial<TransactionCore> = {}): TransactionCore {
   return {
+    operationId: 'test-operation',
     groupId: snapshot.groupId, membershipRevision: snapshot.revisionDigest, validationPolicy: policyId,
     authorId: bytes(20), authorTimestampMs: 5_000n, nonce: bytes(9), executionManifestDigest: bytes(10),
     program: {} as TransactionCore['program'], ...overrides,
@@ -73,6 +74,7 @@ async function attestationFor(
 ): Promise<ValidatorAttestation> {
   const capability = [...snapshot.capabilities.values()].find((entry) => entry.grant.subjectId[0] === subject)!
   return {
+    operationId: 'test-operation',
     groupId: snapshot.groupId, membershipRevision: snapshot.revisionDigest, validatorCapability: capability.id,
     txId, validatorId: bytes(subject), authorTimestampMs: 5_000n, acceptedAboveMs: 4_000n,
     candidateDigest, decision: 'admit', policyVersion: policy.version, ...overrides,

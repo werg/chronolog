@@ -10,6 +10,7 @@ import {
   type ManifestArtifacts,
   type TransactionOrderKey,
 } from '@chronolog/protocol'
+import type { MaterializedReadHandle } from '@chronolog/materializer'
 
 import {
   HEAD_BRANCH,
@@ -68,6 +69,7 @@ export class MaterializerInputError extends Error {
 }
 
 export class DeterministicMaterializer implements MaterializerSqlBackend {
+  readonly #readLeases = new Set<() => void>()
   readonly #writer: DatabaseLike
   #reader: DatabaseLike
   #finalReader: DatabaseLike
@@ -246,6 +248,35 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     options: LocalSqlOptions = {},
   ): LocalSqlQueryResult {
     return this.localSql(sql, parameters, options)
+  }
+
+  captureRead(options: { readonly view?: 'local' | 'final' } = {}): MaterializedReadHandle {
+    this.#assertOpen()
+    if (this.#readLeases.size >= 16) throw new Error('MATERIALIZER_SNAPSHOT_LIMIT')
+    const view = options.view ?? 'final'
+    const published = view === 'final' ? this.#finalPublished : this.#published
+    const revision = view === 'final' ? this.finalRevision : this.revision
+    const orderLength = view === 'final' ? this.finalOrderLength : this.orderLength
+    const finalOrderLength = this.finalOrderLength
+    const branch = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
+    this.#writer.doltBranch(branch, published.doltCommitHash)
+    let reader: DatabaseLike
+    try { reader = openDatabase(this.#sourceOptions).database; reader.doltCheckout(branch) }
+    catch (error) { removeBranchIfPresent(this.#writer, branch); throw error }
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      reader.close()
+      removeBranchIfPresent(this.#writer, branch)
+      this.#readLeases.delete(release)
+    }
+    this.#readLeases.add(release)
+    return { revision, orderLength, finalOrderLength, view,
+      query(sql, parameters = []) {
+        if (released) throw new Error('MATERIALIZER_SNAPSHOT_RELEASED')
+        return { revision, orderLength, finalOrderLength, view, ...executeLocalSql(reader, sql, parameters) }
+      }, release }
   }
 
   subscribe(subscriber: RevisionSubscriber): () => void {
@@ -450,6 +481,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
   close(): void {
     if (this.#closed) return
+    for (const release of [...this.#readLeases]) release()
     this.#closed = true
     this.#subscribers.clear()
     this.#reader.close()
@@ -462,6 +494,9 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#writer.exec('SAVEPOINT chronolog_program')
     let rejection: { readonly code: string; readonly statementIndex: number | null } | null = null
     try {
+      const duplicate = this.#writer.prepare('SELECT tx_id FROM chronolog_transactions WHERE author_id = ? AND operation_id = ? LIMIT 1')
+        .get(transaction.core.authorId, transaction.core.operationId)
+      if (duplicate !== undefined) throw new SqlRejection('operation_conflict', null)
       executeTransactionProgram(this.#writer, transaction.core.program, {
           authorTimestampMs: transaction.core.authorTimestampMs,
           txId: transaction.txId,
@@ -769,6 +804,7 @@ function logRow(
   return {
     txId: transaction.txId,
     orderIndex,
+    operationId: transaction.core.operationId,
     authorId: transaction.core.authorId,
     authorTimestampMs: transaction.core.authorTimestampMs,
     authorFeedSequence: transaction.authorFeedSequence,

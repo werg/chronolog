@@ -22,6 +22,7 @@ export interface TransactionOutcome {
 }
 
 export interface TransactionLogRow extends TransactionOutcome {
+  readonly operationId: string
   readonly authorId: Uint8Array
   readonly authorTimestampMs: bigint
   readonly authorFeedSequence: bigint

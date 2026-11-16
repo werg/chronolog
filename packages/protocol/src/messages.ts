@@ -5,16 +5,17 @@ import { assertCanonicalCbor, type CborValue, encodeCanonicalCbor } from './cbor
 import { ProtocolError, protocolInvariant } from './errors.js'
 import {
   assertKnownIntegerKeys, expectBytes, expectMap, expectUint64,
-  expectVersion, integerMap, optional, required,
+  expectVersion, expectString, integerMap, optional, required,
 } from './schema.js'
 import {
-  assertValidSqlTransactionProgram,
-  sqlTransactionProgramFromCanonicalCbor,
-  sqlTransactionProgramToCanonicalCbor,
-  type SqlTransactionProgram,
+  assertValidChangeProgram,
+  changeProgramFromCanonicalCbor,
+  changeProgramToCanonicalCbor,
+  type ChangeProgram,
 } from './program.js'
 
 export interface TransactionCore {
+  readonly operationId: string
   readonly groupId: Uint8Array
   readonly membershipRevision: Uint8Array
   readonly validationPolicy: Uint8Array
@@ -24,7 +25,7 @@ export interface TransactionCore {
   readonly authorTimestampMs: bigint
   readonly nonce: Uint8Array
   readonly executionManifestDigest: Uint8Array
-  readonly program: SqlTransactionProgram
+  readonly program: ChangeProgram
   readonly metadata?: ReadonlyMap<string, Uint8Array>
 }
 
@@ -57,6 +58,8 @@ function metadataFromCbor(value: CborValue): ReadonlyMap<string, Uint8Array> {
 }
 
 function transactionToCbor(value: TransactionCore): CborValue {
+  protocolInvariant(typeof value.operationId === 'string' && value.operationId.length > 0 && value.operationId.length <= 512 &&
+    !/[\u0000-\u001f]/u.test(value.operationId), 'SCHEMA_INVALID', 'Operation identity must be bounded nonempty text')
   for (const [field, bytes] of [
     ['groupId', value.groupId], ['membershipRevision', value.membershipRevision],
     ['validationPolicy', value.validationPolicy], ['authorId', value.authorId],
@@ -65,11 +68,11 @@ function transactionToCbor(value: TransactionCore): CborValue {
   protocolInvariant(value.nonce.length >= 16, 'SCHEMA_INVALID', 'Transaction nonce must contain at least 16 bytes')
   protocolInvariant(value.executionManifestDigest.length === 32, 'SCHEMA_INVALID', 'Execution-manifest digest must contain 32 bytes')
   if (value.writerCapability !== undefined) protocolInvariant(value.writerCapability.length === 32, 'SCHEMA_INVALID', 'Writer capability must contain 32 bytes')
-  assertValidSqlTransactionProgram(value.program)
+  assertValidChangeProgram(value.program)
   return integerMap([
-    [0, 1n], [1, value.groupId], [2, value.membershipRevision], [3, value.validationPolicy],
+    [0, 2n], [1, value.groupId], [2, value.membershipRevision], [3, value.validationPolicy],
     [4, value.authorId], [5, value.authorTimestampMs], [6, value.nonce], [7, value.executionManifestDigest],
-    [8, sqlTransactionProgramToCanonicalCbor(value.program)], [9, metadataToCbor(value.metadata)], [10, value.writerCapability],
+    [8, changeProgramToCanonicalCbor(value.program)], [9, metadataToCbor(value.metadata)], [10, value.writerCapability], [11, value.operationId],
   ])
 }
 
@@ -77,17 +80,18 @@ export function encodeTransactionCore(value: TransactionCore): Uint8Array { retu
 
 export function decodeTransactionCore(bytes: Uint8Array): TransactionCore {
   const map = expectMap(assertCanonicalCbor(bytes), 'transaction')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'transaction')
-  expectVersion(map, 1n, 'transaction')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 'transaction')
+  expectVersion(map, 2n, 'transaction')
   const authorTimestampMs = expectUint64(required(map, 5, 'transaction.author_timestamp_ms'), 'transaction.author_timestamp_ms')
   protocolInvariant(authorTimestampMs <= (1n << 63n) - 1n, 'INTEGER_OUT_OF_RANGE', 'Author timestamp is outside nonnegative int64')
   const nonce = expectBytes(required(map, 6, 'transaction.nonce'), 'transaction.nonce')
   protocolInvariant(nonce.length >= 16, 'SCHEMA_INVALID', 'Transaction nonce must contain at least 16 bytes')
-  const program = sqlTransactionProgramFromCanonicalCbor(required(map, 8, 'transaction.program'))
-  assertValidSqlTransactionProgram(program)
+  const program = changeProgramFromCanonicalCbor(required(map, 8, 'transaction.program'))
+  assertValidChangeProgram(program)
   const metadata = optional(map, 9)
   const writerCapability = optional(map, 10)
   return {
+    operationId: expectString(required(map, 11, 'transaction.operation_id'), 'transaction.operation_id'),
     groupId: expectBytes(required(map, 1, 'transaction.group_id'), 'transaction.group_id', 32),
     membershipRevision: expectBytes(required(map, 2, 'transaction.membership_revision'), 'transaction.membership_revision', 32),
     validationPolicy: expectBytes(required(map, 3, 'transaction.validation_policy'), 'transaction.validation_policy', 32),

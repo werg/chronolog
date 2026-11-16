@@ -211,7 +211,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const bootstrapTimestamp = node.candidateCore(new TextEncoder().encode(bootstrap.transactionId))!.authorTimestampMs
     const predecessor = await node.publish({
       authorTimestampMs: bootstrapTimestamp + 1n,
-      program: { version: 2, steps: [sqlStatement('UPDATE replay_accounts SET balance = 80 WHERE id = 1')] },
+      program: { version: 3, steps: [sqlStatement('UPDATE replay_accounts SET balance = 80 WHERE id = 1')] },
     })
     expect((await terminal(client, predecessor.txIdText)).outcome.type).toBe('accepted')
     await waitFor(() => outcomeResource.getSnapshot().value?.outcome.type === 'rejected')

@@ -21,6 +21,7 @@ const manifestDigest = bytes(0xe2)
 
 function core(index: number): TransactionCore {
   return {
+    operationId: `fixture-${index}`,
     groupId: bytes(0x01),
     membershipRevision: bytes(0x02),
     validationPolicy: bytes(0x03),
@@ -28,7 +29,7 @@ function core(index: number): TransactionCore {
     authorTimestampMs: 1_000n + BigInt(index),
     nonce: bytes(0x80 + index),
     executionManifestDigest: manifestDigest,
-    program: { version: 2, steps: [{ sql: `INSERT INTO t VALUES (${index})`, bindings: [] }] },
+    program: { version: 3, steps: [{ sql: `INSERT INTO t VALUES (${index})`, bindings: [] }] },
   }
 }
 
@@ -45,6 +46,7 @@ function transaction(index: number): AdmittedTransaction {
 
 function logRow(item: AdmittedTransaction, orderIndex: number): TransactionLogRow {
   return {
+    operationId: item.core.operationId,
     txId: item.txId,
     orderKey: { authorTimestampMs: item.core.authorTimestampMs, authorId: item.core.authorId, authorFeedSequence: item.authorFeedSequence, txId: item.txId },
     orderIndex,

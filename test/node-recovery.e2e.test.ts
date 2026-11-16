@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { ChronologNode } from '@chronolog/node-core'
-import { equalBytes, generateEd25519KeyPair, sqlProgram } from '@chronolog/protocol'
+import { equalBytes, generateEd25519KeyPair, program } from '@chronolog/protocol'
 import { feedIdFromPublicKey, PortableFeedTransport } from '@chronolog/records'
 import { FeedStore, nativeFeedCrypto } from '@chronolog/transport-ssb'
 import { afterEach, expect, it } from 'vitest'
@@ -80,7 +80,7 @@ it('restores every admitted payload before scheduling SQL and returns healthy af
   const f = await fixture()
   const first = await f.open()
   for (const sql of ['CREATE TABLE notes(id INTEGER PRIMARY KEY) STRICT', 'INSERT INTO notes(id) VALUES(1)', 'INSERT INTO notes(id) VALUES(2)']) {
-    const transaction = await first.node.publish({ program: sqlProgram(sql) })
+    const transaction = await first.node.publish({ program: program(sql) })
     await first.node.waitForIdle()
     expect(first.node.outcome(transaction.txId)?.outcome).toBe('accepted')
   }
@@ -99,7 +99,7 @@ it('reports an active materialization failure and clears it only after successfu
   const f = await fixture()
   const replica = await f.open()
   f.fail(new Error('temporary materializer I/O failure'))
-  const transaction = await replica.node.publish({ program: sqlProgram('CREATE TABLE recovered(id INTEGER PRIMARY KEY)') })
+  const transaction = await replica.node.publish({ program: program('CREATE TABLE recovered(id INTEGER PRIMARY KEY)') })
   await expect.poll(async () => (await replica.node.status()).lastError).toBe('temporary materializer I/O failure')
   expect(daemonHealth(await replica.node.status()).ok).toBe(false)
   expect(replica.node.outcome(transaction.txId)).toBeNull()

@@ -13,10 +13,10 @@ import {
 import {
   encodeTransactionCore,
   transactionDigest,
-  sqlProgram,
+  program,
   sqlStatement,
   utf8,
-  type SqlTransactionProgram,
+  type ChangeProgram,
   type TransactionCore,
 } from '@chronolog/protocol'
 
@@ -153,14 +153,14 @@ async function requireRevision(
   return revision
 }
 
-function bootstrapProgram(): SqlTransactionProgram {
-  return sqlProgram(
+function bootstrapProgram(): ChangeProgram {
+  return program(
     sqlStatement('CREATE TABLE release_events (id INTEGER PRIMARY KEY, iteration INTEGER NOT NULL, kind TEXT NOT NULL) STRICT'),
   )
 }
 
-function insertProgram(iteration: number, kind: string): SqlTransactionProgram {
-  return sqlProgram(sqlStatement(
+function insertProgram(iteration: number, kind: string): ChangeProgram {
+  return program(sqlStatement(
     'INSERT INTO release_events (id, iteration, kind) VALUES (?, ?, ?)',
     [BigInt(iteration * 2 + (kind === 'late' ? 1 : 0)), BigInt(iteration), kind],
   ))
@@ -169,10 +169,11 @@ function insertProgram(iteration: number, kind: string): SqlTransactionProgram {
 async function transaction(
   timestamp: bigint,
   id: number,
-  program: SqlTransactionProgram,
+  program: ChangeProgram,
   executionManifestDigest: Uint8Array,
 ): Promise<AdmittedTransaction> {
   const core: TransactionCore = {
+    operationId: String(id),
     groupId: bytes32(1),
     membershipRevision: bytes32(2),
     validationPolicy: bytes32(3),

@@ -26,6 +26,7 @@ const materializer = await DeterministicMaterializer.open({
   },
 })
 const core: TransactionCore = {
+  operationId: 'publication-crash',
   groupId: bytes32(1),
   membershipRevision: bytes32(2),
   validationPolicy: bytes32(3),
@@ -34,7 +35,7 @@ const core: TransactionCore = {
   nonce: bytes32(5),
   executionManifestDigest: materializer.executionManifestDigest,
   program: {
-    version: 2,
+    version: 3,
     steps: [{ sql: 'CREATE TABLE crash_probe (id INTEGER PRIMARY KEY) STRICT', bindings: [] }],
   },
 }

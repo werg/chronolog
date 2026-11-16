@@ -28,7 +28,7 @@ import {
   SqliteFeedForkPersistence,
   type MembershipResolver,
 } from '@chronolog/node-core'
-import { equalBytes, generateEd25519KeyPair, type SqlTransactionProgram } from '@chronolog/protocol'
+import { equalBytes, generateEd25519KeyPair, type ChangeProgram } from '@chronolog/protocol'
 import { type ChronologTransport, MemoryTransportNetwork, FeedTransport } from '@chronolog/transport-ssb'
 
 const { values } = parseArgs({
@@ -100,7 +100,7 @@ try {
   const keepAlive = setInterval(() => {}, 1_000)
   stop.signal.addEventListener('abort', () => clearInterval(keepAlive))
   void (async () => {
-    for await (const _event of node.events(0n, stop.signal)) { wake?.() }
+    for await (const _event of node.revisions(0n, stop.signal)) { wake?.() }
   })().catch(() => {})
   const pump = async (predicate: () => boolean): Promise<number> => {
     while (!predicate()) await new Promise<void>((resolve) => { wake = resolve })
@@ -143,15 +143,15 @@ console.log(JSON.stringify({
 
 function round(value: number): number { return Math.round(value * 10) / 10 }
 function bytes32(seed: number): Uint8Array { return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff) }
-function createProgram(): SqlTransactionProgram {
+function createProgram(): ChangeProgram {
   return {
-    version: 2,
+    version: 3,
     steps: [{ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT', bindings: [] }],
   }
 }
-function insertProgram(id: number): SqlTransactionProgram {
+function insertProgram(id: number): ChangeProgram {
   return {
-    version: 2,
+    version: 3,
     steps: [{
       sql: 'INSERT INTO items (id, value) VALUES (?, ?)',
       bindings: [indexed(1, BigInt(id)), indexed(2, BigInt(id * 10))],

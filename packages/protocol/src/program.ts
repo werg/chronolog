@@ -1,94 +1,117 @@
 import { assertCanonicalCbor, encodeCanonicalCbor, type CborValue } from './cbor.js'
+import { utf8 } from './bytes.js'
 import { protocolInvariant } from './errors.js'
-import {
-  isPlatformOp,
-  platformOpFromCanonicalCbor,
-  platformOpToCanonicalCbor,
-  type PlatformOp,
-} from './platform.js'
-import {
-  assertKnownIntegerKeys,
-  expectArray,
-  expectMap,
-  expectUint64,
-  expectVersion,
-  integerMap,
-  required,
-} from './schema.js'
-import {
-  sqlStatement,
-  sqlStatementFromCanonicalCbor,
-  sqlStatementToCanonicalCbor,
-  type SqlStatement,
-} from './sql.js'
+import { isPlatformOp, platformOpFromCanonicalCbor, platformOpToCanonicalCbor, type PlatformOp } from './platform.js'
+import { assertKnownIntegerKeys, expectArray, expectMap, expectString, expectUint64, expectVersion, integerMap, required } from './schema.js'
+import { sqlStatement, sqlStatementFromCanonicalCbor, sqlStatementToCanonicalCbor, type SqlStatement } from './sql.js'
 
-/** One step of a transaction program: an ordinary SQLite statement or a platform operation. */
-export type ProgramStep = SqlStatement | PlatformOp
+export type EventPayload = null | boolean | number | string | readonly EventPayload[] | { readonly [key: string]: EventPayload }
+export interface EmitStep { readonly op: 'emit'; readonly topic: string; readonly payload: EventPayload }
+/** One signed program, one outcome, and one atomic SQL/event visibility boundary. */
+export type ProgramStep = SqlStatement | PlatformOp | EmitStep
+export interface ChangeProgram { readonly version: 3; readonly steps: readonly ProgramStep[] }
 
-/** Steps executed in order as the signer; any failure rejects the whole transaction. */
-export interface SqlTransactionProgram {
-  readonly version: 2
-  readonly steps: readonly ProgramStep[]
+export const MAX_PROGRAM_STEPS = 256
+export const MAX_PROGRAM_BYTES = 262_144
+export const MAX_PROGRAM_EVENTS = 64
+export const MAX_EVENT_BYTES = 16_384
+export const MAX_TOPIC_BYTES = 128
+
+export function assertEventTopic(topic: string): void {
+  protocolInvariant(typeof topic === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u.test(topic) && utf8(topic).length <= MAX_TOPIC_BYTES,
+    'SCHEMA_INVALID', 'Event topic must be a bounded application label')
 }
 
-export const MAX_SQL_PROGRAM_STEPS = 256
-
-export function isSqlStatementStep(step: ProgramStep): step is SqlStatement {
-  return !isPlatformOp(step)
-}
-
-/** A program from statements, platform operations, or SQL text with parameters. */
-export function sqlProgram(...steps: readonly (ProgramStep | string)[]): SqlTransactionProgram {
-  const program: SqlTransactionProgram = {
-    version: 2,
-    steps: steps.map((step) => typeof step === 'string' ? sqlStatement(step) : step),
+/** Canonical JSON embedded in canonical CBOR; rejects lossy/non-JSON inputs. */
+export function canonicalEventPayload(payload: EventPayload): string {
+  let nodes = 0
+  const visit = (value: EventPayload, depth: number): string => {
+    protocolInvariant(depth <= 32 && ++nodes <= 4096, 'SCHEMA_INVALID', 'Event payload is too complex')
+    if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+    if (typeof value === 'number') {
+      protocolInvariant(Number.isFinite(value), 'SCHEMA_INVALID', 'Event numbers must be finite')
+      return JSON.stringify(value)
+    }
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) protocolInvariant(Object.hasOwn(value, i), 'SCHEMA_INVALID', 'Event arrays cannot be sparse')
+      return `[${value.map((entry) => visit(entry, depth + 1)).join(',')}]`
+    }
+    protocolInvariant(typeof value === 'object' && value !== null &&
+      (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null),
+    'SCHEMA_INVALID', 'Event payload must contain JSON values')
+    protocolInvariant(Reflect.ownKeys(value).length === Object.keys(value).length, 'SCHEMA_INVALID', 'Event objects require enumerable string keys')
+    return `{${Object.keys(value).sort().map((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)!
+      protocolInvariant('value' in descriptor, 'SCHEMA_INVALID', 'Event payload cannot contain accessors')
+      return `${JSON.stringify(key)}:${visit(descriptor.value as EventPayload, depth + 1)}`
+    }).join(',')}}`
   }
-  assertValidSqlTransactionProgram(program)
-  return program
+  const encoded = visit(payload, 0)
+  protocolInvariant(utf8(encoded).length <= MAX_EVENT_BYTES, 'SCHEMA_INVALID', 'Event payload is too large')
+  return encoded
+}
+
+export function emit(topic: string, payload: EventPayload): EmitStep {
+  assertEventTopic(topic)
+  return { op: 'emit', topic, payload: JSON.parse(canonicalEventPayload(payload)) as EventPayload }
+}
+export function isEmitStep(step: unknown): step is EmitStep {
+  return typeof step === 'object' && step !== null && 'op' in step && step.op === 'emit'
+}
+export function isSqlStatementStep(step: ProgramStep): step is SqlStatement { return !isPlatformOp(step) && !isEmitStep(step) }
+
+export function program(...steps: readonly (ProgramStep | string)[]): ChangeProgram {
+  const result: ChangeProgram = { version: 3, steps: steps.map((step) => typeof step === 'string' ? sqlStatement(step) : step) }
+  assertValidChangeProgram(result)
+  return result
 }
 
 function stepToCbor(step: ProgramStep): CborValue {
+  if (isEmitStep(step)) {
+    protocolInvariant(Object.keys(step).every((key) => ['op', 'topic', 'payload'].includes(key)), 'SCHEMA_INVALID', 'Unknown emit field')
+    assertEventTopic(step.topic)
+    return [2n, step.topic, canonicalEventPayload(step.payload)]
+  }
   return isPlatformOp(step) ? [1n, platformOpToCanonicalCbor(step)] : [0n, sqlStatementToCanonicalCbor(step)]
 }
-
 function stepFromCbor(value: CborValue, name: string): ProgramStep {
   const tuple = expectArray(value, name)
-  protocolInvariant(tuple.length === 2, 'SCHEMA_INVALID', `${name} has invalid arity`)
   const kind = expectUint64(tuple[0] ?? null, `${name}.kind`)
+  if (kind === 2n) {
+    protocolInvariant(tuple.length === 3, 'SCHEMA_INVALID', `${name} has invalid arity`)
+    const encoded = expectString(tuple[2] ?? null, `${name}.payload`)
+    protocolInvariant(utf8(encoded).length <= MAX_EVENT_BYTES, 'SCHEMA_INVALID', 'Event payload is too large')
+    let payload: EventPayload
+    try { payload = JSON.parse(encoded) as EventPayload } catch { throw new Error('EVENT_PAYLOAD_INVALID') }
+    protocolInvariant(canonicalEventPayload(payload) === encoded, 'SCHEMA_INVALID', 'Event payload must be canonical')
+    return emit(expectString(tuple[1] ?? null, `${name}.topic`), payload)
+  }
+  protocolInvariant(tuple.length === 2, 'SCHEMA_INVALID', `${name} has invalid arity`)
   if (kind === 0n) return sqlStatementFromCanonicalCbor(tuple[1] ?? null, `${name}.statement`)
   protocolInvariant(kind === 1n, 'SCHEMA_INVALID', `${name} has an unknown kind`)
   return platformOpFromCanonicalCbor(tuple[1] ?? null, `${name}.platform_op`)
 }
 
-export function assertValidSqlTransactionProgram(value: SqlTransactionProgram): void {
-  protocolInvariant(value.version === 2, 'UNSUPPORTED_VERSION', 'Unsupported SQL transaction program version')
-  protocolInvariant((value.steps as unknown) instanceof Array && value.steps.length > 0, 'SCHEMA_INVALID', 'SQL transaction program requires a step')
-  protocolInvariant(value.steps.length <= MAX_SQL_PROGRAM_STEPS, 'SCHEMA_INVALID', 'SQL transaction program has too many steps')
-  for (const step of value.steps) stepToCbor(step)
+export function assertValidChangeProgram(value: ChangeProgram): void {
+  protocolInvariant(value.version === 3, 'UNSUPPORTED_VERSION', 'Unsupported change program version')
+  protocolInvariant(Array.isArray(value.steps) && value.steps.length > 0 && value.steps.length <= MAX_PROGRAM_STEPS,
+    'SCHEMA_INVALID', 'Change program requires a bounded nonempty step list')
+  protocolInvariant(value.steps.filter(isEmitStep).length <= MAX_PROGRAM_EVENTS, 'SCHEMA_INVALID', 'Too many emitted events')
+  protocolInvariant(encodeCanonicalCbor(value.steps.map(stepToCbor)).length <= MAX_PROGRAM_BYTES,
+    'SCHEMA_INVALID', 'Change program is too large')
 }
-
-export function sqlTransactionProgramToCanonicalCbor(value: SqlTransactionProgram): CborValue {
-  assertValidSqlTransactionProgram(value)
-  return integerMap([[0, 2n], [1, value.steps.map(stepToCbor)]])
+export function changeProgramToCanonicalCbor(value: ChangeProgram): CborValue {
+  assertValidChangeProgram(value)
+  return integerMap([[0, 3n], [1, value.steps.map(stepToCbor)]])
 }
-
-export function sqlTransactionProgramFromCanonicalCbor(value: CborValue): SqlTransactionProgram {
-  const map = expectMap(value, 'sql_transaction_program')
-  assertKnownIntegerKeys(map, [0, 1], 'sql_transaction_program')
-  expectVersion(map, 2n, 'sql_transaction_program')
-  const program: SqlTransactionProgram = {
-    version: 2,
-    steps: expectArray(required(map, 1, 'sql_transaction_program.steps'), 'sql_transaction_program.steps')
-      .map((step, index) => stepFromCbor(step, `sql_transaction_program.steps[${index}]`)),
-  }
-  assertValidSqlTransactionProgram(program)
-  return program
+export function changeProgramFromCanonicalCbor(value: CborValue): ChangeProgram {
+  const map = expectMap(value, 'change_program')
+  assertKnownIntegerKeys(map, [0, 1], 'change_program')
+  expectVersion(map, 3n, 'change_program')
+  const result: ChangeProgram = { version: 3, steps: expectArray(required(map, 1, 'change_program.steps'), 'change_program.steps')
+    .map((step, index) => stepFromCbor(step, `change_program.steps[${index}]`)) }
+  assertValidChangeProgram(result)
+  return result
 }
-
-export function encodeSqlTransactionProgram(value: SqlTransactionProgram): Uint8Array {
-  return encodeCanonicalCbor(sqlTransactionProgramToCanonicalCbor(value))
-}
-
-export function decodeSqlTransactionProgram(bytes: Uint8Array): SqlTransactionProgram {
-  return sqlTransactionProgramFromCanonicalCbor(assertCanonicalCbor(bytes))
-}
+export function encodeChangeProgram(value: ChangeProgram): Uint8Array { return encodeCanonicalCbor(changeProgramToCanonicalCbor(value)) }
+export function decodeChangeProgram(bytes: Uint8Array): ChangeProgram { return changeProgramFromCanonicalCbor(assertCanonicalCbor(bytes)) }

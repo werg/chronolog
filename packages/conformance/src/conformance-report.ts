@@ -232,6 +232,7 @@ async function transaction(
   executionManifestDigest: Uint8Array,
 ): Promise<AdmittedTransaction> {
   const core: TransactionCore = {
+    operationId: id,
     groupId: bytes32(1),
     membershipRevision: bytes32(2),
     validationPolicy: bytes32(3),
@@ -239,7 +240,7 @@ async function transaction(
     authorTimestampMs: timestamp,
     nonce: bytes32(Number(timestamp) + 10),
     executionManifestDigest,
-    program: { version: 2, steps },
+    program: { version: 3, steps },
   }
   const canonicalCandidate = encodeTransactionCore(core)
   return {

@@ -67,7 +67,7 @@ describe('live native governed peer', () => {
     await expect(root.runtime.governance.publishCapabilityChange({ validationPolicies: [{ version: 2n, minimumValidators: 0n }] }, root.identity.privateKey))
       .rejects.toThrow('GOVERNANCE_FIXED_VALIDATION_POLICY')
     expect((await root.transport.history()).length).toBe(initialRecords)
-    const original = await root.runtime.node.publish({ operationId: 'schema', program: { version: 2, steps: [
+    const original = await root.runtime.node.publish({ operationId: 'schema', program: { version: 3, steps: [
       sqlStatement('CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)'),
       sqlStatement("INSERT INTO messages (id, body) VALUES (0, 'historical')"),
     ] } })
@@ -99,7 +99,7 @@ describe('live native governed peer', () => {
     expect(newcomer.runtime.node.candidateCore(original.txId)?.writerCapability).toBeDefined()
 
     now = 3_000
-    const authored = await newcomer.runtime.node.publish({ operationId: 'insert-own-row', program: { version: 2,
+    const authored = await newcomer.runtime.node.publish({ operationId: 'insert-own-row', program: { version: 3,
       steps: [sqlStatement("INSERT INTO messages (id, body) VALUES (1, 'new device')")] } })
     await settle(root.runtime, authored.txId)
     await settle(newcomer.runtime, authored.txId)
@@ -113,9 +113,9 @@ describe('live native governed peer', () => {
     })
     await eventually(async () => { await root.runtime.node.waitForIdle(); return root.runtime.node.isFinal(authored.txId) })
     expect(await newcomer.runtime.node.isWritable()).toBe(false)
-    expect(await newcomer.runtime.node.publish({ operationId: 'insert-own-row', program: { version: 2,
+    expect(await newcomer.runtime.node.publish({ operationId: 'insert-own-row', program: { version: 3,
       steps: [sqlStatement("INSERT INTO messages (id, body) VALUES (1, 'new device')")] } })).toEqual(authored)
-    await expect(newcomer.runtime.node.publish({ operationId: 'after-revoke', program: { version: 2,
+    await expect(newcomer.runtime.node.publish({ operationId: 'after-revoke', program: { version: 3,
       steps: [sqlStatement("INSERT INTO messages (id, body) VALUES (2, 'forbidden')")] } })).rejects.toThrow('WRITER_UNAUTHORIZED')
     expect(root.runtime.peerGovernance!.isRevisionClosed(oldRevision)).toBe(true)
     expect(root.runtime.node.localSql('SELECT body FROM messages ORDER BY id', [], { view: 'final' }).rows)

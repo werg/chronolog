@@ -70,6 +70,14 @@ export class DurableOperationJournal {
     })
   }
 
+  async lookup(operationId: string): Promise<Uint8Array | null> {
+    validateOperationId(operationId)
+    const completed = await this.#completed(operationId)
+    if (completed !== null) return completed.payload.slice()
+    const pending = await this.#pending()
+    return pending?.id === operationId ? pending.payload.slice() : null
+  }
+
   async #finish(prepared: PreparedOperation, apply: (payload: Uint8Array) => Promise<void>): Promise<void> {
     const completed = await this.#completed(prepared.id)
     if (completed !== null) {

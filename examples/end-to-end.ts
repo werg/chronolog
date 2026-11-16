@@ -17,10 +17,10 @@ import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
 import {
   equalBytes,
   generateEd25519KeyPair,
-  sqlProgram,
+  program,
   sqlStatement,
   type Ed25519KeyPair,
-  type SqlTransactionProgram,
+  type ChangeProgram,
 } from '@chronolog/protocol'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
@@ -56,13 +56,13 @@ try {
     equalBytes((await client.query('SELECT p.key FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner WHERE a.id = 1')).result.rows[0]![0] as Uint8Array, alice.publicKeyBytes))
 
   // Bob may write, but not Alice's row.
-  const theft = await bobNode.node.publish({ authorTimestampMs: 2n, program: sqlProgram('UPDATE accounts SET balance = 0 WHERE id = 1') })
+  const theft = await bobNode.node.publish({ authorTimestampMs: 2n, program: program('UPDATE accounts SET balance = 0 WHERE id = 1') })
   console.log('Bob updating Alice\'s row:', await settled(aliceNode.node, theft))
 
   // Alice grants Bob updates of the balance column of that one row.
   await settled(aliceNode.node, await aliceNode.node.publish({
     authorTimestampMs: 3n,
-    program: sqlProgram(platformOp.grant({ table: 'accounts', grantee: bob.publicKeyBytes, operations: ['update'], rowKey: [1n], columns: ['balance'] })),
+    program: program(platformOp.grant({ table: 'accounts', grantee: bob.publicKeyBytes, operations: ['update'], rowKey: [1n], columns: ['balance'] })),
   }), 'accepted')
   const granted = await bobNode.node.publish({ authorTimestampMs: 10n, program: updateProgram(100n, 95n) })
   console.log('Bob updating the balance with a grant:', await settled(aliceNode.node, granted))
@@ -104,16 +104,16 @@ async function startNode(name: string, identity: Ed25519KeyPair, validator: bool
   return { node, materializer }
 }
 
-function bootstrapProgram(): SqlTransactionProgram {
-  return sqlProgram(
+function bootstrapProgram(): ChangeProgram {
+  return program(
     sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
     sqlStatement('INSERT INTO accounts (id, balance) VALUES (?, ?)', [1n, 100n]),
   )
 }
 
 /** Sets the balance only if it still equals `expected` at the transaction's position. */
-function updateProgram(expected: bigint, next: bigint): SqlTransactionProgram {
-  return sqlProgram(
+function updateProgram(expected: bigint, next: bigint): ChangeProgram {
+  return program(
     sqlStatement("SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = ?) = ?, 'balance_changed')", [1n, expected]),
     sqlStatement('UPDATE accounts SET balance = ? WHERE id = ?', [next, 1n]),
   )

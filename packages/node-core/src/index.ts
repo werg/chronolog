@@ -15,3 +15,5 @@ export * from './governance-activation.js'
 export * from './peer-governance.js'
 export * from './governed-node.js'
 export * from './wire.js'
+
+export * from './events.js'

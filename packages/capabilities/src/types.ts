@@ -10,6 +10,14 @@ export interface CapabilityGrant {
   /** Authenticated outer replication feed authorized for this capability. */
   readonly transportAuthor?: string
   readonly role: CapabilityRole
+  /** SQL and event/signal publication are distinct rights on a writer grant. */
+  readonly program?: {
+    readonly sql: boolean
+    readonly topics: readonly string[]
+    readonly signals: readonly string[]
+    /** Permit this original signer to submit through another enrolled feed. */
+    readonly forwarded?: boolean
+  }
   readonly validFromRevision: bigint
   readonly minimumAuthorTimestampMs?: bigint
   readonly hpkePublicKey?: Uint8Array

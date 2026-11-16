@@ -70,9 +70,10 @@ export async function admitted(
   author: Uint8Array = ROOT_KEY,
 ): Promise<AdmittedTransaction> {
   const core: TransactionCore = {
+    operationId: id,
     groupId: testKey(1), membershipRevision: testKey(2), validationPolicy: testKey(3), authorId: author,
     authorTimestampMs: timestamp, nonce: testKey(Number(timestamp % 200n) + 10), executionManifestDigest,
-    program: { version: 2, steps: steps.map((step) => typeof step === 'string' ? sqlStatement(step) : step) },
+    program: { version: 3, steps: steps.map((step) => typeof step === 'string' ? sqlStatement(step) : step) },
   }
   const canonicalCandidate = encodeTransactionCore(core)
   return {

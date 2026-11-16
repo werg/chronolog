@@ -7,7 +7,7 @@ import type {
 import type {
   Ed25519KeyPair,
   SqlStatement,
-  SqlTransactionProgram,
+  ChangeProgram,
   TransactionCore,
 } from '@chronolog/protocol'
 import type { ChronologTransport, TransportStatus } from '@chronolog/records'
@@ -36,6 +36,7 @@ export interface EnvelopeCipherResolver {
 }
 
 export interface CandidateAdmissionContext {
+  readonly program?: ChangeProgram
   readonly writerCapability?: Uint8Array
   readonly authorTimestampMs?: bigint
   readonly canonicalPosition?: bigint
@@ -148,7 +149,7 @@ export interface ChronologNodeOptions {
 export interface PublishTransactionInput {
   readonly operationId?: string
   readonly writerCapability?: Uint8Array
-  readonly program: SqlTransactionProgram
+  readonly program: ChangeProgram
   readonly authorTimestampMs?: bigint
   readonly nonce?: Uint8Array
   readonly metadata?: ReadonlyMap<string, Uint8Array>
