@@ -108,11 +108,18 @@ export function decodeLedgerRecord(recordBytes: Uint8Array): LedgerRecord {
 /** Verify detached bytes before parsing any application contents or decrypting. */
 export async function verifyLedgerPayload(record: LedgerRecord, payloadBytes: Uint8Array): Promise<Uint8Array> {
   const expected = ownRecord(record)
-  if (!(payloadBytes instanceof Uint8Array) || payloadBytes.length !== expected.payloadLength) {
+  if (!(payloadBytes instanceof Uint8Array) || payloadBytes.length < 1 || payloadBytes.length > MAX_LEDGER_PAYLOAD_BYTES) {
     throw new LedgerRecordError('LEDGER_PAYLOAD_LENGTH_INVALID')
   }
   const payload = ownBytes(payloadBytes, 'LEDGER_RECORD_INVALID')
-  if (bytesToHex(await sha256(payload)) !== expected.payloadHash) throw new LedgerRecordError('LEDGER_PAYLOAD_DIGEST_MISMATCH')
+  if (bytesToHex(await sha256(payload)) !== expected.payloadHash) {
+    throw new LedgerRecordError(payload.length === expected.payloadLength ? 'LEDGER_PAYLOAD_DIGEST_MISMATCH' : 'LEDGER_PAYLOAD_LENGTH_INVALID')
+  }
+  // Only the exact hash-committed body can prove the descriptor inconsistent.
+  // A truncated or corrupt provider reply cannot invalidate a ledger position.
+  if (payload.length !== expected.payloadLength) {
+    throw new LedgerRecordError('LEDGER_PAYLOAD_METADATA_MISMATCH', 'committed payload length contradicts descriptor')
+  }
   verifyMetadata(expected, payload)
   return payload
 }

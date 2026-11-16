@@ -42,7 +42,7 @@ import { ChangeSignal, type TransportRecord } from '@chronolog/records'
 import { readEffectiveEvents, type EventBatch, type EventReadOptions, type EventHistorySnapshot, type EventHistoryItem } from './events.js'
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { decodeOrderingEvidence, encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
-import { decodeLedgerRecord, resolveLedgerPayload, type LedgerRecord } from './ledger-record.js'
+import { decodeLedgerRecord, LedgerRecordError, verifyLedgerPayload, type LedgerRecord } from './ledger-record.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import type {
@@ -687,7 +687,18 @@ export class ChronologNode {
       if (ledger.kind === 'candidate') {
         // The certified descriptor selects the type. A missing body blocks
         // application progress; it cannot hide governance or become a rejection.
-        const payload = await resolveLedgerPayload(ledger, (hash) => this.#options.transport.getPayload(hash))
+        const detached = await this.#options.transport.getPayload(ledger.payloadHash)
+        if (detached === null) throw new LedgerRecordError('LEDGER_PAYLOAD_UNAVAILABLE', ledger.payloadHash)
+        let payload: Uint8Array
+        try { payload = await verifyLedgerPayload(ledger, detached) }
+        catch (error) {
+          // Metadata is checked only after matching the committed body hash.
+          // That contradiction is permanent; a missing or corrupt peer reply
+          // remains retryable and cannot make us skip a valid position.
+          if (!(error instanceof LedgerRecordError) || error.code !== 'LEDGER_PAYLOAD_METADATA_MISMATCH') throw error
+          this.#coordinatedProcessed = entry.position
+          continue
+        }
         const record: TransportRecord = {
           id: `ordered:${entry.historyId}:${entry.position}`, author: '', sequence: 0n,
           receivedAtMs: 0, payload,

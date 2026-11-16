@@ -1,7 +1,7 @@
 import { encodeGenesisManifest, signGenesis, type GenesisManifest } from '@chronolog/capabilities'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import {
-  DOMAINS, bytesToHex, decodeEnvelope, digestExecutionManifest, emit, encodeCanonicalCbor,
+  DOMAINS, assertCanonicalCbor, bytesToHex, decodeEnvelope, digestExecutionManifest, emit, encodeCanonicalCbor,
   encodeTransactionCore, generateEd25519KeyPair, hashDomain, program, transactionDigest, utf8,
 } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner,
@@ -20,7 +20,11 @@ class ControlledTransport extends PortableFeedTransport {
   blockCandidates = false
   loseNextCandidateReply = false
   lastPreparedEnvelope: Uint8Array | null = null
-  constructor(options: ConstructorParameters<typeof PortableFeedTransport>[0], readonly log: ReferenceRecordLog) { super(options) }
+  constructor(options: ConstructorParameters<typeof PortableFeedTransport>[0], readonly log: ReferenceRecordLog,
+    readonly detached = new Map<string, Uint8Array | null>()) { super(options) }
+  override getPayload(hash: string): Promise<Uint8Array | null> {
+    return this.detached.has(hash) ? Promise.resolve(this.detached.get(hash)?.slice() ?? null) : super.getPayload(hash)
+  }
   override async publish(payload: Uint8Array, options?: PublishOptions): Promise<TransportRecord> {
     const candidate = decodeEnvelope(payload).messageType === 'candidate'
     if (candidate) {
@@ -43,6 +47,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 
 async function fixture() {
   const store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'epoch-writer')
+  const detached = new Map<string, Uint8Array | null>()
   const authorityIdentity = await generateEd25519KeyPair(), historyId = 'h_0123456789abcdef0123456789abcdef'
   const groupId = new Uint8Array(32).fill(51), groupRoute = new Uint8Array(32).fill(52)
   const executionManifestDigest = await digestExecutionManifest(await eventExecutionManifest())
@@ -66,7 +71,7 @@ async function fixture() {
   const authority = createPrefixAuthority({ configuration, identity: authorityIdentity, readHead: () => log.head() })
   const open = async () => {
     const transport = new ControlledTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
-      signer: webFeedSigner(transportAuthor, identity.signing.privateKey) }, log)
+      signer: webFeedSigner(transportAuthor, identity.signing.privateKey) }, log, detached)
     const governed = await createGovernedNode({ genesis, groupRoute, identity: identity.signing, transport, operationStore: store,
       materialization: await createEventMaterializationRuntime({ store, namespace: 'canonical-epoch-events' }),
       recipient: { id: identity.signing.publicKeyBytes, privateKey: identity.reader.privateKey } })
@@ -79,10 +84,45 @@ async function fixture() {
     await peer.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: await authority.certify() })
     await peer.node.waitForIdle()
   }
-  return { identity, groupRoute, log, open, certify }
+  return { identity, groupRoute, log, open, certify, detached }
 }
 
 describe('canonical encryption epoch acceptance fence', () => {
+  it.each(['epoch', 'length'] as const)('waits for authentic detached bytes, then skips a contradictory committed %s across restart', async (field) => {
+    const f = await fixture(), peer = await f.open()
+    const first = await peer.node.publish({ operationId: 'metadata-before', program: program(emit('chat', 'before')) })
+    const core = { ...first.core, operationId: 'contradictory-metadata', nonce: new Uint8Array(32).fill(151),
+      program: program(emit('chat', 'must not execute')) }
+    const canonical = encodeTransactionCore(core), proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
+    const envelope = await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing, peer.governance.cipherRing)
+    const prepared = await createLedgerRecord(envelope)
+    const descriptor = assertCanonicalCbor(prepared.recordBytes)
+    if (!Array.isArray(descriptor)) throw new Error('wrong test descriptor')
+    if (field === 'epoch') descriptor[4] = encodeCanonicalCbor(999n)
+    else descriptor[6] = BigInt(envelope.length + 1)
+    await f.log.append(encodeCanonicalCbor(descriptor))
+    f.detached.set(prepared.record.payloadHash, null)
+    const following = await peer.node.publish({ operationId: 'metadata-after', program: program(emit('chat', 'after')) })
+    await expect(f.certify(peer)).rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
+    expect(peer.node.isFinal(following.txId)).toBe(false)
+    const corrupt = envelope.slice(); corrupt[corrupt.length - 1]! ^= 1
+    f.detached.set(prepared.record.payloadHash, corrupt)
+    await expect(f.certify(peer)).rejects.toThrow(field === 'epoch' ? 'LEDGER_PAYLOAD_DIGEST_MISMATCH' : 'LEDGER_PAYLOAD_LENGTH_INVALID')
+    expect(peer.node.isFinal(following.txId)).toBe(false)
+    f.detached.set(prepared.record.payloadHash, envelope)
+    await f.certify(peer)
+    expect(peer.node.outcome(proposalId)).toBeNull()
+    expect(peer.node.outcome(following.txId)?.outcome).toBe('accepted')
+    expect(peer.node.isFinal(following.txId)).toBe(true)
+    expect((await peer.node.events.read()).transactions.map(transaction => transaction.proposalId)).toEqual([first.txIdText, following.txIdText])
+    await peer.close()
+    const reopened = await f.open()
+    await f.certify(reopened)
+    expect(reopened.node.outcome(proposalId)).toBeNull()
+    expect((await reopened.node.events.read()).transactions.map(transaction => transaction.proposalId)).toEqual([first.txIdText, following.txIdText])
+    expect((await reopened.node.status()).lastError).toBeUndefined()
+  })
+
   it('rejects a foreign execution profile at its certified position and continues across restart', async () => {
     const f = await fixture(), peer = await f.open()
     const first = await peer.node.publish({ operationId: 'profile-before', program: program(emit('chat', 'before')) })
