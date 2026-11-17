@@ -1,8 +1,8 @@
 import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { encodeCanonicalCbor } from '@chronolog/protocol'
 
-import { encodeHistoryConfiguration, encodeOrderingEvidence, verifyOrderedEntry,
-  type CoordinatedHistoryConfiguration, type OrderedRecordEntry } from './history-policy.js'
+import { encodeHistoryConfiguration, encodeFinalityEvidence, verifyOrderedEntry,
+  type HistoryConfiguration, type OrderedRecordEntry } from './history-policy.js'
 import { decodeLedgerRecord } from './ledger-record.js'
 
 /** A cumulative commitment to all finalized control descriptors, in receipt order. */
@@ -16,11 +16,11 @@ export interface FinalizedControl {
   readonly previousRoot: string
   readonly root: string
   readonly entry: OrderedRecordEntry
-  /** The first closure covering this receipt. Later checkpoints cannot rewrite it. */
-  readonly cutoffMs: bigint
+  /** The batch that finalized this control; it takes effect in the following batch. */
+  readonly batchNumber: number
 }
 
-export async function controlGenesisRoot(configuration: CoordinatedHistoryConfiguration): Promise<string> {
+export async function controlGenesisRoot(configuration: HistoryConfiguration): Promise<string> {
   return bytesToHex(await sha256(encodeCanonicalCbor([
     'chronolog/control-projection/v1', encodeHistoryConfiguration(configuration),
   ])))
@@ -31,25 +31,25 @@ export function isControlRecord(bytes: Uint8Array): boolean {
   try { return decodeLedgerRecord(bytes).kind !== 'candidate' } catch { return false }
 }
 
-export async function appendControl(previous: ControlCommitment, entry: OrderedRecordEntry, cutoffMs: bigint): Promise<FinalizedControl> {
+export async function appendControl(previous: ControlCommitment, entry: OrderedRecordEntry, batchNumber: number): Promise<FinalizedControl> {
   if (!Number.isSafeInteger(previous.count) || previous.count < 0 || previous.count >= Number.MAX_SAFE_INTEGER ||
-      !/^[0-9a-f]{64}$/u.test(previous.root) || cutoffMs < 0n || cutoffMs > (1n << 63n) - 1n || !isControlRecord(entry.bytes)) {
+      !/^[0-9a-f]{64}$/u.test(previous.root) || !Number.isSafeInteger(batchNumber) || batchNumber < 1 || !isControlRecord(entry.bytes)) {
     throw new Error('CONTROL_PROJECTION_INVALID')
   }
   entry = structuredClone(entry)
   const index = previous.count + 1
   const root = bytesToHex(await sha256(encodeCanonicalCbor([
     'chronolog/control-entry/v1', BigInt(index), previous.root,
-    encodeOrderingEvidence({ kind: 'ordered-entry', entry }), cutoffMs,
+    encodeFinalityEvidence({ kind: 'record', entry }), BigInt(batchNumber),
   ])))
-  return { index, previousRoot: previous.root, root, entry, cutoffMs }
+  return { index, previousRoot: previous.root, root, entry, batchNumber }
 }
 
-export async function verifyControl(control: FinalizedControl, configuration: CoordinatedHistoryConfiguration): Promise<void> {
+export async function verifyControl(control: FinalizedControl, configuration: HistoryConfiguration): Promise<void> {
   if (control.entry.historyId !== configuration.historyId || !Number.isSafeInteger(control.index) || control.index < 1) {
     throw new Error('CONTROL_PROJECTION_INVALID')
   }
   await verifyOrderedEntry(control.entry)
-  const expected = await appendControl({ count: control.index - 1, root: control.previousRoot }, control.entry, control.cutoffMs)
+  const expected = await appendControl({ count: control.index - 1, root: control.previousRoot }, control.entry, control.batchNumber)
   if (expected.root !== control.root) throw new Error('CONTROL_PROJECTION_ROOT_MISMATCH')
 }

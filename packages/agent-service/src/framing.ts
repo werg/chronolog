@@ -1,7 +1,13 @@
-export interface FramedPeerConnection {
-  send(frame: Uint8Array): Promise<void>
+/** A bounded connection-owned lane. Sending is local dispatch, not delivery. */
+export interface PeerFrameLane {
+  send(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
   frames(signal?: AbortSignal): AsyncIterable<Uint8Array>
   close(): Promise<void>
+}
+
+export interface FramedPeerConnection extends PeerFrameLane {
+  /** Independent disposable traffic; never multiplex it into reliable history. */
+  readonly live?: PeerFrameLane
 }
 
 /**
@@ -28,7 +34,7 @@ export function framePeerStream(options: {
     await Promise.allSettled([reader.cancel(), writer.abort(new Error('PEER_CONNECTION_CLOSED'))])
   }
   return {
-    send(input) {
+    send(input, sendOptions = {}) {
       if (closed) return Promise.reject(new Error('PEER_CONNECTION_CLOSED'))
       if (!(input instanceof Uint8Array) || input.length < 1 || input.length > maximum) return Promise.reject(new Error('PEER_FRAME_TOO_LARGE'))
       if (pending >= maxPending) return Promise.reject(new Error('PEER_FRAME_BACKPRESSURE'))
@@ -37,8 +43,10 @@ export function framePeerStream(options: {
       frame.set(input, 4)
       pending += 1
       const task = tail.then(async () => {
+        sendOptions.signal?.throwIfAborted()
         if (closed) throw new Error('PEER_CONNECTION_CLOSED')
         await writer.ready
+        sendOptions.signal?.throwIfAborted()
         await writer.write(frame)
       }).finally(() => { pending -= 1 })
       tail = task.catch(() => undefined)

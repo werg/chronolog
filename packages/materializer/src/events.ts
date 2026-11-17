@@ -112,19 +112,13 @@ export async function createEventMaterializationRuntime(options: {
         return serial(async () => {
           const nextOutcomes = await evaluate(next)
           for (let i = 0; i < finalLength; i++) if (next[i] === undefined || !sameIdentity(order[i]!, next[i]!)) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_CHANGED')
-          // Admission is a growing set. A late proposal may be inserted before
-          // the provisional suffix, but existing proposal identities and their
-          // relative order cannot disappear or be replaced during replay.
-          let previousIndex = 0
+          // A sealed batch can reorder or reject provisional work. Only the
+          // final prefix is immutable; surviving proposals keep their identity.
           const previousById = new Map(order.map(entry => [bytesToHex(entry.txId), entry]))
           for (const entry of next) {
             const previous = previousById.get(bytesToHex(entry.txId))
-            if (previous === undefined) continue
-            if (!sameIdentity(previous, entry)) throw new Error('EVENT_EXECUTION_IDENTITY_CONFLICT')
-            if (order[previousIndex] !== previous) throw new Error('EVENT_EXECUTION_ADMISSION_SET_REMOVAL')
-            previousIndex++
+            if (previous !== undefined && !sameIdentity(previous, entry)) throw new Error('EVENT_EXECUTION_IDENTITY_CONFLICT')
           }
-          if (previousIndex !== order.length) throw new Error('EVENT_EXECUTION_ADMISSION_SET_REMOVAL')
           let difference = 0
           while (difference < order.length && difference < next.length && sameIdentity(order[difference]!, next[difference]!)) difference++
           if (difference === order.length && difference === next.length) return null

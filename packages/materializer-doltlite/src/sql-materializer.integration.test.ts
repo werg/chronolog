@@ -202,6 +202,36 @@ describe('replicated SQL materialization', () => {
     materializer.close()
   })
 
+  it('rebases provisional SQL when a sealed batch changes its order or excludes a proposal', async () => {
+    const { path, manifest } = await fixture()
+    let materializer = await open(path, manifest, 1)
+    const digest = materializer.executionManifestDigest
+    const setup = await transaction(1n, 'setup', [
+      sqlStatement('CREATE TABLE drafts (id INTEGER PRIMARY KEY, value TEXT)'),
+    ], digest)
+    const first = await transaction(2n, 'first', [sqlStatement("INSERT INTO drafts VALUES (1, 'first')")], digest)
+    const second = await transaction(3n, 'second', [sqlStatement("INSERT INTO drafts VALUES (1, 'second')")], digest)
+    await materializer.materialize([setup, first, second])
+    await materializer.publishFinal(1)
+    expect(materializer.outcome(first.txId)?.outcome).toBe('accepted')
+    expect(materializer.outcome(second.txId)?.outcome).toBe('rejected')
+    const captured = materializer.captureRead({ view: 'local' })
+    await materializer.materialize([setup, second, first])
+    expect(materializer.outcome(second.txId)?.outcome).toBe('accepted')
+    expect(materializer.outcome(first.txId)?.outcome).toBe('rejected')
+    expect(captured.query('SELECT value FROM drafts').rows).toEqual([[{ kind: 'text', value: 'first' }]])
+    captured.release()
+    await materializer.materialize([setup, second])
+    expect(materializer.outcome(first.txId)).toBeNull()
+    await materializer.publishFinal(2)
+    materializer.close()
+    materializer = await open(path, manifest, 1)
+    expect(materializer.finalOrderLength).toBe(2)
+    expect(rows(materializer, 'SELECT value FROM drafts')).toEqual([['second']])
+    await expect(materializer.materialize([setup])).rejects.toThrow('FINAL_PREFIX_CHANGED')
+    materializer.close()
+  })
+
   it('reads a real final SQL prefix, keeps tentative work local, and reopens both views', async () => {
     const { path, manifest } = await fixture()
     let materializer = await open(path, manifest, 100)

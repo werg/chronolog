@@ -1,119 +1,80 @@
 import { bytesToHex, sha256 } from '@chronolog/canonical'
-import {
-  assertCanonicalCbor, encodeCanonicalCbor, equalBytes, utf8,
-  type Ed25519KeyPair,
-} from '@chronolog/protocol'
+import { assertCanonicalCbor, encodeCanonicalCbor, equalBytes, utf8 } from '@chronolog/protocol'
 
 import { Mutex } from './async.js'
-import { controlGenesisRoot } from './control-chain.js'
-import { evaluateFinalitySnapshot, type FinalityProvider, type SignedInclusionSnapshot } from './finality.js'
+import { decodeSignedFinalityBatch, encodeSignedFinalityBatch, evaluateFinalitySnapshot, finalityBatchId,
+  finalityGenesisId, verifyFinalityBatch, type FinalityProvider, type SealedBatchSnapshot, type SignedFinalityBatch } from './finality.js'
 import type { DurableOperationStore } from './operations.js'
 
-/** Immutable group/provider binding. Execution always uses chronological order. */
-export type HistoryConfiguration = {
+/** One immutable finality policy: a fixed proposer and every configured validator. */
+export interface HistoryConfiguration {
   readonly groupId: Uint8Array
   readonly genesisDigest: Uint8Array
   readonly executionManifestDigest: Uint8Array
-  readonly providerId?: string
-  /** Opaque bounded parameters authenticated with the selected provider. */
-  readonly providerParameters?: Uint8Array
-} & ({ readonly kind: 'peer' } | {
-  readonly kind: 'coordinated'
   readonly historyId: string
-  readonly authorityPublicKey: Uint8Array
-})
-
-export type CoordinatedHistoryConfiguration = Extract<HistoryConfiguration, { kind: 'coordinated' }>
+  readonly proposerPublicKey: Uint8Array
+  readonly validatorPublicKeys: readonly Uint8Array[]
+}
 
 export interface OrderedRecordEntry {
   readonly historyId: string
-  /** Inclusion receipt position, never an application execution position. */
+  /** Descriptor position identifies inclusion, not execution order within a batch. */
   readonly position: number
   readonly recordId: string
   readonly previousRoot: string
   readonly root: string
   readonly bytes: Uint8Array
 }
-
-export interface OrderedRecordHead {
-  readonly historyId: string
-  readonly position: number
-  readonly root: string
-}
-
-export interface PrefixCertificate extends OrderedRecordHead {
-  readonly configuration: Uint8Array
-  readonly signature: Uint8Array
-}
-
-export type OrderingEvidence =
-  | { readonly kind: 'ordered-entry'; readonly entry: OrderedRecordEntry }
-  | { readonly kind: 'prefix-certificate'; readonly certificate: PrefixCertificate }
-
-export interface CoordinatedProgress {
+export interface OrderedRecordHead { readonly historyId: string; readonly position: number; readonly root: string }
+export type FinalityEvidence =
+  | { readonly kind: 'record'; readonly entry: OrderedRecordEntry }
+  | { readonly kind: 'batch'; readonly batch: SignedFinalityBatch }
+export interface FinalityProgress {
   readonly receivedThrough: number
   readonly verifiedThrough: number
   readonly certifiedThrough: number
-  /** Complete certified receipt prefix; application finality also needs a closure. */
-  readonly finalThrough: number
+  readonly finalizedThrough: number
+  readonly batchNumber: number
   readonly root: string
   readonly missing: readonly number[]
 }
 
 const LOG_DOMAIN = 'record-log/v1'
-const CERTIFICATE_DOMAIN = 'chronolog/prefix-certificate/v1\0'
-/** Local retained-state bounds are independent from the smaller wire decoder. */
 export const MAX_RETAINED_HISTORY_ENTRIES = 65_536
 const MAX_RETAINED_EVIDENCE = MAX_RETAINED_HISTORY_ENTRIES * 2
 const DEFAULT_EVIDENCE_QUOTA_BYTES = 128 * 1024 * 1024
 const MAX_LOCAL_HISTORY_BYTES = 512 * 1024 * 1024
 
-export interface CoordinatedHistoryStorageOptions {
-  readonly quotaBytes?: number
-}
-
 export function encodeHistoryConfiguration(configuration: HistoryConfiguration): Uint8Array {
-  for (const bytes of [configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest]) {
+  for (const bytes of [configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest, configuration.proposerPublicKey]) {
     if (!(bytes instanceof Uint8Array) || bytes.length !== 32) throw new Error('HISTORY_CONFIGURATION_INVALID')
   }
-  const providerId = configuration.providerId ?? (configuration.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v2')
-  if (!/^[a-z][a-z0-9._-]{0,127}$/u.test(providerId)) throw new Error('HISTORY_PROVIDER_ID_INVALID')
-  const parameters = configuration.providerParameters ?? new Uint8Array()
-  if (!(parameters instanceof Uint8Array) || parameters.length > 16_384) throw new Error('HISTORY_PROVIDER_PARAMETERS_INVALID')
-  if (configuration.kind === 'peer') {
-    return encodeCanonicalCbor([2n, 'peer', configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest, providerId, parameters])
-  }
   assertHistoryId(configuration.historyId)
-  if (configuration.authorityPublicKey.length !== 32) throw new Error('HISTORY_AUTHORITY_KEY_INVALID')
-  return encodeCanonicalCbor([
-    2n, 'coordinated', configuration.groupId, configuration.genesisDigest,
-    configuration.executionManifestDigest, configuration.historyId, configuration.authorityPublicKey, providerId, parameters,
-  ])
+  const validators = configuration.validatorPublicKeys
+  if (!Array.isArray(validators) || validators.length < 1 || validators.length > 64) throw new Error('HISTORY_VALIDATORS_INVALID')
+  let previous = ''
+  for (const key of validators) {
+    if (!(key instanceof Uint8Array) || key.length !== 32) throw new Error('HISTORY_VALIDATORS_INVALID')
+    const encoded = bytesToHex(key)
+    if (encoded <= previous) throw new Error('HISTORY_VALIDATORS_INVALID')
+    previous = encoded
+  }
+  if (!validators.some(key => equalBytes(key, configuration.proposerPublicKey))) throw new Error('HISTORY_PROPOSER_NOT_VALIDATOR')
+  return encodeCanonicalCbor([1n, 'chronolog/sealed-history', configuration.groupId, configuration.genesisDigest,
+    configuration.executionManifestDigest, configuration.historyId, configuration.proposerPublicKey, validators])
 }
-
 export async function historyConfigurationDigest(configuration: HistoryConfiguration): Promise<Uint8Array> {
   return sha256(encodeHistoryConfiguration(configuration))
 }
-
-export async function orderedRecordId(bytes: Uint8Array): Promise<string> {
-  return bytesToHex(await sha256(bytes))
-}
-
+export async function orderedRecordId(bytes: Uint8Array): Promise<string> { return bytesToHex(await sha256(bytes)) }
 export async function orderedGenesisRoot(historyId: string): Promise<string> {
   assertHistoryId(historyId)
   return orderedRecordId(utf8(JSON.stringify([LOG_DOMAIN, 'genesis', historyId])))
 }
-
 export async function orderedEntryRoot(entry: Omit<OrderedRecordEntry, 'root' | 'bytes'>): Promise<string> {
-  assertHistoryId(entry.historyId)
-  assertPosition(entry.position, false)
-  assertHash(entry.previousRoot)
-  assertHash(entry.recordId)
-  return orderedRecordId(utf8(JSON.stringify([
-    LOG_DOMAIN, 'entry', entry.historyId, entry.position, entry.previousRoot, entry.recordId,
-  ])))
+  assertHistoryId(entry.historyId); assertPosition(entry.position, false); assertHash(entry.previousRoot); assertHash(entry.recordId)
+  return orderedRecordId(utf8(JSON.stringify([LOG_DOMAIN, 'entry', entry.historyId, entry.position, entry.previousRoot, entry.recordId])))
 }
-
 export async function verifyOrderedEntry(entry: OrderedRecordEntry): Promise<void> {
   if (!(entry.bytes instanceof Uint8Array)) throw new Error('ORDERED_RECORD_BYTES_INVALID')
   if (entry.bytes.byteLength > 1_048_576) throw new Error('ORDERED_RECORD_TOO_LARGE')
@@ -122,333 +83,162 @@ export async function verifyOrderedEntry(entry: OrderedRecordEntry): Promise<voi
   if (await orderedEntryRoot(entry) !== entry.root) throw new Error('ORDERED_RECORD_ROOT_MISMATCH')
 }
 
-function certificatePayload(certificate: Omit<PrefixCertificate, 'signature'>): Uint8Array {
-  assertHistoryId(certificate.historyId)
-  assertPosition(certificate.position, true)
-  assertHash(certificate.root)
-  return encodeCanonicalCbor([
-    CERTIFICATE_DOMAIN, certificate.configuration, certificate.historyId,
-    BigInt(certificate.position), certificate.root,
-  ])
-}
-
-/** Reads its own committed head. Caller-supplied roots are never signing inputs. */
-export function createPrefixAuthority(options: {
-  readonly configuration: CoordinatedHistoryConfiguration
-  readonly identity: Ed25519KeyPair
-  readonly readHead: () => Promise<OrderedRecordHead>
-}): { certify(): Promise<PrefixCertificate> } {
-  const configuration = encodeHistoryConfiguration(options.configuration)
-  if (!equalBytes(options.identity.publicKeyBytes, options.configuration.authorityPublicKey)) {
-    throw new Error('HISTORY_AUTHORITY_KEY_MISMATCH')
-  }
-  const historyId = options.configuration.historyId
-  return {
-    async certify() {
-      const head = await options.readHead()
-      if (head.historyId !== historyId) throw new Error('HISTORY_ID_MISMATCH')
-      const unsigned = { ...head, configuration: configuration.slice() }
-      const signature = new Uint8Array(await crypto.subtle.sign(
-        'Ed25519', options.identity.privateKey, certificatePayload(unsigned).slice().buffer,
-      ))
-      return { ...unsigned, signature }
-    },
-  }
-}
-
-export async function verifyPrefixCertificate(
-  certificate: PrefixCertificate,
-  configuration: CoordinatedHistoryConfiguration,
-): Promise<void> {
-  if (certificate.historyId !== configuration.historyId ||
-      !equalBytes(certificate.configuration, encodeHistoryConfiguration(configuration))) {
-    throw new Error('HISTORY_CERTIFICATE_CONFIGURATION_MISMATCH')
-  }
-  if (certificate.signature.length !== 64) throw new Error('HISTORY_CERTIFICATE_SIGNATURE_INVALID')
-  const key = await crypto.subtle.importKey('raw', configuration.authorityPublicKey.slice().buffer, 'Ed25519', false, ['verify'])
-  if (!await crypto.subtle.verify('Ed25519', key, certificate.signature.slice().buffer, certificatePayload(certificate).slice().buffer)) {
-    throw new Error('HISTORY_CERTIFICATE_SIGNATURE_INVALID')
-  }
-}
-
-/** Evidence is immutable data; it is independent of a relay's author/feed. */
-export function encodeOrderingEvidence(evidence: OrderingEvidence): Uint8Array {
-  if (evidence.kind === 'ordered-entry') {
+export function encodeFinalityEvidence(evidence: FinalityEvidence): Uint8Array {
+  if (evidence.kind === 'record') {
     const e = evidence.entry
-    return encodeCanonicalCbor([1n, 'ordered-entry', e.historyId, BigInt(e.position), e.recordId, e.previousRoot, e.root, e.bytes])
+    return encodeCanonicalCbor([1n, 'record', e.historyId, BigInt(e.position), e.recordId, e.previousRoot, e.root, e.bytes])
   }
-  const c = evidence.certificate
-  return encodeCanonicalCbor([1n, 'prefix-certificate', c.configuration, c.historyId, BigInt(c.position), c.root, c.signature])
+  return encodeCanonicalCbor([1n, 'batch', encodeSignedFinalityBatch(evidence.batch)])
 }
-
-export function decodeOrderingEvidence(bytes: Uint8Array): OrderingEvidence {
+export function decodeFinalityEvidence(bytes: Uint8Array): FinalityEvidence {
   const value = assertCanonicalCbor(bytes)
-  if (!Array.isArray(value) || value[0] !== 1n) throw new Error('ORDERING_EVIDENCE_INVALID')
-  if (value[1] === 'ordered-entry' && value.length === 8 && typeof value[2] === 'string' &&
-      typeof value[3] === 'bigint' && typeof value[4] === 'string' && typeof value[5] === 'string' &&
-      typeof value[6] === 'string' && value[7] instanceof Uint8Array) {
+  if (!Array.isArray(value) || value[0] !== 1n) throw new Error('FINALITY_EVIDENCE_INVALID')
+  if (value[1] === 'record' && value.length === 8 && typeof value[2] === 'string' && typeof value[3] === 'bigint' &&
+      typeof value[4] === 'string' && typeof value[5] === 'string' && typeof value[6] === 'string' && value[7] instanceof Uint8Array) {
     const position = Number(value[3]); assertPosition(position, false)
-    if (BigInt(position) !== value[3]) throw new Error('ORDERING_EVIDENCE_INVALID')
-    return { kind: 'ordered-entry', entry: {
-      historyId: value[2], position, recordId: value[4], previousRoot: value[5], root: value[6], bytes: value[7],
-    } }
+    if (BigInt(position) !== value[3]) throw new Error('FINALITY_EVIDENCE_INVALID')
+    return { kind: 'record', entry: { historyId: value[2], position, recordId: value[4], previousRoot: value[5], root: value[6], bytes: value[7] } }
   }
-  if (value[1] === 'prefix-certificate' && value.length === 7 && value[2] instanceof Uint8Array &&
-      typeof value[3] === 'string' && typeof value[4] === 'bigint' && typeof value[5] === 'string' &&
-      value[6] instanceof Uint8Array) {
-    const position = Number(value[4]); assertPosition(position, true)
-    if (BigInt(position) !== value[4]) throw new Error('ORDERING_EVIDENCE_INVALID')
-    return { kind: 'prefix-certificate', certificate: {
-      configuration: value[2], historyId: value[3], position, root: value[5], signature: value[6],
-    } }
+  if (value[1] === 'batch' && value.length === 3 && value[2] instanceof Uint8Array) {
+    return { kind: 'batch', batch: decodeSignedFinalityBatch(value[2]) }
   }
-  throw new Error('ORDERING_EVIDENCE_INVALID')
+  throw new Error('FINALITY_EVIDENCE_INVALID')
 }
 
-/**
- * Shared durable control storage retains the exact entry mapping and portable
- * certificates. Receipt order enumerates inclusion evidence only. Application
- * finality additionally requires the independently signed closure markers.
- */
-export class CoordinatedHistoryPolicy implements FinalityProvider {
-  readonly #configuration: CoordinatedHistoryConfiguration
+/** Untrusted descriptor alternatives become canonical only through a complete signed batch chain. */
+export class SealedBatchFinalityProvider implements FinalityProvider {
+  readonly #configuration: HistoryConfiguration
   readonly #store: DurableOperationStore
   readonly #key: string
   readonly #quotaBytes: number
   readonly #mutex = new Mutex()
-  // Entry roots authenticate bytes, not the authority's choice of position.
-  // Retain competing untrusted alternatives until a certificate selects one.
   #entries = new Map<number, Map<string, OrderedRecordEntry>>()
   #selectedEntries = new Map<number, OrderedRecordEntry>()
-  #certificates = new Map<number, PrefixCertificate>()
-  #progress: CoordinatedProgress
-  #finality: SignedInclusionSnapshot
+  #batches = new Map<number, SignedFinalityBatch>()
+  #progress: FinalityProgress
+  #finality: SealedBatchSnapshot
+  #uncertain = false
 
-  private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, root: string, quotaBytes: number) {
-    this.#configuration = structuredClone(configuration)
-    this.#store = store
-    this.#key = `history/${bytesToHex(configuration.groupId)}/coordinated`
-    this.#quotaBytes = quotaBytes
-    this.#progress = { receivedThrough: 0, verifiedThrough: 0, certifiedThrough: 0, finalThrough: 0, root, missing: [] }
-    this.#finality = { checkpointId: root, receivedThrough: 0, includedThrough: 0,
-      closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [], control: { count: 0, root: '' }, controls: [] }
+  private constructor(configuration: HistoryConfiguration, store: DurableOperationStore, snapshot: SealedBatchSnapshot, quotaBytes: number) {
+    this.#configuration = structuredClone(configuration); this.#store = store
+    this.#key = `history/${bytesToHex(configuration.groupId)}/sealed-batches`
+    this.#quotaBytes = quotaBytes; this.#finality = snapshot
+    this.#progress = { receivedThrough: 0, verifiedThrough: 0, certifiedThrough: 0, finalizedThrough: 0, batchNumber: 0, root: '', missing: [] }
   }
-
-  static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore,
-    options: CoordinatedHistoryStorageOptions = {}): Promise<CoordinatedHistoryPolicy> {
-    encodeHistoryConfiguration(configuration)
+  static async open(configuration: HistoryConfiguration, store: DurableOperationStore,
+    options: { readonly quotaBytes?: number } = {}): Promise<SealedBatchFinalityProvider> {
+    configuration = structuredClone(configuration); encodeHistoryConfiguration(configuration)
     const quotaBytes = options.quotaBytes ?? DEFAULT_EVIDENCE_QUOTA_BYTES
     if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1024 || quotaBytes > MAX_LOCAL_HISTORY_BYTES) throw new Error('HISTORY_STORAGE_QUOTA_INVALID')
-    const policy = new CoordinatedHistoryPolicy(configuration, store, await orderedGenesisRoot(configuration.historyId), quotaBytes)
-    policy.#finality = { ...policy.#finality, control: { count: 0, root: await controlGenesisRoot(configuration) } }
+    const policy = new SealedBatchFinalityProvider(configuration, store, await evaluateFinalitySnapshot(configuration, []), quotaBytes)
+    policy.#progress = { ...policy.#progress, root: await orderedGenesisRoot(configuration.historyId) }
     const saved = await store.get(policy.#key)
     if (saved !== null) {
       if (saved.length > quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
-      const decoded = decodeRetainedHistory(saved, quotaBytes, MAX_RETAINED_EVIDENCE)
-      if (!Array.isArray(decoded) || decoded.length !== 3 || decoded[0] !== 1n ||
-          !(decoded[1] instanceof Uint8Array) || !equalBytes(decoded[1], encodeHistoryConfiguration(configuration)) ||
-          !Array.isArray(decoded[2])) throw new Error('HISTORY_STORED_CONFIGURATION_MISMATCH')
+      const decoded = decodeRetainedHistory(saved, quotaBytes, MAX_RETAINED_EVIDENCE + 8)
+      if (!Array.isArray(decoded) || decoded.length !== 3 || decoded[0] !== 1n || !(decoded[1] instanceof Uint8Array) ||
+          !equalBytes(decoded[1], encodeHistoryConfiguration(configuration)) || !Array.isArray(decoded[2])) throw new Error('HISTORY_STORED_CONFIGURATION_MISMATCH')
       for (const bytes of decoded[2]) {
         if (!(bytes instanceof Uint8Array)) throw new Error('HISTORY_STORED_EVIDENCE_INVALID')
-        await policy.#validateAndInsert(decodeOrderingEvidence(bytes), policy.#entries, policy.#certificates)
+        await policy.#validateAndInsert(decodeFinalityEvidence(bytes), policy.#entries, policy.#batches)
       }
-      const evaluated = await policy.#evaluate(policy.#entries, policy.#certificates)
-      policy.#progress = evaluated.progress
-      policy.#selectedEntries = evaluated.selectedEntries
-      policy.#finality = evaluated.finality
-      discardUncommittedAlternatives(policy.#entries, evaluated.selectedEntries)
+      const state = await policy.#evaluate(policy.#entries, policy.#batches)
+      policy.#progress = state.progress; policy.#selectedEntries = state.selected; policy.#finality = state.snapshot
+      for (const [position, entry] of state.selected) policy.#entries.set(position, new Map([[entry.root, entry]]))
     }
     return policy
   }
-
-  get progress(): CoordinatedProgress { return structuredClone(this.#progress) }
-  get configuration(): CoordinatedHistoryConfiguration { return structuredClone(this.#configuration) }
-  get closedThroughMs(): bigint { return this.#finality.closedThroughMs }
-  get closedReceiptThrough(): number { return this.#finality.closedReceiptThrough }
-
-  snapshot(): SignedInclusionSnapshot { return structuredClone(this.#finality) }
-
-  async ingestEvidence(bytes: Uint8Array): Promise<CoordinatedProgress> {
-    let evidence: OrderingEvidence
-    try { evidence = decodeOrderingEvidence(bytes.slice()) }
-    catch { throw new Error('ORDERING_EVIDENCE_INVALID') }
-    return this.ingest(evidence)
+  get configuration(): HistoryConfiguration { return structuredClone(this.#configuration) }
+  get progress(): FinalityProgress { return structuredClone(this.#progress) }
+  snapshot(): SealedBatchSnapshot { return structuredClone(this.#finality) }
+  evidenceBytes(): readonly Uint8Array[] { return this.evidence().map(encodeFinalityEvidence) }
+  evidence(): readonly FinalityEvidence[] {
+    return [...allEntries(this.#entries).sort((a,b) => a.position-b.position || a.root.localeCompare(b.root))
+      .map((entry): FinalityEvidence => ({ kind: 'record', entry: structuredClone(entry) })),
+    ...[...this.#batches.values()].sort((a,b) => a.number-b.number).map((batch): FinalityEvidence => ({ kind: 'batch', batch: structuredClone(batch) }))]
   }
-
-  evidenceBytes(): readonly Uint8Array[] { return this.evidence().map(encodeOrderingEvidence) }
-
-  boundaryForEntry(position: number): bigint | null {
-    return this.#finality.records.find(record => record.entry.position === position)?.closureBoundary?.closedThroughMs ?? null
-  }
-
-  admissionFloor(position: number): bigint {
-    const record = this.#finality.records.find(record => record.entry.position === position)
-    if (record === undefined) throw new Error('FINALITY_RECORD_NOT_INCLUDED')
-    return record.admissionFloorMs
-  }
-
-  isClosure(position: number): boolean { return this.#finality.closures.some(closure => closure.position === position) }
-
   entries(through = this.#progress.verifiedThrough): readonly OrderedRecordEntry[] {
     assertPosition(through, true)
     if (through > this.#progress.verifiedThrough) throw new Error('HISTORY_PREFIX_INCOMPLETE')
-    return Array.from({ length: through }, (_, i) => structuredClone(this.#selectedEntries.get(i + 1)!))
+    return Array.from({ length: through }, (_, index) => structuredClone(this.#selectedEntries.get(index + 1)!))
   }
-
-  evidence(): readonly OrderingEvidence[] {
-    return [
-      ...allEntries(this.#entries).sort((a, b) => a.position - b.position || a.root.localeCompare(b.root)).map((entry): OrderingEvidence => ({ kind: 'ordered-entry', entry: structuredClone(entry) })),
-      ...[...this.#certificates.values()].sort((a, b) => a.position - b.position).map((certificate): OrderingEvidence => ({ kind: 'prefix-certificate', certificate: structuredClone(certificate) })),
-    ]
-  }
-
-  async ingest(evidence: OrderingEvidence): Promise<CoordinatedProgress> {
-    return this.ingestBatch([evidence])
-  }
-
-  /** Atomically retain one bounded page (up to 128 entries plus its certificate). */
-  async ingestBatch(evidence: readonly OrderingEvidence[]): Promise<CoordinatedProgress> {
+  certificates(): readonly SignedFinalityBatch[] { return structuredClone([...this.#batches.values()].sort((a,b) => a.number-b.number)) }
+  ingestEvidence(bytes: Uint8Array): Promise<FinalityProgress> { return this.ingest(decodeFinalityEvidence(bytes.slice())) }
+  ingest(evidence: FinalityEvidence): Promise<FinalityProgress> { return this.ingestBatch([evidence]) }
+  async ingestBatch(evidence: readonly FinalityEvidence[]): Promise<FinalityProgress> {
     if (!Array.isArray(evidence) || evidence.length > 129) throw new Error('HISTORY_EVIDENCE_BATCH_INVALID')
-    const captured: readonly OrderingEvidence[] = structuredClone(evidence)
+    const captured = structuredClone(evidence)
     return this.#mutex.run(async () => {
+      if (this.#uncertain) throw new Error('FINALITY_STORAGE_RECOVERY_REQUIRED')
       const entries = new Map([...this.#entries].map(([position, alternatives]) => [position, new Map(alternatives)]))
-      const certificates = new Map(this.#certificates)
+      const batches = new Map(this.#batches)
       let changed = false
-      for (const item of captured) {
-        const inserted = await this.#validateAndInsert(item, entries, certificates)
-        changed ||= inserted
-      }
-      // Exact retries still pass hash/signature/configuration validation, but
-      // do not rewrite retained history or turn a read into a storage write.
+      for (const item of captured) changed = await this.#validateAndInsert(item, entries, batches) || changed
       if (!changed) return this.progress
-      const { progress, selectedEntries, finality } = await this.#evaluate(entries, certificates)
-      if (progress.finalThrough < this.#progress.finalThrough) throw new Error('HISTORY_FINAL_PREFIX_REGRESSION')
-      discardUncommittedAlternatives(entries, selectedEntries)
-      const all: OrderingEvidence[] = [
-        ...allEntries(entries).map((entry): OrderingEvidence => ({ kind: 'ordered-entry', entry })),
-        ...[...certificates.values()].map((certificate): OrderingEvidence => ({ kind: 'prefix-certificate', certificate })),
-      ]
+      const state = await this.#evaluate(entries, batches)
+      if (state.progress.finalizedThrough < this.#progress.finalizedThrough) throw new Error('HISTORY_FINAL_PREFIX_REGRESSION')
+      for (const [position, entry] of state.selected) entries.set(position, new Map([[entry.root, entry]]))
+      const all: FinalityEvidence[] = [...allEntries(entries).map((entry): FinalityEvidence => ({ kind: 'record', entry })),
+        ...[...batches.values()].map((batch): FinalityEvidence => ({ kind: 'batch', batch }))]
       if (all.length > MAX_RETAINED_EVIDENCE) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
-      const persisted = encodeCanonicalCbor([
-        1n, encodeHistoryConfiguration(this.#configuration), all.map(encodeOrderingEvidence),
-      ])
+      const persisted = encodeCanonicalCbor([1n, encodeHistoryConfiguration(this.#configuration), all.map(encodeFinalityEvidence)])
       if (persisted.length > this.#quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
-      await this.#store.put(this.#key, persisted)
-      this.#entries = entries
-      this.#certificates = certificates
-      this.#selectedEntries = selectedEntries
-      this.#progress = progress
-      this.#finality = finality
+      try { await this.#store.put(this.#key, persisted) } catch (error) { this.#uncertain = true; throw error }
+      this.#entries = entries; this.#batches = batches; this.#selectedEntries = state.selected; this.#progress = state.progress; this.#finality = state.snapshot
       return this.progress
     })
   }
-
-  async #validateAndInsert(evidence: OrderingEvidence, entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<boolean> {
-    if (evidence.kind === 'ordered-entry') {
+  async #validateAndInsert(evidence: FinalityEvidence, entries: Map<number, Map<string, OrderedRecordEntry>>,
+    batches: Map<number, SignedFinalityBatch>): Promise<boolean> {
+    if (evidence.kind === 'record') {
       const entry = evidence.entry
       if (entry.historyId !== this.#configuration.historyId) throw new Error('HISTORY_ID_MISMATCH')
       await verifyOrderedEntry(entry)
       const final = this.#selectedEntries.get(entry.position)
-      if (final !== undefined && final.root !== entry.root) {
-        // A conflicting unauthenticated entry cannot replace a final entry.
-        // Only contradictory signed certificates are authority equivocation.
-        throw new Error('HISTORY_POSITION_CONFLICT')
-      }
+      if (final !== undefined && final.root !== entry.root) throw new Error('HISTORY_POSITION_CONFLICT')
       const alternatives = entries.get(entry.position) ?? new Map<string, OrderedRecordEntry>()
       const previous = alternatives.get(entry.root)
       if (previous !== undefined && !equalBytes(previous.bytes, entry.bytes)) throw new Error('HISTORY_RECORD_HASH_COLLISION')
-      alternatives.set(entry.root, entry)
-      entries.set(entry.position, alternatives)
-      return previous === undefined
-    } else {
-      const certificate = evidence.certificate
-      await verifyPrefixCertificate(certificate, this.#configuration)
-      const previous = certificates.get(certificate.position)
-      if (previous !== undefined && previous.root !== certificate.root) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
-      certificates.set(certificate.position, certificate)
+      alternatives.set(entry.root, entry); entries.set(entry.position, alternatives)
       return previous === undefined
     }
+    await verifyFinalityBatch(evidence.batch, this.#configuration)
+    const previous = batches.get(evidence.batch.number)
+    if (previous !== undefined && await finalityBatchId(previous) !== await finalityBatchId(evidence.batch)) throw new Error('FINALITY_EQUIVOCATION')
+    batches.set(evidence.batch.number, evidence.batch)
+    return previous === undefined
   }
-
-  async #evaluate(entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<{
-    readonly progress: CoordinatedProgress
-    readonly selectedEntries: Map<number, OrderedRecordEntry>
-    readonly finality: SignedInclusionSnapshot
-  }> {
-    const genesisRoot = await orderedGenesisRoot(this.#configuration.historyId)
-    let finalThrough = 0
-    let finalRoot = genesisRoot
-    const selectedEntries = new Map<number, OrderedRecordEntry>()
-    const missing = new Set<number>()
-    const genesisCertificate = certificates.get(0)
-    if (genesisCertificate !== undefined && genesisCertificate.root !== genesisRoot) throw new Error('HISTORY_CERTIFICATE_ROOT_MISMATCH')
-    for (const certificate of [...certificates.values()].sort((a, b) => a.position - b.position)) {
-      if (certificate.position === 0) continue
-      let root = certificate.root
-      let position = certificate.position
+  async #evaluate(entries: Map<number, Map<string, OrderedRecordEntry>>, batches: Map<number, SignedFinalityBatch>) {
+    const selected = new Map<number, OrderedRecordEntry>(), complete: SignedFinalityBatch[] = [], missing = new Set<number>()
+    let through = 0, root = await orderedGenesisRoot(this.#configuration.historyId), parentId = await finalityGenesisId(this.#configuration)
+    for (let number = 1; ; number++) {
+      const batch = batches.get(number)
+      if (!batch) break
+      if (batch.parentId !== parentId || batch.includedHead.position <= through) throw new Error('FINALITY_BATCH_PARENT_MISMATCH')
+      let position = batch.includedHead.position, cursorRoot = batch.includedHead.root
       const path = new Map<number, OrderedRecordEntry>()
-      let complete = true
-      // Work backwards from a signed commitment. A fabricated but internally
-      // consistent entry received first can never select the canonical branch.
-      while (position > finalThrough) {
-        const covered = certificates.get(position)
-        if (covered !== undefined && covered.root !== root) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
-        const entry = entries.get(position)?.get(root)
-        if (entry === undefined) { missing.add(position); complete = false; break }
-        path.set(position, entry)
-        root = entry.previousRoot
-        position -= 1
+      while (position > through) {
+        const entry = entries.get(position)?.get(cursorRoot)
+        if (!entry) { missing.add(position); break }
+        path.set(position, entry); cursorRoot = entry.previousRoot; position--
       }
-      if (!complete) continue
-      if (root !== finalRoot) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
-      for (const [index, entry] of path) selectedEntries.set(index, entry)
-      finalThrough = certificate.position
-      finalRoot = certificate.root
+      if (position !== through) break
+      if (cursorRoot !== root) throw new Error('FINALITY_EQUIVOCATION')
+      for (const [position, entry] of path) selected.set(position, entry)
+      complete.push(batch); through = batch.includedHead.position; root = batch.includedHead.root; parentId = await finalityBatchId(batch)
     }
     const receivedThrough = maximumPosition(entries.keys())
-    const certifiedThrough = maximumPosition(certificates.keys())
-    // This is a bounded diagnostic window. Wrong alternatives at a known gap
-    // remain a gap, even though some bytes for that position were received.
-    const windowEnd = Math.min(certifiedThrough, finalThrough + 1_024)
-    for (let position = finalThrough + 1; position <= windowEnd; position += 1) {
-      if (!entries.has(position)) missing.add(position)
-    }
-    const gaps = [...missing].filter((position) => position > finalThrough).sort((a, b) => a - b).slice(0, 1_024)
-    const finality = finalThrough === this.#finality.includedThrough && finalRoot === this.#finality.checkpointId
-      ? { ...this.#finality, receivedThrough }
-      : await evaluateFinalitySnapshot(this.#configuration,
-        [...selectedEntries.values()].sort((left, right) => left.position - right.position), receivedThrough)
-    return {
-      progress: {
-        receivedThrough, verifiedThrough: finalThrough, certifiedThrough,
-        finalThrough, root: finalRoot, missing: gaps,
-      },
-      selectedEntries,
-      finality,
-    }
+    const certifiedThrough = maximumPosition([...batches.values()].map(batch => batch.includedHead.position))
+    const snapshot = await evaluateFinalitySnapshot(this.#configuration,
+      [...selected.values()].sort((a,b) => a.position-b.position), complete, receivedThrough)
+    return { selected, snapshot, progress: { receivedThrough, verifiedThrough: through, certifiedThrough, finalizedThrough: through,
+      batchNumber: complete.length, root, missing: [...missing].sort((a,b) => a-b).slice(0,1024) } }
   }
 }
-
-/** Preferred name: this provider certifies inclusion and closes author time. */
-export { CoordinatedHistoryPolicy as SignedInclusionFinalityProvider }
-
 function allEntries(entries: ReadonlyMap<number, ReadonlyMap<string, OrderedRecordEntry>>): OrderedRecordEntry[] {
-  const result: OrderedRecordEntry[] = []
-  for (const alternatives of entries.values()) {
-    for (const entry of alternatives.values()) result.push(entry)
-  }
-  return result
+  return [...entries.values()].flatMap(alternatives => [...alternatives.values()])
 }
-
-function discardUncommittedAlternatives(entries: Map<number, Map<string, OrderedRecordEntry>>, selected: ReadonlyMap<number, OrderedRecordEntry>): void {
-  for (const [position, entry] of selected) entries.set(position, new Map([[entry.root, entry]]))
-}
-
-function maximumPosition(values: Iterable<number>): number {
-  let maximum = 0
-  for (const value of values) if (value > maximum) maximum = value
-  return maximum
-}
+function maximumPosition(values: Iterable<number>): number { let maximum = 0; for (const value of values) if (value > maximum) maximum = value; return maximum }
 
 const referenceLogLocks = new WeakMap<DurableOperationStore, Map<string, Mutex>>()
 function referenceLogLock(store: DurableOperationStore, historyId: string): Mutex {
@@ -503,8 +293,8 @@ export class ReferenceRecordLog {
     let root = await orderedGenesisRoot(this.historyId)
     for (const encoded of decoded) {
       if (!(encoded instanceof Uint8Array)) throw new Error('RECORD_LOG_STORAGE_INVALID')
-      const evidence = decodeOrderingEvidence(encoded)
-      if (evidence.kind !== 'ordered-entry') throw new Error('RECORD_LOG_STORAGE_INVALID')
+      const evidence = decodeFinalityEvidence(encoded)
+      if (evidence.kind !== 'record') throw new Error('RECORD_LOG_STORAGE_INVALID')
       const entry = evidence.entry
       await verifyOrderedEntry(entry)
       if (entry.historyId !== this.historyId || entry.position !== entries.length + 1 || entry.previousRoot !== root) {
@@ -536,7 +326,7 @@ export class ReferenceRecordLog {
       await verifyOrderedEntry(entry)
       await this.store.put(`record-log/${this.historyId}`, encodeCanonicalCbor([
         ...entries, entry,
-      ].map((item) => encodeOrderingEvidence({ kind: 'ordered-entry', entry: item }))))
+      ].map((item) => encodeFinalityEvidence({ kind: 'record', entry: item }))))
       return structuredClone(entry)
     })
   }

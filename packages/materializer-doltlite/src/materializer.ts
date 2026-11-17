@@ -311,7 +311,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         }
       }
       verifyFinalTransactions(this.#finalLog, transactions)
-      ensureMonotonicSet(this.#order, transactions.map((transaction) => transaction.txId))
       validateExistingIdentities(this.#log, transactions)
       const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
       if (difference === null) return null
@@ -710,18 +709,9 @@ function validateExistingIdentities(
   const transactionsById = new Map(transactions.map((transaction) => [idKey(transaction.txId), transaction]))
   for (const row of existing) {
     const transaction = transactionsById.get(idKey(row.txId))
-    if (transaction === undefined || !sameIdentity(row, transaction)) {
+    if (transaction !== undefined && !sameIdentity(row, transaction)) {
       throw new MaterializerInputError('MATERIALIZER_TRANSACTION_IDENTITY_CONFLICT')
     }
-  }
-}
-
-function ensureMonotonicSet(previous: readonly Uint8Array[], next: readonly Uint8Array[]): void {
-  let nextIndex = 0
-  for (const previousId of previous) {
-    while (nextIndex < next.length && !bytesEqual(previousId, next[nextIndex]!)) nextIndex += 1
-    if (nextIndex === next.length) throw new MaterializerInputError('MATERIALIZER_ADMISSION_SET_REMOVAL')
-    nextIndex += 1
   }
 }
 

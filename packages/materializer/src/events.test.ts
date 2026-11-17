@@ -88,7 +88,6 @@ describe('SQL-free durable event execution', () => {
     await expect(runtime.coordinator.materialize([two])).rejects.toThrow('EVENT_EXECUTION_CLOSED')
     const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'lost-order-reply' })
     expect(reopened.queries.orderLength).toBe(1)
-    await expect(reopened.coordinator.materialize([two])).rejects.toThrow('ADMISSION_SET_REMOVAL')
     await expect(reopened.coordinator.materialize([one])).resolves.toBeNull()
     await reopened.coordinator.materialize([one, two])
     expect(reopened.queries.orderLength).toBe(2)
@@ -141,18 +140,27 @@ describe('SQL-free durable event execution', () => {
     expect(runtime.queries.outcome(two.txId)).toBeNull()
   })
 
-  it('cannot remove admitted history or change a provisional proposal identity', async () => {
-    const runtime = await createEventMaterializationRuntime({ store: store(), namespace: 'identity' })
+  it('replaces and reorders provisional work while preserving the final prefix and proposal identities', async () => {
+    const bytes = store(), runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'identity' })
     const digest = runtime.queries.executionManifestDigest
-    const one = await admitted(digest, 1, program(emit('chat', 'one')))
-    const two = await admitted(digest, 2, program(emit('chat', 'two')))
-    await runtime.coordinator.materialize([one, two])
-    const revision = runtime.queries.revision
-    await expect(runtime.coordinator.materialize([two])).rejects.toThrow('ADMISSION_SET_REMOVAL')
-    await expect(runtime.coordinator.materialize([two, one])).rejects.toThrow('ADMISSION_SET_REMOVAL')
-    await expect(runtime.coordinator.materialize([{ ...one, authorFeedSequence: 99n }, two])).rejects.toThrow('IDENTITY_CONFLICT')
-    expect(runtime.queries.revision).toBe(revision)
-    expect(runtime.queries.outcome(one.txId)?.outcome).toBe('accepted')
+    const final = await admitted(digest, 1, program(emit('chat', 'final')))
+    const one = await admitted(digest, 2, program(emit('chat', 'one')), 'same')
+    const two = await admitted(digest, 3, program(emit('chat', 'two')), 'same')
+    await runtime.coordinator.materialize([final, one, two])
+    await runtime.coordinator.publishFinal!(1)
+    expect(runtime.queries.outcome(two.txId)?.rejectionCode).toBe('operation_conflict')
+    await runtime.coordinator.materialize([final, two, one])
+    expect(runtime.queries.outcome(two.txId)?.outcome).toBe('accepted')
+    expect(runtime.queries.outcome(one.txId)?.rejectionCode).toBe('operation_conflict')
+    await runtime.coordinator.materialize([final, two])
+    expect(runtime.queries.outcome(one.txId)).toBeNull()
+    await expect(runtime.coordinator.materialize([final, { ...two, authorFeedSequence: 99n }])).rejects.toThrow('IDENTITY_CONFLICT')
+    await expect(runtime.coordinator.materialize([two])).rejects.toThrow('FINAL_PREFIX_CHANGED')
+    await runtime.coordinator.publishFinal!(2)
+    const reopened = await createEventMaterializationRuntime({ store: bytes, namespace: 'identity' })
+    expect(reopened.queries.finalOrderLength).toBe(2)
+    expect(reopened.queries.outcome(two.txId)?.outcome).toBe('accepted')
+    expect(reopened.queries.outcome(one.txId)).toBeNull()
   })
 
   it('binds finality to complete proposal identities, including their event IDs', async () => {
