@@ -27,7 +27,7 @@ export type ApplicationInput<S extends ApplicationInputSchema> =
 type RequiredInputKeys<S> = S extends { readonly required: readonly (infer K extends string)[] } ? K : never
 
 /** Validate, copy and freeze JSON. Accessors, prototypes, undefined, NaN and sparse arrays fail. */
-export function parseApplicationInput(schema: ApplicationInputSchema, value: unknown): EventPayload {
+export function parseApplicationInput<const S extends ApplicationInputSchema>(schema: S, value: unknown): ApplicationInput<S> {
   const copy = JSON.parse(canonicalEventPayload(value as EventPayload)) as EventPayload
   const visit = (spec: ApplicationInputSchema, item: EventPayload, path: string): void => {
     const invalid = (): never => { throw new Error(`APPLICATION_INPUT_INVALID:${path}`) }
@@ -58,7 +58,7 @@ export function parseApplicationInput(schema: ApplicationInputSchema, value: unk
     }
   }
   visit(schema, copy, '$')
-  return freeze(copy)
+  return freeze(copy) as ApplicationInput<S>
 }
 
 export function checkedApplicationInputSchema(value: ApplicationInputSchema): ApplicationInputSchema {

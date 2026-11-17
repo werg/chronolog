@@ -64,7 +64,8 @@ describe('application definitions', () => {
 
   it('validates nullable arrays and rejects non-JSON values before user code runs', () => {
     const input = { anyOf: [{ type: 'null' }, { type: 'array', items: { type: 'integer' }, maxItems: 2 }] } as const
-    expect(parseApplicationInput(input, [1, 2])).toEqual([1, 2])
+    const validated: readonly number[] | null = parseApplicationInput(input, [1, 2])
+    expect(validated).toEqual([1, 2])
     expect(parseApplicationInput(input, null)).toBeNull()
     for (const value of [[1, 2, 3], [1.1], [Number.NaN], [undefined], new Date(), { get value() { throw new Error('must not run') } }]) {
       expect(() => parseApplicationInput(input, value)).toThrow()
