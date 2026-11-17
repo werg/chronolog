@@ -71,7 +71,7 @@ describe('ControlStore', () => {
     expect(resumed.orderedTransactionIds()).toEqual([early.txId, late.txId])
     expect(resumed.setCandidateState(early.txId, 'admissible')).toHaveLength(1)
     expect(() => resumed.setCandidateState(early.txId, 'pending_validation')).toThrow('ADMISSION_NOT_MONOTONIC')
-    resumed.setCandidateState(late.txId, 'inadmissible', { reason: 'ADMISSION_CLOSED' })
+    resumed.setCandidateState(late.txId, 'excluded', { reason: 'ADMISSION_CLOSED' })
     expect(resumed.orderedTransactionIds()).toEqual([early.txId])
     expect(resumed.getCandidate(late.txId)?.canonicalPayload).toEqual(late.canonicalPayload)
   })
@@ -204,9 +204,16 @@ describe('ControlStore', () => {
     expect(store.admissionFrontier(policy, bytes(1))).toEqual({
       provenThroughMs: 100n, closedThroughMs: 100n, blockers: [], excludedProposalIds: [bytes(1)],
     })
-    store.setCandidateState(bytes(1), 'inadmissible', { reason: 'ADMISSION_CLOSED' })
+    store.setCandidateState(bytes(1), 'excluded', { reason: 'ADMISSION_CLOSED' })
     const reopened = new ControlStore(persistence)
-    expect(reopened.getCandidate(bytes(1))).toMatchObject({ state: 'inadmissible', stateReason: 'ADMISSION_CLOSED' })
+    expect(reopened.getCandidate(bytes(1))).toMatchObject({ state: 'excluded', stateReason: 'ADMISSION_CLOSED' })
+    expect(reopened.setCandidateState(bytes(1), 'excluded')).toEqual([])
+    expect(reopened.setCandidateState(bytes(1), 'excluded', { reason: 'ADMISSION_CLOSED' })).toEqual([])
+    expect(() => reopened.setCandidateState(bytes(1), 'excluded', { reason: 'DIFFERENT_REASON' }))
+      .toThrow('CONTROL_STORE_TERMINAL_STATE')
+    expect(() => reopened.setCandidateState(bytes(1), 'excluded', { proofAttestationIds: [bytes(10)] }))
+      .toThrow('CONTROL_STORE_TERMINAL_STATE')
+    expect(reopened.getCandidate(bytes(1))).toMatchObject({ state: 'excluded', stateReason: 'ADMISSION_CLOSED', proofAttestationIds: [] })
     expect(() => reopened.setCandidateState(bytes(1), 'admissible')).toThrow('CONTROL_STORE_TERMINAL_STATE')
   })
 

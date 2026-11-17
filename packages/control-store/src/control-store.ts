@@ -22,11 +22,6 @@ import type {
   WatermarkPolicy,
 } from './types.js'
 
-const TERMINAL_INVALID_STATES = new Set<CandidateState>([
-  'unauthorized',
-  'inadmissible',
-])
-
 type WithoutSequence<T> = T extends unknown ? Omit<T, 'sequence'> : never
 
 export class ControlStoreConflictError extends Error {
@@ -207,6 +202,13 @@ export class ControlStore {
     const candidate = this.#requiredCandidate(txId)
     validateStateTransition(candidate.state, state)
     const proofAttestationIds = options.proofAttestationIds ?? candidate.proofAttestationIds
+    const reason = candidate.state === 'excluded' ? options.reason ?? candidate.stateReason : options.reason
+    if (candidate.state === 'excluded') {
+      if (candidate.stateReason !== reason || !sameBytesList(candidate.proofAttestationIds, proofAttestationIds)) {
+        throw new ControlStoreConflictError('CONTROL_STORE_TERMINAL_STATE')
+      }
+      return []
+    }
     for (const attestationId of proofAttestationIds) {
       const attestation = this.#attestations.get(idKey(attestationId))
       if (attestation === undefined || idKey(attestation.txId) !== key) {
@@ -217,7 +219,7 @@ export class ControlStore {
     if (
       candidate.state === state &&
       sameBytesList(candidate.proofAttestationIds, proofAttestationIds) &&
-      candidate.stateReason === options.reason
+      candidate.stateReason === reason
     ) {
       return []
     }
@@ -227,7 +229,7 @@ export class ControlStore {
     const next: StoredCandidate = cloneCandidate({
       ...identity,
       state,
-      ...(options.reason === undefined ? {} : { stateReason: options.reason }),
+      ...(reason === undefined ? {} : { stateReason: reason }),
       proofAttestationIds,
     })
     this.#candidates.set(key, next)
@@ -237,7 +239,7 @@ export class ControlStore {
         txId: next.txId,
         previousState: candidate.state,
         state,
-        ...(options.reason === undefined ? {} : { reason: options.reason }),
+        ...(reason === undefined ? {} : { reason }),
       }),
     ]
     if (!isSelected(candidate.state) && isSelected(state)) {
@@ -250,7 +252,7 @@ export class ControlStore {
       txId: next.txId,
       state,
       proofAttestationIds,
-      ...(options.reason === undefined ? {} : { reason: options.reason }),
+      ...(reason === undefined ? {} : { reason }),
     })
     return clone(deltas)
   }
@@ -415,7 +417,7 @@ export class ControlStore {
     for (const attestation of this.#attestations.values()) {
       if (attestation.authorTimestampMs <= attestation.acceptedAboveMs) continue
       const key = idKey(attestation.txId), known = this.#candidates.get(key)
-      if (known?.state === 'admissible' || known !== undefined && TERMINAL_INVALID_STATES.has(known.state)) continue
+      if (known?.state === 'admissible' || known?.state === 'excluded') continue
       const context = options.candidatePolicies?.get(key)
       const revision = context?.membershipRevision ?? (options.candidatePolicies === undefined ? membershipRevision : undefined)
       if (known !== undefined && (revision !== undefined && idKey(attestation.membershipRevision) !== idKey(revision) ||
@@ -794,7 +796,7 @@ function validateStateTransition(previous: CandidateState, next: CandidateState)
   if (previous === 'admissible') {
     throw new ControlStoreConflictError('CONTROL_STORE_ADMISSION_NOT_MONOTONIC')
   }
-  if (TERMINAL_INVALID_STATES.has(previous)) {
+  if (previous === 'excluded') {
     throw new ControlStoreConflictError('CONTROL_STORE_TERMINAL_STATE')
   }
 }

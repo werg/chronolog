@@ -48,7 +48,7 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
     coordinator: { ...materialization.coordinator,
       publishFinal: async length => {
         if (length > (materialization.queries.finalOrderLength ?? 0)) finalPublications.push({ length,
-          excluded: (persistence.load()?.candidates ?? []).filter(candidate => candidate.state === 'inadmissible').map(candidate => bytesToHex(candidate.txId)) })
+          excluded: (persistence.load()?.candidates ?? []).filter(candidate => candidate.state === 'excluded').map(candidate => bytesToHex(candidate.txId)) })
         await materialization.coordinator.publishFinal!(length)
       },
     } })
@@ -191,7 +191,7 @@ describe('live chronological finality', () => {
     try {
       await f.heartbeat(0); await f.heartbeat(1); await f.heartbeat(2)
       await expect(f.node.waitForIdle()).rejects.toThrow('PREVIEW_REMOVAL_TEMPORARILY_UNAVAILABLE')
-      expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
+      expect(f.node.candidate(preview.txId)?.state).toBe('excluded')
       // The control decision cannot relabel the still-applied acceptance final.
       expect(f.node.outcome(preview.txId)?.outcome).toBe('accepted')
       expect(f.node.isFinal(preview.txId)).toBe(false)
@@ -243,7 +243,7 @@ describe('live chronological finality', () => {
 
     await f.heartbeat(2); await f.node.waitForIdle()
     expect(f.node.finalOrderLength).toBe(1)
-    expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(preview.txId)?.state).toBe('excluded')
     expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
     expect(f.node.isFinal(preview.txId)).toBe(true)
     expect(f.node.orderLength).toBe(1)
@@ -251,7 +251,7 @@ describe('live chronological finality', () => {
     expect((await f.node.events.read()).transactions.map(item => item.proposalId))
       .toEqual([new TextDecoder().decode(accepted.txId)])
     await f.reopen()
-    expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(preview.txId)?.state).toBe('excluded')
     expect(f.node.finalOrderLength).toBe(1)
   })
 
@@ -288,7 +288,7 @@ describe('live chronological finality', () => {
     const f = await fixture(), a = await f.candidate('excluded', 50n), b = await f.candidate('accepted', 100n)
     await f.vote(0, a); await f.vote(0, b); await f.vote(1, b)
     await f.heartbeat(0); await f.heartbeat(1); await f.heartbeat(2); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
     expect(f.node.outcome(a.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
     expect(f.node.isFinal(a.txId)).toBe(true)
     expect(f.node.finalOrderLength).toBe(1)
@@ -331,7 +331,7 @@ describe('live chronological finality', () => {
     const f = await fixture(), a = await f.candidate('invalid-vote', 50n), b = await f.candidate('accepted', 100n)
     await f.vote(0, a, true, { policyVersion: 99n })
     await f.vote(0, b); await f.vote(1, b); await f.heartbeat(0); await f.heartbeat(1); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
     expect(f.node.finalOrderLength).toBe(1)
   })
 
@@ -340,7 +340,7 @@ describe('live chronological finality', () => {
     await f.vote(0, a); await f.vote(0, b); await f.vote(1, b)
     f.closeRevision([a.txId, b.txId], 100n)
     await f.node.refreshMembership(); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
     expect(f.node.finalOrderLength).toBe(1)
   })
 
@@ -400,7 +400,7 @@ describe('live chronological finality', () => {
     expect(f.node.finalOrderLength).toBe(0)
     expect((await f.node.liveFinality()).closedThroughMs).toBeNull()
     await f.ingest(delayed); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
     expect(f.node.outcome(a.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
     expect(f.node.finalOrderLength).toBe(1)
     expect((await f.node.liveFinality()).closedThroughMs).toBe(100n)

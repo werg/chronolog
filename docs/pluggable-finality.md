@@ -31,6 +31,20 @@ bodies, keys, proof predecessors or execution support block progress. A new late
 proposal receives `FINALITY_TIMESTAMP_CLOSED`; an exact retry of an earlier
 proposal returns its original outcome and does not enter history again.
 
+Both live proof mechanisms produce the same immutable admission exclusion. Its
+reason distinguishes a closed timestamp, an admission quorum that can no longer
+form, or closed writer or encryption authority. Missing bodies, keys or governance evidence remain
+pending; they are not rejection evidence. Repeating a proved exclusion preserves
+its original reason and proof metadata.
+
+An exclusion becomes a final rejected outcome once the proposal is absent from
+the applied local view. If withdrawing a previous preview fails, readers keep
+that coherent local outcome with `final: false` until replay succeeds. If the
+preview is already absent, unrelated application replay or final publication
+does not delay the final denial. `handle.final()` returns the rejected outcome;
+callers still inspect it before performing an external effect. Excluded proposals
+never produce final application events.
+
 The fixed-validator implementation supplies admission attestations and signed
 cutoff/closure promises. The signed-inclusion implementation supplies certified
 receipts and explicit signed author-time closures. Both use the same sorter.

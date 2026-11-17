@@ -4,9 +4,10 @@ export type CandidateState =
   | 'pending_validation'
   /** Locally authorized and selected for preview, but not admitted by consensus. */
   | 'provisional'
+  /** Proven inclusion, independently of the replayed execution outcome. */
   | 'admissible'
-  | 'unauthorized'
-  | 'inadmissible'
+  /** Permanently excluded by verified admission evidence, with an immutable reason. */
+  | 'excluded'
 
 export interface StoredCandidate {
   readonly txId: Uint8Array

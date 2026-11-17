@@ -193,14 +193,48 @@ describe.each(['peer', 'coordinated'] as const)('%s live provisional execution',
     expect(f.node.outcome(denied.txId)).toBeNull()
     expect(f.node.isFinal(denied.txId)).toBe(false)
     expect((await view(f.node, 'local')).events).toEqual(['still-authorized'])
-    await f.finalize([valid], 100n)
+    // The denial is proved independently of unrelated application publication.
+    // Its preview has already been withdrawn, so a failed replay cannot hide it.
+    f.failReplay = true
+    await expect(f.finalize([valid], 100n)).rejects.toThrow('REPLAY_TEMPORARILY_UNAVAILABLE')
+    expect(f.node.candidate(denied.txId)?.state).toBe('excluded')
     expect(f.node.outcome(denied.txId)).toMatchObject({ outcome: 'rejected',
       rejectionCode: mode === 'peer' ? 'ADMISSION_CLOSED' : 'WRITER_UNAUTHORIZED' })
     expect(f.node.isFinal(denied.txId)).toBe(true)
+    expect(f.node.isFinal(valid.txId)).toBe(false)
+    expect((await view(f.node, 'final')).events).toEqual([])
+    expect(f.node.candidate(denied.txId)?.canonicalPayload).toEqual(denied.canonical)
+    f.failReplay = false; await f.node.waitForIdle()
+    expect((await view(f.node, 'final')).events).toEqual(['still-authorized'])
+    expect(f.node.outcome(denied.txId)?.outcome).toBe('rejected')
+    await f.restart()
+    expect(f.node.isFinal(denied.txId)).toBe(true)
+    expect(f.node.outcome(denied.txId)).toMatchObject({ outcome: 'rejected',
+      rejectionCode: mode === 'peer' ? 'ADMISSION_CLOSED' : 'WRITER_UNAUTHORIZED' })
     expect(f.node.candidate(denied.txId)?.canonicalPayload).toEqual(denied.canonical)
     f.denied.clear(); await f.node.refreshMembership()
     expect((await view(f.node, 'final')).events).toEqual(['still-authorized'])
     expect(f.node.outcome(denied.txId)?.outcome).toBe('rejected')
+  })
+
+  it('keeps an excluded preview locally visible until its withdrawal actually succeeds', async () => {
+    const f = await fixture(mode), denied = await f.propose('revoked-preview', 10n)
+    const valid = await f.propose('still-authorized', 20n)
+    const before = await view(f.node, 'local')
+    f.denied.add(10n); f.failReplay = true
+    await expect(f.finalize([valid], 100n)).rejects.toThrow('REPLAY_TEMPORARILY_UNAVAILABLE')
+    expect(f.node.candidate(denied.txId)?.state).toBe('excluded')
+    expect(f.node.outcome(denied.txId)?.outcome).toBe('accepted')
+    expect(f.node.isFinal(denied.txId)).toBe(false)
+    expect(await view(f.node, 'local')).toEqual(before)
+
+    f.failReplay = false; await f.node.waitForIdle()
+    expect(f.node.isFinal(denied.txId)).toBe(true)
+    expect(f.node.outcome(denied.txId)).toMatchObject({ outcome: 'rejected',
+      rejectionCode: mode === 'peer' ? 'ADMISSION_CLOSED' : 'WRITER_UNAUTHORIZED' })
+    expect((await view(f.node, 'local')).events).toEqual(['still-authorized'])
+    expect((await view(f.node, 'final')).events).toEqual(['still-authorized'])
+    expect(f.node.candidate(denied.txId)?.canonicalPayload).toEqual(denied.canonical)
   })
 })
 

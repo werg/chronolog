@@ -44,7 +44,6 @@ export interface CandidateAdmissionContext {
   readonly authorTimestampMs?: bigint
   /** This proposal is covered by a complete closed inclusion frontier. */
   readonly finalityClosed?: boolean
-  readonly canonicalPosition?: bigint
   readonly txId?: Uint8Array
   readonly groupId: Uint8Array
   readonly membershipRevision: Uint8Array

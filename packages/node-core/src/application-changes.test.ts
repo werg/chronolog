@@ -202,7 +202,7 @@ describe('peer authorization outcomes', () => {
     f.clock.now += 1_000
     await f.node.publishHeartbeat()
     await f.node.waitForIdle()
-    expect(f.node.candidate(txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(txId)?.state).toBe('excluded')
     expect(f.node.isFinal(txId)).toBe(true)
     await expect(handle.final()).resolves.toMatchObject({ final: true,
       outcome: { type: 'rejected', rejection: { code: 'ADMISSION_CLOSED' } } })

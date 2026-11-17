@@ -84,7 +84,6 @@ export class ChronologNode {
   #coordinatedAppliedThrough = 0
   #processedClosedThroughMs = -1n
   #appliedClosedThroughMs = -1n
-  readonly #canonicalPositions = new Map<string, number>()
   readonly #mutex = new Mutex()
   readonly #events = new RevisionBroadcaster<NodeRevisionEvent>()
   readonly #applicationChanges = new ChangeSignal()
@@ -703,30 +702,19 @@ export class ChronologNode {
     const outcome = this.#options.materialization.queries.outcome(txId)
     if (outcome !== null) return outcome
     const candidate = this.#control.getCandidate(txId)
-    if ((candidate?.state === 'unauthorized' || candidate?.state === 'inadmissible') && this.isFinal(txId)) return {
+    if (candidate?.state === 'excluded') return {
       txId: candidate.txId, orderKey: candidate.orderKey, orderIndex: -1,
-      outcome: 'rejected', rejectionCode: candidate.stateReason ?? 'WRITER_UNAUTHORIZED', failingStatementIndex: null,
+      outcome: 'rejected', rejectionCode: candidate.stateReason ?? 'ADMISSION_EXCLUDED', failingStatementIndex: null,
     }
     return null
   }
 
   isFinal(txId: Uint8Array): boolean {
     const candidate = this.#control.getCandidate(txId)
-    if (candidate?.state === 'inadmissible') {
-      // These authenticated proposals are permanently excluded from admission.
-      // Missing governance is retryable ingestion, never an authorization denial.
-      return this.#options.materialization.queries.outcome(txId) === null
-    }
-    if (this.historyPolicy === 'coordinated') {
-      const position = this.#canonicalPositions.get(this.#idKey(txId))
-      if (candidate?.state === 'unauthorized') {
-        return this.#options.materialization.queries.outcome(txId) === null &&
-          position !== undefined && position <= this.#coordinatedAppliedThrough &&
-          (candidate.stateReason === 'FINALITY_TIMESTAMP_FUTURE' ||
-            candidate.orderKey.authorTimestampMs <= this.#appliedClosedThroughMs)
-      }
-    }
     const outcome = this.#options.materialization.queries.outcome(txId)
+    // Exclusion is immutable proof, but an earlier applied preview remains
+    // visible until its withdrawal succeeds. Unknown inputs are never excluded.
+    if (candidate?.state === 'excluded') return outcome === null
     return outcome !== null && outcome.orderIndex >= 0 && outcome.orderIndex < this.finalOrderLength
   }
 
@@ -937,10 +925,9 @@ export class ChronologNode {
       this.#resolvedInclusionRecords.add(entry.position)
     }
     // A signed proposal may have several legitimate encrypted envelopes. Its
-    // first decision batch is the first closure covering inclusion AND author
-    // time, or its first inclusion closure for an excessive future timestamp.
-    // Resolve that whole immutable batch before changing admission: a
-    // stale wrapping must not win merely because the provider received it first.
+    // first decision closure covers inclusion AND author time, or proves an
+    // excessive future timestamp. Consider every variant covered by that closure
+    // before freezing admission: a stale wrapping cannot win by arrival order.
     for (const [, alternatives] of [...proposals].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
       const decided = alternatives.filter(item => item.decision !== null)
       if (decided.length === 0) {
@@ -956,7 +943,7 @@ export class ChronologNode {
         (left.inclusion.entry.recordId < right.inclusion.entry.recordId ? -1 : left.inclusion.entry.recordId > right.inclusion.entry.recordId ? 1 : 0))
       const representative = eligible[0]!
       await this.#ingestCandidate(representative.record, representative.canonical, representative.signer,
-        representative.inclusion.entry.position, representative.rejection)
+        { rejection: representative.rejection })
       for (const alternative of alternatives) this.#resolvedInclusionRecords.add(alternative.inclusion.entry.position)
     }
     this.#coordinatedProcessed = snapshot.closedReceiptThrough
@@ -1161,8 +1148,8 @@ export class ChronologNode {
     }
   }
 
-  async #ingestCandidate(record: TransportRecord, canonical: Uint8Array, signer: Uint8Array, canonicalPosition?: number,
-    canonicalRejection?: string): Promise<void> {
+  async #ingestCandidate(record: TransportRecord, canonical: Uint8Array, signer: Uint8Array,
+    closedAdmission?: { readonly rejection: string | undefined }): Promise<void> {
     const core = this.#decodeCandidate(canonical)
     if (!equalBytes(core.groupId, this.#options.groupId)) invalid('CANDIDATE_WRONG_GROUP')
     if (!equalBytes(core.authorId, signer)) invalid('CANDIDATE_SIGNER_MISMATCH')
@@ -1170,9 +1157,9 @@ export class ChronologNode {
       invalid('CANDIDATE_TRANSPORT_AUTHOR_UNAUTHORIZED')
     }
     const foreignProfile = !equalBytes(core.executionManifestDigest, this.executionManifestDigest)
-    if (foreignProfile && canonicalPosition === undefined) {
+    if (foreignProfile && closedAdmission === undefined) {
       // A coordinated history already pins this runtime's immutable profile.
-      // Defer a raw feed proposal until its certified position can record a
+      // Defer a raw feed proposal until verified closed inclusion can record a
       // final rejection, without leaving an unresolvable feed retry behind.
       if (this.historyPolicy === 'coordinated') return
       throw new Error('CANDIDATE_EXECUTION_MANIFEST_UNAVAILABLE')
@@ -1180,7 +1167,6 @@ export class ChronologNode {
     try { assertValidChangeProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
     const candidateDigest = await transactionDigest(canonical)
     const txId = utf8(`tx_${bytesToHex(candidateDigest)}`), key = this.#idKey(txId)
-    if (canonicalPosition !== undefined && !this.#canonicalPositions.has(key)) this.#canonicalPositions.set(key, canonicalPosition)
     const existing = this.#control.getCandidate(txId)
     this.#candidateCores.set(key, core)
     const epoch = decodeEnvelope(record.payload).encryptionEpoch
@@ -1194,12 +1180,12 @@ export class ChronologNode {
       canonicalPayload: canonical, state: 'pending_validation', proofAttestationIds: [],
     }
     if (existing === null) { this.#control.putCandidate(candidate); this.#emit('candidate', txId) }
-    if (canonicalPosition !== undefined) {
+    if (closedAdmission !== undefined) {
       // Only verified closed inclusion decides admission. A local preview may
       // have changed since its original signature, so recheck signed-time rights.
-      const rejection = canonicalRejection ?? (foreignProfile ? 'EXECUTION_PROFILE_MISMATCH'
+      const rejection = closedAdmission.rejection ?? (foreignProfile ? 'EXECUTION_PROFILE_MISMATCH'
         : await this.#canWrite(core, true) ? undefined : 'WRITER_UNAUTHORIZED')
-      this.#control.setCandidateState(txId, rejection === undefined ? 'admissible' : 'unauthorized',
+      this.#control.setCandidateState(txId, rejection === undefined ? 'admissible' : 'excluded',
         rejection === undefined ? {} : { reason: rejection })
     } else {
       await this.#refreshCandidateSelection(candidate, core)
@@ -1240,7 +1226,7 @@ export class ChronologNode {
     const cutoff = this.historyPolicy === 'coordinated' && this.#processedClosedThroughMs > this.#closedAuthorTime()
       ? this.#processedClosedThroughMs : this.#closedAuthorTime()
     if (this.#materializationReady && core.authorTimestampMs <= cutoff && !this.#isAppliedFinal(candidate.txId)) {
-      this.#control.setCandidateState(candidate.txId, 'inadmissible', {
+      this.#control.setCandidateState(candidate.txId, 'excluded', {
         reason: this.historyPolicy === 'coordinated' ? 'FINALITY_TIMESTAMP_CLOSED' : 'ADMISSION_CLOSED' })
       return
     }
@@ -1501,7 +1487,7 @@ export class ChronologNode {
     for (const id of frontier.excludedProposalIds) {
       const candidate = this.#control.getCandidate(id)
       if (candidate !== null && pendingCandidate(candidate.state)) {
-        this.#control.setCandidateState(id, 'inadmissible', { reason: 'ADMISSION_CLOSED' })
+        this.#control.setCandidateState(id, 'excluded', { reason: 'ADMISSION_CLOSED' })
         admissionClosed = true
       }
     }
@@ -1557,9 +1543,9 @@ export class ChronologNode {
       if (frontier.closedThroughMs === null || ordered[index]!.core.authorTimestampMs > frontier.closedThroughMs) break
       finalLength = index + 1
     }
-    // Persist terminal exclusions before publishing the irreversible prefix.
+    // Both proof mechanisms use the same durable admission/publication boundary.
     // A failed flush is retried while the old final length is still in place.
-    if (this.historyPolicy === 'peer' && (admissionClosed || finalLength > this.finalOrderLength)) this.#control.flush()
+    this.#control.flush()
     if (this.#options.materialization.coordinator.publishFinal !== undefined) {
       await this.#options.materialization.coordinator.publishFinal(finalLength)
     } else if (finalLength > 0) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
