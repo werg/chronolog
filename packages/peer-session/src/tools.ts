@@ -1,6 +1,6 @@
-import type { PeerRevision } from '@chronolog/peer-generation'
+import { validatePeerRevision, type PeerRevision } from '@chronolog/peer-generation'
 import type { ApplicationControlHost } from './recovery.js'
-import type { ApplicationSession } from './session.js'
+import type { ApplicationChange, ApplicationSession } from './session.js'
 import { awaitOwnedTask } from './lifetime.js'
 
 export interface ApplicationTool {
@@ -9,22 +9,86 @@ export interface ApplicationTool {
   readonly inputSchema: Readonly<Record<string, unknown>>
 }
 
+const digestSchema = { type: 'string', pattern: '^[0-9a-f]{64}$' }
+const unsignedSchema = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }
+const revisionSchema = {
+  type: 'object', additionalProperties: false,
+  required: ['applicationId', 'historyId', 'generation', 'point', 'controlRevision', 'materializationRevision'],
+  properties: {
+    applicationId: digestSchema, historyId: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[^\\u0000-\\u001f\\u007f]+$' },
+    generation: digestSchema, controlRevision: unsignedSchema,
+    materializationRevision: { type: 'string', pattern: '^[0-9]{1,32}$' },
+    point: { type: 'object', additionalProperties: false, required: ['generation', 'sequence', 'root'],
+      properties: { generation: digestSchema, sequence: unsignedSchema, root: digestSchema } },
+  },
+}
+
+function inputRevision(session: ApplicationSession, value: unknown): PeerRevision | undefined {
+  if (value === undefined) return undefined
+  const revision = value as PeerRevision
+  validatePeerRevision(revision)
+  if (revision.applicationId !== session.applicationId || revision.historyId !== session.historyId) {
+    throw new Error('APPLICATION_TOOL_REVISION_SCOPE_MISMATCH')
+  }
+  return revision
+}
+
+function sameRevision(left: PeerRevision, right: PeerRevision): boolean {
+  return left.applicationId === right.applicationId && left.historyId === right.historyId &&
+    left.generation === right.generation && left.controlRevision === right.controlRevision &&
+    left.materializationRevision === right.materializationRevision && left.point.generation === right.point.generation &&
+    left.point.sequence === right.point.sequence && left.point.root === right.point.root
+}
+
+/** A bounded invalidation observation, not another event stream or replay cursor. */
+async function observeChange(session: ApplicationSession, after: PeerRevision | undefined, waitMs: unknown, signal: AbortSignal): Promise<{
+  readonly change: ApplicationChange | null
+  readonly resetRequired: boolean
+}> {
+  if (typeof waitMs !== 'number' || !Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 30_000) {
+    throw new Error('APPLICATION_TOOL_INPUT_INVALID')
+  }
+  const deadline = new AbortController(), observation = AbortSignal.any([signal, deadline.signal])
+  const iterator = session.changes({ signal: observation })[Symbol.asyncIterator]()
+  const timer = setTimeout(() => { deadline.abort() }, waitMs)
+  try {
+    while (true) {
+      const next = await iterator.next()
+      signal.throwIfAborted()
+      if (next.done === true) return { change: null, resetRequired: false }
+      const change = next.value
+      if (after !== undefined && sameRevision(after, change.revision)) continue
+      const resetRequired = after !== undefined && after.generation !== change.revision.generation
+      // A short-lived observer may start after the recovery notification. Reuse
+      // the real recorded notice; a generation difference alone invents no loss.
+      const recovery = change.recovery ?? (resetRequired
+        ? session.inspectRecovery().findLast(notice => notice.generation === change.revision.generation) ?? null : null)
+      return { change: recovery === null ? change : { ...change, kind: 'recovery', recovery }, resetRequired }
+    }
+  } finally {
+    clearTimeout(timer)
+    await iterator.return?.()
+  }
+}
+
 /** Local agent tools execute against the same owned session, identity and journal as the UI. */
 export function createApplicationTools(session: ApplicationSession, options: { readonly host?: ApplicationControlHost } = {}) {
   const description = session.describe(), operationId = { type: 'string', minLength: 1, maxLength: 256 }
   const object = (properties: Record<string, unknown>, required: readonly string[] = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false })
-  const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>) => ({ oneOf: description[kind].map(entry => object({
+  const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>, required = Object.keys(fields)) => ({ oneOf: description[kind].map(entry => object({
     name: { type: 'string', const: entry.name, description: entry.description }, input: entry.input, ...fields,
-  })) })
+  }, ['name', 'input', ...required])) })
   const tools: readonly ApplicationTool[] = [
     { name: 'describe', description: 'Inspect authenticated application definitions, current role and supported guarantees.', inputSchema: object({}) },
     { name: 'query', description: 'Execute a declared query against one coherent captured application revision.', inputSchema: entries('queries', {}) },
-    { name: 'command', description: 'Save one signed command under a caller-owned operation ID. Returns saved or currently applied state.', inputSchema: entries('commands', { operationId }) },
+    { name: 'command', description: 'Save one signed command under a caller-owned operation ID, optionally guarded by a captured revision. Returns saved or currently applied state.', inputSchema: entries('commands', { operationId, basedOn: revisionSchema }, ['operationId']) },
     { name: 'operation', description: 'Inspect saved attempt bytes, current outcome and explicit reapplication linkage.', inputSchema: object({ operationId }) },
     { name: 'retry', description: 'Retry the exact saved command. Never recreates an abandoned operation.', inputSchema: object({ operationId }) },
     { name: 'wait', description: 'Wait for the current applied result. Cancellation only cancels this wait.', inputSchema: object({ operationId }) },
+    { name: 'changes', description: 'Observe one coalesced coherent revision, optionally waiting after a captured revision. A generation change requires a reread; this is not an event replay cursor.',
+      inputSchema: object({ after: revisionSchema, waitMs: { type: 'integer', minimum: 0, maximum: 30_000, default: 0 } }, []) },
     { name: 'recoveries', description: 'Inspect generation recovery notices and preserved abandoned operations.', inputSchema: object({}) },
-    { name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment.', inputSchema: entries('commands', { operationId, originalOperationId: operationId }) },
+    { name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment, optionally guarded by a captured revision.', inputSchema: entries('commands', { operationId, originalOperationId: operationId, basedOn: revisionSchema }, ['operationId', 'originalOperationId']) },
     ...(options.host === undefined ? [] : [{ name: 'takeover', description: 'Select this eligible device\'s complete recovery point through the hosted authority; may abandon a recent suffix.', inputSchema: object({ transitionId: { type: 'string', minLength: 1, maxLength: 128 } }) }]),
   ]
   return {
@@ -41,18 +105,21 @@ export function createApplicationTools(session: ApplicationSession, options: { r
           case 'query': fields('name', 'input'); return session.query(text('name'), value.input as never)
           case 'command': {
             fields('name', 'input', 'operationId', 'basedOn')
+            const basedOn = inputRevision(session, value.basedOn)
             const operation = await session.command(text('name'), value.input as never, { operationId: text('operationId'),
-              ...(value.basedOn === undefined ? {} : { basedOn: value.basedOn as PeerRevision }) })
+              ...(basedOn === undefined ? {} : { basedOn }) })
             return operation.get()
           }
           case 'operation': fields('operationId'); return session.operations.inspect(text('operationId'))
           case 'retry': fields('operationId'); await session.retry(text('operationId')); return session.operations.get(text('operationId'))
           case 'wait': fields('operationId'); return session.operations.wait(text('operationId'), callOptions)
+          case 'changes': fields('after', 'waitMs'); return observeChange(session, inputRevision(session, value.after), value.waitMs === undefined ? 0 : value.waitMs, signal)
           case 'recoveries': fields(); return session.inspectRecovery()
           case 'reapply': {
             fields('name', 'input', 'operationId', 'originalOperationId', 'basedOn')
+            const basedOn = inputRevision(session, value.basedOn)
             const operation = await session.reapply(text('originalOperationId'), text('name'), value.input as never, { operationId: text('operationId'),
-              ...(value.basedOn === undefined ? {} : { basedOn: value.basedOn as PeerRevision }) })
+              ...(basedOn === undefined ? {} : { basedOn }) })
             return operation.get()
           }
           case 'takeover':

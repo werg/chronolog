@@ -416,14 +416,33 @@ without invalidating the application history that refers to it. Current read
 permissions are rechecked at every fetch; a reference is never a credential.
 
 `createApplicationTools(session, { host })` derives local query/command tool
-schemas from the same application definition. It exposes inspection, exact
-retry, wait, recovery inspection and explicit reapplication. A host port enables
-the takeover tool. `serveApplicationToolLines(session, { input, write, host })`
-accepts bounded JSON lines such as
+schemas from the same application definition. Command and reapplication schemas
+accept an optional `basedOn` revision returned by a coherent query. The complete
+revision shape is also used by `changes`; its application and history scope are
+validated before use. A revision guard does not replace domain transaction guards.
+The tools share operation inspection, exact retry, wait, recovery inspection and
+explicit reapplication. A host port enables the takeover tool.
+
+`changes({ after?, waitMs? })` observes at most one coalesced coherent change from
+`session.changes()`. Without `after` it returns the current ready revision; with
+an unchanged revision it waits for at most `waitMs` (0 by default, maximum 30,000
+milliseconds). The result is `{ change, resetRequired }`; `change: null` means
+no newer ready view was observed within that interval. A generation difference
+sets `resetRequired: true`, including when the observer starts after recovery.
+When available, the result includes the actual recorded recovery notice. An
+unknown notice never becomes an invented abandoned range or loss estimate.
+Reread coherently after a reset and use `recoveries` for retained recovery
+history. This observation is an invalidation, not a complete event log or durable
+cursor. Timeout, caller cancellation and session close release the iterator.
+
+`serveApplicationToolLines(session, { input, write, host })` accepts bounded JSON
+lines such as
 `{"id":1,"tool":"command","input":{"name":"say","input":{"text":"Hello"},"operationId":"message-1"}}`.
-Use `tool: "list"` for schemas and `tool: "wait"` with the operation ID for its
-current applied result. The transport creates no second identity, outbox, or
-hosted command proxy.
+Use `tool: "list"` for schemas, `tool: "wait"` with an operation ID for its applied
+result, or `tool: "changes"` with the captured revision as `input.after` for a
+bounded observation. Set the request's `timeoutMs` above `input.waitMs` when a
+normal unchanged result is wanted. The transport creates no second identity,
+watcher queue, outbox or hosted command proxy.
 
 The portable entry and the browser entry are SQL-free. SQL applications supply
 a qualified materializer through the same execution contract; the pinned schema
