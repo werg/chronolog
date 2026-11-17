@@ -1,7 +1,7 @@
 import type { ChangeProgram } from '@chronolog/protocol'
 import type { ChronologMaterializationRuntime, MaterializedReadHandle, MaterializedTransactionOutcome } from '@chronolog/materializer'
 import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerIdentity, PeerStore, PrefixProof, Signed, SignedGeneration } from './control-types.js'
-import { PEER_GENERATION_PROFILE } from './control-types.js'
+import type { PEER_GENERATION_PROFILE } from './control-types.js'
 export * from './control-types.js'
 
 export interface AttemptHeader {

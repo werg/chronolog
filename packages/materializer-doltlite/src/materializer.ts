@@ -4,6 +4,10 @@ import {
   compareTransactionOrder,
   decodeTransactionCore,
   encodeTransactionCore,
+  encodeChangeProgram,
+  encodeCanonicalCbor,
+  hashDomain,
+  DOMAINS,
   executionManifestArtifacts,
   transactionDigest,
   type ExecutionManifest,
@@ -132,7 +136,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       throw new MaterializerInputError('MATERIALIZER_PLATFORM_DIGEST_MISMATCH')
     }
     const artifacts = await executionManifestArtifacts(options.executionManifest)
-    const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator }
+    const historyProfile = options.historyProfile ?? 'chronological'
+    if (historyProfile !== 'chronological' && historyProfile !== 'peer-generation-v1') throw new MaterializerInputError('MATERIALIZER_HISTORY_PROFILE_UNSUPPORTED')
+    const bootstrapProgram = bootstrapBytes(options)
+    const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator, historyProfile, bootstrapProgram }
+    const bootstrapIdentity = await hashDomain(DOMAINS.peerSchema, bootstrapProgram)
     const opened = openDatabase(options)
     let reader: DatabaseLike | null = null
     let finalReader: DatabaseLike | null = null
@@ -142,7 +150,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       }
       let published = discoverPublishedRef(opened.database)
       if (published === null) {
-        published = initializeRepository(opened.database, expected, options.forkSeeding === true)
+        published = initializeRepository(opened.database, expected, options.forkSeeding === true, options, bootstrapIdentity)
       } else {
         resetActiveWorkingSet(opened.database)
         opened.database.doltCheckout(HEAD_BRANCH)
@@ -201,6 +209,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     }
   }
 
+  get historyProfile(): 'chronological' | 'peer-generation-v1' { return this.#sourceOptions.historyProfile ?? 'chronological' }
   get revision(): bigint { return this.#published.revision }
   get orderLength(): number { return this.#order.length }
   get finalRevision(): bigint { return this.#finalPublished.revision }
@@ -241,6 +250,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   ): LocalSqlQueryResult {
     this.#assertOpen()
     const final = options.view === 'final'
+    if (final && this.historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
     const revision = final ? this.finalRevision : this.revision
     if (options.atRevision !== undefined && options.atRevision !== revision) {
       throw new MaterializerInputError('MATERIALIZER_REVISION_UNAVAILABLE')
@@ -259,7 +269,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
   captureApplication(options: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot {
     this.#assertOpen()
-    const view = options.view ?? 'final'
+    const view = options.view ?? (this.historyProfile === 'peer-generation-v1' ? 'local' : 'final')
+    if (view === 'final' && this.historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
     const log = view === 'final' ? this.#finalLog : this.#log
     return {
       view, revision: view === 'final' ? this.finalRevision : this.revision, orderLength: log.length,
@@ -319,7 +330,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       // Rows of the published log were fully verified when they were read;
       // byte-identical rows are not re-verified, so an append costs O(1)
       // verification work instead of O(history).
-      await validateTransactionSet(transactions, this.#log)
+      await validateTransactionSet(transactions, this.#log, this.historyProfile)
       for (const transaction of transactions) {
         if (!bytesEqual(transaction.core.executionManifestDigest, this.#artifacts.executionManifestDigest)) {
           throw new MaterializerInputError('MATERIALIZER_EXECUTION_MANIFEST_UNAVAILABLE')
@@ -441,6 +452,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   async publishFinal(prefixLength: number): Promise<void> {
+    if (this.historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
     this.#assertOpen()
     if (!Number.isSafeInteger(prefixLength) || prefixLength < this.finalOrderLength || prefixLength > this.orderLength) {
       throw new MaterializerInputError('MATERIALIZER_FINAL_PREFIX_INVALID')
@@ -520,7 +532,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
           txId: transaction.txId,
           actor: transaction.core.authorId,
           groupId: transaction.core.groupId,
-        }, this.#executionManifest.limits)
+        }, this.#executionManifest.limits, { protectedChanges: this.historyProfile === 'chronological' })
     } catch (error) {
       if (!(error instanceof SqlRejection)) {
         rollbackIfActive(this.#writer)
@@ -543,7 +555,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   get #expected(): ExpectedState {
-    return { artifacts: this.#artifacts, rootAdministrator: this.#rootAdministrator }
+    return { artifacts: this.#artifacts, rootAdministrator: this.#rootAdministrator, historyProfile: this.historyProfile,
+      bootstrapProgram: bootstrapBytes(this.#sourceOptions) }
   }
 
   #publicationFault(point: MaterializerPublicationFaultPoint): void {
@@ -575,6 +588,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 interface ExpectedState {
   readonly artifacts: ManifestArtifacts
   readonly rootAdministrator: Uint8Array
+  readonly historyProfile: 'chronological' | 'peer-generation-v1'
+  readonly bootstrapProgram: Uint8Array
 }
 
 /** `forkSeeding`: the genesis is a fork's, so its root may seed rows until the plan ends seeding. */
@@ -582,15 +597,22 @@ function initializeRepository(
   database: DatabaseLike,
   expected: ExpectedState,
   forkSeeding: boolean,
+  options: MaterializerOptions,
+  bootstrapIdentity: Uint8Array,
 ): PublishedRef {
   if (!isFreshRepository(database)) throw new Error('MATERIALIZER_RESERVED_HEAD_MISSING')
   database.exec('BEGIN IMMEDIATE')
   try {
     withAuthorizer(database, 'internal_bootstrap', () => {
       initializeSystemLog(database)
-      insertExecutionManifest(database, storedManifest(expected.artifacts))
+      insertExecutionManifest(database, { ...storedManifest(expected.artifacts), historyProfile: expected.historyProfile, bootstrapProgram: expected.bootstrapProgram })
       initializePlatform(database, expected.rootAdministrator, forkSeeding)
     })
+    if (options.bootstrapProgram !== undefined) {
+      if (options.bootstrapGroupId?.length !== 32) throw new Error('MATERIALIZER_BOOTSTRAP_GROUP_REQUIRED')
+      executeTransactionProgram(database, options.bootstrapProgram, { authorTimestampMs: 0n, txId: bootstrapIdentity,
+        actor: expected.rootAdministrator, groupId: options.bootstrapGroupId }, options.executionManifest.limits)
+    }
     verifyDatabaseState(database, expected)
     database.exec('COMMIT')
   } catch (error) {
@@ -620,7 +642,11 @@ function verifyDatabaseState(
   database: DatabaseLike,
   expected: ExpectedState,
 ): void {
-  verifyStoredManifest(readExecutionManifest(database), expected.artifacts)
+  const stored = readExecutionManifest(database)
+  verifyStoredManifest(stored, expected.artifacts)
+  if (stored.historyProfile !== expected.historyProfile || !bytesEqual(stored.bootstrapProgram, expected.bootstrapProgram)) {
+    throw new Error('DATABASE_HISTORY_PROFILE_MISMATCH')
+  }
   if (!bytesEqual(readRootAdministrator(database), expected.rootAdministrator)) {
     throw new Error('DATABASE_ROOT_ADMINISTRATOR_MISMATCH')
   }
@@ -662,6 +688,7 @@ function validateCheckpointRefs(
 async function validateTransactionSet(
   transactions: readonly ReplayProposal[],
   verified: readonly TransactionLogRow[],
+  historyProfile: 'chronological' | 'peer-generation-v1',
 ): Promise<void> {
   const seen = new Set<string>()
   const proposals = new Set<string>()
@@ -688,7 +715,7 @@ async function validateTransactionSet(
     const proposal = idKey(transaction.candidateDigest)
     if (proposals.has(proposal)) throw new MaterializerInputError('MATERIALIZER_DUPLICATE_PROPOSAL')
     proposals.add(proposal)
-    if (index > 0 && compareTransactionOrder(orderKeyOf(transactions[index - 1]!), orderKeyOf(transaction)) >= 0) {
+    if (historyProfile === 'chronological' && index > 0 && compareTransactionOrder(orderKeyOf(transactions[index - 1]!), orderKeyOf(transaction)) >= 0) {
       throw new MaterializerInputError('MATERIALIZER_ORDER_NOT_CHRONOLOGICAL')
     }
   }
@@ -829,7 +856,7 @@ function logRow(
   }
 }
 
-function storedManifest(artifacts: ManifestArtifacts): StoredExecutionManifest {
+function storedManifest(artifacts: ManifestArtifacts): Omit<StoredExecutionManifest, 'historyProfile' | 'bootstrapProgram'> {
   return {
     manifestDigest: artifacts.executionManifestDigest,
     canonicalManifest: artifacts.canonicalExecutionManifest,
@@ -862,4 +889,10 @@ function resetActiveWorkingSet(database: DatabaseLike): void {
   const branch = database.doltBranches().find((entry) => entry.name === active)
   if (branch === undefined) throw new Error('MATERIALIZER_ACTIVE_BRANCH_MISSING')
   database.doltResetHard(branch.hash)
+}
+
+function bootstrapBytes(options: MaterializerOptions): Uint8Array {
+  if (options.bootstrapProgram === undefined) return new Uint8Array()
+  if (options.bootstrapGroupId?.length !== 32) throw new Error('MATERIALIZER_BOOTSTRAP_GROUP_REQUIRED')
+  return encodeCanonicalCbor([options.bootstrapGroupId, encodeChangeProgram(options.bootstrapProgram)])
 }

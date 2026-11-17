@@ -47,6 +47,7 @@ export function executeTransactionProgram(
   program: ChangeProgram,
   context: DeterministicContext,
   limits: Partial<SqlRuntimeLimits> = {},
+  policy: { readonly protectedChanges?: boolean } = {},
 ): void {
   const platform = new PlatformSession(database, { actor: context.actor, txId: context.txId, groupId: context.groupId, limits })
   // Before the context: it assigns a first-time signer its principal id, which
@@ -55,7 +56,7 @@ export function executeTransactionProgram(
   database.setDeterministicContext(context.authorTimestampMs, prngSeed(context.txId), context.actor, actorId, context.txId)
   try {
     resetChangeCounter(database)
-    let schemaAdmin = signerIsSchemaAdmin
+    let schemaAdmin = policy.protectedChanges !== false && signerIsSchemaAdmin
     // Reconcile right after every statement that changed the schema, so a new
     // table is owner-checked from the next statement on (§3).
     let reconciledVersion = schemaBefore
@@ -73,6 +74,7 @@ export function executeTransactionProgram(
       // durable outcome commits. A later SQL failure therefore exposes none.
       if (isEmitStep(step)) continue
       if (isPlatformOp(step)) {
+        if (policy.protectedChanges === false) throw new SqlRejection('protected_change_required', index)
         try {
           platform.execute(step, index)
         } catch (error) {

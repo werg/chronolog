@@ -18,6 +18,7 @@ import type {
 } from './types.js'
 
 export interface DoltLiteMaterializerRuntimeBackend {
+  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
   readonly revision: bigint
   readonly orderLength: number
   readonly finalRevision?: bigint
@@ -62,6 +63,7 @@ export function createDoltLiteMaterializationRuntime(
   ): MaterializationPublicationResult => ({ status, publicationKey, ...snapshot() })
 
   return {
+    historyProfile: materializer.historyProfile ?? 'chronological',
     coordinator: {
       async publishFinal(prefixLength) {
         if (materializer.publishFinal === undefined) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')

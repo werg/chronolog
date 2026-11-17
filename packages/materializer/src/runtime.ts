@@ -137,6 +137,7 @@ export interface MaterializationPublicationStore {
 }
 
 export interface ChronologMaterializationRuntime {
+  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
   readonly coordinator: MaterializationCoordinator
   readonly queries: MaterializedQueryService
   readonly publications: MaterializationPublicationStore
