@@ -35,13 +35,18 @@ async function fixture() {
   }
   return { host, a, b, outsider, keys, control, registry, peers: opened, openContent }
 }
-async function collect(content: ApplicationContent, ref: ContentReference, options: { offset?: number; length?: number } = {}): Promise<Uint8Array> {
+async function collect(content: ApplicationContent, ref: ContentReference, options: { offset?: number; length?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
   const pieces: Uint8Array[] = []
   for await (const bytes of content.read(ref, options)) pieces.push(bytes)
   const output = new Uint8Array(pieces.reduce((length, bytes) => length + bytes.length, 0))
   let offset = 0
   for (const piece of pieces) { output.set(piece, offset); offset += piece.length }
   return output
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
 }
 
 describe('peer-held application content', () => {
@@ -118,5 +123,64 @@ describe('peer-held application content', () => {
     await expect(a.serveManifest(f.b.publicKey, reference)).rejects.toThrow('CONTENT_ACCESS_DENIED')
     await expect(collect(b, reference)).rejects.toThrow('CONTENT_ACCESS_DENIED')
     await expect(partial.write(0, new Uint8Array([4, 5, 6]))).rejects.toThrow('CONTENT_STAGE_EPOCH_CHANGED')
+  })
+
+  it('bounds unanswered provider requests and releases manifest and retention waits on close', async () => {
+    const f = await fixture(), a = f.openContent(0), b = f.openContent(1)
+    const upload = await a.stage({ bytes: 3 }); await upload.write(0, new Uint8Array([1, 2, 3]))
+    const ref = await upload.commit(), started = Array.from({ length: 8 }, () => deferred<void>())
+    let requests = 0
+    b.attachSource(f.a.publicKey, {
+      manifest: () => { started[requests++]!.resolve(); return new Promise(() => undefined) },
+      chunk: async () => null,
+    })
+    // Stopping a caller's wait must not release the still-running provider's
+    // physical request slot and permit unbounded abandoned requests.
+    for (let index = 0; index < 7; index++) {
+      const stop = new AbortController()
+      const result = collect(b, ref, { signal: stop.signal }).catch((error: unknown) => error)
+      await started[index]!.promise
+      stop.abort(new Error('TEST_WAIT_ENDED'))
+      expect(await result).toMatchObject({ message: 'TEST_WAIT_ENDED' })
+    }
+    const reading = collect(b, ref).catch((error: unknown) => error)
+    await started[7]!.promise
+    await expect(collect(b, ref)).rejects.toThrow('CONTENT_UNAVAILABLE')
+    expect(requests).toBe(8)
+    b.close()
+    expect(await reading).toMatchObject({ message: 'CONTENT_CLOSED' })
+
+    const observing = deferred<void>()
+    a.attachSource(f.b.publicKey, {
+      manifest: async () => null, chunk: async () => null,
+      observeRetention: () => { observing.resolve(); return new Promise(() => undefined) },
+    })
+    const retaining = a.retain(ref).catch((error: unknown) => error)
+    await observing.promise
+    a.close()
+    expect(await retaining).toMatchObject({ message: 'CONTENT_CLOSED' })
+    expect(await collect(f.openContent(0), ref)).toEqual(new Uint8Array([1, 2, 3]))
+  })
+
+  it('fences a late encrypted provider response before storage or plaintext publication', async () => {
+    const f = await fixture(), a = f.openContent(0), b = f.openContent(1)
+    const body = new Uint8Array([11, 22, 33]), upload = await a.stage({ bytes: body.length })
+    await upload.write(0, body)
+    const ref = await upload.commit(), encrypted = await a.serveChunk(f.b.publicKey, ref, 0)
+    const started = deferred<void>(), response = deferred<Uint8Array | null>()
+    b.attachSource(f.a.publicKey, {
+      manifest: reference => a.serveManifest(f.b.publicKey, reference),
+      chunk: () => { started.resolve(); return response.promise },
+    })
+    const reading = collect(b, ref).catch((error: unknown) => error)
+    await started.promise
+    b.close()
+    expect(await reading).toMatchObject({ message: 'CONTENT_CLOSED' })
+    response.resolve(encrypted)
+    await response.promise
+    const reopened = f.openContent(1)
+    expect(await reopened.serveManifest(f.b.publicKey, ref)).not.toBeNull()
+    expect(await reopened.serveChunk(f.b.publicKey, ref, 0)).toBeNull()
+    await expect(reopened.retained(ref)).rejects.toThrow('CONTENT_NOT_RETAINED')
   })
 })

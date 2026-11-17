@@ -373,6 +373,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       verifyDatabaseState(this.#writer, this.#expected)
       // Recovery can land exactly on a retained checkpoint. Publish its existing
       // immutable content under the new view revision without an empty commit.
+      // A newer control projection may still change that candidate with no replay.
       const commitHash = this.#writer.prepare('SELECT * FROM dolt_status').all().length === 0
         ? baseRef : this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
       const contentHash = this.#writer.doltHashOf(commitHash)

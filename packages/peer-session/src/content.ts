@@ -2,9 +2,10 @@ import {
   bytesDigest, type PeerReplica, type PeerStore, type Signed,
 } from '@chronolog/peer-generation'
 import { bytesToHex, canonicalJson, hexToBytes, importEd25519PublicKey, type EventPayload } from '@chronolog/protocol'
+import { awaitOwnedTask } from './lifetime.js'
 
 export const CONTENT_CHUNK_BYTES = 65_536
-const MAX_CONTENT_BYTES = 128 * 1024 * 1024, MAX_SOURCES = 8, MAX_RETENTIONS = 16
+const MAX_CONTENT_BYTES = 128 * 1024 * 1024, MAX_SOURCES = 8, MAX_SOURCE_REQUESTS = 8, MAX_RETENTIONS = 16
 const CONTENT_PROFILE = 'peer-content-v1' as const
 const RETENTION_DOMAIN = 'chronolog/peer-content/retained/v1'
 
@@ -46,6 +47,7 @@ export interface ContentSource {
   retained?(reference: ContentReference): Promise<ContentRetention>
   observeRetention?(receipt: ContentRetention): Promise<void>
 }
+interface AttachedSource { readonly source: ContentSource; readonly lifetime: AbortController }
 export interface ContentUpload {
   readonly id: string
   /** Exact repeated writes are safe; an index cannot be replaced with different bytes. */
@@ -66,9 +68,10 @@ export class ApplicationContent {
   readonly #keys: ReadonlyMap<number, Uint8Array>
   readonly #acquireKey: ((epoch: number) => Promise<void>) | undefined
   readonly #prefix: string
-  readonly #sources = new Map<string, ContentSource>()
+  readonly #sources = new Map<string, AttachedSource>()
+  readonly #lifetime = new AbortController()
   #pending: Promise<unknown> = Promise.resolve()
-  #closed = false
+  #sourceRequests = 0
 
   constructor(options: { readonly replica: PeerReplica; readonly store: PeerStore; readonly storageId: string; readonly epochKeys: ReadonlyMap<number, Uint8Array>; readonly acquireKey?: (epoch: number) => Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#storageId = options.storageId
@@ -86,7 +89,9 @@ export class ApplicationContent {
       historyId: this.#replica.descriptor.historyId, stageId: bytesToHex(crypto.getRandomValues(new Uint8Array(16))),
       epoch: control.epoch, bytes: options.bytes, mediaType, committed: null }
     await this.#key(stage.epoch)
+    this.#access(this.#replica.device.publicKey, true)
     await this.#store.put(this.#stageKey(stage.stageId), encode(stage))
+    this.#lifetime.signal.throwIfAborted()
     return this.#upload(stage.stageId)
   }
 
@@ -95,23 +100,29 @@ export class ApplicationContent {
   attachSource(peerId: string, source: ContentSource): () => void {
     this.#access(peerId)
     if (this.#sources.has(peerId) || this.#sources.size >= MAX_SOURCES) throw new Error('CONTENT_SOURCE_LIMIT')
-    this.#sources.set(peerId, source)
-    return () => { if (this.#sources.get(peerId) === source) this.#sources.delete(peerId) }
+    const attached = { source, lifetime: new AbortController() }
+    this.#sources.set(peerId, attached)
+    return () => {
+      if (this.#sources.get(peerId) !== attached) return
+      this.#sources.delete(peerId)
+      attached.lifetime.abort(new Error('CONTENT_SOURCE_DETACHED'))
+    }
   }
 
   async *read(reference: ContentReference, options: { readonly offset?: number; readonly length?: number; readonly signal?: AbortSignal } = {}): AsyncIterable<Uint8Array> {
     this.#access(this.#replica.device.publicKey); this.#reference(reference)
     const offset = options.offset ?? 0, length = options.length ?? reference.bytes - offset
     integer(offset, reference.bytes); integer(length, reference.bytes - offset)
-    options.signal?.throwIfAborted()
-    const manifest = await this.#manifest(reference)
+    const signal = this.#signal(options.signal)
+    signal.throwIfAborted()
+    const manifest = await this.#manifest(reference, signal)
     if (manifest === null) throw new Error('CONTENT_UNAVAILABLE')
     for (let index = Math.floor(offset / CONTENT_CHUNK_BYTES); index * CONTENT_CHUNK_BYTES < offset + length; index++) {
-      this.#access(this.#replica.device.publicKey); options.signal?.throwIfAborted()
-      const chunk = await this.#chunk(reference, manifest, index)
+      this.#access(this.#replica.device.publicKey); signal.throwIfAborted()
+      const chunk = await this.#chunk(reference, manifest, index, signal)
       if (chunk === null) throw new Error('CONTENT_UNAVAILABLE')
       const plain = await this.#decrypt(manifest, index, chunk)
-      this.#access(this.#replica.device.publicKey); options.signal?.throwIfAborted()
+      this.#access(this.#replica.device.publicKey); signal.throwIfAborted()
       yield plain.slice(Math.max(0, offset - index * CONTENT_CHUNK_BYTES), Math.min(plain.length, offset + length - index * CONTENT_CHUNK_BYTES))
     }
   }
@@ -121,7 +132,9 @@ export class ApplicationContent {
     this.#access(requester); this.#access(this.#replica.device.publicKey); this.#reference(reference)
     const bytes = await this.#store.get(`${this.#prefix}/manifest/${reference.id}`)
     this.#access(requester)
-    return bytes === null ? null : this.#verifyManifest(reference, decode<ContentManifest>(bytes))
+    const manifest = bytes === null ? null : await this.#verifyManifest(reference, decode<ContentManifest>(bytes))
+    this.#access(requester); this.#access(this.#replica.device.publicKey)
+    return manifest
   }
 
   async serveChunk(requester: string, reference: ContentReference, index: number): Promise<Uint8Array | null> {
@@ -131,6 +144,7 @@ export class ApplicationContent {
     const bytes = await this.#store.get(this.#chunkKey(manifest.chunks[index]!.hash))
     this.#access(requester); this.#access(this.#replica.device.publicKey)
     if (bytes !== null) await this.#verifyChunk(manifest.chunks[index]!, bytes)
+    this.#access(requester); this.#access(this.#replica.device.publicKey)
     return bytes
   }
 
@@ -151,15 +165,20 @@ export class ApplicationContent {
     return { payload, signature: bytesToHex(new Uint8Array(signature)) }
   }
 
-  /** Fetch a complete independent copy, then announce its durable retention asynchronously. */
+  /** Fetch a complete independent copy, then attempt to announce its durable retention. */
   async retain(reference: ContentReference, options: { readonly signal?: AbortSignal } = {}): Promise<ContentRetention> {
+    const signal = this.#signal(options.signal)
     for await (const _chunk of this.read(reference, options)) { /* Persistence precedes each yielded chunk. */ }
     const receipt = await this.retained(reference)
-    for (const [peer, source] of this.#sources) {
-      if (source.observeRetention === undefined) continue
-      try { this.#access(peer); await source.observeRetention(receipt) }
-      catch { /* A lost observation never invalidates the retained local copy. */ }
+    signal.throwIfAborted()
+    for (const [peer, attached] of [...this.#sources]) {
+      const { source } = attached
+      const observe = source.observeRetention?.bind(source)
+      if (observe === undefined) continue
+      try { await this.#sourceCall(peer, attached, () => observe(receipt), signal) }
+      catch { signal.throwIfAborted() /* A lost observation never invalidates the retained local copy. */ }
     }
+    signal.throwIfAborted()
     return receipt
   }
 
@@ -169,6 +188,7 @@ export class ApplicationContent {
       const prior = await this.#retentions(receipt.payload.reference)
       const next = prior.filter(item => item.payload.peer !== receipt.payload.peer || item.payload.storageId !== receipt.payload.storageId)
       next.push(structuredClone(receipt))
+      this.#access(receipt.payload.peer); this.#access(this.#replica.device.publicKey)
       await this.#store.put(`${this.#prefix}/retention/${receipt.payload.reference.id}`, encode(next.slice(-MAX_RETENTIONS)))
     })
   }
@@ -179,27 +199,67 @@ export class ApplicationContent {
     const result: ContentRetention[] = []
     for (const receipt of await this.#retentions(reference)) {
       try { await this.#verifyRetention(receipt); result.push(receipt) }
-      catch { /* A removed reader is no longer an eligible content source. */ }
+      catch { this.#lifetime.signal.throwIfAborted() /* A removed reader is no longer an eligible content source. */ }
     }
+    this.#access(this.#replica.device.publicKey)
     return result
   }
 
-  close(): void { this.#closed = true; this.#sources.clear() }
+  close(): void {
+    if (this.#lifetime.signal.aborted) return
+    this.#lifetime.abort(new Error('CONTENT_CLOSED'))
+    for (const attached of this.#sources.values()) attached.lifetime.abort(this.#lifetime.signal.reason)
+    this.#sources.clear()
+  }
+
+  #signal(signal?: AbortSignal): AbortSignal {
+    return signal === undefined ? this.#lifetime.signal : AbortSignal.any([this.#lifetime.signal, signal])
+  }
+
+  #sourceAccess(peer: string, attached: AttachedSource, signal: AbortSignal): void {
+    signal.throwIfAborted(); attached.lifetime.signal.throwIfAborted()
+    if (this.#sources.get(peer) !== attached) throw new Error('CONTENT_SOURCE_DETACHED')
+    this.#access(peer); this.#access(this.#replica.device.publicKey)
+  }
+
+  async #sourceCall<T>(peer: string, attached: AttachedSource, call: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    this.#sourceAccess(peer, attached, signal)
+    const lifetime = AbortSignal.any([signal, attached.lifetime.signal])
+    const value = await this.#providerCall(lifetime, call)
+    this.#sourceAccess(peer, attached, signal)
+    return value
+  }
+
+  #providerCall<T>(signal: AbortSignal, call: () => Promise<T>): Promise<T> {
+    return awaitOwnedTask(signal, () => {
+      if (this.#sourceRequests >= MAX_SOURCE_REQUESTS) throw new Error('CONTENT_SOURCE_BUSY')
+      this.#sourceRequests++
+      let request: Promise<T>
+      try { request = Promise.resolve(call()) }
+      catch (error) { this.#sourceRequests--; throw error }
+      // Abandoning a wait does not cancel provider I/O. Retain its slot until
+      // the actual request settles, including after detachment or owner close.
+      void request.then(() => { this.#sourceRequests-- }, () => { this.#sourceRequests-- })
+      return request
+    })
+  }
 
   #access(peerId: string, write = false) {
-    if (this.#closed) throw new Error('CONTENT_CLOSED')
+    this.#lifetime.signal.throwIfAborted()
     const bundle = this.#replica.authority, control = bundle.controls[this.#replica.generation.payload.controlRevision]!.payload
     const grant = control.grants.find(item => item.publicKey === peerId)
     if (grant?.reader !== true || write && grant.writer !== true) throw new Error('CONTENT_ACCESS_DENIED')
     return control
   }
   async #key(epoch: number): Promise<CryptoKey> {
-    if (!this.#keys.has(epoch)) await this.#acquireKey?.(epoch)
+    const acquire = this.#acquireKey
+    if (!this.#keys.has(epoch) && acquire !== undefined) await this.#providerCall(this.#lifetime.signal, () => acquire(epoch))
     this.#access(this.#replica.device.publicKey)
     const bytes = this.#keys.get(epoch)
     if (bytes?.length !== 32) throw new Error('CONTENT_KEY_UNAVAILABLE')
     const control = this.#replica.authority.controls.find(item => item.payload.epoch === epoch)?.payload
     if (control === undefined || await bytesDigest(bytes) !== control.keyDigest) throw new Error('CONTENT_KEY_MISMATCH')
+    this.#access(this.#replica.device.publicKey)
     return crypto.subtle.importKey('raw', new Uint8Array(bytes), 'AES-GCM', false, ['encrypt', 'decrypt'])
   }
   #stageKey(id: string): string { return `${this.#prefix}/stage/${id}` }
@@ -230,9 +290,10 @@ export class ApplicationContent {
         if (stage.committed !== null) throw new Error('CONTENT_STAGE_COMMITTED')
         const nonce = crypto.getRandomValues(new Uint8Array(12))
         const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, additionalData: aad(stage, index) }, await this.#key(stage.epoch), plain))
-        if (stage.epoch !== this.#access(this.#replica.device.publicKey, true).epoch) throw new Error('CONTENT_STAGE_EPOCH_CHANGED')
         const descriptor: StagedChunk = { hash: await bytesDigest(encrypted), nonce: bytesToHex(nonce), bytes: size, plaintextHash }
+        if (stage.epoch !== this.#access(this.#replica.device.publicKey, true).epoch) throw new Error('CONTENT_STAGE_EPOCH_CHANGED')
         await this.#store.put(this.#chunkKey(descriptor.hash), encrypted)
+        if (stage.epoch !== this.#access(this.#replica.device.publicKey, true).epoch) throw new Error('CONTENT_STAGE_EPOCH_CHANGED')
         await this.#store.put(descriptorKey, encode(descriptor))
       }),
       progress: async () => {
@@ -241,6 +302,7 @@ export class ApplicationContent {
           const bytes = await this.#store.get(`${this.#stageKey(id)}/${index}`)
           if (bytes === null) missingChunks.push(index); else storedBytes += decode<StagedChunk>(bytes).bytes
         }
+        this.#access(this.#replica.device.publicKey, true)
         return { bytes: stage.bytes, storedBytes, missingChunks }
       },
       commit: () => this.#mutate(async () => {
@@ -262,7 +324,9 @@ export class ApplicationContent {
           id: contentId, epoch: stage.epoch, bytes: stage.bytes, mediaType: stage.mediaType }
         if (stage.epoch !== this.#access(this.#replica.device.publicKey, true).epoch) throw new Error('CONTENT_STAGE_EPOCH_CHANGED')
         await this.#store.put(`${this.#prefix}/manifest/${contentId}`, encode(manifest))
+        if (stage.epoch !== this.#access(this.#replica.device.publicKey, true).epoch) throw new Error('CONTENT_STAGE_EPOCH_CHANGED')
         await this.#store.put(this.#stageKey(stage.stageId), encode({ ...stage, committed: reference }))
+        this.#lifetime.signal.throwIfAborted()
         return reference
       }),
     }
@@ -287,37 +351,39 @@ export class ApplicationContent {
   async #verifyChunk(chunk: ContentChunk, bytes: Uint8Array): Promise<void> {
     if (bytes.length !== chunk.bytes + 16 || await bytesDigest(bytes) !== chunk.hash) throw new Error('CONTENT_CHUNK_HASH_MISMATCH')
   }
-  async #manifest(reference: ContentReference): Promise<ContentManifest | null> {
+  async #manifest(reference: ContentReference, signal: AbortSignal): Promise<ContentManifest | null> {
     const local = await this.serveManifest(this.#replica.device.publicKey, reference)
+    signal.throwIfAborted()
     if (local !== null) return local
-    for (const [peer, source] of this.#sources) {
+    for (const [peer, attached] of [...this.#sources]) {
       try {
-        this.#access(peer)
-        const value = await source.manifest(reference)
-        this.#access(peer); this.#access(this.#replica.device.publicKey)
+        const value = await this.#sourceCall(peer, attached, () => attached.source.manifest(reference), signal)
         if (value === null) continue
         const manifest = await this.#verifyManifest(reference, value)
+        this.#sourceAccess(peer, attached, signal)
         await this.#store.put(`${this.#prefix}/manifest/${reference.id}`, encode(manifest))
+        this.#sourceAccess(peer, attached, signal)
         return manifest
-      } catch { /* A missing or invalid optional provider does not break application history. */ }
+      } catch { signal.throwIfAborted() /* A missing or invalid optional provider does not break application history. */ }
     }
     return null
   }
-  async #chunk(reference: ContentReference, manifest: ContentManifest, index: number): Promise<Uint8Array | null> {
+  async #chunk(reference: ContentReference, manifest: ContentManifest, index: number, signal: AbortSignal): Promise<Uint8Array | null> {
     const descriptor = manifest.chunks[index]!
     const local = await this.#store.get(this.#chunkKey(descriptor.hash))
-    if (local !== null) { await this.#verifyChunk(descriptor, local); return local }
-    for (const [peer, source] of this.#sources) {
+    signal.throwIfAborted()
+    if (local !== null) { await this.#verifyChunk(descriptor, local); signal.throwIfAborted(); return local }
+    for (const [peer, attached] of [...this.#sources]) {
       try {
-        this.#access(peer)
-        const value = await source.chunk(reference, index)
-        this.#access(peer); this.#access(this.#replica.device.publicKey)
+        const value = await this.#sourceCall(peer, attached, () => attached.source.chunk(reference, index), signal)
         if (value === null) continue
         await this.#verifyChunk(descriptor, value)
         await this.#decrypt(manifest, index, value)
+        this.#sourceAccess(peer, attached, signal)
         await this.#store.put(this.#chunkKey(descriptor.hash), value)
+        this.#sourceAccess(peer, attached, signal)
         return value
-      } catch { /* Try another independently authorized source. */ }
+      } catch { signal.throwIfAborted() /* Try another independently authorized source. */ }
     }
     return null
   }
@@ -342,9 +408,10 @@ export class ApplicationContent {
     if (typeof value.storageId !== 'string' || value.storageId.length > 256 || !/^[0-9a-f]{128}$/u.test(receipt.signature) ||
         !this.#replica.authority.generations.some(generation => generation.id === value.generation && generation.payload.controlRevision === value.controlRevision)) throw new Error('CONTENT_RETENTION_INVALID')
     if (!await crypto.subtle.verify('Ed25519', await importEd25519PublicKey(hexToBytes(value.peer)), new Uint8Array(hexToBytes(receipt.signature)), signedBytes(value))) throw new Error('CONTENT_RETENTION_INVALID')
+    this.#access(value.peer); this.#access(this.#replica.device.publicKey)
   }
   #mutate<T>(operation: () => Promise<T>): Promise<T> {
-    const pending = this.#pending.then(operation)
+    const pending = this.#pending.then(() => { this.#lifetime.signal.throwIfAborted(); return operation() })
     this.#pending = pending.catch(() => undefined)
     return pending
   }

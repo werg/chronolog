@@ -12,7 +12,7 @@ export interface PilotBootstrap {
   readonly hostBase: string
 }
 export interface PeerIntroductionModule {
-  readonly introducePeerWorker: (options: { readonly peers: RuntimeApi['peers']; readonly channel: string; readonly peerId: string;
+  readonly introducePeerWorker: (options: { readonly peers: RuntimeApi['host']['peers']; readonly channel: string; readonly peerId: string;
     readonly signal: AbortSignal; readonly configuration: RTCConfiguration; readonly handoff: (channels: WebRtcChannels) => void }) => Promise<WebRtcSession>
 }
 export interface PilotRouteStats {

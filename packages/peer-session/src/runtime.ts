@@ -39,9 +39,9 @@ export async function openPeerApplication<const D extends ApplicationDefinition>
     const content = new ApplicationContent({ replica, store: options.device.store, storageId: options.device.storageId,
       epochKeys: keyring.epochKeys, acquireKey: epoch => keyring.ensure([epoch]) })
     return await openApplication({ replica, definition: options.definition, store: options.device.store, content, keys,
-      close: async () => { keys?.close(); release(); await options.device.close() } })
+      close: async () => { await keys?.close(); release(); await options.device.close() } })
   } catch (error) {
-    keys?.close(); release(); if (replica !== undefined) await replica.close(); else await materializer?.close()
+    await keys?.close(); release(); if (replica !== undefined) await replica.close(); else await materializer?.close()
     await options.device.close(); throw error
   }
 }

@@ -1,9 +1,7 @@
-import { sessionInternals as internals } from './internals.js'
 import {
   PEER_GENERATION_CAPABILITIES, type PeerReplica, type PeerRevision, type AppliedResult,
   type OperationState, type AuthorityBundle, type RecoveryNotice, type SignedAttempt,
   type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView, type PeerStore,
-  type OrderedCommand,
 } from '@chronolog/peer-generation'
 import {
   bytesToHex, hexToBytes, decodeTransactionCore, isEmitStep,
@@ -16,6 +14,10 @@ import { applicationDefinitionDigest, describeApplication, type ApplicationComma
 import { ApplicationRecovery } from './recovery.js'
 import type { ApplicationContent } from './content.js'
 import type { ApplicationKeyring } from './keys.js'
+import {
+  connectApplicationPeer, connectApplicationPeerPair,
+  type ApplicationPeerConnectOptions, type ApplicationPeerLink, type ApplicationPeerPort,
+} from './network.js'
 
 export type QueryParameter = null | string | number | bigint | Uint8Array
 export interface QueryRows {
@@ -80,8 +82,9 @@ export class ApplicationOperation {
 type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
 type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
 type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
-interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void>; readonly link: { close(): void | Promise<void> } }
-
+interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void>; readonly link: { close(): Promise<void> } }
+interface SessionInternals { readonly port: ApplicationPeerPort }
+const internals = new WeakMap<ApplicationSession, SessionInternals>()
 
 /** The application-facing owner: one peer journal, coherent views and explicit recovery. */
 export class ApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
@@ -101,14 +104,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #lifetime = new AbortController()
   readonly #closing: (() => void | Promise<void>) | undefined
   readonly #inflight = new Map<string, Promise<void>>()
-  readonly #links = new Set<{ close(): void | Promise<void> }>()
+  readonly #links = new Set<{ close(): Promise<void> }>()
   readonly #views = new Set<ApplicationReadView>()
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
   readonly #stopStatus: () => void
   readonly #stopKeys: () => void
   #lastStatus = ''
-  #closedTask: Promise<void> | undefined
   #closed = false
+  #closeTask: Promise<void> | undefined
 
   constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: PeerStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void> }) {
     this.#replica = options.replica; this.#definition = options.definition; this.#closing = options.close
@@ -121,7 +124,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.recovery = new ApplicationRecovery({ replica, store: options.store, signal: this.#lifetime.signal })
     this.content = options.content
     this.keys = options.keys
-    internals.set(this, { replica, signals, store: options.store, content: options.content, keys: options.keys })
+    const port: ApplicationPeerPort = { replica, signals, content: options.content, keys: options.keys, signal: this.#lifetime.signal,
+      attach: (peerId, submit, link) => this.#attachPeer(peerId, submit, link),
+      resume: () => this.resume(),
+    }
+    internals.set(this, { port })
     this.#stopStatus = replica.subscribe(() => this.#publishStatus())
     this.#stopKeys = options.keys.subscribe(() => this.#publishStatus())
     this.operations = Object.freeze({ get: (operationId: string, options: { readonly author?: string } = {}) => replica.operation(operationId, options.author),
@@ -140,7 +147,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   get storageId(): string { return this.#replica.storageId }
   get status(): SessionStatus {
     const coordinator = this.#replica.generation.payload.coordinator
-    return { phase: this.#closed ? 'closed' : this.keys.missing().length > 0 ? 'awaiting-keys' : revisionKeySafe(this.#replica).endsWith('/recovering') ? 'recovering' : this.#replica.isCoordinator || this.#peers.has(coordinator) ? 'ready' : 'waiting',
+    return { phase: this.#closed ? 'closed' : this.keys.missing().length > 0 ? 'awaiting-keys' : !this.#replica.ready ? 'recovering' : this.#replica.isCoordinator || this.#peers.has(coordinator) ? 'ready' : 'waiting',
       role: this.#replica.isCoordinator ? 'coordinator' : 'follower', generation: this.#replica.generation.id,
       coordinator, connectedPeers: this.#peers.size }
   }
@@ -225,6 +232,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return coalescedChanges(this.#replica, this.#lifetime.signal, options.signal)
   }
 
+  connectPeer(options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
+    this.#assertOpen()
+    return connectApplicationPeer(internals.get(this)!.port, options)
+  }
+
   async retry(operationId: string): Promise<void> {
     this.#assertOpen()
     const existing = this.#inflight.get(operationId)
@@ -249,11 +261,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   async resume(): Promise<void> {
     this.#assertOpen()
+    if (!this.#replica.ready) return
     for (const attempt of await this.#replica.pendingAttempts()) await this.retry(attempt.payload.header.operationId)
   }
 
   async waitFor(operationId: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> {
     return waitFor(this.#replica, this.#lifetime.signal, options.signal, async () => {
+      if (!this.#replica.ready) return undefined
       const current = await this.#replica.operation(operationId)
       if (current?.status === 'applied') return current
       if (current?.status === 'abandoned' || current?.status === 'needsReapply') throw new AbandonedOperationError(current)
@@ -264,6 +278,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   async waitForCoverage(applied: AppliedResult, options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> {
     return waitFor(this.#replica, this.#lifetime.signal, options.signal, async () => {
+      if (!this.#replica.ready) return undefined
       const current = await this.#replica.operation(applied.operationId)
       if (current?.status === 'abandoned' || current?.status === 'needsReapply') throw new AbandonedOperationError(current)
       const commands = await this.#replica.exportCommands()
@@ -275,7 +290,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   /** Runtime-owned attachment. Discovery hints never invoke this without peer authentication. */
-  attachPeer(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): void | Promise<void> }): () => void {
+  #attachPeer(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): Promise<void> }): () => void {
     this.#assertOpen()
     if (!currentReader(this.#replica, peerId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
     if (this.#peers.size >= 8 && !this.#peers.has(peerId)) throw new Error('APPLICATION_PEER_LIMIT')
@@ -289,18 +304,24 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   close(): Promise<void> {
-    if (this.#closedTask !== undefined) return this.#closedTask
-    this.#closedTask = Promise.resolve().then(async () => {
-      const closing = [...this.#links].map(link => Promise.resolve().then(() => link.close()))
-      for (const view of [...this.#views]) view.release()
-      internals.get(this)!.signals.close()
-      this.content.close()
-      await Promise.allSettled([...this.#inflight.values(), ...closing])
-      try { await this.#replica.close() } finally { await this.#closing?.() }
-    })
+    if (this.#closeTask !== undefined) return this.#closeTask
+    let resolve!: () => void, reject!: (error: unknown) => void
+    this.#closeTask = new Promise<void>((done, fail) => { resolve = done; reject = fail })
+    const owned = [...this.#links]
     this.#closed = true; this.#lifetime.abort(new Error('APPLICATION_SESSION_CLOSED'))
     this.#publishStatus(); this.#statusListeners.clear(); this.#stopStatus(); this.#stopKeys()
-    return this.#closedTask
+    for (const view of [...this.#views]) view.release()
+    internals.get(this)!.port.signals.close()
+    this.content.close()
+    const links = owned.map(link => Promise.resolve().then(() => link.close()))
+    const recovery = this.recovery.close()
+    const keys = this.keys.close()
+    void (async () => {
+      await Promise.allSettled([...links, recovery, keys])
+      await Promise.allSettled(this.#inflight.values())
+      try { await this.#replica.close() } finally { await this.#closing?.() }
+    })().then(resolve, reject)
+    return this.#closeTask
   }
   #assertOpen(): void { if (this.#closed) throw new Error('APPLICATION_SESSION_CLOSED') }
 }
@@ -315,116 +336,14 @@ export async function openApplication<const D extends ApplicationDefinition>(opt
 }
 
 /** In-process transport for embedded peers and reproducible independent-store qualification. */
-export async function connectApplications(left: ApplicationSession, right: ApplicationSession): Promise<{ synchronize(): Promise<void>; close(): void }> {
+export async function connectApplications(left: ApplicationSession, right: ApplicationSession): Promise<{ synchronize(): Promise<void>; close(): Promise<void> }> {
   if (left === right) throw new Error('APPLICATION_PEER_SELF')
-  const a = internals.get(left)!, b = internals.get(right)!
-  if (a.replica.descriptor.historyId !== b.replica.descriptor.historyId || a.replica.descriptor.applicationId !== b.replica.descriptor.applicationId ||
-      a.replica.descriptor.controlPublicKey !== b.replica.descriptor.controlPublicKey) throw new Error('APPLICATION_PEER_SCOPE_MISMATCH')
-  let closed = false, pending = Promise.resolve(), requested = false
-  let detachA = () => {}, detachB = () => {}, unsubscribeA = () => {}, unsubscribeB = () => {}
-  let contentA = () => {}, contentB = () => {}, keysA = () => {}, keysB = () => {}
-  let signalA: ReturnType<SignalChannel['attachRoute']> | undefined, signalB: ReturnType<SignalChannel['attachRoute']> | undefined
-  const assertOpen = (): void => {
-    if (closed) throw new Error('APPLICATION_PEER_DISCONNECTED')
-    if (!currentReader(a.replica, right.deviceId) || !currentReader(b.replica, left.deviceId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
-  }
-  const synchronize = async (): Promise<void> => {
-    assertOpen(); requested = true
-    const previous = pending
-    const task = previous.then(async () => {
-      while (requested && !closed) {
-        requested = false; assertOpen()
-        if (a.replica.generation.id !== b.replica.generation.id) {
-          const [source, target] = a.replica.generation.payload.number > b.replica.generation.payload.number ? [a.replica, b.replica] : [b.replica, a.replica]
-          try { await target.adopt(source.authority) }
-          catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') throw error }
-          assertOpen()
-        }
-        for (const [receiver, issuer] of [[a, b], [b, a]] as const) {
-          for (let batch = 0; batch < 256; batch++) {
-            const ticket = await receiver.keys.request()
-            if (ticket === null) break
-            try { assertOpen(); const share = await issuer.keys.offer(ticket.request); assertOpen(); await ticket.accept(share); assertOpen() }
-            finally { ticket.cancel() }
-            if (batch === 255 && receiver.keys.missing().length > 0) throw new Error('APPLICATION_KEY_EXCHANGE_LIMIT')
-          }
-        }
-        const capture = async (replica: PeerReplica) => {
-          try { return await replica.capture() }
-          catch (error) { if (error instanceof Error && error.message === 'PEER_RECOVERING') return null; throw error }
-        }
-        const av = await capture(a.replica), bv = await capture(b.replica)
-        try {
-          if (av === null && bv === null) continue
-          const [source, target, view] = av !== null && (bv === null || av.read.orderLength >= bv.read.orderLength)
-            ? [a.replica, b.replica, av] as const : [b.replica, a.replica, bv!] as const
-          async function* pages(): AsyncGenerator<readonly OrderedCommand[]> {
-            for (let offset = 0; offset < view.read.orderLength; offset += 32) {
-              const commands = await source.exportCommands({ at: view.revision, offset, limit: Math.min(32, view.read.orderLength - offset) })
-              assertOpen(); yield commands
-            }
-          }
-          assertOpen(); await target.synchronize(view.authority, pages(), { at: view.revision }); assertOpen()
-          const targetCoverage = await target.retainedCoverage(view.revision.point)
-          assertOpen(); await source.observeCoverage(targetCoverage); assertOpen()
-          const sourceCoverage = await source.retainedCoverage(view.revision.point)
-          assertOpen(); await target.observeCoverage(sourceCoverage)
-        } finally { av?.release(); bv?.release() }
-      }
-    })
-    pending = task.catch(() => undefined)
-    return task
-  }
-  const link = { synchronize, close() {
-    if (closed) return
-    closed = true; requested = false; detachA(); detachB(); unsubscribeA(); unsubscribeB(); signalA?.close(); signalB?.close(); contentA(); contentB(); keysA(); keysB()
-  } }
-  const submit = (coordinator: PeerReplica) => async (attempt: SignedAttempt): Promise<void> => {
-    assertOpen()
-    await coordinator.order(attempt)
-    // A late reply may be ignored after disconnection; the saved attempt is retried exactly.
-    assertOpen()
-    await synchronize()
-  }
-  try {
-    signalA = a.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalB!.receive(frame); return true } })
-    signalB = b.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalA!.receive(frame); return true } })
-    let priorA = revisionKeySafe(a.replica), priorB = revisionKeySafe(b.replica)
-    unsubscribeA = a.replica.subscribe(() => {
-      const current = revisionKeySafe(a.replica)
-      if (current !== priorA) { priorA = current; void synchronize().catch(() => { link.close() }) }
-    })
-    unsubscribeB = b.replica.subscribe(() => {
-      const current = revisionKeySafe(b.replica)
-      if (current !== priorB) { priorB = current; void synchronize().catch(() => { link.close() }) }
-    })
-    await synchronize()
-    keysA = a.keys.attachSource(right.deviceId, async request => { assertOpen(); const share = await b.keys.offer(request); assertOpen(); return share })
-    keysB = b.keys.attachSource(left.deviceId, async request => { assertOpen(); const share = await a.keys.offer(request); assertOpen(); return share })
-    contentA = a.content.attachSource(right.deviceId, {
-      manifest: async reference => { assertOpen(); const value = await b.content.serveManifest(left.deviceId, reference); assertOpen(); return value },
-      chunk: async (reference, index) => { assertOpen(); const value = await b.content.serveChunk(left.deviceId, reference, index); assertOpen(); return value },
-      retained: async reference => { assertOpen(); const value = await b.content.retained(reference); assertOpen(); return value },
-      observeRetention: async receipt => { assertOpen(); await b.content.observeRetention(receipt); assertOpen() },
-    })
-    contentB = b.content.attachSource(left.deviceId, {
-      manifest: async reference => { assertOpen(); const value = await a.content.serveManifest(right.deviceId, reference); assertOpen(); return value },
-      chunk: async (reference, index) => { assertOpen(); const value = await a.content.serveChunk(right.deviceId, reference, index); assertOpen(); return value },
-      retained: async reference => { assertOpen(); const value = await a.content.retained(reference); assertOpen(); return value },
-      observeRetention: async receipt => { assertOpen(); await a.content.observeRetention(receipt); assertOpen() },
-    })
-    detachA = left.attachPeer(right.deviceId, submit(b.replica), link)
-    detachB = right.attachPeer(left.deviceId, submit(a.replica), link)
-    await Promise.all([left.resume(), right.resume()])
-    return link
-  } catch (error) { link.close(); throw error }
+  return connectApplicationPeerPair(internals.get(left)!.port, internals.get(right)!.port)
 }
 
 function currentReader(replica: PeerReplica, publicKey: string): boolean {
-  const control = replica.authority.controls.find(value => value.payload.revision === replica.generation.payload.controlRevision)
-  return control?.payload.grants.some(grant => grant.publicKey === publicKey && grant.reader) === true
+  return replica.grant(publicKey)?.reader === true
 }
-function revisionKey(revision: PeerRevision): string { return `${revision.generation}/${revision.point.root}/${revision.materializationRevision}` }
 function encodeParameter(value: QueryParameter): MaterializedLocalSqlValue {
   if (value === null) return { kind: 'null' }
   if (typeof value === 'string') return { kind: 'text', value }
@@ -506,15 +425,17 @@ function coalescedChanges(replica: PeerReplica, lifetime: AbortSignal, signal?: 
     const abort = signal === undefined ? lifetime : AbortSignal.any([lifetime, signal])
     let closed = false, pending: ApplicationChange | undefined, waiting: ((value: IteratorResult<ApplicationChange>) => void) | undefined
     let latestRecovery: RecoveryNotice | null = null
+    let lastRevision: string | undefined
     const close = (): IteratorResult<ApplicationChange> => {
       if (!closed) { closed = true; unsubscribe(); recovery(); abort.removeEventListener('abort', close); waiting?.({ done: true, value: undefined }); waiting = undefined; pending = undefined }
       return { done: true, value: undefined }
     }
     const publish = (): void => {
-      if (closed) return
-      let revision: PeerRevision
-      try { revision = replica.revision }
-      catch (error) { if (error instanceof Error && error.message === 'PEER_RECOVERING') return; throw error }
+      if (closed || !replica.ready) return
+      const revision = replica.revision
+      const identity = `${revision.generation}/${revision.point.root}/${revision.materializationRevision}`
+      if (latestRecovery === null && identity === lastRevision) return
+      lastRevision = identity
       const value: ApplicationChange = { kind: latestRecovery === null ? 'applied' : 'recovery', revision, recovery: latestRecovery }
       latestRecovery = null
       if (waiting !== undefined) { const resolve = waiting; waiting = undefined; resolve({ done: false, value }) }
@@ -533,9 +454,4 @@ function coalescedChanges(replica: PeerReplica, lifetime: AbortSignal, signal?: 
       async return() { return close() },
     }
   } }
-}
-
-function revisionKeySafe(replica: PeerReplica): string {
-  try { return revisionKey(replica.revision) }
-  catch (error) { if (error instanceof Error && error.message === 'PEER_RECOVERING') return `${replica.generation.id}/recovering`; throw error }
 }

@@ -5,21 +5,25 @@ import {
 import type { ReplayProposal, PeerExecutionControls } from '@chronolog/materializer'
 import { createSignedAttempt, validatePeerRevision, verifyAttempt } from './attempt.js'
 import {
-  boundedText, bytesDigest, bytesToHex, check, isArray, decodePeerValue, encodePeerValue,
+  boundedText, bytesDigest, bytesToHex, check, isArray, decodePeerValue, encodePeerValue, hex, object,
   hexToBytes, peerDigest, PeerGenerationError, samePeerValue, Serial, signPeerValue, verifyPeerValue,
 } from './codec.js'
 import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, validateHistoryPoint, verifyAuthorityBundle, verifyOrderReceipt } from './control.js'
 import { PEER_MAX_RECORDS, PEER_MAX_HISTORY_BYTES } from './control-types.js'
 import type {
-  AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, OperationState, OrderedCommand,
-  PeerReplica, PeerReplicaOptions, PeerRevision, PeerStore, PrefixProof, PrepareCommand,
+  AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, HistoryReceiveResult, OperationState, OrderedCommand,
+  PeerGrant, PeerReplica, PeerReplicaOptions, PeerRevision, PeerStore, PrefixProof, PrepareCommand,
   RecoveryNotice, SignedAttempt, SignedGeneration, SignedRetainedCoverage,
 } from './types.js'
 
 interface Head { readonly sequence: number; readonly root: string; readonly bytes: number }
 interface Retained { readonly command: OrderedCommand; readonly core: TransactionCore }
-interface PendingRecovery { readonly previousGeneration: string; readonly previousCoordinator: string }
-interface ReplicaState { readonly version: 2; readonly authority: AuthorityBundle; readonly pending: PendingRecovery | null }
+interface PendingRecovery {
+  readonly previousGeneration: string
+  readonly generation: string
+  readonly knownAttemptId: string | null
+}
+interface StoredSelection { readonly authority: AuthorityBundle; readonly recovery: PendingRecovery | null }
 const activeOwners = new WeakMap<PeerStore, Set<string>>()
 const operationKey = (author: string, operationId: string): string => `${author}\u0000${operationId}`
 
@@ -66,36 +70,53 @@ class Replica implements PeerReplica {
     const generation = this.#authority.current; check(generation !== null, 'PEER_NO_SELECTED_GENERATION'); return generation
   }
   get isCoordinator(): boolean { return this.generation.payload.coordinator === this.device.publicKey }
+  grant(publicKey: string): PeerGrant | null { this.#assertOpen(); return this.#authority.grant(publicKey) }
+  get ready(): boolean { return !this.#closed && this.#ready }
+  get retainedPoint(): HistoryPoint | null {
+    this.#assertOpen()
+    let point: HistoryPoint | null = null
+    for (const segment of this.#authority.selectedSegments()) {
+      const head = this.#heads.get(segment.generation.id), records = this.#records.get(segment.generation.id)
+      check(head !== undefined && records !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
+      const requested = segment.cutoff?.sequence ?? head.sequence
+      const through = Math.min(requested, head.sequence)
+      if (through > 0) {
+        const command = records.get(through)?.command
+        check(command !== undefined, 'PEER_HISTORY_INCOMPLETE')
+        point = { generation: segment.generation.id, sequence: through, root: command.receipt.root }
+      }
+      if (through < requested) break
+    }
+    return point
+  }
   get revision(): PeerRevision {
+    this.#assertOpen()
     check(this.#ready && this.#publishedRevision !== null, 'PEER_RECOVERING')
     return structuredClone(this.#publishedRevision)
   }
   async initialize(): Promise<void> {
-    const stored = await this.#options.store.get(`${this.#prefix}/authority`)
+    const stored = await this.#options.store.get(`${this.#prefix}/selection`)
+    let previous: PeerAuthority | undefined
     if (stored !== null) {
-      const state = decodePeerValue<ReplicaState>(stored)
-      check(state.version === 2 && Object.hasOwn(state, 'pending'), 'PEER_REPLICA_STATE_INVALID')
-      const previous = await verifyAuthorityBundle(state.authority, this.#authority.bundle.descriptor)
-      this.#pendingRecovery = state.pending
+      const selection = decodePeerValue<StoredSelection>(stored)
+      object(selection, ['authority', 'recovery'])
+      previous = await verifyAuthorityBundle(selection.authority, this.#authority.bundle.descriptor)
       if (previous.bundle.generations.length > this.#authority.bundle.generations.length) {
         assertAuthorityExtension(this.#authority, previous); this.#authority = previous
-      } else {
-        assertAuthorityExtension(previous, this.#authority)
-        if (previous.current !== null && previous.current.id !== this.#authority.current?.id) this.#pendingRecovery ??= {
-          previousGeneration: previous.current.id, previousCoordinator: previous.current.payload.coordinator,
-        }
+      } else assertAuthorityExtension(previous, this.#authority)
+      if (selection.recovery !== null) {
+        object(selection.recovery, ['previousGeneration', 'generation', 'knownAttemptId'])
+        hex(selection.recovery.previousGeneration); hex(selection.recovery.generation)
+        if (selection.recovery.knownAttemptId !== null) hex(selection.recovery.knownAttemptId)
+        check(selection.recovery.generation === previous.current?.id, 'PEER_RECOVERY_JOURNAL_INVALID')
+        previous.generation(selection.recovery.previousGeneration)
+        this.#pendingRecovery = { ...selection.recovery, generation: this.generation.id }
       }
     }
     check(this.#authority.current !== null, 'PEER_NO_SELECTED_GENERATION')
     check(this.#options.materializer.historyProfile === 'peer-generation-v1', 'PEER_MATERIALIZER_PROFILE_MISMATCH')
     check(bytesToHex(this.#options.materializer.queries.executionManifestDigest) === this.descriptor.executionManifestDigest,
       'PEER_EXECUTION_MANIFEST_MISMATCH')
-    if (this.#pendingRecovery !== null) {
-      const value = this.#pendingRecovery
-      check(typeof value.previousGeneration === 'string' && typeof value.previousCoordinator === 'string' &&
-        this.#authority.generation(value.previousGeneration).payload.coordinator === value.previousCoordinator, 'PEER_RECOVERY_JOURNAL_INVALID')
-    }
-    await this.#persistAuthority()
     const journal = await this.#options.store.get(`${this.#prefix}/journal-head`)
     this.#journalHead = journal === null ? 0 : decodePeerValue<number>(journal)
     check(Number.isSafeInteger(this.#journalHead) && this.#journalHead >= 0 && this.#journalHead <= this.#maxRecords, 'PEER_JOURNAL_INVALID')
@@ -107,19 +128,25 @@ class Replica implements PeerReplica {
       this.#remember(attempt)
     }
     for (const generation of this.#authority.bundle.generations) await this.#loadGeneration(generation, this.#authority)
+    const previousGeneration = previous?.current
+    if (previous !== undefined && previousGeneration !== null && previousGeneration !== undefined && previousGeneration.id !== this.generation.id && this.#pendingRecovery === null) {
+      const known = this.#selectedHistory(previous, false).at(-1)?.command.attempt.id ?? null
+      this.#pendingRecovery = { previousGeneration: previousGeneration.id, generation: this.generation.id, knownAttemptId: known }
+    }
+    if (this.#pendingRecovery?.knownAttemptId !== undefined && this.#pendingRecovery.knownAttemptId !== null) {
+      check(this.#attempts.has(this.#pendingRecovery.knownAttemptId), 'PEER_RECOVERY_JOURNAL_INVALID')
+    }
     const recoveryBytes = await this.#options.store.get(`${this.#prefix}/recoveries`)
     if (recoveryBytes !== null) {
       const notices = decodePeerValue<RecoveryNotice[]>(recoveryBytes)
       check(isArray(notices) && notices.length <= 32, 'PEER_RECOVERY_JOURNAL_INVALID')
       this.#recoveries.push(...notices)
     }
-    try { await this.#materialize(this.#authority) }
+    // Selection and its recovery baseline are one atomic pointer. Reopening
+    // cannot forget an accepted generation or confuse it with a published view.
+    await this.#writeSelection(this.#authority, this.#pendingRecovery)
+    try { await this.#materialize(this.#authority); await this.#finishRecovery(false) }
     catch (error) { if (!(error instanceof PeerGenerationError) || error.code !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') throw error }
-    if (this.#ready) await this.#finishRecovery()
-  }
-  async #persistAuthority(): Promise<void> {
-    const state: ReplicaState = { version: 2, authority: this.#authority.bundle, pending: this.#pendingRecovery }
-    await this.#write(`${this.#prefix}/authority`, encodePeerValue(state))
   }
   get #maxRecords(): number { return this.#options.maxRecords ?? PEER_MAX_RECORDS }
   #assertOpen(): void { check(!this.#closed, 'PEER_REPLICA_CLOSED') }
@@ -134,6 +161,9 @@ class Replica implements PeerReplica {
       // never continue from stale signing or sequence state.
       this.#closed = true; this.#ready = false; throw error
     }
+  }
+  #writeSelection(authority: PeerAuthority, recovery: PendingRecovery | null): Promise<void> {
+    return this.#write(`${this.#prefix}/selection`, encodePeerValue({ authority: authority.bundle, recovery } satisfies StoredSelection))
   }
   #remember(attempt: SignedAttempt): void {
     const key = operationKey(attempt.payload.header.author, attempt.payload.header.operationId)
@@ -202,20 +232,24 @@ class Replica implements PeerReplica {
     this.#heads.set(generation.id, next); entries.set(next.sequence, { command: structuredClone(command), core })
     this.#remember(attempt); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += recordBytes.length + 2
   }
-  #selectedHistory(authority: PeerAuthority): Retained[] {
+  #selectedHistory(authority: PeerAuthority, complete = true): Retained[] {
     const result: Retained[] = []
     for (const segment of authority.selectedSegments()) {
       const head = this.#heads.get(segment.generation.id), records = this.#records.get(segment.generation.id)
       check(head !== undefined && records !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
-      const through = segment.cutoff?.sequence ?? head.sequence
-      check(through <= head.sequence, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
-      if (segment.cutoff !== null) {
+      const requested = segment.cutoff?.sequence ?? head.sequence
+      if (complete) check(requested <= head.sequence, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
+      const through = Math.min(requested, head.sequence)
+      if (segment.cutoff !== null && requested <= head.sequence) {
         const root = through === 0 ? records.get(1)?.command.receipt.payload.previousRoot ?? head.root : records.get(through)?.command.receipt.root
         check(root === segment.cutoff.root, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
       }
       for (let sequence = 1; sequence <= through; sequence++) {
         const retained = records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); result.push(retained)
       }
+      // Later generations cannot fill an earlier missing prefix. Export the
+      // available evidence without publishing an incomplete application view.
+      if (through < requested) break
     }
     return result
   }
@@ -245,15 +279,37 @@ class Replica implements PeerReplica {
       this.#lastOutcomes.set(attempt.id, result)
     }
     const generation = authority.current!, head = this.#heads.get(generation.id)!
-    // No await between these assignments: even synchronous status observers see
-    // either the old complete publication or the new complete publication.
-    if (this.#authority.current?.id !== generation.id) this.#coverage.clear()
+    // Control may already have advanced while ready=false. Publish all view
+    // metadata together before allowing readers to observe the complete prefix.
     this.#authority = authority
     this.#selected = selected; this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
     this.#publishedRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
       generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
       controlRevision: generation.payload.controlRevision, materializationRevision: String(this.#options.materializer.queries.revision) }
     this.#ready = true
+  }
+  async #finishRecovery(notify: boolean): Promise<RecoveryNotice | null> {
+    const pending = this.#pendingRecovery
+    if (pending === null) return null
+    let notice = this.#recoveries.find(value => value.previousGeneration === pending.previousGeneration && value.generation === pending.generation)
+    if (notice === undefined) {
+      const abandoned: OperationState[] = []
+      for (const [id, attempt] of this.#attempts) {
+        if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
+      }
+      notice = { previousGeneration: pending.previousGeneration, generation: pending.generation, adopted: this.generation.payload.adopted,
+        revision: this.revision, abandoned: abandoned.slice(0, 1024),
+        unknownLoss: true }
+      const recoveries = [...this.#recoveries, structuredClone(notice)].slice(-32)
+      await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(recoveries))
+      this.#recoveries.splice(0, this.#recoveries.length, ...recoveries)
+    }
+    await this.#writeSelection(this.#authority, null)
+    this.#pendingRecovery = null
+    if (notify) {
+      for (const listener of [...this.#recoveryListeners]) { try { listener(structuredClone(notice)) } catch { /* Observers are isolated. */ } }
+    }
+    return structuredClone(notice)
   }
   #publish(): void { for (const listener of [...this.#listeners]) { try { listener() } catch { /* Consumer failure cannot undo persistence. */ } } }
   #pointAvailable(point: HistoryPoint, authority = this.#authority): boolean {
@@ -339,73 +395,71 @@ class Replica implements PeerReplica {
         if (!(error instanceof PeerGenerationError) || error.code !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') this.#closed = true
         throw error
       }
-      await this.#finishRecovery()
+      await this.#finishRecovery(true)
       this.#publish()
     })
   }
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> { return this.synchronize(authority, []) }
-  synchronize(input: AuthorityBundle, inputCommands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>, options: { readonly at?: PeerRevision } = {}): Promise<RecoveryNotice | null> {
+  async synchronize(input: AuthorityBundle, inputCommands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>, options: { readonly at?: PeerRevision } = {}): Promise<RecoveryNotice | null> {
+    const result = await this.#receive(input, inputCommands, options)
+    check(result.ready, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
+    return result.recovery
+  }
+  receiveHistory(input: AuthorityBundle, inputCommands: readonly OrderedCommand[]): Promise<HistoryReceiveResult> {
+    return this.#receive(input, inputCommands)
+  }
+  async #receive(input: AuthorityBundle, inputCommands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>, options: { readonly at?: PeerRevision } = {}): Promise<HistoryReceiveResult> {
     const bundle = structuredClone(input), at = structuredClone(options.at)
     const commands = isArray(inputCommands) ? structuredClone(inputCommands as readonly OrderedCommand[]) : inputCommands
-    return (async () => {
-      const next = await verifyAuthorityBundle(bundle, this.#authority.bundle.descriptor)
-      if (at !== undefined) {
-        validatePeerRevision(at)
-        check(at.applicationId === this.descriptor.applicationId && at.historyId === this.descriptor.historyId &&
-          at.generation === next.current?.id && at.point.generation === at.generation && at.controlRevision === next.current.payload.controlRevision,
-        'PEER_REPLICATION_TARGET_INVALID')
+    const next = await verifyAuthorityBundle(bundle, this.#authority.bundle.descriptor)
+    if (at !== undefined) {
+      validatePeerRevision(at)
+      check(at.applicationId === this.descriptor.applicationId && at.historyId === this.descriptor.historyId &&
+        at.generation === next.current?.id && at.point.generation === at.generation && at.controlRevision === next.current.payload.controlRevision,
+      'PEER_REPLICATION_TARGET_INVALID')
+    }
+    await this.#serial.run(async () => {
+      this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
+      const previous = this.generation
+      if (previous.id !== next.current!.id) {
+        const pending = this.#pendingRecovery === null
+          ? { previousGeneration: previous.id, generation: next.current!.id, knownAttemptId: this.#selected.at(-1)?.command.attempt.id ?? null }
+          : { ...this.#pendingRecovery, generation: next.current!.id }
+        await this.#writeSelection(next, pending)
+        // Restrictive controls fence readers and coordinators before peer I/O.
+        this.#authority = next; this.#pendingRecovery = pending; this.#ready = false; this.#coverage.clear()
+        this.#publish()
+      } else if (!samePeerValue(this.#authority.bundle, next.bundle)) {
+        await this.#writeSelection(next, this.#pendingRecovery)
+        this.#authority = next
       }
+      for (const generation of next.bundle.generations) await this.#loadGeneration(generation, next)
+    })
+    let count = 0
+    // A remote reader may concurrently need our retained pages. Never hold the
+    // replica's serial section while waiting for the next network page.
+    for await (const inputPage of replicationPages(commands)) {
+      check(isArray(inputPage) && inputPage.length > 0 && inputPage.length <= PEER_MAX_RECORDS, 'PEER_REPLICATION_BATCH_LIMIT')
+      count += inputPage.length; check(count <= this.#maxRecords, 'PEER_REPLICATION_BATCH_LIMIT')
+      const page = structuredClone(inputPage)
       await this.#serial.run(async () => {
         this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
-        if (this.generation.id !== next.current!.id) {
-          this.#pendingRecovery ??= { previousGeneration: this.generation.id, previousCoordinator: this.generation.payload.coordinator }
-          // Fence restrictive controls before fetching the replacement prefix.
-          this.#ready = false; this.#authority = next; this.#coverage.clear()
-          await this.#persistAuthority()
-          this.#publish()
-        }
-        for (const generation of next.bundle.generations) await this.#loadGeneration(generation, next)
+        for (const command of page) await this.#retain(command, next, true)
       })
-      let count = 0
-      // Fetch outside the serial section: the other peer may simultaneously
-      // need our retained ranges. Each page is copied before asynchronous checks.
-      for await (const inputPage of replicationPages(commands)) {
-        check(isArray(inputPage) && inputPage.length > 0 && inputPage.length <= PEER_MAX_RECORDS, 'PEER_REPLICATION_BATCH_LIMIT')
-        count += inputPage.length; check(count <= this.#maxRecords, 'PEER_REPLICATION_BATCH_LIMIT')
-        const page = structuredClone(inputPage)
-        await this.#serial.run(async () => {
-          this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
-          for (const command of page) await this.#retain(command, next, true)
-        })
-      }
-      return this.#serial.run(async () => {
-        this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
-        this.#selectedHistory(next)
-        if (at !== undefined) check(this.#pointAvailable(at.point, next), 'PEER_REPLICATION_TARGET_INCOMPLETE')
-        try { await this.#materialize(next) } catch (error) { this.#closed = true; throw error }
-        this.#authority = next
-        const notice = await this.#finishRecovery()
-        this.#publish(); return notice
-      })
-    })()
-  }
-  async #finishRecovery(): Promise<RecoveryNotice | null> {
-    const pending = this.#pendingRecovery
-    if (pending === null) return null
-    const recorded = this.#recoveries.at(-1)
-    if (recorded?.previousGeneration === pending.previousGeneration && recorded.generation === this.generation.id) {
-      this.#pendingRecovery = null; await this.#persistAuthority(); return structuredClone(recorded)
     }
-    const abandoned: OperationState[] = []
-    for (const [id, attempt] of this.#attempts) if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
-    const notice: RecoveryNotice = { previousGeneration: pending.previousGeneration, generation: this.generation.id, adopted: this.generation.payload.adopted,
-      // Local abandoned evidence never certifies the last head held elsewhere.
-      revision: this.revision, abandoned: abandoned.slice(0, 1024), unknownLoss: true }
-    this.#recoveries.push(structuredClone(notice)); if (this.#recoveries.length > 32) this.#recoveries.shift()
-    await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(this.#recoveries))
-    this.#pendingRecovery = null; await this.#persistAuthority()
-    for (const listener of [...this.#recoveryListeners]) { try { listener(structuredClone(notice)) } catch { /* Observers are isolated. */ } }
-    return notice
+    return this.#serial.run(async () => {
+      this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
+      if (at !== undefined) check(this.#pointAvailable(at.point, next), 'PEER_REPLICATION_TARGET_INCOMPLETE')
+      try { await this.#materialize(next) }
+      catch (error) {
+        if (error instanceof PeerGenerationError && error.code === 'PEER_RECOVERY_PREFIX_INCOMPLETE') {
+          this.#publish(); return { ready: false, recovery: null }
+        }
+        this.#closed = true; throw error
+      }
+      const recovery = await this.#finishRecovery(true)
+      this.#publish(); return { ready: true, recovery }
+    })
   }
   #state(attempt: SignedAttempt): OperationState {
     const header = attempt.payload.header, previous = this.#lastOutcomes.get(attempt.id)
@@ -441,13 +495,17 @@ class Replica implements PeerReplica {
   }
   recoveryPoint(): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(this.revision.point) }) }
   prefixProof(point: HistoryPoint): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(point) }) }
-  exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
+  exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly maxBytes?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
     return this.#serial.run(async () => {
-      this.#assertReady(); let start = 0, end = this.#selected.length
+      this.#assertOpen()
+      check(this.#authority.grant(this.device.publicKey)?.reader === true, 'PEER_READER_FORBIDDEN')
+      const selected = this.#selectedHistory(this.#authority, false)
+      let start = 0, end = selected.length
       if (options.at !== undefined) {
+        this.#assertReady()
         this.#checkView(options.at)
         check(options.at.generation === this.generation.id && options.at.point.generation === this.generation.id, 'PEER_VIEW_RECOVERY_REQUIRED')
-        end -= this.revision.point.sequence - options.at.point.sequence
+        end -= this.#heads.get(this.generation.id)!.sequence - options.at.point.sequence
       }
       if (options.offset !== undefined) {
         check(options.after === undefined && Number.isSafeInteger(options.offset) && options.offset >= 0 && options.offset <= end, 'PEER_RANGE_OFFSET_INVALID')
@@ -456,26 +514,40 @@ class Replica implements PeerReplica {
       if (options.after !== undefined) {
         check(this.#pointAvailable(options.after), 'PEER_CURSOR_RECOVERY_REQUIRED')
         if (options.after.sequence > 0) {
-          start = this.#selected.findIndex(value => value.command.receipt.payload.generation === options.after!.generation && value.command.receipt.payload.sequence === options.after!.sequence) + 1
+          start = selected.findIndex(value => value.command.receipt.payload.generation === options.after!.generation && value.command.receipt.payload.sequence === options.after!.sequence) + 1
           check(start > 0, 'PEER_CURSOR_RECOVERY_REQUIRED')
         } else {
-          start = this.#selected.findIndex(value => value.command.receipt.payload.generation === options.after!.generation)
-          if (start < 0) start = this.#selected.length
+          const segments = this.#authority.selectedSegments()
+          const cursorSegment = segments.findIndex(value => value.generation.id === options.after!.generation)
+          const remaining = new Set(segments.slice(cursorSegment).map(value => value.generation.id))
+          start = selected.findIndex(value => remaining.has(value.command.receipt.payload.generation))
+          if (start < 0) start = selected.length
         }
       }
       const limit = options.limit ?? this.#maxRecords
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= this.#maxRecords, 'PEER_RANGE_LIMIT_INVALID')
-      return this.#selected.slice(start, Math.min(end, start + limit)).map(value => structuredClone(value.command))
+      const maxBytes = options.maxBytes ?? Number.MAX_SAFE_INTEGER
+      check(Number.isSafeInteger(maxBytes) && maxBytes > 0, 'PEER_RANGE_BYTES_INVALID')
+      const result: OrderedCommand[] = []
+      let bytes = 0
+      for (const value of selected.slice(start, Math.min(end, start + limit))) {
+        const size = encodePeerValue(value.command).byteLength
+        if (bytes + size > maxBytes) { check(result.length > 0, 'PEER_RANGE_RECORD_TOO_LARGE'); break }
+        bytes += size; result.push(structuredClone(value.command))
+      }
+      return result
     })
   }
-  retainedCoverage(input?: HistoryPoint): Promise<SignedRetainedCoverage> {
-    const captured = structuredClone(input)
+  retainedCoverage(point?: HistoryPoint): Promise<SignedRetainedCoverage> {
+    const requested = point === undefined ? undefined : structuredClone(point)
     return this.#serial.run(async () => {
-      this.#assertReady()
-      const point = captured ?? this.revision.point
-      check(this.#pointAvailable(point), 'PEER_RECOVERY_PREFIX_INCOMPLETE')
+      this.#assertOpen()
+      check(this.#authority.grant(this.device.publicKey)?.reader === true, 'PEER_READER_FORBIDDEN')
+      const retained = requested ?? this.revision.point
+      validateHistoryPoint(retained)
+      check(this.#pointAvailable(retained), 'PEER_RECOVERY_PREFIX_INCOMPLETE')
       return signPeerValue(DOMAINS.peerCoverage, { applicationId: this.descriptor.applicationId, generation: this.generation.id,
-        point, peer: this.device.publicKey, storageId: this.#options.storageId, retainedAt: this.#now() }, this.device)
+        point: retained, peer: this.device.publicKey, storageId: this.#options.storageId, retainedAt: this.#now() }, this.device)
     })
   }
   observeCoverage(input: SignedRetainedCoverage): Promise<void> {
@@ -487,8 +559,8 @@ class Replica implements PeerReplica {
       check(value.applicationId === this.descriptor.applicationId && value.generation === this.generation.id &&
         this.#authority.grant(value.peer)?.reader === true && this.#pointAvailable(value.point) && Number.isSafeInteger(value.retainedAt) && value.retainedAt >= 0,
       'PEER_COVERAGE_INVALID')
-      // One signing identity is one peer, regardless of how many storage IDs
-      // it advertises. The current signed grant roster bounds this map.
+      // One current signing identity is one peer; a stale receipt cannot
+      // replace its newer already verified durable coverage.
       const previous = this.#coverage.get(value.peer)
       if (previous !== undefined && !this.#authority.atOrAfter(value.point, previous.payload.point)) return
       this.#coverage.set(value.peer, coverage); this.#publish()

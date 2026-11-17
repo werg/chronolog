@@ -37,6 +37,7 @@ export const DOMAINS = {
   peerAttempt: 'chronolog/peer-generation/attempt/v1',
   peerOrder: 'chronolog/peer-generation/order/v1',
   peerCoverage: 'chronolog/peer-generation/coverage/v1',
+  peerConnection: 'chronolog/peer-generation/connection/v1',
 } as const
 
 export type ProtocolDomain = (typeof DOMAINS)[keyof typeof DOMAINS]

@@ -5,6 +5,7 @@ import {
 } from '@chronolog/peer-generation'
 import { bytesToHex, hexToBytes, importEd25519PublicKey } from '@chronolog/protocol'
 import type { ApplicationDevice } from './device.js'
+import { awaitOwnedTask } from './lifetime.js'
 
 export type ApplicationKeyRequest = Signed<{
   readonly applicationId: string
@@ -24,6 +25,7 @@ export type ApplicationKeyShare = Signed<{
 const REQUEST_DOMAIN = 'chronolog/peer-generation/key-request/v1'
 const SHARE_DOMAIN = 'chronolog/peer-generation/key-share/v1'
 const MAX_BATCH = 16
+interface KeySource { readonly offer: (request: ApplicationKeyRequest) => Promise<ApplicationKeyShare>; readonly lifetime: AbortController }
 
 /** Durable enrolled keys, with peer exchange independent of command retry and host storage. */
 export class ApplicationKeyring {
@@ -33,15 +35,18 @@ export class ApplicationKeyring {
   readonly #initial: AuthorityBundle
   readonly #keys = new Map<number, Uint8Array>()
   #replica: PeerReplica | undefined
-  #closed = false
+  readonly #lifetime = new AbortController()
+  readonly #tickets = new Set<AbortController>()
+  #closeTask: Promise<void> | undefined
   #tail: Promise<unknown> = Promise.resolve()
   #pendingRequests = 0
   readonly #listeners = new Set<() => void>()
-  readonly #sources = new Map<string, (request: ApplicationKeyRequest) => Promise<ApplicationKeyShare>>()
+  readonly #sources = new Map<string, KeySource>()
+  #sourceRequests = 0
   #acquiring: Promise<unknown> = Promise.resolve()
 
   private constructor(device: ApplicationDevice, authority: AuthorityBundle) {
-    this.#identity = device.identity; this.#store = device.store; this.#initial = authority
+    this.#identity = device.identity; this.#store = device.store; this.#initial = structuredClone(authority)
     this.#key = `peer-session/keys/${authority.descriptor.payload.applicationId}/${authority.descriptor.payload.historyId}`
   }
   static async open(options: { readonly device: ApplicationDevice; readonly authority: AuthorityBundle; readonly epochKeys?: ReadonlyMap<number, Uint8Array> }): Promise<ApplicationKeyring> {
@@ -55,7 +60,7 @@ export class ApplicationKeyring {
   get epochKeys(): ReadonlyMap<number, Uint8Array> { return this.#keys }
   bind(replica: PeerReplica): void {
     if (this.#replica !== undefined || replica.device.publicKey !== this.#identity.publicKey ||
-        replica.descriptor.applicationId !== this.#initial.descriptor.payload.applicationId) throw new Error('APPLICATION_KEYRING_BINDING_INVALID')
+        bytesToHex(encodePeerValue(replica.authority.descriptor)) !== bytesToHex(encodePeerValue(this.#initial.descriptor))) throw new Error('APPLICATION_KEYRING_BINDING_INVALID')
     this.#replica = replica
   }
   missing(requiredEpochs?: readonly number[]): readonly number[] {
@@ -72,8 +77,13 @@ export class ApplicationKeyring {
   attachSource(peerId: string, offer: (request: ApplicationKeyRequest) => Promise<ApplicationKeyShare>): () => void {
     this.#open(); this.#reader(peerId)
     if (!this.#sources.has(peerId) && this.#sources.size >= 8) throw new Error('APPLICATION_KEY_SOURCE_LIMIT')
-    this.#sources.set(peerId, offer)
-    return () => { if (this.#sources.get(peerId) === offer) this.#sources.delete(peerId) }
+    this.#sources.get(peerId)?.lifetime.abort(new Error('APPLICATION_KEY_SOURCE_DETACHED'))
+    const source = { offer, lifetime: new AbortController() }
+    this.#sources.set(peerId, source)
+    return () => {
+      if (this.#sources.get(peerId) !== source) return
+      this.#sources.delete(peerId); source.lifetime.abort(new Error('APPLICATION_KEY_SOURCE_DETACHED'))
+    }
   }
   ensure(requiredEpochs?: readonly number[]): Promise<void> {
     const requested = requiredEpochs === undefined ? undefined : [...requiredEpochs]
@@ -82,12 +92,18 @@ export class ApplicationKeyring {
         this.#reader(this.#identity.publicKey)
         if (this.missing(requested).length === 0) return
         let obtained = false, failure: unknown = new Error('PEER_EPOCH_KEY_UNAVAILABLE')
-        for (const offer of [...this.#sources.values()]) {
+        for (const [peer, source] of [...this.#sources]) {
           const ticket = await this.request(requested)
           if (ticket === null) return
-          try { await ticket.accept(await offer(ticket.request)); obtained = true; break }
-          catch (error) { failure = error }
-          finally { ticket.cancel() }
+          const detached = (): void => { ticket.cancel() }
+          source.lifetime.signal.addEventListener('abort', detached, { once: true })
+          if (source.lifetime.signal.aborted) detached()
+          try {
+            const share = await this.#offer(peer, source, ticket.request)
+            await ticket.accept(share); obtained = true; break
+          }
+          catch (error) { this.#open(); failure = error }
+          finally { source.lifetime.signal.removeEventListener('abort', detached); ticket.cancel() }
         }
         if (!obtained) throw failure
       }
@@ -99,20 +115,23 @@ export class ApplicationKeyring {
 
   /** Explicit bootstrap/rotation input must match already authenticated control commitments. */
   install(input: ReadonlyMap<number, Uint8Array>): Promise<void> {
+    return this.#install(input, () => this.#open())
+  }
+  #install(input: ReadonlyMap<number, Uint8Array>, current: () => void): Promise<void> {
     const keys = new Map([...input].map(([epoch, key]) => [epoch, key.slice()]))
     const operation = this.#tail.then(async () => {
-      this.#open()
-      const commitments = this.#commitments(), current = await this.#load()
+      this.#open(); current()
+      const commitments = this.#commitments(), stored = await this.#load()
       for (const [epoch, key] of keys) {
         if (!Number.isSafeInteger(epoch) || epoch < 0 || key.length !== 32 || commitments.get(epoch) !== await bytesDigest(key)) throw new Error('APPLICATION_EPOCH_KEY_MISMATCH')
-        const existing = current.get(epoch)
+        const existing = stored.get(epoch)
         if (existing !== undefined && bytesToHex(existing) !== bytesToHex(key)) throw new Error('APPLICATION_EPOCH_KEY_CONFLICT')
-        current.set(epoch, key)
+        stored.set(epoch, key)
       }
-      this.#open()
-      await this.#store.put(this.#key, encodePeerValue([...current].sort(([a], [b]) => a - b).map(([epoch, key]) => [epoch, bytesToHex(key)])))
-      this.#open()
-      for (const [epoch, key] of current) this.#keys.set(epoch, key)
+      this.#open(); current()
+      await this.#store.put(this.#key, encodePeerValue([...stored].sort(([a], [b]) => a - b).map(([epoch, key]) => [epoch, bytesToHex(key)])))
+      this.#open(); current()
+      for (const [epoch, key] of stored) this.#keys.set(epoch, key)
       for (const listener of [...this.#listeners]) { try { listener() } catch { /* Observer failures cannot undo durable enrollment. */ } }
     })
     this.#tail = operation.catch(() => undefined)
@@ -126,33 +145,53 @@ export class ApplicationKeyring {
     if (epochs.length === 0) return null
     if (this.#pendingRequests >= 4) throw new Error('APPLICATION_KEY_REQUEST_LIMIT')
     this.#pendingRequests++
-    let finished = false
-    const cancel = (): void => { if (!finished) { finished = true; this.#pendingRequests-- } }
+    const lifetime = new AbortController(), signal = AbortSignal.any([this.#lifetime.signal, lifetime.signal])
+    this.#tickets.add(lifetime)
+    let finished = false, accepting = false, released = false
+    const release = (): void => {
+      if (released) return
+      released = true; this.#pendingRequests--; this.#tickets.delete(lifetime)
+    }
+    const cancel = (): void => {
+      finished = true; lifetime.abort(new Error('APPLICATION_KEY_REQUEST_CLOSED'))
+      if (!accepting) release()
+    }
     try {
       const receiver = await generateX25519KeyPair(), authority = this.#authority(), generation = authority.generations.at(-1)!
+      signal.throwIfAborted()
       const controlDigest = await peerDigest(authority.controls[generation.payload.controlRevision]!)
       const request = await sign(REQUEST_DOMAIN, { applicationId: authority.descriptor.payload.applicationId,
         historyId: authority.descriptor.payload.historyId, generation: generation.id, controlDigest,
         recipient: this.#identity.publicKey, receiverKey: bytesToHex(receiver.publicKeyBytes), nonce: bytesToHex(crypto.getRandomValues(new Uint8Array(16))), epochs }, this.#identity)
-      await this.#scope(request)
+      await this.#scope(request); signal.throwIfAborted()
       const requestDigest = await peerDigest(request)
+      signal.throwIfAborted()
       return { request, cancel, accept: async share => {
-        if (finished) throw new Error('APPLICATION_KEY_REQUEST_CLOSED')
-        try {
-          await this.#scope(request)
+        if (finished || accepting) throw new Error('APPLICATION_KEY_REQUEST_CLOSED')
+        accepting = true
+        const current = (): void => {
+          signal.throwIfAborted()
+          if (this.#authority().generations.at(-1)?.id !== request.payload.generation) throw new Error('APPLICATION_KEY_REQUEST_EXPIRED')
+          this.#reader(request.payload.recipient); this.#reader(share.payload.issuer)
+        }
+        const work = (async () => {
+          signal.throwIfAborted(); await this.#scope(request); signal.throwIfAborted()
           if (share.payload.requestDigest !== requestDigest || !Array.isArray(share.payload.keys) || share.payload.keys.length !== epochs.length) throw new Error('APPLICATION_KEY_SHARE_INVALID')
           this.#reader(share.payload.issuer)
-          await verify(SHARE_DOMAIN, share, share.payload.issuer)
+          await verify(SHARE_DOMAIN, share, share.payload.issuer); current()
           const installed = new Map<number, Uint8Array>()
           for (const [index, item] of (share.payload.keys as ApplicationKeyShare['payload']['keys']).entries()) {
             if (item.epoch !== epochs[index] || !/^[0-9a-f]{64}$/u.test(item.encapsulatedKey) || !/^[0-9a-f]{96}$/u.test(item.ciphertext)) throw new Error('APPLICATION_KEY_SHARE_INVALID')
             const context = wrapContext(requestDigest, item.epoch)
             const key = await hpkeOpenBase(receiver.privateKey, receiver.publicKeyBytes, hexToBytes(item.encapsulatedKey), hexToBytes(item.ciphertext), context, context)
-            installed.set(item.epoch, key)
+            current(); installed.set(item.epoch, key)
           }
-          await this.#scope(request); this.#reader(share.payload.issuer)
-          await this.install(installed)
-        } finally { cancel() }
+          await this.#scope(request); current()
+          await this.#install(installed, current)
+        })()
+        const complete = (): void => { accepting = false; finished = true; release() }
+        void work.then(complete, complete)
+        return awaitOwnedTask(signal, () => work)
       } }
     } catch (error) { cancel(); throw error }
   }
@@ -174,8 +213,40 @@ export class ApplicationKeyring {
     return share
   }
 
-  close(): void { this.#closed = true; this.#listeners.clear(); this.#sources.clear(); for (const key of this.#keys.values()) key.fill(0); this.#keys.clear() }
-  #open(): void { if (this.#closed) throw new Error('APPLICATION_KEYRING_CLOSED') }
+  close(): Promise<void> {
+    if (this.#closeTask !== undefined) return this.#closeTask
+    this.#lifetime.abort(new Error('APPLICATION_KEYRING_CLOSED'))
+    for (const ticket of this.#tickets) ticket.abort(this.#lifetime.signal.reason)
+    this.#tickets.clear()
+    for (const source of this.#sources.values()) source.lifetime.abort(this.#lifetime.signal.reason)
+    this.#listeners.clear(); this.#sources.clear()
+    for (const key of this.#keys.values()) key.fill(0)
+    this.#keys.clear()
+    this.#closeTask = Promise.allSettled([this.#tail, this.#acquiring]).then(() => undefined)
+    return this.#closeTask
+  }
+  #open(): void { this.#lifetime.signal.throwIfAborted() }
+  async #offer(peer: string, source: KeySource, request: ApplicationKeyRequest): Promise<ApplicationKeyShare> {
+    const signal = AbortSignal.any([this.#lifetime.signal, source.lifetime.signal])
+    const current = (): void => {
+      signal.throwIfAborted(); this.#reader(peer)
+      if (this.#sources.get(peer) !== source) throw new Error('APPLICATION_KEY_SOURCE_DETACHED')
+    }
+    current()
+    const share = await awaitOwnedTask(signal, () => {
+      if (this.#sourceRequests >= 8) throw new Error('APPLICATION_KEY_SOURCE_BUSY')
+      this.#sourceRequests++
+      let pending: Promise<ApplicationKeyShare>
+      try { pending = Promise.resolve(source.offer(request)) }
+      catch (error) { this.#sourceRequests--; throw error }
+      // Ending the wait does not cancel physical provider work or free its slot.
+      void pending.then(() => { this.#sourceRequests-- }, () => { this.#sourceRequests-- })
+      return pending
+    })
+    current()
+    if (share.payload.issuer !== peer) throw new Error('APPLICATION_KEY_SHARE_INVALID')
+    return share
+  }
   #authority(): AuthorityBundle { this.#open(); return this.#replica?.authority ?? this.#initial }
   #reader(peer: string): void {
     const authority = this.#authority(), generation = authority.generations.at(-1)

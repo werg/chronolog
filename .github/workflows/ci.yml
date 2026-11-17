@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 5dc1e63365c4d073f03c6491ec5e84ed14c26f73
+          ref: 11c445e4d25e7b8ca415f3327c8049fcadc9f547
           path: artifacts/contrib-recipes
           persist-credentials: false
       - name: Qualify previews through the standalone public package
@@ -50,6 +50,14 @@ jobs:
           archives=(artifacts/peer-session/chronolog-peer-session-*.tgz)
           test "${#archives[@]}" -eq 1
           node artifacts/contrib-recipes/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --output artifacts/peer-session-consumer
+      - name: Build and qualify the pinned native SQL application package
+        shell: bash
+        run: |
+          node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
+          archives=(artifacts/peer-session-sql/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
+          node artifacts/contrib-recipes/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --domain tasks --output artifacts/peer-session-tasks
       - name: Preserve public peer-session qualification
         if: always()
         uses: actions/upload-artifact@v6
@@ -60,6 +68,10 @@ jobs:
             artifacts/peer-session/package/provenance.json
             artifacts/peer-session-consumer/report.json
             artifacts/peer-session-consumer/summary.json
+            artifacts/peer-session-sql/package/provenance.json
+            artifacts/peer-session-sql-check/report.json
+            artifacts/peer-session-tasks/report.json
+            artifacts/peer-session-tasks/summary.json
           if-no-files-found: warn
           retention-days: 30
       - name: Preserve the standalone live-signal package

@@ -278,6 +278,41 @@ describe('replicated SQL materialization', () => {
     materializer.close()
   })
 
+  it('publishes rollback to an exact retained checkpoint and reopens that revision', async () => {
+    const { path, manifest } = await fixture()
+    let materializer = await open(path, manifest, 1)
+    const runtime = createDoltLiteMaterializationRuntime(materializer)
+    const digest = materializer.executionManifestDigest
+    const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE rollback (id INTEGER PRIMARY KEY)')], digest)
+    const insert = await transaction(2n, 'insert', [sqlStatement('INSERT INTO rollback (id) VALUES (1)')], digest)
+    const initial = (await runtime.coordinator.materialize([setup]))!
+    await runtime.publications.publish(initial.publication)
+    await materializer.publishFinal(1)
+    const checkpointHash = materializer.databaseContentHash
+    const extended = (await runtime.coordinator.materialize([setup, insert]))!
+    await runtime.publications.publish(extended.publication)
+    const previousRevision = materializer.revision
+    const held = materializer.captureRead({ view: 'local' })
+    try {
+      const rollback = (await runtime.coordinator.materialize([setup]))!
+      expect(rollback.revision).toMatchObject({ previousRevision, revision: previousRevision + 1n,
+        orderLength: 1, replayedTransactions: 0, checkpointPrefix: 1, contentHash: checkpointHash })
+      expect(rollback.publication.publicationKey).not.toBe(initial.publication.publicationKey)
+      const published = await runtime.publications.publish(rollback.publication)
+      expect(await runtime.publications.publish(rollback.publication)).toEqual(published)
+      expect(rows(materializer, 'SELECT id FROM rollback')).toEqual([])
+      expect(materializer.outcome(insert.txId)).toBeNull()
+      expect(held.query('SELECT id FROM rollback').rows).toEqual([[{ kind: 'integer', value: '1' }]])
+    } finally { held.release(); materializer.close() }
+    materializer = await open(path, manifest, 1)
+    expect(materializer.revision).toBe(previousRevision + 1n)
+    expect(materializer.finalOrderLength).toBe(1)
+    expect(materializer.databaseContentHash).toBe(checkpointHash)
+    expect(rows(materializer, 'SELECT id FROM rollback')).toEqual([])
+    expect(await materializer.materialize([setup])).toBeNull()
+    materializer.close()
+  })
+
   it('reads a real final SQL prefix, keeps tentative work local, and reopens both views', async () => {
     const { path, manifest } = await fixture()
     let materializer = await open(path, manifest, 100)

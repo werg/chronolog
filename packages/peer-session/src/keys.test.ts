@@ -10,12 +10,15 @@ import { ApplicationKeyring } from './keys.js'
 
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
-async function fixture(options: { loseKeyReply?: boolean } = {}) {
+async function fixture(options: { loseKeyReply?: boolean; beforeKeyRead?: () => Promise<void> } = {}) {
   const host = await createPeerIdentity(), stores: PeerStore[] = [new MemoryPeerStore(), new MemoryPeerStore(), new MemoryPeerStore()]
   let loseReply = options.loseKeyReply ?? false
-  if (loseReply) {
+  if (loseReply || options.beforeKeyRead !== undefined) {
     const saved = stores[1]!
-    stores[1] = { get: key => saved.get(key), async put(key, value) {
+    stores[1] = { async get(key) {
+      if (key.startsWith('peer-session/keys/')) await options.beforeKeyRead?.()
+      return saved.get(key)
+    }, async put(key, value) {
       await saved.put(key, value)
       if (loseReply && key.startsWith('peer-session/keys/')) { loseReply = false; throw new Error('LOST_KEY_STORAGE_REPLY') }
     } }
@@ -39,11 +42,16 @@ async function fixture(options: { loseKeyReply?: boolean } = {}) {
     const replica: PeerReplica = await createPeerReplica({ authority, device: device.identity, storageId: device.storageId,
       store: device.store, materializer: runtime, epochKeys: keys.epochKeys })
     keys.bind(replica); await keys.validate()
-    const close = async () => { await replica.close(); keys.close(); await device.close() }
+    const close = async () => { await keys.close(); await replica.close(); await device.close() }
     cleanup.push(close)
     return { device, keys, replica, close }
   }
   return { host, devices, key, control, registry, open }
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
 }
 
 describe('durable peer key enrollment', () => {
@@ -113,5 +121,54 @@ describe('durable peer key enrollment', () => {
     await b.close(); b = await f.open(1)
     expect(b.keys.missing()).toEqual([])
     expect(await b.keys.request()).toBeNull()
+  })
+
+  it('bounds physical key providers and closes an unanswered enrollment before a late share arrives', async () => {
+    const f = await fixture(), a = await f.open(0, new Map([[0, f.key]])); let b = await f.open(1)
+    const started = Array.from({ length: 9 }, () => deferred<void>())
+    const responses = Array.from({ length: 9 }, () => deferred<Awaited<ReturnType<typeof a.keys.offer>>>())
+    const requests: Parameters<typeof a.keys.offer>[0][] = []
+    const offer = (request: Parameters<typeof a.keys.offer>[0]) => {
+      const index = requests.length; requests.push(request); started[index]!.resolve(); return responses[index]!.promise
+    }
+    for (let index = 0; index < 8; index++) {
+      const detach = b.keys.attachSource(a.device.identity.publicKey, offer)
+      const result = b.keys.ensure().catch((error: unknown) => error)
+      await started[index]!.promise; detach()
+      expect(await result).toMatchObject({ message: 'APPLICATION_KEY_SOURCE_DETACHED' })
+    }
+    b.keys.attachSource(a.device.identity.publicKey, offer)
+    await expect(b.keys.ensure()).rejects.toThrow('APPLICATION_KEY_SOURCE_BUSY')
+    expect(requests).toHaveLength(8)
+    await b.close(); b = await f.open(1)
+    b.keys.attachSource(a.device.identity.publicKey, offer)
+    const result = b.keys.ensure().catch((error: unknown) => error)
+    await started[8]!.promise
+    await b.keys.close()
+    expect(await result).toMatchObject({ message: 'APPLICATION_KEYRING_CLOSED' })
+    const share = await a.keys.offer(requests[8]!)
+    responses[8]!.resolve(share); await responses[8]!.promise
+    expect(b.keys.epochKeys.size).toBe(0)
+    expect(requests).toHaveLength(9)
+    await b.close()
+    const reopened = await f.open(1)
+    expect(reopened.keys.missing()).toEqual([0])
+  })
+
+  it('cancels an in-flight accepted share before its queued durable installation', async () => {
+    let pause = false
+    const entered = deferred<void>(), release = deferred<void>()
+    const f = await fixture({ beforeKeyRead: async () => { if (pause) { entered.resolve(); await release.promise } } })
+    const a = await f.open(0, new Map([[0, f.key]])), b = await f.open(1)
+    const ticket = (await b.keys.request())!, share = await a.keys.offer(ticket.request)
+    pause = true
+    const result = ticket.accept(share).catch((error: unknown) => error)
+    await entered.promise
+    ticket.cancel()
+    expect(await result).toMatchObject({ message: 'APPLICATION_KEY_REQUEST_CLOSED' })
+    release.resolve(); pause = false
+    await b.close()
+    const reopened = await f.open(1)
+    expect(reopened.keys.missing()).toEqual([0])
   })
 })

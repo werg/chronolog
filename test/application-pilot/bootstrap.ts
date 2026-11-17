@@ -85,7 +85,7 @@ async function connect(): Promise<void> {
       const workerLifetime = new AbortController()
       const attempt = AbortSignal.any([signal, workerLifetime.signal])
       try {
-        introduced = await introducePeerWorker({ peers: target.tendril.peers, channel: crypto.randomUUID(), peerId: device!,
+        introduced = await introducePeerWorker({ peers: target.tendril.host.peers, channel: crypto.randomUUID(), peerId: device!,
           signal: attempt, configuration: { iceServers: [] }, handoff(channels) {
             // Transfer synchronously; only the Worker owns keys, frames and replay.
             activeConnection = ++connectionSequence

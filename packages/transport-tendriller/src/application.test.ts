@@ -49,6 +49,22 @@ function fixture() {
 }
 
 describe('selected Chronolog application adapter', () => {
+  it('rejects generation-only preconditions and views before touching the replica', async () => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: false })
+    expect(backend.profile).toBe('chronolog-finality-v1')
+    const options = { operationId: 'stable', basedOn: 'generation-revision' }
+    await expect(backend.submit(program(emit('conversation', { text: 'guarded' })), options))
+      .rejects.toMatchObject({ code: 'unsupported_barrier' })
+    await expect(backend.events.publish('conversation', { text: 'guarded' }, options))
+      .rejects.toMatchObject({ code: 'unsupported_barrier' })
+    expect(f.calls).toEqual([])
+    expect(f.reads).toBe(0)
+    expect(() => backend.changes({ view: 'applied' })).toThrow('Choose the local or final view')
+    await expect(backend.readView({ view: 'applied' })).rejects.toMatchObject({ code: 'invalid_view' })
+    expect(f.changeCalls).toEqual([])
+    expect(f.viewCalls).toEqual([])
+  })
+
   it('delegates one exact authored program and never creates a second command identity', async () => {
     const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: false })
     const change = program(emit('conversation', { text: 'reviewed' }))

@@ -117,10 +117,61 @@ Coverage retains one strongest claim per current reader identity, so changing
 storage IDs cannot count one signer as several independent peers. Recovery
 clears those claims; the new generation needs fresh retention acknowledgments.
 
+## Authenticated peer connections
+
+`session.connectPeer({ connection, peerIdentity?, signal? })` owns an authenticated
+connection to another current reader. `connection` supplies reliable framed byte
+lanes (`send`, `frames`, `signal`, `close`) and an optional separate lossy `live`
+lane. The existing `openWebRtcConnection()` and `frameRtcPeerChannels()` results
+implement this structural interface directly, in a native process or an owning
+browser Worker. A discovery result identifies a possible route; the session
+independently verifies a fresh signed challenge bound to both identities, the
+application descriptor, and the generation profile before attaching that route.
+An optional `peerIdentity` pins the discovered identity. A control-only host
+identity cannot attach without an explicit reader grant.
+The hello can carry a newer signed authority bundle, so an existing reader can
+verify a newly enrolled peer's grant before checking its proof of possession.
+
+The returned link exposes `peerId`, `signal`, `completion`, `synchronize()` and
+`close()`. History requests select one advertised head and check each original
+signed command before retaining its ciphertext and replaying it. Retention proofs
+refer to an exact locally held prefix. Both directions exchange available history,
+including when a fresh device is still recovering an inherited generation.
+Explicit synchronization observes a fresh head after any older background pull.
+Local history/control changes trigger coalesced peer hints; there is no idle host
+polling or application-data HTTP fallback. Pending commands use the session's
+existing immutable attempt journal, and retry after reconnection preserves those
+original bytes.
+
+Reliable messages are fragmented into at most 48 KiB payloads. Each connection
+bounds messages to 32 MiB, queued reliable work to eight messages and 32 MiB,
+in-flight requests to four in each direction, and history pages to 32 commands
+and 4 MiB. The replica's configured quotas bound retained history; transfer does
+not allocate a second whole-history buffer. A session owns at most eight peers and
+eight opening handshakes. Defaults are 10 seconds for authentication, 30 seconds
+for a queued write or partial message, and 120 seconds per request; callers can
+set the three corresponding timeout options up to 120 seconds. Closing fences
+pending replies and detaches routes synchronously, then retires transport work.
+Already committed commands remain eligible for exact retry after a lost reply.
+
+Signed live signals use only the optional lossy lane and its independent bounded
+queue. Congestion drops live traffic before dispatch; it never enters the durable
+history queue. Live signal authors and connected peers must remain current
+readers. Command submission and ordering additionally recheck current writer
+permissions. Reader removal retires the peer connection.
+
+The initial creator provisions its epoch key explicitly. Maintained connections
+acquire a granted reader's missing keys through the authenticated keyring port;
+each share is HPKE-wrapped for that device's fresh signed request. The request's
+recipient and the share's issuer must match their authenticated peer connection.
+Keys are never sent in plaintext or through an automatic hosted fallback. Use a
+confidential transport such as WebRTC when live signal contents require privacy.
+
 `connectApplications(a, b)` is a built-in in-process transport for embedded peers
-and independent-store qualification. It carries commands, verified history,
-retention acknowledgments and signed live signals. It is not a measurement of
-Internet WebRTC routing. No recipe needs its own application retry queue.
+and independent-store qualification. It executes this same authenticated framed
+protocol over bounded memory byte lanes, including live signals. It is not a
+measurement of Internet WebRTC routing. No recipe needs its own application retry
+queue.
 
 `session.recovery.takeover(host, { transitionId })` validates this device's
 complete recovery point, saves one signed transition request, selects it through
@@ -130,26 +181,42 @@ lost hosted reply, including after device reopen. A planned
 requires the successor's signed retention of the exact current prefix. These
 methods never reinterpret an excluded branch as an eligible recovery base.
 
+`ApplicationControlHost` recognizes the typed error code
+`peer_generation_conflict`; error messages are diagnostic. Direct adapters can
+throw the exported `ApplicationControlConflictError`, and HTTP adapters preserve
+or map that code. After verifying a competing successor, the session marks its
+original signed request superseded and adopts the current authority. That
+transition ID is never resubmitted.
+
+The recovery journal retains up to 64 transition attempts, including completed
+and superseded attempts. Once full, it refuses new signing and hosted selection
+requests. There is no automatic pruning or reset: the application must choose
+an explicit device/application lifecycle. Pending exact requests are never
+discarded to create room for a different transition.
+
 ## Peer connections and Worker ownership
 
-`connectApplicationTransport(session, { connection, expectedPeerId })` owns the
-signed challenge handshake, bounded requests, captured history ranges and
-retention acknowledgments over a framed reliable connection. Its optional live
-lane carries disposable signed signals independently. Each side must call this
-function; close or cancellation fences pending responses.
+`session.connectPeer({ connection, peerIdentity })` owns the protocol described
+above. `connection` implements the shared `FramedPeerConnection` interface from
+`@chronolog/records`. Each side calls its own session; the returned
+`ApplicationPeerLink` includes its authenticated lifetime and traffic counters.
 
-`connection.synchronize()` finishes one captured prefix. Later change hints
+`link.synchronize()` finishes one captured prefix. Later change hints
 coalesce into a separate pass, so a continuously writing coordinator cannot
 extend an earlier wait indefinitely. Ranges contain at most 32 commands and
-fit the 1 MiB frame limit; verified pages are retained before requesting the
-next page. The replica's configured record and history-byte quotas bound the
-complete history. There is no smaller whole-history network buffer limit.
-The selected view is published only after the captured root is available, and
+4 MiB, transported in bounded fragments; verified pages are retained before
+requesting the next page. The current replica envelope permits at most 4,096
+retained records and 64 MiB of history; lower configured quotas still apply.
+There is no smaller whole-history network buffer limit. For a published source,
+the selected view is published only after the captured root is available, and
 the retention acknowledgment names that captured prefix. If recovery excludes
 the captured generation during transfer, the pass fails explicitly; reconnect
 or synchronize against the newly selected history. The lower-level replica
 accepts command arrays or an async iterable of bounded command pages through
 `synchronize(authority, commands, { at: capturedRevision })`.
+A source without a complete published target can still transfer its contiguous
+retained evidence. A recovering receiver stays unavailable until the selected
+inherited prefix is complete.
 
 A congested live lane refuses the current send without queuing it or closing
 the reliable connection. Ending that lane retires its live route. A dispatched
@@ -161,18 +228,28 @@ available when that attempt began; reconnecting never replays missed signals.
 The `/webrtc` entry provides `connectApplicationWebRtc(session, options)` for a
 runtime with a usable RTC factory. The optional `/webrtc-native` entry supplies
 `connectNativeApplicationWebRtc(session, options)` with the exact supported
-Werift implementation. Returned connections expose logical frame byte counts,
+Werift implementation. Returned connections expose reliable framed byte counts (including authentication and fragmentation),
 request counts, and `rtc.getRoute()` observations. An unknown observed route
 stays unknown.
 
 In a browser, install `installApplicationWorkerTransport(session, self)` beside
 the Worker-owned session. The page calls
-`connectWorkerApplicationWebRtc(worker, { role, signaling, expectedPeerId })`.
+`connectWorkerApplicationWebRtc(worker, { role, signaling, peerIdentity })`.
 The helper transfers both negotiated channels synchronously, owns the dedicated
 control port, and waits for authentication and initial replay. The page retains
 the peer connection for ICE lifecycle and route diagnostics. This API requires a
 browser that supports transferring RTC data channels; unsupported browsers fail
 explicitly. Actual browser qualification is separate from native stream tests.
+
+The WebRTC CI workflow runs `tools/test-peer-session-webrtc.ts` with actual
+Chromium, a DedicatedWorker holding OPFS, and a native SQLite peer. Its separate
+source-bound report checks authenticated reconnection with the original saved
+attempt, peer commands, signed live signals and encrypted content after the page
+and signaling HTTP server stops, then an offline session reopen. The artifact
+contains the emitted page and Worker JavaScript as well as their hashes. A local
+`--build-only` run checks the browser graph without claiming browser execution.
+This fixture provisions epoch keys explicitly and uses loopback ICE; it does not
+qualify hosted enrollment, automatic key delivery, public NAT traversal or TURN.
 
 A session with a selected recovery prefix that has not arrived reports
 `status.phase === 'recovering'`. Queries fail with `PEER_RECOVERING` until a
@@ -237,9 +314,10 @@ history. Readers fetch missing chunks from authenticated peers, verify them,
 and retain verified chunks for bounded resumption.
 
 `content.read(reference, { offset, length, signal })` yields plaintext chunks.
-`content.retain(reference)` fetches the complete object and sends a signed
-durable-copy observation to available sources. `content.retention(reference)`
-reports those observations. Missing content returns `CONTENT_UNAVAILABLE`
+`content.retain(reference)` fetches the complete object and attempts to announce
+its signed durable-copy observation to available sources. A lost notification
+does not invalidate the retained copy. `content.retention(reference)` reports
+those observations. Missing content returns `CONTENT_UNAVAILABLE`
 without invalidating the application history that refers to it. Current read
 permissions are rechecked at every fetch; a reference is never a credential.
 

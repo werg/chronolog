@@ -7,6 +7,11 @@ Chronolog client through Tendriller's application contract. It does not open a
 second database, send application work to the host, allocate replacement
 operations, or select the group's finality provider.
 
+The adapter advertises `chronolog-finality-v1`. It supports local and final
+views and returns finality operation states. Requests for an applied-generation
+view or a generation-specific `basedOn` precondition fail before accessing or
+publishing through the replica.
+
 ```ts
 import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
 

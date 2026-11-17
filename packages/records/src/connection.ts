@@ -20,4 +20,3 @@ export interface FramedPeerConnection extends PeerFrameLane {
   /** Never multiplex disposable traffic into reliable history. */
   readonly live?: PeerLiveLane
 }
-

@@ -6,7 +6,7 @@ export { createNativePeerConnection, type NativeRtcOptions } from '@chronolog/tr
 
 /** Optional Node RTC adapter; install the declared exact Werift peer dependency. */
 export function connectNativeApplicationWebRtc(session: ApplicationSession, options: Omit<WebRtcOptions, 'createPeerConnection'> & {
-  readonly expectedPeerId?: string
+  readonly peerIdentity?: string
   readonly native?: NativeRtcOptions
 }) {
   return connectApplicationWebRtc(session, { ...options, createPeerConnection: configuration => createNativePeerConnection(configuration, options.native) })

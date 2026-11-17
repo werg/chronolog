@@ -6,7 +6,7 @@ import {
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
   type AuthorityBundle, type PeerIdentity, type PeerReplica, type PeerStore, type PrefixProof,
 } from './index.js'
-import { bytesToHex, signPeerValue } from './codec.js'
+import { bytesToHex, encodePeerValue, signPeerValue } from './codec.js'
 
 const opened: PeerReplica[] = []
 afterEach(async () => { for (const peer of opened.splice(0)) await peer.close() })
@@ -222,6 +222,90 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     await a.observeCoverage(await b.retainedCoverage())
     expect(a.shared()).toHaveLength(0)
   })
+  it('persists an incomplete selection and its abandoned-operation recovery across reopen', async () => {
+    const f = await fixture(), store = new MemoryPeerStore(), a = await f.open(f.a, store), b = await f.open(f.b)
+    const inherited = await a.prepare({ operationId: 'inherited', program: event('inherited') })
+    await a.order(inherited); await b.ingest(await a.exportCommands())
+    const tail = await a.prepare({ operationId: 'tail', program: event('tail') })
+    await a.order(tail)
+    const oldAuthority = a.authority, previousResult = await a.operation('tail'), held = await a.capture()
+    await f.select(f.b, await b.recoveryPoint(), 'survivor')
+    await b.adopt(await f.registry.read())
+    await b.order(await b.prepare({ operationId: 'next-generation', program: event('next-generation') }))
+    const surviving = await b.exportCommands()
+    const selected = await f.select(f.c, await b.recoveryPoint(), 'next-survivor'), authority = await f.registry.read()
+
+    expect(await a.receiveHistory(authority, [])).toEqual({ ready: false, recovery: null })
+    expect(a.generation.id).toBe(selected.id)
+    expect(a.ready).toBe(false)
+    expect(() => a.revision).toThrow('PEER_RECOVERING')
+    await expect(a.capture()).rejects.toThrow('PEER_RECOVERING')
+    await expect(a.operation('tail')).rejects.toThrow('PEER_RECOVERING')
+    expect((await a.exportCommands({ limit: 1 })).map(value => value.attempt.id)).toEqual([inherited.id])
+    expect(a.retainedPoint).toEqual({ generation: inherited.payload.header.generation, sequence: 1, root: surviving[0]!.receipt.root })
+    expect((await a.retainedCoverage(a.retainedPoint!)).payload.point).toEqual(a.retainedPoint)
+    await expect(a.retainedCoverage({ generation: surviving[1]!.receipt.payload.generation, sequence: 1, root: surviving[1]!.receipt.root })).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
+    expect(held.read.orderLength).toBe(2); held.release()
+    await a.close()
+
+    // The stale bootstrap hint cannot roll back the durably accepted selection.
+    const reopened = await f.open(f.a, store, oldAuthority)
+    expect(reopened.generation.id).toBe(selected.id)
+    expect(reopened.ready).toBe(false)
+    const received = await reopened.receiveHistory(authority, surviving)
+    expect(received.ready).toBe(true)
+    expect(received.recovery).toMatchObject({ previousGeneration: oldAuthority.generations[0]!.id, generation: selected.id, unknownLoss: true })
+    expect(received.recovery?.abandoned).toContainEqual(expect.objectContaining({ operationId: 'tail', status: 'abandoned', previous: previousResult }))
+    expect((await reopened.operation('inherited'))?.status).toBe('applied')
+    expect((await reopened.operation('tail'))?.status).toBe('abandoned')
+    expect((await reopened.receiveHistory(authority, [])).recovery).toBeNull()
+    expect(reopened.inspectRecovery()).toHaveLength(1)
+  })
+  it('continues a retained range across an empty selected generation', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const empty = await a.recoveryPoint()
+    await f.select(f.b, empty, 'empty-parent')
+    await b.adopt(await f.registry.read())
+    const command = await b.order(await b.prepare({ operationId: 'child', program: event('child') }))
+    expect(await b.exportCommands({ after: empty.point, limit: 1 })).toEqual([command])
+  })
+  it('does not duplicate a durable recovery notice after its storage acknowledgement is lost', async () => {
+    const f = await fixture(), durable = new MemoryPeerStore()
+    let loseAck = false
+    const store: PeerStore = { get: key => durable.get(key), async put(key, value) {
+      await durable.put(key, value)
+      if (loseAck && key.endsWith('/recoveries')) { loseAck = false; throw new Error('LOST_RECOVERY_ACK') }
+    } }
+    const a = await f.open(f.a, store), b = await f.open(f.b), oldAuthority = a.authority
+    await a.order(await a.prepare({ operationId: 'discarded', program: event('discarded') }))
+    const original = await a.operation('discarded')
+    const selected = await f.select(f.b, await b.recoveryPoint(), 'notice-retry')
+    loseAck = true
+    await expect(a.receiveHistory(await f.registry.read(), [])).rejects.toThrow('LOST_RECOVERY_ACK')
+    await a.close()
+    const reopened = await f.open(f.a, store, oldAuthority)
+    expect(reopened.generation.id).toBe(selected.id)
+    expect(reopened.inspectRecovery()).toHaveLength(1)
+    expect(await reopened.operation('discarded')).toMatchObject({ status: 'abandoned', previous: original })
+    expect((await reopened.receiveHistory(await f.registry.read(), [])).recovery).toBeNull()
+    expect(reopened.inspectRecovery()).toHaveLength(1)
+  })
+  it('keeps at most one retained coverage claim per authenticated signer', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), clone = await f.open(f.b, undefined, undefined, 'renamed-store')
+    await a.observeCoverage(await b.retainedCoverage())
+    await a.observeCoverage(await clone.retainedCoverage())
+    expect(a.shared()).toHaveLength(1)
+    expect(a.shared()[0]?.payload.peer).toBe(f.b.publicKey)
+  })
+  it('bounds exported command pages before copying their encrypted bodies', async () => {
+    const f = await fixture(), a = await f.open(f.a)
+    await a.order(await a.prepare({ operationId: 'first', program: event('first') }))
+    await a.order(await a.prepare({ operationId: 'second', program: event('second') }))
+    const commands = await a.exportCommands(), firstBytes = encodePeerValue(commands[0]!).byteLength
+    expect(await a.exportCommands({ limit: 2, maxBytes: firstBytes })).toEqual([commands[0]])
+    await expect(a.exportCommands({ maxBytes: firstBytes - 1 })).rejects.toThrow('PEER_RANGE_RECORD_TOO_LARGE')
+    await expect(a.exportCommands({ maxBytes: 0 })).rejects.toThrow('PEER_RANGE_BYTES_INVALID')
+  })
   it('bounds retention evidence by current peer identity and refuses stale or revoked claims', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const old = await b.retainedCoverage()
@@ -250,4 +334,5 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
       { ...latest.payload, generation: a.generation.id, point: a.revision.point }, f.b)
     await expect(a.observeCoverage(revoked)).rejects.toThrow('PEER_COVERAGE_INVALID')
   })
+
 })

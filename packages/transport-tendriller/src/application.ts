@@ -3,11 +3,12 @@ import {
   type ChronologClient, type DecodedLocalSqlValue, type LocalSqlInput,
 } from '@chronolog/client'
 import type { ChronologNode } from '@chronolog/node-core'
-import { emit, program, type ChangeProgram, type EventPayload, type ViewChange } from '@chronolog/protocol'
+import { emit, program, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import { ChangeSignal } from '@chronolog/records'
 import {
   ApplicationError, assertApplicationOperationId, applicationSelection,
-  type ApplicationBackend, type ApplicationChangeOptions, type ApplicationReadView, type FinalityApplicationOperation,
+  type ApplicationBackend, type FinalityApplicationOperation, type ApplicationReadView,
+  type ApplicationChange, type ApplicationChangeOptions, type ApplicationView,
   type ApplicationEventReadOptions, type ApplicationEventBatch, type ApplicationSubmitOptions,
 } from '@tendriller/core/application'
 
@@ -18,9 +19,12 @@ export interface ChronologApplicationQuery {
   readonly rows: readonly (readonly DecodedLocalSqlValue[])[]
   readonly truncated: boolean
 }
+export type ChronologApplicationReadView = Extract<ApplicationReadView<ChronologApplicationQuery, LocalSqlInput>, { readonly view: 'local' | 'final' }>
+export type ChronologApplicationChange = Extract<ApplicationChange, { readonly view: 'local' | 'final' }>
 export interface ChronologApplicationBackend extends ApplicationBackend<ChangeProgram, FinalityApplicationOperation, ChronologApplicationQuery, LocalSqlInput> {
-  changes(options?: ApplicationChangeOptions): AsyncIterable<ViewChange>
-  readView(options?: Pick<ApplicationChangeOptions, 'view'>): Promise<Extract<ApplicationReadView<ChronologApplicationQuery, LocalSqlInput>, { readonly view: 'local' | 'final' }>>
+  readonly profile: 'chronolog-finality-v1'
+  changes(options?: ApplicationChangeOptions): AsyncIterable<ChronologApplicationChange>
+  readView(options?: { readonly view?: ApplicationView }): Promise<ChronologApplicationReadView>
 }
 export type NodeApplicationSource = Pick<ChronologNode, 'publish' | 'operation' | 'revisions' | 'revision' | 'changes' | 'readView' | 'events'>
 export type ClientApplicationSource = Pick<ChronologClient, 'submit' | 'operations' | 'changes' | 'readView' | 'events'>
@@ -49,12 +53,10 @@ function operation(value: OperationState): FinalityApplicationOperation {
 function nodeSource(replica: NodeApplicationSource | ClientApplicationSource): replica is NodeApplicationSource {
   return 'publish' in replica
 }
-function chronologicalView(value: unknown): 'local' | 'final' {
-  if (value === undefined) return 'final'
-  if (value !== 'local' && value !== 'final') {
-    throw new ApplicationError('invalid_view', 'Chronological history supports only local or final application views')
-  }
-  return value
+function finalityView(view: unknown): 'local' | 'final' {
+  if (view === undefined) return 'final'
+  if (view === 'local' || view === 'final') return view
+  throw new ApplicationError('invalid_view', 'Choose the local or final view for chronolog-finality-v1')
 }
 
 /**
@@ -77,7 +79,7 @@ export function createChronologApplicationBackend(options: {
   }
   const submit: ChronologApplicationBackend['submit'] = async (change, submitOptions) => {
     if (submitOptions.basedOn !== undefined) {
-      throw new ApplicationError('unsupported_barrier', 'Chronological history does not support basedOn ordering barriers')
+      throw new ApplicationError('unsupported_barrier', 'Generation preconditions are unavailable in chronolog-finality-v1')
     }
     const operationId = assertApplicationOperationId(submitOptions.operationId)
     if (nodeSource(replica)) {
@@ -141,7 +143,7 @@ export function createChronologApplicationBackend(options: {
   } })
   const wrapView = (view: { readonly view: 'local' | 'final'; readonly revision: string; readonly finalRevision: string;
       readEvents(options?: ApplicationEventReadOptions): ApplicationEventBatch | Promise<ApplicationEventBatch>; release(): void | Promise<void> },
-    query: (sql: string, parameters: readonly LocalSqlInput[]) => Promise<ChronologApplicationQuery>): Awaited<ReturnType<ChronologApplicationBackend['readView']>> => {
+    query: (sql: string, parameters: readonly LocalSqlInput[]) => Promise<ChronologApplicationQuery>): ChronologApplicationReadView => {
     let released = false
     const assertHeld = (): void => { if (released) throw new Error('APPLICATION_VIEW_RELEASED') }
     return Object.freeze({ view: view.view, revision: view.revision, finalRevision: view.finalRevision,
@@ -155,20 +157,17 @@ export function createChronologApplicationBackend(options: {
     })
   }
   return Object.freeze({
-    id, capabilities: Object.freeze([...(supportsSql ? ['sql'] : []), 'events', 'conversation', 'revision-views', 'operation-status']),
+    id, profile: 'chronolog-finality-v1', capabilities: Object.freeze([...(supportsSql ? ['sql'] : []), 'events', 'conversation', 'revision-views', 'operation-status']),
     submit,
-    changes: (changeOptions: ApplicationChangeOptions = {}) => replica.changes({
-      view: chronologicalView(changeOptions.view),
-      ...(changeOptions.signal === undefined ? {} : { signal: changeOptions.signal }),
-    }),
+    changes: (changeOptions: ApplicationChangeOptions = {}) => replica.changes({ ...changeOptions, view: finalityView(changeOptions.view) }),
     events: Object.freeze({
       publish: (topic: string, payload: unknown, submitOptions: ApplicationSubmitOptions) => submit(program(emit(topic, payload as EventPayload)), submitOptions),
       read: (readOptions: ApplicationEventReadOptions = {}) => replica.events.read(readOptions),
       subscribe: (readOptions: ApplicationEventReadOptions = {}) => replica.events.subscribe(readOptions),
     }),
     operations: Object.freeze({ get, subscribe }),
-    async readView(readOptions: Pick<ApplicationChangeOptions, 'view'> = {}) {
-      const selected = { view: chronologicalView(readOptions.view) }
+    async readView(readOptions: { readonly view?: ApplicationView } = {}) {
+      const selected = { view: finalityView(readOptions.view) }
       if (nodeSource(replica)) {
         const view = await replica.readView(selected)
         return wrapView(view, async (sql, parameters) => {

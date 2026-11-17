@@ -71,8 +71,8 @@ importers:
         specifier: 1.65.0
         version: 1.65.0
       '@tendriller/core':
-        specifier: file:./test/artifacts/tendriller-sdk-90cfb794.tgz
-        version: file:test/artifacts/tendriller-sdk-90cfb794.tgz
+        specifier: file:./test/artifacts/tendriller-sdk-cb32e137.tgz
+        version: file:test/artifacts/tendriller-sdk-cb32e137.tgz
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
@@ -558,11 +558,11 @@ importers:
         specifier: workspace:*
         version: link:../rpc
       '@tendriller/core':
-        specifier: file:../../test/artifacts/tendriller-sdk-90cfb794.tgz
-        version: file:test/artifacts/tendriller-sdk-90cfb794.tgz
+        specifier: file:../../test/artifacts/tendriller-sdk-cb32e137.tgz
+        version: file:test/artifacts/tendriller-sdk-cb32e137.tgz
       '@tendriller/engine':
-        specifier: file:../../test/artifacts/tendriller-engine-90cfb794.tgz
-        version: file:test/artifacts/tendriller-engine-90cfb794.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-90cfb794.tgz)
+        specifier: file:../../test/artifacts/tendriller-engine-cb32e137.tgz
+        version: file:test/artifacts/tendriller-engine-cb32e137.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-cb32e137.tgz)
 
   packages/transport-webrtc:
     dependencies:
@@ -1302,12 +1302,12 @@ packages:
   '@speed-highlight/core@1.2.24':
     resolution: {integrity: sha512-qeW2e1l78afw8VhRPfPQ1Gjj+KU5XFQ/OFV5ti6eTa9bruO7mJyZtA4vw0ofqmA3tKCkROE9xLk3VZoeRc98nw==}
 
-  '@tendriller/core@file:test/artifacts/tendriller-sdk-90cfb794.tgz':
-    resolution: {integrity: sha512-GpHG66RHKZDB210MOa+zoKKXnOGxbxpAJzCEfor90+U7lCDsNNEpzmE0cKXJ4NhsNlRVoyCFj778JMMD+u129w==, tarball: file:test/artifacts/tendriller-sdk-90cfb794.tgz}
+  '@tendriller/core@file:test/artifacts/tendriller-sdk-cb32e137.tgz':
+    resolution: {integrity: sha512-7cBJryKSpQmIJ3Kui0etwBe28xsKAhLyVdKktM78xIuMcrUxXNrHpfp4f0Nft6+iuOh6lFfx/6R7F+FNUewyQQ==, tarball: file:test/artifacts/tendriller-sdk-cb32e137.tgz}
     version: 0.3.0-rc.9
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-90cfb794.tgz':
-    resolution: {integrity: sha512-4VTTP6u01IECXPTqIPFwD0KyU6Xd3aRqWvQ1yqjL2WZe7Onu7QVYLr0Jo/oH1U2wVfYjqsZ+Jfkzx+jBVazBPQ==, tarball: file:test/artifacts/tendriller-engine-90cfb794.tgz}
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-cb32e137.tgz':
+    resolution: {integrity: sha512-FZKBKJ/Ev0NgQzGtx8/0AyQD7IM//1QeZMogMZUnIAGTnY+Mqzd3A1MmRHwHuiodmXT2yzrxBZXwYN5kDeVmrA==, tarball: file:test/artifacts/tendriller-engine-cb32e137.tgz}
     version: 0.3.0-rc.9
     peerDependencies:
       '@tendriller/core': 0.3.0-rc.9
@@ -3651,12 +3651,12 @@ snapshots:
 
   '@speed-highlight/core@1.2.24': {}
 
-  '@tendriller/core@file:test/artifacts/tendriller-sdk-90cfb794.tgz': {}
+  '@tendriller/core@file:test/artifacts/tendriller-sdk-cb32e137.tgz': {}
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-90cfb794.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-90cfb794.tgz)':
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-cb32e137.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-cb32e137.tgz)':
     dependencies:
       '@cloudflare/workers-types': 5.20261113.1
-      '@tendriller/core': file:test/artifacts/tendriller-sdk-90cfb794.tgz
+      '@tendriller/core': file:test/artifacts/tendriller-sdk-cb32e137.tgz
 
   '@testcontainers/toxiproxy@12.0.4':
     dependencies:

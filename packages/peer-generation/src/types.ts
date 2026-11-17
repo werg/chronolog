@@ -1,6 +1,6 @@
 import type { ChangeProgram } from '@chronolog/protocol'
 import type { ChronologMaterializationRuntime, MaterializedReadHandle, MaterializedTransactionOutcome } from '@chronolog/materializer'
-import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerIdentity, PeerStore, PrefixProof, Signed, SignedGeneration } from './control-types.js'
+import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerGrant, PeerIdentity, PeerStore, PrefixProof, Signed, SignedGeneration } from './control-types.js'
 import type { PEER_GENERATION_PROFILE } from './control-types.js'
 export * from './control-types.js'
 
@@ -58,6 +58,10 @@ export interface RecoveryNotice {
   readonly abandoned: readonly OperationState[]
   readonly unknownLoss: boolean
 }
+export interface HistoryReceiveResult {
+  readonly ready: boolean
+  readonly recovery: RecoveryNotice | null
+}
 export interface RetainedCoverage {
   readonly applicationId: string
   readonly generation: string
@@ -104,20 +108,28 @@ export interface PeerReplica {
   readonly requiredEpochs: readonly number[]
   readonly authority: AuthorityBundle
   readonly generation: SignedGeneration
+  /** A complete selected prefix has been published as an application view. */
+  readonly ready: boolean
+  /** Last contiguous retained command in the selected history, before application publication if necessary. */
+  readonly retainedPoint: HistoryPoint | null
   readonly revision: PeerRevision
   readonly isCoordinator: boolean
+  /** Current verified control, including a selection whose application bodies are still recovering. */
+  grant(publicKey: string): PeerGrant | null
   prepare(input: PrepareCommand): Promise<SignedAttempt>
   order(attempt: SignedAttempt): Promise<OrderedCommand>
   ingest(commands: readonly OrderedCommand[]): Promise<void>
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null>
-  /** Retains bounded pages before publishing one complete captured prefix. Network reads run outside the replica lock. */
+  /** Fetches bounded pages outside the replica lock, then publishes one complete target. */
   synchronize(authority: AuthorityBundle, commands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>, options?: { readonly at?: PeerRevision }): Promise<RecoveryNotice | null>
+  receiveHistory(authority: AuthorityBundle, commands: readonly OrderedCommand[]): Promise<HistoryReceiveResult>
   operation(operationId: string, author?: string): Promise<OperationState | null>
   attempt(operationId: string, author?: string): Promise<SignedAttempt | null>
   capture(): Promise<CapturedPeerView>
   recoveryPoint(): Promise<PrefixProof>
   prefixProof(point: HistoryPoint): Promise<PrefixProof>
-  exportCommands(options?: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly at?: PeerRevision }): Promise<readonly OrderedCommand[]>
+  /** The contiguous retained selected prefix, including evidence available while recovery is pending. */
+  exportCommands(options?: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly maxBytes?: number; readonly at?: PeerRevision }): Promise<readonly OrderedCommand[]>
   pendingAttempts(): Promise<readonly SignedAttempt[]>
   retainedCoverage(point?: HistoryPoint): Promise<SignedRetainedCoverage>
   observeCoverage(coverage: SignedRetainedCoverage): Promise<void>

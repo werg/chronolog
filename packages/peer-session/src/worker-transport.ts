@@ -1,5 +1,5 @@
 import { frameRtcPeerChannels, negotiateWebRtc, type WebRtcOptions, type WebRtcSession } from '@chronolog/transport-webrtc'
-import { connectApplicationTransport, type ApplicationPeerConnection } from './network.js'
+import type { ApplicationPeerLink } from './network.js'
 import type { ApplicationSession } from './session.js'
 
 const CHANNEL_TRANSFER = 'chronolog/peer-session/rtc-channels/v1'
@@ -17,18 +17,20 @@ export interface ApplicationWorkerEndpoint {
  */
 export function installApplicationWorkerTransport(session: ApplicationSession, endpoint: ApplicationWorkerEndpoint): { close(): Promise<void> } {
   const active = new Set<() => Promise<void>>()
-  let closed = false
+  let closed = false, closing: Promise<void> | undefined
   const receive = (event: MessageEvent): void => {
     const data = event.data as Record<string, unknown> | null
     if (data === null || typeof data !== 'object' || data.type !== CHANNEL_TRANSFER) return
     const port = data.port as MessagePort | undefined
-    if (port === undefined || typeof port.postMessage !== 'function') return
+    if (port === undefined || typeof port.postMessage !== 'function') { retireTransferred(data); return }
     if (closed || active.size >= MAX_CONNECTIONS) {
-      port.postMessage({ type: 'ended', error: closed ? 'APPLICATION_WORKER_CLOSED' : 'APPLICATION_PEER_LIMIT' }); port.close()
+      retireTransferred(data)
+      try { port.postMessage({ type: 'ended', error: closed ? 'APPLICATION_WORKER_CLOSED' : 'APPLICATION_PEER_LIMIT' }) }
+      finally { port.close() }
       return
     }
     const lifetime = new AbortController()
-    let link: ApplicationPeerConnection | undefined, stopping: Promise<void> | undefined
+    let link: ApplicationPeerLink | undefined, stopping: Promise<void> | undefined
     let connection: ReturnType<typeof frameRtcPeerChannels> | undefined
     const end = (reason: unknown = new Error('APPLICATION_PEER_DISCONNECTED')): Promise<void> => {
       if (stopping !== undefined) return stopping
@@ -37,19 +39,19 @@ export function installApplicationWorkerTransport(session: ApplicationSession, e
         active.delete(end); port.close()
       })
       lifetime.abort(reason)
-      port.postMessage({ type: 'ended', error: errorMessage(reason) })
+      try { port.postMessage({ type: 'ended', error: errorMessage(reason) }) } catch { /* The owner may already have closed its control port. */ }
       port.removeEventListener('message', request)
       return stopping
     }
-    let pending = 0
+    let pending = 0, lastRequest = 0
     const request = (message: MessageEvent): void => {
       const input = message.data as Record<string, unknown> | null
       if (input === null || typeof input !== 'object') { void end(new Error('APPLICATION_WORKER_MESSAGE_INVALID')); return }
       if (input.type === 'close') { void end(); return }
-      if (input.type !== 'synchronize' || !Number.isSafeInteger(input.id) || pending >= MAX_REQUESTS || link === undefined) {
+      if (input.type !== 'synchronize' || !Number.isSafeInteger(input.id) || Number(input.id) <= lastRequest || pending >= MAX_REQUESTS || link === undefined) {
         void end(new Error('APPLICATION_WORKER_REQUEST_INVALID')); return
       }
-      pending++
+      lastRequest = Number(input.id); pending++
       void link.synchronize().then(() => {
         lifetime.signal.throwIfAborted()
         port.postMessage({ type: 'result', id: input.id, stats: link!.stats })
@@ -60,28 +62,31 @@ export function installApplicationWorkerTransport(session: ApplicationSession, e
     active.add(end); port.addEventListener('message', request); port.start()
     void (async () => {
       try {
-        if (typeof data.expectedPeerId !== 'string' || !/^[0-9a-f]{64}$/u.test(data.expectedPeerId) ||
+        if (typeof data.peerIdentity !== 'string' || !/^[0-9a-f]{64}$/u.test(data.peerIdentity) ||
             typeof data.timeoutMs !== 'number' || !Number.isSafeInteger(data.timeoutMs) || data.timeoutMs < 100 || data.timeoutMs > 60_000) {
           throw new Error('APPLICATION_WORKER_OPTIONS_INVALID')
         }
         connection = frameRtcPeerChannels({ reliable: data.reliable as RTCDataChannel, live: data.live as RTCDataChannel })
         const timer = setTimeout(() => { void end(new Error('APPLICATION_WORKER_CONNECTION_TIMEOUT')) }, data.timeoutMs)
         try {
-          const candidate = await connectApplicationTransport(session, { connection, expectedPeerId: data.expectedPeerId,
-            signal: lifetime.signal, timeoutMs: data.timeoutMs })
+          const candidate = await session.connectPeer({ connection, peerIdentity: data.peerIdentity,
+            signal: lifetime.signal, handshakeTimeoutMs: data.timeoutMs })
           link = candidate
           if (lifetime.signal.aborted) { await candidate.close(); return }
           candidate.signal.addEventListener('abort', () => { void end(candidate.signal.reason) }, { once: true })
+          if (candidate.signal.aborted) { await end(candidate.signal.reason); return }
+          await candidate.synchronize(); lifetime.signal.throwIfAborted()
           port.postMessage({ type: 'ready', peerId: candidate.peerId, stats: candidate.stats })
         } finally { clearTimeout(timer) }
-      } catch (error) { await end(error) }
+      } catch (error) { if (connection === undefined) retireTransferred(data); await end(error) }
     })().catch(() => undefined)
   }
   endpoint.addEventListener('message', receive)
-  const close = async (): Promise<void> => {
-    if (closed) return
+  const close = (): Promise<void> => {
+    if (closing !== undefined) return closing
     closed = true; endpoint.removeEventListener('message', receive); session.signal.removeEventListener('abort', abort)
-    await Promise.all([...active].map(end => end()))
+    closing = Promise.all([...active].map(end => end())).then(() => undefined)
+    return closing
   }
   const abort = (): void => { void close() }
   session.signal.addEventListener('abort', abort, { once: true })
@@ -94,37 +99,43 @@ export function installApplicationWorkerTransport(session: ApplicationSession, e
  * Worker authentication and initial replay. No application-owned RPC map is needed.
  */
 export async function connectWorkerApplicationWebRtc(endpoint: ApplicationWorkerEndpoint, options: WebRtcOptions & {
-  readonly expectedPeerId: string
-}): Promise<ApplicationPeerConnection & { readonly rtc: WebRtcSession }> {
+  readonly peerIdentity: string
+}): Promise<ApplicationPeerLink & { readonly rtc: WebRtcSession }> {
   const timeoutMs = options.timeoutMs ?? 30_000
-  if (!/^[0-9a-f]{64}$/u.test(options.expectedPeerId) || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) {
+  if (!/^[0-9a-f]{64}$/u.test(options.peerIdentity) || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) {
     throw new Error('APPLICATION_WORKER_OPTIONS_INVALID')
   }
   const channel = new MessageChannel(), port = channel.port1, lifetime = new AbortController()
   let rtc: WebRtcSession | undefined, closing: Promise<void> | undefined, peerId = '', sequence = 0
-  let stats: ApplicationPeerConnection['stats'] = { sentBytes: 0, receivedBytes: 0, sentRequests: 0, receivedRequests: 0 }
+  let stats: ApplicationPeerLink['stats'] = { sentBytes: 0, receivedBytes: 0, sentRequests: 0, receivedRequests: 0 }
   const pending = new Map<number, { resolve(): void; reject(reason: unknown): void; timer: ReturnType<typeof setTimeout> }>()
   let resolveReady!: () => void, rejectReady!: (reason: unknown) => void
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
   void ready.catch(() => undefined)
-  const close = (reason: unknown = new Error('APPLICATION_PEER_DISCONNECTED')): Promise<void> => {
+  let resolveComplete!: () => void, rejectComplete!: (reason: unknown) => void
+  const completion = new Promise<void>((resolve, reject) => { resolveComplete = resolve; rejectComplete = reject })
+  void completion.catch(() => undefined)
+  const close = (reason?: unknown): Promise<void> => {
     if (closing !== undefined) return closing
     closing = Promise.resolve().then(async () => { await rtc?.close(); port.close(); channel.port2.close() })
-    lifetime.abort(reason); clearTimeout(timer); options.signal?.removeEventListener('abort', abort)
+    const failure = reason ?? new Error('APPLICATION_PEER_DISCONNECTED')
+    lifetime.abort(failure); clearTimeout(timer); options.signal?.removeEventListener('abort', abort)
     port.postMessage({ type: 'close' }); port.removeEventListener('message', receive)
-    rejectReady(reason)
-    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(reason) }
+    rejectReady(failure)
+    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(failure) }
     pending.clear()
+    if (reason === undefined) resolveComplete(); else rejectComplete(reason)
     void closing.catch(() => undefined)
     return closing
   }
   const abort = (): void => { void close(options.signal?.reason) }
   const receive = (event: MessageEvent): void => {
+    try {
     const value = event.data as Record<string, unknown> | null
     if (value === null || typeof value !== 'object') { void close(new Error('APPLICATION_WORKER_MESSAGE_INVALID')); return }
     if (value.type === 'ended') { void close(new Error(String(value.error))); return }
     if (value.type === 'ready') {
-      if (peerId || value.peerId !== options.expectedPeerId) { void close(new Error('APPLICATION_WORKER_PEER_INVALID')); return }
+      if (peerId || value.peerId !== options.peerIdentity) { void close(new Error('APPLICATION_WORKER_PEER_INVALID')); return }
       peerId = value.peerId; stats = checkedStats(value.stats); resolveReady(); return
     }
     if (value.type === 'result' && Number.isSafeInteger(value.id)) {
@@ -134,6 +145,7 @@ export async function connectWorkerApplicationWebRtc(endpoint: ApplicationWorker
       if (value.error !== undefined) request.reject(new Error(typeof value.error === 'string' ? value.error : 'APPLICATION_WORKER_REQUEST_FAILED'))
       else { stats = checkedStats(value.stats); request.resolve() }
     } else void close(new Error('APPLICATION_WORKER_MESSAGE_INVALID'))
+    } catch (error) { void close(error) }
   }
   const timer = setTimeout(() => { void close(new Error('APPLICATION_WORKER_CONNECTION_TIMEOUT')) }, timeoutMs)
   port.addEventListener('message', receive); port.start()
@@ -142,13 +154,13 @@ export async function connectWorkerApplicationWebRtc(endpoint: ApplicationWorker
   try {
     rtc = await negotiateWebRtc({ ...options, signal: lifetime.signal, onDataChannels(channels) {
       endpoint.postMessage({ type: CHANNEL_TRANSFER, reliable: channels.reliable, live: channels.live, port: channel.port2,
-        expectedPeerId: options.expectedPeerId, timeoutMs }, [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel, channel.port2])
+        peerIdentity: options.peerIdentity, timeoutMs }, [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel, channel.port2])
     } })
     if (lifetime.signal.aborted) { await rtc.close(); lifetime.signal.throwIfAborted() }
     rtc.signal.addEventListener('abort', () => { void close(rtc!.signal.reason) }, { once: true })
     await ready; lifetime.signal.throwIfAborted(); clearTimeout(timer)
-    const result: ApplicationPeerConnection & { readonly rtc: WebRtcSession } = {
-      peerId, rtc, signal: lifetime.signal, get stats() { return stats },
+    const result: ApplicationPeerLink & { readonly rtc: WebRtcSession } = {
+      peerId, rtc, signal: lifetime.signal, completion, get stats() { return stats },
       async synchronize() {
         lifetime.signal.throwIfAborted()
         if (pending.size >= MAX_REQUESTS) throw new Error('APPLICATION_PEER_REQUEST_LIMIT')
@@ -165,9 +177,15 @@ export async function connectWorkerApplicationWebRtc(endpoint: ApplicationWorker
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error) }
-function checkedStats(value: unknown): ApplicationPeerConnection['stats'] {
+function retireTransferred(value: Record<string, unknown>): void {
+  for (const key of ['reliable', 'live']) {
+    const channel = value[key] as { close?: () => void } | undefined
+    try { channel?.close?.() } catch { /* An already closed transferred channel has no remaining owner. */ }
+  }
+}
+function checkedStats(value: unknown): ApplicationPeerLink['stats'] {
   if (value === null || typeof value !== 'object') throw new Error('APPLICATION_WORKER_STATS_INVALID')
-  const candidate = value as ApplicationPeerConnection['stats']
+  const candidate = value as ApplicationPeerLink['stats']
   if (![candidate.sentBytes, candidate.receivedBytes, candidate.sentRequests, candidate.receivedRequests].every(number => Number.isSafeInteger(number) && number >= 0)) {
     throw new Error('APPLICATION_WORKER_STATS_INVALID')
   }

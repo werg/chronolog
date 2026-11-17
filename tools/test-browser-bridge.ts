@@ -119,11 +119,14 @@ try {
   ])
   const transactionIds = [nativeClaim, browserClaim]
   const beforeCertification = await fixture.snapshot([nativeClaim])
-  assert(beforeCertification.outcomes.every(({ outcome, final }) => outcome.type === 'pending' && !final))
-  const browserPending = await page.evaluate((transactionId) =>
-    (globalThis as unknown as TestWindow).chronologBrowserBridge.outcome('browser', transactionId), browserClaim)
-  assert.equal(browserPending.outcome.type, 'pending')
-  assert.equal(browserPending.final, false)
+  // Eligible proposals may already have a provisional local result. That
+  // execution must neither claim finality nor change the default final view.
+  assert(beforeCertification.outcomes.every(({ final }) => !final))
+  assert.deepEqual(beforeCertification.rows, [[{ kind: 'integer', value: '1' }, { kind: 'null' }]])
+  const browserBeforeCertification = await state('browser', [browserClaim])
+  assert(browserBeforeCertification.outcomes.every(({ final }) => !final))
+  assert.deepEqual(browserBeforeCertification.rows, beforeCertification.rows)
+  passed('provisional claims leave final SQL unchanged until certified')
   const nativeFinal = await fixture.sync(transactionIds)
   await sync()
   const browserFinal = await page.evaluate((transactionId) =>

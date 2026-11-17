@@ -92,7 +92,8 @@ it('administers an independently ordered native/browser group through the actual
   expect(bytesToBase64Url(genesis.manifest.schemaAdminPublicKey)).toBe(setup.schemaAdministratorPublicKey);
   const rootRoles = genesis.manifest.initialCapabilities.filter(grant =>
     bytesToBase64Url(grant.signingPublicKey) === bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).map(grant => grant.role);
-  expect(rootRoles).toEqual(['administrator']);
+  // Signed genesis names the membership root directly; it has no application grant.
+  expect(rootRoles).toEqual([]);
   const bootstrap = await fixture('start', configured.descriptor);
   await owner.sync();
   await passed('Cloudflare owns a durable membership-only root; the separate native signer owns application schema and ordering');

@@ -1,392 +1,221 @@
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { frameLivePeerStream, framePeerStream } from '@chronolog/agent-service/framing'
+import {
+  bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, decodePeerValue, encodePeerValue,
+  MemoryPeerStore, participantGrant, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  type OrderedCommand,
+} from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
-import { bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant,
-  peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest, type OrderedCommand, type PeerIdentity, type PeerRevision, type PrefixProof } from '@chronolog/peer-generation'
-import { bytesToHex, DOMAINS, emit, executionManifestArtifacts, hexToBytes, program, transactionDigest, type TransactionCore } from '@chronolog/protocol'
-import type { FramedPeerConnection } from '@chronolog/records'
-import { createSignedAttempt } from '../../peer-generation/src/attempt.js'
-import { encodePeerValue, signPeerValue } from '../../peer-generation/src/codec.js'
-import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
-import { sessionInternals } from './internals.js'
-import { openNativeDevice } from './native.js'
-import { connectApplicationTransport } from './network.js'
+import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program } from '@chronolog/protocol'
+import { defineApplication, defineCommand, applicationDefinitionDigest } from './definition.js'
+import { openApplicationDevice } from './device.js'
 import { openPeerApplication } from './runtime.js'
-import { connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
+import { createFramedPeerConnectionPair, type FramedPeerConnection } from './network.js'
 
-const definition = defineApplication({ id: 'network-messages', version: '1', commands: {
-  say: defineCommand({ description: 'Post a message', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
-}, queries: {
-  messages: defineQuery({ description: 'Read messages', input: { type: 'null' }, read: (view: ApplicationReadView) => view.readEvents() }),
-} })
-const cleanup: Array<() => void | Promise<void>> = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
-
-async function fixture(initialMembers = [0, 1, 2]) {
-  const directory = await mkdtemp(join(tmpdir(), 'peer-network-'))
-  cleanup.push(() => rm(directory, { recursive: true, force: true }))
-  const host = await createPeerIdentity(), devices = await Promise.all([0, 1, 2].map(index => openNativeDevice({ path: join(directory, `${index}.sqlite`), create: true })))
-  for (const device of devices) cleanup.push(() => device.close())
-  const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
+const definition = defineApplication({ id: 'network', version: '1', commands: {
+  say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
+  bulk: defineCommand({ description: 'Send a fragmented command', input: { type: 'string' },
+    prepare: text => program(...Array.from({ length: 8 }, (_, index) => emit('chunk', { index, text }))) }),
+}, queries: {} })
+const closing: Array<() => void | Promise<void>> = []
+afterEach(async () => { for (const close of closing.splice(0).reverse()) await close() })
+async function fixture(options: { readerOnly?: boolean } = {}) {
+  const host = await createPeerIdentity(), a = await openApplicationDevice({ store: new MemoryPeerStore(), create: true }),
+    b = await openApplicationDevice({ store: new MemoryPeerStore(), create: true })
+  const key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
   const manifest = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
-  const descriptor = await signApplicationDescriptor({ applicationId: '81'.repeat(32), historyId: 'network-test', profile: 'peer-generation-v1',
-    policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: devices[0]!.identity.publicKey,
-    executionManifestDigest: bytesToHex(manifest.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)
-  const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
-    revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: devices.filter((_device, index) => initialMembers.includes(index)).map((device, index) => participantGrant(device.identity.publicKey, { administrator: index === 0 })) }, host)
+  const descriptor = await signApplicationDescriptor({ applicationId: 'cc'.repeat(32), historyId: 'network',
+    profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey,
+    schemaAdministrator: a.identity.publicKey, executionManifestDigest: bytesToHex(manifest.executionManifestDigest),
+    definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)
+  const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
+    policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
+    grants: [controlParticipantGrant(host.publicKey), participantGrant(a.identity.publicKey, { dataRole: 'admin' }),
+      { ...participantGrant(b.identity.publicKey), ...(options.readerOnly === true ? { writer: false, coordinator: false, recovery: false } : {}) }] }, host)
   const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
-  const select = async (identity: PeerIdentity, base: PrefixProof | null, transitionId: string) => {
-    const bundle = await registry.read()
-    return registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
-      policy: descriptor.payload.policy, expectedGeneration: bundle.generations.at(-1)?.id ?? null, coordinator: identity.publicKey,
-      requester: identity.publicKey, controlRevision: 0, base, transitionId, reason: base === null ? 'create' : 'takeover' }, identity))
+  await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
+    profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
+    coordinator: a.identity.publicKey, requester: a.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, a.identity))
+  const open = async (device: typeof a, epochKeys = keys) => {
+    const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
+    closing.push(() => session.close()); return session
   }
-  await select(devices[0]!.identity, null, 'create')
-  const open = async (index: number, seedKeys = true) => {
-    const app = await openPeerApplication({ device: devices[index]!, authority: await registry.read(), definition, ...(seedKeys ? { epochKeys } : {}) })
-    cleanup.push(() => app.close()); return app
-  }
-  return { devices, open, select, registry, key, directory, host }
+  return { a, b, host, keys, descriptor, control, registry, open }
 }
 
-function pair(): readonly [FramedPeerConnection, FramedPeerConnection] {
-  const a = new TransformStream<Uint8Array>(), b = new TransformStream<Uint8Array>(), liveA = new TransformStream<Uint8Array>(), liveB = new TransformStream<Uint8Array>()
-  const left = framePeerStream({ readable: a.readable, writable: b.writable }), right = framePeerStream({ readable: b.readable, writable: a.writable })
-  const leftLive = frameLivePeerStream({ readable: liveA.readable, writable: liveB.writable }), rightLive = frameLivePeerStream({ readable: liveB.readable, writable: liveA.writable })
-  return [
-    { ...left, live: leftLive, close: async () => { await Promise.all([left.close(), leftLive.close()]) } },
-    { ...right, live: rightLive, close: async () => { await Promise.all([right.close(), rightLive.close()]) } },
-  ]
+/** Fault injection at an existing single-fragment control response, preserving framing IDs. */
+function rewrite(connection: FramedPeerConnection, change: (value: Record<string, unknown>) => unknown): FramedPeerConnection {
+  return { ...connection, async send(bytes, options) {
+    const frame = assertCanonicalCbor(bytes)
+    if (Array.isArray(frame) && frame.length === 5 && frame[2] === 0n && frame[4] instanceof Uint8Array && frame[3] === BigInt(frame[4].length)) {
+      const value = decodePeerValue<Record<string, unknown>>(frame[4]), encoded = encodePeerValue(change(value))
+      await connection.send(encodeCanonicalCbor([frame[0]!, frame[1]!, 0n, BigInt(encoded.length), encoded]), options)
+    } else await connection.send(bytes, options)
+  } }
 }
 
-async function connect(a: ApplicationSession, b: ApplicationSession, channels = pair()) {
-  const links = await Promise.all([
-    connectApplicationTransport(a, { connection: channels[0], expectedPeerId: b.deviceId, timeoutMs: 5000 }),
-    connectApplicationTransport(b, { connection: channels[1], expectedPeerId: a.deviceId, timeoutMs: 5000 }),
-  ])
-  cleanup.push(() => links[0].close(), () => links[1].close())
-  return links
-}
-
-function deferred() {
-  let resolve!: () => void
-  const promise = new Promise<void>(yes => { resolve = yes })
-  return { promise, resolve }
-}
-function packet(frame: Uint8Array): { readonly type: string; readonly method?: string; readonly value?: { readonly limit: number }; readonly result?: { readonly authority?: unknown } | readonly OrderedCommand[] | null } {
-  return JSON.parse(new TextDecoder().decode(frame)) as ReturnType<typeof packet>
-}
-
-async function seed(session: ApplicationSession, count: number, key: Uint8Array): Promise<void> {
-  const replica = sessionInternals.get(session)!.replica, descriptor = replica.descriptor, generation = replica.generation
-  const control = replica.authority.controls[generation.payload.controlRevision]!
-  const membershipRevision = hexToBytes(await peerDigest(control)), validationPolicy = hexToBytes(await peerDigest([descriptor.profile, descriptor.policy]))
-  let root = replica.revision.point.root
-  const commands: OrderedCommand[] = []
-  for (let offset = 0; offset < count; offset += 32) {
-    const attempts = await Promise.all(Array.from({ length: Math.min(32, count - offset) }, async (_, position) => {
-      const index = offset + position
-      const core: TransactionCore = { operationId: `bulk-${index}`, groupId: hexToBytes(descriptor.applicationId),
-        membershipRevision, validationPolicy, authorId: hexToBytes(replica.device.publicKey), authorTimestampMs: BigInt(index),
-        nonce: crypto.getRandomValues(new Uint8Array(16)), executionManifestDigest: hexToBytes(descriptor.executionManifestDigest),
-        program: program(emit('message', { index })) }
-      return createSignedAttempt({ applicationId: descriptor.applicationId, profile: descriptor.profile, generation: generation.id,
-        controlRevision: control.payload.revision, epoch: control.payload.epoch, author: replica.device.publicKey,
-        operationId: core.operationId, definitionDigest: descriptor.definitionDigest, command: 'say', commandVersion: '1',
-        basedOn: null, reapplyOf: null, coreDigest: bytesToHex(await transactionDigest(core)) }, core, key, replica.device)
-    }))
-    const receipts: Array<Promise<OrderedCommand>> = []
-    for (const [position, attempt] of attempts.entries()) {
-      const body = encodePeerValue(attempt)
-      const payload = { applicationId: descriptor.applicationId, profile: descriptor.profile,
-        generation: generation.id, sequence: offset + position + 1, previousRoot: root, attemptId: attempt.id,
-        author: attempt.payload.header.author, operationId: attempt.payload.header.operationId,
-        bodyHash: await bytesDigest(body), bodyBytes: body.length }
-      const receiptRoot = await peerDigest([DOMAINS.peerOrder, payload]); root = receiptRoot
-      receipts.push(signPeerValue(DOMAINS.peerOrder, payload, replica.device).then(receipt => ({ attempt, receipt: { ...receipt, root: receiptRoot } })))
-    }
-    commands.push(...await Promise.all(receipts))
-  }
-  // Fixture signing is bounded and parallel; production import still verifies
-  // every body and receipt and publishes through the real event materializer.
-  await replica.synchronize(replica.authority, commands)
-}
-
-describe('authenticated application transport', () => {
-  it('learns signed controls from a newly granted reader before authentication and supplies its inherited prefix', async () => {
-    const f = await fixture([0, 1]), a = await f.open(0)
-    await (await a.command('say', 'surviving prefix', { operationId: 'before-grant' })).applied()
-    const before = await f.registry.read(), previous = before.controls[0]!
-    const control = await signControlRevision({ ...previous.payload, revision: 1, previous: await peerDigest(previous),
-      grants: [...previous.payload.grants, participantGrant(f.devices[2]!.identity.publicKey)] }, f.host)
-    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-      expectedGeneration: before.generations.at(-1)!.id, coordinator: a.deviceId, requester: a.deviceId,
-      controlRevision: 1, base: await a.recoveryPoint(), transitionId: 'enroll-reader', reason: 'control-change' }, f.devices[0]!.identity), { control })
-    const c = await f.open(2, false)
-    expect(a.status.generation).not.toBe(c.status.generation)
-    expect(c.status.phase).toBe('awaiting-keys')
-    await connect(a, c)
-    expect(a.status.generation).toBe(c.status.generation)
-    expect(c.status.phase).toBe('ready')
-    expect((await c.query('messages', null)).value.events).toHaveLength(1)
-    const operation = await c.command('say', 'newly enrolled', { operationId: 'after-grant' })
-    expect(await operation.applied({ signal: AbortSignal.timeout(5000) })).toMatchObject({ status: 'applied', author: c.deviceId })
-  })
-
-  it('enrolls a reader without application-managed epoch keys and reopens its durable keys and history', async () => {
-    const f = await fixture(), a = await f.open(0)
-    await (await a.command('say', 'before enrollment', { operationId: 'retained' })).applied()
-    const b = await f.open(1, false), phases: string[] = []
-    cleanup.push(b.onStatus(status => { phases.push(status.phase) }))
-    expect(b.status.phase).toBe('awaiting-keys')
-    expect(b.keys.missing()).toEqual([0])
-    const links = await connect(a, b)
-    expect(b.keys.missing()).toEqual([])
-    expect(b.status.phase).toBe('ready')
-    expect((await b.query('messages', null)).value.events).toHaveLength(1)
-    const operation = await b.command('say', 'after enrollment', { operationId: 'enrolled' })
-    await operation.applied({ signal: AbortSignal.timeout(5000) })
-    await links[1].synchronize()
-    const identity = b.deviceId
-    await b.close()
-    const device = await openNativeDevice({ path: join(f.directory, '1.sqlite') })
-    const reopened = await openPeerApplication({ device, authority: await f.registry.read(), definition })
-    cleanup.push(() => reopened.close())
-    expect(reopened.deviceId).toBe(identity)
-    expect(reopened.keys.missing()).toEqual([])
-    expect((await reopened.query('messages', null)).value.events).toHaveLength(2)
-    expect(await reopened.operations.get('enrolled')).toMatchObject({ status: 'applied', outcome: 'accepted' })
-    expect(phases[0]).toBe('awaiting-keys')
-    expect(phases).toContain('ready')
-  })
-
-  it('owns ordered delivery, signed independent live traffic and durable retained acknowledgements', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1)
-    const [left, right] = await connect(a, b)
-    expect([left.peerId, right.peerId]).toEqual([b.deviceId, a.deviceId])
-    const operation = await b.command('say', 'over bytes', { operationId: 'once' })
-    expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
-    await right.synchronize()
-    expect(await operation.shared({ signal: AbortSignal.timeout(5000) })).toHaveLength(1)
-    expect((await a.query('messages', null)).value.events[0]).toMatchObject({ author: b.deviceId, payload: { text: 'over bytes' } })
-    const stream = a.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), receiving = stream.next()
-    const revision = a.revision
-    await b.signals.send('typing', { active: true })
-    expect((await receiving).value).toMatchObject({ authorId: b.deviceId, topic: 'typing', payload: { active: true } })
-    expect(a.revision).toEqual(revision)
-    await stream.return?.()
-    expect(left.stats.receivedBytes).toBeGreaterThan(0)
-    expect(right.stats.sentRequests).toBeGreaterThan(0)
-    await left.close()
-    expect(left.signal.aborted).toBe(true)
-    await expect(b.signals.send('typing', { active: false })).rejects.toThrow()
-  })
-
-  it('does not accept a discovery hint for another authenticated signer', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
-    const results = await Promise.allSettled([
-      connectApplicationTransport(a, { connection: channels[0], expectedPeerId: f.devices[2]!.identity.publicKey, timeoutMs: 1000 }),
-      connectApplicationTransport(b, { connection: channels[1], expectedPeerId: a.deviceId, timeoutMs: 1000 }),
-    ])
-    expect(results.every(result => result.status === 'rejected')).toBe(true)
-    expect(a.status.connectedPeers).toBe(0)
-    expect(b.status.connectedPeers).toBe(0)
-  })
-
-  it('connects an empty peer to a selected retained prefix before exposing a ready view', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1)
-    const original = await connect(a, b)
-    await (await a.command('say', 'retained', { operationId: 'retained' })).applied()
-    await original[1].synchronize()
-    await Promise.all(original.map(link => link.close()))
-    await f.select(f.devices[1]!.identity, await b.recoveryPoint(), 'move')
-    await b.adopt(await f.registry.read())
-    const c = await f.open(2)
-    expect(c.status.phase).toBe('recovering')
-    await expect(c.query('messages', null)).rejects.toThrow('PEER_RECOVERING')
-    await connect(b, c)
-    expect(c.status.phase).toBe('ready')
-    expect((await c.query('messages', null)).value.events).toHaveLength(1)
-    const oldLink = await connectApplications(a, c)
-    cleanup.push(() => oldLink.close())
-    expect(a.revision.generation).toBe(c.revision.generation)
-  })
-
-  it('resumes encrypted content over bounded peer chunks without changing application history', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1)
-    const bytes = new Uint8Array(65_536 + 19).fill(43), upload = await a.content.stage({ bytes: bytes.length })
-    await upload.write(0, bytes.slice(0, 65_536)); await upload.write(1, bytes.slice(65_536))
-    const reference = await upload.commit(), revision = b.revision
-    const first = await connect(a, b)
-    const prefix: Uint8Array[] = []
-    for await (const chunk of b.content.read(reference, { length: 65_536 })) prefix.push(chunk)
-    expect(prefix).toEqual([bytes.slice(0, 65_536)])
-    await Promise.all(first.map(link => link.close()))
-    await expect(async () => { for await (const _chunk of b.content.read(reference)) { /* Complete content is required. */ } }).rejects.toThrow('CONTENT_UNAVAILABLE')
-    await connect(a, b)
-    await b.content.retain(reference)
-    expect(await a.content.retention(reference)).toEqual([expect.objectContaining({ payload: expect.objectContaining({ peer: b.deviceId }) })])
-    expect(b.revision).toEqual(revision)
-    const copied: Uint8Array[] = []
-    for await (const chunk of b.content.read(reference)) copied.push(chunk)
-    expect(copied).toEqual([bytes.slice(0, 65_536), bytes.slice(65_536)])
-  })
-
-  it('completes a captured synchronization before a later source change finishes', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
-    await (await a.command('say', 'captured', { operationId: 'captured' })).applied()
-    let enabled = false, states = 0
-    const nextState = deferred(), release = deferred()
-    const left: FramedPeerConnection = { ...channels[0], async send(frame, options) {
-      const value = packet(frame)
-      if (enabled && value.type === 'response' && value.result !== undefined && value.result !== null && 'authority' in value.result) {
-        states++
-        if (states === 1) await (await a.command('say', 'later', { operationId: 'later' })).applied()
-        else if (states === 2) { nextState.resolve(); await release.promise }
-      }
-      await channels[0].send(frame, options)
+describe('authenticated peer application connections', () => {
+  it('routes original saved commands, fragmented ciphertext, exact coverage and live signals over separate lanes', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const operation = await b.command('bulk', 'private payload '.repeat(500), { operationId: 'fragmented' })
+    const saved = await b.operations.inspect('fragmented')
+    const [left, right] = createFramedPeerConnectionPair(), sizes: number[] = [], reliableText: string[] = []
+    const counted = { ...right, async send(bytes: Uint8Array, options?: { signal?: AbortSignal }) {
+      sizes.push(bytes.length); reliableText.push(new TextDecoder().decode(bytes)); await right.send(bytes, options)
     } }
-    const links = await connect(a, b, [left, channels[1]])
+    const links = await Promise.all([a.connectPeer({ connection: left, peerIdentity: b.deviceId }),
+      b.connectPeer({ connection: counted, peerIdentity: a.deviceId })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    expect(links.map(link => link.peerId)).toEqual([b.deviceId, a.deviceId])
+    expect(await operation.applied({ signal: AbortSignal.timeout(5000) })).toMatchObject({ status: 'applied', outcome: 'accepted' })
     await Promise.all(links.map(link => link.synchronize()))
-    enabled = true
-    let completed = false
-    const first = links[1].synchronize().then(() => { completed = true })
-    try {
-      await nextState.promise
-      expect(completed, 'new hints must not extend the promise for an earlier captured target').toBe(true)
-      expect((await b.query('messages', null)).value.events).toHaveLength(1)
-    } finally { release.resolve(); await first }
-    await links[1].synchronize()
-    expect((await b.query('messages', null)).value.events).toHaveLength(2)
+    expect((await b.operations.inspect('fragmented'))?.attempt).toEqual(saved?.attempt)
+    expect(sizes.length).toBeGreaterThan(4)
+    expect(Math.max(...sizes)).toBeLessThan(50_000)
+    expect(reliableText.join('')).not.toContain('private payload')
+    const view = await a.readView()
+    expect(view.readEvents().events).toHaveLength(8); view.release()
+    expect(await operation.shared({ signal: AbortSignal.timeout(5000) })).toHaveLength(1)
+    const subscription = a.signals.subscribe({ topics: ['typing'] })[Symbol.asyncIterator](), received = subscription.next()
+    const sent = await b.signals.send('typing', { active: true })
+    expect((await received).value).toEqual(sent)
+    await subscription.return?.()
+    await b.close()
+    expect(links[0].signal.aborted).toBe(true); expect(links[1].signal.aborted).toBe(true)
+    expect(a.status.connectedPeers).toBe(0)
   })
 
-  it('retires a live lane at EOF while keeping reliable command replication usable', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
-    const left: FramedPeerConnection = { ...channels[0], live: { ...channels[0].live!,
-      async *frames() { yield* [] },
-    } }
-    const links = await connect(a, b, [left, channels[1]])
-    await expect(a.signals.send('typing', { active: true })).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
-    expect(links.every(link => !link.signal.aborted)).toBe(true)
-    const operation = await b.command('say', 'after live EOF', { operationId: 'after-eof' })
-    expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
-    await links[1].synchronize()
-    expect((await a.query('messages', null)).value.events[0]?.payload).toEqual({ text: 'after live EOF' })
+  it('requires a fresh signed proof from the advertised reader identity', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    const forged = rewrite(right, value => value.kind === 'proof' ? { ...value, signature: '00'.repeat(64) } : value)
+    const results = await Promise.allSettled([a.connectPeer({ connection: left }), b.connectPeer({ connection: forged })])
+    expect(results[0]).toMatchObject({ status: 'rejected', reason: new Error('APPLICATION_PEER_PROOF_INVALID') })
+    for (const result of results) if (result.status === 'fulfilled') await result.value.close()
+    expect(a.status.connectedPeers).toBe(0)
+    expect(left.signal.aborted).toBe(true)
   })
 
-  it('refuses live congestion without retiring the authenticated peer or retrying the refused frame', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
-    let congested = true, dispatched = 0
-    const right: FramedPeerConnection = { ...channels[1], live: { ...channels[1].live!,
-      async trySend(frame, options) {
-        if (congested) return false
-        dispatched++
-        return channels[1].live!.trySend(frame, options)
-      },
-    } }
-    const links = await connect(a, b, [channels[0], right])
-    await expect(b.signals.send('typing', { active: true })).rejects.toThrow('SIGNAL_BACKPRESSURE')
-    expect(dispatched).toBe(0)
-    expect(links.every(link => !link.signal.aborted)).toBe(true)
-    congested = false
-    const stream = a.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), receiving = stream.next()
-    await b.signals.send('typing', { active: false })
-    expect((await receiving).value?.payload).toEqual({ active: false })
-    await stream.return?.()
-    expect(dispatched).toBe(1)
-    expect((await (await b.command('say', 'healthy', { operationId: 'after-pressure' })).applied()).outcome).toBe('accepted')
-  })
-
-  it('retires the physical owner when a dispatched live write ignores cancellation', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
-    const entered = deferred(), release = deferred(), controller = new AbortController()
-    const right: FramedPeerConnection = { ...channels[1], live: { ...channels[1].live!,
-      async trySend() { entered.resolve(); await release.promise; return true },
-    } }
-    const links = await connect(a, b, [channels[0], right])
-    const failure = new Error('cancel the live attempt')
-    const sending = b.signals.send('typing', { active: true }, { signal: controller.signal })
-    const rejected = expect(sending).rejects.toBe(failure)
-    try {
-      await entered.promise; controller.abort(failure)
-      await rejected
-      await expect.poll(() => links[1].signal.aborted).toBe(true)
-      expect(channels[1].signal.aborted).toBe(true)
-    } finally { release.resolve() }
-  })
-
-  it('closes the previous physical connection when the same authenticated peer reconnects', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1)
-    const previous = await connect(a, b), replacement = await connect(a, b)
-    expect(previous.every(link => link.signal.aborted)).toBe(true)
-    expect(replacement.every(link => !link.signal.aborted)).toBe(true)
-    expect(a.status.connectedPeers).toBe(1)
-    expect(b.status.connectedPeers).toBe(1)
-    const operation = await b.command('say', 'replacement', { operationId: 'replacement' })
-    expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
-  })
-
-  it('fully verifies a captured 65-command history in three bounded pages', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1)
-    await seed(a, 65, f.key)
-    const channels = pair(), pageSizes: number[] = [], responseBytes: number[] = []
-    const left: FramedPeerConnection = { ...channels[0], async send(frame, options) {
-      const value = packet(frame)
-      if (value.type === 'response' && Array.isArray(value.result)) { pageSizes.push(value.result.length); responseBytes.push(frame.length) }
-      await channels[0].send(frame, options)
-    } }
-    await connect(a, b, [left, channels[1]])
-    expect(b.revision.point).toEqual(a.revision.point)
-    expect(b.revision.point.sequence).toBe(65)
-    expect(pageSizes).toEqual([32, 32, 1])
-    expect(Math.max(...pageSizes)).toBeLessThanOrEqual(32)
-    expect(Math.max(...responseBytes)).toBeLessThanOrEqual(1_048_576)
-    expect(await b.operations.get('bulk-64', { author: a.deviceId })).toMatchObject({ status: 'applied', outcome: 'accepted' })
-  })
-
-  it('admits an authenticated 4097-command target to bounded page fetching and cancels before retention', async () => {
-    const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
-    const requested = deferred(), release = deferred(), controller = new AbortController()
-    let limit: number | undefined
-    const left: FramedPeerConnection = { ...channels[0], async send(frame, options) {
-      const value = packet(frame)
-      if (value.type === 'response' && value.result !== undefined && value.result !== null && 'authority' in value.result) {
-        const state = value.result as { readonly revision: PeerRevision }
-        // The authenticated head is a transfer target, not retained evidence.
-        // Stop before a page arrives; the real 65-command case checks completion.
-        const result = { ...value.result, count: 4097, revision: { ...state.revision,
-          point: { ...state.revision.point, sequence: 4097 } } }
-        frame = new TextEncoder().encode(JSON.stringify({ ...value, result }))
-      }
-      await channels[0].send(frame, options)
-    } }
-    const right: FramedPeerConnection = { ...channels[1], async send(frame, options) {
-      const value = packet(frame)
-      if (value.type === 'request' && value.method === 'range') {
-        limit = value.value?.limit; requested.resolve(); await release.promise
-      }
-      await channels[1].send(frame, options)
-    } }
-    const opening = Promise.allSettled([
-      connectApplicationTransport(a, { connection: left, expectedPeerId: b.deviceId, timeoutMs: 5000 }),
-      connectApplicationTransport(b, { connection: right, expectedPeerId: a.deviceId, timeoutMs: 5000, signal: controller.signal }),
-    ])
-    try {
-      await Promise.race([requested.promise, opening.then(() => { throw new Error('Expected bounded range fetch before closure') })])
-      expect(limit).toBe(32)
-      controller.abort(new Error('cancel before a retained page'))
-      const results = await opening
-      expect(results[1]).toMatchObject({ status: 'rejected', reason: expect.objectContaining({ message: 'cancel before a retained page' }) })
-      expect(b.revision.point.sequence).toBe(0)
-    } finally {
-      controller.abort(); release.resolve()
-      await Promise.all(channels.map(channel => channel.close()))
-      await opening
+  it('bounds authentication even when the first transport write never completes', async () => {
+    const f = await fixture(), a = await f.open(f.a), lifetime = new AbortController()
+    const connection: FramedPeerConnection = { signal: lifetime.signal,
+      send: () => new Promise<void>(() => {}), close: async () => { lifetime.abort(new Error('closed')) },
+      frames: () => ({ [Symbol.asyncIterator]: () => ({ next: () => new Promise<IteratorResult<Uint8Array>>(() => {}) }) }),
     }
+    await expect(a.connectPeer({ connection, handshakeTimeoutMs: 20 })).rejects.toThrow('APPLICATION_PEER_HANDSHAKE_TIMEOUT')
+    expect(lifetime.signal.aborted).toBe(true); expect(a.status.connectedPeers).toBe(0)
   })
 
+  it('keeps control ownership separate from reader and writer access', async () => {
+    const f = await fixture({ readerOnly: true }), a = await f.open(f.a), b = await f.open(f.b)
+    const host = await f.open({ identity: f.host, storageId: 'control-only', store: new MemoryPeerStore(), close: async () => {} })
+    const [forbidden, unused] = createFramedPeerConnectionPair()
+    await expect(host.connectPeer({ connection: forbidden, peerIdentity: a.deviceId })).rejects.toThrow('APPLICATION_PEER_NOT_AUTHORIZED')
+    await unused.close()
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    await (await a.command('say', 'reader receives', { operationId: 'read-only' })).applied()
+    await Promise.all(links.map(link => link.synchronize()))
+    expect(await b.operations.get('read-only', { author: a.deviceId })).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    await expect(b.command('say', 'forbidden', { operationId: 'writer-required' })).rejects.toThrow('PEER_AUTHOR_FORBIDDEN')
+    expect(links[1].signal.aborted).toBe(false)
+    await Promise.all(links.map(link => link.close()))
+  })
+
+  it('rejects a transport that authenticates a different expected peer', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    const results = await Promise.allSettled([a.connectPeer({ connection: left, peerIdentity: '11'.repeat(32) }), b.connectPeer({ connection: right })])
+    expect(results[0]).toMatchObject({ status: 'rejected', reason: new Error('APPLICATION_NETWORK_SCOPE_MISMATCH') })
+    for (const result of results) if (result.status === 'fulfilled') await result.value.close()
+    expect(a.status.connectedPeers).toBe(0); expect(b.status.connectedPeers).toBe(0)
+  })
+
+  it.each(['overrun', 'root mismatch'])('rejects a signed page with %s against its fixed target before retaining any command', async fault => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await (await a.command('say', 'one', { operationId: 'one' })).applied()
+    const one = a.revision.point
+    await (await a.command('say', 'two', { operationId: 'two' })).applied()
+    // Obtain real ordered ciphertext from the owned store, not fabricated valid receipts.
+    const commands: OrderedCommand[] = []
+    for (let sequence = 1; sequence <= 2; sequence++) {
+      const bytes = await f.a.store.get(`peer-generation/replica/${f.descriptor.payload.applicationId}/record/${a.revision.generation}/${sequence}`)
+      expect(bytes).not.toBeNull(); commands.push(decodePeerValue<OrderedCommand>(bytes!))
+    }
+    const [left, right] = createFramedPeerConnectionPair()
+    const malicious = rewrite(left, value => {
+      if (value.kind !== 'response') return value
+      if (fault === 'root mismatch' && value.ok === false && value.value === 'PEER_VIEW_RECOVERY_REQUIRED') {
+        return { ...value, ok: true, value: commands.slice(0, 1) }
+      }
+      if (value.ok !== true) return value
+      const body = value.value
+      if (body !== null && typeof body === 'object' && 'authority' in body && 'revision' in body) {
+        const point = fault === 'overrun' ? one : { ...one, root: 'ff'.repeat(32) }
+        return { ...value, value: { ...body, point, revision: { ...body.revision as object, point } } }
+      }
+      if (Array.isArray(body)) return { ...value, value: fault === 'overrun' ? commands : commands.slice(0, 1) }
+      return value
+    })
+    const links = await Promise.all([a.connectPeer({ connection: malicious }), b.connectPeer({ connection: right })])
+    await expect(links[1].synchronize()).rejects.toThrow('APPLICATION_NETWORK_RANGE_INVALID')
+    expect(await b.operations.get('one', { author: a.deviceId })).toBeNull()
+    expect(await b.operations.get('two', { author: a.deviceId })).toBeNull()
+    const view = await b.readView(); expect(view.readEvents().events).toHaveLength(0); view.release()
+    await Promise.all(links.map(link => link.close()))
+  })
+
+  it('enrolls a verified reader with confidential key shares and reopens its durable keys', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b, new Map())
+    await (await a.command('say', 'encrypted history', { operationId: 'secret' })).applied()
+    const original = await a.operations.inspect('secret')
+    const [left, right] = createFramedPeerConnectionPair(), wire: string[] = []
+    const observed = { ...left, async send(bytes: Uint8Array, options?: { signal?: AbortSignal }) {
+      wire.push(new TextDecoder().decode(bytes)); await left.send(bytes, options)
+    } }
+    const links = await Promise.all([a.connectPeer({ connection: observed }), b.connectPeer({ connection: right })])
+    await links[1].synchronize()
+    expect(b.keys.missing()).toEqual([])
+    expect(wire.join('')).not.toContain(bytesToHex(f.keys.get(0)!))
+    expect((await b.operations.inspect('secret', { author: a.deviceId }))?.attempt).toEqual(original?.attempt)
+    await Promise.all(links.map(link => link.close())); await b.close()
+    const enrolled = await f.open(await openApplicationDevice({ store: f.b.store }), new Map())
+    expect(enrolled.keys.missing()).toEqual([])
+    expect((await enrolled.operations.inspect('secret', { author: a.deviceId }))?.attempt).toEqual(original?.attempt)
+  })
+
+  it.each(['recipient', 'issuer'] as const)('binds the key-share %s to the authenticated peer', async field => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b, new Map())
+    const [left, right] = createFramedPeerConnectionPair()
+    const request = rewrite(right, value => {
+      if (field !== 'recipient' || value.kind !== 'request' || value.method !== 'keyShare') return value
+      const envelope = value.value as { readonly payload: object }
+      return { ...value, value: { ...envelope, payload: { ...envelope.payload, recipient: a.deviceId } } }
+    })
+    const response = rewrite(left, value => {
+      const envelope = value.value as { readonly payload?: { readonly requestDigest?: string } } | null
+      if (field !== 'issuer' || value.kind !== 'response' || envelope?.payload?.requestDigest === undefined) return value
+      return { ...value, value: { ...envelope, payload: { ...envelope.payload, issuer: f.host.publicKey } } }
+    })
+    const links = await Promise.all([a.connectPeer({ connection: response }), b.connectPeer({ connection: request })])
+    await expect(links[1].synchronize()).rejects.toThrow(field === 'recipient' ? 'APPLICATION_KEY_REQUEST_INVALID' : 'APPLICATION_KEY_SHARE_INVALID')
+    expect(b.keys.missing()).toEqual([0])
+    await Promise.all(links.map(link => link.close()))
+  })
+
+  it('revokes an attached reader on the currently authenticated control transition', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    await Promise.all(links.map(link => link.synchronize()))
+    const next = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
+      epoch: 1, keyDigest: await bytesDigest(crypto.getRandomValues(new Uint8Array(32))),
+      grants: f.control.payload.grants.filter(value => value.publicKey !== b.deviceId) }, f.host)
+    await f.registry.select(await signTransitionRequest({ applicationId: f.descriptor.payload.applicationId,
+      profile: f.descriptor.payload.profile, policy: f.descriptor.payload.policy, transitionId: 'revoke', expectedGeneration: a.revision.generation,
+      coordinator: a.deviceId, requester: f.host.publicKey, controlRevision: 1, reason: 'control-change', base: await a.recoveryPoint() }, f.host), { control: next })
+    await a.adopt(await f.registry.read())
+    expect(links[0].signal.aborted).toBe(true)
+    expect(a.status.connectedPeers).toBe(0)
+    await Promise.all(links.map(link => link.close()))
+  })
 })

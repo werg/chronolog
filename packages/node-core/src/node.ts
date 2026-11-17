@@ -63,6 +63,7 @@ import type {
 import { WIRE_ENCRYPTION_EPOCH_UNAVAILABLE, decodeSignedEnvelope, encodeSignedEnvelope, decodeSignedMessage, sealSignedMessage } from './wire.js'
 import { FeedForkRegistry } from './feed-forks.js'
 import { ValidatorRevisionClosures } from './validator-closures.js'
+import { assertChronologicalMaterialization } from './materialization-profile.js'
 
 export type { ViewChange, ViewChangeOptions } from '@chronolog/protocol'
 
@@ -137,6 +138,7 @@ export class ChronologNode {
   #observedAuthorTimestampMs = -1n
 
   constructor(options: ChronologNodeOptions) {
+    assertChronologicalMaterialization(options.materialization)
     this.#options = options
     const maxFutureSkewMs = options.live?.maxFutureSkewMs ?? Number(DEFAULT_LIVE_CLOCK_POLICY.maxFutureSkewMs)
     if (!Number.isSafeInteger(maxFutureSkewMs) || maxFutureSkewMs < 0) throw new Error('LIVE_MAX_FUTURE_SKEW_INVALID')
