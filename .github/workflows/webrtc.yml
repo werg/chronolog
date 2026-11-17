@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 80997ea96d00a59d3c376c9157cba78cefdb1cfc
+          ref: 1d46947b2f86a5cbbb2c95b3e358b343768d5aa8
           path: artifacts/contrib
           persist-credentials: false
       - name: Check out exact hosted participant
@@ -106,6 +106,7 @@ jobs:
           path: |
             artifacts/session-rtc/*.tgz
             artifacts/session-rtc/package/provenance.json
+            artifacts/session-sql/*.tgz
             artifacts/session-sql/package/provenance.json
             artifacts/peer-session-sql-check/report.json
             artifacts/qualification/**/report.json
@@ -113,6 +114,7 @@ jobs:
             artifacts/qualification/**/host-artifacts.json
             artifacts/qualification/**/*.png
             artifacts/qualification/composition.json
+            artifacts/host-source/dist/*.tgz
             artifacts/host-source/dist/provenance.json
           if-no-files-found: error
           retention-days: 30
