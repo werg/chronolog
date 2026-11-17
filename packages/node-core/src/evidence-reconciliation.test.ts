@@ -22,7 +22,7 @@ const groupId = bytes(71), membershipRevision = bytes(72), validationPolicy = by
 const emptyCounts = () => ({ materialize: 0, changed: 0, publish: 0, reconcile: 0, publishFinal: 0, proofs: 0, writes: 0 })
 type FixtureMode = 'available' | 'missing-body' | 'missing-key' | 'failed-reconcile' | 'failed-retention' | 'failed-final-publication'
 
-async function fixture(mode: FixtureMode) {
+async function fixture(mode: FixtureMode, clock?: { readonly now: number; readonly maxFutureSkewMs: number }) {
   const identity = await generateEd25519KeyPair(), finalityIdentity = await generateEd25519KeyPair()
   const store = new MemoryOperationStore(), bodies = new Map<string, Uint8Array | null>(), counts = emptyCounts()
   const put = store.put.bind(store)
@@ -77,6 +77,7 @@ async function fixture(mode: FixtureMode) {
   writerRing.install(bytes(91), 0n, true)
   const node = new ChronologNode({ identity, groupId, membershipRevision, validationPolicy, operationStore: store, transport,
     historyPolicy: { kind: 'coordinated', policy },
+    ...(clock === undefined ? {} : { clock: { now: () => clock.now }, live: { maxFutureSkewMs: clock.maxFutureSkewMs } }),
     // This fixture has one issued epoch; local key availability is separate.
     ...(mode === 'missing-key' ? { encryptionEpochCanAuthorize: () => true, encryptionEpochStatusAt: () => 'active' as const } : {}),
     materialization, membership: { canWrite: () => true, canValidate: () => false, threshold: () => 1 },
@@ -106,7 +107,23 @@ async function fixture(mode: FixtureMode) {
 }
 
 describe('application reconciliation after finality evidence', () => {
-  it.each(['failed-reconcile', 'failed-final-publication'] as const)('keeps authoritative published snapshots observable after %s', async mode => {
+  it.each([30, 5])('preserves verified closed time after transport retention fails with %d ms author skew', async maxFutureSkewMs => {
+    const f = await fixture('failed-retention', { now: 10, maxFutureSkewMs })
+    await expect(f.node.ingestFinalityEvidence(f.proof)).rejects.toThrow('RETENTION_FAILED')
+    expect(f.policy.snapshot().closedThroughMs).toBe(20n)
+    expect(await f.state()).toMatchObject({ finalOrderLength: 0, appliedThrough: 0 })
+    const input = { operationId: 'after-retained-proof', program: program(emit('events', 'new intent')) }
+    if (maxFutureSkewMs < 11) {
+      await expect(f.node.publish(input)).rejects.toThrow('AUTHOR_CLOCK_AHEAD')
+      expect(await f.node.operation(input.operationId)).toBeNull()
+    } else {
+      const published = await f.node.publish(input)
+      expect(published.core.authorTimestampMs).toBe(21n)
+      expect((await f.node.publish(input)).core).toEqual(published.core)
+    }
+  })
+
+  it.each(['failed-reconcile', 'failed-final-publication'] as const)('keeps published application views coherent while %s acknowledgements retry', async mode => {
     const f = await fixture(mode)
     const local = f.node.changes({ view: 'local' })[Symbol.asyncIterator](), final = f.node.changes()[Symbol.asyncIterator]()
     await local.next()
@@ -117,32 +134,42 @@ describe('application reconciliation after finality evidence', () => {
     await f.node.ingestFinalityEvidence(f.proof)
     await expect(f.node.waitForIdle()).rejects.toThrow(
       mode === 'failed-reconcile' ? 'RECONCILIATION_FAILED' : 'FINAL_PUBLICATION_REPLY_LOST')
-    const publishedLocal = await f.node.readView({ view: 'local' }), publishedFinal = await f.node.readView()
-    const localChange = (await localPending).value!
-    try {
-      expect(localChange).toEqual({ view: 'local', revision: publishedLocal.revision, finalRevision: publishedFinal.revision })
-      expect(publishedLocal.readEvents().transactions).toHaveLength(1)
-      expect((await f.node.events.read()).transactions).toEqual(publishedFinal.readEvents().transactions)
-      if (mode === 'failed-final-publication') {
-        // The actual final publication succeeded before its acknowledgement
-        // was lost. Its immutable snapshot remains the source of truth.
-        expect(publishedFinal.readEvents().transactions).toHaveLength(1)
-        expect(f.node.isFinal(f.txId)).toBe(true)
-      } else {
-        expect(publishedFinal.revision).toBe(initialFinal.revision)
-        expect(publishedFinal.readEvents().transactions).toEqual([])
-        expect(f.node.isFinal(f.txId)).toBe(false)
-      }
-    } finally {
-      publishedLocal.release(); publishedFinal.release()
-    }
-    f.restore(); await f.node.waitForIdle()
     const localView = await f.node.readView({ view: 'local' }), finalView = await f.node.readView()
-    expect(localView.revision).toBe(localChange.revision)
-    expect((await finalPending).value).toEqual({ view: 'final', revision: finalView.revision, finalRevision: finalView.revision })
-    expect(localView.readEvents().transactions).toHaveLength(1)
-    expect(finalView.readEvents().transactions).toHaveLength(1)
-    localView.release(); finalView.release(); await local.return?.(); await final.return?.()
+    try {
+      const applied = localView.readEvents().transactions
+      expect((await f.node.events.read()).transactions).toEqual(finalView.readEvents().transactions)
+      expect(applied).toHaveLength(1)
+      expect(applied[0]!.proposalId).toBe(new TextDecoder().decode(f.txId))
+      expect(applied[0]!.events[0]!.origin.operationId).toBe(mode)
+      expect(f.node.outcome(f.txId)).toMatchObject({ outcome: 'accepted', orderIndex: 0 })
+      expect(f.node.isFinal(f.txId)).toBe(mode === 'failed-final-publication')
+      expect((await localPending).value).toEqual({ view: 'local', revision: localView.revision, finalRevision: finalView.revision })
+      if (mode === 'failed-reconcile') {
+        expect(finalView.revision).toBe(initialFinal.revision)
+        expect(finalView.readEvents().transactions).toEqual([])
+      } else {
+        // The final materializer commit succeeded before its acknowledgement
+        // failed. Its actual immutable view is already readable and final.
+        expect(finalView.revision).not.toBe(initialFinal.revision)
+        expect(finalView.readEvents().transactions).toEqual(applied)
+      }
+      const localFinalityChange = mode === 'failed-reconcile' ? local.next() : undefined
+      f.restore(); await f.node.waitForIdle()
+      const settledLocal = await f.node.readView({ view: 'local' }), settledFinal = await f.node.readView()
+      try {
+        expect(settledLocal.revision).toBe(localView.revision)
+        expect(settledLocal.readEvents().transactions).toEqual(applied)
+        expect(settledFinal.readEvents().transactions).toEqual(applied)
+        expect((await finalPending).value).toEqual({ view: 'final', revision: settledFinal.revision, finalRevision: settledFinal.revision })
+        if (localFinalityChange !== undefined) expect((await localFinalityChange).value)
+          .toEqual({ view: 'local', revision: settledLocal.revision, finalRevision: settledFinal.revision })
+        expect(f.node.isFinal(f.txId)).toBe(true)
+        expect(localView.readEvents().transactions).toEqual(applied)
+        expect(finalView.readEvents().transactions).toHaveLength(mode === 'failed-reconcile' ? 0 : 1)
+      } finally { settledLocal.release(); settledFinal.release() }
+    } finally {
+      localView.release(); finalView.release(); await local.return?.(); await final.return?.()
+    }
   })
 
   it('verifies repeated retained proofs without redoing an applied materialization', async () => {

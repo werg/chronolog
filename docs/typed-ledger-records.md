@@ -72,11 +72,19 @@ rotation effective at its signed author timestamp. Receiving a later key wrap
 does not rewrite earlier activation. A stale prepared operation gets
 `ENCRYPTION_EPOCH_CLOSED`, or `FINALITY_TIMESTAMP_CLOSED` when first included behind
 an already closed time, under its original proposal ID. An exact previously
-finalized retry preserves its result. If the epoch and its causal predecessors
-were absent from the candidate's first covered inclusion set, the descriptor
-is invalid there and is skipped without claiming an unverified proposal ID.
-A later manifest cannot retroactively satisfy that inclusion dependency. If the epoch
-was issued but its key is locally missing, application still waits for authorized
+finalized retry preserves its result.
+
+Before decryption, an epoch missing from the first inclusion set does not prove
+that the candidate is invalid: its future signed author time may fall after a
+later governance transition. Exclusion requires complete causal governance and
+verified closure of the candidate's entire permitted author-time window, proving
+that the named epoch could authorize none of it. Only then can the descriptor be
+skipped without claiming an unverified proposal ID. After decryption, the exact
+signed author time selects the effective grant and encryption epoch.
+
+Key distributions bind their issuing governance revision and per-epoch content-key
+commitment. Their delivery supplies availability, not another authority timeline.
+If an authorized epoch's key is locally missing, application waits for authorized
 key delivery. Unavailable bytes remain pending. This fence does not prevent an
 authorized participant from separately disclosing data or keys it already possesses.
 

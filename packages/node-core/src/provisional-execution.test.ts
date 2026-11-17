@@ -1,6 +1,6 @@
 import { createEventMaterializationRuntime, type ChronologMaterializationRuntime } from '@chronolog/materializer'
 import {
-  bytesToHex, emit, encodeTransactionCore, encodeValidatorAttestation, encodeValidatorHeartbeat,
+  bytesToHex, decodeEnvelope, emit, encodeTransactionCore, encodeValidatorAttestation, encodeValidatorHeartbeat,
   generateEd25519KeyPair, program, transactionDigest, utf8, type TransactionCore,
 } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
@@ -202,4 +202,47 @@ describe.each(['peer', 'coordinated'] as const)('%s live provisional execution',
     expect((await view(f.node, 'final')).events).toEqual(['still-authorized'])
     expect(f.node.outcome(denied.txId)?.outcome).toBe('rejected')
   })
+})
+
+it('retries a failed validator publication without confusing a preview with a durable vote', async () => {
+  const identity = await generateEd25519KeyPair(), store = new MemoryOperationStore()
+  const materialization = await createEventMaterializationRuntime({ store, namespace: 'vote-recovery' })
+  const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
+    signer: webFeedSigner(feedIdFromPublicKey(identity.publicKeyBytes), identity.privateKey) })
+  const publish = transport.publish.bind(transport)
+  let voteAttempts = 0
+  transport.publish = async (payload, options) => {
+    if (decodeEnvelope(payload).messageType === 'attestation' && ++voteAttempts === 1) {
+      throw new Error('ATTESTATION_STORAGE_TEMPORARILY_UNAVAILABLE')
+    }
+    return publish(payload, options)
+  }
+  const node = new ChronologNode({ identity, groupId, membershipRevision, validationPolicy, operationStore: store,
+    materialization, transport, clock: { now: () => 1_000 },
+    membership: { canWrite: () => true, canValidate: () => true, threshold: () => 2 },
+    validator: { capabilityId, cutoffLagMs: 100 },
+  })
+  cleanup.push(() => node.close())
+  await node.start()
+  const proposal = await node.publish({ operationId: 'recover-vote', authorTimestampMs: 1_005n,
+    program: program(emit('preview', 'recover-vote')) })
+  const canonical = node.candidate(proposal.txId)!.canonicalPayload.slice()
+  // Replaying the retained proposal and refreshing current rights must retry
+  // the failed vote without changing the proposal or requiring resubmission.
+  for (const retained of await transport.history()) await node.ingest(retained)
+  await node.refreshMembership()
+  for (const retained of await transport.history()) await node.ingest(retained)
+  await node.waitForIdle()
+  expect(voteAttempts).toBe(2)
+  expect(node.controlStore.attestationsFor(proposal.txId)).toHaveLength(1)
+  expect(node.candidate(proposal.txId)?.state).toBe('provisional')
+  expect(node.candidate(proposal.txId)?.canonicalPayload).toEqual(canonical)
+  expect(node.outcome(proposal.txId)?.outcome).toBe('accepted')
+  expect(node.isFinal(proposal.txId)).toBe(false)
+  // A quorum is still pending. Reconsidering the selectable preview must not
+  // publish the already retained local vote again.
+  for (let index = 0; index < 3; index += 1) await node.refreshMembership()
+  const votes = (await transport.history()).filter(record => decodeEnvelope(record.payload).messageType === 'attestation')
+  expect(voteAttempts).toBe(2)
+  expect(votes).toHaveLength(1)
 })

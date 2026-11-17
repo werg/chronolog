@@ -6,6 +6,7 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/pr
 import { createServer, type IncomingMessage } from 'node:http'
 import { tmpdir } from 'node:os'
 import { extname, join, relative, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 
 import type { AgentApplicationModule } from '@chronolog/agent-service'
@@ -457,9 +458,18 @@ try {
     await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.close())))
     report.status = 'passed'; report.passed = true
     await record()
+    // The exact public checkout supplies both the application and its evidence
+    // contract. Save observations before checking that contract so a rejected
+    // report still leaves the original runtime evidence available to inspect.
+    const { validateApplicationReport } = await import(pathToFileURL(join(contrib,
+      'cookbooks/run-a-peer-application/checks/application-report.mjs')).href) as {
+        validateApplicationReport: (observations: unknown) => unknown
+      }
+    validateApplicationReport(report)
     process.stdout.write(`Application pilot evidence: ${output}\n`)
   }
 } catch (error) {
+  report.passed = false
   report.error = error instanceof Error ? error.stack ?? error.message : String(error)
   report.status = `failed during ${report.status}`
   const observations = await Promise.allSettled(observedPages.map(async (page, index) => {
@@ -481,7 +491,7 @@ try {
     report.diagnostics.nativeRevision = native.node.revision.toString()
     report.diagnostics.nativeFinalEvents = await bounded(native.client.events.read(), 5_000).catch((error: unknown) => String(error))
   }
-  if (routes !== undefined) { report.diagnostics.routes = routes.snapshot(); await routes.saveTrace(join(output, 'route-trace.ndjson')) }
+  if (routes !== undefined) { report.diagnostics.routes ??= routes.snapshot(); await routes.saveTrace(join(output, 'route-trace.ndjson')) }
   await record()
   // Preserve complete event evidence in report.json without burying the actual
   // failure beneath 768 KiB of repeated benchmark payloads in the CI log.

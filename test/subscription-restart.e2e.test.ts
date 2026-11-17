@@ -24,12 +24,7 @@ describe('transport subscription restart', () => {
     const network = new MemoryTransportNetwork()
     const [a, b] = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
     const capability = bytes32(4)
-    const membership: MembershipResolver = {
-      canWrite: () => false,
-      canValidate: ({ validatorId, validatorCapability }) =>
-        (equalBytes(validatorId, a.publicKeyBytes) || equalBytes(validatorId, b.publicKeyBytes)) && equalBytes(validatorCapability, capability),
-      threshold: () => 1,
-    }
+    const membership = validatorMembership(a, b, capability)
     const innerA = network.createNode('a')
     let subscriptions = 0
     const transportA: ChronologTransport = {
@@ -49,34 +44,36 @@ describe('transport subscription restart', () => {
     network.connectAll()
     await nodeB.publishHeartbeat()
     const deadline = Date.now() + 10_000
-    while ((await nodeA.status()).processedTransportRecords < 1) {
+    while (!hasHeartbeat(nodeA, b.publicKeyBytes)) {
       if (Date.now() > deadline) throw new Error('node A never ingested the live record from node B')
       await new Promise((resolve) => setTimeout(resolve, 50))
     }
     expect(nodeA.subscriptionRestarts).toBeGreaterThanOrEqual(1)
+    expect(subscriptions).toBeGreaterThanOrEqual(2)
   })
 
   it('recovers records a live subscription silently missed from transport history', async () => {
     const network = new MemoryTransportNetwork()
     const [a, b] = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
     const capability = bytes32(4)
-    const membership: MembershipResolver = {
-      canWrite: () => false,
-      canValidate: ({ validatorId, validatorCapability }) =>
-        (equalBytes(validatorId, a.publicKeyBytes) || equalBytes(validatorId, b.publicKeyBytes)) && equalBytes(validatorCapability, capability),
-      threshold: () => 1,
-    }
+    const membership = validatorMembership(a, b, capability)
     const innerA = network.createNode('a')
-    let subscriptions = 0
+    let subscriptions = 0, historyReads = 0
+    const dropped = new Set<string>()
     const transportA: ChronologTransport = {
       identity: innerA.identity,
       publish: (payload, options) => innerA.publish(payload, options),
       get: (id) => innerA.get(id),
       getPayload: (hash) => innerA.getPayload(hash),
-      history: () => innerA.history(),
+      history: () => { historyReads += 1; return innerA.history() },
       // The first subscription stays open but drops every live record from b.
       subscribe: (signal) => (subscriptions += 1) === 1
-        ? (async function* () { for await (const record of innerA.subscribe(signal)) if (record.author !== 'b') yield record })()
+        ? (async function* () {
+            for await (const record of innerA.subscribe(signal)) {
+              if (record.author === 'b') dropped.add(record.id)
+              else yield record
+            }
+          })()
         : innerA.subscribe(signal),
       status: () => innerA.status(),
       feedContiguousThrough: (feedId) => innerA.feedContiguousThrough(feedId),
@@ -86,14 +83,38 @@ describe('transport subscription restart', () => {
     const nodeB = await node('b2', b, network.createNode('b'), membership, capability)
     network.connectAll()
     await nodeB.publishHeartbeat()
+    const missing = nodeB.controlStore.listHeartbeats().find(heartbeat => equalBytes(heartbeat.validatorId, b.publicKeyBytes))!
+    const previousHistoryReads = historyReads
     const deadline = Date.now() + 40_000
-    while ((await nodeA.status()).processedTransportRecords < 1) {
+    // Automatic local heartbeats continue to arrive. Only B's verified,
+    // contiguous heartbeat establishes that the missing feed was recovered.
+    while (!hasHeartbeat(nodeA, b.publicKeyBytes, missing.validatorFeedSequence)) {
       if (Date.now() > deadline) throw new Error('node A never recovered the missed record')
       await new Promise((resolve) => setTimeout(resolve, 200))
     }
+    expect(dropped.has(new TextDecoder().decode(missing.heartbeatId))).toBe(true)
+    expect(historyReads).toBeGreaterThan(previousHistoryReads)
     expect(nodeA.subscriptionRestarts).toBeGreaterThanOrEqual(1)
   }, 60_000)
 })
+
+function validatorMembership(a: Ed25519KeyPair, b: Ed25519KeyPair, capability: Uint8Array): MembershipResolver {
+  return {
+    canWrite: () => false,
+    canValidate: ({ validatorId, validatorCapability }) =>
+      (equalBytes(validatorId, a.publicKeyBytes) || equalBytes(validatorId, b.publicKeyBytes)) && equalBytes(validatorCapability, capability),
+    canUseTransportAuthor: ({ role, transportAuthor, signingId, validatorCapability }) =>
+      role === 'validator' && validatorCapability !== undefined && equalBytes(validatorCapability, capability) &&
+      (transportAuthor === 'a' && equalBytes(signingId, a.publicKeyBytes) ||
+        transportAuthor === 'b' && equalBytes(signingId, b.publicKeyBytes)),
+    threshold: () => 1,
+  }
+}
+
+function hasHeartbeat(node: ChronologNode, validatorId: Uint8Array, throughSequence = 1n): boolean {
+  return node.controlStore.listHeartbeats().some(heartbeat => equalBytes(heartbeat.validatorId, validatorId) &&
+    heartbeat.feedContiguous && heartbeat.validatorFeedSequence >= throughSequence)
+}
 
 async function node(name: string, identity: Ed25519KeyPair, transport: ChronologTransport, membership: MembershipResolver, capability: Uint8Array): Promise<ChronologNode> {
   const directory = await mkdtemp(join(tmpdir(), `chronolog-subscription-${name}-`))
