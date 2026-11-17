@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -38,7 +38,11 @@ it('introduces through the packaged host then replicates signed records over RTC
   try {
     const engine = join(directory, 'engine')
     await mkdir(engine)
-    execFileSync('tar', ['-xzf', new URL('../../test/artifacts/tendriller-engine-534e044c.tgz', import.meta.url).pathname,
+    const manifestUrl = new URL('../../packages/transport-tendriller/package.json', import.meta.url)
+    const manifest = JSON.parse(await readFile(manifestUrl, 'utf8')) as { devDependencies: Record<string, string> }
+    const archive = manifest.devDependencies['@tendriller/engine']!
+    expect(archive).toMatch(/^file:.*\.tgz$/u)
+    execFileSync('tar', ['-xzf', new URL(archive.slice('file:'.length), manifestUrl).pathname,
       '-C', engine, '--strip-components=1'])
     native = await createNativeBrowserFixture({ directory: join(directory, 'native'), browsers: [{
       identity: bytesToBase64Url(identity.signing.publicKeyBytes), readerKey: bytesToBase64Url(identity.reader.publicKeyBytes), transportAuthor: transport.identity,

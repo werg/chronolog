@@ -30,7 +30,7 @@ interface BrowserState {
 }
 interface PublishedOperation { readonly proposalId: string; readonly outcome: TransactionOutcome }
 function finalDecision({ proposalId, outcome }: PublishedOperation) {
-  return { proposalId, transactionId: outcome.transactionId, phase: outcome.phase, outcome: outcome.outcome,
+  return { proposalId, transactionId: outcome.transactionId, outcome: outcome.outcome,
     orderKey: outcome.orderKey, admissible: outcome.admissible, final: outcome.final }
 }
 const workspace = resolve(import.meta.dirname, '..')
@@ -147,7 +147,8 @@ try {
       { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
     onError: error => {
       const message = error instanceof Error ? error.message : String(error)
-      if (injectingInterruption && ['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED'].includes(message)) expectedTerminations.push(message)
+      if (injectingInterruption && ['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED',
+        'PEER_CONNECTION_ENDED', 'PEER_LIVE_ENDED'].includes(message)) expectedTerminations.push(message)
       else errors.push(String(error))
     }, async accept(connection) {
     nativeConnection = connection

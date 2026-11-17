@@ -131,11 +131,21 @@ describe('public Tendriller adapter', () => {
   })
 
   it('pins the built public SDK/engine artifacts and provenance', async () => {
-    for (const name of ['sdk', 'engine']) {
-      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-534e044c.tgz`, import.meta.url)
-      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-534e044c.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
+    const manifestUrl = new URL('../package.json', import.meta.url)
+    const manifest = JSON.parse(await readFile(manifestUrl, 'utf8')) as { devDependencies: Record<string, string> }
+    for (const [dependency, name] of [['@tendriller/core', 'sdk'], ['@tendriller/engine', 'engine']]) {
+      const reference = manifest.devDependencies[dependency!]!
+      expect(reference).toMatch(new RegExp(`^file:.*tendriller-${name}-[0-9a-f]{8}\\.tgz$`))
+      const artifact = new URL(reference.slice('file:'.length), manifestUrl)
+      const provenance = JSON.parse(await readFile(new URL(artifact.href.replace(/\.tgz$/u, '.provenance.json')), 'utf8')) as {
+        sha256: string; sourceCommit: string; sourceDirty: boolean; package: string; repository: string
+      }
       expect(createHash('sha256').update(await readFile(artifact)).digest('hex')).toBe(provenance.sha256)
-      expect(provenance.sourceCommit).toBe('534e044c74589a2c19757386813c5627b9383b8d')
+      expect(provenance.repository).toBe('https://github.com/werg/tendriller')
+      expect(provenance.package).toBe(dependency)
+      expect(provenance.sourceCommit).toMatch(/^[0-9a-f]{40}$/u)
+      expect(provenance.sourceDirty).toBe(false)
+      expect(artifact.pathname.endsWith(`-${provenance.sourceCommit.slice(0, 8)}.tgz`)).toBe(true)
     }
     expect(RECORD_LOG_FORMAT).toBe('record-log/v1')
   })
