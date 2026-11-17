@@ -68,11 +68,11 @@ describe('native WebRTC interoperability', () => {
     ]).finally(() => { interfaces.mockRestore(); syncBuiltinESMExports() })
     try {
       const reading = left.frames()[Symbol.asyncIterator]().next()
-      const rejected = expect(reading).rejects.toThrow('WEBRTC_CONNECTION_ENDED')
+      const rejected = expect(reading).rejects.toThrow('PEER_MESSAGE_CONNECTION_ENDED')
       controller.abort()
       await rejected
       expect(left.session.signal.aborted).toBe(true)
-      await expect(left.send(new Uint8Array([1]))).rejects.toThrow('WEBRTC_CONNECTION_ENDED')
+      await expect(left.send(new Uint8Array([1]))).rejects.toThrow('PEER_MESSAGE_CONNECTION_ENDED')
     } finally { await Promise.all([left.close(), right.close()]) }
   })
 

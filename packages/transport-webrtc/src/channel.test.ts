@@ -41,7 +41,7 @@ describe('reliable WebRTC frame transport', () => {
     const left = new Channel(), right = new Channel()
     left.other = right; right.other = left
     const connection = frameRtcDataChannel(left, { helloTimeoutMs: 10 })
-    const rejected = expect(connection.ready).rejects.toThrow('WEBRTC_HELLO_TIMEOUT')
+    const rejected = expect(connection.ready).rejects.toThrow('PEER_MESSAGE_HELLO_TIMEOUT')
     try {
       await vi.advanceTimersByTimeAsync(30_000)
       expect(left.readyState).toBe('connecting')
@@ -114,10 +114,10 @@ describe('reliable WebRTC frame transport', () => {
     const { a, b, left } = pair({ maxFrameBytes: 32, queueBytes: 32, queueFrames: 1 })
     try {
       await a.ready
-      await expect(a.send(new Uint8Array(33))).rejects.toThrow('WEBRTC_FRAME_TOO_LARGE')
+      await expect(a.send(new Uint8Array(33))).rejects.toThrow('PEER_MESSAGE_FRAME_TOO_LARGE')
       await a.send(new Uint8Array(32))
       const waiting = a.send(new Uint8Array(32))
-      const rejected = expect(waiting).rejects.toThrow('WEBRTC_CONNECTION_CLOSED')
+      const rejected = expect(waiting).rejects.toThrow('PEER_MESSAGE_CONNECTION_CLOSED')
       await a.close(); await rejected
       expect(left.readyState).toBe('closed')
     } finally { await b.close() }
@@ -130,7 +130,7 @@ describe('reliable WebRTC frame transport', () => {
       const packet = new Uint8Array(16); packet.set([0x43, 0x52, 1, 3])
       new DataView(packet.buffer).setUint32(4, 1); new DataView(packet.buffer).setUint32(8, 1)
       right.dispatchEvent(new MessageEvent('message', { data: packet.buffer }))
-      await expect(b.frames()[Symbol.asyncIterator]().next()).rejects.toThrow('WEBRTC_CREDIT_INVALID')
+      await expect(b.frames()[Symbol.asyncIterator]().next()).rejects.toThrow('PEER_MESSAGE_CREDIT_INVALID')
       expect(left.readyState).toBe('closed')
     } finally { await Promise.all([a.close(), b.close()]) }
   })
@@ -178,7 +178,7 @@ describe('independent live WebRTC lane', () => {
   it('never queues a cancelled, disconnected or congested live send', async () => {
     const source = channels(false, 0), a = frameRtcLiveChannel(source.left), b = frameRtcLiveChannel(source.right)
     try {
-      await expect(a.trySend(new Uint8Array([1]))).rejects.toThrow('WEBRTC_LIVE_NOT_OPEN')
+      await expect(a.trySend(new Uint8Array([1]))).rejects.toThrow('PEER_MESSAGE_LIVE_NOT_OPEN')
       source.open()
       const controller = new AbortController(); controller.abort(new Error('preview expired'))
       await expect(a.trySend(new Uint8Array([2]), { signal: controller.signal })).rejects.toThrow('preview expired')
@@ -199,7 +199,7 @@ describe('independent live WebRTC lane', () => {
       expect(b.stats.queuedReceiveFrames).toBe(WEBRTC_LIVE_LIMITS.queueFrames)
       expect(b.stats.droppedPackets).toBe(1)
       expect((await received.next()).value).toEqual(new Uint8Array([1]))
-      await expect(a.trySend(new Uint8Array(WEBRTC_LIVE_LIMITS.frameBytes + 1))).rejects.toThrow('WEBRTC_LIVE_FRAME_TOO_LARGE')
+      await expect(a.trySend(new Uint8Array(WEBRTC_LIVE_LIMITS.frameBytes + 1))).rejects.toThrow('PEER_MESSAGE_LIVE_FRAME_TOO_LARGE')
     } finally { await Promise.all([a.close(), b.close()]); await received.return?.() }
   })
 
