@@ -22,12 +22,13 @@ export class EventHistoryStore {
   async load(): Promise<EventHistoryState | null> {
     const bytes = await this.store.get(this.key)
     if (bytes === null) return null
-    const value = assertCanonicalCbor(bytes)
+    if (bytes.length > 1024 || bytes.length > this.quota) throw new Error('EVENT_EXECUTION_STORE_INVALID')
+    const value = assertCanonicalCbor(bytes, { maxBytes: 1024, maxItems: 32 })
     if (!Array.isArray(value) || value.length !== 8 || value[0] !== 'chronolog/event-head/v2' ||
         !(value[1] instanceof Uint8Array) || !equalBytes(value[1], this.digest) || typeof value[2] !== 'bigint' ||
         typeof value[3] !== 'bigint' || typeof value[4] !== 'bigint' || typeof value[5] !== 'bigint' ||
         value[2] < 0n || value[3] < 0n || value[3] > value[5] || value[4] < 0n || value[5] < 0n || value[5] > 100_000n ||
-        typeof value[7] !== 'bigint' || value[7] < 0n || value[7] > BigInt(this.quota) ||
+        typeof value[7] !== 'bigint' || value[7] < 0n || value[7] + BigInt(bytes.length) > BigInt(this.quota) || value[5] > value[7] / 64n ||
         value[6] !== null && (!(value[6] instanceof Uint8Array) || value[6].length !== 32)) throw new Error('EVENT_EXECUTION_STORE_INVALID')
     const count = Number(value[5]), order = new Array<ReplayProposal>(count), sizes = new Array<number>(count)
     const anchors = new Array<string>(count)
@@ -35,7 +36,7 @@ export class EventHistoryStore {
     for (let index = count - 1; index >= 0; index--) {
       if (!(tail instanceof Uint8Array)) throw new Error('EVENT_EXECUTION_STORE_INVALID')
       const hash = bytesToHex(tail), node = await this.store.get(`${this.key}/node/${hash}`)
-      if (node === null || !equalBytes(await sha256(node), tail)) throw new Error('EVENT_EXECUTION_HISTORY_INCOMPLETE')
+      if (node === null || node.length > this.quota - used || !equalBytes(await sha256(node), tail)) throw new Error('EVENT_EXECUTION_HISTORY_INCOMPLETE')
       used += node.length
       if (used > this.quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
       const row = assertCanonicalCbor(node, { maxBytes: this.quota, maxByteStringBytes: this.quota, maxItems: 32 })
@@ -52,6 +53,8 @@ export class EventHistoryStore {
   }
 
   async commit(state: EventHistoryState, difference: number): Promise<string> {
+    if (!Number.isSafeInteger(difference) || difference < 0 || difference > this.#anchors.length ||
+        difference > state.order.length || state.order.length > 100_000) throw new Error('EVENT_EXECUTION_STORE_INVALID')
     const anchors = this.#anchors.slice(0, difference), sizes = this.#prefixBytes.slice(0, difference)
     let tail = anchors.at(-1) ?? null, used = sizes.at(-1) ?? 0
     for (let index = difference; index < state.order.length; index++) {

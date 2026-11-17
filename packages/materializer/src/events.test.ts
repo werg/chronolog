@@ -269,4 +269,41 @@ describe('SQL-free durable event execution', () => {
       .rejects.toThrow('DUPLICATE_PROPOSAL')
     expect(runtime.queries.orderLength).toBe(0)
   })
+  it('ignores an incomplete tail and recovers the previously published prefix', async () => {
+    const bytes = store()
+    let untilFailure = Infinity
+    const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
+      if (--untilFailure === 0) throw new Error('power loss during tail')
+      await bytes.put(key, value)
+    } }
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'partial-tail' })
+    const digest = runtime.queries.executionManifestDigest
+    const entries = await Promise.all([1, 2, 3].map(index => proposal(digest, index, program(emit('chat', index)))))
+    await runtime.coordinator.materialize(entries.slice(0, 1))
+    untilFailure = 2
+    await expect(runtime.coordinator.materialize(entries)).rejects.toThrow('power loss during tail')
+    expect(runtime.queries.orderLength).toBe(1)
+    untilFailure = Infinity
+    const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'partial-tail' })
+    expect(reopened.queries.orderLength).toBe(1)
+    await reopened.coordinator.materialize(entries)
+    expect(reopened.queries.orderLength).toBe(3)
+  })
+
+  it('rejects corrupt or missing records referenced by a durable head', async () => {
+    const bytes = store()
+    let recordKey = ''
+    const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
+      if (key.includes('/node/')) recordKey = key
+      await bytes.put(key, value)
+    } }
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'corrupt-record' })
+    await runtime.coordinator.materialize([await proposal(runtime.queries.executionManifestDigest, 1, program(emit('chat', 'one')))])
+    const original = (await bytes.get(recordKey))!
+    const corrupt = original.slice(); corrupt[corrupt.length - 1] = corrupt[corrupt.length - 1]! ^ 1
+    await bytes.put(recordKey, corrupt)
+    await expect(createEventMaterializationRuntime({ store: storage, namespace: 'corrupt-record' })).rejects.toThrow('HISTORY_INCOMPLETE')
+    await bytes.put(recordKey, original)
+    await expect(createEventMaterializationRuntime({ store: { get: async key => key === recordKey ? null : bytes.get(key), put: (key, value) => storage.put(key, value) }, namespace: 'corrupt-record' })).rejects.toThrow('HISTORY_INCOMPLETE')
+  })
 })
