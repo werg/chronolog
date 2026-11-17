@@ -152,12 +152,22 @@ export function assertReleaseStateExtension(previous: ReleaseState, next: Releas
 export async function verifyReleaseContent(manifest: SignedReleaseManifest, content: ReleaseContentSource,
   options: { readonly signal?: AbortSignal } = {}): Promise<void> {
   validateReleaseManifest(manifest.payload)
+  await verifyAssets(structuredClone(manifest.payload.assets), content, options)
+}
+/** Verify one stored asset before serving its immutable storage version. No page manifest is invented. */
+export async function verifyReleaseAsset(asset: ReleaseAsset, content: ReleaseContentSource,
+  options: { readonly signal?: AbortSignal } = {}): Promise<void> {
+  validateReleaseAsset(asset)
+  await verifyAssets([structuredClone(asset)], content, options)
+}
+async function verifyAssets(assets: readonly ReleaseAsset[], content: ReleaseContentSource,
+  options: { readonly signal?: AbortSignal }): Promise<void> {
   const lifetime = new AbortController(), timer = setTimeout(() => lifetime.abort(new Error('RELEASE_CONTENT_TIMEOUT')), RELEASE_LIMITS.verificationMs)
   const signal = options.signal === undefined ? lifetime.signal : AbortSignal.any([lifetime.signal, options.signal])
   try {
     signal.throwIfAborted()
     const verified = new Set<string>()
-    for (const asset of manifest.payload.assets) {
+    for (const asset of assets) {
       if (verified.has(asset.digest)) continue
       const hash = createSha256(); let bytes = 0, done = false
       const iterator = content.read(structuredClone(asset), { signal })[Symbol.asyncIterator]()
