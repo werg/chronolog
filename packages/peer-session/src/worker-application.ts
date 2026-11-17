@@ -4,7 +4,7 @@ import type { EphemeralSignal, SignalPayload, SignalSendOptions, Signals, Signal
 
 import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from './definition.js'
 import type { ContentReference, ContentRetention, ContentUpload } from './content.js'
-import type { ApplicationControlHost, ApplicationTransition } from './recovery.js'
+import type { ApplicationControlHost, ApplicationRecoveryExpectation, ApplicationTransition } from './recovery.js'
 import {
   AbandonedOperationError, RecoveredViewError, type ApplicationChange, type ApplicationEventBatch,
   type ApplicationEventOptions, type ApplicationReadView, type ApplicationSession, type CommandOptions,
@@ -114,7 +114,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'recoveryPoint': return session.recoveryPoint()
       case 'adopt': return session.adopt(args[0] as AuthorityBundle)
       case 'recovery.inspect': return session.recovery.inspect()
-      case 'recovery.takeover': return session.recovery.takeover(controlHost(), { ...args[0] as { coordinator?: string; transitionId?: string }, signal })
+      case 'recovery.takeover': return session.recovery.takeover(controlHost(), { ...args[0] as { coordinator?: string; transitionId?: string; expected?: ApplicationRecoveryExpectation }, signal })
       case 'recovery.handover': return session.recovery.handover(controlHost(), { ...args[0] as { coordinator: string; transitionId?: string }, signal })
       case 'participation.approve': return participation().approveRecovery(args[0] as string)
       case 'participation.close': return participation().close()
@@ -136,7 +136,6 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'content.retain': return session.content.retain(args[0] as ContentReference, { signal })
       case 'content.retained': return session.content.retained(args[0] as ContentReference)
       case 'content.retention': return session.content.retention(args[0] as ContentReference)
-      case 'close': await stop(new Error('APPLICATION_SESSION_CLOSED')); return null
       default: throw new Error('APPLICATION_WORKER_METHOD_UNKNOWN')
     }
   }
@@ -153,6 +152,9 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
   }
   const handle = async (request: Request): Promise<void> => {
     if (closed) throw new Error('APPLICATION_SESSION_CLOSED')
+    // Shutdown must remain available when every ordinary request slot is
+    // occupied by a passive operation or stream waiter.
+    if (request.method === 'close') { await stop(new Error('APPLICATION_SESSION_CLOSED')); return }
     if (calls.size >= MAX_REQUESTS) throw new Error('APPLICATION_WORKER_REQUEST_LIMIT')
     const controller = new AbortController(); calls.set(request.id, controller)
     try {
@@ -243,7 +245,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   }
   readonly recovery = {
     inspect: (): Promise<readonly ApplicationTransition[]> => this.#call('recovery.inspect', []),
-    takeover: (options: { readonly coordinator?: string; readonly transitionId?: string; readonly signal?: AbortSignal } = {}): Promise<RecoveryNotice | null> => {
+    takeover: (options: { readonly coordinator?: string; readonly transitionId?: string; readonly expected?: ApplicationRecoveryExpectation; readonly signal?: AbortSignal } = {}): Promise<RecoveryNotice | null> => {
       const { signal, ...request } = options
       return this.#call('recovery.takeover', [request], signal, true)
     },
@@ -369,7 +371,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   #call<T>(method: string, args: readonly unknown[], signal?: AbortSignal, passive = false): Promise<T> {
     if (this.signal.aborted) return Promise.reject(this.signal.reason)
     if (signal?.aborted) return Promise.reject(signal.reason)
-    if (this.#pending.size >= MAX_REQUESTS) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_LIMIT'))
+    if (method !== 'close' && this.#pending.size >= MAX_REQUESTS) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_LIMIT'))
     const id = ++this.#nextId
     if (!Number.isSafeInteger(id)) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_ID_EXHAUSTED'))
     const request: Request = { id, method, args }

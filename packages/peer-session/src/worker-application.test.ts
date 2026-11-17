@@ -307,6 +307,16 @@ describe('owned browser application facade', () => {
     expect(await client.operations.get('oversized')).toBeNull()
   })
 
+  it('closes the owned session even when every ordinary RPC slot is waiting offline', async () => {
+    const f = await fixture(), { client } = await facade(f.b)
+    const operation = await client.command('say', 'offline', { operationId: 'close-full' })
+    const pending = Promise.allSettled(Array.from({ length: 80 }, () => operation.applied()))
+    await client.close()
+    expect(client.signal.aborted).toBe(true)
+    expect(f.b.status.phase).toBe('closed')
+    expect((await pending).every(value => value.status === 'rejected')).toBe(true)
+  })
+
   it('rejects malformed query capabilities in Worker readiness metadata', async () => {
     const f = await fixture(), description = f.a.describe()
     const metadata = vi.spyOn(f.a, 'describe').mockReturnValue({ ...description,
