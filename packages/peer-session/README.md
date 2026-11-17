@@ -22,6 +22,8 @@ Opening an application starts its authenticated protocol participant. Reading
 `status`, `revision`, `capabilities` or `describe()`, observing status/recovery,
 registering a projection, connecting peers and exchanging control, publication
 or live signal messages do not load database code or acquire data storage.
+Authentication and membership use the participant's verified authority and its
+small metadata store; they do not depend on a replica or materializer.
 
 The first command, query, read view, operation inspection, content request,
 recovery action or projection read loads the one durable implementation. Pulling
@@ -334,11 +336,13 @@ may still commit remotely; its saved exact request remains available for recover
 
 ## Enrollment and epoch keys
 
-The device owns one Ed25519 identity and one durable application keyring. An
-initial creator passes `epochKeys` to the open function as explicit local
-bootstrap; normal reopening loads those keys from the owned store. A newly
-granted reader can open without keys and reports `status.phase ===
-'awaiting-keys'` until it connects to another reader with the needed keys.
+The device owns one Ed25519 identity. Its durable application keyring opens
+with the data facet. An initial creator passes `epochKeys` to the open function
+as explicit local bootstrap; normal first data use loads enrolled keys from
+the owned store. A newly granted reader can authenticate and exchange live or
+control messages without epoch keys. After data activation it reports
+`status.phase === 'awaiting-keys'` until another current reader supplies the
+needed keys through an authenticated connection.
 
 Maintained peer transports acquire missing keys before replay. Each request
 signs a fresh ephemeral HPKE receiver together with the application, history,
@@ -360,9 +364,10 @@ created the new key calls `session.keys.install(new Map([[epoch, key]]))`.
 Other readers acquire the rotated key through their peer connections. Selected
 history determines the keys required for replay; content can acquire an older
 committed key when a retained attachment needs it. Old keys remain local for
-reading retained history and content. Advanced transports can use
-`session.keys.request()`, `offer()` and `attachSource()` directly; ordinary
-applications use the maintained connection helpers.
+reading retained history and content. Explicit `session.keys.request()`,
+`offer()`, `install()`, `ensure()` and `missing()` calls are asynchronous data
+demands. The maintained connection owner attaches key sources to the same
+authenticated peer link when the durable facet becomes active.
 
 ## Recovery and inspection
 
