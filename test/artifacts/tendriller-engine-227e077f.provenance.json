@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "227e077f0c914094a0eb3c9c59d41a4ba6d443a1",
+  "sourceTree": "72004ff83085b58900d6ac72ba539b12f5d19629",
+  "sourceDirty": false,
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm ci --ignore-scripts --no-audit --no-fund",
+  "membershipSource": "eaef20aad0c120fc1490755ae753909c20a3fbce",
+  "purpose": "Atomic application views, bounded cancellable hosted signals, independent live peer lanes, and explicit writer rights.",
+  "package": "@tendriller/engine",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-engine-227e077f.tgz",
+  "sha256": "56062bdef6f8524e06c718eebb9b4ae87984aa57b62d40fb7800b511551b47a9"
+}
