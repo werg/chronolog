@@ -114,7 +114,6 @@ class Replica implements PeerReplica {
       }
     }
     check(this.#authority.current !== null, 'PEER_NO_SELECTED_GENERATION')
-    check(this.#options.materializer.historyProfile === 'peer-generation-v1', 'PEER_MATERIALIZER_PROFILE_MISMATCH')
     check(bytesToHex(this.#options.materializer.queries.executionManifestDigest) === this.descriptor.executionManifestDigest,
       'PEER_EXECUTION_MANIFEST_MISMATCH')
     const journal = await this.#options.store.get(`${this.#prefix}/journal-head`)

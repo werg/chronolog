@@ -39,7 +39,7 @@ export async function openNativeSqlApplication<const D extends ApplicationDefini
       throw new Error('APPLICATION_SCHEMA_DEFINITION_MISMATCH')
     }
     const materializer = await DeterministicMaterializer.open({ path: options.databasePath, executionManifest: createNativeSqlManifest(),
-      historyProfile: 'peer-generation-v1', rootAdministrator: hexToBytes(descriptor.schemaAdministrator),
+      rootAdministrator: hexToBytes(descriptor.schemaAdministrator),
       bootstrapGroupId: hexToBytes(descriptor.applicationId), bootstrapProgram })
     return createDoltLiteMaterializationRuntime(materializer)
   } })

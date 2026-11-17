@@ -48,14 +48,14 @@ export interface CoordinatedMaterialization {
   readonly publication: MaterializationPublicationRequest
 }
 
-/** Calculates or follows one immutable materialization candidate. */
+/** Executes one order already authenticated by the history owner, independently of transport or ordering policy. */
 export interface MaterializationCoordinator {
   materialize(
     orderedTransactions: readonly ReplayProposal[],
     controls?: PeerExecutionControls,
   ): Promise<CoordinatedMaterialization | null>
-  /** Materialize and pin an actual immutable final prefix, independently of local state. */
-  publishFinal?(prefixLength: number): Promise<void>
+  /** Optional settlement capability, invoked only by an owner holding the required settlement evidence. */
+  publishFinal?(prefixLength: number, controls?: PeerExecutionControls): Promise<void>
 }
 
 /** A verified control projection supplied by the history owner, never an application callback. */
@@ -150,7 +150,6 @@ export interface MaterializationPublicationStore {
 }
 
 export interface ChronologMaterializationRuntime {
-  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
   readonly coordinator: MaterializationCoordinator
   readonly queries: MaterializedQueryService
   readonly publications: MaterializationPublicationStore

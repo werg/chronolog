@@ -241,9 +241,9 @@ describe('pluggable inclusion finality with one chronological execution order', 
 })
 
 describe('signed provider selection', () => {
-  async function configured(historyProfile: 'chronological' | 'peer-generation-v1' = 'chronological') {
+  async function configured() {
     const store = new MemoryOperationStore(), identity = await generateEd25519KeyPair()
-    const runtime = await createEventMaterializationRuntime({ store, namespace: 'custom-provider', historyProfile })
+    const runtime = await createEventMaterializationRuntime({ store, namespace: 'custom-provider' })
     const transportAuthor = feedIdFromPublicKey(identity.publicKeyBytes)
     const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
       signer: webFeedSigner(transportAuthor, identity.privateKey) })
@@ -263,23 +263,6 @@ describe('signed provider selection', () => {
     cleanup.push(async () => { await transport.close(); await runtime.close() })
     return { genesis, groupRoute: groupId, identity, transport, operationStore: store, materialization: runtime }
   }
-
-  it('refuses a generation materializer before opening chronological governance', async () => {
-    const options = await configured('peer-generation-v1')
-    let writes = 0
-    const operationStore = {
-      get: options.operationStore.get.bind(options.operationStore),
-      async put(key: string, value: Uint8Array) { writes++; await options.operationStore.put(key, value) },
-    }
-    expect(() => new ChronologNode({
-      identity: options.identity, groupId, membershipRevision, validationPolicy,
-      transport: options.transport, materialization: options.materialization, operationStore,
-      membership: { canWrite: () => true, canValidate: () => false, threshold: () => 1 },
-    })).toThrow('NODE_MATERIALIZATION_PROFILE_MISMATCH')
-    await expect(createGovernedNode({ ...options, operationStore }))
-      .rejects.toThrow('NODE_MATERIALIZATION_PROFILE_MISMATCH')
-    expect(writes).toBe(0)
-  })
 
   it('selects an injected verifier by the signed provider ID and passes opaque proof bytes', async () => {
     const options = await configured(), seen: Uint8Array[] = []

@@ -17,7 +17,6 @@ import { GovernanceControlPlane, GovernanceRecordPendingError, isInvalidGovernan
 import { SignedInclusionFinalityProvider, encodeHistoryConfiguration, type CoordinatedHistoryConfiguration, type OrderedRecordEntry } from './history-policy.js'
 import { resolveFinalityClockPolicy, type LiveInclusionFinalityProvider } from './finality.js'
 import { ChronologNode } from './node.js'
-import { assertChronologicalMaterialization } from './materialization-profile.js'
 import type { DurableOperationStore } from './operations.js'
 import { PeerGovernanceController } from './peer-governance.js'
 import type { Clock, OperationalMembershipState, RandomSource, ValidatorOptions } from './types.js'
@@ -44,7 +43,6 @@ export interface GovernedNodeOptions {
 
 /** The same governance, history and enrollment composition on native and browser peers. */
 export async function createGovernedNode(options: GovernedNodeOptions) {
-  assertChronologicalMaterialization(options.materialization)
   // Verification and all derived runtime policy must observe one owned input,
   // even when a caller changes its configuration while crypto is awaited.
   options = { ...options, genesis: structuredClone(options.genesis), groupRoute: options.groupRoute.slice() }

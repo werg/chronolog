@@ -24,7 +24,7 @@ async function fixture(options: { loseKeyReply?: boolean; beforeKeyRead?: () => 
     } }
   }
   const devices = await Promise.all(stores.map(store => openApplicationDevice({ store, create: true })))
-  const key = crypto.getRandomValues(new Uint8Array(32)), artifacts = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const key = crypto.getRandomValues(new Uint8Array(32)), artifacts = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '68'.repeat(32), historyId: 'key-enrollment',
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: devices[0]!.identity.publicKey,
     definitionDigest: '01'.repeat(32), schemaDigest: null, executionManifestDigest: bytesToHex(artifacts.executionManifestDigest) }, host)
@@ -38,7 +38,7 @@ async function fixture(options: { loseKeyReply?: boolean; beforeKeyRead?: () => 
   const open = async (index: number, initial?: ReadonlyMap<number, Uint8Array>) => {
     const device = await openApplicationDevice({ store: stores[index]! }), authority = await registry.read()
     const keys = await ApplicationKeyring.open({ device, authority, ...(initial === undefined ? {} : { epochKeys: initial }) })
-    const runtime = await createEventMaterializationRuntime({ store: device.store, namespace: 'keys', historyProfile: 'peer-generation-v1' })
+    const runtime = await createEventMaterializationRuntime({ store: device.store, namespace: 'keys' })
     const replica: PeerReplica = await createPeerReplica({ authority, device: device.identity, storageId: device.storageId,
       store: device.store, materializer: runtime, epochKeys: keys.epochKeys })
     keys.bind(replica); await keys.validate()

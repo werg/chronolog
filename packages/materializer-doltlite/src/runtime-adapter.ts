@@ -19,7 +19,6 @@ import type {
 } from './types.js'
 
 export interface DoltLiteMaterializerRuntimeBackend {
-  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
   readonly revision: bigint
   readonly orderLength: number
   readonly finalRevision?: bigint
@@ -27,7 +26,7 @@ export interface DoltLiteMaterializerRuntimeBackend {
   readonly executionManifestDigest: Uint8Array
   proposalIdAt(index: number): Uint8Array | null
   materialize(orderedTransactions: readonly ReplayProposal[], controls?: PeerExecutionControls): Promise<MaterializedRevision | null>
-  publishFinal?(prefixLength: number): Promise<void>
+  publishFinal?(prefixLength: number, controls?: PeerExecutionControls): Promise<void>
   localSql(
     sql: string,
     parameters?: readonly LocalSqlValue[],
@@ -64,11 +63,10 @@ export function createDoltLiteMaterializationRuntime(
   ): MaterializationPublicationResult => ({ status, publicationKey, ...snapshot() })
 
   return {
-    historyProfile: materializer.historyProfile ?? 'chronological',
     coordinator: {
-      async publishFinal(prefixLength) {
+      async publishFinal(prefixLength, controls) {
         if (materializer.publishFinal === undefined) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
-        await materializer.publishFinal(prefixLength)
+        await materializer.publishFinal(prefixLength, controls)
       },
       async materialize(orderedTransactions, controls) {
         const revision = await materializer.materialize(orderedTransactions, controls)

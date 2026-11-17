@@ -121,7 +121,7 @@ describe('SQL-free durable event execution', () => {
     const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
       writes.push({ key, bytes: value.length }); await bytes.put(key, value)
     } }
-    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'bounded-growth', historyProfile: 'peer-generation-v1' })
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'bounded-growth' })
     const history: ReplayProposal[] = []
     for (let index = 0; index < 32; index++) {
       history.push(await proposal(runtime.queries.executionManifestDigest, index, program(emit('chat', 'x'.repeat(1024)))))
@@ -135,7 +135,7 @@ describe('SQL-free durable event execution', () => {
     const bodyBytes = history.reduce((total, entry) => total + entry.canonicalCandidate.length, 0)
     expect(writes.reduce((total, write) => total + write.bytes, 0)).toBeLessThan(bodyBytes * 1.5)
     await runtime.coordinator.materialize(history.slice(0, 12))
-    const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'bounded-growth', historyProfile: 'peer-generation-v1' })
+    const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'bounded-growth' })
     expect(reopened.queries.orderLength).toBe(12)
     expect(reopened.queries.outcome(history[12]!.txId)).toBeNull()
     expect(records).toHaveLength(32)
@@ -151,7 +151,8 @@ describe('SQL-free durable event execution', () => {
     const held = runtime.queries.captureRead!({ view: 'local' })
     const before = runtime.queries.captureApplication({ view: 'local' })
     expect(snapshotData(held)).toEqual(snapshotData(before))
-    expect(snapshotData(runtime.queries.captureApplication())).toEqual({
+    expect(snapshotData(runtime.queries.captureApplication())).toEqual(snapshotData(before))
+    expect(snapshotData(runtime.queries.captureApplication({ view: 'final' }))).toEqual({
       view: 'final', revision: 0n, orderLength: 0, finalRevision: 0n, finalOrderLength: 0, transactions: [],
     })
     const changed = await runtime.coordinator.materialize([early, late])
@@ -172,7 +173,7 @@ describe('SQL-free durable event execution', () => {
     expect(applied.transactionAt(0))
       .toEqual({ txId: early.txId, canonicalCandidate: early.canonicalCandidate, outcome: 'accepted' })
     await runtime.coordinator.publishFinal!(2)
-    const final = runtime.queries.captureApplication()
+    const final = runtime.queries.captureApplication({ view: 'final' })
     expect(final).toMatchObject({ view: 'final', revision: 1n, orderLength: 2, finalRevision: 1n, finalOrderLength: 2 })
     expect(snapshotData(held)).toEqual(snapshotData(before))
     held.release()
@@ -181,7 +182,7 @@ describe('SQL-free durable event execution', () => {
     expect(reopened.queries.outcome(early.txId)?.outcome).toBe('accepted')
     expect(reopened.queries.outcome(late.txId)?.rejectionCode).toBe('operation_conflict')
     expect(reopened.queries.finalOrderLength).toBe(2)
-    expect(snapshotData(reopened.queries.captureApplication())).toEqual(snapshotData(final))
+    expect(snapshotData(reopened.queries.captureApplication({ view: 'final' }))).toEqual(snapshotData(final))
     await reopened.close()
   })
 
@@ -235,7 +236,9 @@ describe('SQL-free durable event execution', () => {
     await runtime.coordinator.materialize([final, one, two])
     expect(runtime.queries.outcome(one.txId)?.outcome).toBe('accepted')
     expect(runtime.queries.outcome(two.txId)?.rejectionCode).toBe('operation_conflict')
-    await expect(runtime.coordinator.materialize([final, two, one])).rejects.toThrow('ORDER_NOT_CHRONOLOGICAL')
+    await runtime.coordinator.materialize([final, two, one])
+    expect(runtime.queries.outcome(two.txId)?.outcome).toBe('accepted')
+    expect(runtime.queries.outcome(one.txId)?.rejectionCode).toBe('operation_conflict')
     await runtime.coordinator.materialize([final, two])
     const changed = await proposal(digest, 3, program(emit('chat', 'changed')), 'same')
     await expect(runtime.coordinator.materialize([final, { ...changed, txId: two.txId }])).rejects.toThrow('IDENTITY_CONFLICT')

@@ -28,7 +28,7 @@ export async function openPeerApplication<const D extends ApplicationDefinition>
     keys = await ApplicationKeyring.open({ device: options.device, authority: options.authority,
       ...(options.epochKeys === undefined ? {} : { epochKeys: options.epochKeys }) })
     materializer = options.createMaterializer === undefined ? await createEventMaterializationRuntime({ store: options.device.store,
-      namespace: options.authority.descriptor.payload.historyId, historyProfile: 'peer-generation-v1',
+      namespace: options.authority.descriptor.payload.historyId,
       ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) }) : await options.createMaterializer()
     const input: PeerReplicaOptions = { authority: options.authority, device: options.device.identity,
       store: options.device.store, storageId: options.device.storageId, epochKeys: keys.epochKeys, materializer,

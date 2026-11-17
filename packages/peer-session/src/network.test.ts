@@ -22,7 +22,7 @@ async function fixture(options: { readerOnly?: boolean } = {}) {
   const host = await createPeerIdentity(), a = await openApplicationDevice({ store: new MemoryPeerStore(), create: true }),
     b = await openApplicationDevice({ store: new MemoryPeerStore(), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
-  const manifest = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: 'cc'.repeat(32), historyId: 'network',
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey,
     schemaAdministrator: a.identity.publicKey, executionManifestDigest: bytesToHex(manifest.executionManifestDigest),

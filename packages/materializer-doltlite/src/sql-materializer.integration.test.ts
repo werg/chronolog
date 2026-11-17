@@ -62,11 +62,12 @@ describe('replicated SQL materialization', () => {
     const held = runtime.queries.captureRead!({ view: 'local' })
     const before = runtime.queries.captureApplication({ view: 'local' })
     expect(snapshotData(held)).toEqual(snapshotData(before))
+    expect(snapshotData(runtime.queries.captureApplication())).toEqual(snapshotData(before))
     expect(snapshotData(before).transactions).toEqual([
       { txId: setup.txId, canonicalCandidate: setup.canonicalCandidate, outcome: 'accepted' },
       { txId: withdraw.txId, canonicalCandidate: withdraw.canonicalCandidate, outcome: 'rejected' },
     ])
-    expect(runtime.queries.captureApplication().transactionAt(0)).toBeNull()
+    expect(runtime.queries.captureApplication({ view: 'final' }).transactionAt(0)).toBeNull()
     const deposit = await transaction(3n, 'deposit', [sqlStatement('UPDATE accounts SET balance = balance + 100 WHERE id = 1')], digest)
     try {
       const revision = await materializer.materialize([setup, deposit, withdraw])
@@ -89,11 +90,11 @@ describe('replicated SQL materialization', () => {
       await materializer.publishFinal(3)
       expect(snapshotData(held)).toEqual(snapshotData(before))
     } finally { held.release() }
-    const final = runtime.queries.captureApplication()
+    const final = runtime.queries.captureApplication({ view: 'final' })
     expect(final).toMatchObject({ view: 'final', revision: 1n, orderLength: 3, finalRevision: 1n, finalOrderLength: 3 })
     materializer.close()
     const reopened = await open(path, manifest, 1)
-    try { expect(snapshotData(reopened.captureApplication())).toEqual(snapshotData(final)) } finally { reopened.close() }
+    try { expect(snapshotData(reopened.captureApplication({ view: 'final' }))).toEqual(snapshotData(final)) } finally { reopened.close() }
   })
 
   it('pins now, random, localtime and connection counters to the transaction, identically under replay', async () => {
@@ -227,14 +228,17 @@ describe('replicated SQL materialization', () => {
     materializer.close()
   })
 
-  it('rejects a provider order that contradicts the signed author timestamps', async () => {
+  it('executes the verified supplied order without rewriting original author timestamps', async () => {
     const { path, manifest } = await fixture()
     const materializer = await open(path, manifest)
     const digest = materializer.executionManifestDigest
     const create = await transaction(50n, 'create', [sqlStatement('CREATE TABLE ordered (id INTEGER PRIMARY KEY)')], digest)
     const insert = await transaction(1n, 'insert', [sqlStatement('INSERT INTO ordered (id) VALUES (1)')], digest)
-    await expect(materializer.materialize([create, insert])).rejects.toThrow('ORDER_NOT_CHRONOLOGICAL')
-    expect(materializer.orderLength).toBe(0)
+    await materializer.materialize([create, insert])
+    expect(materializer.outcome(create.txId)?.outcome).toBe('accepted')
+    expect(materializer.outcome(insert.txId)?.outcome).toBe('accepted')
+    expect(rows(materializer, 'SELECT id FROM ordered')).toEqual([[{ kind: 'integer', value: '1' }]])
+    expect([create.core.authorTimestampMs, insert.core.authorTimestampMs]).toEqual([50n, 1n])
     await materializer.materialize([insert, create])
     expect(materializer.outcome(insert.txId)?.outcome).toBe('rejected')
     expect(materializer.outcome(create.txId)?.outcome).toBe('accepted')
@@ -242,7 +246,7 @@ describe('replicated SQL materialization', () => {
     materializer.close()
   })
 
-  it('rolls back and redoes provisional SQL while retaining timestamp order and the final prefix', async () => {
+  it('replays the selected order while preserving an explicitly settled prefix', async () => {
     const { path, manifest } = await fixture()
     let materializer = await open(path, manifest, 1)
     const digest = materializer.executionManifestDigest
@@ -266,7 +270,9 @@ describe('replicated SQL materialization', () => {
     await materializer.materialize([setup, first, second])
     expect(materializer.outcome(first.txId)?.outcome).toBe('accepted')
     expect(materializer.outcome(second.txId)?.outcome).toBe('rejected')
-    await expect(materializer.materialize([setup, second, first])).rejects.toThrow('ORDER_NOT_CHRONOLOGICAL')
+    await materializer.materialize([setup, second, first])
+    expect(materializer.outcome(second.txId)?.outcome).toBe('accepted')
+    expect(materializer.outcome(first.txId)?.outcome).toBe('rejected')
     await materializer.materialize([setup, second])
     await materializer.publishFinal(2)
     materializer.close()

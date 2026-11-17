@@ -113,7 +113,7 @@ try {
   const identity = await page.evaluate(name => (globalThis as unknown as TestWindow).peerGenerationRtcTest.prepare(name), `generation-rtc-${crypto.randomUUID()}`)
   nativeDevice = await openNativeDevice({ path: join(directory, 'native.sqlite'), create: true })
   const owner = await createPeerIdentity(), key = crypto.getRandomValues(new Uint8Array(32))
-  const manifest = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '98'.repeat(32), historyId: 'generation-rtc', profile: 'peer-generation-v1',
     policy: 'eligible-members-v1', controlPublicKey: owner.publicKey, schemaAdministrator: nativeDevice.identity.publicKey,
     definitionDigest: await applicationDefinitionDigest(definition), executionManifestDigest: bytesToHex(manifest.executionManifestDigest), schemaDigest: null }, owner)

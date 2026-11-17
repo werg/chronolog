@@ -12,7 +12,7 @@ afterEach(async () => { for (const content of contents.splice(0)) content.close(
 async function fixture() {
   const host = await createPeerIdentity(), a = await createPeerIdentity(), b = await createPeerIdentity(), outsider = await createPeerIdentity()
   const key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
-  const manifest = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '45'.repeat(32), historyId: 'content-test',
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: a.publicKey,
     executionManifestDigest: bytesToHex(manifest.executionManifestDigest), definitionDigest: '01'.repeat(32), schemaDigest: null }, host)
@@ -25,7 +25,7 @@ async function fixture() {
     requester: a.publicKey, controlRevision: 0, reason: 'create', base: null }, a))
   const stores = [new MemoryPeerStore(), new MemoryPeerStore()]
   const opened = await Promise.all([a, b].map(async (device, index) => {
-    const store = stores[index]!, materializer = await createEventMaterializationRuntime({ store, namespace: 'content', historyProfile: 'peer-generation-v1' })
+    const store = stores[index]!, materializer = await createEventMaterializationRuntime({ store, namespace: 'content' })
     const peer = await createPeerReplica({ authority: await registry.read(), device, store, storageId: device.publicKey, materializer, epochKeys: keys })
     peers.push(peer); return peer
   }))

@@ -27,7 +27,7 @@ async function fixture(options: { readonly closeA?: () => Promise<void> } = {}) 
   const a = await openApplicationDevice({ store: new MemoryPeerStore(), create: true, ...(options.closeA === undefined ? {} : { close: options.closeA }) })
   const b = await openApplicationDevice({ store: new MemoryPeerStore(), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
-  const execution = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const execution = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '91'.repeat(32), historyId: 'worker-test',
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey,
     schemaAdministrator: a.identity.publicKey, executionManifestDigest: bytesToHex(execution.executionManifestDigest),

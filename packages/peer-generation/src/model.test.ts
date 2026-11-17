@@ -26,7 +26,7 @@ it.each([7, 29, 101, 997])('matches the independent prefix model across bounded 
   const host = await createPeerIdentity(), identities = await Promise.all([0, 1, 2].map(() => createPeerIdentity()))
   const [a, b, c] = identities as [PeerIdentity, PeerIdentity, PeerIdentity]
   const stores = identities.map(() => new MemoryPeerStore()), key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
-  const artifacts = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const artifacts = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: seed.toString(16).padStart(64, '0'), historyId: `model-${seed}`,
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: a.publicKey,
     executionManifestDigest: bytesToHex(artifacts.executionManifestDigest), definitionDigest: '01'.repeat(32), schemaDigest: null }, host)
@@ -40,7 +40,7 @@ it.each([7, 29, 101, 997])('matches the independent prefix model across bounded 
     requester: identity.publicKey, coordinator: identity.publicKey, expectedGeneration, controlRevision, reason, transitionId, base }, identity)
   await registry.select(await request(a, null, null, 'initial', 0, 'create'))
   const open = async (index: number) => {
-    const store = stores[index]!, materializer = await createEventMaterializationRuntime({ store, namespace: 'model', historyProfile: 'peer-generation-v1' })
+    const store = stores[index]!, materializer = await createEventMaterializationRuntime({ store, namespace: 'model' })
     const peer = await createPeerReplica({ store, materializer, storageId: identities[index]!.publicKey, device: identities[index]!, authority: await registry.read(), epochKeys: keys })
     opened.push(peer); return peer
   }

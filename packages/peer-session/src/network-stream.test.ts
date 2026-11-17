@@ -27,7 +27,7 @@ async function fixture(initialMembers = [0, 1, 2]) {
   const host = await createPeerIdentity(), devices = await Promise.all([0, 1, 2].map(index => openNativeDevice({ path: join(directory, `${index}.sqlite`), create: true })))
   for (const device of devices) cleanup.push(() => device.close())
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
-  const manifest = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '81'.repeat(32), historyId: 'network-test', profile: 'peer-generation-v1',
     policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: devices[0]!.identity.publicKey,
     executionManifestDigest: bytesToHex(manifest.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)

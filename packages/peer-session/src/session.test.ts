@@ -31,7 +31,7 @@ async function fixture() {
   const c = await openNativeDevice({ path: join(directory, 'c.sqlite'), create: true })
   cleanup.push(() => a.close(), () => b.close(), () => c.close())
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
-  const artifacts = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const artifacts = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '77'.repeat(32), historyId: 'session-test', profile: 'peer-generation-v1',
     policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: a.identity.publicKey,
     executionManifestDigest: bytesToHex(artifacts.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)

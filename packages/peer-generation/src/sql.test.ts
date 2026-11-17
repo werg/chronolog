@@ -34,7 +34,7 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
       transitionId: 'initial', expectedGeneration: null, requester: a.publicKey, coordinator: a.publicKey, controlRevision: 0, reason: 'create', base: null }, a))
     const open = async (identity: PeerIdentity, name: string, store = new MemoryPeerStore(), databaseName = name) => {
       const materializer = await DeterministicMaterializer.open({ path: join(directory, `${databaseName}.db`), executionManifest: manifest,
-        rootAdministrator: hexToBytes(a.publicKey), historyProfile: 'peer-generation-v1',
+        rootAdministrator: hexToBytes(a.publicKey),
         bootstrapGroupId: hexToBytes(applicationId), bootstrapProgram: await verifyApplicationSchema(schema, descriptor.payload), checkpointEvery: 1 })
       const runtime = createDoltLiteMaterializationRuntime(materializer)
       const replica = await createPeerReplica({ authority: await registry.read(), device: identity, store,
@@ -136,7 +136,7 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
     expect(await pb.replica.operation('cannot-revive-data-role')).toMatchObject({ outcome: 'rejected' })
     const recovered = await pb.replica.capture()
     try { expect(recovered.read.query('SELECT title FROM tasks WHERE id=3').rows).toEqual([[{ kind: 'text', value: 'shared' }]]) } finally { recovered.release() }
-    await expect(pb.runtime.coordinator.publishFinal!(1)).rejects.toThrow('FINALITY_UNSUPPORTED')
+    await expect(pb.runtime.coordinator.publishFinal!(1)).rejects.toThrow('MATERIALIZER_CONTROLS_REQUIRED')
   } finally {
     for (const peer of peers) await peer.close()
     await rm(directory, { recursive: true, force: true })

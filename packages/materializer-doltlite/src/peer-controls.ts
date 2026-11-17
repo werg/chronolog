@@ -35,6 +35,11 @@ export function hasCurrentPeerControl(database: DatabaseLike, context: PeerExecu
     equalBytes(row.application_id, context.applicationId) && equalBytes(row.digest, context.revisions[context.currentRevision]!.digest)
 }
 
+/** Once controls own application permissions, replay cannot silently omit that projection. */
+export function hasPeerExecutionControl(database: DatabaseLike): boolean {
+  return database.prepare('SELECT 1 FROM chronolog_peer_control WHERE singleton = 1').get() !== undefined
+}
+
 /**
  * Applies only the reserved application collective. Inherited commands replay
  * under historical controls inside a private candidate. Before publication the
