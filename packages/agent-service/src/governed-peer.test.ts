@@ -2,11 +2,11 @@ import type { CapabilitySnapshot, EffectiveCapability } from '@chronolog/capabil
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { assertCanonicalCbor, bytesToHex, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
-import { SignalBackpressureError, type SignalLimits } from '@chronolog/signals'
+import type { SignalLimits } from '@chronolog/signals'
 import { frameRtcPeerChannels, WEBRTC_LIVE_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { framePeerStream } from './framing.js'
+import { frameLivePeerStream, framePeerStream } from './framing.js'
 import { createGovernedPeerService, type GovernedPeerService } from './governed-peer.js'
 import { openAuthenticatedPeerLink } from './peer-link.js'
 
@@ -41,16 +41,17 @@ async function replicas(writer = true, signalLimits?: SignalLimits) {
   return { identities, snapshots, transports, services }
 }
 async function connect(left: GovernedPeerService, right: GovernedPeerService, expected?: Uint8Array, withLive = true,
-  dispatch: () => void = () => {}) {
-  const lane = () => {
+  dispatch: () => boolean | Promise<boolean> = () => true) {
+  const lane = <T,>(frame: (options: Parameters<typeof framePeerStream>[0]) => T) => {
     const forward = new TransformStream<Uint8Array, Uint8Array>(), backward = new TransformStream<Uint8Array, Uint8Array>()
-    return [framePeerStream({ readable: backward.readable, writable: forward.writable }),
-      framePeerStream({ readable: forward.readable, writable: backward.writable })]
+    return [frame({ readable: backward.readable, writable: forward.writable }),
+      frame({ readable: forward.readable, writable: backward.writable })]
   }
-  const reliable = lane(), live = withLive ? lane() : undefined
+  const reliable = lane(framePeerStream), live = withLive ? lane(frameLivePeerStream) : undefined
   const connections = reliable.map((connection, index) => ({ ...connection, ...(live === undefined ? {} : {
-    live: { ...live[index]!, async send(bytes: Uint8Array, options?: { readonly signal?: AbortSignal }) {
-      dispatch(); await live[index]!.send(bytes, options)
+    live: { ...live[index]!, async trySend(bytes: Uint8Array, options?: { readonly signal?: AbortSignal }) {
+      if (!await dispatch()) return false
+      return live[index]!.trySend(bytes, options)
     } }, signal: AbortSignal.any([connection.signal, live[index]!.signal]),
   }),
     async close() { await Promise.all([connection.close(), live?.[index]?.close()]) } }))
@@ -97,10 +98,8 @@ describe('owned governed peer composition', () => {
   it('keeps durable replication available through live congestion and sends only fresh observations on recovery', async () => {
     const { services, transports } = await replicas()
     let busy = true
-    const refusal = Object.assign(new Error('independent live adapter queue full'), { code: 'SIGNAL_BACKPRESSURE', dispatched: false })
-    expect(refusal).not.toBeInstanceOf(SignalBackpressureError)
-    const sessions = await connect(services[0]!, services[1]!, undefined, true, () => { if (busy) throw refusal })
-    await expect(services[0]!.signals.send('typing', 'discarded')).rejects.toMatchObject({ code: 'SIGNAL_BACKPRESSURE', dispatched: false })
+    const sessions = await connect(services[0]!, services[1]!, undefined, true, () => !busy)
+    await expect(services[0]!.signals.send('typing', 'discarded')).rejects.toMatchObject({ code: 'SIGNAL_BACKPRESSURE' })
     expect(sessions.every(session => !session.signal.aborted)).toBe(true)
     await transports[0]!.publish(new Uint8Array([1, 2, 3]))
     await transports[1]!.catchUp()
@@ -196,6 +195,44 @@ describe('owned governed peer composition', () => {
     expect((await receiving).value).toEqual(sent)
     expect(sessions.every(session => !session.signal.aborted)).toBe(true)
     await iterator.return?.()
+  })
+
+  it('drops an in-flight signal after writer revocation while reader access and durable history remain usable', async () => {
+    const { services, snapshots, identities, transports } = await replicas()
+    let release!: () => void, entered!: () => void, checked!: () => void, first = true
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const dispatched = new Promise<void>(resolve => { entered = resolve })
+    const denied = new Promise<void>(resolve => { checked = resolve })
+    const sessions = await connect(services[0]!, services[1]!, undefined, true, async () => {
+      if (first) { first = false; entered(); await gate }
+      return true
+    })
+    const iterator = services[1]!.signals.subscribe()[Symbol.asyncIterator](), receiving = iterator.next()
+    try {
+      const sending = services[0]!.signals.send('typing', 'signed before revocation')
+      await dispatched
+      const writerId = bytesToHex(bytes(3))
+      const revoked = { ...snapshots[1]!.capabilities.get(writerId)!, revokedAtRevision: 1n }
+      const capabilities = new Map([...snapshots[1]!.capabilities, [writerId, revoked]])
+      const get = capabilities.get.bind(capabilities)
+      capabilities.get = id => { if (id === writerId) checked(); return get(id) }
+      const current: CapabilitySnapshot = { ...snapshots[1]!, revision: 1n, capabilities }
+      snapshots[1] = current
+      release(); await sending; await denied
+      const record = await transports[0]!.publish(utf8('history after writer-only revocation'))
+      await transports[1]!.catchUp()
+      expect((await transports[1]!.get(record.id))?.payload).toEqual(record.payload)
+      expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+      snapshots[0] = current
+      await expect(services[0]!.signals.send('typing', 'new unauthorized intent')).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+      const replacement = capability(identities[0], 'writer', 4)
+      const renewed: CapabilitySnapshot = { ...current, revision: 2n,
+        capabilities: new Map([...current.capabilities, [bytesToHex(replacement.id), replacement]]) }
+      snapshots[0] = renewed; snapshots[1] = renewed
+      const fresh = await services[0]!.signals.send('typing', 'fresh after regrant')
+      expect((await receiving).value).toEqual(fresh)
+      expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+    } finally { release(); await iterator.return?.() }
   })
 
   it('rechecks the sender reader grant on an established incoming signal route', async () => {

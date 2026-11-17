@@ -5,14 +5,46 @@ export interface PeerFrameLane {
   close(): Promise<void>
 }
 
+/** Independent disposable traffic with no queued retry on congestion. */
+export interface PeerLiveLane {
+  readonly signal: AbortSignal
+  /** False means no bytes were queued or dispatched. Actual failures throw. */
+  trySend(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<boolean>
+  frames(signal?: AbortSignal): AsyncIterable<Uint8Array>
+  close(): Promise<void>
+}
+
 export interface FramedPeerConnection extends PeerFrameLane {
   /** Ends before frame readers finish; preserves the physical failure or close reason. */
   readonly signal: AbortSignal
-  /**
-   * Independent disposable traffic; never multiplex it into reliable history.
-   * Refuse congestion with SignalBackpressureError before queueing or dispatching.
-   */
-  readonly live?: PeerFrameLane
+  /** Never multiplex disposable traffic into reliable history. */
+  readonly live?: PeerLiveLane
+}
+
+export interface PeerStreamOptions {
+  readonly readable: ReadableStream<Uint8Array>
+  readonly writable: WritableStream<Uint8Array>
+  readonly maxFrameBytes?: number
+  readonly maxPendingSends?: number
+}
+
+/** A dedicated live stream permits one write in flight and refuses further writes while busy. */
+export function frameLivePeerStream(options: Omit<PeerStreamOptions, 'maxPendingSends'>): PeerLiveLane {
+  const stream = framePeerStream({ ...options, maxPendingSends: 1 })
+  let sending = false
+  return {
+    signal: stream.signal,
+    async trySend(frame, sendOptions = {}) {
+      sendOptions.signal?.throwIfAborted()
+      stream.signal.throwIfAborted()
+      if (sending) return false
+      sending = true
+      try { await stream.send(frame, sendOptions); return true }
+      finally { sending = false }
+    },
+    frames: signal => stream.frames(signal),
+    close: () => stream.close(),
+  }
 }
 
 /**
@@ -20,12 +52,7 @@ export interface FramedPeerConnection extends PeerFrameLane {
  * stream. It has no database identity or permission semantics: signed Chronolog
  * records, evidence and ephemeral domains remain independently authenticated.
  */
-export function framePeerStream(options: {
-  readonly readable: ReadableStream<Uint8Array>
-  readonly writable: WritableStream<Uint8Array>
-  readonly maxFrameBytes?: number
-  readonly maxPendingSends?: number
-}): FramedPeerConnection {
+export function framePeerStream(options: PeerStreamOptions): FramedPeerConnection {
   const maximum = options.maxFrameBytes ?? 1_048_576 + 65_536
   const maxPending = options.maxPendingSends ?? 16
   if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 16 * 1024 * 1024 ||

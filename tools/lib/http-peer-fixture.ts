@@ -1,14 +1,15 @@
 import { once } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 
-import { framePeerStream, type FramedPeerConnection } from '@chronolog/agent-service/framing'
+import { frameLivePeerStream, framePeerStream, type FramedPeerConnection, type PeerLiveLane, type PeerStreamOptions } from '@chronolog/agent-service/framing'
 import { MAX_SIGNAL_BYTES } from '@chronolog/signals'
-
-import { liveFrameLane } from '../../test/fixtures/live-frame-lane.js'
 
 type Lane = 'reliable' | 'live'
 interface OwnedSession { readonly completion: Promise<void>; close(): Promise<void> }
-interface StreamLane { readonly writer: WritableStreamDefaultWriter<Uint8Array>; readonly connection: FramedPeerConnection }
+type StreamLane = { readonly writer: WritableStreamDefaultWriter<Uint8Array> } & (
+  | { readonly lane: 'reliable'; readonly connection: FramedPeerConnection }
+  | { readonly lane: 'live'; readonly connection: PeerLiveLane }
+)
 interface PairedStream { readonly lanes: Map<Lane, StreamLane>; start(): void; close(): Promise<void> }
 
 /** Loopback qualification transport: independent streams, one authenticated owner. */
@@ -35,12 +36,14 @@ export async function createHttpPeerFixture(options: {
     return { lanes, close, start() {
       if (closed || lanes.size !== 2) return
       clearTimeout(timer)
-      const reliable = lanes.get('reliable')!.connection, live = lanes.get('live')!.connection
+      const reliableLane = lanes.get('reliable'), liveLane = lanes.get('live')
+      if (reliableLane?.lane !== 'reliable' || liveLane?.lane !== 'live') throw new Error('PEER_LANE_PAIR_INVALID')
+      const reliable = reliableLane.connection, live = liveLane.connection
       const signal = AbortSignal.any([reliable.signal, live.signal])
       signal.addEventListener('abort', () => { void close() }, { once: true })
       if (signal.aborted) { void close(); return }
       const connection: FramedPeerConnection = { signal, send: (frame, options) => reliable.send(frame, options),
-        frames: signal => reliable.frames(signal), live: liveFrameLane(live), close }
+        frames: signal => reliable.frames(signal), live, close }
       void options.accept(connection).then(value => {
         session = value
         void value.completion.catch(reportFailure).finally(close)
@@ -70,10 +73,12 @@ export async function createHttpPeerFixture(options: {
         }
         response.writeHead(200, { 'Content-Type': 'application/octet-stream' }); response.flushHeaders()
         const incoming = new TransformStream<Uint8Array, Uint8Array>(), writer = incoming.writable.getWriter()
-        const connection = framePeerStream({ readable: incoming.readable, maxFrameBytes: maximum,
+        const stream: PeerStreamOptions = { readable: incoming.readable, maxFrameBytes: maximum,
           writable: new WritableStream<Uint8Array>({ write: bytes => writeStream(response, bytes),
-            close: () => { response.end() }, abort: () => { response.destroy() } }) })
-        owner.lanes.set(lane, { writer, connection })
+            close: () => { response.end() }, abort: () => { response.destroy() } }) }
+        owner.lanes.set(lane, lane === 'live'
+          ? { lane, writer, connection: frameLivePeerStream(stream) }
+          : { lane, writer, connection: framePeerStream(stream) })
         response.on('close', () => { void owner.close() })
         owner.start()
       } else {

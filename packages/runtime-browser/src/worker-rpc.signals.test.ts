@@ -13,8 +13,8 @@ it('uses the ordinary Worker bridge for signed live delivery, latest backpressur
   const identity = await generateEd25519KeyPair(), remoteIdentity = await generateEd25519KeyPair()
   const local = new SignalChannel({ scope: group, identity, authorize: () => true })
   const remote = new SignalChannel({ scope: group, identity: remoteIdentity, authorize: () => true })
-  local.attachRoute({ send: async frame => { await remote.receive(frame) } })
-  remote.attachRoute({ send: async frame => { await local.receive(frame) } })
+  local.attachRoute({ trySend: async frame => { await remote.receive(frame); return true } })
+  remote.attachRoute({ trySend: async frame => { await local.receive(frame); return true } })
   let pulls = 0, stopped = 0
   const signals: Signals = { send: (topic, payload, options) => local.send(topic, payload, options),
     subscribe: options => ({ async *[Symbol.asyncIterator]() {

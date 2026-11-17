@@ -45,7 +45,7 @@ describe('native WebRTC interoperability', () => {
       // The negotiated unordered lane must work with the actual SCTP adapter,
       // independently of the large reliable body and its outstanding credit.
       const liveRead = right.live.frames()[Symbol.asyncIterator]()
-      await left.live.send(new Uint8Array([4, 5, 6]))
+      await left.live.trySend(new Uint8Array([4, 5, 6]))
       expect((await liveRead.next()).value).toEqual(new Uint8Array([4, 5, 6]))
       expect(right.live.stats.receivedBytes).toBe(3)
       expect(left.stats.sentBytes).toBe(body.length + 3)

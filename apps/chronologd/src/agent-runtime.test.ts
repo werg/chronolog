@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { NativeAgentStore, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
+import { NativeAgentStore, frameLivePeerStream, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
 import { signGenesis } from '@chronolog/capabilities'
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
@@ -177,12 +177,12 @@ describe('native agent composition', () => {
     expect(subscriber.finality).toBeNull()
     expect(subscriber.taskIds).toEqual([])
     expect(subscriber.context).not.toHaveProperty('createSignals')
-    const lane = () => {
+    const lane = <T,>(frame: (options: Parameters<typeof framePeerStream>[0]) => T) => {
       const toOwner = new TransformStream<Uint8Array, Uint8Array>(), toReader = new TransformStream<Uint8Array, Uint8Array>()
-      return [framePeerStream({ readable: toOwner.readable, writable: toReader.writable }),
-        framePeerStream({ readable: toReader.readable, writable: toOwner.writable })] as const
+      return [frame({ readable: toOwner.readable, writable: toReader.writable }),
+        frame({ readable: toReader.readable, writable: toOwner.writable })] as const
     }
-    const reliable = lane(), live = lane()
+    const reliable = lane(framePeerStream), live = lane(frameLivePeerStream)
     const connections = reliable.map((connection, index) => ({ ...connection, live: live[index]!,
       signal: AbortSignal.any([connection.signal, live[index]!.signal]),
       async close() { await Promise.all([connection.close(), live[index]!.close()]) } }))

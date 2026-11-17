@@ -6,7 +6,7 @@ import {
 import type { CborValue, Ed25519KeyPair } from '@chronolog/protocol'
 import { assertFeedPosition, ChangeSignal } from '@chronolog/records'
 import type { FeedLink } from '@chronolog/records'
-import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN, SignalBackpressureError } from '@chronolog/signals'
+import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN } from '@chronolog/signals'
 
 import type { FramedPeerConnection } from './framing.js'
 
@@ -65,7 +65,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   readonly link: FeedLink
   readonly peer: PeerAuthorization
   readonly completion: Promise<void>
-  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
+  trySendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<boolean>
   close(): Promise<void>
 }> {
   for (const bytes of [options.groupId, options.identity.publicKeyBytes, options.grantId]) {
@@ -307,11 +307,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
           void (async () => {
             if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
             if (!controller.signal.aborted) await options.receiveSignal?.(incoming)
-          })().catch((error: unknown) => {
-            // The channel may have exhausted its global verification or replay
-            // budget across routes. It admitted nothing; keep the session usable.
-            if (!SignalBackpressureError.is(error)) fail(error)
-          }).finally(() => { signalsInFlight -= 1 })
+          })().catch(fail).finally(() => { signalsInFlight -= 1 })
         } catch (error) { fail(error); break }
       }
       if (!controller.signal.aborted) fail(new Error('PEER_LIVE_ENDED'))
@@ -379,7 +375,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       readEvidence: (after, limit) => requestRange(null, after, limit), readPayload: requestPayload,
       watch: (signal) => changes.watch(signal) },
     completion,
-    async sendSignal(bytes, sendOptions = {}) {
+    async trySendSignal(bytes, sendOptions = {}) {
       const live = options.connection.live
       if (live === undefined) throw new Error('PEER_LIVE_UNAVAILABLE')
       const signal = sendOptions.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, sendOptions.signal])
@@ -399,14 +395,13 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       // implementation too; data already handed to the network is not recallable.
       const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
       try {
-        const result = await interruptible(live.send(outgoing, { signal }), signal)
-        if (result !== undefined) {
-          throw new Error('PEER_SIGNAL_DISPATCH_RESULT_INVALID')
-        }
+        const result = await interruptible(live.trySend(outgoing, { signal }), signal)
+        if (typeof result !== 'boolean') throw new Error('PEER_SIGNAL_DISPATCH_RESULT_INVALID')
+        return result
       }
       catch (error) {
         if (controller.signal.aborted) throw failure ?? controller.signal.reason
-        if (!signal.aborted && !SignalBackpressureError.is(error)) fail(error)
+        if (!signal.aborted) fail(error)
         throw error
       }
       finally { clearTimeout(timer) }

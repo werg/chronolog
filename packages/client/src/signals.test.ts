@@ -17,8 +17,8 @@ describe('public live signal client', () => {
     ]
     const snapshot: CapabilitySnapshot = { encryptionEpoch: 0n, groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
       capabilityLogFeed: new Uint8Array(32), capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), validatorFloorMs: 0n }
-    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, send: async () => {} })
-    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, send: async frame => { await receiver.receive(frame) } })
+    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, trySend: async () => { return true } })
+    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, trySend: async frame => { await receiver.receive(frame); return true } })
     // Deliberately no authoring, SQL, operation or finality service exists here.
     const node = { groupId } as ChronologRpcNodeService
     const client = new ChronologClient({ groupId: bytesToBase64Url(groupId), transport: new InProcessRpcTransport(new NodeRpcService({ node, signals: receiver })) })

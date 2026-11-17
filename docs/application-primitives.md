@@ -111,6 +111,11 @@ the automatic clock would exceed that bound, new authoring fails with
 Correct the clock before trying new intent again. Retrying an already prepared
 operation preserves its original timestamp and bytes.
 
+`LimitedPublisher` has no replica view or closed-time authority. Its supplied
+clock must already reflect the causal dependencies known to its application;
+it cannot discover remote history or advance from a replica's observed view.
+Use a replica client when authoring depends on reading that view.
+
 Signed genesis selects the trust policy. The built-in validator policy needs
 the specified validators' admission and closed-time evidence. The built-in
 signed-inclusion policy needs one pinned finality signer and its continuous

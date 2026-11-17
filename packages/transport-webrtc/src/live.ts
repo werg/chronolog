@@ -1,11 +1,10 @@
 import type { DataChannelStats } from './channel.js'
 import type { RtcDataChannel } from './types.js'
-import type { PeerFrameLane } from '@chronolog/agent-service/framing'
-import { SignalBackpressureError } from '@chronolog/signals'
+import type { PeerLiveLane } from '@chronolog/agent-service/framing'
 
 export const WEBRTC_LIVE_LIMITS = Object.freeze({ frameBytes: 16_384, queueFrames: 64, bufferedBytes: 65_536 })
 
-export interface LiveDataChannelConnection extends PeerFrameLane {
+export interface LiveDataChannelConnection extends PeerLiveLane {
   readonly ready: Promise<void>
   readonly signal: AbortSignal
   readonly stats: DataChannelStats & { readonly droppedPackets: number }
@@ -78,14 +77,15 @@ export function frameRtcLiveChannel(channel: RtcDataChannel): LiveDataChannelCon
     ready, signal: lifetime.signal,
     get stats() { return { sentBytes, receivedBytes, sentPackets, receivedPackets, droppedPackets,
       queuedSendBytes: channel.bufferedAmount, queuedReceiveBytes, queuedReceiveFrames: queue.length } },
-    async send(input, options = {}) {
+    async trySend(input, options = {}) {
       options.signal?.throwIfAborted()
       if (closed) throw failure ?? new Error('WEBRTC_LIVE_CLOSED')
       if (channel.readyState !== 'open') throw new Error('WEBRTC_LIVE_NOT_OPEN')
       if (!(input instanceof Uint8Array) || input.length < 1 || input.length > WEBRTC_LIVE_LIMITS.frameBytes) throw new Error('WEBRTC_LIVE_FRAME_TOO_LARGE')
-      if (channel.bufferedAmount + input.length > WEBRTC_LIVE_LIMITS.bufferedBytes) throw new SignalBackpressureError()
+      if (channel.bufferedAmount + input.length > WEBRTC_LIVE_LIMITS.bufferedBytes) return false
       // No application queue or suspension can dispatch this frame after cancellation.
       channel.send(input.slice().buffer); sentBytes += input.length; sentPackets += 1
+      return true
     },
     frames(signal) {
       return { [Symbol.asyncIterator]() {

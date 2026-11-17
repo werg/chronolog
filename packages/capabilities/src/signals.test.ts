@@ -13,8 +13,8 @@ describe('group signal authorization adapter', () => {
     let snapshot: CapabilitySnapshot = { encryptionEpoch: 0n, groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
       capabilityLogFeed: new Uint8Array(32), capabilities: new Map([[bytesToHex(grantId), grant]]), policies: new Map(), validatorFloorMs: 0n }
     const outgoing: Uint8Array[] = []
-    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, send: async frame => { outgoing.push(frame) } })
-    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, send: async () => {} })
+    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, trySend: async frame => { outgoing.push(frame); return true } })
+    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, trySend: async () => { return true } })
     const iterator = receiver.subscribe({ topics: ['presence'] })[Symbol.asyncIterator](), pending = iterator.next()
     const sent = await sender.send('presence', { online: true })
     await receiver.receive(outgoing[0]!)
@@ -23,7 +23,7 @@ describe('group signal authorization adapter', () => {
     await expect(sender.send('admin', true)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
     await sender.send('presence', { online: false })
     snapshot = { ...snapshot, revision: 1n, capabilities: new Map([[bytesToHex(grantId), { ...grant, revokedAtRevision: 1n }]]) }
-    await expect(receiver.receive(outgoing[1]!)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    await expect(receiver.receive(outgoing[1]!)).resolves.toBeNull()
     await expect(sender.send('presence', null)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
     await iterator.return?.(); sender.close(); receiver.close()
   })

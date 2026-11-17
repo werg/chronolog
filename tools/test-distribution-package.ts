@@ -115,7 +115,7 @@ await client.close();
 const { SignalChannel, generateSignalIdentity } = await import(pathToFileURL(await withinArchive(createRequire(agentEntry).resolve('@chronolog/signals'))).href);
 const sender = new SignalChannel({ scope: 'native-artifact', identity: await generateSignalIdentity(), authorize: () => true });
 const receiver = new SignalChannel({ scope: 'native-artifact', identity: await generateSignalIdentity(), authorize: () => true });
-const route = sender.attachRoute({ send: async frame => { await receiver.receive(frame); } });
+const route = sender.attachRoute({ trySend: async frame => { await receiver.receive(frame); return true; } });
 const iterator = receiver.subscribe({ topics: ['preview'] })[Symbol.asyncIterator]();
 try {
   const next = iterator.next();

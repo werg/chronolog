@@ -19,11 +19,11 @@ async function fixture() {
         validFromRevision: 0n, hpkePublicKey: new Uint8Array(32) } }]]) }
   const detach = vi.fn(), close = vi.fn(async () => {}), rawClose = vi.fn(async () => {})
   const connection = { signal: new AbortController().signal, send: async () => {}, async *frames() {}, close: rawClose,
-    live: { send: async () => {}, async *frames() {}, close: rawClose } }
+    live: { signal: new AbortController().signal, trySend: async () => true, async *frames() {}, close: rawClose } }
   const local: FeedLink = { identity: 'local', head: async () => 0n, evidenceHead: async () => 0n,
     read: async () => [], readEvidence: async () => [], readPayload: async () => null, async *watch() {} }
   const session = { link: { ...local, identity: 'remote' }, peer: { authorId: identity.publicKeyBytes, grantId, feedId: 'remote' },
-    completion: new Promise<void>(() => {}), sendSignal: async () => {}, close }
+    completion: new Promise<void>(() => {}), trySendSignal: async () => true, close }
   const attach = vi.fn(() => detach)
   vi.mocked(openAuthenticatedPeerLink).mockResolvedValue(session)
   return { identity, groupId, activeMembership: () => snapshot, local, attach, connection, session, detach, close, rawClose }

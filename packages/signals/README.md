@@ -71,38 +71,35 @@ credential for each topic. Both `authorize(input, { signal })` and
 `credential(topic, { signal })` receive the attempt's `AbortSignal`: pass it to
 network policy/credential requests so caller cancellation, expiry and channel
 closure release their work promptly. Check current authorization when that work
-completes. An optional `send` callback supplies a standalone
+completes. An optional `trySend` callback supplies a standalone
 outgoing transport; pass its incoming frames to `channel.receive(frame)`.
 
-For bidirectional routes, call `channel.attachRoute({ send })` and give incoming
-frames to that returned route's `receive(frame)`. A transport's `send` returns
-`Promise<void>` and resolves after local dispatch. If a bounded queue is full,
-throw `SignalBackpressureError` before accepting any bytes. Do not queue the
-refused message for later; the channel preserves the healthy route for a fresh
-intent. Successful application `signals.send` returns the authenticated envelope.
-`SignalBackpressureError.is(error)` recognizes the stable `SIGNAL_BACKPRESSURE`
-code and explicit `dispatched: false` marker across independently bundled
-adapters. A matching code alone never proves that dispatch was refused.
+For bidirectional routes, call `channel.attachRoute({ trySend, close })` and give
+incoming frames to that returned route's `receive(frame)`. The transport hook
+returns `Promise<boolean>`: `true` means local dispatch, and `false` refuses the
+attempt before queueing or dispatching any bytes. Refuse immediately when the
+live lane is busy; do not retain the value for retry. Actual transport failures
+throw. This byte-transport contract has no dependency on Chronolog errors,
+governance or finality. Successful application `signals.send` returns the
+authenticated envelope after at least one route dispatches.
 
-Verified messages are delivered locally. Set `relay: true` to relay their
-original signed bytes to other live routes; standalone relay is disabled by
-default. Close the route when its connection ends. Distinct fresh sequences may
-arrive out of order through different paths; duplicate author/session/sequence
-identities are suppressed. A bounded replay cache reports
-`SignalBackpressureError` when full instead of evicting protection for still-fresh
-messages. That incoming attempt was not admitted; a disposable transport can
-drop it while preserving the connection and existing duplicate protection.
-`receive()` returns `null` for a duplicate or an otherwise valid, authorized
-expired message. Ordinary expiry neither relays a frame nor tears down its
-connection. Invalid signatures, malformed frames and failed current
-authorization remain errors.
+Verified, currently authorized messages are delivered locally. Set `relay: true`
+to relay their original signed bytes to other live routes; standalone relay is
+disabled by default. Close the route when its connection ends. Distinct fresh
+sequences may arrive out of order through different paths; duplicate
+author/session/sequence identities are suppressed. The bounded replay cache
+drops incoming messages when full instead of evicting protection for still-fresh
+messages.
 
-An attached route also returns `null` when the channel's shared receive-work
-capacity is full. This is a drop before admission: it does not authenticate,
-deliver, remember or relay that frame, and it does not close the route. The
-direct `channel.receive(frame)` port instead rejects with `SIGNAL_BACKPRESSURE`
-at capacity so its caller can choose its own admission policy. Neither port
-retains a frame for later replay.
+`receive()` and an attached route's `receive()` return `null` for duplicate,
+expired or currently unauthorized valid messages, and for input dropped at the
+shared receive-work or replay-memory bound. A busy receive queue drops before
+verification; a current policy denial is checked after signature verification.
+None of these drops retains a retry, delivers or relays the message, or closes
+the route. Writer revocation can therefore discard an in-flight observation
+without disrupting a still-authorized reader's history replication. Malformed
+frames, invalid signatures and exceptions from the policy remain errors. Reader
+connection admission is enforced independently by the connection owner.
 
 Start a subscription before the messages it should observe. A new subscriber
 receives no earlier value, and a channel does not echo its own outgoing messages
@@ -150,24 +147,23 @@ TTL, and a local clock rollback cannot revive an expired frame.
 A send is one attempt on the currently attached routes. Resolution means at
 least one route accepted local dispatch; it does not acknowledge remote receipt
 or application processing. A healthy route can complete a send while another
-route remains busy; every route permits at most one unsettled dispatch and has
-its own deadline. Policy work that ignores cancellation stays counted against
-its work quota until it settles. A low-level transport may throw
-`SignalBackpressureError` only when that attempt queued and dispatched no frame.
-The application send rejects visibly while the route stays usable for a
-later fresh message; nothing retries the refused value. Normal dispatch resolves
-without a return value. Any other return value is a transport error. Some
-routes can receive a message even when the operation later rejects; cancellation
-cannot recall bytes already handed to a transport. When every available route is busy, the public send rejects with
-`SIGNAL_BACKPRESSURE`. Congestion creates a live delivery gap without retiring
-healthy routes or interrupting durable replication. A fresh send is a new
-observation; the channel never retries a discarded one. A failed publication does
-not revoke healthy routes. A transport failure or a dispatched write that ignores
-cancellation retires that route and invokes its optional `close()` callback;
-the connection owner should close its underlying session there. The explicit
-`dispatched: false` marker distinguishes a healthy refusal from an arbitrary
-transport error. It must never describe a partially dispatched frame or a
-closed or failed transport. Reconnect never resends prior messages.
+route remains busy. Each route permits at most one unsettled dispatch and has
+its own deadline. Policy and credential work that ignores cancellation stays
+counted against its work quota until it actually settles. A detached busy route
+also occupies its route slot until the underlying work settles, so repeatedly
+replacing stalled routes cannot create unbounded work. Existing healthy routes
+remain usable.
+
+If every route is busy or explicitly returns `false`, public `send` rejects with
+`SIGNAL_BACKPRESSURE`. Congestion creates a live delivery gap; it does not retire
+healthy routes or interrupt durable replication. A new send is a fresh
+observation, and the channel never retries a discarded one. `true` and `false`
+are the only valid transport results. A transport exception or invalid result
+retires that route and invokes its optional `close()` callback; the connection
+owner should close its underlying session there. A dispatched write that ignores
+cancellation is also retired. Some routes may have dispatched before an attempt
+later rejects, and cancellation cannot recall those bytes. Reconnect never
+resends prior messages.
 
 ## Governed replicas
 

@@ -48,7 +48,7 @@ const identity = await generateSignalIdentity();
 const receiver = new SignalChannel({ scope: 'isolated-artifact', identity: await generateSignalIdentity(), authorize: () => true });
 const sender = new SignalChannel({ scope: 'isolated-artifact', identity, authorize: () => true });
 await assert.rejects(sender.send('typing', true), /SIGNAL_ROUTE_UNAVAILABLE/);
-const route = sender.attachRoute({ send: async frame => { await receiver.receive(frame); } });
+const route = sender.attachRoute({ trySend: async frame => { await receiver.receive(frame); return true; } });
 const iterator = receiver.subscribe({ topics: ['typing'] })[Symbol.asyncIterator]();
 const next = iterator.next();
 const first = await sender.send('typing', { active: true }, { ttlMs: 5000 });
@@ -73,7 +73,7 @@ sender.close(); receiver.close();
   type Signals, type SignalPayload, type EphemeralSignal, type SignalSendOptions, type SignalSubscribeOptions } from '@chronolog/signals';
 const signalChannel = new SignalChannel({ scope: 'typed-artifact', identity: await generateSignalIdentity(),
   authorize: ({ scope, authorId, credential, topic }) => scope.length > 0 && authorId.length === 32 && credential === null && topic.length > 0 });
-const route = signalChannel.attachRoute({ send: async (frame, { signal }) => { signal.throwIfAborted(); void frame; } });
+const route = signalChannel.attachRoute({ trySend: async (frame, { signal }) => { signal.throwIfAborted(); void frame; return true; } });
 const channel: Signals = signalChannel;
 const payload: SignalPayload = { values: [null, true, 2, 'preview'] };
 const send: SignalSendOptions = { ttlMs: 1000 };

@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest'
-import { SignalBackpressureError } from '@chronolog/signals'
 
 import { frameRtcDataChannel, frameRtcPeerChannels, WEBRTC_LIMITS } from './channel.js'
 import { frameRtcLiveChannel, WEBRTC_LIVE_LIMITS } from './live.js'
@@ -168,7 +167,7 @@ describe('independent live WebRTC lane', () => {
       await a.send(new Uint8Array(32).fill(1))
       waiting = a.send(new Uint8Array(32).fill(2)).then(() => { completed = true })
       void waiting.catch(() => undefined)
-      await a.live.send(new Uint8Array([7]))
+      await a.live.trySend(new Uint8Array([7]))
       expect((await received.next()).value).toEqual(new Uint8Array([7]))
       expect(completed).toBe(false)
       expect(history.left.sent.filter(packet => packet[3] === 2)).toHaveLength(1)
@@ -179,14 +178,14 @@ describe('independent live WebRTC lane', () => {
   it('never queues a cancelled, disconnected or congested live send', async () => {
     const source = channels(false, 0), a = frameRtcLiveChannel(source.left), b = frameRtcLiveChannel(source.right)
     try {
-      await expect(a.send(new Uint8Array([1]))).rejects.toThrow('WEBRTC_LIVE_NOT_OPEN')
+      await expect(a.trySend(new Uint8Array([1]))).rejects.toThrow('WEBRTC_LIVE_NOT_OPEN')
       source.open()
       const controller = new AbortController(); controller.abort(new Error('preview expired'))
-      await expect(a.send(new Uint8Array([2]), { signal: controller.signal })).rejects.toThrow('preview expired')
+      await expect(a.trySend(new Uint8Array([2]), { signal: controller.signal })).rejects.toThrow('preview expired')
       source.left.bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
-      await expect(a.send(new Uint8Array([3]))).rejects.toBeInstanceOf(SignalBackpressureError)
+      await expect(a.trySend(new Uint8Array([3]))).resolves.toBe(false)
       source.left.bufferedAmount = 0
-      await a.send(new Uint8Array([4]))
+      await a.trySend(new Uint8Array([4]))
       expect(source.left.sent).toEqual([new Uint8Array([4])])
     } finally { await Promise.all([a.close(), b.close()]) }
   })
@@ -196,11 +195,11 @@ describe('independent live WebRTC lane', () => {
     source.open()
     const received = b.frames()[Symbol.asyncIterator]()
     try {
-      for (let index = 0; index <= WEBRTC_LIVE_LIMITS.queueFrames; index++) await a.send(new Uint8Array([index]))
+      for (let index = 0; index <= WEBRTC_LIVE_LIMITS.queueFrames; index++) await a.trySend(new Uint8Array([index]))
       expect(b.stats.queuedReceiveFrames).toBe(WEBRTC_LIVE_LIMITS.queueFrames)
       expect(b.stats.droppedPackets).toBe(1)
       expect((await received.next()).value).toEqual(new Uint8Array([1]))
-      await expect(a.send(new Uint8Array(WEBRTC_LIVE_LIMITS.frameBytes + 1))).rejects.toThrow('WEBRTC_LIVE_FRAME_TOO_LARGE')
+      await expect(a.trySend(new Uint8Array(WEBRTC_LIVE_LIMITS.frameBytes + 1))).rejects.toThrow('WEBRTC_LIVE_FRAME_TOO_LARGE')
     } finally { await Promise.all([a.close(), b.close()]); await received.return?.() }
   })
 

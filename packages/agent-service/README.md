@@ -448,9 +448,10 @@ the separately bounded `connection.live` lane after the same peer authentication
 a reliable-only connection provides replication without advertising a signal route.
 Signals cannot hold up retained range handling. At most eight signal callbacks
 run per connection; excess disposable input is dropped before further
-verification. Channel verification/replay capacity can also reject a live
-attempt without closing the session. Malformed frames, invalid signatures,
-failed current authorization and broken transports still retire the connection.
+verification. Channel verification/replay capacity and current writer/topic
+policy can also drop a live attempt without closing the session. Malformed
+frames, invalid signatures, failed reader admission and broken transports still
+retire the connection.
 There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement
@@ -498,15 +499,21 @@ cursor or trigger a finality wait. TTL begins at the original `send()` call,
 including queued work. No route means immediate `SIGNAL_ROUTE_UNAVAILABLE`; the client
 never retries sends or reconnects subscriptions behind the application's back.
 
-Live transports resolve after local dispatch. A bounded queue that cannot accept
-any bytes throws `SignalBackpressureError` with `dispatched: false`; the route
-remains usable. `SignalBackpressureError.is(error)` recognizes that contract
-across separately bundled adapters. A matching code without the pre-dispatch
-marker is not a healthy refusal. When every route refuses dispatch, public
-`signals.send` rejects with the same typed `SIGNAL_BACKPRESSURE` error; reliable
-feed and payload transfer continue. Success acknowledges local dispatch on at least
-one route, not remote receipt or application processing. Expired or discarded
-live observations never become retryable durable work.
+The independent `PeerLiveLane.trySend(frame, { signal })` returns `true` after
+local dispatch or `false` when busy before accepting any bytes. Actual failures
+throw. Use `frameLivePeerStream` for a dedicated byte stream: it permits one
+write in flight and refuses further sends while that write remains outstanding.
+It does not share the reliable history stream or its queue. The WebRTC adapter
+implements the same contract on its independent datagram channel.
+
+When every route refuses dispatch, public `signals.send` rejects with
+`SIGNAL_BACKPRESSURE`; reliable feed and payload transfer continue. Success
+acknowledges local dispatch on at least one route, not remote receipt or
+application processing. Expired or discarded live observations never become
+retryable durable work. Receive capacity drops and valid signed messages denied
+by current writer/topic policy also leave the reader session usable. Malformed
+frames, invalid signatures, failed reader admission and physical failures retire
+the session under its existing owner.
 
 `createGovernedPeerService` accepts `signalLimits` for TTL, replay memory,
 concurrent work and subscriber budgets. These live resource choices are local

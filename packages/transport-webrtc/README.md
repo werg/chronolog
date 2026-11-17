@@ -312,9 +312,11 @@ Chronolog session above them.
 
 The live lane carries one original signed signal per datagram, up to 16 KiB.
 It has a separate 64 KiB SCTP buffered-amount budget and at most 64 queued
-received datagrams. A congested send rejects immediately with
-`SignalBackpressureError` before dispatch, preserving the authenticated session
-and its durable lane for later work. A slow receiver drops
+received datagrams. `live.trySend(frame, { signal })` returns `false` immediately
+when congested, before queueing or dispatching bytes. A successful dispatch
+returns `true`; actual failures throw. This transport contract has no dependency
+on the signed signal protocol and preserves the authenticated session and its
+durable lane for later work. A slow receiver drops
 its oldest queued datagram and increments `live.stats.droppedPackets`. Verification
 limits above this transport can discard additional live input. Neither form of
 congestion interrupts durable replication. No history
@@ -332,11 +334,13 @@ into reliable history when the independent lane is absent.
 The authenticated reader admits at most eight concurrent live validations per
 peer. Extra datagrams are dropped before admission, and shared signal-channel
 receive capacity can also refuse admission without ending the peer session.
-These drops occur before local FIFO delivery, so they do not silently remove an
-already admitted subscriber message. Admitted malformed, invalid-signature or
-unauthorized frames still fail the session; transport failures and dispatched
-writes that ignore cancellation also retire it. Returning a live frame iterator
-wakes a pending idle read and closes its owned lane.
+Current writer/topic policy denial drops a valid signed signal without changing
+reader admission. These drops occur before local FIFO delivery, so they do not
+silently remove an already admitted subscriber message. Malformed frames,
+invalid signatures and failed reader admission still fail the session; physical
+failures and dispatched writes that ignore cancellation also retire it.
+Returning a live frame iterator wakes a pending idle read and closes its owned
+lane.
 
 `ready` requires the live lane to open and both local and remote reliable framing HELLO messages. Its 10-second
 HELLO deadline starts after the local channel opens, allowing ICE negotiation

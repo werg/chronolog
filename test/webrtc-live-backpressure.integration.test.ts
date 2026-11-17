@@ -4,7 +4,6 @@ import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { bytesToHex, generateEd25519KeyPair } from '@chronolog/protocol'
 import { ChangeSignal, DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type FeedLink } from '@chronolog/records'
-import { SignalBackpressureError } from '@chronolog/signals'
 import { frameRtcPeerChannels, WEBRTC_LIVE_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
 import { expect, it } from 'vitest'
 
@@ -119,7 +118,7 @@ it('keeps the authenticated durable session after live congestion and dispatches
     const sessions = await Promise.all(services.map((service, index) => service.connectPeer({ connection: connections[index]! })))
     expect(attachments).toBe(2)
     live.left.bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
-    await expect(services[0]!.signals.send('typing', { text: 'congested intent' })).rejects.toBeInstanceOf(SignalBackpressureError)
+    await expect(services[0]!.signals.send('typing', { text: 'congested intent' })).rejects.toThrow('SIGNAL_BACKPRESSURE')
     expect(live.left.sent).toEqual([])
     expect(sessions.every(session => !session.signal.aborted)).toBe(true)
 

@@ -1,12 +1,10 @@
-import { framePeerStream, type FramedPeerConnection } from '@chronolog/agent-service/framing'
+import { frameLivePeerStream, type FramedPeerConnection } from '@chronolog/agent-service/framing'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
 import { ChangeSignal, type FeedLink } from '@chronolog/records'
 import { describe, expect, it } from 'vitest'
-import { SignalBackpressureError } from '@chronolog/signals'
 
 import { openHttpPeerConnection } from '../../test/browser/event-connection.js'
-import { liveFrameLane } from '../../test/fixtures/live-frame-lane.js'
 import { createHttpPeerFixture } from './http-peer-fixture.js'
 
 function emptyLink(identity: string): FeedLink {
@@ -20,16 +18,35 @@ describe('paired HTTP qualification transport', () => {
   it('refuses saturated live dispatch without writing or closing its stream', async () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve }), writes: Uint8Array[] = []
-    const lane = liveFrameLane(framePeerStream({ readable: new ReadableStream(), maxPendingSends: 1,
-      writable: new WritableStream({ write: bytes => { writes.push(bytes); return gate } }) }))
-    const first = lane.send(new Uint8Array([1]))
-    await expect(lane.send(new Uint8Array([2]))).rejects.toBeInstanceOf(SignalBackpressureError)
+    const lane = frameLivePeerStream({ readable: new ReadableStream(),
+      writable: new WritableStream({ write: bytes => { writes.push(bytes); return gate } }) })
+    const first = lane.trySend(new Uint8Array([1]))
+    await expect(lane.trySend(new Uint8Array([2]))).resolves.toBe(false)
     release()
-    await expect(first).resolves.toBeUndefined()
-    await expect(lane.send(new Uint8Array([3]))).resolves.toBeUndefined()
+    await expect(first).resolves.toBe(true)
+    await expect(lane.trySend(new Uint8Array([3]))).resolves.toBe(true)
     expect(writes.map(frame => [...frame.subarray(4)])).toEqual([[1], [3]])
     await lane.close()
-    await expect(lane.send(new Uint8Array([4]))).rejects.toThrow('PEER_CONNECTION_CLOSED')
+    await expect(lane.trySend(new Uint8Array([4]))).rejects.toThrow('PEER_CONNECTION_CLOSED')
+  })
+
+  it('keeps a cancelled in-flight write bounded until the underlying stream settles', async () => {
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve }), started = new Promise<void>(resolve => { entered = resolve })
+    const writes: Uint8Array[] = [], controller = new AbortController()
+    const lane = frameLivePeerStream({ readable: new ReadableStream(),
+      writable: new WritableStream({ write(bytes) { writes.push(bytes); entered(); return gate } }) })
+    const first = lane.trySend(new Uint8Array([1]), { signal: controller.signal })
+    try {
+      await started; controller.abort(new Error('observation expired'))
+      await expect(lane.trySend(new Uint8Array([2]))).resolves.toBe(false)
+      await expect(lane.trySend(new Uint8Array([3]), { signal: controller.signal })).rejects.toThrow('observation expired')
+      expect(writes).toHaveLength(1)
+      release(); await expect(first).resolves.toBe(true)
+      await expect(lane.trySend(new Uint8Array([4]))).resolves.toBe(true)
+      expect(writes.map(frame => [...frame.subarray(4)])).toEqual([[1], [4]])
+      expect(lane.signal.aborted).toBe(false)
+    } finally { release(); await lane.close() }
   })
 
   it('carries live frames independently of a blocked reliable stream and closes both lanes together', async () => {
@@ -50,13 +67,13 @@ describe('paired HTTP qualification transport', () => {
       void sendingReliable.catch(() => undefined)
       const receivingLive = remote.live!.frames()[Symbol.asyncIterator]()
       const nextLive = receivingLive.next()
-      await client.live!.send(new Uint8Array([4, 5]))
+      await client.live!.trySend(new Uint8Array([4, 5]))
       expect((await nextLive).value).toEqual(new Uint8Array([4, 5]))
       expect(sentReliable).toBe(false)
 
       const receivingReply = client.live!.frames()[Symbol.asyncIterator]()
       const reply = receivingReply.next()
-      await remote.live!.send(new Uint8Array([6]))
+      await remote.live!.trySend(new Uint8Array([6]))
       expect((await reply).value).toEqual(new Uint8Array([6]))
       expect(sentReliable).toBe(false)
 
@@ -100,7 +117,7 @@ describe('paired HTTP qualification transport', () => {
       else {
         session = await opening
         // Valid framing, invalid live protocol: the authenticated owner must fail.
-        await client.live!.send(encodeCanonicalCbor([1n, 'unexpected'])).catch(() => undefined)
+        await client.live!.trySend(encodeCanonicalCbor([1n, 'unexpected'])).catch(() => undefined)
       }
       const error = await reported
       expect(error).toMatchObject({ message: failure === 'authorization' ? 'PEER_READ_UNAUTHORIZED' : 'SIGNAL_FRAME_INVALID' })
