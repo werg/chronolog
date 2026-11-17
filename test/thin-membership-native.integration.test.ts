@@ -6,7 +6,7 @@ import { createGovernedPeerService } from '@chronolog/agent-service/governed-pee
 import { NativeAgentStore } from '@chronolog/agent-service'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
-import { ChronologClient } from '@chronolog/client'
+import { ChronologClient, type TransactionHandle } from '@chronolog/client'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { createEnrollmentService, createGovernedNode } from '@chronolog/node-core'
 import { LedgerRecordError, decodeLedgerRecord } from '@chronolog/node-core/ledger'
@@ -14,7 +14,7 @@ import {
   MembershipAdministrator, createMembershipLedgerClient, encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity,
   prepareEnrollmentRequest, provisionMembership, verifyEnrollmentApproval,
 } from '@chronolog/node-core/membership'
-import { bytesToBase64Url, decodeEnvelope, equalBytes } from '@chronolog/protocol'
+import { bytesToBase64Url, decodeEnvelope, equalBytes, utf8 } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { createHttpWebRtcSignaling, openWebRtcConnection } from '@chronolog/transport-webrtc'
@@ -36,6 +36,7 @@ describe('thin membership qualification native boundary', () => {
     let phase = 'create native fixture'
     const phases = [{ phase, elapsedMs: 0 }]
     let failureDiagnostic: () => unknown = () => undefined
+    let operationFailure: unknown
     const observe = (name: string): void => {
       phase = name
       const elapsedMs = Math.round(performance.now() - started)
@@ -45,7 +46,7 @@ describe('thin membership qualification native boundary', () => {
     onTestFailed(() => {
       const elapsedMs = Math.round(performance.now() - started)
       process.stderr.write(`Thin native failed phase: ${JSON.stringify({ phase, elapsedMs,
-        phaseElapsedMs: elapsedMs - phases.at(-1)!.elapsedMs, phases, native: failureDiagnostic() })}\n`)
+        phaseElapsedMs: elapsedMs - phases.at(-1)!.elapsedMs, phases, native: failureDiagnostic(), operation: operationFailure })}\n`)
     })
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-thin-membership-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true }))
@@ -151,6 +152,29 @@ describe('thin membership qualification native boundary', () => {
     const client = new ChronologClient({ groupId: bytesToBase64Url(replica.descriptor.history.groupId),
       transport: new InProcessRpcTransport(new NodeRpcService({ node: replica.node, enrollment })), unaryRetryAttempts: 1 })
     cleanup.push(() => client.close())
+    const captureOperationFailure = (handle: TransactionHandle, error: unknown): void => {
+      const describeError = (value: unknown) => value instanceof Error ? { name: value.name, message: value.message } : String(value)
+      try {
+        // Observe cached state before handle disposal. Do not open another RPC
+        // stream, request replay, advance time or wait for more evidence here.
+        const snapshot = handle.outcome.getSnapshot(), txId = utf8(handle.proposalId)
+        const candidate = replica.node.controlStore.getCandidate(txId), outcome = replica.node.outcome(txId)
+        operationFailure = { operationId: handle.operationId, proposalId: handle.proposalId, phase,
+          elapsedMs: Math.round(performance.now() - started), clockNow, error: describeError(error),
+          client: { status: snapshot.status, reconnectAttempt: snapshot.reconnectAttempt, value: snapshot.value,
+            ...(snapshot.error === undefined ? {} : { error: describeError(snapshot.error) }) },
+          node: { revision: String(replica.node.revision), materializedRevision: String(replica.node.materializedRevision),
+            finalRevision: String(replica.node.finalRevision), finalThrough: replica.node.finalThrough,
+            orderLength: replica.node.orderLength, finalOrderLength: replica.node.finalOrderLength,
+            candidate: candidate === null ? null : { state: candidate.state, reason: candidate.stateReason,
+              authorTimestampMs: String(candidate.orderKey.authorTimestampMs) },
+            final: replica.node.isFinal(txId), outcome: outcome === null ? null : {
+              outcome: outcome.outcome, rejectionCode: outcome.rejectionCode, orderIndex: outcome.orderIndex } } }
+      } catch (diagnosticError) {
+        operationFailure = { operationId: handle.operationId, proposalId: handle.proposalId,
+          error: describeError(error), diagnosticError: describeError(diagnosticError) }
+      }
+    }
     expect((await client.enrollment.getStatus(request.request.requestId, { signedApproval: original })).state).not.toBe('ready')
     const hydrateControls = async () => {
       const label = phase
@@ -201,6 +225,7 @@ describe('thin membership qualification native boundary', () => {
       const candidates = (await transport.history()).filter(record => record.author === transport.identity &&
         decodeEnvelope(record.payload).messageType === 'candidate')
       expect(candidates).toHaveLength(++deviceCandidates)
+      observe(`${phase}: retained inclusion and clock advance`)
       await native.advanceAfterInclusion(candidates.at(-1)!.payload, signal)
     }
 
@@ -210,8 +235,10 @@ describe('thin membership qualification native boundary', () => {
     try {
       const signal = AbortSignal.timeout(10_000)
       await closeDeviceCandidate(signal)
+      observe('original accepted device operation: client finality')
       expect((await first.final({ signal })).outcome.type).toBe('accepted')
     }
+    catch (error) { captureOperationFailure(first, error); throw error }
     finally { first.dispose() }
     const afterOrdinaryOperation = native.traffic()
     // The authenticated peer carries both the proposal and its finality. No
@@ -231,8 +258,10 @@ describe('thin membership qualification native boundary', () => {
     try {
       const signal = AbortSignal.timeout(10_000)
       await closeDeviceCandidate(signal)
+      observe('rejected writer operation: client finality')
       expect((await rejected.final({ signal })).outcome.type).toBe('rejected')
     }
+    catch (error) { captureOperationFailure(rejected, error); throw error }
     finally { rejected.dispose() }
     observe('original accepted operation retry')
     const retry = await client.events.publish('qualification', { text: 'before writer removal' }, { operationId: 'device-before-removal' })

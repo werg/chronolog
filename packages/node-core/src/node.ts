@@ -779,8 +779,11 @@ export class ChronologNode {
     const exact = bytes.slice()
     await this.#mutex.run(async () => {
       await policy.ingestEvidence(exact)
-      await this.#options.transport.putEvidence?.(exact)
       const snapshot = policy.snapshot()
+      // This verified, durably retained closure already limits new author
+      // timestamps even if replication retention or application replay fails.
+      this.#observeAuthorTime(snapshot.closedThroughMs)
+      await this.#options.transport.putEvidence?.(exact)
       // Exact proof replays and open receipt growth cannot change an already
       // applied closed prefix. Pending bodies, keys or publication failures
       // still need reconciliation even when the verified frontier is unchanged.
@@ -1255,9 +1258,10 @@ export class ChronologNode {
       reason === undefined ? {} : { reason })
     if (this.historyPolicy === 'peer' && reason === undefined) {
       await this.#evaluateAdmission(candidate.txId, core)
-      // A newly eligible preview needs its first local vote. Existing previews
-      // have already attempted it; incoming proofs use the same evaluator.
-      if (candidate.state !== 'provisional') await this.#maybeAttest(candidate.txId, candidate, core)
+      // Selection does not prove that a local vote was durably published.
+      // Retry failed publication or newly available authority; retained votes
+      // are deduplicated independently of the provisional materialized view.
+      await this.#maybeAttest(candidate.txId, candidate, core)
     }
   }
 
@@ -1267,6 +1271,7 @@ export class ChronologNode {
     if (this.#validatorClosures.isClosed(core.membershipRevision)) return
     const validatorCapability = this.#validatorCapability()
     if (validatorCapability === undefined) return
+    if (this.#control.attestationsFor(txId).some((item) => equalBytes(item.validatorId, this.identity))) return
     const now = this.#clockNow()
     // The advanced cutoff only becomes a commitment once it is signed, so it
     // is persisted just before signing. Persisting here for every candidate
@@ -1293,7 +1298,6 @@ export class ChronologNode {
       core.membershipRevision,
       validatorCapability,
     )) throw new Error('LOCAL_TRANSPORT_AUTHOR_UNAUTHORIZED')
-    if (this.#control.attestationsFor(txId).some((item) => equalBytes(item.validatorId, this.identity))) return
     const policyVersion = await this.#expectedPolicyVersion(core)
     if (policyVersion < 0n) return
     const configuredPolicyVersion = validator.policyVersion ?? policyVersion
@@ -1313,10 +1317,12 @@ export class ChronologNode {
     }
     const payload = encodeValidatorAttestation(attestation)
     const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'attestation', payload, this.#options.identity, this.#options.envelopeCipher)
-    // Publishing before returning is the validator durability rule. The newly
-    // appended record is handled by the normal subscription path.
+    // Record the local vote only after its transport publication is durable.
+    // The normal subscription still advances the verified feed prefix, but
+    // another selection pass must already see the retained vote for dedupe.
     this.#setConsumerPhase('publishing-attestation')
-    await this.#options.transport.publish(envelope, { timestampMs: now })
+    const record = await this.#options.transport.publish(envelope, { timestampMs: now })
+    await this.#ingestAttestation(record, payload, this.identity)
   }
 
   async #ingestAttestation(record: TransportRecord, encoded: Uint8Array, signer: Uint8Array): Promise<void> {

@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "5bc58c0d0004549b0d50d1ba9d187072542507cb",
+  "sourceTree": "947de2c03857fe21df5539d34335929a83c20af1",
+  "sourceDirty": false,
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm install --ignore-scripts --offline --no-audit --no-fund",
+  "membershipSource": "7fcebd4c371a2d62811b24a91ff9baf9e0be19a8",
+  "purpose": "Reviewed host with explicit writer rights, root-only membership, compact verified control proofs and epoch keys bound to their authorized membership revision.",
+  "package": "@tendriller/engine",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-engine-5bc58c0d.tgz",
+  "sha256": "f30bc1bd48ce179fb7f4d156e57e62b5f750c1825f2e518a28f0629c29856f12",
+  "bytes": 218392,
+  "dependencyPreparation": "Reused existing registry dependencies with unchanged locked versions; offline install updated only the tracked local membership archive."
+}
