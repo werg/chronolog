@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { FINAL_BRANCH, HEAD_BRANCH } from './checkpoints.js'
 import { openDatabase } from './driver.js'
-import { createDoltLiteExecutionManifest } from './manifest.js'
-import { DeterministicMaterializer } from './native.js'
+import { DeterministicMaterializer } from './materializer.js'
+import { createNativeSqlEngine } from './native.js'
 import { MaterializerFixture, ROOT_KEY, replayProposal } from './test-fixtures.js'
 import type { DatabaseLike, ReplayProposal } from './types.js'
 
@@ -118,7 +118,7 @@ async function proposals(digest: Uint8Array): Promise<readonly ReplayProposal[]>
 
 async function instrumented(checkpointEvery: number) {
   const path = `${await fixtures.directory()}/application.db`
-  const manifest = createDoltLiteExecutionManifest()
+  const manifest = createNativeSqlEngine().executionManifest
   const executions: string[] = []
   let writer: DatabaseLike | undefined
   let fault: 'commit' | 'reader-validation' | undefined
@@ -128,8 +128,7 @@ async function instrumented(checkpointEvery: number) {
     fail: (value: typeof fault) => { fault = value },
     open: () => {
       let openedCount = 0
-      return DeterministicMaterializer.open({ path, executionManifest: manifest, rootAdministrator: ROOT_KEY, checkpointEvery,
-        openDatabase(options) {
+      return DeterministicMaterializer.open({ path, engine: { executionManifest: manifest, openDatabase(options) {
           const opened = openDatabase(options)
           const native = opened.database
           const isWriter = openedCount++ === 0
@@ -167,7 +166,7 @@ async function instrumented(checkpointEvery: number) {
           }
           if (isWriter) writer = database
           return { ...opened, database }
-        },
+        } }, rootAdministrator: ROOT_KEY, checkpointEvery,
       })
     },
   }
