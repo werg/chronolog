@@ -19,6 +19,7 @@ export class NativeBytesStore implements AtomicBytesStore {
   readonly #database: DatabaseSync
   readonly #quotaBytes: number
   readonly #maxValueBytes: number
+  #usedBytes = 0
   #closed = false
 
   constructor(path: string, options: NativeBytesStoreOptions = {}) {
@@ -43,6 +44,9 @@ export class NativeBytesStore implements AtomicBytesStore {
         value BLOB NOT NULL
       )`)
       this.#database.exec('COMMIT')
+      // An exclusive owner accounts once on reopen. Appending one value must
+      // not scan every retained body merely to enforce its storage quota.
+      this.#usedBytes = (this.#database.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM agent_values').get() as { bytes: number }).bytes
     } catch (error) {
       try { this.#database.close() } catch { /* failed opening */ }
       if (/locked|busy/iu.test(error instanceof Error ? error.message : '')) {
@@ -66,13 +70,14 @@ export class NativeBytesStore implements AtomicBytesStore {
     if (!(value instanceof Uint8Array) || value.byteLength > this.#maxValueBytes) throw new Error('AGENT_STORE_VALUE_TOO_LARGE')
     this.#database.exec('BEGIN IMMEDIATE')
     try {
-      const used = this.usageBytes()
       const previous = this.#database.prepare('SELECT length(value) AS bytes FROM agent_values WHERE key = ?').get(key) as
         { bytes: number } | undefined
-      if (used - (previous?.bytes ?? 0) + value.byteLength > this.#quotaBytes) throw new Error('AGENT_STORE_QUOTA_EXCEEDED')
+      const used = this.#usedBytes - (previous?.bytes ?? 0) + value.byteLength
+      if (used > this.#quotaBytes) throw new Error('AGENT_STORE_QUOTA_EXCEEDED')
       this.#database.prepare('INSERT INTO agent_values (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
         .run(key, value)
       this.#database.exec('COMMIT')
+      this.#usedBytes = used
     } catch (error) {
       this.#database.exec('ROLLBACK')
       throw error
@@ -81,7 +86,7 @@ export class NativeBytesStore implements AtomicBytesStore {
 
   usageBytes(): number {
     this.#assertOpen()
-    return (this.#database.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM agent_values').get() as { bytes: number }).bytes
+    return this.#usedBytes
   }
 
   close(): void {

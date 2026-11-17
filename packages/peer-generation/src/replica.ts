@@ -375,10 +375,14 @@ class Replica implements PeerReplica {
   prefixProof(point: HistoryPoint): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(point) }) }
   exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
     return this.#serial.run(async () => {
-      this.#assertReady(); let start = 0
-      if (options.at !== undefined) this.#checkView(options.at)
+      this.#assertReady(); let start = 0, end = this.#selected.length
+      if (options.at !== undefined) {
+        this.#checkView(options.at)
+        check(options.at.generation === this.generation.id && options.at.point.generation === this.generation.id, 'PEER_VIEW_RECOVERY_REQUIRED')
+        end -= this.revision.point.sequence - options.at.point.sequence
+      }
       if (options.offset !== undefined) {
-        check(options.after === undefined && Number.isSafeInteger(options.offset) && options.offset >= 0 && options.offset <= this.#selected.length, 'PEER_RANGE_OFFSET_INVALID')
+        check(options.after === undefined && Number.isSafeInteger(options.offset) && options.offset >= 0 && options.offset <= end, 'PEER_RANGE_OFFSET_INVALID')
         start = options.offset
       }
       if (options.after !== undefined) {
@@ -393,7 +397,7 @@ class Replica implements PeerReplica {
       }
       const limit = options.limit ?? this.#maxRecords
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= this.#maxRecords, 'PEER_RANGE_LIMIT_INVALID')
-      return this.#selected.slice(start, start + limit).map(value => structuredClone(value.command))
+      return this.#selected.slice(start, Math.min(end, start + limit)).map(value => structuredClone(value.command))
     })
   }
   retainedCoverage(): Promise<SignedRetainedCoverage> {
