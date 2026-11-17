@@ -53,6 +53,14 @@ export interface SessionStatus {
   readonly coordinator: string
   readonly connectedPeers: number
 }
+/** Coarse public discovery hints; signed controls and peer authentication decide authority. */
+export interface ApplicationPeerAvailability {
+  readonly peerId: string
+  readonly storageId: string
+  readonly profiles: readonly ['peer-generation-v1']
+  readonly coordinatorEligible: boolean
+  readonly recovery?: { readonly generation: string; readonly sequence: number; readonly root: string; readonly controlRevision: number; readonly retainedAt: number }
+}
 
 export class AbandonedOperationError extends Error {
   constructor(readonly operation: Extract<OperationState, { status: 'abandoned' | 'needsReapply' }>) {
@@ -145,6 +153,19 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       coordinator, connectedPeers: this.#peers.size }
   }
   describe() { return { ...describeApplication(this.#definition), profile: 'peer-generation-v1' as const, capabilities: this.capabilities } }
+  async availability(): Promise<ApplicationPeerAvailability> {
+    this.#assertOpen()
+    let coverage: SignedRetainedCoverage | undefined
+    try { coverage = await this.#replica.retainedCoverage() }
+    catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERING') throw error }
+    this.#assertOpen()
+    const generation = this.#replica.generation, control = this.#replica.authority.controls[generation.payload.controlRevision]!
+    const grant = control.payload.grants.find(value => value.publicKey === this.deviceId)
+    if (grant?.reader !== true) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
+    return { peerId: this.deviceId, storageId: this.storageId, profiles: ['peer-generation-v1'], coordinatorEligible: grant.coordinator,
+      ...(coverage?.payload.generation === generation.id ? { recovery: { ...coverage.payload.point,
+        controlRevision: generation.payload.controlRevision, retainedAt: coverage.payload.retainedAt } } : {}) }
+  }
   onStatus(listener: (status: SessionStatus) => void): () => void {
     this.#statusListeners.add(listener)
     try { listener(this.status) } catch { /* Observation never changes peer lifetime. */ }

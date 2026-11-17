@@ -1,6 +1,15 @@
 import type { PeerRevision } from '@chronolog/peer-generation'
 import type { ApplicationControlHost } from './recovery.js'
 import type { ApplicationSession } from './session.js'
+import { parseApplicationInput, type ApplicationInputSchema } from './definition.js'
+
+const revisionSchema = { type: 'object', properties: {
+  applicationId: { type: 'string', minLength: 64, maxLength: 64 }, historyId: { type: 'string', minLength: 1, maxLength: 256 },
+  generation: { type: 'string', minLength: 64, maxLength: 64 }, controlRevision: { type: 'integer', minimum: 0 },
+  materializationRevision: { type: 'string', minLength: 1, maxLength: 256 },
+  point: { type: 'object', properties: { generation: { type: 'string', minLength: 64, maxLength: 64 },
+    sequence: { type: 'integer', minimum: 0 }, root: { type: 'string', minLength: 64, maxLength: 64 } }, required: ['generation', 'sequence', 'root'] },
+}, required: ['applicationId', 'historyId', 'generation', 'controlRevision', 'materializationRevision', 'point'] } as const satisfies ApplicationInputSchema
 
 export interface ApplicationTool {
   readonly name: string
@@ -12,18 +21,19 @@ export interface ApplicationTool {
 export function createApplicationTools(session: ApplicationSession, options: { readonly host?: ApplicationControlHost } = {}) {
   const description = session.describe(), operationId = { type: 'string', minLength: 1, maxLength: 256 }
   const object = (properties: Record<string, unknown>, required: readonly string[] = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false })
-  const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>) => ({ oneOf: description[kind].map(entry => object({
-    name: { type: 'string', const: entry.name, description: entry.description }, input: entry.input, ...fields,
-  })) })
+  const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>, optional: Record<string, unknown> = {}) => ({ oneOf: description[kind].map(entry => object({
+    name: { type: 'string', const: entry.name, description: entry.description }, input: entry.input, ...fields, ...optional,
+  }, ['name', 'input', ...Object.keys(fields)])) })
   const tools: readonly ApplicationTool[] = [
     { name: 'describe', description: 'Inspect authenticated application definitions, current role and supported guarantees.', inputSchema: object({}) },
     { name: 'query', description: 'Execute a declared query against one coherent captured application revision.', inputSchema: entries('queries', {}) },
-    { name: 'command', description: 'Save one signed command under a caller-owned operation ID. Returns saved or currently applied state.', inputSchema: entries('commands', { operationId }) },
+    { name: 'command', description: 'Save one signed command under a caller-owned operation ID. Returns saved or currently applied state.', inputSchema: entries('commands', { operationId }, { basedOn: revisionSchema }) },
     { name: 'operation', description: 'Inspect saved attempt bytes, current outcome and explicit reapplication linkage.', inputSchema: object({ operationId }) },
     { name: 'retry', description: 'Retry the exact saved command. Never recreates an abandoned operation.', inputSchema: object({ operationId }) },
     { name: 'wait', description: 'Wait for the current applied result. Cancellation only cancels this wait.', inputSchema: object({ operationId }) },
     { name: 'recoveries', description: 'Inspect generation recovery notices and preserved abandoned operations.', inputSchema: object({}) },
-    { name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment.', inputSchema: entries('commands', { operationId, originalOperationId: operationId }) },
+    { name: 'changes', description: 'Wait for a coherent revision different from after, or return the current view when omitted. Recovery requires rereading; changes may coalesce.', inputSchema: object({ after: revisionSchema }, []) },
+    { name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment.', inputSchema: entries('commands', { operationId, originalOperationId: operationId }, { basedOn: revisionSchema }) },
     ...(options.host === undefined ? [] : [{ name: 'takeover', description: 'Select this eligible device\'s complete recovery point through the hosted authority; may abandon a recent suffix.', inputSchema: object({ transitionId: { type: 'string', minLength: 1, maxLength: 128 } }) }]),
   ]
   return {
@@ -34,23 +44,40 @@ export function createApplicationTools(session: ApplicationSession, options: { r
       const value = input as Record<string, unknown>
       const text = (key: string): string => { if (typeof value[key] !== 'string') throw new Error('APPLICATION_TOOL_INPUT_INVALID'); return value[key] }
       const fields = (...keys: string[]): void => { if (Object.keys(value).some(key => !keys.includes(key))) throw new Error('APPLICATION_TOOL_INPUT_INVALID') }
+      const revision = (input: unknown): PeerRevision => {
+        const result = parseApplicationInput(revisionSchema, input) as unknown as PeerRevision
+        if (result.applicationId !== session.applicationId || result.historyId !== session.historyId || result.point.generation !== result.generation) throw new Error('APPLICATION_TOOL_REVISION_INVALID')
+        return result
+      }
       switch (name) {
         case 'describe': fields(); return { definition: description, status: session.status }
         case 'query': fields('name', 'input'); return session.query(text('name'), value.input as never)
         case 'command': {
           fields('name', 'input', 'operationId', 'basedOn')
           const operation = await session.command(text('name'), value.input as never, { operationId: text('operationId'),
-            ...(value.basedOn === undefined ? {} : { basedOn: value.basedOn as PeerRevision }) })
+            ...(value.basedOn === undefined ? {} : { basedOn: revision(value.basedOn) }) })
           return operation.get()
         }
         case 'operation': fields('operationId'); return session.operations.inspect(text('operationId'))
         case 'retry': fields('operationId'); await session.retry(text('operationId')); return session.operations.get(text('operationId'))
         case 'wait': fields('operationId'); return session.operations.wait(text('operationId'), callOptions)
         case 'recoveries': fields(); return session.inspectRecovery()
+        case 'changes': {
+          fields('after')
+          const after = value.after === undefined ? undefined : revision(value.after)
+          for await (const change of session.changes(callOptions)) {
+            if (after !== undefined && after.generation === change.revision.generation && after.point.root === change.revision.point.root &&
+                after.materializationRevision === change.revision.materializationRevision) continue
+            if (after !== undefined && after.generation !== change.revision.generation) return { ...change, kind: 'recovery',
+              recovery: change.recovery ?? session.inspectRecovery().findLast(notice => notice.generation === change.revision.generation) ?? null }
+            return change
+          }
+          callOptions.signal?.throwIfAborted(); session.signal.throwIfAborted(); throw new Error('APPLICATION_CHANGES_ENDED')
+        }
         case 'reapply': {
           fields('name', 'input', 'operationId', 'originalOperationId', 'basedOn')
           const operation = await session.reapply(text('originalOperationId'), text('name'), value.input as never, { operationId: text('operationId'),
-            ...(value.basedOn === undefined ? {} : { basedOn: value.basedOn as PeerRevision }) })
+            ...(value.basedOn === undefined ? {} : { basedOn: revision(value.basedOn) }) })
           return operation.get()
         }
         case 'takeover':

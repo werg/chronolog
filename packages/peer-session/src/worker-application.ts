@@ -5,11 +5,11 @@ import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from
 import type { ContentReference, ContentRetention, ContentUpload } from './content.js'
 import type { ApplicationControlHost, ApplicationTransition } from './recovery.js'
 import {
-  AbandonedOperationError, RecoveredViewError, type ApplicationChange, type ApplicationEventBatch,
+  AbandonedOperationError, RecoveredViewError, type ApplicationChange, type ApplicationEventBatch, type ApplicationPeerAvailability,
   type ApplicationEventOptions, type ApplicationReadView, type ApplicationSession, type CommandOptions,
   type QueryParameter, type QueryRows, type SessionStatus,
 } from './session.js'
-import type { ApplicationWorkerEndpoint } from './worker-transport.js'
+import { installApplicationWorkerTransport, type ApplicationWorkerEndpoint } from './worker-transport.js'
 
 const PROTOCOL = 'chronolog/peer-session/worker-application/v1'
 const MAX_REQUESTS = 64, MAX_STREAMS = 16, MAX_BYTES = 1_048_576
@@ -47,6 +47,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
 } = {}): { close(): Promise<void> } {
   let port: MessagePort | undefined, closed = false, lastId = 0, nextView = 0
   let closing: Promise<void> | undefined
+  const transport = installApplicationWorkerTransport(session, endpoint)
   const calls = new Map<number, AbortController>(), streams = new Map<number, Stream>(), views = new Map<number, ApplicationReadView>()
   const send = (value: unknown): void => { bounded(value); port?.postMessage(value) }
   const respond = (id: number, value: unknown): void => { send({ id, value, snapshot: snapshot(session) } satisfies Response) }
@@ -66,7 +67,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     views.clear()
     port?.removeEventListener('message', receive); port?.removeEventListener('messageerror', messageError)
     closing = Promise.allSettled([...streams.keys()].map(cancelStream)).then(async () => {
-      try { await session.close() }
+      try { await transport.close(); await session.close() }
       finally {
         // A page can reopen the device immediately after close resolves: send
         // the terminal observation only after the owning store released its lock.
@@ -92,6 +93,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'command': return (await session.command(args[0] as string, args[1] as never, args[2] as CommandOptions)).operationId
       case 'reapply': return (await session.reapply(args[0] as string, args[1] as string, args[2] as never, args[3] as CommandOptions)).operationId
       case 'query': return session.query(args[0] as string, args[1] as never)
+      case 'availability': return session.availability()
       case 'operation.get': return session.operations.get(args[0] as string, args[1] as { author?: string })
       case 'operation.inspect': return session.operations.inspect(args[0] as string, args[1] as { author?: string })
       case 'operation.wait': return session.operations.wait(args[0] as string, { signal })
@@ -297,6 +299,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   }
   retry(id: string): Promise<void> { return this.#call('retry', [id]) }
   resume(): Promise<void> { return this.#call('resume', []) }
+  availability(): Promise<ApplicationPeerAvailability> { return this.#call('availability', []) }
   inspectRecovery(): Promise<readonly RecoveryNotice[]> { return this.#call('inspectRecovery', []) }
   recoveryPoint(): Promise<PrefixProof> { return this.#call('recoveryPoint', []) }
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> { return this.#call('adopt', [authority]) }

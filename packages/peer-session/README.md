@@ -183,15 +183,13 @@ and connections before closing its durable store.
 
 ## Page facade
 
-The Worker opens the device, owns the application and installs the application
-bridge alongside the transport bridge:
+The Worker opens the device and owns the application. Installing its page facade
+also owns the RTC channel transfer bridge:
 
 ```ts
 import { serveApplicationWorker } from '@chronolog/peer-session/browser'
-import { installApplicationWorkerTransport } from '@chronolog/peer-session/webrtc'
 
 serveApplicationWorker(session, self, { host })
-installApplicationWorkerTransport(session, self)
 ```
 
 The page connects through a dedicated message port:

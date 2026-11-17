@@ -197,6 +197,13 @@ describe('public peer application sessions', () => {
     expect(JSON.parse(output[1]!)).toMatchObject({ id: 2, result: { status: 'applied', outcome: 'accepted' } })
     expect(JSON.parse(output[3]!)).toMatchObject({ id: 4, result: { value: { events: [expect.objectContaining({ operationId: 'tool-once', payload: { text: 'from local tool' } })] } } })
     expect((await app.query('messages', null)).value.events).toHaveLength(1)
+    const before = app.revision, waiting = tools.call('changes', { after: before }, { signal: AbortSignal.timeout(5000) })
+    await tools.call('command', { name: 'say', input: 'with captured guard', operationId: 'guarded', basedOn: before })
+    expect(await waiting).toMatchObject({ kind: 'applied', revision: { point: { sequence: 2 } } })
+    const cancelled = new AbortController(), changeWait = tools.call('changes', { after: app.revision }, { signal: cancelled.signal })
+    cancelled.abort(new Error('AGENT_STOPPED_WAITING'))
+    await expect(changeWait).rejects.toThrow('AGENT_STOPPED_WAITING')
+    expect(await app.operations.get('guarded')).toMatchObject({ status: 'applied', outcome: 'accepted' })
   })
 
   it('binds Tendriller to applied views and authenticated operations without hosted command calls', async () => {

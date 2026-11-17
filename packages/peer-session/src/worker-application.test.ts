@@ -79,6 +79,8 @@ describe('owned browser application facade', () => {
     await operation.retry()
     expect((await client.operations.inspect('once'))?.attempt).toEqual(original?.attempt)
     expect((await client.query('messages', null)).value.events[0]?.payload).toEqual({ text: 'saved once' })
+    expect(await client.availability()).toMatchObject({ peerId: f.b.deviceId, storageId: f.b.storageId,
+      profiles: ['peer-generation-v1'], recovery: { sequence: 1 } })
     expect(await operation.shared({ signal: AbortSignal.timeout(5000) })).toHaveLength(1)
   })
 
