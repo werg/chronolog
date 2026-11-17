@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: a6a9e4b89ecb2f74fe15322735418116e7931204
+          ref: 373b35395ed4ab77b554c9fccd0179c7266ad905
           path: artifacts/signal-recipe
           persist-credentials: false
       - name: Qualify previews through the standalone public package
