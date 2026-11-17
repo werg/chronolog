@@ -226,7 +226,7 @@ export interface GovernanceStatus {
   readonly revisionDigest: string
   readonly rootAdminPublicKey: string
   readonly capabilityLogFeed: string
-  readonly currentEpoch: string | null
+  readonly currentEpoch: string
   readonly capabilities: readonly GovernanceCapabilityStatus[]
 }
 
@@ -234,12 +234,11 @@ interface GrantCapabilityIdentity {
   readonly subjectId: string
   readonly signingPublicKey: string
   readonly transportAuthor?: string
-  readonly minimumAuthorTimestampMs?: string
   readonly hpkePublicKey?: string
 }
 export type GrantCapabilityInput = GrantCapabilityIdentity & (
   | { readonly role: 'writer'; readonly program: ProgramRights }
-  | { readonly role: Exclude<CapabilityRole, 'writer'>; readonly program?: never }
+  | { readonly role: 'reader'; readonly program?: never }
 )
 export type GrantCapabilityRequest = GetGovernanceStatusRequest & GrantCapabilityInput
 export interface GrantCapabilityResponse { readonly revision: string; readonly capabilityId: string }

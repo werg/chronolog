@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { SignedGenesis } from '@chronolog/capabilities'
 import { NodeStateDatabase, SqliteControlStorePersistence, ControlStore } from '../packages/control-store/src/index.js'
 import { DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite'
-import { createGovernedNode, type GovernedNode } from '@chronolog/node-core'
+import { createGovernedNode, type CapabilityChange, type GovernedNode } from '@chronolog/node-core'
 import { generateEd25519KeyPair, executionManifestArtifacts, sqlStatement, decodeEnvelope, equalBytes } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -63,7 +63,7 @@ describe('live native governed peer', () => {
     const initialRecords = (await root.transport.history()).length
     await expect(root.runtime.governance.publishCapabilityChange({ revocations: [validatorGrant.id] }, root.identity.privateKey))
       .rejects.toThrow('GOVERNANCE_FIXED_VALIDATORS')
-    await expect(root.runtime.governance.publishCapabilityChange({ validationPolicies: [{ version: 2n, minimumValidators: 0n }] }, root.identity.privateKey))
+    await expect(root.runtime.governance.publishCapabilityChange({ validationPolicies: [{ version: 2n, minimumValidators: 0n }] } as unknown as CapabilityChange, root.identity.privateKey))
       .rejects.toThrow('GOVERNANCE_FIXED_VALIDATION_POLICY')
     expect((await root.transport.history()).length).toBe(initialRecords)
     const original = await root.runtime.node.publish({ operationId: 'schema', program: { version: 3, steps: [

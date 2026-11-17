@@ -431,15 +431,15 @@ async function governanceFixture(operationStore?: DurableOperationStore) {
   return { network, root, rootHpke, adminTransport, genesis, admin, groupId, groupRoute, policy }
 }
 
-function grant(
+function grant<Role extends 'reader' | 'validator'>(
   signingPublicKey: Uint8Array,
-  role: 'reader' | 'validator',
+  role: Role,
   options: { readonly transportAuthor?: string; readonly minimumAuthorTimestampMs?: bigint; readonly hpkePublicKey?: Uint8Array } = {},
-): CapabilityGrantInput {
+): CapabilityGrantInput & { readonly role: Role } {
   return { subjectId: signingPublicKey, signingPublicKey, role, ...options }
 }
 
-function sqlWriter(signingPublicKey: Uint8Array, options: { readonly transportAuthor?: string } = {}): CapabilityGrantInput {
+function sqlWriter(signingPublicKey: Uint8Array, options: { readonly transportAuthor?: string } = {}): CapabilityGrantInput & { readonly role: 'writer' } {
   return { subjectId: signingPublicKey, signingPublicKey, role: 'writer',
     program: { sql: true, topics: [], signals: [] }, ...options }
 }

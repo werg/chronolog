@@ -2,10 +2,9 @@ import {
   capabilityId,
   isCapabilityActive,
   normalizeProgramRights,
-  type CapabilityGrantInput,
   type ProgramRights,
 } from '@chronolog/capabilities'
-import type { GovernanceControlPlane } from '@chronolog/node-core'
+import type { CapabilityChange, GovernanceControlPlane } from '@chronolog/node-core'
 import {
   ChronologRpcError,
   type GovernanceCapabilityStatus,
@@ -15,9 +14,7 @@ import {
 export function createGovernanceRpcAdmin(options: {
   readonly governance: GovernanceControlPlane
   readonly rootPrivateKey: CryptoKey
-  readonly now?: () => number
 }): GovernanceRpcAdmin {
-  const now = options.now ?? Date.now
   return {
     async getStatus() {
       const snapshot = options.governance.snapshot
@@ -45,24 +42,22 @@ export function createGovernanceRpcAdmin(options: {
         revisionDigest: base64url(snapshot.revisionDigest),
         rootAdminPublicKey: base64url(snapshot.rootAdminPublicKey),
         capabilityLogFeed: new TextDecoder().decode(snapshot.capabilityLogFeed),
-        currentEpoch: options.governance.currentEpoch?.toString(10) ?? null,
+        currentEpoch: options.governance.currentEpoch.toString(10),
         capabilities,
       }
     },
 
     async grantCapability(request) {
-      if (!['reader', 'writer', 'validator'].includes(request.role)) throw invalid('Unknown capability role')
+      if (!['reader', 'writer'].includes(request.role)) throw invalid('Live grants support only reader and writer roles')
+      if ('minimumAuthorTimestampMs' in request) throw invalid('Validator timestamp floors are fixed by genesis')
       if (request.role !== 'writer' && request.program !== undefined) throw invalid('program is valid only for writer grants')
       const identity = {
         subjectId: publicKey(request.subjectId, 'subjectId'),
         signingPublicKey: publicKey(request.signingPublicKey, 'signingPublicKey'),
         ...(request.transportAuthor === undefined ? {} : { transportAuthor: boundedText(request.transportAuthor, 'transportAuthor') }),
-        ...(request.minimumAuthorTimestampMs === undefined
-          ? request.role === 'validator' ? { minimumAuthorTimestampMs: BigInt(Math.trunc(now())) } : {}
-          : { minimumAuthorTimestampMs: decimal(request.minimumAuthorTimestampMs, 'minimumAuthorTimestampMs') }),
         ...(request.hpkePublicKey === undefined ? {} : { hpkePublicKey: publicKey(request.hpkePublicKey, 'hpkePublicKey') }),
       }
-      const grant: CapabilityGrantInput = request.role === 'writer'
+      const grant: NonNullable<CapabilityChange['grants']>[number] = request.role === 'writer'
         ? { ...identity, role: 'writer', program: programRights(request.program) }
         : { ...identity, role: request.role }
       if (grant.role === 'reader' && grant.hpkePublicKey === undefined) {
@@ -117,11 +112,6 @@ function boundedText(value: string, label: string): string {
 function programRights(value: ProgramRights): ProgramRights {
   try { return normalizeProgramRights(value) }
   catch (error) { throw invalid('writer grants require explicit valid program rights', error) }
-}
-
-function decimal(value: string, label: string): bigint {
-  if (!/^(0|[1-9][0-9]*)$/u.test(value)) throw invalid(`${label} must be an unsigned decimal integer`)
-  return BigInt(value)
 }
 
 function publicKey(value: string, label: string): Uint8Array { return bytes(value, label, 32) }

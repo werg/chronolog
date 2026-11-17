@@ -26,7 +26,7 @@ describe('governance admin RPC adapter', () => {
       currentEpoch: 7n,
       publishCapabilityChange,
     } as unknown as GovernanceControlPlane
-    const admin = createGovernanceRpcAdmin({ governance, rootPrivateKey: {} as CryptoKey, now: () => 12_345 })
+    const admin = createGovernanceRpcAdmin({ governance, rootPrivateKey: {} as CryptoKey })
 
     const status = await admin.getStatus({ groupId: b64(snapshot.groupId), requestId: 'status' })
     expect(status).toMatchObject({ revision: '3', currentEpoch: '7' })
@@ -50,8 +50,8 @@ describe('governance admin RPC adapter', () => {
     })] }, expect.anything(), { operationId: 'grant' })
   })
 
-  it('rejects ambiguous keys and invalid reader grants', async () => {
-    const governance = { snapshot: capabilitySnapshot(), currentEpoch: null } as unknown as GovernanceControlPlane
+  it('rejects invalid grants and fixed-validator mutation fields', async () => {
+    const governance = { snapshot: capabilitySnapshot(), currentEpoch: 0n } as unknown as GovernanceControlPlane
     const admin = createGovernanceRpcAdmin({ governance, rootPrivateKey: {} as CryptoKey })
     const base = { groupId: b64(governance.snapshot.groupId), requestId: 'grant' }
     const common = { ...base, subjectId: b64(bytes(20)), signingPublicKey: b64(bytes(21)) }
@@ -64,6 +64,10 @@ describe('governance admin RPC adapter', () => {
       .rejects.toMatchObject({ code: 'invalid_argument' })
     await expect(admin.grantCapability({ ...common, role: 'administrator' } as unknown as GrantCapabilityRequest))
       .rejects.toMatchObject({ code: 'invalid_argument' })
+    await expect(admin.grantCapability({ ...common, role: 'validator' } as unknown as GrantCapabilityRequest))
+      .rejects.toMatchObject({ code: 'invalid_argument', message: 'Live grants support only reader and writer roles' })
+    await expect(admin.grantCapability({ ...writer, minimumAuthorTimestampMs: '12345' } as unknown as GrantCapabilityRequest))
+      .rejects.toMatchObject({ code: 'invalid_argument', message: 'Validator timestamp floors are fixed by genesis' })
   })
 })
 

@@ -340,8 +340,12 @@ require an HPKE public key. Every writer grant requires an explicit `program`
 object containing `sql`, allowed durable-event `topics` and allowed ephemeral
 `signals`. Omitting it is invalid and never grants SQL access. Forwarding through
 another enrolled feed requires `forwarded: true`; its default is denied.
-`grantCapability` accepts these rights and governance status returns the same
-rights for each writer, so an agent can inspect the permission it is requesting.
+`grantCapability` accepts reader/writer grants and governance status returns the
+same rights for each writer, so an agent can inspect the permission it is requesting.
+Validator grants and their timestamp floors belong to signed genesis, not live
+mutation requests. The live `CapabilityChange` input likewise contains only
+reader/writer grants and revocations; received signed revisions still undergo
+the fixed-validator and fixed-policy checks.
 One exact grant must cover a program; rights from several grants are not pooled.
 
 Live enrollment selects reader/writer grants with explicit `writerProgram`

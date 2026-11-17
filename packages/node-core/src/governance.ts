@@ -13,7 +13,6 @@ import {
   type CapabilitySnapshot,
   type SignedCapabilityRevision,
   type SignedGenesis,
-  type ValidationPolicy,
 } from '@chronolog/capabilities'
 import {
   createEpochManifest,
@@ -84,9 +83,9 @@ export interface GovernanceControlPlaneOptions {
 export interface GovernanceOperationOptions { readonly operationId?: string }
 
 export interface CapabilityChange {
-  readonly grants?: readonly CapabilityGrantInput[]
+  /** Live changes grant application membership; validators are fixed by genesis. */
+  readonly grants?: readonly (CapabilityGrantInput & { readonly role: 'reader' | 'writer' })[]
   readonly revocations?: readonly Uint8Array[]
-  readonly validationPolicies?: readonly ValidationPolicy[]
 }
 
 export class GovernanceControlPlane {
@@ -192,7 +191,7 @@ export class GovernanceControlPlane {
       groupId: this.#snapshot.groupId, revision: 1n,
       previousRevisionDigest: new Uint8Array(32), issuerRootPublicKey: this.#options.genesis.manifest.rootAdminPublicKey,
       grants: (change.grants ?? []).map(grant => ({ ...grant, validFromRevision: 1n })),
-      revocations: [...(change.revocations ?? [])], validationPolicies: [...(change.validationPolicies ?? [])], encryptionEpoch: 0n,
+      revocations: [...(change.revocations ?? [])], validationPolicies: [], encryptionEpoch: 0n,
     })
     const prepared = await this.#operations.run({
       operationId: options.operationId ?? crypto.randomUUID(),
@@ -206,7 +205,7 @@ export class GovernanceControlPlane {
           previousRevisionDigest: this.#snapshot.revisionDigest, issuerRootPublicKey: this.#snapshot.rootAdminPublicKey,
           grants: (change.grants ?? []).map(grant => ({ ...grant, validFromRevision: revisionNumber })),
           revocations: (change.revocations ?? []).map(id => id.slice()),
-          validationPolicies: [...(change.validationPolicies ?? [])],
+          validationPolicies: [],
           encryptionEpoch: this.#snapshot.encryptionEpoch + (rotate ? 1n : 0n),
         }
         const signed = await signCapabilityRevision(revision, rootPrivateKey)
@@ -562,11 +561,13 @@ export class GovernanceControlPlane {
     }
   }
 
-  #assertSupportedChange(change: CapabilityChange, snapshot: CapabilitySnapshot): void {
+  #assertSupportedChange(change: CapabilityChange | CapabilityRevision, snapshot: CapabilitySnapshot): void {
     // These roles are pinned by genesis in every supported live runtime. Validate
     // received controls before updating the snapshot, just as for authoring;
     // a root signature cannot turn an unsupported change into activation.
-    if ((change.validationPolicies?.length ?? 0) > 0) throw new Error('GOVERNANCE_FIXED_VALIDATION_POLICY')
+    if ('validationPolicies' in change && (change.validationPolicies?.length ?? 0) > 0) {
+      throw new Error('GOVERNANCE_FIXED_VALIDATION_POLICY')
+    }
     if (change.grants?.some(grant => grant.role === 'validator') === true ||
         change.revocations?.some(id => snapshot.capabilities.get(bytesToHex(id))?.grant.role === 'validator') === true) {
       throw new Error('GOVERNANCE_FIXED_VALIDATORS')

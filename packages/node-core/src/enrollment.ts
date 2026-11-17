@@ -2,7 +2,7 @@ import {
   capabilityId, capabilityRevisionDigest, encodeGenesisManifest, encodeSignedCapabilityRevision,
   decodeSignedCapabilityRevision, isCapabilityActive, verifySignedGenesis,
   normalizeProgramRights, programRightsSubset, type ProgramRights,
-  type CapabilityGrantInput, type CapabilitySnapshot, type SignedCapabilityRevision, type SignedGenesis,
+  type CapabilitySnapshot, type SignedCapabilityRevision, type SignedGenesis,
 } from '@chronolog/capabilities'
 import {
   exportX25519PrivateKey, generateX25519KeyPair, importX25519PrivateKey, importX25519PublicKey,
@@ -16,7 +16,7 @@ import {
 } from '@chronolog/protocol'
 
 import { Mutex } from './async.js'
-import type { GovernanceControlPlane } from './governance.js'
+import type { CapabilityChange, GovernanceControlPlane } from './governance.js'
 import { historyConfigurationDigest, type HistoryConfiguration } from './history-policy.js'
 import { validateOperationId, type DurableOperationStore } from './operations.js'
 
@@ -334,7 +334,7 @@ export class EnrollmentIssuer {
       }
       if (state.approval !== null) return state.approval
       if (state.revision === null) {
-        const grants: CapabilityGrantInput[] = grantedRoles.map((role) => {
+        const grants: NonNullable<CapabilityChange['grants']> = grantedRoles.map((role) => {
           const identity = { subjectId: request.signingPublicKey, signingPublicKey: request.signingPublicKey,
             transportAuthor: request.transportAuthor }
           return role === 'writer' ? { ...identity, role, program: writerProgram! }
