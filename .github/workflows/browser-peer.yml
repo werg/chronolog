@@ -68,7 +68,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller
-          ref: 4d63f48c9a0f8e9765fe4d90541d67648fa20340
+          ref: 9dd7a89765767bcef6229f8fe8d29f6c66b8af2b
           path: artifacts/pilot-source/tendriller
           persist-credentials: false
       - name: Build the packaged public Tendriller SDK, runtime and engine
