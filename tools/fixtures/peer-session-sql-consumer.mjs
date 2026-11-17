@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import process from 'node:process';
 import { webcrypto as crypto } from 'node:crypto';
 import {
-  APPLICATION_COLLECTIVE_ID, OWNER_FOR_KEY_SQL, bytesDigest, bytesToHex, connectApplications, controlParticipantGrant,
+  APPLICATION_COLLECTIVE_ID, OWNER_FOR_KEY_SQL, bytesDigest, connectApplications, controlParticipantGrant,
   createGenerationRegistry, createPeerIdentity, defineApplication, defineCommand, defineQuery, emit,
   MemoryPeerStore, participantGrant, program, signApplicationDescriptor, signControlRevision, signTransitionRequest, sqlStatement,
 } from '@chronolog/peer-session';
