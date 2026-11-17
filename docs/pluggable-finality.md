@@ -121,6 +121,16 @@ a verified enrollment descriptor and derive timing directly from its signed cloc
 policy. Governed validators do the same. There is no separate local override for
 the cutoff lag, skew allowance or heartbeat interval.
 
+`DEFAULT_LIVE_CLOCK_POLICY` supplies a one-second cutoff lag, one-second
+heartbeat interval and thirty-second future-clock allowance. Native bootstrap
+and portable Tendriller membership share these defaults.
+The values become part of a new group's signed genesis; an existing group's
+verified policy takes precedence over process defaults. The short tick keeps
+healthy live collaboration moving without requiring another user operation.
+It is not a settlement deadline: missing proof, history or keys still blocks
+finality, and late first inclusion behind closed time still rejects. Deployments
+that need a wider inclusion window choose it explicitly when creating the group.
+
 The service chooses a cutoff using its clock and signed lag, independently
 of encrypted application contents. After all included records' possible time
 windows have closed, idle ticks add no markers. New receipts restart closure

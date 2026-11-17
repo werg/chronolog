@@ -67,7 +67,8 @@ describe('daemon configuration', () => {
   })
 
   it('strictly validates numeric, scope, and peer environment settings', () => {
-    expect(parseDaemonRuntimeConfig({ CHRONOLOG_PORT: '0' })).toMatchObject({ port: 0, ssbScope: 'device' })
+    expect(parseDaemonRuntimeConfig({ CHRONOLOG_PORT: '0' })).toMatchObject({ port: 0, ssbScope: 'device',
+      cutoffLagMs: 1_000, heartbeatIntervalMs: 1_000, maxFutureSkewMs: 30_000 })
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_PORT: '12.5' })).toThrow('CHRONOLOG_PORT_INVALID')
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_SSB_SCOPE: 'internet' })).toThrow('CHRONOLOG_SSB_SCOPE_INVALID')
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_CHECKPOINT_EVERY: '0' })).toThrow('CHRONOLOG_CHECKPOINT_EVERY_INVALID')
