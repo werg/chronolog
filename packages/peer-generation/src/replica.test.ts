@@ -76,10 +76,10 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
       const snapshot = captureApplication(options)
       return { ...snapshot, transactionAt(index) { publicationReads.push(index); return snapshot.transactionAt(index) } }
     })
-    vi.spyOn(runtime.queries, 'captureRead').mockImplementation(options => {
+    runtime.queries.captureRead = (options: Parameters<typeof captureRead>[0]) => {
       const read = captureRead(options)
-      return { ...read, transactionAt(index) { viewReads.push(index); return read.transactionAt(index) } }
-    })
+      return { ...read, transactionAt(index: number) { viewReads.push(index); return read.transactionAt(index) } }
+    }
     const b = await createPeerReplica({ authority: await f.registry.read(), device: f.b, store,
       storageId: f.b.publicKey, materializer: runtime, epochKeys: f.keys })
     opened.push(b)
