@@ -5,11 +5,11 @@ timers, and peer connections alongside an application agent. The loops do not
 depend on model turns. Provider calls stay in trusted application modules;
 Chronolog's execution and UI replay never call them.
 
-The examples below describe the existing native composition. The unified
-generation session already implements coordinator selection and recovery.
-These examples are component documentation; the durable consumer adapters in
-this package still need the reset handling described below before consuming
-generation history.
+The examples below describe the existing chronological native composition.
+New peer applications use the separate public generation session, which owns
+coordinator selection and recovery. Its operation methods are `applied()` and
+`shared()`; neither establishes the immutable final prefix required by this
+package's effect workers and timers.
 
 Start with the [application primitives guide](../../docs/application-primitives.md)
 for the choice between signals, durable events and SQL, and for the separate
@@ -17,27 +17,29 @@ membership, finality and external-effect roles.
 
 ## Scope of the durable consumer adapters
 
-The unified contract is `local()` for work applied here and `final()` for work
-committed and applied under the selected history. Explicit recovery may abandon
-recent work. The name `final` does not promise immutability across that recovery.
+`DurableEffectWorker` and `DurableTimerScheduler` consume an immutable final
+prefix from the chronological client or node. Their source and result publisher
+must explicitly declare `historyProfile: 'chronological'`. Both workers reject a
+missing profile or `peer-generation-v1` before reading a checkpoint, writing
+private state, or invoking a provider. The maintained chronological producers
+carry this profile, and the chronological node rejects a generation materializer
+at its own construction boundary.
 
-The current `DurableProjection`, `DurableTimerScheduler`, and
-`DurableEffectWorker` implementations assume append-only event delivery and
-persist cursors and private state without a reset protocol. Their structural
-`FinalEventSource` port does not supply reset handling. Generation integration
-needs projection rebuilds and checkpoint reconciliation, plus a distinction
-between retrying the original prepared operation and abandoning an attempt.
-These are current adapter limitations; those recovery updates are not yet
-implemented here.
+The peer session's `applied()` result belongs to its selected generation;
+`shared()` adds authenticated retained-copy observations. Explicit recovery can
+abandon either result. Generation events therefore cannot be passed to these
+append-only workers. `FinalEventSource` has resumable cursors but no reset
+protocol. A generation-aware effect or timer service is not implemented here.
+Pure projection adapters also need explicit rebuild handling before consuming
+generation history.
 
-Generation-aware workers may deliberately tolerate source history being
-abandoned after an external action. Preserve the dispatch journal, provider
-idempotency identities, and original authenticated request origin across resets;
-link results to that request. Dispatch still requires current tool authorization,
-and the scheduler or worker's credentials do not become the requester's authority.
-An uncertain provider call needs idempotent recovery, provider reconciliation,
-or explicit manual resolution. Resetting an application view or checkpoint does
-not establish that the call never happened and must not erase that recovery
+A future generation-aware worker would need to preserve the dispatch journal,
+provider idempotency identities, and original authenticated request origin
+across resets, and link results to that request. Dispatch would still require
+current tool authorization; worker credentials would not become the requester's
+authority. An uncertain provider call requires idempotent recovery, provider
+reconciliation, or explicit manual resolution. Resetting an application view
+does not establish that the call never happened or permit erasing its recovery
 record.
 
 The [generation integration notes](../../docs/plans/peer-generation-integration-details.md)

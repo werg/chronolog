@@ -9,9 +9,11 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { MaterializedApplicationSnapshot } from '@chronolog/materializer'
 
 import { DeterministicMaterializer } from './native.js'
+import { DeterministicMaterializer as PortableMaterializer } from './materializer.js'
+import { openDatabase } from './driver.js'
 import { createDoltLiteMaterializationRuntime } from './runtime-adapter.js'
 import { MaterializerFixture, ROOT_KEY, replayProposal, rows } from './test-fixtures.js'
-import type { ReplayProposal } from './types.js'
+import type { MaterializerOptions, ReplayProposal } from './types.js'
 
 const fixtures = new MaterializerFixture()
 afterEach(async () => fixtures.cleanup())
@@ -23,6 +25,22 @@ function snapshotData(snapshot: MaterializedApplicationSnapshot) {
 }
 
 describe('replicated SQL materialization', () => {
+  it('pins the validated history profile when the caller mutates or deletes its options', async () => {
+    const path = `${await fixtures.directory()}/application.db`
+    const { createDoltLiteExecutionManifest } = await import('./manifest.js')
+    const options: MaterializerOptions = { path, executionManifest: createDoltLiteExecutionManifest({ profile: 'chronolog-peer-sql-v1' }), rootAdministrator: ROOT_KEY,
+      openDatabase, historyProfile: 'peer-generation-v1' }
+    const materializer = await PortableMaterializer.open(options)
+    try {
+      Object.assign(options, { historyProfile: 'chronological' })
+      expect(materializer.historyProfile).toBe('peer-generation-v1')
+      expect(() => materializer.captureApplication({ view: 'final' })).toThrow('FINALITY_UNSUPPORTED')
+      Reflect.deleteProperty(options, 'historyProfile')
+      expect(createDoltLiteMaterializationRuntime(materializer).historyProfile).toBe('peer-generation-v1')
+      expect(() => materializer.captureRead({ view: 'final' })).toThrow('FINALITY_UNSUPPORTED')
+    } finally { materializer.close() }
+  })
+
   it('executes DDL and DML in order and keeps the state across reopen', async () => {
     const { path, manifest } = await fixture()
     let materializer = await open(path, manifest, 1)

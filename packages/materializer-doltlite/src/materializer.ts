@@ -81,6 +81,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   #finalPublished: PublishedRef
   #finalLog: TransactionLogRow[]
   readonly #sourceOptions: MaterializerOptions
+  readonly #historyProfile: 'chronological' | 'peer-generation-v1'
   readonly #options: Required<Pick<MaterializerOptions, 'checkpointEvery' | 'retainCheckpoints'>>
   readonly #backend: MaterializerBackendInfo
   readonly #executionManifest: ExecutionManifest
@@ -99,6 +100,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     writer: DatabaseLike,
     reader: DatabaseLike,
     options: MaterializerOptions,
+    historyProfile: 'chronological' | 'peer-generation-v1',
     backend: MaterializerBackendInfo,
     executionManifest: ExecutionManifest,
     artifacts: ManifestArtifacts,
@@ -115,6 +117,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#finalPublished = finalPublished
     this.#finalLog = finalLog
     this.#sourceOptions = options
+    this.#historyProfile = historyProfile
     this.#backend = backend
     this.#executionManifest = structuredClone(executionManifest)
     this.#artifacts = artifacts
@@ -192,6 +195,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         opened.database,
         reader,
         options,
+        historyProfile,
         opened.backend,
         options.executionManifest,
         artifacts,
@@ -210,7 +214,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     }
   }
 
-  get historyProfile(): 'chronological' | 'peer-generation-v1' { return this.#sourceOptions.historyProfile ?? 'chronological' }
+  get historyProfile(): 'chronological' | 'peer-generation-v1' { return this.#historyProfile }
   get revision(): bigint { return this.#published.revision }
   get orderLength(): number { return this.#order.length }
   get finalRevision(): bigint { return this.#finalPublished.revision }

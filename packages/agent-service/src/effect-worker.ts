@@ -6,7 +6,7 @@ import type { CborValue, EventPayload } from '@chronolog/protocol'
 
 import { CheckpointStore } from './checkpoint.js'
 import { decodeEventOrigin, encodeEventOrigin } from './event-origin.js'
-import { batchEvents, canonicalTopics, cloneFinalEvent, validateConsumerId } from './event-source.js'
+import { assertChronologicalHistory, batchEvents, canonicalTopics, cloneFinalEvent, validateConsumerId } from './event-source.js'
 import type { FinalEvent, FinalEventBatch, FinalEventPublisher, FinalEventSource } from './event-source.js'
 
 export interface EffectContext {
@@ -85,6 +85,7 @@ export class DurableEffectWorker {
   #running = false
 
   private constructor(options: EffectWorkerOptions) {
+    assertChronologicalHistory(options.source, options.publisher)
     for (const value of [options.sourceId, options.handler.id, options.handler.version]) validateConsumerId(value)
     assertEventTopic(options.resultTopic)
     this.#topics = canonicalTopics(options.handler.topics)

@@ -19,6 +19,7 @@ export interface ChronologApplicationQuery {
   readonly truncated: boolean
 }
 export interface ChronologApplicationBackend extends ApplicationBackend<ChangeProgram, FinalityApplicationOperation, ChronologApplicationQuery, LocalSqlInput> {
+  readonly events: ApplicationBackend<ChangeProgram, FinalityApplicationOperation, ChronologApplicationQuery, LocalSqlInput>['events'] & { readonly historyProfile: 'chronological' }
   changes(options?: ApplicationChangeOptions): AsyncIterable<ViewChange>
   readView(options?: Pick<ApplicationChangeOptions, 'view'>): Promise<Extract<ApplicationReadView<ChronologApplicationQuery, LocalSqlInput>, { readonly view: 'local' | 'final' }>>
 }
@@ -68,6 +69,9 @@ export function createChronologApplicationBackend(options: {
   readonly sql: boolean
 }): ChronologApplicationBackend {
   const { id, replica, sql: supportsSql } = options
+  if (replica.events.historyProfile !== 'chronological') {
+    throw new ApplicationError('unsupported_history_profile', 'Chronological application adapters require chronological history')
+  }
   if (typeof supportsSql !== 'boolean') throw new TypeError('Describe the selected SQL execution profile explicitly')
   applicationSelection({ kind: 'peer', id })
   const get = async (operationId: string): Promise<FinalityApplicationOperation | null> => {
@@ -162,6 +166,7 @@ export function createChronologApplicationBackend(options: {
       ...(changeOptions.signal === undefined ? {} : { signal: changeOptions.signal }),
     }),
     events: Object.freeze({
+      historyProfile: 'chronological' as const,
       publish: (topic: string, payload: unknown, submitOptions: ApplicationSubmitOptions) => submit(program(emit(topic, payload as EventPayload)), submitOptions),
       read: (readOptions: ApplicationEventReadOptions = {}) => replica.events.read(readOptions),
       subscribe: (readOptions: ApplicationEventReadOptions = {}) => replica.events.subscribe(readOptions),

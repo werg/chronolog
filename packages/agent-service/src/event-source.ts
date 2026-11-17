@@ -6,38 +6,29 @@ export type FinalEvent = EffectiveEvent
 export type FinalEventBatch = EventBatch
 export type { EventReadOptions } from '@chronolog/protocol'
 
-/**
- * Accepted events committed and applied under the selected history, with
- * resumable cursors. "Final" describes that history; explicit recovery can
- * abandon recent work and is not ruled out by this interface's name.
- *
- * The current DurableProjection, DurableTimerScheduler, and DurableEffectWorker
- * implementations assume append-only delivery, allowing repeated batches, and
- * have no reset/checkpoint-rebuild protocol. Using them across a generation
- * recovery requires that integration; structural typing and batch validation
- * do not supply it. This is an adapter limitation, not a separate architecture
- * or an across-recovery immutability guarantee.
- *
- * Generation-aware effects may deliberately outlive abandoned source history.
- * Preserve dispatch journals, provider retry identities, and authenticated
- * request origins across resets. Check current tool permissions at dispatch and
- * reconcile uncertain earlier calls under the provider's recovery contract.
- */
-export interface FinalEventSource {
+/** The existing chronological final-prefix contract; generation-applied history does not satisfy it. */
+export interface ChronologicalHistoryPort {
+  readonly historyProfile: 'chronological'
+}
+
+/** Accepted events from an immutable final prefix, with resumable append-only cursors. */
+export interface FinalEventSource extends ChronologicalHistoryPort {
   read(options?: EventReadOptions): Promise<FinalEventBatch>
   subscribe(options?: EventReadOptions & { readonly signal?: AbortSignal }): AsyncIterable<FinalEventBatch>
 }
 
-export interface FinalEventPublisher {
+export interface FinalEventPublisher extends ChronologicalHistoryPort {
   /**
-   * Resolve after acceptance is committed and applied in the selected history.
-   * Explicit recovery may abandon that history. Cancellation interrupts waiting,
-   * not a prepared operation's identity. The current adapters have no reset or
-   * abandoned-attempt handling; recovery integration must distinguish retrying
-   * the original prepared operation from starting a new attempt, while retaining
-   * records of any provider action that may already have happened.
+   * Resolve after immutable final acceptance. Cancellation interrupts waiting,
+   * not a prepared operation's identity. A peer-generation applied/shared result
+   * cannot implement this boundary because a later recovery can abandon it.
    */
   publishFinal(topic: string, payload: EventPayload, options: { readonly operationId: string; readonly signal?: AbortSignal }): Promise<void>
+}
+
+/** Reject unsupported histories before loading cursors or dispatching provider work. */
+export function assertChronologicalHistory(...ports: readonly { readonly historyProfile?: unknown }[]): void {
+  if (ports.some(port => port?.historyProfile !== 'chronological')) throw new Error('CONSUMER_HISTORY_PROFILE_UNSUPPORTED')
 }
 
 export function validateConsumerId(value: string): void {

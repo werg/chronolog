@@ -71,6 +71,7 @@ export function createPeerGenerationApplicationBackend(options: {
       subscribe: (input: { readonly operationId: string; readonly signal?: AbortSignal }) => session.operations.subscribe(input),
     }),
     events: Object.freeze({
+      historyProfile: 'peer-generation-v1' as const,
       async publish(topic: string, payload: unknown, input: SubmitOptions) {
         if (options.eventCommand === undefined) throw new Error('APPLICATION_EVENT_PUBLICATION_NOT_CONFIGURED')
         return submit({ name: options.eventCommand, input: { topic, payload } }, input)

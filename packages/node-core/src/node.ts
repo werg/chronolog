@@ -89,6 +89,7 @@ export class ChronologNode {
   readonly #events = new RevisionBroadcaster<NodeRevisionEvent>()
   readonly #applicationChanges = new ChangeSignal()
   readonly events = {
+    historyProfile: 'chronological' as const,
     publish: (topic: string, payload: EventPayload, options: { readonly operationId: string }) =>
       this.publish({ program: program(emit(topic, payload)), operationId: options.operationId }),
     read: (options: EventReadOptions = {}): Promise<EventBatch> => this.#mutex.run(() =>
@@ -137,6 +138,7 @@ export class ChronologNode {
   #observedAuthorTimestampMs = -1n
 
   constructor(options: ChronologNodeOptions) {
+    if (options.materialization.historyProfile !== 'chronological') throw new Error('NODE_HISTORY_PROFILE_UNSUPPORTED')
     this.#options = options
     const maxFutureSkewMs = options.live?.maxFutureSkewMs ?? Number(DEFAULT_LIVE_CLOCK_POLICY.maxFutureSkewMs)
     if (!Number.isSafeInteger(maxFutureSkewMs) || maxFutureSkewMs < 0) throw new Error('LIVE_MAX_FUTURE_SKEW_INVALID')

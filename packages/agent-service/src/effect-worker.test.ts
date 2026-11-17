@@ -1,7 +1,7 @@
 import { MemoryOperationStore } from '@chronolog/node-core'
 import type { DurableOperationStore } from '@chronolog/node-core'
 import type { ChronologEventOrigin, EventPayload } from '@chronolog/protocol'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { DurableEffectWorker, effectIdentity } from './effect-worker.js'
 import type { EffectHandler, EffectWorkerOptions } from './effect-worker.js'
@@ -13,6 +13,7 @@ const origin: ChronologEventOrigin = { kind: 'chronolog', groupId: 'A'.repeat(43
 
 function source(batches: readonly { readonly topic: string; readonly payloads: readonly EventPayload[] }[]): FinalEventSource {
   return {
+    historyProfile: 'chronological',
     read: async (options: EventReadOptions = {}) => {
       const start = Number((options.cursor ?? 'c:0').slice(2)), end = Math.min(batches.length, start + (options.limit ?? 8))
       return {
@@ -37,12 +38,28 @@ function fixture(options: { readonly store?: DurableOperationStore; readonly rec
     handler: { id: 'jobs', version: '1', topics: ['jobs.requested'], recovery: options.recovery ?? 'manual',
       dispatch: async ({ effectId }) => { calls.push(effectId); return { ok: true } } },
     resultTopic: 'jobs.results',
-    publisher: { publishFinal: async (_topic, payload, { operationId }) => { results.push({ operationId, payload }) } },
+    publisher: { historyProfile: 'chronological' as const, publishFinal: async (_topic, payload, { operationId }) => { results.push({ operationId, payload }) } },
   }
   return { configuration, calls, results }
 }
 
 describe('durable final-intent workers', () => {
+  it('refuses generation sources and publishers before checkpoint access or provider dispatch', async () => {
+    const f = fixture(), get = vi.spyOn(f.configuration.store, 'get'), put = vi.spyOn(f.configuration.store, 'put')
+    const read = vi.spyOn(f.configuration.source, 'read')
+    const peerSource = { ...f.configuration.source, historyProfile: 'peer-generation-v1' as const }
+    // @ts-expect-error Generation-applied events cannot satisfy the immutable final source contract.
+    await expect(DurableEffectWorker.open({ ...f.configuration, source: peerSource })).rejects.toThrow('CONSUMER_HISTORY_PROFILE_UNSUPPORTED')
+    const peerPublisher = { ...f.configuration.publisher, historyProfile: 'peer-generation-v1' as const }
+    // @ts-expect-error An applied/shared result cannot satisfy immutable final publication.
+    await expect(DurableEffectWorker.open({ ...f.configuration, publisher: peerPublisher })).rejects.toThrow('CONSUMER_HISTORY_PROFILE_UNSUPPORTED')
+    const unmarkedSource = { ...f.configuration.source }
+    Reflect.deleteProperty(unmarkedSource, 'historyProfile')
+    await expect(DurableEffectWorker.open({ ...f.configuration, source: unmarkedSource })).rejects.toThrow('CONSUMER_HISTORY_PROFILE_UNSUPPORTED')
+    expect(get).not.toHaveBeenCalled(); expect(put).not.toHaveBeenCalled(); expect(read).not.toHaveBeenCalled()
+    expect(f.calls).toEqual([]); expect(f.results).toEqual([])
+  })
+
   it('checkpoints a whole final batch and does not dispatch again on restart', async () => {
     const f = fixture()
     const worker = await DurableEffectWorker.open(f.configuration)
@@ -226,7 +243,7 @@ describe('durable final-intent workers', () => {
     const attempts: { operationId: string; payload: EventPayload }[] = []
     const configuration: EffectWorkerOptions = { ...f.configuration,
       source: source([{ topic: 'jobs.requested', payloads: [null] }]),
-      publisher: { publishFinal: async (_topic, payload, { operationId }) => {
+      publisher: { historyProfile: 'chronological' as const, publishFinal: async (_topic, payload, { operationId }) => {
         attempts.push({ operationId, payload: structuredClone(payload) })
         if (fail) { fail = false; throw new Error('publication response lost') }
       } } }
@@ -245,7 +262,7 @@ describe('durable final-intent workers', () => {
     let publicationSignal: AbortSignal | undefined
     const configuration: EffectWorkerOptions = { ...f.configuration,
       source: { ...f.configuration.source, async *subscribe() { yield await f.configuration.source.read() } },
-      publisher: { publishFinal: async (_topic: string, payload: EventPayload, input: { operationId: string; signal?: AbortSignal }) => {
+      publisher: { historyProfile: 'chronological' as const, publishFinal: async (_topic: string, payload: EventPayload, input: { operationId: string; signal?: AbortSignal }) => {
         attempts.push({ operationId: input.operationId, payload: structuredClone(payload) })
         publicationSignal = input.signal
         entered()
@@ -271,7 +288,7 @@ describe('durable final-intent workers', () => {
     expect(await running).toMatchObject({ message: 'RESIDENT_TASK_FAILED: authority', cause: { message: 'authority stopped' } })
     expect(await worker.status()).toMatchObject({ cursor: null, remaining: 2, effect: { stage: 'result', result: { ok: true } } })
     expect(f.calls).toHaveLength(1)
-    const reopened = await DurableEffectWorker.open({ ...f.configuration, publisher: {
+    const reopened = await DurableEffectWorker.open({ ...f.configuration, publisher: { historyProfile: 'chronological' as const,
       publishFinal: async (_topic, payload, input) => { attempts.push({ operationId: input.operationId, payload: structuredClone(payload) }) },
     } })
     await reopened.processNext()

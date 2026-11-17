@@ -119,6 +119,7 @@ export interface RpcPublishedTransaction {
 
 export interface ChronologRpcNodeService {
   readonly events?: {
+    readonly historyProfile: 'chronological'
     read(options?: EventReadOptions): Promise<EventBatch>
     subscribe(options?: EventReadOptions & { readonly signal?: AbortSignal }): AsyncIterable<EventBatch>
   }

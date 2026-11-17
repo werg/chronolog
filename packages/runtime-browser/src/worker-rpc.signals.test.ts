@@ -34,7 +34,7 @@ it('uses the ordinary Worker bridge for signed live delivery, latest backpressur
     authorTimestampMs: '1', membershipRevision: group, writerCapability: group }
   const eventBatch = { transactions: [{ proposalId: 'proposal', events: [{ id: 'proposal:0', proposalId: 'proposal', eventOrdinal: 0,
     topic: 'jobs', payload: { origin: { authorId: 'forged-owner' } }, origin }] }], scannedThrough: 'cursor', hasMore: false, revision: 'final-1' }
-  const node = { groupId, publish, events: { read: async () => eventBatch } } as unknown as ChronologRpcNodeService
+  const node = { groupId, publish, events: { historyProfile: 'chronological', read: async () => eventBatch } } as unknown as ChronologRpcNodeService
   const service = new NodeRpcService({ node, signals })
   const channel = new MessageChannel()
   const closePeer = vi.fn(async () => { local.close() })

@@ -60,6 +60,7 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
     activeMembership: options.activeMembership, local: options.peerLinks.local,
     attach: (link) => options.peerLinks.attach(link) })
   const publisher: FinalEventPublisher = {
+    historyProfile: 'chronological',
     publishFinal: async (topic, payload, input) => {
       // A sibling resident task can stop the authority before runtime.close().
       // Its task signal must interrupt finality waiting as well as provider work.

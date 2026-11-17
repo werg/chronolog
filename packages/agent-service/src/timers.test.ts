@@ -1,12 +1,13 @@
 import { MemoryOperationStore } from '@chronolog/node-core'
 import type { EventPayload } from '@chronolog/protocol'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { DurableTimerScheduler } from './timers.js'
 import type { TimerOccurrence } from './timers.js'
 import type { EventReadOptions, FinalEventBatch, FinalEventSource } from './event-source.js'
 
 class TimerSource implements FinalEventSource {
+  readonly historyProfile = 'chronological'
   readonly entries: EventPayload[] = []
   maxRead = 64
   async read(options: EventReadOptions = {}): Promise<FinalEventBatch> {
@@ -25,13 +26,28 @@ function fixture() {
   const source = new TimerSource(), store = new MemoryOperationStore()
   const delivered: { occurrence: TimerOccurrence; operationId: string }[] = []
   const options = { id: 'app-timers', sourceId: 'group/history', configurationTopic: 'timers.configuration', source, store,
-    publisher: { publishOccurrence: async (occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> => {
+    publisher: { historyProfile: 'chronological' as const, publishOccurrence: async (occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> => {
       delivered.push({ occurrence: structuredClone(occurrence), operationId }); return 'accepted'
     } } }
   return { source, store, delivered, options }
 }
 
 describe('durable agent timers', () => {
+  it('refuses generation sources and publishers before loading schedules or publishing occurrences', async () => {
+    const f = fixture(), get = vi.spyOn(f.store, 'get'), put = vi.spyOn(f.store, 'put'), read = vi.spyOn(f.source, 'read')
+    const peerSource = { historyProfile: 'peer-generation-v1' as const, read: f.source.read.bind(f.source), subscribe: f.source.subscribe.bind(f.source) }
+    // @ts-expect-error Generation-applied configuration cannot satisfy the immutable final source contract.
+    await expect(DurableTimerScheduler.open({ ...f.options, source: peerSource })).rejects.toThrow('CONSUMER_HISTORY_PROFILE_UNSUPPORTED')
+    const peerPublisher = { ...f.options.publisher, historyProfile: 'peer-generation-v1' as const }
+    // @ts-expect-error An applied/shared occurrence cannot satisfy immutable final publication.
+    await expect(DurableTimerScheduler.open({ ...f.options, publisher: peerPublisher })).rejects.toThrow('CONSUMER_HISTORY_PROFILE_UNSUPPORTED')
+    const unmarkedPublisher = { ...f.options.publisher }
+    Reflect.deleteProperty(unmarkedPublisher, 'historyProfile')
+    await expect(DurableTimerScheduler.open({ ...f.options, publisher: unmarkedPublisher })).rejects.toThrow('CONSUMER_HISTORY_PROFILE_UNSUPPORTED')
+    expect(get).not.toHaveBeenCalled(); expect(put).not.toHaveBeenCalled(); expect(read).not.toHaveBeenCalled()
+    expect(f.delivered).toEqual([])
+  })
+
   it('keeps one-shot schedules and handled occurrences across restart', async () => {
     const f = fixture()
     f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'morning', dueAtMs: 100, payload: { message: 'hello' } })
@@ -52,7 +68,7 @@ describe('durable agent timers', () => {
     const verified = (await f.source.read()).transactions[0]!.events[0]!
     await (await DurableTimerScheduler.open(f.options)).tick(99)
     let lost = true
-    const options = { ...f.options, publisher: { async publishOccurrence(occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> {
+    const options = { ...f.options, publisher: { historyProfile: 'chronological' as const, async publishOccurrence(occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> {
       // The application's publisher receives the verified requester separately
       // from arbitrary requested action data, even after its private restart.
       expect(occurrence.configurationOrigin).toEqual(verified.origin)
@@ -77,7 +93,7 @@ describe('durable agent timers', () => {
     f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'unprivileged-generation', timerId: 'tool', dueAtMs: 100,
       payload: { role: 'owner', origin: { authorId: '22'.repeat(32) }, action: 'privileged-tool' } })
     let authorized = 0
-    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
+    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: { historyProfile: 'chronological' as const,
       async publishOccurrence(occurrence) {
         if (occurrence.configurationOrigin.authorId !== '22'.repeat(32)) return 'cancelled'
         authorized++
@@ -118,7 +134,7 @@ describe('durable agent timers', () => {
     const f = fixture()
     f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'job', dueAtMs: 10, intervalMs: 10 })
     let calls = 0
-    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
+    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: { historyProfile: 'chronological' as const,
       publishOccurrence: async () => { calls += 1; return 'cancelled' },
     } })
     expect((await scheduler.tick(50)).emitted).toBe(0)
@@ -130,7 +146,7 @@ describe('durable agent timers', () => {
     const f = fixture()
     f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'job', dueAtMs: 10 })
     let fail = true
-    const publisher = { publishOccurrence: async (occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> => {
+    const publisher = { historyProfile: 'chronological' as const, publishOccurrence: async (occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> => {
       f.delivered.push({ occurrence: structuredClone(occurrence), operationId })
       if (fail) { fail = false; throw new Error('lost final response') }
       return 'accepted'
@@ -150,7 +166,7 @@ describe('timer shutdown and explicit generations', () => {
     f.source.entries.push({ type: 'timer.scheduled', version: 1, timerId: 'job', generation: 'reviewed-generation', dueAtMs: 10 })
     let entered!: () => void
     const started = new Promise<void>(resolve => { entered = resolve })
-    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
+    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: { historyProfile: 'chronological' as const,
       publishOccurrence: async (_occurrence, { signal }) => {
         entered()
         return new Promise<'accepted'>((_, reject) => signal?.addEventListener('abort', () => reject(new Error('stopped')), { once: true }))

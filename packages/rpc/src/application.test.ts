@@ -25,10 +25,20 @@ function readHandle(revision: string, release: () => void): RpcReadHandle {
 }
 
 describe('application RPC', () => {
+  it('refuses a peer or unmarked event source before opening chronological RPC readers', () => {
+    const read = vi.fn(), subscribe = vi.fn(), readView = vi.fn()
+    const peerEvents = { historyProfile: 'peer-generation-v1' as const, read, subscribe }
+    // @ts-expect-error The chronological RPC service cannot wrap generation-applied events.
+    expect(() => new NodeRpcService({ node: node({ events: peerEvents, readView }) })).toThrow('RPC_HISTORY_PROFILE_UNSUPPORTED')
+    // @ts-expect-error An absent profile cannot establish the chronological final-prefix contract.
+    expect(() => new NodeRpcService({ node: node({ events: { read, subscribe }, readView }) })).toThrow('RPC_HISTORY_PROFILE_UNSUPPORTED')
+    expect(read).not.toHaveBeenCalled(); expect(subscribe).not.toHaveBeenCalled(); expect(readView).not.toHaveBeenCalled()
+  })
+
   it('streams view metadata without opening read leases or accepting event replay cursors', async () => {
     const readView = vi.fn(), read = vi.fn(), options: unknown[] = []
     const service = new NodeRpcService({ node: node({ readView,
-      events: { read, subscribe: () => ({ async *[Symbol.asyncIterator]() { throw new Error('must not replay events') } }) },
+      events: { historyProfile: 'chronological', read, subscribe: () => ({ async *[Symbol.asyncIterator]() { throw new Error('must not replay events') } }) },
       changes: value => ({ async *[Symbol.asyncIterator]() {
         options.push(value); yield { view: value!.view!, revision: 'current', finalRevision: 'final' }
       } }),
@@ -51,7 +61,7 @@ describe('application RPC', () => {
     const history: EventBatch = { ...batch(), transactions: [{ proposalId: 'proposal', events: [{ id: 'proposal:0', proposalId: 'proposal', eventOrdinal: 0,
       topic: 'jobs', payload: { origin: { authorId: 'forged-owner' }, $chronologRpc: ['bytes', 'AA=='] }, origin }] }] }
     const service = new NodeRpcService({ node: node({
-      events: { read: async () => history, async *subscribe() { yield history } },
+      events: { historyProfile: 'chronological', read: async () => history, async *subscribe() { yield history } },
       readView: async () => ({ ...readHandle(history.revision, () => undefined), readEvents: () => history }),
     }) })
     const server = new HttpRpcServer({ service, port: 0 })
@@ -186,7 +196,7 @@ describe('application RPC', () => {
   it('preserves empty event batches and pulls only when the consumer asks', async () => {
     let pulls = 0
     const read = vi.fn(async () => batch())
-    const service = new NodeRpcService({ node: node({ events: { read, subscribe: () => ({ async *[Symbol.asyncIterator]() {
+    const service = new NodeRpcService({ node: node({ events: { historyProfile: 'chronological', read, subscribe: () => ({ async *[Symbol.asyncIterator]() {
       pulls++; yield batch('first'); pulls++; yield batch('second')
     } }) } }) })
     const transport = new InProcessRpcTransport(service)

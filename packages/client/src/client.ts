@@ -228,6 +228,7 @@ export class ChronologClient {
   }
   /** At-least-once final batches; never coalesced into snapshot notifications. */
   readonly events = {
+    historyProfile: 'chronological' as const,
     publish: (topic: string, payload: EventPayload, options: ChangeOptions): Promise<TransactionHandle> => this.submit(program(emit(topic, payload)), options),
     read: (options: EventReaderOptions = {}): Promise<EventBatch> => this._unary('events.read', {
       groupId: this.groupId, requestId: this._requestId(), ...eventReadOptions(options),

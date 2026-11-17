@@ -6,8 +6,8 @@ import type { CborValue, ChronologEventOrigin, EventPayload } from '@chronolog/p
 
 import { CheckpointStore } from './checkpoint.js'
 import { decodeEventOrigin, encodeEventOrigin } from './event-origin.js'
-import { batchEvents, validateConsumerId } from './event-source.js'
-import type { FinalEvent, FinalEventSource } from './event-source.js'
+import { assertChronologicalHistory, batchEvents, validateConsumerId } from './event-source.js'
+import type { ChronologicalHistoryPort, FinalEvent, FinalEventSource } from './event-source.js'
 import { waitForAbortableDelay } from './service.js'
 
 export interface TimerOccurrence {
@@ -26,7 +26,7 @@ export interface TimerOccurrence {
   readonly payload: EventPayload
 }
 
-export interface TimerOccurrencePublisher {
+export interface TimerOccurrencePublisher extends ChronologicalHistoryPort {
   /**
    * Atomically validate that generation is still the active schedule and
    * publish the occurrence, then resolve its final accepted/cancelled outcome.
@@ -81,6 +81,7 @@ export class DurableTimerScheduler {
   #running = false
 
   private constructor(options: TimerSchedulerOptions) {
+    assertChronologicalHistory(options.source, options.publisher)
     validateConsumerId(options.id); validateConsumerId(options.sourceId); assertEventTopic(options.configurationTopic)
     this.#options = options
     this.#maxTimers = options.maxTimers ?? 4096

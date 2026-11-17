@@ -110,6 +110,9 @@ export class NodeRpcService implements ChronologRpcService {
   #closed = false
 
   constructor(options: NodeRpcServiceOptions) {
+    if (options.node.events !== undefined && options.node.events.historyProfile !== 'chronological') {
+      throw new Error('RPC_HISTORY_PROFILE_UNSUPPORTED')
+    }
     this.#node = options.node
     this.#governanceAdmin = options.governanceAdmin
     this.#enrollmentService = options.enrollment

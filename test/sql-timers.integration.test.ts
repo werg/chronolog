@@ -40,6 +40,7 @@ async function fixture() {
     operation: operationId => native.node.operation(operationId),
     revisions: (after, signal) => native.node.revisions(after, signal),
     get revision() { return native.node.revision },
+    events: native.node.events,
   }
   const publisher = createSqlTimerPublisher({ node: publisherNode, configurationTopic, occurrenceTopic })
   await publisher.initialize({ operationId: 'timer-schema', signal: AbortSignal.timeout(10_000) })
@@ -66,7 +67,7 @@ describe('native SQL timer publication', () => {
     let observed!: (value: TimerOccurrence) => void, release!: () => void
     const pending = new Promise<TimerOccurrence>((resolve) => { observed = resolve })
     const held = new Promise<void>((resolve) => { release = resolve })
-    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
+    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: { historyProfile: 'chronological' as const,
       async publishOccurrence(occurrence, options) { observed(occurrence); await held; return f.publisher.publishOccurrence(occurrence, options) },
     } })
     const racing = scheduler.tick(1000)
@@ -81,7 +82,7 @@ describe('native SQL timer publication', () => {
     await f.publisher.schedule({ timerId: 'alarm', generation: 'g2', dueAtMs: 2000, payload: { action: 'wake-new' } },
       { operationId: 'schedule-g2', expectedGeneration: 'g1' })
     let lost = true
-    const losing = await DurableTimerScheduler.open({ ...f.options, publisher: {
+    const losing = await DurableTimerScheduler.open({ ...f.options, publisher: { historyProfile: 'chronological' as const,
       async publishOccurrence(occurrence, options) {
         const result = await f.publisher.publishOccurrence(occurrence, options)
         if (lost) { lost = false; throw new Error('final occurrence response lost') }

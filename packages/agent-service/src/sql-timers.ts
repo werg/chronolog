@@ -3,7 +3,7 @@ import { assertEventTopic, canonicalEventPayload, emit, program, sqlStatement, t
 import type { EventPayload } from '@chronolog/protocol'
 import { ChangeSignal } from '@chronolog/records'
 
-import { validateConsumerId } from './event-source.js'
+import { assertChronologicalHistory, validateConsumerId } from './event-source.js'
 import { validateTimerOccurrence, type TimerOccurrence, type TimerOccurrencePublisher } from './timers.js'
 
 export interface SqlTimerSchedule {
@@ -29,7 +29,7 @@ export class SqlTimerRejectedError extends Error {
   }
 }
 
-type TimerNode = Pick<ChronologNode, 'publish' | 'operation' | 'revisions' | 'revision'>
+type TimerNode = Pick<ChronologNode, 'publish' | 'operation' | 'revisions' | 'revision' | 'events'>
 type FinalOutcome = NonNullable<NonNullable<Awaited<ReturnType<TimerNode['operation']>>>['outcome']>
 const MAX_TIME = Number.MAX_SAFE_INTEGER
 function timestamp(value: number): void {
@@ -50,6 +50,7 @@ export function createSqlTimerPublisher(options: {
   readonly tablePrefix?: string
 }): SqlTimerPublisher {
   const { node, configurationTopic, occurrenceTopic } = options
+  assertChronologicalHistory(node.events)
   assertEventTopic(configurationTopic); assertEventTopic(occurrenceTopic)
   if (configurationTopic === occurrenceTopic) throw new Error('TIMER_TOPICS_MUST_DIFFER')
   const prefix = options.tablePrefix ?? 'agent'
@@ -99,6 +100,7 @@ export function createSqlTimerPublisher(options: {
     return result.proposalId
   }
   return Object.freeze({
+    historyProfile: 'chronological' as const,
     initialize(changeOptions: SqlTimerChangeOptions) {
       return accepted(program(
         sqlStatement(`CREATE TABLE ${heads} (timer_id TEXT PRIMARY KEY, generation TEXT NOT NULL, next_due_at_ms INTEGER NOT NULL, interval_ms INTEGER, payload_json TEXT NOT NULL, active INTEGER NOT NULL) STRICT`),

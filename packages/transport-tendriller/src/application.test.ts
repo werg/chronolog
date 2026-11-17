@@ -22,7 +22,7 @@ function fixture() {
       try { yield* revisions.subscribe(signal === undefined ? {} : { signal }) }
       finally { watchers-- }
     },
-    events: { read: async () => batch, async *subscribe() { yield batch } },
+    events: { historyProfile: 'chronological', read: async () => batch, async *subscribe() { yield batch } },
     changes(options: unknown) { changeCalls.push(options); return changes },
     async readView(options: { view?: 'local' | 'final' } = {}) { viewCalls.push(options); return { view: options.view ?? 'final', revision: batch.revision,
       finalRevision: options.view === 'local' ? 'pinned-final' : batch.revision,
@@ -49,6 +49,14 @@ function fixture() {
 }
 
 describe('selected Chronolog application adapter', () => {
+  it('refuses a generation source before labelling its events as chronological', () => {
+    const f = fixture()
+    Object.assign(f.source.events, { historyProfile: 'peer-generation-v1' })
+    expect(() => createChronologApplicationBackend({ id: 'history', replica: f.source, sql: false }))
+      .toThrowError(expect.objectContaining({ code: 'unsupported_history_profile' }))
+    expect(f.calls).toEqual([]); expect(f.reads).toBe(0)
+  })
+
   it('delegates one exact authored program and never creates a second command identity', async () => {
     const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: false })
     const change = program(emit('conversation', { text: 'reviewed' }))
