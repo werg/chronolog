@@ -27,7 +27,7 @@ describe('NodeRpcService policy views and enrollment', () => {
   it.each([true, false])('reports retained-route connectivity %s without inventing feed peers', async (connected) => {
     const service = new NodeRpcService({ node: {
       ...readerNode(),
-      controlStore: { listCandidates: () => [] },
+      controlStore: { missingProposalCount: 0 },
       async status() {
         return { started: true, materializedRevision: 6n, orderLength: 3, validating: false,
           processedTransportRecords: 1, materializationPending: false, quarantinedFeeds: [],

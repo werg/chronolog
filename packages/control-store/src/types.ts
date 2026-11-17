@@ -1,13 +1,12 @@
 import type { TransactionOrderKey } from '@chronolog/protocol'
 
 export type CandidateState =
-  | 'waiting_for_payload'
   | 'pending_validation'
+  /** Locally authorized and selected for preview, but not admitted by consensus. */
+  | 'provisional'
   | 'admissible'
-  | 'invalid_protocol'
   | 'unauthorized'
   | 'inadmissible'
-  | 'quarantined'
 
 export interface StoredCandidate {
   readonly txId: Uint8Array
@@ -15,7 +14,7 @@ export interface StoredCandidate {
   readonly candidateDigest: Uint8Array
   readonly validationPolicy: Uint8Array
   readonly orderKey: TransactionOrderKey
-  readonly canonicalPayload?: Uint8Array
+  readonly canonicalPayload: Uint8Array
   readonly state: CandidateState
   readonly stateReason?: string
   readonly proofAttestationIds: readonly Uint8Array[]
@@ -155,7 +154,7 @@ export type ControlStoreDelta =
     }
   | {
       readonly sequence: bigint
-      readonly kind: 'order_append' | 'order_insert'
+      readonly kind: 'order_append' | 'order_insert' | 'order_remove'
       readonly txId: Uint8Array
       readonly index: number
       readonly previousLength: number
@@ -255,14 +254,3 @@ export interface ValidatorCutoffState {
   readonly validatorId: Uint8Array
   readonly acceptedAboveMs: bigint
 }
-
-export interface AdmissionEvaluation {
-  readonly state: Extract<CandidateState, 'pending_validation' | 'admissible'>
-  readonly proofAttestationIds?: readonly Uint8Array[]
-  readonly reason?: string
-}
-
-export type AdmissionEvaluator = (
-  candidate: StoredCandidate,
-  attestations: readonly StoredAttestation[],
-) => AdmissionEvaluation

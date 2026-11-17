@@ -138,7 +138,7 @@ export interface ChronologRpcNodeService {
   readonly finalRevision: bigint
   readonly finalOrderLength: number
   readonly controlStore: {
-    listCandidates(): readonly { readonly state: string }[]
+    readonly missingProposalCount: number
   }
   publish(input: { readonly program: ChangeProgram; readonly operationId: string }): Promise<RpcPublishedTransaction>
   status(): Promise<RpcNodeStatusSnapshot>

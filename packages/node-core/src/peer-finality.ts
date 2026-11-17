@@ -29,7 +29,7 @@ export async function evaluatePeerLiveFinality(options: {
     [bytesToHex(options.membershipRevision), options.membershipRevision],
   ])
   const candidates = options.control.listCandidates().filter(candidate =>
-    candidate.state === 'pending_validation' || candidate.state === 'admissible')
+    candidate.state === 'pending_validation' || candidate.state === 'provisional' || candidate.state === 'admissible')
   for (const candidate of candidates) {
     const core = options.candidateCores.get(bytesToHex(candidate.txId))
     if (core !== undefined) revisions.set(bytesToHex(core.membershipRevision), core.membershipRevision)
@@ -59,7 +59,7 @@ export async function evaluatePeerLiveFinality(options: {
   const verifiedAttestationIds = new Set<string>()
   const candidatePolicies = new Map<string, { policy: WatermarkPolicy; membershipRevision: Uint8Array }>()
   for (const candidate of candidates) {
-    if (candidate.state !== 'pending_validation') continue
+    if (candidate.state !== 'pending_validation' && candidate.state !== 'provisional') continue
     const key = bytesToHex(candidate.txId), core = options.candidateCores.get(key)
     if (core === undefined) continue
     const policy = await options.membership.watermarkPolicy?.(core)

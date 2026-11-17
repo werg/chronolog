@@ -558,7 +558,7 @@ export class NodeRpcService implements ChronologRpcService {
     const knownPeers = status.transport.configuredPeers?.length ?? status.transport.peers.length
     const ingestionBacklog = Math.max(0, status.transport.records - status.processedTransportRecords)
     const feedsWithGaps = status.transport.feedsWithGaps ?? status.transport.feedStates?.filter((feed) => feed.hasGaps).length ?? 0
-    const pendingPayloads = this.#node.controlStore.listCandidates().filter((candidate) => candidate.state === 'waiting_for_payload').length
+    const pendingPayloads = this.#node.controlStore.missingProposalCount
     return {
       groupId: this.#groupId(),
       revision: this.#node.revision.toString(10),

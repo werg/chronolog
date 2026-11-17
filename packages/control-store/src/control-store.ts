@@ -1,8 +1,6 @@
 import { bytesToHex, hexToBytes, compareTransactionOrder } from '@chronolog/protocol'
 
 import type {
-  AdmissionEvaluation,
-  AdmissionEvaluator,
   AdmissionBlocker,
   AdmissionFrontier,
   AdmissionFrontierOptions,
@@ -25,10 +23,8 @@ import type {
 } from './types.js'
 
 const TERMINAL_INVALID_STATES = new Set<CandidateState>([
-  'invalid_protocol',
   'unauthorized',
   'inadmissible',
-  'quarantined',
 ])
 
 type WithoutSequence<T> = T extends unknown ? Omit<T, 'sequence'> : never
@@ -140,7 +136,7 @@ export class ControlStore {
     const deltas: ControlStoreDelta[] = [
       this.#appendDelta({ kind: 'candidate_added', txId: candidate.txId, state: candidate.state }),
     ]
-    if (candidate.state === 'admissible') deltas.push(this.#insertOrder(candidate))
+    if (isSelected(candidate.state)) deltas.push(this.#insertOrder(candidate))
     this.#persist({ kind: 'put_candidate', candidate })
     return { added: true, deltas: clone(deltas) }
   }
@@ -186,6 +182,13 @@ export class ControlStore {
     return { added: true, delta: clone(delta) }
   }
 
+  /** Distinct authentic references whose proposal body has not been indexed. */
+  get missingProposalCount(): number {
+    let count = 0
+    for (const key of this.#attestationsByTx.keys()) if (!this.#candidates.has(key)) count += 1
+    return count
+  }
+
   attestationsFor(txId: Uint8Array): readonly StoredAttestation[] {
     const refs = this.#attestationsByTx.get(idKey(txId))
     if (refs === undefined) return []
@@ -193,28 +196,6 @@ export class ControlStore {
       .map((ref) => this.#attestations.get(ref))
       .filter((value): value is StoredAttestation => value !== undefined)
       .map(cloneAttestation)
-  }
-
-  evaluateAdmission(txId: Uint8Array, evaluator: AdmissionEvaluator): AdmissionEvaluation {
-    const candidate = this.#requiredCandidate(txId)
-    if (candidate.state === 'admissible') {
-      return {
-        state: 'admissible',
-        proofAttestationIds: candidate.proofAttestationIds.map(copyBytes),
-      }
-    }
-    if (TERMINAL_INVALID_STATES.has(candidate.state) || candidate.state === 'waiting_for_payload') {
-      throw new ControlStoreConflictError('CONTROL_STORE_CANDIDATE_NOT_ADMISSION_ELIGIBLE')
-    }
-
-    const evaluation = evaluator(cloneCandidate(candidate), this.attestationsFor(txId))
-    this.setCandidateState(txId, evaluation.state, {
-      ...(evaluation.proofAttestationIds === undefined
-        ? {}
-        : { proofAttestationIds: evaluation.proofAttestationIds }),
-      ...(evaluation.reason === undefined ? {} : { reason: evaluation.reason }),
-    })
-    return clone(evaluation)
   }
 
   setCandidateState(
@@ -241,8 +222,10 @@ export class ControlStore {
       return []
     }
 
+    const identity = { ...candidate }
+    delete identity.stateReason
     const next: StoredCandidate = cloneCandidate({
-      ...candidate,
+      ...identity,
       state,
       ...(options.reason === undefined ? {} : { stateReason: options.reason }),
       proofAttestationIds,
@@ -257,8 +240,10 @@ export class ControlStore {
         ...(options.reason === undefined ? {} : { reason: options.reason }),
       }),
     ]
-    if (candidate.state !== 'admissible' && state === 'admissible') {
+    if (!isSelected(candidate.state) && isSelected(state)) {
       deltas.push(this.#insertOrder(next))
+    } else if (isSelected(candidate.state) && !isSelected(state)) {
+      deltas.push(this.#removeOrder(next))
     }
     this.#persist({
       kind: 'set_candidate_state',
@@ -433,7 +418,7 @@ export class ControlStore {
       if (known?.state === 'admissible' || known !== undefined && TERMINAL_INVALID_STATES.has(known.state)) continue
       const context = options.candidatePolicies?.get(key)
       const revision = context?.membershipRevision ?? (options.candidatePolicies === undefined ? membershipRevision : undefined)
-      if (known !== undefined && known.state !== 'waiting_for_payload' && (revision !== undefined && idKey(attestation.membershipRevision) !== idKey(revision) ||
+      if (known !== undefined && (revision !== undefined && idKey(attestation.membershipRevision) !== idKey(revision) ||
           attestation.authorTimestampMs !== known.orderKey.authorTimestampMs ||
           idKey(attestation.candidateDigest) !== idKey(known.candidateDigest) ||
           options.verifiedAttestationIds !== undefined && !options.verifiedAttestationIds.has(idKey(attestation.attestationId)))) continue
@@ -443,11 +428,11 @@ export class ControlStore {
     // Payload arrival and proof arrival are independent. A known proposal with
     // no local vote may still have admissible votes in flight under its policy.
     for (const [key, candidate] of this.#candidates) {
-      if (candidate.state === 'pending_validation' && !proposals.has(key)) proposals.set(key, [])
+      if ((candidate.state === 'pending_validation' || candidate.state === 'provisional') && !proposals.has(key)) proposals.set(key, [])
     }
     for (const [key, attestations] of proposals) {
       const candidate = this.#candidates.get(key)
-      if (candidate === undefined || candidate.state === 'waiting_for_payload') {
+      if (candidate === undefined) {
         // Until the payload arrives its own policy and signed timestamp cannot
         // be checked. Authentic metadata blocks; it never proves rejection.
         for (const attestation of attestations) blockers.push({ proposalId: copyBytes(attestation.txId),
@@ -602,6 +587,14 @@ export class ControlStore {
     })
   }
 
+  #removeOrder(candidate: StoredCandidate): ControlStoreDelta {
+    const index = this.#orderedTxIds.findIndex(id => bytesEqual(id, candidate.txId))
+    if (index < 0) throw new ControlStoreConflictError('CONTROL_STORE_SELECTED_PROPOSAL_MISSING')
+    const previousLength = this.#orderedTxIds.length
+    this.#orderedTxIds.splice(index, 1)
+    return this.#appendDelta({ kind: 'order_remove', txId: candidate.txId, index, previousLength })
+  }
+
   #appendDelta(delta: WithoutSequence<ControlStoreDelta>): ControlStoreDelta {
     this.#sequence += 1n
     const sequenced = clone({ ...delta, sequence: this.#sequence })
@@ -734,7 +727,7 @@ export class ControlStore {
     const seen = new Set<string>()
     for (const txId of this.#orderedTxIds) {
       const candidate = this.#requiredCandidate(txId)
-      if (candidate.state !== 'admissible') {
+      if (!isSelected(candidate.state)) {
         throw new ControlStoreConflictError('CONTROL_STORE_CORRUPT_ORDER_STATE')
       }
       const key = idKey(txId)
@@ -787,6 +780,10 @@ export class ControlStore {
   }
 }
 
+function isSelected(state: CandidateState): boolean {
+  return state === 'provisional' || state === 'admissible'
+}
+
 function validateStateTransition(previous: CandidateState, next: CandidateState): void {
   if (previous === next) return
   if (previous === 'admissible') {
@@ -794,16 +791,6 @@ function validateStateTransition(previous: CandidateState, next: CandidateState)
   }
   if (TERMINAL_INVALID_STATES.has(previous)) {
     throw new ControlStoreConflictError('CONTROL_STORE_TERMINAL_STATE')
-  }
-  if (
-    previous === 'waiting_for_payload' &&
-    next !== 'pending_validation' &&
-    !TERMINAL_INVALID_STATES.has(next)
-  ) {
-    throw new ControlStoreConflictError('CONTROL_STORE_PAYLOAD_NOT_VERIFIED')
-  }
-  if (next === 'waiting_for_payload') {
-    throw new ControlStoreConflictError('CONTROL_STORE_PAYLOAD_STATE_REGRESSION')
   }
 }
 

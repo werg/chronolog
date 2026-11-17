@@ -56,6 +56,27 @@ function heartbeat(validator: number, cutoff: bigint, contiguous = true): Valida
 }
 
 describe('ControlStore', () => {
+  it('keeps provisional selection reversible while preserving proposal identity and admitted decisions', () => {
+    const persistence = new MemoryControlStorePersistence(), store = new ControlStore(persistence)
+    const early = candidate(1, 10n), late = candidate(2, 20n)
+    store.putCandidate(early)
+    store.putCandidate({ ...late, state: 'provisional' })
+    store.setCandidateState(early.txId, 'provisional')
+    expect(store.orderedTransactionIds()).toEqual([early.txId, late.txId])
+    expect(store.setCandidateState(early.txId, 'pending_validation', { reason: 'AUTHORIZATION_PENDING' }).at(-1))
+      .toMatchObject({ kind: 'order_remove', index: 0, previousLength: 2 })
+    expect(store.getCandidate(early.txId)?.canonicalPayload).toEqual(early.canonicalPayload)
+    store.setCandidateState(early.txId, 'provisional')
+    expect(store.getCandidate(early.txId)?.stateReason).toBeUndefined()
+    const resumed = new ControlStore(persistence)
+    expect(resumed.orderedTransactionIds()).toEqual([early.txId, late.txId])
+    expect(resumed.setCandidateState(early.txId, 'admissible')).toHaveLength(1)
+    expect(() => resumed.setCandidateState(early.txId, 'pending_validation')).toThrow('ADMISSION_NOT_MONOTONIC')
+    resumed.setCandidateState(late.txId, 'inadmissible', { reason: 'ADMISSION_CLOSED' })
+    expect(resumed.orderedTransactionIds()).toEqual([early.txId])
+    expect(resumed.getCandidate(late.txId)?.canonicalPayload).toEqual(late.canonicalPayload)
+  })
+
   it('inserts newly admissible candidates at a stable deterministic position', () => {
     const store = new ControlStore()
     store.putCandidate(candidate(2, 20n))
@@ -96,22 +117,6 @@ describe('ControlStore', () => {
     )
   })
 
-  it('assembles admission with a pluggable capability policy evaluator', () => {
-    const store = new ControlStore()
-    store.putCandidate(candidate(4, 40n))
-    store.putAttestation(attestation(20, 4, 1))
-    store.putAttestation(attestation(21, 4, 2))
-
-    const result = store.evaluateAdmission(bytes(4), (_candidate, attestations) => ({
-      state: attestations.length >= 2 ? 'admissible' : 'pending_validation',
-      proofAttestationIds: attestations.map((value) => value.attestationId),
-    }))
-
-    expect(result.state).toBe('admissible')
-    expect(store.getCandidate(bytes(4))?.proofAttestationIds).toHaveLength(2)
-    expect(store.orderedTransactionIds()).toEqual([bytes(4)])
-  })
-
   it('calculates the exact 2-of-3 blocking watermark from contiguous feeds', () => {
     const store = new ControlStore()
     store.putCandidate(candidate(1, 85n))
@@ -141,6 +146,8 @@ describe('ControlStore', () => {
     store.putCandidate(candidate(1, 85n))
     store.setCandidateState(bytes(1), 'admissible')
     store.putAttestation(attestation(99, 9, 1))
+    store.putAttestation(attestation(98, 9, 2))
+    expect(store.missingProposalCount).toBe(1)
     store.recordHeartbeat(heartbeat(1, 100n))
 
     const evidence = store.settlementEvidence(bytes(1), {
@@ -149,7 +156,9 @@ describe('ControlStore', () => {
       validatorIds: [bytes(1)],
       threshold: 1,
     })
-    expect(evidence.unresolvedAttestationIds).toEqual([bytes(99)])
+    expect(evidence.unresolvedAttestationIds).toEqual([bytes(99), bytes(98)])
+    store.putCandidate(candidate(9, 9n))
+    expect(store.missingProposalCount).toBe(0)
   })
 
   it('does not finalize past a known partial quorum whose remaining vote can arrive late', () => {
