@@ -46,13 +46,13 @@ jobs:
       - name: Qualify actual hosted control and rendezvous with packed RTC peers
         shell: bash
         run: |
-          mkdir -p artifacts/tendriller-public-e4939047
-          cp test/artifacts/tendriller-sdk-e4939047.tgz artifacts/tendriller-public-e4939047/tendriller-sdk-0.3.0-rc.9.tgz
-          cp test/artifacts/tendriller-engine-e4939047.tgz artifacts/tendriller-public-e4939047/tendriller-engine-0.3.0-rc.9.tgz
-          cp test/artifacts/tendriller-public-e4939047.provenance.json artifacts/tendriller-public-e4939047/provenance.json
+          mkdir -p artifacts/tendriller-public-2e8200a3
+          cp test/artifacts/tendriller-sdk-2e8200a3.tgz artifacts/tendriller-public-2e8200a3/tendriller-sdk-0.3.0-rc.9.tgz
+          cp test/artifacts/tendriller-engine-2e8200a3.tgz artifacts/tendriller-public-2e8200a3/tendriller-engine-0.3.0-rc.9.tgz
+          cp test/artifacts/tendriller-public-2e8200a3.provenance.json artifacts/tendriller-public-2e8200a3/provenance.json
           archives=(artifacts/peer-session-rtc/chronolog-peer-session-*.tgz)
           test "${#archives[@]}" -eq 1
-          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/tendriller-public-e4939047 --output artifacts/peer-session-host-consumer
+          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/tendriller-public-2e8200a3 --output artifacts/peer-session-host-consumer
       - name: Preserve public transport and hosted control evidence
         if: always()
         uses: actions/upload-artifact@v6
