@@ -1,9 +1,7 @@
-import { once } from 'node:events'
 import { mkdir } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
 
-import { NativeAgentStore, framePeerStream, type AgentApplicationModule } from '@chronolog/agent-service'
+import { NativeAgentStore, type AgentApplicationModule } from '@chronolog/agent-service'
 import { encodeSignedGenesis, signGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
@@ -15,6 +13,7 @@ import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 
 import { createDaemonAgentRuntime } from '../apps/chronologd/src/agent-runtime.js'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from '../test/browser/event-contract.js'
+import { createHttpPeerFixture } from './lib/http-peer-fixture.js'
 
 /**
  * Real native fixed authority used by browser and contrib acceptance gates.
@@ -84,70 +83,12 @@ export async function createNativeBrowserFixture(options: {
   void running.catch((error: unknown) => { serviceFailure = error instanceof Error ? error : new Error('NATIVE_AGENT_FAILED', { cause: error }) })
   const client = new ChronologClient({ groupId: bytesToBase64Url(groupId),
     transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node, signals: agent.context.signals })), unaryRetryAttempts: 1 })
-  const token = crypto.randomUUID()
-  const sessions = new Map<string, { readonly writer: WritableStreamDefaultWriter<Uint8Array>;
-    close(): Promise<void> }>()
   const failures: string[] = []
-  const server = createServer((request, response) => {
-    response.setHeader('Access-Control-Allow-Origin', '*')
-    response.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-    response.setHeader('Access-Control-Allow-Headers', 'Content-Type')
-    response.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
-    response.setHeader('Cache-Control', 'no-store')
-    if (request.method === 'OPTIONS') { response.writeHead(204); response.end(); return }
-    const handle = async () => {
-      const url = new URL(request.url ?? '/', 'http://localhost')
-      const id = /^\/peer\/([a-z0-9-]{36})$/u.exec(url.pathname)?.[1]
-      if (id === undefined || url.searchParams.get('token') !== token) { response.writeHead(403); response.end(); return }
-      if (request.method === 'GET') {
-        if (sessions.has(id)) { response.writeHead(409); response.end(); return }
-        if (sessions.size >= 16) { response.writeHead(429); response.end(); return }
-        response.writeHead(200, { 'Content-Type': 'application/octet-stream' }); response.flushHeaders()
-        const incoming = new TransformStream<Uint8Array, Uint8Array>(), writer = incoming.writable.getWriter()
-        const connection = framePeerStream({ readable: incoming.readable, writable: new WritableStream<Uint8Array>({
-          write: (bytes) => writeStream(response, bytes), close: () => { response.end() }, abort: () => { response.destroy() },
-        }) })
-        let session: Awaited<ReturnType<typeof agent.context.connectPeer>> | undefined
-        let closed = false
-        const close = async () => {
-          if (closed) return
-          closed = true
-          sessions.delete(id)
-          await Promise.allSettled([connection.close(), writer.abort(), session?.close()])
-        }
-        sessions.set(id, { writer, close })
-        response.on('close', () => { void close() })
-        void agent.context.connectPeer({ connection }).then((value) => {
-          session = value
-          if (closed) { void value.close(); return }
-          void value.completion.catch((error: unknown) => {
-            if (!closed) failures.push(error instanceof Error ? error.message : String(error))
-          }).finally(close)
-        }, (error: unknown) => {
-          if (!closed) failures.push(error instanceof Error ? error.message : String(error))
-          void close()
-        })
-      } else {
-        const session = sessions.get(id)
-        if (session === undefined) { response.writeHead(410); response.end(); return }
-        if (request.method === 'POST') await session.writer.write(await boundedBody(request))
-        else if (request.method === 'DELETE') await session.close()
-        else { response.writeHead(405); response.end(); return }
-        response.writeHead(204); response.end()
-      }
-    }
-    void handle().catch((error: unknown) => {
-      if (!response.headersSent) { response.writeHead(500); response.end(error instanceof Error ? error.message : String(error)) }
-      else response.destroy()
-    })
-  })
-  server.listen(0, '127.0.0.1')
-  await once(server, 'listening')
-  const address = server.address()
-  if (address === null || typeof address === 'string') throw new Error('BROWSER_FIXTURE_ADDRESS_UNAVAILABLE')
+  const http = await createHttpPeerFixture({ accept: connection => agent.context.connectPeer({ connection }),
+    onError: error => { failures.push(error instanceof Error ? error.message : String(error)) } })
   const bootstrap: BrowserEventBootstrap = { genesis: bytesToBase64Url(encodeSignedGenesis(genesis)), groupRoute: bytesToBase64Url(groupRoute),
     epochContentKey: bytesToBase64Url(epochContentKey), executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
-    nativeIdentity: bytesToBase64Url(identity.signing.publicKeyBytes), peerUrl: `http://127.0.0.1:${address.port}/peer`, peerToken: token }
+    nativeIdentity: bytesToBase64Url(identity.signing.publicKeyBytes), peerUrl: http.url, peerToken: http.token }
   let closed = false
   return { bootstrap, node: governed.node, governed, client, store, feedStore, identity, agent, transport,
     assertHealthy() {
@@ -157,35 +98,11 @@ export async function createNativeBrowserFixture(options: {
     async close() {
       if (closed) return
       closed = true
-      await Promise.all([...sessions.values()].map((session) => session.close()))
-      server.closeAllConnections()
-      await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)))
+      await http.close()
       try { await agent.close(); await client.close(); await governed.close() }
       finally { control.close(); store.close() }
     },
   }
-}
-
-async function boundedBody(request: IncomingMessage): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = []
-  let length = 0
-  for await (const chunk of request) {
-    const bytes = typeof chunk === 'string' ? utf8(chunk) : new Uint8Array(chunk as Uint8Array)
-    length += bytes.length
-    if (length > 1_048_576 + 65_540) throw new Error('PEER_HTTP_FRAME_TOO_LARGE')
-    chunks.push(bytes)
-  }
-  if (length === 0) throw new Error('PEER_HTTP_FRAME_EMPTY')
-  const body = new Uint8Array(length)
-  let offset = 0
-  for (const bytes of chunks) { body.set(bytes, offset); offset += bytes.length }
-  return body
-}
-
-function writeStream(response: ServerResponse, bytes: Uint8Array): Promise<void> {
-  return new Promise((resolve, reject) => {
-    response.write(bytes, (error) => error === undefined || error === null ? resolve() : reject(error))
-  })
 }
 
 export type NativeBrowserFixture = Awaited<ReturnType<typeof createNativeBrowserFixture>>
