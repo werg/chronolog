@@ -312,10 +312,12 @@ export class ControlStore {
         throw new ControlStoreConflictError('CONTROL_STORE_HEARTBEAT_CUTOFF_REGRESSION')
       }
       if (heartbeat.validatorFeedSequence === previous.validatorFeedSequence) {
-        if (!sameValue(previous, next)) {
+        // Feed continuity is locally verified evidence, not a signed field.
+        // Filling a replication gap can upgrade this exact heartbeat later.
+        if (!sameValue({ ...previous, feedContiguous: next.feedContiguous }, next)) {
           throw new ControlStoreConflictError('CONTROL_STORE_HEARTBEAT_CONFLICT')
         }
-        return null
+        if (previous.feedContiguous || !next.feedContiguous) return null
       }
     }
 
@@ -331,13 +333,20 @@ export class ControlStore {
     return clone(delta)
   }
 
-  watermark(policy: WatermarkPolicy, membershipRevision?: Uint8Array): WatermarkEvidence {
-    return this.#thresholdWatermark(policy, membershipRevision)
+  /** Current signed heartbeats and the locally established prefix evidence. */
+  listHeartbeats(): readonly ValidatorHeartbeat[] {
+    return [...this.#heartbeats.values()].map(cloneHeartbeat)
+  }
+
+  watermark(policy: WatermarkPolicy, membershipRevision?: Uint8Array,
+    verifiedHeartbeatIds?: ReadonlySet<string>): WatermarkEvidence {
+    return this.#thresholdWatermark(policy, membershipRevision, verifiedHeartbeatIds)
   }
 
   #thresholdWatermark(
     policy: Extract<WatermarkPolicy, { kind: 'threshold' }>,
     membershipRevision?: Uint8Array,
+    verifiedHeartbeatIds?: ReadonlySet<string>,
   ): WatermarkEvidence {
     if (
       !Number.isSafeInteger(policy.threshold) ||
@@ -356,7 +365,8 @@ export class ControlStore {
 
     const heartbeats = policy.validatorIds.map((validatorId) => {
       const heartbeat = this.#heartbeatFor(validatorId, membershipRevision)
-      return heartbeat?.feedContiguous === true ? heartbeat : null
+      return heartbeat?.feedContiguous === true &&
+        (verifiedHeartbeatIds === undefined || verifiedHeartbeatIds.has(idKey(heartbeat.heartbeatId))) ? heartbeat : null
     })
     const available = heartbeats
       .filter((heartbeat): heartbeat is ValidatorHeartbeat => heartbeat !== null)
@@ -399,7 +409,7 @@ export class ControlStore {
     options: AdmissionFrontierOptions = {},
   ): SettlementEvidence {
     const candidate = this.#requiredCandidate(txId)
-    const watermark = this.watermark(policy, membershipRevision)
+    const watermark = this.watermark(policy, membershipRevision, options.verifiedHeartbeatIds)
     const frontier = this.admissionFrontier(policy, membershipRevision, options)
     const unresolved = frontier.blockers.filter(item => item.authorTimestampMs <= candidate.orderKey.authorTimestampMs)
     return {
@@ -424,7 +434,8 @@ export class ControlStore {
    */
   admissionFrontier(policy: WatermarkPolicy, membershipRevision?: Uint8Array,
     options: AdmissionFrontierOptions = {}): AdmissionFrontier {
-    const provenThroughMs = options.provenThroughMs === undefined ? this.watermark(policy, membershipRevision).cutoffMs : options.provenThroughMs
+    const provenThroughMs = options.provenThroughMs === undefined
+      ? this.watermark(policy, membershipRevision, options.verifiedHeartbeatIds).cutoffMs : options.provenThroughMs
     const blockers: AdmissionBlocker[] = [], excludedProposalIds: Uint8Array[] = []
     const proposals = new Map<string, StoredAttestation[]>()
     for (const attestation of this.#attestations.values()) {
@@ -470,7 +481,9 @@ export class ControlStore {
       const revisionClosed = revision !== undefined && options.closedMembershipRevisions?.has(idKey(revision)) === true
       for (const validator of revisionClosed ? [] : candidatePolicy.validatorIds) {
         const heartbeat = this.#heartbeatFor(validator, revision)
-        if (heartbeat?.feedContiguous !== true || heartbeat.acceptanceCutoffMs < timestamp) possible.add(idKey(validator))
+        if (heartbeat?.feedContiguous !== true ||
+            options.verifiedHeartbeatIds !== undefined && !options.verifiedHeartbeatIds.has(idKey(heartbeat.heartbeatId)) ||
+            heartbeat.acceptanceCutoffMs < timestamp) possible.add(idKey(validator))
       }
       // A complete revision closure also proves the current evaluated vote set
       // cannot change. It resolves stricter custom admission policies as well.

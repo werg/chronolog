@@ -336,6 +336,54 @@ describe('ControlStore', () => {
     expect(store.watermark(policy, bytes(3)).cutoffMs).toBeNull()
   })
 
+  it('advances an existing heartbeat proof after its replication gap is filled', () => {
+    const persistence = new MemoryControlStorePersistence()
+    const store = new ControlStore(persistence)
+    const policy = { kind: 'threshold' as const, policyId: 'one', validatorIds: [bytes(1)], threshold: 1 }
+    const incomplete = heartbeat(1, 100n, false)
+    store.recordHeartbeat(incomplete)
+    expect(store.watermark(policy, bytes(1)).cutoffMs).toBeNull()
+
+    expect(store.recordHeartbeat({ ...incomplete, feedContiguous: true })).toMatchObject({
+      kind: 'heartbeat_advanced', feedContiguous: true,
+    })
+    expect(store.watermark(policy, bytes(1)).cutoffMs).toBe(100n)
+    // Replaying a snapshot of the earlier local observation cannot erase proof.
+    expect(store.recordHeartbeat(incomplete)).toBeNull()
+    const reopened = new ControlStore(persistence)
+    expect(reopened.watermark(policy, bytes(1)).cutoffMs).toBe(100n)
+    const exposed = reopened.listHeartbeats()[0]!
+    exposed.validatorId[0] = 99
+    expect(reopened.listHeartbeats()[0]!.validatorId).toEqual(bytes(1))
+    expect(() => reopened.recordHeartbeat({ ...incomplete, heartbeatId: bytes(9), feedContiguous: true }))
+      .toThrow('CONTROL_STORE_HEARTBEAT_CONFLICT')
+  })
+
+  it('requires the current admission index to consume a restored heartbeat prefix', () => {
+    const persistence = new MemoryControlStorePersistence()
+    const store = new ControlStore(persistence)
+    const policy = { kind: 'threshold' as const, policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2 }
+    store.putCandidate(candidate(1, 50n))
+    store.putAttestation({ ...attestation(1, 1), authorTimestampMs: 50n })
+    for (const validator of [1, 2, 3]) store.recordHeartbeat(heartbeat(validator, 100n))
+
+    const reopened = new ControlStore(persistence)
+    const indexed = new Set<string>()
+    expect(reopened.watermark(policy, bytes(1), indexed).cutoffMs).toBeNull()
+    indexed.add('0164'); indexed.add('0264')
+    const partial = reopened.admissionFrontier(policy, bytes(1), { verifiedHeartbeatIds: indexed })
+    expect(partial).toMatchObject({ provenThroughMs: 100n, closedThroughMs: 49n,
+      excludedProposalIds: [], blockers: [{ proposalId: bytes(1), reason: 'pending-admission' }] })
+
+    // The missing third feed might contain the vote completing this proposal.
+    // Only consuming its prefix can prove that no such delayed vote remains.
+    indexed.add('0364')
+    expect(reopened.admissionFrontier(policy, bytes(1), { verifiedHeartbeatIds: indexed }))
+      .toMatchObject({ provenThroughMs: 100n, closedThroughMs: 100n,
+        excludedProposalIds: [bytes(1)], blockers: [] })
+  })
+
   it('rejects conflicting duplicate identities and later regressing cutoffs', () => {
     const store = new ControlStore()
     store.putCandidate(candidate(1, 1n))

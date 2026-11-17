@@ -107,6 +107,8 @@ export interface AdmissionFrontierOptions {
   readonly closedMembershipRevisions?: ReadonlySet<string>
   /** Fully verified proof IDs, encoded as lowercase hexadecimal, for known payloads. */
   readonly verifiedAttestationIds?: ReadonlySet<string>
+  /** Heartbeat IDs whose complete feed prefixes the current admission index has consumed. */
+  readonly verifiedHeartbeatIds?: ReadonlySet<string>
   /** Every known pending proposal's own policy and signed membership revision. */
   readonly candidatePolicies?: ReadonlyMap<string, {
     readonly policy: WatermarkPolicy
