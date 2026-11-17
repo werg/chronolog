@@ -1,4 +1,4 @@
-name: WebRTC native and browser
+name: Native peer transport and hosted control
 
 on:
   pull_request:
@@ -28,11 +28,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Verify bounded framing and native ICE/DTLS/SCTP
         run: pnpm exec vitest run packages/transport-webrtc/src
-      - name: Check out the exact public resident deployment recipe
+      - name: Check out the exact public peer application consumers
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 5dc1e63365c4d073f03c6491ec5e84ed14c26f73
+          ref: 114bc2709f5cbb15d96dff0481ded425ffa15384
           path: artifacts/tendriller-contrib
           persist-credentials: false
       - name: Build the clean public peer-session RTC package
@@ -46,20 +46,14 @@ jobs:
       - name: Qualify actual hosted control and rendezvous with packed RTC peers
         shell: bash
         run: |
-          mkdir -p artifacts/tendriller-public-90cfb794
-          cp test/artifacts/tendriller-sdk-90cfb794.tgz artifacts/tendriller-public-90cfb794/tendriller-sdk-0.3.0-rc.9.tgz
-          cp test/artifacts/tendriller-engine-90cfb794.tgz artifacts/tendriller-public-90cfb794/tendriller-engine-0.3.0-rc.9.tgz
-          cp test/artifacts/tendriller-public-90cfb794.provenance.json artifacts/tendriller-public-90cfb794/provenance.json
+          mkdir -p artifacts/tendriller-public-e4939047
+          cp test/artifacts/tendriller-sdk-e4939047.tgz artifacts/tendriller-public-e4939047/tendriller-sdk-0.3.0-rc.9.tgz
+          cp test/artifacts/tendriller-engine-e4939047.tgz artifacts/tendriller-public-e4939047/tendriller-engine-0.3.0-rc.9.tgz
+          cp test/artifacts/tendriller-public-e4939047.provenance.json artifacts/tendriller-public-e4939047/provenance.json
           archives=(artifacts/peer-session-rtc/chronolog-peer-session-*.tgz)
           test "${#archives[@]}" -eq 1
-          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/tendriller-public-90cfb794 --output artifacts/peer-session-host-consumer
-      - name: Qualify the native HTTPS resident task and current reader authorization
-        run: node --import tsx tools/test-resident-webrtc.ts --contrib artifacts/tendriller-contrib --output artifacts/resident-webrtc
-      - name: Install actual Chromium
-        run: pnpm exec playwright install --with-deps chromium
-      - name: Qualify OPFS peer after page and signaling host shutdown
-        run: node --import tsx tools/test-browser-webrtc.ts --contrib artifacts/tendriller-contrib --output artifacts/browser-webrtc
-      - name: Preserve native and browser results and emitted graphs
+          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/tendriller-public-e4939047 --output artifacts/peer-session-host-consumer
+      - name: Preserve public transport and hosted control evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:
@@ -73,9 +67,5 @@ jobs:
             artifacts/peer-session-host-consumer/host/package-lock.json
             artifacts/peer-session-host-consumer/peers/report.json
             artifacts/peer-session-host-consumer/peers/summary.json
-            artifacts/browser-webrtc/report.json
-            artifacts/browser-webrtc/bundle.json
-            artifacts/resident-webrtc/report.json
-            artifacts/resident-webrtc/bundle.json
           if-no-files-found: error
           retention-days: 30

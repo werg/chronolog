@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -38,77 +40,50 @@ jobs:
         env:
           CHRONOLOG_REQUIRE_WASM: '1'
         run: pnpm exec vitest run packages/runtime-browser/src/wasm-conformance.test.ts
+      - name: Package the SQL-free public browser session
+        id: session_events
+        if: ${{ !cancelled() }}
+        run: node tools/package-peer-session.mjs --native-rtc --output artifacts/peer-session-browser-events
+      - name: Package matching browser and native SQL engines
+        id: session_sql
+        if: ${{ !cancelled() && steps.sql_engine.outcome == 'success' }}
+        run: node tools/package-peer-session.mjs --sql-native --sql-browser artifacts/wasm --native-rtc --output artifacts/peer-session-browser-sql
       - name: Install real Chromium with platform dependencies
         id: chromium
         if: ${{ !cancelled() && steps.sql_engine.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
-      - name: Check out the exact contrib application specimens
+      - name: Check out the exact independent application consumers
         id: contrib_source
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 5dc1e63365c4d073f03c6491ec5e84ed14c26f73
-          path: artifacts/pilot-source/contrib
+          ref: 114bc2709f5cbb15d96dff0481ded425ffa15384
+          path: artifacts/tendriller-contrib
           persist-credentials: false
       - name: Qualify native and browser WebRTC after signaling host shutdown
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' && steps.contrib_source.outcome == 'success' }}
-        run: node --import tsx tools/test-browser-webrtc.ts --contrib artifacts/pilot-source/contrib --output artifacts/browser-webrtc
+        run: node --import tsx tools/test-browser-webrtc.ts --contrib artifacts/tendriller-contrib --output artifacts/browser-webrtc
       - name: Qualify SQL-free events, native framed authority and abrupt OPFS checkpoints
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: node --import tsx tools/test-browser-events.ts
       - name: Qualify Worker ownership, OPFS recovery and the public client
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: node --import tsx tools/test-browser-peer.ts
-      - name: Qualify enrolled browser and native agents claiming one shared task
-        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
-        run: node --import tsx tools/test-browser-bridge.ts
-      - name: Check out the exact public Tendriller runtime source
-        id: tendriller_source
-        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
-        uses: actions/checkout@v6
-        with:
-          repository: werg/tendriller
-          ref: 90cfb7943206872cda9192c095fd83d68db60f98
-          path: artifacts/pilot-source/tendriller
-          persist-credentials: false
-      - name: Build the packaged public Tendriller SDK, runtime and engine
-        id: public_artifacts
-        if: ${{ !cancelled() && steps.tendriller_source.outcome == 'success' }}
-        working-directory: artifacts/pilot-source/tendriller
+      - name: Qualify public events through the packed Worker facade and native RTC
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' && steps.contrib_source.outcome == 'success' && steps.session_events.outcome == 'success' }}
+        shell: bash
         run: |
-          npm ci
-          npm run build
-      - name: Qualify both contrib layouts with native agents and independent browser peers
-        id: application_pilot
-        if: ${{ !cancelled() && steps.public_artifacts.outcome == 'success' && steps.contrib_source.outcome == 'success' }}
+          archives=(artifacts/peer-session-browser-events/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-browser.mjs --artifact "${archives[0]}" --output artifacts/peer-session-browser-events-consumer
+      - name: Qualify task claims and recovery through packed browser and native SQL
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' && steps.contrib_source.outcome == 'success' && steps.session_sql.outcome == 'success' }}
+        shell: bash
         run: |
-          node --import tsx tools/application-pilot.ts \
-            --contrib artifacts/pilot-source/contrib \
-            --tendriller-runtime artifacts/pilot-source/tendriller/dist/runtime \
-            --tendriller-engine artifacts/pilot-source/tendriller/dist/engine \
-            --wasm artifacts/wasm \
-            --output artifacts/application-pilot/ci
-      - name: Preserve application qualification immediately
-        if: ${{ always() && (steps.application_pilot.outcome == 'success' || steps.application_pilot.outcome == 'failure') }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: application-pilot-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            artifacts/application-pilot/ci/report.json
-            artifacts/application-pilot/ci/bundles.json
-            artifacts/application-pilot/ci/route-trace.ndjson
-            artifacts/application-pilot/ci/*.png
-            artifacts/application-pilot/ci/pages/specimen-manifest.json
-          if-no-files-found: error
-          retention-days: 30
-      - name: Qualify thin Cloudflare membership with a separate native authority and browser device
-        if: ${{ !cancelled() && steps.public_artifacts.outcome == 'success' }}
-        run: |
-          node --import tsx tools/thin-membership-pilot.ts \
-            --tendriller-artifacts artifacts/pilot-source/tendriller/dist \
-            --wasm artifacts/wasm \
-            --output artifacts/thin-membership/ci
+          archives=(artifacts/peer-session-browser-sql/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-browser.mjs --domain tasks --artifact "${archives[0]}" --output artifacts/peer-session-browser-tasks-consumer
       - name: Preserve the qualification and engine provenance
         if: always()
         uses: actions/upload-artifact@v6
@@ -116,21 +91,20 @@ jobs:
           name: browser-peer-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             artifacts/wasm/manifest.json
+            artifacts/peer-session-browser-sql/*.tgz
+            artifacts/peer-session-browser-sql/package/provenance.json
             artifacts/browser-qualification/report.json
-            artifacts/browser-bridge/report.json
             artifacts/browser-events/report.json
             artifacts/browser-events/bundle.json
             artifacts/browser-webrtc/report.json
             artifacts/browser-webrtc/bundle.json
-            artifacts/application-pilot/ci/report.json
-            artifacts/application-pilot/ci/bundles.json
-            artifacts/application-pilot/ci/route-trace.ndjson
-            artifacts/application-pilot/ci/*.png
-            artifacts/application-pilot/ci/pages/specimen-manifest.json
-            artifacts/thin-membership/ci/report.json
-            artifacts/thin-membership/ci/bundles.json
-            artifacts/thin-membership/ci/membership-provenance.json
-            artifacts/thin-membership/ci/host/host-results.json
-            artifacts/thin-membership/ci/*.png
+            artifacts/peer-session-browser-events/*.tgz
+            artifacts/peer-session-browser-events/package/provenance.json
+            artifacts/peer-session-browser-events-consumer/report.json
+            artifacts/peer-session-browser-events-consumer/summary.json
+            artifacts/peer-session-browser-events-consumer/consumer/package-lock.json
+            artifacts/peer-session-browser-tasks-consumer/report.json
+            artifacts/peer-session-browser-tasks-consumer/summary.json
+            artifacts/peer-session-browser-tasks-consumer/consumer/package-lock.json
           if-no-files-found: error
           retention-days: 30
