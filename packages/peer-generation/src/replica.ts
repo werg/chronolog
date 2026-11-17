@@ -18,7 +18,7 @@ import type {
 } from './types.js'
 
 interface Head { readonly sequence: number; readonly root: string; readonly bytes: number }
-interface Retained { readonly command: OrderedCommand; readonly core: TransactionCore }
+interface Retained { readonly command: OrderedCommand; readonly proposal: ReplayProposal }
 interface SelectedRange {
   readonly generation: string
   readonly offset: number
@@ -237,7 +237,11 @@ class Replica implements PeerReplica {
       await this.#write(`${this.#prefix}/record/${generation.id}/${next.sequence}`, recordBytes)
       await this.#write(`${this.#prefix}/head/${generation.id}`, encodePeerValue(next))
     }
-    this.#heads.set(generation.id, next); entries.set(next.sequence, { command: structuredClone(command), core })
+    this.#heads.set(generation.id, next)
+    entries.set(next.sequence, { command: structuredClone(command), proposal: {
+      txId: hexToBytes(attempt.id), candidateDigest: hexToBytes(attempt.payload.header.coreDigest),
+      canonicalCandidate: encodeTransactionCore(core), core,
+    } })
     this.#remember(attempt); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += recordBytes.length + 2
   }
   /** Describe retained selected segments without visiting their individual records. */
@@ -272,11 +276,24 @@ class Replica implements PeerReplica {
     return result
   }
   async #materialize(authority: PeerAuthority): Promise<void> {
-    const selected = this.#selectedHistory(authority)
-    const admitted: ReplayProposal[] = selected.map(({ command, core }) => ({
-      txId: hexToBytes(command.attempt.id), candidateDigest: hexToBytes(command.attempt.payload.header.coreDigest),
-      canonicalCandidate: encodeTransactionCore(core), core,
-    }))
+    const generation = authority.current!, head = this.#heads.get(generation.id)!, published = this.#publishedRevision
+    const continuing = this.#ready && published !== null && published.generation === generation.id &&
+      published.controlRevision === generation.payload.controlRevision
+    let selected: Retained[]
+    if (continuing) {
+      // A selected generation only appends. Selection/control changes and
+      // restart take the full verified-history path below.
+      check(head.sequence >= published.point.sequence, 'PEER_HISTORY_REGRESSION')
+      if (head.sequence === published.point.sequence) {
+        check(head.root === published.point.root, 'PEER_HEAD_ROOT_MISMATCH'); return
+      }
+      selected = this.#selected.slice()
+      const records = this.#records.get(generation.id)!
+      for (let sequence = published.point.sequence + 1; sequence <= head.sequence; sequence++) {
+        const retained = records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); selected.push(retained)
+      }
+    } else selected = this.#selectedHistory(authority)
+    const admitted = selected.map(value => value.proposal)
     const controls: PeerExecutionControls = { applicationId: hexToBytes(authority.descriptor.applicationId),
       currentRevision: authority.current!.payload.controlRevision,
       revisions: await Promise.all(authority.bundle.controls.map(async control => ({ revision: control.payload.revision,
@@ -284,7 +301,10 @@ class Replica implements PeerReplica {
           [{ publicKey: hexToBytes(grant.publicKey), role: grant.dataRole }]) }))) }
     const output = await this.#options.materializer.coordinator.materialize(admitted, controls)
     if (output !== null) await this.#options.materializer.publications.publish(output.publication)
-    for (const item of selected) {
+    const previousLength = this.#selected.length, changedFrom = output?.revision.earliestChangedOrderIndex ?? previousLength
+    check(Number.isSafeInteger(changedFrom) && changedFrom >= 0 && (output === null || changedFrom <= selected.length), 'PEER_MATERIALIZATION_BOUNDARY_INVALID')
+    const inspectFrom = continuing ? Math.min(previousLength, changedFrom) : 0
+    for (const item of selected.slice(inspectFrom)) {
       const { receipt, attempt } = item.command
       const outcome = this.#options.materializer.queries.outcome(hexToBytes(attempt.id))
       check(outcome !== null, 'PEER_OUTCOME_MISSING')
@@ -296,11 +316,12 @@ class Replica implements PeerReplica {
       if (previous === undefined) await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
       this.#lastOutcomes.set(attempt.id, result)
     }
-    const generation = authority.current!, head = this.#heads.get(generation.id)!
     // Control may already have advanced while ready=false. Publish all view
     // metadata together before allowing readers to observe the complete prefix.
     this.#authority = authority
-    this.#selected = selected; this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
+    this.#selected = selected
+    if (continuing) for (let index = previousLength; index < selected.length; index++) this.#selectedIds.add(selected[index]!.command.attempt.id)
+    else this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
     this.#publishedRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
       generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
       controlRevision: generation.payload.controlRevision, materializationRevision: String(this.#options.materializer.queries.revision) }

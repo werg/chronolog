@@ -208,6 +208,14 @@ requested; ordinary queries do not copy or scan an extra outcome array. Bounded
 history exports inspect selected segment boundaries and the requested records,
 including after recovery, instead of walking the entire selected history.
 
+Within an unchanged generation, the replica extends its selected prefix with
+new retained records and checks only new outcomes, or an earlier range explicitly
+reported by the materializer. Verified replay proposals keep their canonical
+bytes with the retained record. Restart and generation/control changes still
+rebuild and check the entire selected prefix. The materializer receives the full
+proposed order; these bounds describe the replica's own work, not a constant-time
+SQL or events execution claim.
+
 Attachments use independently staged encrypted 64 KiB chunks, with a 128 MiB
 per-object limit and at most eight attached sources. Range reads fetch only needed
 chunks, and verified local chunks survive an interrupted fetch. A reference does

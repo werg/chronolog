@@ -4,9 +4,9 @@ import { decodeTransactionCore, emit, executionManifestArtifacts, program } from
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryBytesStore, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
-  type AuthorityBundle, type PeerIdentity, type PeerReplica, type BytesStore, type PrefixProof,
+  type AppliedResult, type AuthorityBundle, type PeerIdentity, type PeerReplica, type BytesStore, type PrefixProof,
 } from './index.js'
-import { bytesToHex, encodePeerValue, signPeerValue } from './codec.js'
+import { bytesToHex, decodePeerValue, encodePeerValue, signPeerValue } from './codec.js'
 
 const opened: PeerReplica[] = []
 afterEach(async () => { for (const peer of opened.splice(0)) await peer.close() })
@@ -103,6 +103,52 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
       expect(afterReopen.scannedRecords).toBeLessThanOrEqual(8)
     } finally { old.release() }
   }, 30_000)
+  it('checks only appended outcomes within a generation and rechecks the selected prefix at recovery', async () => {
+    const f = await fixture(), a = await f.open(f.a), runtime = f.materializers.get(a)!
+    const outcomes = vi.spyOn(runtime.queries, 'outcome'), materialize = vi.spyOn(runtime.coordinator, 'materialize')
+    try {
+      let base: PrefixProof | undefined
+      for (let index = 0; index < 16; index++) {
+        outcomes.mockClear()
+        await a.order(await a.prepare({ operationId: `append-${index}`, program: event(String(index)) }))
+        expect(outcomes).toHaveBeenCalledTimes(1)
+        if (index === 3) base = await a.recoveryPoint()
+      }
+      materialize.mockClear(); outcomes.mockClear()
+      await a.ingest([])
+      expect(materialize).not.toHaveBeenCalled(); expect(outcomes).not.toHaveBeenCalled()
+      await f.select(f.a, base!, 'recover-four'); await a.adopt(await f.registry.read())
+      expect(outcomes).toHaveBeenCalledTimes(4)
+      outcomes.mockClear()
+      await a.order(await a.prepare({ operationId: 'after-recovery', program: event('after') }))
+      expect(outcomes).toHaveBeenCalledTimes(1)
+    } finally { outcomes.mockRestore(); materialize.mockRestore() }
+  })
+  it('still validates retained outcomes against full replay on reopen', async () => {
+    const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store)
+    const attempt = await a.prepare({ operationId: 'retained-result', program: event('accepted') })
+    await a.order(attempt); await a.close()
+    const key = `peer-generation/replica/${a.descriptor.applicationId}/result/${attempt.id}`
+    const result = decodePeerValue<AppliedResult>((await store.get(key))!)
+    await store.put(key, encodePeerValue({ ...result, outcome: 'rejected', rejectionCode: 'corrupt-result' }))
+    await expect(f.open(f.a, store)).rejects.toThrow('PEER_REPLAY_OUTCOME_CONFLICT')
+  })
+  it('checks an earlier outcome again when the materializer reports replay before the appended suffix', async () => {
+    const f = await fixture(), a = await f.open(f.a), runtime = f.materializers.get(a)!
+    const first = await a.prepare({ operationId: 'first', program: event('first') }); await a.order(first)
+    const materialize = runtime.coordinator.materialize.bind(runtime.coordinator), outcome = runtime.queries.outcome.bind(runtime.queries)
+    const replay = vi.spyOn(runtime.coordinator, 'materialize').mockImplementation(async (...args) => {
+      const result = await materialize(...args)
+      return result === null ? null : { ...result, revision: { ...result.revision, earliestChangedOrderIndex: 0 } }
+    })
+    const read = vi.spyOn(runtime.queries, 'outcome').mockImplementation(id => {
+      const result = outcome(id)
+      return bytesToHex(id) === first.id && result !== null ? { ...result, outcome: 'rejected', rejectionCode: 'changed-inherited-result' } : result
+    })
+    try {
+      await expect(a.order(await a.prepare({ operationId: 'later', program: event('later') }))).rejects.toThrow('PEER_REPLAY_OUTCOME_CONFLICT')
+    } finally { replay.mockRestore(); read.mockRestore() }
+  })
   it('adopts an older complete prefix, seeds a fresh peer and quarantines the returning suffix', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const one = await a.prepare({ operationId: 'one', program: event('one') })
