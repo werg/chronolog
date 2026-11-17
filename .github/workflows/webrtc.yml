@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 5da656d1dc7091aba61bea82ee4199ad46b8e299
+          ref: e90096809fa1fed4abf4f2fa57ce87a07307a9ac
           path: artifacts/contrib
           persist-credentials: false
       - name: Check out exact hosted participant
