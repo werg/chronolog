@@ -2,6 +2,7 @@ import type { AppliedResult, OperationState, PeerRevision, PeerStore } from '@ch
 import { assertCanonicalCbor, assertEventTopic, canonicalEventPayload, encodeCanonicalCbor, type EventPayload } from '@chronolog/protocol'
 
 import type { ApplicationChange, ApplicationEvent, ApplicationEventBatch, ApplicationEventOptions, QueryParameter, QueryRows } from '../session.js'
+import { ownSessionResource } from '../internals.js'
 
 /** A captured, verified application view, also implemented by the Worker facade. */
 export interface ApplicationConsumerView {
@@ -52,6 +53,7 @@ export class ConsumerJournal {
   readonly #binding: string
   readonly #maximum: number
   readonly #stop: () => void
+  readonly #release: () => void
   #active: Promise<unknown> | undefined
   #closed: Promise<void> | undefined
 
@@ -69,6 +71,8 @@ export class ConsumerJournal {
     const close = (): void => { void this.close() }
     options.session.signal.addEventListener('abort', close, { once: true })
     this.#stop = () => options.session.signal.removeEventListener('abort', close)
+    try { this.#release = ownSessionResource(options.session, this) }
+    catch (error) { this.#stop(); held.delete(this.#key); throw error }
   }
 
   async read(): Promise<unknown> {
@@ -91,6 +95,11 @@ export class ConsumerJournal {
     await this.#options.store.put(this.#key, bytes)
   }
 
+  reserve(value: unknown, additionalBytes: number): void {
+    const bytes = encodeCanonicalCbor([1n, this.#binding, JSON.stringify(value)])
+    if (bytes.length + additionalBytes > this.#maximum) throw new Error('APPLICATION_CONSUMER_STATE_LIMIT')
+  }
+
   run<T>(operation: () => Promise<T>): Promise<T> {
     this.signal.throwIfAborted()
     if (this.#active !== undefined) return Promise.reject(new Error('APPLICATION_CONSUMER_BUSY'))
@@ -104,6 +113,7 @@ export class ConsumerJournal {
       this.#abort.abort(new Error('APPLICATION_CONSUMER_CLOSED')); this.#stop()
       try { await this.#active } catch { /* The caller owns a failed or cancelled turn. */ }
       owners.get(this.#options.store)?.delete(this.#key)
+      this.#release()
     })()
     return this.#closed
   }

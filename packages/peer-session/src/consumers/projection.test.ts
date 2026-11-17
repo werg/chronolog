@@ -3,11 +3,29 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { ApplicationProjection } from './projection.js'
 import { consumerFixture, publish } from './test-support.js'
+import { ownSessionResource } from '../internals.js'
 
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 describe('generation-aware application projections', () => {
+  it('settles an active durable checkpoint before the session releases its storage owner', async () => {
+    const f = await consumerFixture(); cleanup.push(() => f.close())
+    await publish(f.a, 'message', 'one', 'one')
+    const durable = new MemoryPeerStore()
+    let entered!: () => void, release!: () => void
+    const writing = new Promise<void>(resolve => { entered = resolve }), blocked = new Promise<void>(resolve => { release = resolve })
+    const store: PeerStore = { get: key => durable.get(key), async put(key, value) { entered(); await blocked; await durable.put(key, value) } }
+    const projection = await ApplicationProjection.open({ id: 'close-order', version: '1', session: f.a, store, initial: () => 0, reduce: (n: number) => n + 1 })
+    const checkpoint = projection.catchUp(); await writing
+    let closed = false
+    const closing = f.a.close().then(() => { closed = true })
+    await Promise.resolve(); await Promise.resolve()
+    expect(f.a.signal.aborted).toBe(true); expect(closed).toBe(false)
+    expect(() => ownSessionResource(f.a, { close() {} })).toThrow()
+    release(); await checkpoint; await closing
+    expect(closed).toBe(true)
+  })
   it('rebuilds the selected prefix as one coherent checkpoint and resumes it after reopening', async () => {
     const f = await consumerFixture(); cleanup.push(() => f.close())
     await publish(f.a, 'message', 'keep', 'keep')

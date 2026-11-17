@@ -1,4 +1,4 @@
-import { sessionInternals as internals } from './internals.js'
+import { closeSessionResources, sessionInternals as internals } from './internals.js'
 import {
   PEER_GENERATION_CAPABILITIES, type PeerReplica, type PeerRevision, type AppliedResult,
   type OperationState, type AuthorityBundle, type RecoveryNotice, type SignedAttempt,
@@ -335,7 +335,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       internals.get(this)!.signals.close()
       this.content.close()
       await Promise.allSettled([...this.#inflight.values(), ...closing])
-      try { await this.#replica.close() } finally { await this.#closing?.() }
+      try { await closeSessionResources(this) }
+      finally { try { await this.#replica.close() } finally { await this.#closing?.() } }
     })
     this.#closed = true; this.#lifetime.abort(new Error('APPLICATION_SESSION_CLOSED'))
     this.#publishStatus(); this.#statusListeners.clear(); this.#stopStatus(); this.#stopKeys()

@@ -4,6 +4,7 @@ import type { EphemeralSignal, SignalPayload, SignalSendOptions, Signals, Signal
 import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from './definition.js'
 import type { ContentReference, ContentRetention, ContentUpload } from './content.js'
 import type { ApplicationControlHost, ApplicationTransition } from './recovery.js'
+import { closeSessionResources } from './internals.js'
 import {
   AbandonedOperationError, RecoveredViewError, type ApplicationChange, type ApplicationEventBatch, type ApplicationPeerAvailability,
   type ApplicationEventOptions, type ApplicationReadView, type ApplicationSession, type CommandOptions,
@@ -320,7 +321,10 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   close(): Promise<void> {
     if (this.#closing !== undefined) return this.#closing
     this.#closing = (async () => {
-      try { if (!this.signal.aborted) await this.#call('close', []) }
+      try {
+        try { await closeSessionResources(this) }
+        finally { if (!this.signal.aborted) await this.#call('close', []) }
+      }
       catch (error) { if (!this.signal.aborted) throw error }
       finally { this.#fail(new Error('APPLICATION_SESSION_CLOSED')) }
     })()
