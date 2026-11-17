@@ -31,6 +31,10 @@ export async function openApplicationDevice(options: {
   readonly close?: () => void | Promise<void>
 }): Promise<ApplicationDevice> {
   let raw = await options.store.get(DEVICE_KEY), binding = await options.store.get(DEVICE_BINDING)
+  // Atomic initialization can commit between these separate metadata reads.
+  // Its immutable binding confirms creation finished; check the signer again
+  // before treating an earlier missing value as lost keys.
+  if (raw === null && binding !== null) raw = await options.store.get(DEVICE_KEY)
   let identity: PeerIdentity, storageId: string
   if (raw === null) {
     if (binding !== null) throw new Error('APPLICATION_DEVICE_KEYS_MISSING')

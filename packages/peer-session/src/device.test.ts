@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { assertCanonicalCbor, encodeCanonicalCbor } from '@chronolog/protocol'
 import { MemoryBytesStore, type BytesStore } from '@chronolog/peer-generation'
-import { openApplicationDevice } from './device.js'
+import { openApplicationDevice, type ApplicationDevice } from './device.js'
 
 describe('owned application device identities', () => {
   it('keeps protocol identity independent of lazy data storage and coalesces first use', async () => {
@@ -96,6 +96,30 @@ describe('owned application device identities', () => {
     await expect(openApplicationDevice({ store: damaged })).rejects.toThrow('APPLICATION_DEVICE_KEYS_MISSING')
     await expect(openApplicationDevice({ store: damaged, create: true })).rejects.toThrow('APPLICATION_DEVICE_KEYS_MISSING')
     expect(writes).toBe(0)
+  })
+
+  it.each([false, true])('resumes a concurrent identity created between metadata reads (create: %s)', async create => {
+    const store = new MemoryBytesStore(), writes = vi.fn(), openStorage = vi.fn()
+    let firstRead = true, concurrent: ApplicationDevice | undefined
+    const metadata: BytesStore = {
+      async get(key) {
+        const value = await store.get(key)
+        if (key === 'peer-session/device/v1' && firstRead) {
+          firstRead = false
+          // Another tab commits both records after this read saw no signer,
+          // before this caller reads the binding in its next transaction.
+          concurrent = await openApplicationDevice({ store, create: true })
+        }
+        return value
+      },
+      put: writes,
+    }
+    const resumed = await openApplicationDevice({ store: metadata, openStorage, ...(create ? { create: true } : {}) })
+    expect(concurrent).toBeDefined()
+    expect(resumed.identity.publicKey).toBe(concurrent!.identity.publicKey)
+    expect(resumed.storageId).toBe(concurrent!.storageId)
+    expect(writes).not.toHaveBeenCalled(); expect(openStorage).not.toHaveBeenCalled()
+    await resumed.close(); await concurrent!.close()
   })
 
   it('verifies the signing private key when resuming the stored identity', async () => {
