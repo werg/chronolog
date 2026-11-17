@@ -1,4 +1,4 @@
-import { bytesToBase64Url, emit, encodeChangeProgram, program, type EventBatch, type ViewChangeOptions } from '@chronolog/protocol'
+import { bytesToBase64Url, emit, encodeChangeProgram, program, type EventBatch, type ApplicationChangeOptions } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 import type { EphemeralSignal, SignalSubscribeOptions } from '@chronolog/signals'
 
@@ -67,7 +67,7 @@ describe('application RPC', () => {
   })
 
   it('routes view changes separately from events and cancels them when their service closes', async () => {
-    const calls: ViewChangeOptions[] = []
+    const calls: ApplicationChangeOptions[] = []
     const service = new NodeRpcService({ node: node({ changes: options => ({ async *[Symbol.asyncIterator]() {
       calls.push(options!)
       yield { view: options!.view!, revision: 'view-1', finalRevision: 'final-1' }
@@ -95,21 +95,21 @@ describe('application RPC', () => {
     const publish = vi.fn()
     const send = vi.fn(async () => value)
     const subscriptions: SignalSubscribeOptions[] = []
-    const service = new NodeRpcService({ node: node({ publish }), signals: { send,
+    const service = new NodeRpcService({ node: node({ publish }), now: () => 1, signals: { send,
       subscribe: options => ({ async *[Symbol.asyncIterator]() { subscriptions.push(options!); yield value } }),
     } })
     const server = new HttpRpcServer({ service, port: 0 })
     const transport = new HttpRpcTransport({ baseUrl: (await server.listen()).url })
     try {
-      expect(await transport.unary('signals.send', { ...request, topic: 'typing', payload: value.payload, ttlMs: 999 })).toEqual(value)
+      expect(await transport.unary('signals.send', { groupId: group, topic: 'typing', payload: value.payload, ttlMs: 999, expiresAtMs: 1000 })).toEqual(value)
       expect(send).toHaveBeenCalledWith('typing', value.payload, expect.objectContaining({ ttlMs: 999, signal: expect.any(AbortSignal) }))
       const received = []
-      for await (const signal of transport.stream('signals.subscribe', { ...request, topics: ['typing'], mode: 'latest' })) received.push(signal)
+      for await (const signal of transport.stream('signals.subscribe', { groupId: group, topics: ['typing'], mode: 'latest' })) received.push(signal)
       expect(received).toEqual([value])
       expect(subscriptions).toHaveLength(1)
       expect(subscriptions[0]).toMatchObject({ topics: ['typing'], mode: 'latest' })
       expect(publish).not.toHaveBeenCalled()
-      await expect(transport.unary('signals.send', { ...request, groupId: 'wrong', topic: 'typing', payload: null })).rejects.toMatchObject({ code: 'not_found' })
+      await expect(transport.unary('signals.send', { groupId: 'wrong', topic: 'typing', payload: null, expiresAtMs: Date.now() + 5000 })).rejects.toMatchObject({ code: 'not_found' })
       expect(send).toHaveBeenCalledTimes(1)
     } finally { await transport.close(); await server.close() }
   })
@@ -121,11 +121,34 @@ describe('application RPC', () => {
       return new Promise<EphemeralSignal>((_resolve, reject) => lifetime!.addEventListener('abort', () => reject(lifetime!.reason), { once: true }))
     }), subscribe: () => ({ async *[Symbol.asyncIterator]() { /* no history to replay */ } }), close: vi.fn() }
     const service = new NodeRpcService({ node: node({}), signals })
-    const sent = service.sendSignal({ ...request, topic: 'typing', payload: null }, { method: 'signals.send' })
+    const sent = service.sendSignal({ groupId: group, topic: 'typing', payload: null, expiresAtMs: Date.now() + 5000 }, { method: 'signals.send' })
     const rejected = expect(sent).rejects.toMatchObject({ code: 'cancelled' })
     await service.close(); await rejected
     expect(lifetime?.aborted).toBe(true)
     expect(signals.close).not.toHaveBeenCalled()
+  })
+
+  it('preserves the node-owner operation identity across HTTP bearer rotation', async () => {
+    const identities: string[] = []
+    const instance = node({
+      publish: async input => { identities.push(input.operationId); return published },
+      operation: async id => id === identities[0]
+        ? { operationId: id, proposalId: 'tx-a', final: true, outcome: { outcome: 'accepted', rejectionCode: null, failingStatementIndex: null } } : null,
+    })
+    const input = { ...request, operationId: 'durable-intent', program: encodeChangeProgram(program(emit('jobs', {}))) }
+    for (const token of ['before-rotation', 'after-rotation']) {
+      const server = new HttpRpcServer({ service: new NodeRpcService({ node: instance }), port: 0, token })
+      const address = await server.listen()
+      const transport = new HttpRpcTransport({ baseUrl: address.url, token })
+      try {
+        await transport.unary('change.submit', input)
+        expect(await transport.unary('operation.get', { ...request, operationId: input.operationId })).toMatchObject({ final: true, proposalId: 'tx-a' })
+        const denied = await fetch(`${address.url}/rpc/unary/change.submit`, { method: 'POST', headers: { authorization: 'Bearer invalid' }, body: '{}' })
+        expect(denied.status).toBe(401)
+      } finally { await transport.close(); await server.close() }
+    }
+    expect(identities).toHaveLength(2)
+    expect(identities[1]).toBe(identities[0])
   })
 
   it('closes the owning service once when HTTP shutdown calls overlap', async () => {
@@ -160,7 +183,7 @@ describe('application RPC', () => {
     const transport = new InProcessRpcTransport(service)
     const change = program(emit('conversation', { text: 'Hello' }))
     const result = await transport.unary('change.submit', { ...request, operationId: 'message-1', program: encodeChangeProgram(change) }, { metadata: { principal: 'alice' } })
-    await transport.unary('transaction.submit', { ...request, idempotencyKey: 'message-1', steps: [{ emit: { topic: 'conversation', payload: { text: 'Hello' } } }] }, { metadata: { principal: 'alice' } })
+    await transport.unary('transaction.submit', { ...request, operationId: 'message-1', steps: [{ emit: { topic: 'conversation', payload: { text: 'Hello' } } }] }, { metadata: { principal: 'alice' } })
     await transport.unary('change.submit', { ...request, operationId: 'message-1', program: encodeChangeProgram(change) }, { metadata: { principal: 'bob' } })
     expect(result).toMatchObject({ operationId: 'message-1', proposalId: 'tx-a', transactionId: 'tx-a', durableLocalAppend: true })
     expect(publish.mock.calls[0]![0].program).toEqual(change)
@@ -176,11 +199,11 @@ describe('application RPC', () => {
     const instance = node({ publish: async input => { identity = input.operationId; return published }, operation: async id => id === identity
       ? { operationId: id, proposalId: 'tx-a', final: true, outcome: { outcome: 'rejected', rejectionCode: 'assert:closed', failingStatementIndex: 0 } } : null })
     const first = new NodeRpcService({ node: instance })
-    await first.submitChange({ ...request, operationId: 'claim-1', program: encodeChangeProgram(program(emit('tasks', {}))) }, { method: 'change.submit', token: 'alice' })
+    await first.submitChange({ ...request, operationId: 'claim-1', program: encodeChangeProgram(program(emit('tasks', {}))) }, { method: 'change.submit', metadata: { principal: 'alice' } })
     await first.close()
     const reopened = new NodeRpcService({ node: instance })
-    expect(await reopened.getOperation({ ...request, operationId: 'claim-1' }, { method: 'operation.get', token: 'alice' })).toMatchObject({ operationId: 'claim-1', final: true, outcome: { rejectionCode: 'assert:closed' } })
-    expect(await reopened.getOperation({ ...request, operationId: 'claim-1' }, { method: 'operation.get', token: 'bob' })).toBeNull()
+    expect(await reopened.getOperation({ ...request, operationId: 'claim-1' }, { method: 'operation.get', metadata: { principal: 'alice' } })).toMatchObject({ operationId: 'claim-1', final: true, outcome: { rejectionCode: 'assert:closed' } })
+    expect(await reopened.getOperation({ ...request, operationId: 'claim-1' }, { method: 'operation.get', metadata: { principal: 'bob' } })).toBeNull()
     await reopened.close()
   })
 
@@ -206,20 +229,20 @@ describe('application RPC', () => {
     const capture = vi.fn(async () => readHandle(revision, () => { released++ }))
     const service = new NodeRpcService({ node: node({ readView: capture }), maxReadViews: 1 })
     const transport = new InProcessRpcTransport(service)
-    const captured = await transport.unary('view.open', request, { token: 'alice' })
+    const captured = await transport.unary('view.open', request, { metadata: { principal: 'alice' } })
     revision = 'view-2'
-    expect(await transport.unary('view.open', request, { token: 'alice' })).toEqual(captured)
+    expect(await transport.unary('view.open', request, { metadata: { principal: 'alice' } })).toEqual(captured)
     expect(capture).toHaveBeenCalledTimes(1)
-    await expect(transport.unary('view.open', { ...request, requestId: 'second' }, { token: 'alice' })).rejects.toMatchObject({ code: 'resource_exhausted' })
-    await expect(transport.unary('view.open', { ...request, view: 'local' }, { token: 'alice' })).rejects.toMatchObject({ code: 'already_exists' })
+    await expect(transport.unary('view.open', { ...request, requestId: 'second' }, { metadata: { principal: 'alice' } })).rejects.toMatchObject({ code: 'resource_exhausted' })
+    await expect(transport.unary('view.open', { ...request, view: 'local' }, { metadata: { principal: 'alice' } })).rejects.toMatchObject({ code: 'already_exists' })
     const selected = { ...request, viewId: captured.viewId }
-    const query = await transport.unary('view.query', { ...selected, sql: 'SELECT v', parameters: [] }, { token: 'alice' })
+    const query = await transport.unary('view.query', { ...selected, sql: 'SELECT v', parameters: [] }, { metadata: { principal: 'alice' } })
     expect(query.rows).toEqual([[{ kind: 'text', value: 'view-1' }]])
-    expect((await transport.unary('view.events', selected, { token: 'alice' })).revision).toBe('view-1')
-    await expect(transport.unary('view.events', selected, { token: 'bob' })).rejects.toMatchObject({ code: 'revision_unavailable' })
-    await transport.unary('view.release', selected, { token: 'alice' })
+    expect((await transport.unary('view.events', selected, { metadata: { principal: 'alice' } })).revision).toBe('view-1')
+    await expect(transport.unary('view.events', selected, { metadata: { principal: 'bob' } })).rejects.toMatchObject({ code: 'revision_unavailable' })
+    await transport.unary('view.release', selected, { metadata: { principal: 'alice' } })
     expect(released).toBe(1)
-    await transport.unary('view.open', { ...request, requestId: 'second' }, { token: 'alice' })
+    await transport.unary('view.open', { ...request, requestId: 'second' }, { metadata: { principal: 'alice' } })
     await transport.close()
     expect(released).toBe(2)
   })
@@ -238,9 +261,9 @@ describe('application RPC', () => {
     const service = new NodeRpcService({ node: node({}) })
     await expect(service.readEvents(request, { method: 'events.read' })).rejects.toMatchObject({ code: 'failed_precondition' })
     await expect(service.openReadView(request, { method: 'view.open' })).rejects.toMatchObject({ code: 'failed_precondition' })
-    expect(() => service.viewChanges({ groupId: group }, { method: 'view.changes' })).toThrowError(expect.objectContaining({ code: 'failed_precondition' }))
-    await expect(service.sendSignal({ ...request, topic: 'typing', payload: null }, { method: 'signals.send' })).rejects.toMatchObject({ code: 'failed_precondition' })
-    await expect(service.subscribeSignals(request, { method: 'signals.subscribe' })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'failed_precondition' })
+    expect(() => service.changes({ groupId: group }, { method: 'view.changes' })).toThrow(expect.objectContaining({ code: 'failed_precondition' }))
+    await expect(service.sendSignal({ groupId: group, topic: 'typing', payload: null, expiresAtMs: Date.now() + 5000 }, { method: 'signals.send' })).rejects.toMatchObject({ code: 'failed_precondition' })
+    await expect(service.subscribeSignals({ groupId: group }, { method: 'signals.subscribe' })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'failed_precondition' })
     await service.close()
   })
 

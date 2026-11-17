@@ -23,10 +23,10 @@ export type RpcInterceptor = <T>(
 const unaryDispatch: {
   [M in UnaryRpcMethod]: keyof ChronologRpcService
 } = {
+  'signals.send': 'sendSignal',
   'change.submit': 'submitChange',
   'ingress.submit': 'submitSigned',
   'events.read': 'readEvents',
-  'signals.send': 'sendSignal',
   'operation.get': 'getOperation',
   'view.open': 'openReadView',
   'view.query': 'queryReadView',
@@ -52,9 +52,9 @@ const unaryDispatch: {
 const streamDispatch: {
   [M in StreamRpcMethod]: keyof ChronologRpcService
 } = {
-  'view.changes': 'viewChanges',
-  'events.subscribe': 'subscribeEvents',
   'signals.subscribe': 'subscribeSignals',
+  'view.changes': 'changes',
+  'events.subscribe': 'subscribeEvents',
   'operation.subscribe': 'subscribeOperations',
   'node.streamStatus': 'streamStatus',
   'query.liveSql': 'liveSql',

@@ -10,7 +10,7 @@ import {
 import { ChronologNode, Mutex, membershipDescriptor, provisionMembership } from '@chronolog/node-core'
 import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
 import {
-  CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog,
+  SignedInclusionFinalityProvider, decodeOrderingEvidence, ReferenceRecordLog,
 } from '@chronolog/node-core/history'
 import { digestExecutionManifest, equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
@@ -112,7 +112,7 @@ describe('Tendriller coordinated SQL connection', () => {
       const transport = adapter ?? local
       const materializer = await DeterministicMaterializer.open({ path: join(directory, `${name}.db`), executionManifest,
         rootAdministrator: aliceKey.publicKeyBytes })
-      const policy = await CoordinatedHistoryPolicy.open(authority.configuration, saved)
+      const policy = await SignedInclusionFinalityProvider.open(authority.configuration, saved)
       const node = new ChronologNode({
         groupId: authority.configuration.groupId, membershipRevision: bytes32(13), validationPolicy: bytes32(14), identity,
         transport, operationStore: saved, historyPolicy: { kind: 'coordinated', policy },
@@ -173,7 +173,7 @@ describe('Tendriller coordinated SQL connection', () => {
     expect((await alice.client.getTransactionOutcome(aliceClaim.transactionId)).outcome.type).toBe('pending')
     expect((await bob.client.getTransactionOutcome(bobClaim.transactionId)).outcome.type).toBe('pending')
     await sync()
-    const outcomes = await Promise.all([aliceClaim.settled(), bobClaim.settled()])
+    const outcomes = await Promise.all([aliceClaim.provisional(), bobClaim.provisional()])
     expect(outcomes.map((outcome) => outcome.outcome.type)).toEqual(['rejected', 'accepted'])
     const losing = outcomes.find((outcome) => outcome.outcome.type === 'rejected')!
     expect(losing.outcome).toMatchObject({ type: 'rejected', rejection: { code: 'assert:already_claimed' } })

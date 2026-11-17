@@ -19,7 +19,7 @@ interface Snapshot {
   readonly revision: string
   readonly finalRevision: string
   readonly records: string[]
-  readonly transactions: Array<{ txId: string; canonical: string; sequence: string }>
+  readonly transactions: Array<{ txId: string; canonical: string }>
 }
 
 const workspace = resolve(import.meta.dirname, '..')
@@ -84,7 +84,7 @@ const compare = async (state: Snapshot): Promise<void> => {
     rootAdministrator: base64UrlToBytes(state.identity), checkpointEvery: 1 })
   const transactions = await Promise.all(state.transactions.map(async (row) => {
     const canonicalCandidate = base64UrlToBytes(row.canonical)
-    return { txId: base64UrlToBytes(row.txId), authorFeedSequence: BigInt(row.sequence), canonicalCandidate,
+    return { txId: base64UrlToBytes(row.txId), canonicalCandidate,
       candidateDigest: await transactionDigest(canonicalCandidate), core: decodeTransactionCore(canonicalCandidate) }
   }))
   await native.materialize(transactions)

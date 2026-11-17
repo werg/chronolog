@@ -1,3 +1,4 @@
+import type { ApplicationChange } from '@chronolog/protocol'
 import type { EphemeralSignal } from '@chronolog/signals'
 import type {
   ApproveEnrollmentRequest,
@@ -38,17 +39,16 @@ import type {
   GrantHistoricalAccessResponse,
   SubmitChangeRequest, SubmitChangeResponse, SubmitSignedRequest,
   EventReadRequest, EventReadResponse,
-  SendSignalRequest, SubscribeSignalsRequest,
   GetOperationRequest, OperationStatus, StreamOperationsRequest,
   OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
-  ViewChangesRequest, ViewChange,
+  SignalSendRequest, SignalSubscribeRequest, ChangesRequest,
 } from './types.js'
 
 export interface RpcCallOptions { readonly signal?: AbortSignal; readonly token?: string; readonly timeoutMs?: number; readonly metadata?: Readonly<Record<string, string>> }
 export interface RpcCallContext extends RpcCallOptions { readonly method: RpcMethod; readonly peer?: string }
 
 export interface UnaryRpcMethods {
-  'signals.send': { request: SendSignalRequest; response: EphemeralSignal }
+  'signals.send': { request: SignalSendRequest; response: EphemeralSignal }
   'change.submit': { request: SubmitChangeRequest; response: SubmitChangeResponse }
   'ingress.submit': { request: SubmitSignedRequest; response: SubmitTransactionResponse }
   'events.read': { request: EventReadRequest; response: EventReadResponse }
@@ -74,8 +74,8 @@ export interface UnaryRpcMethods {
   'enrollment.getStatus': { request: GetEnrollmentStatusRequest; response: EnrollmentStatus }
 }
 export interface StreamRpcMethods {
-  'view.changes': { request: ViewChangesRequest; response: ViewChange }
-  'signals.subscribe': { request: SubscribeSignalsRequest; response: EphemeralSignal }
+  'signals.subscribe': { request: SignalSubscribeRequest; response: EphemeralSignal }
+  'view.changes': { request: ChangesRequest; response: ApplicationChange }
   'events.subscribe': { request: EventReadRequest; response: EventReadResponse }
   'operation.subscribe': { request: StreamOperationsRequest; response: OperationStatus }
   'node.streamStatus': { request: StreamStatusRequest; response: NodeStatus }
@@ -97,8 +97,9 @@ export interface RpcTransport {
   close?(): Promise<void>
 }
 export interface ChronologRpcService {
-  sendSignal(request: SendSignalRequest, context: RpcCallContext): Promise<EphemeralSignal>
-  subscribeSignals(request: SubscribeSignalsRequest, context: RpcCallContext): AsyncIterable<EphemeralSignal>
+  sendSignal(request: SignalSendRequest, context: RpcCallContext): Promise<EphemeralSignal>
+  subscribeSignals(request: SignalSubscribeRequest, context: RpcCallContext): AsyncIterable<EphemeralSignal>
+  changes(request: ChangesRequest, context: RpcCallContext): AsyncIterable<ApplicationChange>
   submitChange(request: SubmitChangeRequest, context: RpcCallContext): Promise<SubmitChangeResponse>
   submitSigned(request: SubmitSignedRequest, context: RpcCallContext): Promise<SubmitTransactionResponse>
   readEvents(request: EventReadRequest, context: RpcCallContext): Promise<EventReadResponse>
@@ -106,7 +107,6 @@ export interface ChronologRpcService {
   getOperation(request: GetOperationRequest, context: RpcCallContext): Promise<OperationStatus | null>
   subscribeOperations(request: StreamOperationsRequest, context: RpcCallContext): AsyncIterable<OperationStatus>
   openReadView(request: OpenReadViewRequest, context: RpcCallContext): Promise<OpenReadViewResponse>
-  viewChanges(request: ViewChangesRequest, context: RpcCallContext): AsyncIterable<ViewChange>
   queryReadView(request: QueryReadViewRequest, context: RpcCallContext): Promise<LocalSqlResult>
   eventsReadView(request: EventsReadViewRequest, context: RpcCallContext): Promise<EventReadResponse>
   releaseReadView(request: ReadViewRequest, context: RpcCallContext): Promise<{ readonly released: true }>

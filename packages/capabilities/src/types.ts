@@ -14,6 +14,7 @@ export interface ProgramRights {
 
 interface CapabilityIdentity {
   readonly subjectId: Uint8Array
+  /** A validator key has exactly one active validator grant per revision. */
   readonly signingPublicKey: Uint8Array
   /** Authenticated outer replication feed authorized for this capability. */
   readonly transportAuthor?: string
@@ -31,7 +32,7 @@ export type CapabilityGrant = CapabilityGrantInput & { readonly validFromRevisio
 
 export interface ValidationPolicy {
   readonly version: bigint
-  /** Distinct authorized validators whose attestations admit a candidate. */
+  /** Distinct authorized signing keys whose attestations admit a candidate. */
   readonly minimumValidators: bigint
 }
 

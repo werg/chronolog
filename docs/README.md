@@ -19,9 +19,9 @@ resolves.
 
 - **Developer:** [README](../README.md), [peer application architecture](peer-application-architecture.md), [portable peers](portable-peers.md), then [design](design.md) and
   [Specification 10](implementation-specs/10-deterministic-sql-transactions.md).
-- **Application/agent author:** [Application primitives](application-primitives.md),
-  [signals](../packages/signals/README.md), [resident service](../packages/agent-service/README.md)
-  and [browser runtimes](../packages/runtime-browser/README.md).
+- **Application/agent author:** [Application architecture](application-primitives.md),
+  [application-log implementation and evidence](plans/application-log.md),
+  [resident service](../packages/agent-service/README.md) and [browser runtimes](../packages/runtime-browser/README.md).
 - **Operator:** [Pilot runbook](pilot-runbook.md), then
   [governance](governance.md), [snapshot recovery](snapshot-recovery.md) and
   [release hardening](release-hardening.md).
@@ -41,9 +41,8 @@ resolves.
 
 | Document | Status | Contents |
 | --- | --- | --- |
-| [application-primitives.md](application-primitives.md) | Application guide | Signals, durable events, SQL, finality, replay, retries, authority roles and external effects. |
-| [pluggable-finality.md](pluggable-finality.md) | Architecture and integration | Deterministic author-time order, inclusion, signed closure promises and the provider extension boundary. |
-| [plans/application-log.md](plans/application-log.md) | Implementation and qualification | Durable events, native finality, signed ingress, coherent projections, worker/timer recovery and the public contrib pilot. |
+| [application-primitives.md](application-primitives.md) | Architecture and guide | Primitive selection, operation lifecycle, coherent views, authority roles, replay, agent effects and live signals. |
+| [plans/application-log.md](plans/application-log.md) | Implementation and qualification | Durable events, native authority, signed ingress, coherent projections, worker/timer recovery and the public contrib pilot. |
 | [portable-peers.md](portable-peers.md) | Architecture and integration | Two history policies, portable records, durable proposals, actual final SQL and live enrollment. |
 | [peer-application-architecture.md](peer-application-architecture.md) | Architecture and integration | Thin page host, compact participants, owned WebRTC sessions, live signals and independent finality. |
 | [implementation-status.md](implementation-status.md) | Status | What works end to end and what remains. |

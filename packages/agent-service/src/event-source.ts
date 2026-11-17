@@ -12,8 +12,27 @@ export interface FinalEventSource {
 }
 
 export interface FinalEventPublisher {
-  /** Resolve only after final acceptance. Cancellation interrupts waiting, not a prepared operation's identity. */
+  /**
+   * Resolve only after final acceptance. Use FinalEventPublicationRejectedError
+   * only for verified final rejection; transport ambiguity is an ordinary error.
+   * Cancellation interrupts waiting, not a prepared operation's identity.
+   */
   publishFinal(topic: string, payload: EventPayload, options: { readonly operationId: string; readonly signal?: AbortSignal }): Promise<void>
+}
+
+/** A trusted publisher proved a final rejection; transport ambiguity must not use this error. */
+export class FinalEventPublicationRejectedError extends Error {
+  constructor(readonly proposalId: string, readonly rejectionCode: string | null) {
+    super(`FINAL_EVENT_PUBLICATION_REJECTED: ${rejectionCode ?? 'unknown'}`)
+    this.name = 'FinalEventPublicationRejectedError'
+  }
+}
+
+export interface FinalEventPublicationRejection {
+  readonly attempt: number
+  readonly operationId: string
+  readonly proposalId: string
+  readonly rejectionCode: string | null
 }
 
 export function validateConsumerId(value: string): void {

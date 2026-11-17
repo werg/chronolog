@@ -1,174 +1,77 @@
 # Application primitives, finality and authority
 
-Start with the guarantee the application needs. Chronolog offers a live message
-path and a durable application log. Signals can be used on their own. The default
-Tendriller application mode is live collaboration: signed timestamp ordering,
-deterministic replay, and a provisional suffix above an immutable final prefix.
-SQL is an optional execution profile of that log. A future asynchronous
-branch/merge mode can share signed operations, timestamp ordering and replay;
-it has no finality concept, API or provisional/final states. It would define its
-own inclusion and merge rules and is not implemented by the live API.
+Chronolog is a replicated application log. A signed program can change SQL state
+and emit durable facts atomically; an event-only profile runs without SQL. Peers
+agree on inclusion, derive one fixed order, and execute locally. A separate live
+signal channel carries transient messages and works without that log. Tendriller
+supplies hosting and application bindings; it does not implicitly own the peer
+database or its trust policy.
 
-## Choose the primitive
+This is the entry point for application and agent authors. The protocol details
+live in [pluggable finality](pluggable-finality.md) and the
+[SQL specification](implementation-specs/10-deterministic-sql-transactions.md).
+All formats are pre-release: changed formats reject old input, with no migration
+or compatibility layer.
 
-| Need | Primitive | What the caller gets |
+## Choose the primitive by the promise you need
+
+| Primitive | Promise | Typical uses |
 | --- | --- | --- |
-| Typing, presence, cursors, live progress, previews, telemetry whose loss is acceptable | `signals.send(topic, payload)` | A signed, expiring live message. No persistence, retry outbox, replay, transaction or finality wait. |
-| Chat, an audit record, a durable command or a completed result | `events.publish(topic, payload, { operationId })` | A durable proposal. Effective events are exposed after final acceptance. |
-| A change that must preserve an invariant, or a state change and event that must agree | `submit(program(...), { operationId })` | One atomic SQL/event program, with a durable accepted or rejected outcome. |
-| Payment, email, a provider call or another irreversible action | A final intent event and one designated effect worker | Durable dispatch state plus an explicit provider idempotency, reconciliation or manual recovery contract. |
-| A local display/cache derived from durable events | A checkpointed projection | Rebuildable state and processed progress committed together. |
-| Refresh a screen after applied SQL, events, replay or finality changes | `changes({ view })` followed by `readView({ view })` | The current applied view identity, then coalesced invalidations; each captured read remains coherent until released. |
+| `signals.send` / `signals.subscribe` | Authenticated live delivery with expiry and bounded resources. No durable recovery or finality. | Presence, typing, pointers, progress, preview chunks, transient actions, device samples. |
+| `submit(program, { operationId })` | One durable signed operation; SQL changes and emitted facts accept or reject together. Exact retries retain identity. | Claims, permissions, task changes, mixed state/event updates. |
+| `events.publish` / `events.subscribe` | Durable facts; final readers deliver complete accepted programs with resumable progress. | Conversation, audit, jobs, agent intent, replayable projections. |
+| `changes({ view })` + `readView({ view })` | Initial state and coalesced invalidations, then a coherent SQL/event snapshot. | Screens, local optimistic feedback, finality indicators. |
 
-Ephemeral does not mean restricted to presence. Choose signals whenever losing
-an individual message, missing messages while disconnected, and receiving a
-newer value are acceptable. Persist the final result separately when it matters.
-An action that must happen after reconnect is a durable intent, even when it
-does not need SQL.
+An event-only execution profile runs durable events without loading SQL.
+The shipped final event readers require inclusion and finality; a proposal can
+be durably retained before either. If recovery is unnecessary, use signals
+directly; they are an independent package, not an event-only database.
 
-```ts
-// These return different guarantees deliberately.
-await client.signals.send('typing', { active: true }, { ttlMs: 3_000 })
+### Live signals
 
-const message = await client.events.publish('conversation', {
-  text: 'The analysis is ready.',
-}, { operationId: durableMessageId })
-const final = await message.final()
-if (final.outcome.type === 'rejected') handleRejection(final.outcome.rejection)
-message.dispose()
-```
+`@chronolog/signals` depends on WebCrypto and JSON, not Chronolog records,
+membership, SQL, validators, or finality. Applications provide a signing identity,
+an authorization function, and live routes. Browser peers and resident agents
+provide those bindings through `peer.signals`, `client.signals`, and
+`context.signals`. Governed peer connections carry replication and signals on
+independent reliable and live lanes under one authenticated connection owner.
+Closing that physical connection removes both routes. The signal service and
+its subscriptions can outlive an individual route and use other attached peers;
+a reliable-only connection installs no signal route.
 
-The standalone [`@chronolog/signals`](../packages/signals/README.md) package
-depends on canonical encoding, not the database protocol, capabilities,
-membership history, finality or an SQL engine. Its explicit authorization callback
-can use the application's own session or credential policy. The Chronolog group
-adapter checks active signal-topic rights; it still does not submit a ledger
-record. Native and browser replicas expose the same `client.signals` API and
-attach it to their live peer connections.
+`mode: 'all'` preserves arrival order in a bounded FIFO. A live transport may drop
+or reorder messages, so include chunk indices when the application needs to
+reconstruct a sequence or detect gaps. `mode: 'latest'` replaces pending state
+from the same author, session, and topic. Use it for presence and current progress. Overflow ends a subscription
+with an explicit error. Neither mode claims reliable delivery through a
+disconnect. A completed send means local dispatch on a live route, not remote
+receipt or execution. Reconnect never replays signals.
 
-Signal listeners choose `mode: 'latest'` for replaceable state such as a cursor
-or progress value. The bounded `all` mode preserves messages accepted into that
-live subscription; it does not promise network delivery or reconnect replay.
-Neither mode provides a durable command queue. Cancellation or a send timeout
-does not prove a remote callback did not run. See the signals package for exact
-limits, loss, ordering, authorization and encryption semantics.
+Signatures preserve the original author through relays. Authorization uses that
+author, not the connecting relay or a payload role. Encryption and recipient
+admission belong to the transport. Expiry bounds message lifetime; applications
+also expire displayed presence. See the [signals contract](../packages/signals/README.md).
 
-## What finality means
+### Durable facts and coherent reads
 
-There are three decisions:
+An emit is a literal step of a signed program. If any step fails, the complete
+program rejects and contributes no effective events. Stable event IDs identify
+the proposal and event ordinal. Every effective event includes `origin` derived
+from the verified signed proposal: original author, group, operation ID, writer
+capability, membership revision, and author timestamp. Payloads cannot replace
+that provenance. A local RPC owner may delegate authoring to its node; the
+origin then names that node and its signed, principal-scoped operation identity.
 
-1. **Validity:** original signatures, group, execution profile, grants and the
-   program are valid.
-2. **Inclusion:** the selected provider proves which original records belong
-   to this history.
-3. **Finality:** a verified author-time closure proves that later first
-   inclusions cannot insert a proposal into the closed chronological prefix.
+`events.subscribe()` delivers final batches with a cursor bound to the history
+and normalized topic filter. Persist projection state and the **processed**
+cursor atomically. A cursor received in memory is not a committed checkpoint.
+Use `DurableProjection` for pure replayable caches. Do not send external requests
+from a reducer or replay callback.
 
-Every replica derives the application order from signed author timestamp,
-signing public key and stable proposal ID. The transport arrival order and the
-provider's receipt positions do not order application execution. A provider
-can affect which records are included; it cannot choose a different comparator.
-
-The selected provider proves finality; the local replica must also obtain and
-verify the required records, bodies and keys, then apply the prefix. A receipt,
-an open RTC connection, or knowledge of a newer certificate alone does not mean
-the application has applied that state.
-
-| Observation | Meaning |
-| --- | --- |
-| `submit` / `events.publish` returns | The original proposal has been durably published locally. |
-| `handle.settled()` returns | A current accepted or rejected result; it may still change through replay. |
-| `handle.accepted()` returns | Immutable locally applied acceptance. A final rejection throws `TransactionRejectedError`. |
-| `handle.final()` returns | An immutable locally applied accepted **or rejected** result. Inspect `outcome.type`. |
-| A final read view exists | A coherent snapshot of this replica's applied final prefix. It may lag another replica. |
-| `signals.send()` returns | Local live dispatch completed; it has no relationship to durable finality. |
-
-The Tendriller application port reports lifecycle separately from outcome. A
-rejection can be provisional; once immutable it is `status: 'final', outcome:
-'rejected'`. An exact retry recovers that final rejection without creating a new
-operation or waiting for another finality decision.
-
-Use final reads by default for shared business state. Use a local view when the
-UI intentionally presents speculative state and can replace it after replay.
-Not every locally submitted proposal is immediately in the local materialized
-view: admission and required inputs can still be pending. Wait cancellation
-stops the caller's wait and leaves a prepared durable operation intact.
-
-Author dependent work after observing its prerequisite's final accepted result,
-and keep the required business guards in the new program. Automatic timestamps
-advance past the replica's successfully applied history and verified closed-time
-frontier, even when its wall clock trails another writer. Reopening reconstructs
-that floor from retained proofs and application history. Merely receiving an
-unadmitted proposal does not advance it, and it creates no dependency on unseen
-work. Applications should preserve an original observation time as domain data
-instead of calculating ordering timestamps.
-
-Governed authoring uses the maximum future skew in signed genesis. If advancing
-the automatic clock would exceed that bound, new authoring fails with
-`AUTHOR_CLOCK_AHEAD`; it does not change the requested operation or its guards.
-Correct the clock before trying new intent again. Retrying an already prepared
-operation preserves its original timestamp and bytes.
-
-Signed genesis selects the trust policy. The built-in validator policy needs
-the specified validators' admission and closed-time evidence. The built-in
-signed-inclusion policy needs one pinned finality signer and its continuous
-retained history. Both are P2P replication systems. The second policy deliberately
-trades finality availability for a simpler single-service trust model. A signer
-can withhold inclusion; contradictory authentic promises are continuity errors,
-not a reason to silently select another history. There is no automatic signer,
-validator-set or provider replacement.
-
-Peer catch-up has a finite boundary: it captures retained feed and evidence
-heads and copies through those positions. Publication may continue while that
-copy finishes. Later hints or another catch-up collect the new tail. Catch-up
-does not promise that every application input is available or that a final
-target has been applied; those remain explicit materialization and finality
-checks. Availability heads carry no extra authority.
-
-## Replay, retries, redo and undo
-
-These operations have different meanings:
-
-| Operation | Identity and behavior |
-| --- | --- |
-| Retry a request whose response was lost | Reuse the exact `operationId` and program. Recover the original proposal and outcome. |
-| Replay after learning an earlier admitted proposal | The replica recomputes the provisional suffix in deterministic order, preserving original proposal identities. |
-| Redo a business action after a final rejection | Make a deliberate new proposal with a new operation ID and current assumptions. The old rejection remains final. |
-| Undo a final change | Submit a new compensating transaction. Final history is not erased or rolled back. |
-
-A locally authorized proposal may be selected for preview before consensus
-admission. That unadmitted preview can be removed when the proposal is excluded
-or loses authorization. Admission is a separate immutable inclusion decision:
-an admitted proposal cannot be removed or replaced, but its application result
-can remain provisional.
-
-A late proposal may change a provisional SQL outcome from accepted to rejected,
-or rejected to accepted. The materializer returns to a checkpoint before the
-affected suffix, re-executes pure programs and atomically publishes the new
-view. Events from rejected programs are suppressed. An established final prefix
-cannot change. The SQL-free event materializer preserves original proposal
-bytes and that final-prefix boundary while allowing unadmitted previews to leave
-the selected suffix.
-
-An uncertain storage acknowledgment requires reopening the event runtime before
-more replay or finality publication. A write may already have committed; it is
-unsafe to overwrite that stored prefix from older in-memory state. Reopening
-recovers the committed operation identities and final boundary.
-
-The UI replaces a complete captured view after a rebase; it must not accumulate
-irreversible side effects from speculative event callbacks. Capture SQL and
-events through one `readView()` when displaying them together. The capture pins
-one locally applied application prefix: its SQL rows, effective events and
-revision metadata agree even if new proof or replay arrives during rendering.
-Release the read lease after rendering. Durable projections and effect workers
-consume the final event stream using stable event IDs and processed checkpoints.
-
-A backdated proposal first included after its timestamp is closed receives
-`FINALITY_TIMESTAMP_CLOSED`. Re-signing it silently under a new timestamp would
-change its meaning. Exact retries still recover the original result. If the
-user wants to try again, create a new operation explicitly. Excessive future
-timestamps receive `FINALITY_TIMESTAMP_FUTURE`; a timestamp within the signed
-future window waits until its time closes.
+If the event runtime loses a storage acknowledgment, it refuses further mutation
+until reopened: the write may have committed, so replacing it from older
+in-memory state would be unsafe. Default `readView()` and durable event readers
+use the final view; choose `local` explicitly for speculative state.
 
 ## Observe and capture an application view
 
@@ -208,18 +111,146 @@ for expiring live messages. Neither is a substitute for application view
 invalidation: SQL-only replay may emit no event, and signals do not establish
 what durable state this replica has applied.
 
-## Give each authority a precise job
+## Submission, replay, and finality
 
-Co-location is a deployment choice. These are separate permissions and roles:
+A transaction has two independent properties:
 
-| Role | Owns | Does not acquire implicitly |
+| Property | Values | Meaning |
 | --- | --- | --- |
-| Membership administrator | Signed grants/revocations, reader-key delivery and roster history | Application writer rights, SQL ownership or the finality signing key |
-| Schema administrator | Initial schema-administration authority authenticated in genesis | Membership administration, reader keys or arbitrary ownership of other users' rows |
-| Finality service | Inclusion receipts and closed-time promises for one pinned history | Permission to author application writes, administer membership, read encrypted bodies or execute external effects |
-| Replica | Verification, local durable state, replay and reads permitted by its grants | Finality signer, membership administrator or effect-worker status |
-| Designated effect worker | One handler's durable processed checkpoint and provider dispatch/recovery | Distributed exactly-once execution merely because peers share a log |
-| Page host / introduction service | Assets, account access and bounded connection introductions | Database membership, execution order or application finality |
+| Lifecycle | `queued`, `provisional`, `final` | How stable the observed result is. |
+| Outcome | `accepted`, `rejected` | What executing the program did. |
+
+Before materialization the outcome is pending. Both acceptance and rejection
+can be provisional. A final rejection is a completed operation and retires its
+outbox entry just as final acceptance does.
+
+For Chronolog handles:
+
+```ts
+const change = await client.submit(program, { operationId })
+const preview = await change.provisional({ signal }) // Can change during replay.
+const outcome = await change.final({ signal })       // Final acceptance or rejection.
+await change.accepted({ signal })                    // Throws on final rejection.
+```
+
+Use `accepted()` before dependent durable intent. The node assigns new author
+time after its applied observations and verified closed frontier, even if the
+wall clock regresses. Applications do not repair timestamps or manufacture
+validator evidence. Persist the operation ID before submission and reuse the
+same program for exact retries. A retry recovers the original signed proposal,
+timestamp, outcome, and revocation context. A changed program needs a new ID.
+Cancelling a waiter does not cancel an already published operation.
+
+Reopening reconstructs the automatic author-time floor from retained proofs and
+successfully applied history. Merely receiving an unadmitted proposal does not
+advance it. Preserve an original observation time as application data instead
+of calculating ordering timestamps. Governed authoring uses the maximum future
+skew in signed genesis. If advancing the automatic clock would exceed that bound,
+new authoring fails with `AUTHOR_CLOCK_AHEAD`. Correct the clock before trying
+new intent again; an exact retry of a prepared operation keeps its original
+bytes and timestamp.
+
+In a signed-inclusion history, a proposal first included after its author
+timestamp closes receives `FINALITY_TIMESTAMP_CLOSED`. Excessive future
+timestamps receive `FINALITY_TIMESTAMP_FUTURE`; admissible future proposals
+wait for closure. Fixed validators withhold votes outside their future window
+and reconsider those proposals on heartbeat clock progress. A proposal becomes
+finally excluded only when no remaining legitimate admission is possible.
+Silently re-signing either rejected proposal would change its identity and
+meaning. Trying again is an explicit new operation with current assumptions.
+
+### One execution order
+
+All providers use `(author timestamp, author public key, proposal ID)`.
+Transport feed sequence is a replication concern. Receipt order is an inclusion
+concern. Neither is an application sort key. A late eligible predecessor can
+change a tentative suffix: restore the nearest checkpoint, replay pure programs,
+and publish one coherent replacement view. Do not append the replacement events
+to an earlier speculative projection as if they were new final facts.
+
+Finality proves that no eligible predecessor can still change a prefix. The
+replica must also have the records, keys, and execution profile needed to apply
+that prefix. Missing input or a storage failure blocks progress; it does not
+invent a SQL rejection. `accepted()` and `final()` wait for the locally applied
+result, not merely a receipt or a clock observation. A final replica can still
+be behind another replica.
+
+The fixed-validator provider uses signed decisions and closure promises over
+complete authenticated feed prefixes. Partial earlier admissions must be
+resolved before later work is final. The signed-inclusion provider uses a
+certified retained set and explicit author-time closures. Its service can
+certify inclusion without decrypting SQL. A custom provider must prove the same
+inclusion and closed-prefix contract; it cannot supply a different comparator.
+The current extension port normalizes the signed-inclusion receipt/closure proof
+family. It does not implement arbitrary consensus providers or dynamic signer
+reconfiguration.
+The detailed trust and liveness rules are in [pluggable finality](pluggable-finality.md).
+
+Peer catch-up has a finite boundary: it captures retained feed and evidence
+heads and copies through those positions. Publication may continue while that
+copy finishes. Later hints or another catch-up collect the new tail. Catch-up
+does not promise that every application input is available or that a final
+target has been applied; materialization and finality are separate checks.
+Availability heads carry no extra authority.
+
+### Rollback, redo, and user undo
+
+The current node executes admitted proposals. Its `provisional()` result means
+that the executed ordering or outcome can still change before finality; it does
+not promise execution before admission.
+
+Admission and local selection are different facts. Admission is permanent;
+the local materializer can replace an unfinalized selection while replaying it.
+Removing a selected preview removes its current outcome, not its retained signed
+proposal. A proposal that remains selected keeps its original identity, and an
+established final prefix cannot be removed or changed. Both the SQL and event-only
+runtimes enforce the same chronological order and final-prefix rules.
+
+The Tendriller application port reports lifecycle separately from outcome. A
+rejection can be provisional; once immutable it is `status: 'final', outcome:
+'rejected'`. An exact retry recovers that final rejection without creating a new
+operation or waiting for another finality decision.
+
+Use final reads by default for shared business state. Use a local view when the
+UI intentionally presents speculative state and can replace it after replay.
+Not every locally submitted proposal is immediately in the local materialized
+view: admission and required inputs can still be pending. Wait cancellation
+stops the caller's wait and leaves a prepared durable operation intact.
+
+Protocol replay replaces speculative local state. It cannot roll back an
+external email, payment, or device action, so those actions start only from
+final accepted intent. Redoing deterministic materialization does not rerun
+external providers. The owning node recovers retained operations from its journal
+and feed; catch-up and explicit same-ID retries reuse the original signed bytes.
+A frontend reconnection cannot recover intent that its owner never retained.
+Client request retries are bounded and do not create an offline intent queue.
+Reconnection never replays a live signal.
+
+User undo is a new authorized compensating program, with a new operation ID and
+guards against the current state. It does not delete signed history or restore
+a stale database image. If another user changed the target, the guard can reject
+the undo. Redo is another explicitly guarded intent. Application-specific undo
+rules belong in the application, not the consensus or transport layer.
+
+## Authority is a set of named roles
+
+| Role | Controls | Does not imply |
+| --- | --- | --- |
+| Tendriller page host | Hosting, page lifetime, transport binding | Peer database ownership, membership administration, or finality authority. |
+| Membership administrator | Signed enrollment, capabilities, key grants and revocations | Ownership of every application row or permission to run every external action. |
+| Schema administrator | DDL and application constraints | Permission to bypass owner-controlled row writes. |
+| Writer | Exact SQL/topic/signal rights from its grant | Finality, administrator status, or authority asserted in payload text. |
+| Finality provider | Inclusion and closed-prefix evidence under genesis policy | Application semantics, row ownership, or a choice of execution order. |
+| Replica | Verifies original proofs and materializes local views | Authority to rewrite another author's identity or replace the provider. |
+| Resident effect handler | Explicit delegated application actions | A general right to obey every event or signal it can receive. |
+
+`NativeFinalityService` is the concrete native signed-inclusion service. Agent
+modules receive `context.finality` when this process hosts it, or `null` when it
+does not. There is no catch-all `context.authority`. The provider identity and
+configuration are authenticated by genesis; transport discovery never chooses
+them implicitly. The replica-side `LiveInclusionFinalityProvider` verifies
+receipt and closure proofs; effect modules normally use `context.publisher`,
+`context.signals`, and final-event handlers.
 
 Membership administration is pinned by genesis's `rootAdminPublicKey` and
 `capabilityLogFeed`; it is not a grantable capability role. Reader, writer and
@@ -234,11 +265,12 @@ A separately provisioned membership host may pin a different finality key and
 schema administrator. An agent on an ordinary enrolled replica can consume final
 events without hosting the finality service.
 
-The public proof producer is **`NativeFinalityService`**. A **`LiveInclusionFinalityProvider`**
-is the replica-side verifier of proof bytes. `AgentApplicationContext.finality`
-is non-null only where this process hosts the selected signer. Effect modules
-normally need `context.publisher`, `context.signals` and their final-event
-handlers, not direct access to the service.
+The built-in signed service assumes the configured signer honors its promises
+and its durable history is not rolled back. Fixed validators assume the selected
+quorums honor their promises. An unavailable required provider pauses finality;
+it need not stop independent live signals under already known permissions.
+There is no automatic authority rotation, validator reconfiguration, or failover.
+Recovery requires established continuity or an explicitly new history lineage.
 
 Effective durable events carry `event.origin` from their verified signed
 proposal: the group and signing key, original operation ID, membership revision,
@@ -292,7 +324,12 @@ that no later promises existed. A missing or conflicting established log is a
 hard continuity error. Finality pauses while its selected service is unavailable;
 existing final reads and live signals can continue over connected peers.
 
-## External effects are a separate boundary
+## Agents act on authorized final intent
+
+Agent code is ordinary trusted application code. Keep provider credentials and
+private reasoning in the agent's private store. A topic filter is not a secrecy
+boundary. If publishing to a narrowly scoped intent topic itself grants an action,
+make that delegation explicit in the grant and handler contract.
 
 Every effective event carries `origin` derived from its verified signed
 proposal, separate from `payload`. Chronolog supplies `kind: 'chronolog'`, the
@@ -314,32 +351,49 @@ an uncertain provider call that was already dispatched.
 
 The database can make an intent final and persist a worker's state. It cannot
 atomically commit another provider's action. Use one designated worker per
-handler and select one explicit recovery contract:
+handler with an explicit recovery contract.
 
-- Provider idempotency: send the worker's stable `idempotencyKey` unchanged.
-- Provider reconciliation: query the uncertain operation before redispatching.
-- Manual resolution: stop on an uncertain external result until an operator
-  supplies a decision.
+Use `DurableEffectWorker` for recovery-sensitive actions. It checkpoints intent,
+dispatch state, provider result, and processed event progress. Recovery must use
+the provider's real idempotency guarantee, provider reconciliation, or an
+explicit uncertain state. A local operation ID alone does not create exactly-once
+external effects. Use one designated worker per handler. Independent worker
+stores need an explicit ownership arrangement; a local file fence is not a
+distributed lease. Result publication is an exact retry and waits for final
+acceptance before processed progress advances.
 
-The worker durably records dispatch state before calling the provider, retains
-the result before publishing its final result event, and retries publication
-without dispatching again. Multiple processes on independent stores still need
-an explicit ownership arrangement and the provider's recovery contract. A
-local file fence is not a distributed lease. Pure SQL/event replay never calls
-provider code.
+A proved final rejection of result publication pauses the effect worker in
+`publication-rejected`, with the completed provider result retained. Inspect
+`status()` and correct the cause, then explicitly call
+`retryPublication(effectId)` to authorize a new publication attempt. This never
+repeats the external action. An ambiguous or lost response keeps the same
+attempt and operation ID. The eventual `effect.completed` event carries the
+rejection audit; each effect permits at most 64 publication attempts.
 
-## Implementation map
+Timers publish ordinary final intent, with durable generation IDs and guarded
+cancellation. A rejected publication pauses the scheduler with its original
+occurrence intact; `retryPublication(occurrenceId)` explicitly allocates a new
+guarded attempt. An uncertain reply keeps the old attempt. Rechecking the same
+generation and due time prevents recovery from reviving a cancelled schedule or
+duplicating an accepted occurrence. The successful event carries rejected-attempt
+audit, and `publicationStatus(occurrenceId)` retains local audit even when the
+final outcome is cancellation with no event. Timers do not execute provider code
+from a clock callback. See the
+[resident agent guide](../packages/agent-service/README.md) for the actual module,
+worker, timer, signal, and peer APIs.
 
-- [Signal contract and standalone usage](../packages/signals/README.md)
-- [Client views and transaction handles](../packages/client/README.md)
-- [Finality proofs, controls and provider extension](pluggable-finality.md)
-- [Compact membership proofs and peer bootstrap](membership-control-proofs.md)
-- [Resident effects, timers and recovery](../packages/agent-service/README.md)
-- [Native continuity and crash recovery](authority-recovery.md)
-- [Browser Worker ownership and peer connections](../packages/runtime-browser/README.md)
+## Evidence and release surfaces
 
-The current custom-provider port uses the signed-inclusion proof family and
-normalized receipt/closure snapshots. It is an extension point for a verified
-inclusion policy, not a claim that arbitrary consensus engines or automatic
-authority failover are implemented. The record and transport layers remain
-independent of that choice.
+- The standalone signals package is built, checked for zero runtime imports,
+  packed, and included in quality/release artifacts with source provenance.
+- The client, RPC, browser peer, and resident service expose the same live signal
+  interface. Governed transport tests relay original signed frames through three
+  peers without reading durable history.
+- Application integration tests cover atomic SQL/events, final rejection,
+  provisional rebases, interrupted publication, coherent pinned views, finality
+  invalidations, provenance after restart, and atomic projection checkpoints.
+- Provider tests exercise proof gaps, partial quorums, late admission, rejection,
+  exact retries, missing keys/bodies, monotone closure, and recovery.
+- Tendriller consumers use packed SDK/runtime/engine artifacts; contrib recipes
+  exercise the public APIs. Historical reports retain their original versions
+  and do not qualify a changed protocol.

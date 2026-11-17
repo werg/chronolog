@@ -35,12 +35,13 @@ describe('ChronologClient.transaction', () => {
       { sql: 'INSERT INTO t VALUES (?, ?, ?, ?, ?)', params: [1, 2n ** 62n, 1.5, 'text', new Uint8Array([1, 2])] },
       { sql: 'UPDATE t SET v = :v, w = @w WHERE id = :id', params: { v: sqlValue.real(1), '@w': null, id: true } },
       platformOp.grant({ table: 't', grantee: new Uint8Array(32).fill(2), operations: ['update'], rowKey: [1n] }),
-    ], { idempotencyKey: 'key-1' })
+    ], { operationId: 'key-1' })
     handle.dispose()
     expect(handle.transactionId).toBe('tx-1')
+    expect(handle.operationId).toBe('key-1')
     expect(submitted).toHaveLength(1)
     const request = submitted[0]!
-    expect(request.idempotencyKey).toBe('key-1')
+    expect(request.operationId).toBe('key-1')
     const statement = (index: number): RpcSqlStatement => request.steps[index] as RpcSqlStatement
     expect(statement(0)).toEqual({ sql: "SELECT chronolog_assert(1, 'ok')", bindings: [] })
     expect(statement(1).bindings.map((binding) => binding.value)).toEqual([

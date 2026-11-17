@@ -17,12 +17,11 @@ const source = git(['rev-parse', 'HEAD']).trim();
 const bundled = await build({ entryPoints: [entry], outfile: join(output, 'index.mjs'), write: false,
   bundle: true, platform: 'browser', format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root });
 const runtimeInputs = Object.keys(bundled.metafile.inputs).sort();
-assert(runtimeInputs.every(path => /^packages\/(signals|canonical)\/src\//u.test(path) ||
-  /(?:^|\/)node_modules\/@noble\/hashes\//u.test(path)), 'Signals artifact must contain only the signal core and canonical codec dependencies');
+assert(runtimeInputs.every(path => /^packages\/signals\/src\//u.test(path)), 'Signals artifact must contain only the standalone signal core');
 assert(Object.values(bundled.metafile.outputs).every(value => value.imports.length === 0), 'Signals ESM must have no external imports');
 
 const inputs = [...new Set([...runtimeInputs, 'packages/signals/package.json', 'packages/signals/README.md',
-  'packages/canonical/package.json', 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
+  'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
   'tools/package-signals.mjs', 'tools/test-signals-package.mjs'])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('SIGNALS_PACKAGE_REQUIRES_CLEAN_INPUTS (commit package inputs before building)');
@@ -30,7 +29,7 @@ const declarations = emitDeclarations();
 const readme = await readFile(join(root, 'packages/signals/README.md'));
 for (const text of declarations.values()) {
   const imports = ts.preProcessFile(text, true).importedFiles.map(value => value.fileName);
-  assert(imports.every(name => name === './payload.js') && !/reference\s+(?:types|path)=/u.test(text),
+  assert(imports.every(name => /^\.\/(?:channel|codec|types)\.js$/u.test(name)) && !/reference\s+(?:types|path)=/u.test(text),
     'Signals declarations must be self-contained and portable');
 }
 assert.equal(git(['rev-parse', 'HEAD']).trim(), source, 'Signals source commit changed during packaging');
@@ -45,9 +44,9 @@ await writeFile(join(output, 'README.md'), readme);
 const packageJson = { name: '@chronolog/signals', version, type: 'module',
   description: 'Standalone signed, expiring live messages without a database or finality protocol',
   exports: { '.': { types: './index.d.ts', import: './index.mjs' } },
-  files: ['index.mjs', 'index.d.ts', 'payload.d.ts', 'provenance.json', 'README.md'], dependencies: {} };
+  files: ['index.mjs', ...declarations.keys(), 'provenance.json', 'README.md'], dependencies: {} };
 await writeFile(join(output, 'package.json'), JSON.stringify(packageJson, null, 2) + '\n');
-const sha256 = Object.fromEntries(await Promise.all(['index.mjs', 'index.d.ts', 'payload.d.ts', 'README.md', 'package.json']
+const sha256 = Object.fromEntries(await Promise.all(['index.mjs', ...declarations.keys(), 'README.md', 'package.json']
   .map(async name => [name, hash(await readFile(join(output, name)))])));
 await writeFile(join(output, 'provenance.json'), JSON.stringify({ format: 'chronolog-signals-package/v1',
   repository: 'werg/chronolog-db', source, dirty, inputs, runtimeInputs, sha256 }, null, 2) + '\n');
@@ -69,13 +68,13 @@ function emitDeclarations() {
     getCurrentDirectory: () => root, getCanonicalFileName: name => name, getNewLine: () => '\n',
   }));
   const files = new Map();
-  for (const name of ['index.ts', 'payload.ts']) {
+  for (const name of ['index.ts', 'channel.ts', 'codec.ts', 'types.ts']) {
     const file = program.getSourceFile(join(root, 'packages/signals/src', name));
     assert(file, `Signals declaration source missing: ${name}`);
     const result = program.emit(file, (path, text) => files.set(basename(path), text), undefined, true);
     assert(!result.emitSkipped, `Signals declaration emit failed: ${relative(root, file.fileName)}`);
   }
-  assert.deepEqual([...files.keys()].sort(), ['index.d.ts', 'payload.d.ts']);
+  assert.deepEqual([...files.keys()].sort(), ['channel.d.ts', 'codec.d.ts', 'index.d.ts', 'types.d.ts']);
   return files;
 }
 function git(args) { return execFileSync('git', args, { cwd: root, encoding: 'utf8' }); }

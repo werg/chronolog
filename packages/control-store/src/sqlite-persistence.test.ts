@@ -24,7 +24,7 @@ function addCandidates(store: ControlStore, from: number, to: number): void {
       groupId: Uint8Array.of(1),
       candidateDigest: Uint8Array.of(100 + id),
       validationPolicy: Uint8Array.of(2),
-      orderKey: { authorTimestampMs: BigInt(id), authorId: Uint8Array.of(3), authorFeedSequence: BigInt(id), txId: Uint8Array.of(id) },
+      orderKey: { authorTimestampMs: BigInt(id), authorId: Uint8Array.of(3), txId: Uint8Array.of(id) },
       canonicalPayload: Uint8Array.of(4, id),
       state: 'pending_validation',
     })

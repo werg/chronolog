@@ -20,13 +20,9 @@ proposals cannot reopen a closed prefix. Custom verifiers are selected by the
 provider ID and parameters signed in genesis.
 Both expose separate local and final SQL revisions, durable submission identity,
 and live scoped reader/writer enrollment. Start with the
-[application primitives guide](docs/application-primitives.md) for choosing APIs,
-finality, replay and role boundaries. The [resident agent](packages/agent-service/README.md)
-and [pluggable finality](docs/pluggable-finality.md) explain the architecture;
-the [application-log report](docs/plans/application-log.md) tracks qualification.
-The [peer application architecture](docs/peer-application-architecture.md) describes
-the boundary between page hosting, compact membership, live signals and durable
-application work.
+[application and agent architecture](docs/application-primitives.md). See the [application-log roadmap and
+evidence](docs/plans/application-log.md), [resident agent](packages/agent-service/README.md),
+and [pluggable finality](docs/pluggable-finality.md) for the architecture and tests.
 
 - **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
   dialect or migration system. Assumptions are SQL statements, usually
@@ -37,11 +33,10 @@ application work.
   use bounded pull delivery and history/filter-bound cursors, including progress
   across nonmatching records. Local projections atomically checkpoint state and
   processed progress outside the consensus core.
-- **Ephemeral signals.** `client.signals` carries typing, presence, cursors and
-  replaceable progress without retained history, transactional execution or a
-  finality provider. The standalone `@chronolog/signals` package also works
-  without a database or Chronolog membership. Group adapters add explicit
-  signal rights; durable topic rights do not implicitly grant them.
+- **Live signals.** Standalone `@chronolog/signals` carries typing, presence,
+  previews and transient messages without a database or finality dependency.
+  Bounded FIFO and explicit latest-value subscriptions share one public API;
+  authenticated peer relays preserve the original author and never replay on reconnect.
 - **Coherent views.** A bounded read lease pins SQL and effective events to one
   view. Provisional rebases replace that view; finality and operation status can
   advance even when rows stay equal.
@@ -71,11 +66,10 @@ application work.
   activate at verified policy boundaries. Epoch keys are wrapped to readers.
   SQL, durable topic and ephemeral signal rights are distinct. Limited
   publishers use original-signer ingress without reader keys or a local replica.
-- **Resident work.** Final-intent workers own timer generations and durable
-  dispatch checkpoints in a fenced native store. A native finality service can
-  run alongside them, or a replica can consume proofs from another provider.
-  External effects require provider idempotency/reconciliation or an explicit
-  uncertain state.
+- **Resident work.** A fenced native store retains final-intent workers, timer
+  generations and durable dispatch checkpoints. A process may also host the
+  separately selected native finality service. External effects
+  require provider idempotency/reconciliation or an explicit uncertain state.
 
 Read [the design](docs/design.md) for how it works,
 [Specification 10](docs/implementation-specs/10-deterministic-sql-transactions.md)
@@ -140,7 +134,7 @@ const tx = await client.transaction([
   { sql: 'UPDATE accounts SET balance = balance - 50 WHERE id = :id', params: { id: 1 } },
   platformOp.grant({ table: 'accounts', grantee: bobKey, operations: ['update'], rowKey: [1] }),
 ])
-const provisional = await tx.settled()  // current accepted/rejected result
+const provisional = await tx.provisional()  // current accepted/rejected result
 const outcome = await tx.final()         // actual applied final result
 const rows = await client.query(`SELECT a.id, a.balance, p.key AS owner
   FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner`)
@@ -166,7 +160,7 @@ const claim = await client.submit(program(
   sqlStatement('UPDATE tasks SET claimed_by = ? WHERE id = ?', ['member-1', 'task-1']),
   emit('tasks/claimed', { taskId: 'task-1', memberId: 'member-1' }),
 ), { operationId: 'claim-task-1' })
-await claim.final()
+await claim.accepted()
 
 const view = await client.readView({ view: 'final' })
 try {
@@ -180,15 +174,11 @@ try {
 The schema/row grants and topic rights must authorize this program. Durable
 workers consume `client.events` or `node.events`; use `DurableProjection` with
 an atomic store for replayable frontend caches. Received cursors are not durable
-processed checkpoints. Typing and replaceable progress use `client.signals`:
-
-```ts
-await client.signals.send('presence/typing', { active: true }, { ttlMs: 3_000 })
-```
-
-Signals are best-effort and have no replay or final outcome. Publish a durable
-result when persistence matters. See the [signals contract](packages/signals/README.md)
-for bounded subscriptions, expiration and standalone use.
+processed checkpoints. Screens observe `client.changes({ view })` and capture a
+new read view; durable event subscriptions are not UI invalidations. Typing,
+preview chunks, presence and replaceable progress use `client.signals`, ending
+in a durable result when persistence matters. See the
+[standalone signals guide](packages/signals/README.md).
 
 `@chronolog/runtime-browser/events` opens the SQL-free OPFS Worker profile and
 exports `WorkerRpcTransport`. Its exclusive owner, synchronous private control
@@ -256,6 +246,7 @@ See the [chaos testing guide](docs/chaos-testing.md) and the
 | `capabilities` | Genesis, grants, revocations, validation policy |
 | `crypto` | HPKE, signed epochs, content encryption |
 | `records` | Portable original signed records, immutable evidence, durable storage and shared range/stream synchronization |
+| `signals` | Standalone authenticated live messaging, bounded FIFO/latest subscriptions, expiry and relay deduplication |
 | `transport-ssb` | Native SQLite record/evidence storage and authenticated SSB connections |
 | `transport-webrtc` | Bounded RTC framing, HTTPS introduction, observed ICE routes and session supervision |
 | `transport-tendriller` | Optional public retained-log adapter and on-demand finality service |
@@ -269,6 +260,7 @@ See the [chaos testing guide](docs/chaos-testing.md) and the
 | `runtime-workerd` | Experimental workerd execution contract ([plan](docs/workerd-reconstruction-plan.md)) |
 | `rpc` | Service contract, in-process and HTTP transports |
 | `client` / `react` | TypeScript client and React hooks |
+| `agent-service` | Native finality service, authorized final-intent workers, durable timers and governed peer connections |
 | `conformance` | Replay-equivalence and release characterization |
 | `chaos` | Container topology, faults, workloads, invariant checks |
 | `testkit` | Clocks, permutations, network helpers |

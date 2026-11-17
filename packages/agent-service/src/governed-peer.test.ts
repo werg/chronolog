@@ -1,11 +1,11 @@
 import type { CapabilitySnapshot, EffectiveCapability } from '@chronolog/capabilities'
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { assertCanonicalCbor, bytesToHex, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
-import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
+import { ChangeSignal, DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type FeedLink } from '@chronolog/records'
 import { frameRtcPeerChannels, WEBRTC_LIVE_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { framePeerStream } from './framing.js'
+import { framePeerStream, PeerFrameBackpressureError } from './framing.js'
 import { createGovernedPeerService, type GovernedPeerService } from './governed-peer.js'
 import { openAuthenticatedPeerLink } from './peer-link.js'
 
@@ -38,16 +38,17 @@ async function replicas(writer = true) {
   }
   return { identities, snapshots, transports, services }
 }
-async function connect(left: GovernedPeerService, right: GovernedPeerService, expected?: Uint8Array, withLive = true) {
+async function connect(left: GovernedPeerService, right: GovernedPeerService, expected?: Uint8Array, withLive = true, congested?: () => boolean) {
   const lane = () => {
     const forward = new TransformStream<Uint8Array, Uint8Array>(), backward = new TransformStream<Uint8Array, Uint8Array>()
     return [framePeerStream({ readable: backward.readable, writable: forward.writable }),
       framePeerStream({ readable: forward.readable, writable: backward.writable })]
   }
   const reliable = lane(), live = withLive ? lane() : undefined
-  const connections = reliable.map((connection, index) => ({ ...connection, ...(live === undefined ? {} : {
-    live: live[index]!, signal: AbortSignal.any([connection.signal, live[index]!.signal]),
-  }),
+  const connections = reliable.map((connection, index) => ({ ...connection, ...(live === undefined ? {} : { signal: AbortSignal.any([connection.signal, live[index]!.signal]), live: { ...live[index]!, async send(frame: Uint8Array, options?: { readonly signal?: AbortSignal }) {
+      if (index === 0 && congested?.() === true) throw new PeerFrameBackpressureError()
+      await live[index]!.send(frame, options)
+    } } }),
     async close() { await Promise.all([connection.close(), live?.[index]?.close()]) } }))
   return Promise.all([left.connectPeer({ connection: connections[0]!, ...(expected === undefined ? {} : { peerIdentity: expected }) }),
     right.connectPeer({ connection: connections[1]! })])
@@ -95,7 +96,7 @@ describe('owned governed peer composition', () => {
     const iterator = services[1]!.signals.subscribe()[Symbol.asyncIterator](), receiving = iterator.next()
     try {
       live[0].bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
-      await expect(services[0]!.signals.send('typing', 'discarded preview')).rejects.toThrow('SIGNAL_BACKPRESSURE')
+      await expect(services[0]!.signals.send('typing', 'discarded preview')).rejects.toMatchObject({ code: 'signal_route_backpressure' })
       expect(live[0].sent).toEqual([])
       expect(sessions.every(session => !session.signal.aborted)).toBe(true)
       const record = await transports[0]!.publish(utf8('durable history during live congestion'))
@@ -114,16 +115,82 @@ describe('owned governed peer composition', () => {
     const sessions = await connect(services[0]!, services[1]!, undefined, false)
     expect(sessions.every(session => !session.signal.aborted)).toBe(true)
     expect((await transports[0]!.status()).peers).toContain(transports[1]!.identity)
-    await expect(services[0]!.signals.send('typing', true)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+    await expect(services[0]!.signals.send('typing', true)).rejects.toThrow('signal_disconnected')
     await transports[0]!.catchUp()
     expect(await transports[0]!.history()).toEqual([])
+  })
+
+  it('rejects live congestion before dispatch, then sends fresh intent and keeps reliable ranges usable', async () => {
+    const { services, transports } = await replicas()
+    let congested = true
+    const sessions = await connect(services[0]!, services[1]!, undefined, true, () => congested)
+    await expect(services[0]!.signals.send('typing', 'stale')).rejects.toMatchObject({ code: 'signal_route_backpressure' })
+    expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+    congested = false
+    const reader = services[1]!.signals.subscribe()[Symbol.asyncIterator](), first = reader.next()
+    const fresh = await services[0]!.signals.send('typing', 'fresh')
+    expect((await first).value).toEqual(fresh)
+    await transports[0]!.catchUp()
+    expect(await transports[0]!.history()).toEqual([])
+    expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+    await reader.return?.()
+  })
+
+  it('cancels an opening peer with its owner before any replication or signal attachment', async () => {
+    const identity = await generateEd25519KeyPair(), grant = capability(identity, 'reader', 1)
+    const snapshot: CapabilitySnapshot = { groupId: bytes(5), revision: 0n, revisionDigest: bytes(6), rootAdminPublicKey: identity.publicKeyBytes,
+      capabilityLogFeed: bytes(7), capabilities: new Map([[bytesToHex(grant.id), grant]]), policies: new Map(), validatorFloorMs: 0n }
+    const changes = new ChangeSignal(), abort = new AbortController(), reason = new Error('owner closed')
+    const local: FeedLink = { identity: feedIdFromPublicKey(identity.publicKeyBytes), head: async () => 0n, evidenceHead: async () => 0n, read: async () => [], readEvidence: async () => [],
+      readPayload: async () => null, watch: signal => changes.watch(signal) }
+    let attached = false
+    const owner = await createGovernedPeerService({ identity, groupId: snapshot.groupId, activeMembership: () => snapshot, local,
+      attach: () => { attached = true; return () => undefined } })
+    cleanup.push(async () => { await owner.close(); changes.close() })
+    const connection = framePeerStream({ readable: new ReadableStream<Uint8Array>(), writable: new WritableStream<Uint8Array>() })
+    const opening = owner.connectPeer({ connection, signal: abort.signal }), rejected = expect(opening).rejects.toBe(reason)
+    abort.abort(reason); await rejected
+    expect(attached).toBe(false)
+    await expect(owner.signals.send('typing', true)).rejects.toMatchObject({ code: 'signal_disconnected' })
+  })
+
+  it('relays an original publisher through real framed peers while durable history and finality are unavailable', async () => {
+    const identities = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair(), generateEd25519KeyPair()])
+    const grants = identities.flatMap((identity, index) => [capability(identity, 'reader', index * 2 + 1), capability(identity, 'writer', index * 2 + 2)])
+    const snapshot: CapabilitySnapshot = { groupId: bytes(5), revision: 0n, revisionDigest: bytes(6), rootAdminPublicKey: identities[0].publicKeyBytes,
+      capabilityLogFeed: bytes(7), capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), validatorFloorMs: 0n }
+    let durableReads = 0, attachments = 0
+    const services = await Promise.all(identities.map(async identity => {
+      const changes = new ChangeSignal()
+      const local: FeedLink = { identity: feedIdFromPublicKey(identity.publicKeyBytes),
+        async head() { durableReads++; throw new Error('history unavailable') },
+        async evidenceHead() { durableReads++; throw new Error('finality unavailable') },
+        async read() { durableReads++; throw new Error('history unavailable') },
+        async readEvidence() { durableReads++; throw new Error('finality unavailable') },
+        async readPayload() { durableReads++; throw new Error('body unavailable') },
+        watch: signal => changes.watch(signal) }
+      const service = await createGovernedPeerService({ identity, groupId: snapshot.groupId, activeMembership: () => snapshot, local,
+        attach: () => { attachments++; return () => { attachments-- } } })
+      cleanup.push(async () => { await service.close(); changes.close() })
+      return service
+    }))
+    await connect(services[0]!, services[1]!); const second = await connect(services[1]!, services[2]!)
+    const reader = services[2]!.signals.subscribe()[Symbol.asyncIterator](), first = reader.next()
+    const sent = await services[0]!.signals.send('typing', { live: true })
+    expect((await first).value).toEqual(sent)
+    expect(sent.authorId).toBe(bytesToHex(identities[0].publicKeyBytes))
+    expect(sent).not.toHaveProperty('grantId')
+    expect(attachments).toBe(4); expect(durableReads).toBe(0)
+    await Promise.all(second.map(session => session.close()))
+    await expect(services[2]!.signals.send('typing', false)).rejects.toMatchObject({ code: 'signal_disconnected' })
+    await reader.return?.()
   })
 
   it('opens without a publisher grant, receives read-only, and selects a later topic grant dynamically', async () => {
     const { services, identities, snapshots, transports } = await replicas(false)
     const [sender, receiver] = services
     await connect(sender!, receiver!, identities[1].publicKeyBytes)
-    await expect(sender!.signals.send('typing', true)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    await expect(sender!.signals.send('typing', true)).rejects.toThrow('signal_unauthorized')
     const writer = capability(identities[0], 'writer', 3)
     const membership: CapabilitySnapshot = { ...snapshots[0]!, revision: 1n,
       capabilities: new Map([...snapshots[0]!.capabilities, [bytesToHex(writer.id), writer]]) }
@@ -131,8 +198,8 @@ describe('owned governed peer composition', () => {
     const iterator = receiver!.signals.subscribe()[Symbol.asyncIterator](), receiving = iterator.next()
     const sent = await sender!.signals.send('typing', { active: true })
     expect((await receiving).value).toEqual(sent)
-    await expect(receiver!.signals.send('typing', true)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
-    await expect(sender!.signals.send('durable-chat', true)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    await expect(receiver!.signals.send('typing', true)).rejects.toThrow('signal_unauthorized')
+    await expect(sender!.signals.send('durable-chat', true)).rejects.toThrow('signal_unauthorized')
     for (const transport of transports) {
       expect(await transport.history()).toEqual([])
       expect(await transport.evidenceHistory()).toEqual([])
@@ -145,7 +212,7 @@ describe('owned governed peer composition', () => {
     const sessions = await connect(services[0]!, services[1]!)
     const revoke = { ...snapshots[0]!.capabilities.get(bytesToHex(bytes(3)))!, revokedAtRevision: 1n }
     snapshots[0] = { ...snapshots[0]!, revision: 1n, capabilities: new Map([...snapshots[0]!.capabilities, [bytesToHex(revoke.id), revoke]]) }
-    await expect(services[0]!.signals.send('typing', true)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    await expect(services[0]!.signals.send('typing', true)).rejects.toThrow('signal_unauthorized')
     expect(sessions.every(session => !session.signal.aborted)).toBe(true)
     const replacement = capability(identities[0], 'writer', 4)
     const snapshot: CapabilitySnapshot = { ...snapshots[0], revision: 2n,
@@ -167,7 +234,7 @@ describe('owned governed peer composition', () => {
     // Dispatch is not a delivery receipt; remote rejection can close it first.
     const [sending] = await Promise.allSettled([services[0]!.signals.send('typing', 'after reader revocation')])
     await rejected
-    if (sending.status === 'rejected') expect(sending.reason).toMatchObject({ message: expect.stringMatching(/^(SIGNAL_ROUTE_CLOSED|PEER_CONNECTION_CLOSED)$/u) })
+    if (sending.status === 'rejected') expect(sending.reason).toMatchObject({ message: expect.stringMatching(/^(signal_route_closed|PEER_CONNECTION_CLOSED)$/u) })
     expect(sessions[1].signal.aborted).toBe(true)
   })
 
@@ -183,7 +250,7 @@ describe('owned governed peer composition', () => {
     expect((await receiving).value).toEqual(sent)
     await services[0]!.close()
     expect(replacement[0].signal.aborted).toBe(true)
-    await expect(services[0]!.signals.send('typing', true)).rejects.toThrow('SIGNAL_CHANNEL_CLOSED')
+    await expect(services[0]!.signals.send('typing', true)).rejects.toThrow('signal_channel_closed')
     await iterator.return?.()
   })
 

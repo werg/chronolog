@@ -1,373 +1,252 @@
-import { assertCanonicalCbor, encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { SignalBackpressureError, SignalChannel, type SignalTransport } from './index.js'
+import { SignalChannel, SignalError, generateSignalIdentity } from './index.js'
+import type { SignalChannelOptions, SignalRoute } from './index.js'
 
-async function fixture() {
-  const identity = await generateEd25519KeyPair(), receiverIdentity = await generateEd25519KeyPair()
-  const scope = 'standalone-room'
-  let now = 100, active = true
-  const frames: Uint8Array[] = []
-  const options = { scope, identity, send: async (frame: Uint8Array) => { frames.push(frame) },
-    now: () => now, authorize: ({ topic }: { topic: string }) => active && topic === 'typing' }
-  const sender = new SignalChannel(options)
-  const receiver = new SignalChannel({ ...options, identity: receiverIdentity })
-  return { sender, receiver, frames, options, setNow(value: number) { now = value }, revoke() { active = false } }
+const inputs = new WeakMap<SignalChannel, SignalRoute>()
+function inputRoute(channel: SignalChannel): SignalRoute {
+  let route = inputs.get(channel)
+  if (route === undefined) {
+    // Unit ingress has its own explicit lifetime and no outgoing transport.
+    route = channel.attachRoute({ async send() { throw new SignalError('signal_disconnected') } })
+    inputs.set(channel, route)
+  }
+  return route
 }
 
-describe('authorized ephemeral peer signals', () => {
-  it('rejects a saturated publication without retiring routes that refused local dispatch', async () => {
-    const f = await fixture(), { send: _send, ...options } = f.options
-    const channel = new SignalChannel(options)
+const channels: SignalChannel[] = []
+afterEach(() => {
+  try { for (const channel of channels.splice(0)) channel.close() } finally { vi.useRealTimers() }
+})
+async function channel(options: Partial<SignalChannelOptions> = {}) {
+  const value = new SignalChannel({ scope: 'live:lifetime', identity: await generateSignalIdentity(), authorize: () => true, ...options })
+  channels.push(value); return value
+}
+async function capture(options: Partial<SignalChannelOptions> = {}) {
+  const sender = await channel(options), frames: Uint8Array[] = []
+  sender.attachRoute({ send: async frame => { frames.push(frame) } })
+  return { sender, frames }
+}
+function gate() {
+  let enter!: () => void, release!: () => void
+  const entered = new Promise<void>(resolve => { enter = resolve }), wait = new Promise<void>(resolve => { release = resolve })
+  return { enter, entered, wait, release }
+}
+
+describe('live signal transport ownership', () => {
+  it('preserves every safely congested route for a fresh publication', async () => {
+    const sender = await channel(), receiver = await channel()
     let congested = true, retired = 0
-    const received: Uint8Array[] = []
-    for (let index = 0; index < 2; index++) channel.attachRoute({
-      async send(frame) { if (congested) return { refused: 'backpressure' }; received.push(frame) },
+    const frames: Uint8Array[] = []
+    for (let index = 0; index < 2; index++) sender.attachRoute({
+      async send(frame) { if (congested) throw new SignalError('signal_route_backpressure'); frames.push(frame) },
       close() { retired++ },
     })
-    try {
-      await expect(channel.send('typing', 'discarded intent')).rejects.toBeInstanceOf(SignalBackpressureError)
-      expect(received).toEqual([])
-      expect(retired).toBe(0)
-      congested = false
-      const sent = await channel.send('typing', 'fresh intent')
-      expect(received).toHaveLength(2)
-      expect(received[0]).toEqual(received[1])
-      expect((await f.receiver.receive(received[0]!))?.payload).toEqual(sent.payload)
-      expect(retired).toBe(0)
-    } finally { channel.close(); f.sender.close(); f.receiver.close() }
+    await expect(sender.send('typing', 'discarded intent')).rejects.toMatchObject({ code: 'signal_route_backpressure' })
+    expect(frames).toEqual([]); expect(retired).toBe(0); expect(sender.routeCount).toBe(2)
+    congested = false
+    const sent = await sender.send('typing', 'fresh intent')
+    expect(frames).toHaveLength(2); expect(frames[0]).toEqual(frames[1])
+    expect(await inputRoute(receiver).receive(frames[0]!)).toEqual(sent)
+    expect(retired).toBe(0)
   })
 
-  it('keeps a route after an explicit refusal before dispatch without retaining a retry', async () => {
-    const f = await fixture(), delivered: Uint8Array[] = []
-    let congested = true, closed = 0
-    const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
-    channel.attachRoute({ async send(frame) {
-      if (congested) return { refused: 'backpressure' }
-      delivered.push(frame)
-    }, close() { closed++ } })
-    try {
-      await expect(channel.send('typing', 'discard this attempt')).rejects.toThrow('SIGNAL_BACKPRESSURE')
-      expect(delivered).toEqual([]); expect(closed).toBe(0)
-      congested = false
-      await channel.send('typing', 'current value')
-      expect(delivered).toHaveLength(1)
-      expect((assertCanonicalCbor(delivered[0]!) as unknown[])[10]).toBe('"current value"')
-      expect(closed).toBe(0)
-    } finally { channel.close(); f.sender.close(); f.receiver.close() }
+  it('does not refresh an intent TTL while queued behind a blocked send', async () => {
+    let now = 100
+    const blocked = gate(), frames: Uint8Array[] = [], sender = await channel({ now: () => now })
+    sender.attachRoute({ async send(frame) { frames.push(frame); blocked.enter(); await blocked.wait } })
+    const first = sender.send('typing', 1)
+    await blocked.entered
+    const stale = sender.send('typing', 2, { ttlMs: 1_000 })
+    const rejected = expect(stale).rejects.toMatchObject({ code: 'signal_expired' })
+    now = 1_101; blocked.release(); await first; await rejected
+    expect(frames).toHaveLength(1)
   })
 
-  it.each(['exception', 'backpressure exception', 'invalid result'] as const)('retires a route after a transport %s without treating it as a dispatch refusal', async kind => {
-    const f = await fixture()
-    let closed = 0
-    const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
-    channel.attachRoute({ send: (async () => {
-      if (kind === 'exception') throw new Error('transport failed')
-      if (kind === 'backpressure exception') throw new SignalBackpressureError()
-      return { refused: 'something else' }
-    }) as unknown as SignalTransport['send'], close() { closed++ } })
-    try {
-      const reason = kind === 'exception' ? 'transport failed'
-        : kind === 'backpressure exception' ? 'SIGNAL_BACKPRESSURE' : 'SIGNAL_TRANSPORT_RESULT_INVALID'
-      await expect(channel.send('typing', 1)).rejects.toThrow(reason)
-      expect(closed).toBe(1)
-      await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
-    } finally { channel.close(); f.sender.close(); f.receiver.close() }
-  })
-
-  it('drops an attached route frame before shared receive admission without remembering it or revoking routes', async () => {
-    const f = await fixture()
-    let entered!: () => void, release!: () => void, authorizations = 0, closed = 0
-    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
-    const channel = new SignalChannel({ scope: f.options.scope, identity: f.options.identity, maxPendingReceives: 1,
-      now: f.options.now, async authorize() { authorizations++; if (authorizations === 1) { entered(); await gate }; return true } })
+  it('rejects shared receive overload before authorization without remembering the frame or revoking routes', async () => {
+    const f = await capture(), blocked = gate()
+    let authorizations = 0, closed = 0
+    const receiver = await channel({ maxPendingReceives: 1, async authorize() {
+      if (++authorizations === 1) { blocked.enter(); await blocked.wait }
+      return true
+    } })
     const transport = { async send() {}, close() { closed++ } }
-    const first = channel.attachRoute(transport), second = channel.attachRoute(transport)
+    const first = receiver.attachRoute(transport), second = receiver.attachRoute(transport)
     await f.sender.send('typing', 'held'); await f.sender.send('typing', 'later')
     const admitted = first.receive(f.frames[0]!)
     try {
-      await started
-      expect(await second.receive(f.frames[1]!)).toBeNull()
-      await expect(channel.receive(f.frames[1]!)).rejects.toThrow('SIGNAL_BACKPRESSURE')
+      await blocked.entered
+      await expect(second.receive(f.frames[1]!)).rejects.toMatchObject({ code: 'signal_backpressure' })
       expect(authorizations).toBe(1); expect(closed).toBe(0)
-      release(); expect((await admitted)?.payload).toBe('held')
+      blocked.release(); expect((await admitted)?.payload).toBe('held')
       expect((await second.receive(f.frames[1]!))?.payload).toBe('later')
-      expect(authorizations).toBe(2); expect(closed).toBe(0)
-    } finally { release(); await admitted.catch(() => undefined); channel.close(); f.sender.close(); f.receiver.close() }
+      expect(authorizations).toBe(4); expect(closed).toBe(0)
+    } finally { blocked.release(); await admitted.catch(() => undefined) }
   })
 
-  it('does not refresh the TTL of a message waiting behind a backpressured send', async () => {
-    const f = await fixture()
-    let release!: () => void, entered!: () => void
-    const started = new Promise<void>(resolve => { entered = resolve })
-    const blocked = new Promise<void>(resolve => { release = resolve })
-    const frames: Uint8Array[] = []
-    const channel = new SignalChannel({ ...f.options, async send(frame) { frames.push(frame); entered(); await blocked } })
-    const first = channel.send('typing', 1)
-    await started
-    const stale = channel.send('typing', 2, { ttlMs: 1_000 })
-    f.setNow(1_101); release(); await first
-    await expect(stale).rejects.toThrow('SIGNAL_EXPIRED')
-    expect(frames).toHaveLength(1)
-    channel.close(); f.sender.close(); f.receiver.close()
+  it('retires an aborted noncooperative write and counts it across replacement routes', async () => {
+    const blocked = gate(), sender = await channel({ maxRoutes: 1 })
+    let writes = 0, closes = 0
+    sender.attachRoute({ async send() { writes++; blocked.enter(); await blocked.wait }, close() { closes++ } })
+    const abort = new AbortController(), pending = sender.send('typing', 1, { signal: abort.signal })
+    await blocked.entered
+    const rejected = expect(pending).rejects.toThrow('cancelled intent')
+    abort.abort(new Error('cancelled intent')); await rejected
+    await expect.poll(() => closes).toBe(1)
+    expect(sender.routeCount).toBe(0)
+    sender.attachRoute({ async send() { writes++ } })
+    await expect(sender.send('typing', 2)).rejects.toMatchObject({ code: 'signal_route_backpressure' })
+    expect(writes).toBe(1)
+    blocked.release()
+    await expect.poll(async () => {
+      try { await sender.send('typing', 3); return true } catch { return false }
+    }).toBe(true)
+    expect(writes).toBe(2)
   })
 
-  it('retires an aborted noncooperative route instead of starting unlimited background sends', async () => {
-    const f = await fixture()
-    let calls = 0, entered!: () => void
-    const started = new Promise<void>(resolve => { entered = resolve })
-    const channel = new SignalChannel({ ...f.options, async send() { calls++; entered(); await new Promise<void>(() => {}) } })
-    const abort = new AbortController(), pending = channel.send('typing', 1, { signal: abort.signal })
-    await started
-    const refused = expect(pending).rejects.toThrow('cancelled')
-    abort.abort(new Error('cancelled')); await refused
-    // Give a cooperative cancellation one turn before retiring an outstanding write.
-    await new Promise(resolve => { setTimeout(resolve, 5) })
-    await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
-    expect(calls).toBe(1)
-    channel.close(); f.sender.close(); f.receiver.close()
-  })
-
-  it('keeps cancelled policy work counted until it settles', async () => {
-    const f = await fixture()
-    let entered!: () => void
-    const started = new Promise<void>(resolve => { entered = resolve })
-    const channel = new SignalChannel({ ...f.options, maxPendingSends: 1,
-      async authorize() { entered(); return new Promise<boolean>(() => {}) } })
-    const abort = new AbortController(), pending = channel.send('typing', 1, { signal: abort.signal })
-    await started
-    const refused = expect(pending).rejects.toThrow('cancelled')
-    abort.abort(new Error('cancelled')); await refused
-    await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_BACKPRESSURE')
-    channel.close(); f.sender.close(); f.receiver.close()
-  })
-
-  it('retires a stalled relay route after its deadline instead of accumulating callbacks', async () => {
-    const f = await fixture()
+  it('keeps cancelled policy work counted until it settles, then admits fresh intent', async () => {
+    const blocked = gate()
     let calls = 0
-    const relay = new SignalChannel({ ...f.options, relay: true, sendTimeoutMs: 20,
-      async send() { calls++; await new Promise<void>(() => {}) } })
-    await f.sender.send('typing', 1)
-    expect((await relay.receive(f.frames[0]!))?.payload).toBe(1)
-    await f.sender.send('typing', 2)
-    expect((await relay.receive(f.frames[1]!))?.payload).toBe(2)
-    expect(calls).toBe(1)
-    await expect(relay.send('typing', 3)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
-    relay.close(); f.sender.close(); f.receiver.close()
-  })
-
-  it('preserves independent sessions in a latest subscription', async () => {
-    const f = await fixture(), secondSession = new SignalChannel(f.options)
-    const iterator = f.receiver.subscribe({ mode: 'latest' })[Symbol.asyncIterator](), first = iterator.next()
-    await f.sender.send('typing', 'start'); await f.receiver.receive(f.frames[0]!); await first
-    await f.sender.send('typing', 'tab-one'); await f.receiver.receive(f.frames[1]!)
-    await secondSession.send('typing', 'tab-two'); await f.receiver.receive(f.frames[2]!)
-    expect((await iterator.next()).value?.payload).toBe('tab-one')
-    expect((await iterator.next()).value?.payload).toBe('tab-two')
-    await iterator.return?.(); secondSession.close(); f.sender.close(); f.receiver.close()
-  })
-
-  it('discards expired pending values before testing a FIFO capacity bound', async () => {
-    const f = await fixture(), receiver = new SignalChannel({ ...f.options, maxQueuedSignals: 1 })
-    const iterator = receiver.subscribe()[Symbol.asyncIterator](), first = iterator.next()
-    await f.sender.send('typing', 'first'); await receiver.receive(f.frames[0]!); await first
-    await f.sender.send('typing', 'expired', { ttlMs: 1_000 }); await receiver.receive(f.frames[1]!)
-    f.setNow(1_101)
-    await f.sender.send('typing', 'fresh'); await receiver.receive(f.frames[2]!)
-    expect((await iterator.next()).value?.payload).toBe('fresh')
-    await iterator.return?.(); receiver.close(); f.sender.close(); f.receiver.close()
-  })
-
-  it('returns an idle iterator immediately and releases its subscription quota', async () => {
-    const f = await fixture(), receiver = new SignalChannel({ ...f.options, maxSubscriptions: 1 })
-    const iterator = receiver.subscribe()[Symbol.asyncIterator](), pending = iterator.next()
-    expect((await iterator.return?.())?.done).toBe(true)
-    expect((await pending).done).toBe(true)
-    const replacement = receiver.subscribe()[Symbol.asyncIterator](), next = replacement.next()
-    await f.sender.send('typing', 1); await receiver.receive(f.frames[0]!)
-    expect((await next).value?.payload).toBe(1)
-    await replacement.return?.(); receiver.close(); f.sender.close(); f.receiver.close()
-  })
-
-  it('keeps healthy routes usable while a slow peer is cancelled', async () => {
-    const f = await fixture(), delivered: Uint8Array[] = []
-    let stalled = 0
-    const channel = new SignalChannel({ ...f.options,
-      async send() { stalled++; await new Promise<void>(() => {}) } })
-    channel.attachRoute({ async send(frame) { delivered.push(frame) } })
-    const abort = new AbortController()
-    await channel.send('typing', 1, { signal: abort.signal })
-    await channel.send('typing', 2)
-    expect(stalled).toBe(1); expect(delivered).toHaveLength(2)
-    abort.abort()
-    await Promise.resolve(); await Promise.resolve()
-    await channel.send('typing', 3)
-    expect(stalled).toBe(1); expect(delivered).toHaveLength(3)
-    channel.close(); f.sender.close(); f.receiver.close()
-  })
-  it('preserves discrete messages by default and reports overflow instead of silently coalescing', async () => {
-    const f = await fixture()
-    const receiver = new SignalChannel({ ...f.options, maxQueuedSignals: 2 })
-    const iterator = receiver.subscribe()[Symbol.asyncIterator]()
-    const first = iterator.next()
-    await f.sender.send('typing', 1); await receiver.receive(f.frames[0]!)
-    expect((await first).value?.payload).toBe(1)
-    await f.sender.send('typing', 2); await receiver.receive(f.frames[1]!)
-    await f.sender.send('typing', 3); await receiver.receive(f.frames[2]!)
-    expect((await iterator.next()).value?.payload).toBe(2)
-    expect((await iterator.next()).value?.payload).toBe(3)
-    for (let value = 4; value <= 6; value++) {
-      await f.sender.send('typing', value); await receiver.receive(f.frames[value - 1]!)
-    }
-    await expect(iterator.next()).rejects.toThrow('SIGNAL_SUBSCRIPTION_OVERFLOW')
-    receiver.close(); f.sender.close(); f.receiver.close()
-  })
-
-  it('accepts async verification completion in either order without accepting duplicates', async () => {
-    const f = await fixture()
-    let release!: () => void, entered!: () => void
-    const started = new Promise<void>(resolve => { entered = resolve })
-    const blocked = new Promise<void>(resolve => { release = resolve })
-    let calls = 0
-    const receiver = new SignalChannel({ ...f.options, async authorize() {
-      if (++calls === 1) { entered(); await blocked }
+    const sender = await channel({ maxPendingSends: 1, async authorize() {
+      if (++calls === 1) { blocked.enter(); await blocked.wait }
       return true
     } })
-    await f.sender.send('typing', 1); await f.sender.send('typing', 2)
-    const earlier = receiver.receive(f.frames[0]!)
-    await started
-    expect((await receiver.receive(f.frames[1]!))?.payload).toBe(2)
-    release()
-    expect((await earlier)?.payload).toBe(1)
-    await expect(receiver.receive(f.frames[0]!)).resolves.toBeNull()
-    await expect(receiver.receive(f.frames[1]!)).resolves.toBeNull()
-    receiver.close(); f.sender.close(); f.receiver.close()
+    const frames: Uint8Array[] = []
+    sender.attachRoute({ async send(frame) { frames.push(frame) } })
+    const abort = new AbortController(), pending = sender.send('typing', 1, { signal: abort.signal })
+    await blocked.entered
+    const rejected = expect(pending).rejects.toThrow('cancelled policy')
+    abort.abort(new Error('cancelled policy')); await rejected
+    await expect(sender.send('typing', 2)).rejects.toMatchObject({ code: 'signal_backpressure' })
+    blocked.release()
+    await expect.poll(async () => {
+      try { await sender.send('typing', 3); return true } catch { return false }
+    }).toBe(true)
+    expect(frames).toHaveLength(1)
   })
 
-  it('does not let reordered older frames replace a latest value already consumed', async () => {
-    const f = await fixture()
-    const iterator = f.receiver.subscribe({ mode: 'latest' })[Symbol.asyncIterator]()
-    const first = iterator.next()
-    await f.sender.send('typing', 1); await f.sender.send('typing', 2)
-    await f.receiver.receive(f.frames[1]!)
-    expect((await first).value?.payload).toBe(2)
-    await f.receiver.receive(f.frames[0]!)
-    const next = iterator.next()
-    await f.sender.send('typing', 3); await f.receiver.receive(f.frames[2]!)
-    expect((await next).value?.payload).toBe(3)
-    await iterator.return?.(); f.sender.close(); f.receiver.close()
+  it('cancels route-owned receive before admission and retains noncooperative policy capacity', async () => {
+    const f = await capture(), blocked = gate()
+    const receiver = await channel({ maxPendingReceives: 1, async authorize() { blocked.enter(); await blocked.wait; return true } })
+    await f.sender.send('preview', 1)
+    const route = receiver.attachRoute({ async send() {} }), receiving = route.receive(f.frames[0]!)
+    await blocked.entered
+    const rejected = expect(receiving).rejects.toMatchObject({ code: 'signal_route_closed' })
+    route.close(); await rejected
+    await expect(inputRoute(receiver).receive(f.frames[0]!)).rejects.toMatchObject({ code: 'signal_backpressure' })
+    blocked.release()
+    await expect.poll(async () => {
+      try { return (await inputRoute(receiver).receive(f.frames[0]!))?.payload } catch { return undefined }
+    }).toBe(1)
+    expect(await inputRoute(receiver).receive(f.frames[0]!)).toBeNull()
   })
 
-  it('works without credentials, rejects disconnected sends, and never keeps a reconnect outbox', async () => {
-    const f = await fixture()
-    const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
-    await expect(channel.send('cursor', { x: 3 })).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
-    const delivered: Uint8Array[] = []
-    const route = channel.attachRoute({ async send(bytes) { delivered.push(bytes) } })
-    await channel.send('cursor', { x: 4 })
-    expect(delivered).toHaveLength(1)
-    const frame = assertCanonicalCbor(delivered[0]!) as unknown[]
-    expect(frame[2]).toBe('room'); expect(frame[4]).toBeNull()
-    route.close()
-    await expect(channel.send('cursor', { x: 5 })).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
-    channel.close(); f.sender.close(); f.receiver.close()
+  it('releases admission ordering after a receive deadline while keeping underlying work counted', async () => {
+    const f = await capture(), blocked = gate()
+    const receiver = await channel({ receiveTimeoutMs: 30, maxPendingReceives: 2, async authorize({ topic }) {
+      if (topic === 'blocked') { blocked.enter(); await blocked.wait }
+      return true
+    } })
+    await f.sender.send('blocked', 1); await f.sender.send('fresh', 2)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const receiving = inputRoute(receiver).receive(f.frames[0]!)
+    const rejected = expect(receiving).rejects.toMatchObject({ code: 'signal_receive_timeout' })
+    await blocked.entered
+    await vi.advanceTimersByTimeAsync(31); await rejected
+    expect((await inputRoute(receiver).receive(f.frames[1]!))?.payload).toBe(2)
+    blocked.release()
   })
 
-  it('cancels work waiting on policy without sending after close', async () => {
-    const f = await fixture()
-    let release!: () => void, entered!: () => void
-    const started = new Promise<void>(resolve => { entered = resolve })
-    const blocked = new Promise<void>(resolve => { release = resolve })
-    const channel = new SignalChannel({ ...f.options, async authorize() { entered(); await blocked; return true } })
-    const pending = channel.send('typing', 1)
-    await started
-    const refused = expect(pending).rejects.toThrow('SIGNAL_CHANNEL_CLOSED')
-    channel.close(); release(); await refused
-    expect(f.frames).toHaveLength(0)
-    f.sender.close(); f.receiver.close()
+  it('retires a stalled relay at its deadline without stalling accepted inbound messages', async () => {
+    const f = await capture(), blocked = gate(), relay = await channel({ relay: true, sendTimeoutMs: 30 })
+    let writes = 0, closes = 0
+    relay.attachRoute({ async send() { writes++; blocked.enter(); await blocked.wait }, close() { closes++ } })
+    await f.sender.send('typing', 1)
+    expect((await inputRoute(relay).receive(f.frames[0]!))?.payload).toBe(1)
+    await blocked.entered
+    await f.sender.send('typing', 2)
+    expect((await inputRoute(relay).receive(f.frames[1]!))?.payload).toBe(2)
+    await expect.poll(() => closes).toBe(1)
+    expect(writes).toBe(1)
+    await expect(relay.send('typing', 3)).rejects.toMatchObject({ code: 'signal_disconnected' })
+    blocked.release()
   })
 
-  it('relays original authenticated frames across live routes without replay loops', async () => {
-    const identity = await generateEd25519KeyPair(), middleIdentity = await generateEd25519KeyPair(), rightIdentity = await generateEd25519KeyPair()
-    const options = { scope: 'standalone-mesh', authorize: () => true }
-    const left = new SignalChannel({ ...options, identity })
-    const middle = new SignalChannel({ ...options, identity: middleIdentity, relay: true })
-    const right = new SignalChannel({ ...options, identity: rightIdentity })
-    left.attachRoute({ async send(frame) { await middle.receive(frame) } })
-    middle.attachRoute({ async send(frame) { await left.receive(frame) } })
-    middle.attachRoute({ async send(frame) { await right.receive(frame) } })
-    const iterator = right.subscribe()[Symbol.asyncIterator]()
-    const next = iterator.next()
-    const sent = await left.send('progress', { step: 1 })
-    expect((await next).value).toEqual(sent)
-    await iterator.return?.(); left.close(); middle.close(); right.close()
-  })
-  it('verifies exact signed identity and rejects replay, tampering and revocation', async () => {
-    const f = await fixture()
-    const sent = await f.sender.send('typing', { messageId: 'draft', typing: true })
-    const received = await f.receiver.receive(f.frames[0]!)
-    expect(received).toEqual(sent)
-    await expect(f.receiver.receive(f.frames[0]!)).resolves.toBeNull()
-    const tampered = assertCanonicalCbor(f.frames[0]!) as unknown[]
-    tampered[10] = 'null'
-    await expect(f.receiver.receive(encodeCanonicalCbor(tampered as never))).rejects.toThrow('SIGNAL_SIGNATURE_INVALID')
-    await f.sender.send('typing', false)
-    f.revoke()
-    await expect(f.receiver.receive(f.frames[1]!)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
-    await expect(f.sender.send('typing', true)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
-    f.sender.close(); f.receiver.close()
+  it('keeps healthy routes usable without awaiting a stalled peer', async () => {
+    const blocked = gate(), sender = await channel(), delivered: Uint8Array[] = []
+    let stalled = 0
+    sender.attachRoute({ async send() { stalled++; blocked.enter(); await blocked.wait } })
+    sender.attachRoute({ async send(frame) { delivered.push(frame) } })
+    const abort = new AbortController()
+    await sender.send('typing', 1, { signal: abort.signal }); await blocked.entered
+    await sender.send('typing', 2)
+    expect(stalled).toBe(1); expect(delivered).toHaveLength(2)
+    abort.abort(); blocked.release()
   })
 
-  it('accepts bounded reordering once without losing replay protection across TTLs', async () => {
-    const f = await fixture()
-    await f.sender.send('typing', 'older', { ttlMs: 5000 })
-    await f.sender.send('typing', 'newer', { ttlMs: 1_000 })
-    await f.receiver.receive(f.frames[1]!)
-    f.setNow(1_101)
-    expect((await f.receiver.receive(f.frames[0]!))?.payload).toBe('older')
-    await expect(f.receiver.receive(f.frames[0]!)).resolves.toBeNull()
-    f.setNow(5200)
-    await expect(f.receiver.receive(f.frames[0]!)).resolves.toBeNull()
-    f.sender.close(); f.receiver.close()
+  it.each([2, 3])('rechecks current permission at async send boundary %i without retiring a healthy route', async boundary => {
+    const blocked = gate()
+    let allowed = true, calls = 0
+    const f = await capture({ async authorize() {
+      if (++calls === boundary) { blocked.enter(); await blocked.wait }
+      return allowed
+    } })
+    const pending = f.sender.send('typing', true), rejected = expect(pending).rejects.toMatchObject({ code: 'signal_unauthorized' })
+    await blocked.entered; allowed = false; blocked.release(); await rejected
+    expect(f.frames).toHaveLength(0); expect(f.sender.routeCount).toBe(1)
+    allowed = true; await f.sender.send('typing', false)
+    expect(f.frames).toHaveLength(1)
   })
 
-  it('coalesces slow-consumer values without making a durable event history', async () => {
-    const f = await fixture()
-    const iterator = f.receiver.subscribe({ topics: ['typing'], mode: 'latest' })[Symbol.asyncIterator]()
-    const first = iterator.next()
-    await f.sender.send('typing', 1); await f.receiver.receive(f.frames[0]!)
-    expect((await first).value?.payload).toBe(1)
-    await f.sender.send('typing', 2); await f.receiver.receive(f.frames[1]!)
-    await f.sender.send('typing', 3); await f.receiver.receive(f.frames[2]!)
-    expect((await iterator.next()).value?.payload).toBe(3)
-    await iterator.return?.()
-    f.sender.close(); f.receiver.close()
+  it('returns an idle iterator immediately and frees a paused aborted subscription quota', async () => {
+    const f = await capture(), receiver = await channel({ maxSubscriptions: 1 })
+    const idle = receiver.subscribe()[Symbol.asyncIterator](), pending = idle.next()
+    expect((await idle.return?.())?.done).toBe(true); expect((await pending).done).toBe(true)
+    const abort = new AbortController(), paused = receiver.subscribe({ signal: abort.signal })[Symbol.asyncIterator](), first = paused.next()
+    await f.sender.send('sample', 1); await inputRoute(receiver).receive(f.frames[0]!); await first
+    abort.abort()
+    const replacement = receiver.subscribe()[Symbol.asyncIterator](), next = replacement.next()
+    await f.sender.send('sample', 2); await inputRoute(receiver).receive(f.frames[1]!)
+    expect((await next).value?.payload).toBe(2)
+    await replacement.return?.(); await paused.return?.()
   })
 
-  it('bounds active sessions without evicting replay protection for live frames', async () => {
-    const f = await fixture()
-    const receiver = new SignalChannel({ ...f.options, maxSessions: 1 })
-    await f.sender.send('typing', 1); await receiver.receive(f.frames[0]!)
-    const replacement = new SignalChannel(f.options)
-    await replacement.send('typing', 2)
-    await expect(receiver.receive(f.frames[1]!)).rejects.toThrow('SIGNAL_SESSION_QUOTA_EXCEEDED')
-    f.setNow(40_000)
-    await replacement.send('typing', 3)
-    expect((await receiver.receive(f.frames[2]!))?.payload).toBe(3)
-    replacement.close(); receiver.close(); f.sender.close(); f.receiver.close()
+  it('discards expired queued values before a capacity check and never revives them after clock rollback', async () => {
+    let now = 100
+    const f = await capture({ now: () => now }), receiver = await channel({ maxQueuedSignals: 1, now: () => now })
+    const reader = receiver.subscribe()[Symbol.asyncIterator](), first = reader.next()
+    await f.sender.send('sample', 'first'); await inputRoute(receiver).receive(f.frames[0]!); await first
+    await f.sender.send('sample', 'expired', { ttlMs: 1_000 }); await inputRoute(receiver).receive(f.frames[1]!)
+    now = 1_101
+    await f.sender.send('sample', 'fresh'); await inputRoute(receiver).receive(f.frames[2]!)
+    expect((await reader.next()).value?.payload).toBe('fresh')
+    expect(await inputRoute(receiver).receive(f.frames[1]!)).toBeNull()
+    now = 100
+    expect(await inputRoute(receiver).receive(f.frames[1]!)).toBeNull()
+    await reader.return?.()
   })
 
-  it('bounds outgoing queues and preserves backpressure', async () => {
-    const f = await fixture()
-    let release!: () => void, entered!: () => void
-    const started = new Promise<void>((resolve) => { entered = resolve })
-    const blocked = new Promise<void>((resolve) => { release = resolve })
-    const channel = new SignalChannel({ ...f.options, maxPendingSends: 1,
-      send: async () => { entered(); await blocked } })
-    const first = channel.send('typing', 1)
-    await started
-    await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_BACKPRESSURE')
-    release(); await first
-    channel.close(); f.sender.close(); f.receiver.close()
+  it('bounds queued bytes independently of item count and refuses malformed filters', async () => {
+    const f = await capture(), receiver = await channel({ maxQueuedSignals: 10, maxQueuedBytes: 600 })
+    const reader = receiver.subscribe()[Symbol.asyncIterator](), first = reader.next()
+    await f.sender.send('sample', 1); await inputRoute(receiver).receive(f.frames[0]!); await first
+    await f.sender.send('sample', 'x'.repeat(400)); await inputRoute(receiver).receive(f.frames[1]!)
+    await expect(reader.next()).rejects.toMatchObject({ code: 'signal_subscription_overflow' })
+    const invalid = receiver.subscribe({ topics: 'sample' as unknown as readonly string[] })[Symbol.asyncIterator]()
+    await expect(invalid.next()).rejects.toMatchObject({ code: 'signal_topic_filter_invalid' })
+  })
+
+  it('snapshots bounded plain JSON before async policy and does not invoke accessors', async () => {
+    const f = await capture(), receiver = await channel(), payload = { text: 'before', values: [1, 2] }
+    const pending = f.sender.send('preview', payload)
+    payload.text = 'after'; payload.values.push(3)
+    expect((await pending).payload).toEqual({ text: 'before', values: [1, 2] })
+    expect((await inputRoute(receiver).receive(f.frames[0]!))?.payload).toEqual({ text: 'before', values: [1, 2] })
+    let invoked = false
+    const accessor = { get value() { invoked = true; return 'unsafe' } }
+    await expect(f.sender.send('preview', accessor)).rejects.toMatchObject({ code: 'signal_payload_invalid' })
+    expect(invoked).toBe(false)
+    await expect(f.sender.send('preview', Array.from({ length: 4096 }, () => null))).rejects.toMatchObject({ code: 'signal_payload_invalid' })
+    expect(f.frames).toHaveLength(1)
   })
 })

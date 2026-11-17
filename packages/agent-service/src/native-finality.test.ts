@@ -4,12 +4,12 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 import { signGenesis, type ClockPolicy } from '@chronolog/capabilities'
-import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence, membershipDescriptor,
+import { SignedInclusionFinalityProvider, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence, membershipDescriptor,
   encodeOrderingEvidence, evaluateFinalitySnapshot, verifyPrefixCertificate } from '@chronolog/node-core'
 import type { DurableOperationStore } from '@chronolog/node-core'
 import { encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { NativeFinalityService } from './finality-service.js'
 import { NativeAgentStore } from './native-store.js'
@@ -18,7 +18,7 @@ const envelope = (text: string) => encodeEnvelope({ groupRoute: new Uint8Array(3
   messageType: 'candidate', encryptionEpoch: null, payload: utf8(text) })
 
 const cleanup: Array<() => Promise<void> | void> = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close() })
 
 async function credentials(options: { readonly clockPolicy?: ClockPolicy; readonly identity?: Ed25519KeyPair;
   readonly executionManifestDigest?: Uint8Array } = {}) {
@@ -375,14 +375,14 @@ describe('native signed-inclusion finality service', () => {
     const first = await authority.certifiedRead({ limit: 1 })
     for (const entry of first.entries) await sink.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
     await sink.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: first.certificate }))
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     for (const bytes of captured.splice(0)) await peer.ingest(decodeOrderingEvidence(bytes))
     expect(peer.progress.finalThrough).toBe(0)
     await authority.share(sink, { after: first.entries.at(-1)!.position })
     for (const bytes of captured.reverse()) await peer.ingest(decodeOrderingEvidence(bytes))
     expect(peer.progress.finalThrough).toBe(4)
     expect(peer.snapshot().closedThroughMs).toBe(1_000n)
-    const third = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const third = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     for (const evidence of [...peer.evidence()].reverse()) await third.ingest(evidence)
     expect(third.progress).toEqual(peer.progress)
   })
@@ -407,7 +407,7 @@ describe('native signed-inclusion finality service', () => {
       .toEqual(Array.from({ length: 66 }, (_, index) => index + 1))
     expect(evidence.at(-1)).toMatchObject({ kind: 'prefix-certificate', certificate: shared })
     expect((await authority.head()).position).toBe(67)
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     await peer.ingestBatch(evidence)
     expect(peer.progress.finalThrough).toBe(66)
 
@@ -420,10 +420,30 @@ describe('native signed-inclusion finality service', () => {
     expect(peer.progress.finalThrough).toBe(68)
   })
 
+  it.each(['missing', 'repeated'] as const)('does not publish a certificate when a later retained page is %s', async mode => {
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
+    await Promise.all(Array.from({ length: 65 }, (_, index) => authority.append(envelope(`page-${index}`))))
+    const captured: Uint8Array[] = [], read = authority.read.bind(authority)
+    vi.spyOn(authority, 'read').mockImplementation(async options => {
+      const range = await read(options)
+      return { ...range, entries: mode === 'missing' ? [] : (await read({ after: 0, limit: 1 })).entries }
+    })
+    await expect(authority.share({ putEvidence: async bytes => { captured.push(bytes.slice()) } }))
+      .rejects.toThrow(mode === 'missing' ? 'AUTHORITY_RANGE_INCOMPLETE' : 'AUTHORITY_RANGE_NOT_CONTIGUOUS')
+    expect(captured.map(decodeOrderingEvidence).every(item => item.kind === 'ordered-entry')).toBe(true)
+    expect(captured).toHaveLength(64)
+    vi.restoreAllMocks()
+    const repaired: Uint8Array[] = []
+    const shared = await authority.share({ putEvidence: async bytes => { repaired.push(bytes.slice()) } }, { after: 64 })
+    expect(shared.position).toBe(66)
+    expect(repaired.map(decodeOrderingEvidence).map(item => item.kind === 'ordered-entry' ? item.entry.position : item.kind))
+      .toEqual([65, 66, 'prefix-certificate'])
+  })
+
   it.each(['entry', 'certificate'] as const)('propagates a lost %s sink acknowledgment and retries exact evidence', async (boundary) => {
     const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
     await Promise.all(['one', 'two', 'three'].map(text => authority.append(envelope(text))))
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     const captured: Uint8Array[] = [], lost = new Error('sink acknowledgment lost')
     let fail = true
     const sink = { putEvidence: async (bytes: Uint8Array) => {
@@ -521,7 +541,7 @@ describe('native signed-inclusion finality service', () => {
     cleanup.push(() => transport.close())
     await transport.publish(envelope('queued-before-service'))
     const stopped = new AbortController(), running = authority.serve(transport, stopped.signal)
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     const frontier = async () => {
       for (const item of await transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
       return policy.snapshot().closedThroughMs
@@ -587,4 +607,30 @@ describe('native signed-inclusion finality service', () => {
     expect(proof.closures).toHaveLength(1)
     expect(proof.closedThroughMs).toBe(1_000n)
   })
+  it('does not advance a closure clock while asynchronous verification blocks queued appenders', async () => {
+    const f = await metadataFixture()
+    let advanceDuringRead = false
+    const store: DurableOperationStore = {
+      get: async key => {
+        if (advanceDuringRead && key === f.logKey) { advanceDuringRead = false; f.clock.now = 5_000 }
+        return f.store.get(key)
+      },
+      put: (key, bytes) => f.store.put(key, bytes),
+    }
+    const authority = await NativeFinalityService.open({ ...f, store })
+    await authority.append(envelope('previously-included'))
+    advanceDuringRead = true
+    const closing = authority.certify()
+    const pending = authority.append(envelope('published-while-closure-was-verifying'))
+    await closing
+    const entry = await pending
+    const proof = await evaluateFinalitySnapshot(f.configuration, (await authority.read()).entries)
+    expect(proof.closedThroughMs).toBe(1_000n)
+    expect(proof.records.find(record => record.entry.position === entry.position)!.admissionFloorMs).toBe(1_000n)
+    // A later closure can use the newer clock, after that queued receipt exists.
+    await authority.certify()
+    expect((await evaluateFinalitySnapshot(f.configuration, (await authority.read()).entries)).closedThroughMs).toBe(5_000n)
+  })
+
+
 })

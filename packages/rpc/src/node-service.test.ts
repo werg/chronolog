@@ -1,4 +1,4 @@
-import { bytesToBase64Url } from '@chronolog/protocol'
+import { bytesToBase64Url, emit, program, utf8 } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 
 import { InProcessRpcTransport } from './in-process.js'
@@ -24,6 +24,24 @@ function readerNode(): ChronologRpcNodeService {
 }
 
 describe('NodeRpcService policy views and enrollment', () => {
+  it('reports a known partial admission as a candidate blocker even below the raw watermark', async () => {
+    const service = new NodeRpcService({ node: {
+      ...readerNode(),
+      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 200n, authorId: groupId, txId: utf8('tx-later') } }),
+      candidateCore: () => ({ authorTimestampMs: 200n, membershipRevision: groupId, validationPolicy: groupId, program: program(emit('events', 'later')) }),
+      outcome: () => ({ outcome: 'accepted', rejectionCode: null, failingStatementIndex: null }),
+      isFinal: () => false,
+      outcomeChangedByReplay: () => false,
+      settlementEvidence: async () => ({ belowWatermark: true, unresolvedAttestationIds: [], pendingCandidateIds: [utf8('tx-earlier')],
+        watermark: { cutoffMs: 250n, heartbeatIds: [] } }),
+    } })
+    const evidence = await service.getSettlementEvidence({ groupId: group, transactionId: 'tx-later', requestId: 'evidence' },
+      { method: 'evidence.getSettlement' })
+    expect(evidence.confidence).toBe('provisional')
+    expect(evidence.unresolvedReferences).toEqual([{ kind: 'candidate', reference: 'tx-earlier' }])
+    expect(evidence.outcome).toMatchObject({ final: false, outcome: { type: 'accepted' } })
+  })
+
   it.each([true, false])('reports retained-route connectivity %s without inventing feed peers', async (connected) => {
     const service = new NodeRpcService({ node: {
       ...readerNode(),
@@ -46,7 +64,7 @@ describe('NodeRpcService policy views and enrollment', () => {
     const node: ChronologRpcNodeService = {
       ...readerNode(),
       get revision() { return revision },
-      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, authorFeedSequence: 1n, txId: groupId } }),
+      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, txId: groupId } }),
       outcome: () => ({ outcome: 'accepted', rejectionCode: null, failingStatementIndex: null }),
       isFinal: () => finalized,
       outcomeChangedByReplay: () => false,
@@ -73,7 +91,7 @@ describe('NodeRpcService policy views and enrollment', () => {
     const node = readerNode()
     const service = new NodeRpcService({ node: {
       ...node,
-      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, authorFeedSequence: 1n, txId: groupId } }),
+      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, txId: groupId } }),
       outcome: () => ({ outcome: finalized ? 'rejected' : 'accepted', rejectionCode: finalized ? 'constraint' : null, failingStatementIndex: finalized ? 0 : null }),
       isFinal: () => finalized,
       outcomeChangedByReplay: () => finalized,

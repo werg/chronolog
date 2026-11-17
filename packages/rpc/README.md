@@ -24,6 +24,21 @@ lifetime.
 | `signals.send` | Sends one topic/payload with optional `ttlMs`, returning its signed signal's public fields. The client makes one attempt. |
 | `signals.subscribe` | Streams future live signals with optional topics and `mode: 'all' \| 'latest'`. There is no resume or replay cursor. |
 
+The private `signals.send` request requires an absolute integer `expiresAtMs`
+computed at the public client's invocation, plus the original optional `ttlMs`.
+The shared default is five seconds. Missing or malformed deadlines fail before
+dispatch; already elapsed intent fails with `signal_expired`, mapped to
+`deadline_exceeded` with `retryable: false`. The service forwards only
+`min(original TTL, expiry - observed time)` to the injected channel, and the
+client separately bounds its wait using elapsed time. Neither path retries or
+creates a durable request identity. The public `Signals.send` options remain
+`{ ttlMs?, signal? }`; callers do not supply the wire deadline themselves.
+
+Cross-process transit accounting assumes synchronized wall clocks. Observed
+service time never moves backward, and clock offsets cannot increase a request's
+original duration. The injected signal port must honor TTL and cancellation.
+Once a transport has accepted bytes, timeout or abort cannot retract them.
+
 Both methods run through in-process, HTTP and the existing pull-based Worker
 transport. Signal identities use string `scope`, `authorId` and `sessionId`;
 payloads are JSON values. Authorization, expiry, duplicate suppression, bounded
@@ -45,8 +60,9 @@ streams does not reconnect live signal subscriptions.
   SQL executes in the browser's local owned replica.
 
 SQL BLOBs are `Uint8Array` in the TypeScript API. The HTTP adapter preserves them
-with its explicit JSON byte encoding. Digests, public keys, signed enrollment
-requests and signed approvals use canonical unpadded base64url strings.
+with its explicit JSON byte encoding. Binary digests, public keys, signed enrollment
+requests and signed approvals use canonical unpadded base64url strings. Event
+`origin.authorId` and live `authorId` are lowercase hex identifiers.
 
 ### Limited publisher ingress
 
@@ -159,8 +175,13 @@ processing remains the separate `events.subscribe` contract.
 ## Durable transaction submission
 
 `transaction.submit` accepts SQL/platform steps, a `requestId`, and an optional
-`idempotencyKey`. The service derives one stable operation identity from the
-caller principal, group and `idempotencyKey ?? requestId`.
+`operationId`. The service derives one stable operation identity from the
+caller principal, group and `operationId ?? requestId`.
+
+The HTTP server authenticates one node owner. Its trusted principal is stable
+across bearer-token rotation; credentials are never part of durable operation
+identity. Embedded multi-principal adapters supply authenticated stable
+`metadata.principal` values. HTTP request bodies cannot choose this metadata.
 
 The node's durable operation journal owns the mapping from that identity to the
 canonical signed proposal. It persists the exact prepared bytes before append
@@ -214,9 +235,6 @@ Only the device that created the request can claim its local readiness.
 | Captured views | `view.open`, `view.query`, `view.events`, `view.release` | `view.changes` |
 | Live signals | `signals.send` | `signals.subscribe` |
 | SQL | `query.localSql` | `query.liveSql` |
-| Captured views | `view.open`, `view.query`, `view.events`, `view.release` | `view.changes` |
-| Application changes and events | `change.submit`, `events.read`, `operation.get` | `events.subscribe`, `operation.subscribe` |
-| Live signals | `signals.send` | `signals.subscribe` |
 | Transactions | `transaction.submit`, `transaction.getOutcome` | `transaction.streamOutcome` |
 | Evidence | `evidence.getSettlement`, `evidence.getValidatorWatermark` | `evidence.streamSettlement` |
 | Governance | `governance.getStatus`, `governance.grantCapability`, `governance.revokeCapabilities`, `governance.rotateEpoch`, `governance.grantHistoricalAccess` | — |

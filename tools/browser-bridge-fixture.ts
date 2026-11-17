@@ -83,11 +83,11 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
   const token = crypto.randomUUID()
   let governed: GovernedNode | undefined
   let peers: GovernedPeerService | undefined
-  let peerFailure: Error | undefined
-  const peerHttp = await createHttpPeerFixture({ async accept(connection) {
+  const peerToken = crypto.randomUUID()
+  const peerHttp = createHttpPeerFixture({ token: peerToken, async connect(connection) {
     if (peers === undefined) { await connection.close(); throw new Error('BRIDGE_NATIVE_NOT_STARTED') }
     return peers.connectPeer({ connection })
-  }, onError(error) { peerFailure ??= error instanceof Error ? error : new Error('BRIDGE_PEER_FAILED', { cause: error }) } })
+  } })
   let online = true
   let loseAppendResponse = false
   let lostAppend: { readonly position: number; readonly recordId: string } | undefined
@@ -162,6 +162,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
     outgoing.setHeader('Cache-Control', 'no-store')
     if (incoming.method === 'OPTIONS') { outgoing.writeHead(204); outgoing.end(); return }
     const respond = async () => {
+      if (await peerHttp.handle(incoming, outgoing)) return
       const request = await webRequest(incoming)
       const path = new URL(request.url).pathname
       if (path === '/_chronolog/certificate') requests.certificates += 1
@@ -244,7 +245,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       const throughMs = BigInt(Date.now())
       const deadline = Date.now() + 10_000
       for (;;) {
-        if (peerFailure !== undefined) throw peerFailure
+        peerHttp.assertHealthy()
         await adapter.catchUp()
         for (const evidence of await local.evidenceHistory()) await root.node.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
         await root.node.waitForIdle()
@@ -279,12 +280,12 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       'CREATE TABLE tasks (id INTEGER PRIMARY KEY, claimed_by TEXT) STRICT',
       'CREATE TABLE history (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT',
       "INSERT INTO history (id, value) VALUES (1, 'before-enrollment')",
-    ], { idempotencyKey: 'bridge-schema' }))
+    ], { operationId: 'bridge-schema' }))
     const bootstrap: BrowserBridgeBootstrap = {
       hubUrl, token, genesis: bytesToBase64Url(savedGenesis), groupRoute: bytesToBase64Url(groupRoute),
       executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
       rootIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes),
-      nativeIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes), peerUrl: peerHttp.url, peerToken: peerHttp.token,
+      nativeIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes), peerUrl: `${hubUrl}/peer`, peerToken,
     }
     const snapshot = async (transactionIds: readonly string[] = []) => {
       await root.node.waitForIdle()
@@ -307,18 +308,18 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
         return approval
       },
       async prepareTask(browserIdentity: string) {
-        const team = await native.ownership.createTeam({ invite: [base64UrlToBytes(browserIdentity)] }, { idempotencyKey: 'bridge-team' })
+        const team = await native.ownership.createTeam({ invite: [base64UrlToBytes(browserIdentity)] }, { operationId: 'bridge-team' })
         const teamTransaction = await finalize(team.handle)
         const taskTransaction = await finalize(await native.transaction([{
           sql: `INSERT INTO tasks (id, chronolog_owner) VALUES (1, ${OWNER_FOR_KEY_SQL})`, params: [team.id],
-        }], { idempotencyKey: 'bridge-task' }))
+        }], { operationId: 'bridge-task' }))
         return { teamId: bytesToBase64Url(team.id), transactionIds: [schemaId, teamTransaction, taskTransaction] }
       },
       async claimTask(operationId = 'native-claim') {
         const handle = await native.transaction([
           "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",
           { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = 1', params: ['native'] },
-        ], { idempotencyKey: operationId })
+        ], { operationId: operationId })
         try { return handle.transactionId } finally { handle.dispose() }
       },
       async sync(transactionIds: readonly string[] = []) { await syncEvidence(); return snapshot(transactionIds) },

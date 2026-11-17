@@ -6,7 +6,7 @@ owner-controlled rows. The rules themselves are in
 is [`examples/shared-notes.ts`](../examples/shared-notes.ts)
 (`pnpm demo:ownership`).
 That walkthrough intentionally inspects provisional local outcomes with
-`settled()`; applications use `accepted()` when later work requires immutable
+`provisional()`; applications use `accepted()` when later work requires immutable
 success.
 
 ## The model in four sentences
@@ -42,7 +42,7 @@ await client.transaction([{
 
 ## Knowing why a write failed
 
-`handle.accepted()` waits for locally applied immutable acceptance and throws a
+`handle.accepted()` waits for final acceptance and throws a
 `TransactionRejectedError` on final rejection. `error.reason` says what went wrong:
 
 | `reason.kind` | Meaning |
@@ -54,8 +54,8 @@ await client.transaction([{
 | `engine` | SQLite refused the statement: `constraint`, `denied`, `step_limit`, … |
 
 `error.stepIndex` is the failing step. For provisional UI inspection, use
-`handle.settled()` and inspect its outcome. A late predecessor can still change
-that provisional result on replay (`TransactionOutcome.changedByReplay`);
+`handle.provisional()` and inspect `outcome.type`. A late predecessor can still
+change that result on replay (`TransactionOutcome.changedByReplay`);
 `accepted()` waits through those changes.
 
 ## Sharing, teams and transfers

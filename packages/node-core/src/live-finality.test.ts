@@ -49,7 +49,7 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
     materialization: { ...materialization, coordinator: { ...materialization.coordinator,
       publishFinal: async length => {
         if (length > (materialization.queries.finalOrderLength ?? 0)) finalPublications.push({ length,
-          excluded: (persistence.load()?.candidates ?? []).filter(candidate => candidate.state === 'inadmissible').map(candidate => bytesToHex(candidate.txId)) })
+          excluded: (persistence.load()?.candidates ?? []).filter(candidate => candidate.state === 'excluded').map(candidate => bytesToHex(candidate.txId)) })
         await materialization.coordinator.publishFinal!(length)
       },
     } },
@@ -134,7 +134,11 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
       await node.start()
     },
     closeRevision(proposals: readonly Uint8Array[], closedThroughMs: bigint, revision: Uint8Array = membershipRevision) {
-      closures = [...closures.filter(item => !equalBytes(item.membershipRevision, revision)), { membershipRevision: revision, closedThroughMs, proposalIds: proposals,
+      const index = revisions.findIndex(item => equalBytes(item.membershipRevision, revision))
+      if (index < 0) throw new Error('TEST_REVISION_UNDECLARED')
+      if (index === revisions.length - 1) revisions = [...revisions, { membershipRevision: bytes(119), authorTimeAfterMs: closedThroughMs }]
+      const nextMembershipRevision = revisions[index + 1]!.membershipRevision
+      closures = [...closures.filter(item => !equalBytes(item.membershipRevision, revision)), { membershipRevision: revision, nextMembershipRevision, closedThroughMs, proposalIds: proposals,
         feedPrefixes: transports.slice(0, 3).map(transport => ({ author: transport.identity, throughSequence: heads.get(transport.identity) ?? 0n })),
       }]
     } }
@@ -170,15 +174,15 @@ describe('live chronological finality', () => {
 
     await f.heartbeat(2); await f.node.waitForIdle()
     expect(f.node.finalOrderLength).toBe(1)
-    expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
-    expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
+    expect(f.node.candidate(preview.txId)?.state).toBe('excluded')
+    expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' })
     expect(f.node.isFinal(preview.txId)).toBe(true)
     expect(f.node.orderLength).toBe(1)
     expect(f.node.outcome(accepted.txId)?.orderIndex).toBe(0)
     expect((await f.node.events.read()).transactions.map(item => item.proposalId))
       .toEqual([new TextDecoder().decode(accepted.txId)])
     await f.reopen()
-    expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(preview.txId)?.state).toBe('excluded')
     expect(f.node.finalOrderLength).toBe(1)
   })
 
@@ -215,8 +219,8 @@ describe('live chronological finality', () => {
     const f = await fixture(), a = await f.candidate('excluded', 50n), b = await f.candidate('accepted', 100n)
     await f.vote(0, a); await f.vote(0, b); await f.vote(1, b)
     await f.heartbeat(0); await f.heartbeat(1); await f.heartbeat(2); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
-    expect(f.node.outcome(a.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
+    expect(f.node.outcome(a.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' })
     expect(f.node.isFinal(a.txId)).toBe(true)
     expect(f.node.finalOrderLength).toBe(1)
     expect(f.finalPublications.at(-1)).toEqual({ length: 1, excluded: [bytesToHex(a.txId)] })
@@ -230,14 +234,12 @@ describe('live chronological finality', () => {
     f.control.setCandidateState(preview.txId, 'provisional')
     await f.vote(0, admitted); await f.vote(1, admitted)
     await f.heartbeat(0); await f.heartbeat(1); await f.heartbeat(2); await f.node.waitForIdle()
-    expect(await f.node.liveFinality()).toMatchObject({ closedThroughMs: 100n, excludedProposalIds: [] })
+    expect(f.node.candidate(preview.txId)?.state).toBe('excluded')
     expect(f.node.orderLength).toBe(1)
-    expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
-    expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
+    expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' })
     expect(f.node.finalOrderLength).toBe(1)
     expect(f.finalPublications.at(-1)).toEqual({ length: 1, excluded: [bytesToHex(preview.txId)] })
-    expect((await f.node.events.read()).transactions.map(item => item.proposalId))
-      .toEqual([new TextDecoder().decode(admitted.txId)])
+    expect((await f.node.events.read()).transactions.map(entry => entry.proposalId)).toEqual([new TextDecoder().decode(admitted.txId)])
   })
 
   it('waits for indexed admissions even when the transport already has a contiguous heartbeat prefix', async () => {
@@ -258,7 +260,7 @@ describe('live chronological finality', () => {
     const f = await fixture(), a = await f.candidate('invalid-vote', 50n), b = await f.candidate('accepted', 100n)
     await f.vote(0, a, true, { policyVersion: 99n })
     await f.vote(0, b); await f.vote(1, b); await f.heartbeat(0); await f.heartbeat(1); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
     expect(f.node.finalOrderLength).toBe(1)
   })
 
@@ -267,8 +269,29 @@ describe('live chronological finality', () => {
     await f.vote(0, a); await f.vote(0, b); await f.vote(1, b)
     f.closeRevision([a.txId, b.txId], 100n)
     await f.node.refreshMembership(); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
     expect(f.node.finalOrderLength).toBe(1)
+    expect(await f.node.liveFinality()).toMatchObject({ provenThroughMs: 100n, closedThroughMs: 100n })
+  })
+
+  it('never lets one closed revision lift another open revision past its own proof', async () => {
+    const f = await fixture(), independentRevision = bytes(118), closingRevision = bytes(119), currentRevision = bytes(122)
+    f.setRevisions([{ membershipRevision, authorTimeAfterMs: -1n },
+      { membershipRevision: independentRevision, authorTimeAfterMs: 0n },
+      { membershipRevision: closingRevision, authorTimeAfterMs: 0n },
+      { membershipRevision: currentRevision, authorTimeAfterMs: 500n }])
+    f.closeRevision([], 0n)
+    f.closeRevision([], 500n, closingRevision)
+    const stillOpen = await f.candidate('separate-revision', 300n, twoVotes, independentRevision)
+    await f.vote(0, stillOpen); await f.vote(1, stillOpen)
+    await f.heartbeat(0, 200n, independentRevision); await f.heartbeat(1, 200n, independentRevision)
+    await f.node.refreshMembership(); await f.node.waitForIdle()
+    expect(await f.node.liveFinality()).toMatchObject({ provenThroughMs: 200n, closedThroughMs: 200n })
+    expect(f.node.outcome(stillOpen.txId)?.outcome).toBe('accepted')
+    expect(f.node.isFinal(stillOpen.txId)).toBe(false)
+    await f.heartbeat(0, 350n, independentRevision); await f.heartbeat(1, 350n, independentRevision)
+    await f.node.waitForIdle()
+    expect(f.node.isFinal(stillOpen.txId)).toBe(true)
   })
 
   it('does not infer away an intermediate open revision with no locally known proposals', async () => {
@@ -305,8 +328,8 @@ describe('live chronological finality', () => {
   it('finalizes the old boundary before a newly activated revision has a heartbeat', async () => {
     const f = await fixture(), next = bytes(122), old = await f.candidate('old-boundary', 100n)
     await f.vote(0, old); await f.vote(1, old)
-    f.closeRevision([old.txId], 100n)
     f.setRevisions([{ membershipRevision, authorTimeAfterMs: -1n }, { membershipRevision: next, authorTimeAfterMs: 100n }])
+    f.closeRevision([old.txId], 100n)
     await f.node.refreshMembership(); await f.node.waitForIdle()
     expect(f.node.finalOrderLength).toBe(1)
     expect((await f.node.liveFinality()).closedThroughMs).toBe(100n)
@@ -327,8 +350,8 @@ describe('live chronological finality', () => {
     expect(f.node.finalOrderLength).toBe(0)
     expect((await f.node.liveFinality()).closedThroughMs).toBeNull()
     await f.ingest(delayed); await f.node.waitForIdle()
-    expect(f.node.candidate(a.txId)?.state).toBe('inadmissible')
-    expect(f.node.outcome(a.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
+    expect(f.node.candidate(a.txId)?.state).toBe('excluded')
+    expect(f.node.outcome(a.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' })
     expect(f.node.finalOrderLength).toBe(1)
     expect((await f.node.liveFinality()).closedThroughMs).toBe(100n)
   })

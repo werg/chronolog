@@ -137,7 +137,7 @@ export const applicationReady = (async () => {
   // The invitation and schema-dependent application calls need the initial state.
   // Reconnect only attaches; qualification observes its replay separately.
   await command('sync', {}, 120_000)
-  const membership = await client.ownership.acceptInvitation(base64UrlToBytes(bootstrap.teamId), { idempotencyKey: 'accept-pilot-team' })
+  const membership = await client.ownership.acceptInvitation(base64UrlToBytes(bootstrap.teamId), { operationId: 'accept-pilot-team' })
   try {
     const outcome = await membership.handle.final({ signal: AbortSignal.timeout(30_000) })
     if (outcome.outcome.type !== 'accepted') throw new Error(`PILOT_MEMBERSHIP_REJECTED: ${JSON.stringify(outcome.outcome)}`)

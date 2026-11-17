@@ -150,7 +150,7 @@ export class PeerGovernanceController {
         const transactions = new Map<string, Uint8Array>()
         for (const item of scanned) for (const txId of item.transactionIds) transactions.set(bytesToHex(txId), txId)
         this.#closed.set(bytesToHex(previous.revisionDigest), {
-          membershipRevision: previous.revisionDigest.slice(), closedThroughMs: boundary,
+          membershipRevision: previous.revisionDigest.slice(), nextMembershipRevision: next.revisionDigest.slice(), closedThroughMs: boundary,
           proposalIds: [...transactions.values()],
           feedPrefixes: closures.map(item => ({ author: item.record.author, throughSequence: item.record.sequence })),
         })

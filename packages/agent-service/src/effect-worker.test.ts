@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 
 import { DurableEffectWorker, effectIdentity } from './effect-worker.js'
 import type { EffectHandler, EffectWorkerOptions } from './effect-worker.js'
+import { FinalEventPublicationRejectedError } from './event-source.js'
 import type { EventReadOptions, FinalEvent, FinalEventBatch, FinalEventSource } from './event-source.js'
 import { ResidentAgentService } from './service.js'
 
@@ -43,6 +44,26 @@ function fixture(options: { readonly store?: DurableOperationStore; readonly rec
 }
 
 describe('durable final-intent workers', () => {
+  it('retains original-author provenance through a failed dispatch and checkpoint reopen', async () => {
+    const f = fixture({ recovery: 'idempotent' })
+    const observed: FinalEvent[] = []
+    let interrupted = true
+    const configuration: EffectWorkerOptions = { ...f.configuration,
+      source: source([{ topic: 'jobs.requested', payloads: [{ authorId: 'forged-payload-role', command: 'first' }] }]),
+      handler: { ...f.configuration.handler, dispatch: async ({ event }) => {
+        observed.push(structuredClone(event))
+        if (interrupted) { interrupted = false; throw new Error('reply lost') }
+        return { completed: true }
+      } },
+    }
+    await expect((await DurableEffectWorker.open(configuration)).processNext()).rejects.toThrow('EFFECT_OUTCOME_UNCERTAIN')
+    await (await DurableEffectWorker.open(configuration)).processNext()
+    expect(observed).toHaveLength(2)
+    expect(observed[0]!.origin).toEqual(origin)
+    expect(observed[1]).toEqual(observed[0])
+    expect(observed[1]!.origin.authorId).not.toBe('forged-payload-role')
+  })
+
   it('checkpoints a whole final batch and does not dispatch again on restart', async () => {
     const f = fixture()
     const worker = await DurableEffectWorker.open(f.configuration)
@@ -197,6 +218,77 @@ describe('durable final-intent workers', () => {
     expect(f.calls).toHaveLength(1)
     expect(attempts).toHaveLength(2)
     expect(attempts[1]).toEqual(attempts[0])
+  })
+
+  it('explicitly recovers a finally rejected result publication across lost checkpoint replies without redispatch', async () => {
+    const disk = new MemoryOperationStore()
+    let loseCheckpointReply = false
+    const store: DurableOperationStore = { get: key => disk.get(key), async put(key, value) {
+      await disk.put(key, value)
+      if (loseCheckpointReply) { loseCheckpointReply = false; throw new Error('checkpoint reply lost') }
+    } }
+    const f = fixture({ store })
+    const attempts: { operationId: string; payload: EventPayload }[] = []
+    let losePublicationReply = true
+    const configuration: EffectWorkerOptions = { ...f.configuration,
+      source: source([{ topic: 'jobs.requested', payloads: [null] }]),
+      publisher: { publishFinal: async (_topic, payload, { operationId }) => {
+        attempts.push({ operationId, payload: structuredClone(payload) })
+        if (operationId.endsWith(':0')) {
+          loseCheckpointReply = true
+          throw new FinalEventPublicationRejectedError('original-result-proposal', 'FINALITY_TIMESTAMP_CLOSED')
+        }
+        if (losePublicationReply) { losePublicationReply = false; throw new Error('publication reply lost') }
+      } },
+    }
+    await expect((await DurableEffectWorker.open(configuration)).processNext()).rejects.toThrow('checkpoint reply lost')
+    const rejected = await DurableEffectWorker.open(configuration)
+    const status = await rejected.status(), effectId = status.effect!.effectId
+    expect(status).toMatchObject({ cursor: null, remaining: 1, effect: { stage: 'publication-rejected', result: { ok: true },
+      publicationAttempt: 0, publicationRejections: [{ attempt: 0, operationId: attempts[0]!.operationId,
+        proposalId: 'original-result-proposal', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' }] } })
+    await expect(rejected.processNext()).rejects.toBeInstanceOf(FinalEventPublicationRejectedError)
+    expect(attempts).toHaveLength(1)
+    expect(f.calls).toHaveLength(1)
+
+    loseCheckpointReply = true
+    await expect(rejected.retryPublication(effectId)).rejects.toThrow('checkpoint reply lost')
+    const resumed = await DurableEffectWorker.open(configuration)
+    expect((await resumed.status()).effect).toMatchObject({ stage: 'result', publicationAttempt: 1, result: { ok: true } })
+    await expect(resumed.processNext()).rejects.toThrow('publication reply lost')
+    // An unknown result of the new publication cannot authorize another ID.
+    await expect(resumed.retryPublication(effectId)).rejects.toThrow('EFFECT_PUBLICATION_NOT_REJECTED')
+    const completed = await DurableEffectWorker.open(configuration)
+    await completed.processNext()
+    expect(f.calls).toHaveLength(1)
+    expect(attempts).toHaveLength(3)
+    expect(attempts[1]!.operationId).not.toBe(attempts[0]!.operationId)
+    expect(attempts[2]).toEqual(attempts[1])
+    expect(attempts[2]!.payload).toMatchObject({ type: 'effect.completed', version: 2, result: { ok: true },
+      publication: { attempt: 1, rejections: [{ attempt: 0, operationId: attempts[0]!.operationId,
+        proposalId: 'original-result-proposal', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' }] } })
+    expect(await completed.status()).toMatchObject({ cursor: 'c:1', remaining: 0, effect: null })
+  })
+
+  it('bounds explicit publication retries while retaining every definitive rejection', async () => {
+    const f = fixture()
+    let sequence = 0
+    const configuration: EffectWorkerOptions = { ...f.configuration,
+      source: source([{ topic: 'jobs.requested', payloads: [null] }]),
+      publisher: { publishFinal: async () => { throw new FinalEventPublicationRejectedError(`proposal-${sequence++}`, 'WRITER_UNAUTHORIZED') } },
+    }
+    const worker = await DurableEffectWorker.open(configuration)
+    for (let attempt = 0; attempt < 64; attempt++) {
+      await expect(worker.processNext()).rejects.toBeInstanceOf(FinalEventPublicationRejectedError)
+      const effect = (await worker.status()).effect!
+      expect(effect.publicationAttempt).toBe(attempt)
+      expect(effect.publicationRejections).toHaveLength(attempt + 1)
+      if (attempt < 63) {
+        expect(await worker.retryPublication(effect.effectId)).toEqual({ operationId: `effect-result:${effect.effectId}:${attempt + 1}` })
+      } else await expect(worker.retryPublication(effect.effectId)).rejects.toThrow('EFFECT_PUBLICATION_ATTEMPTS_EXHAUSTED')
+    }
+    expect(f.calls).toHaveLength(1)
+    expect(await worker.status()).toMatchObject({ cursor: null, remaining: 1, effect: { stage: 'publication-rejected' } })
   })
 
   it('stops result finality waits after a sibling service failure and resumes the exact saved result', async () => {

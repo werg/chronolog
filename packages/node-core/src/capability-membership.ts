@@ -7,12 +7,14 @@ import {
   type ValidatorEvidence,
 } from '@chronolog/capabilities'
 import type { StoredAttestation, WatermarkPolicy } from '@chronolog/control-store'
-import { bytesToHex, equalBytes, type TransactionCore } from '@chronolog/protocol'
+import { bytesToHex, equalBytes } from '@chronolog/protocol'
 
 import type {
   AdmissionScope,
   CandidateAdmissionContext,
   MembershipResolver,
+  MembershipPolicyContext,
+  PotentialAdmissionEvidence,
   TransportAuthorContext,
   ValidatorAuthorityContext,
 } from './types.js'
@@ -120,7 +122,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
   }
 
   async canHeartbeat(context: ValidatorAuthorityContext): Promise<boolean> {
-    const snapshot = await this.#snapshot({ ...context, validationPolicy: new Uint8Array(), writerId: new Uint8Array() })
+    const snapshot = await this.#snapshot(context)
     if (!snapshot) return false
     const capability = snapshot.capabilities.get(bytesToHex(context.validatorCapability))
     return capability !== undefined &&
@@ -129,12 +131,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
   }
 
   async canUseTransportAuthor(context: TransportAuthorContext): Promise<boolean> {
-    const snapshot = await this.#snapshot({
-      groupId: context.groupId,
-      membershipRevision: context.membershipRevision,
-      validationPolicy: new Uint8Array(),
-      writerId: context.signingId,
-    })
+    const snapshot = await this.#snapshot(context)
     if (!snapshot) {
       if (await this.#snapshots(context.membershipRevision) === null) throw new GovernanceEvidencePendingError()
       return false
@@ -190,16 +187,38 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     return evaluation.selected.map((evidence) => indexed.get(bytesToHex(evidence.capabilityId))!.attestation)
   }
 
-  async watermarkPolicy(core: TransactionCore): Promise<WatermarkPolicy | null> {
-    const context = {
-      groupId: core.groupId,
-      membershipRevision: core.membershipRevision,
-      validationPolicy: core.validationPolicy,
-      writerId: core.authorId,
-      ...(core.writerCapability === undefined ? {} : { writerCapability: core.writerCapability }),
-    }
+  async canStillAdmit(
+    context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>,
+    evidence: PotentialAdmissionEvidence,
+  ): Promise<boolean> {
     const snapshot = await this.#snapshot(context)
-    const effective = snapshot?.policies.get(bytesToHex(core.validationPolicy))
+    const policy = snapshot?.policies.get(bytesToHex(context.validationPolicy))?.policy
+    if (!snapshot || !policy) return true
+    const possible = new Map<string, ValidatorEvidence>()
+    for (const attestation of evidence.attestations) {
+      const capability = snapshot.capabilities.get(bytesToHex(attestation.validatorCapability))
+      if (capability === undefined || !this.#activeRole(capability, snapshot, 'validator') ||
+          !equalBytes(capability.grant.signingPublicKey, attestation.validatorId) ||
+          !equalBytes(attestation.membershipRevision, snapshot.revisionDigest) ||
+          attestation.policyVersion !== policy.version ||
+          attestation.authorTimestampMs <= attestation.acceptedAboveMs ||
+          attestation.authorTimestampMs <= (capability.grant.minimumAuthorTimestampMs ?? -1n)) continue
+      possible.set(bytesToHex(attestation.validatorId), { capabilityId: capability.id, validatorId: attestation.validatorId })
+    }
+    const open = new Set(evidence.openValidatorIds.map(bytesToHex))
+    for (const capability of snapshot.capabilities.values()) {
+      const key = bytesToHex(capability.grant.signingPublicKey)
+      if (!open.has(key) || possible.has(key) || !this.#activeRole(capability, snapshot, 'validator') ||
+          context.authorTimestampMs === undefined ||
+          context.authorTimestampMs <= (capability.grant.minimumAuthorTimestampMs ?? -1n)) continue
+      possible.set(key, { capabilityId: capability.id, validatorId: capability.grant.signingPublicKey })
+    }
+    return evaluateValidationPolicy(policy, [...possible.values()]).satisfied
+  }
+
+  async watermarkPolicy(context: MembershipPolicyContext): Promise<WatermarkPolicy | null> {
+    const snapshot = await this.#snapshot(context)
+    const effective = snapshot?.policies.get(bytesToHex(context.validationPolicy))
     if (!snapshot || !effective) return null
     return this.#watermarkPolicies(snapshot)?.find(item => item.policyId === bytesToHex(effective.id)) ?? null
   }
@@ -212,6 +231,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     if (new Set(validatorIds.map(bytesToHex)).size !== validatorIds.length) return null
     const policies: WatermarkPolicy[] = []
     for (const effective of snapshot.policies.values()) {
+      if (effective.installedAtRevision > snapshot.revision) continue
       const threshold = Number(effective.policy.minimumValidators)
       if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > validators.length) return null
       policies.push({ kind: 'threshold', policyId: bytesToHex(effective.id), validatorIds, threshold })
@@ -234,7 +254,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     return scopes
   }
 
-  async #snapshot(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): Promise<CapabilitySnapshot | null> {
+  async #snapshot(context: Pick<CandidateAdmissionContext, 'groupId' | 'membershipRevision'>): Promise<CapabilitySnapshot | null> {
     const snapshot = await this.#snapshots(context.membershipRevision)
     return snapshot !== null &&
       equalBytes(snapshot.groupId, context.groupId) &&

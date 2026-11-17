@@ -8,7 +8,7 @@ import { openBrowserEventPeer, prepareBrowserIdentity, serveBrowserEventPeer, ty
 import { acquireBrowserStorage } from '../../packages/runtime-browser/src/opfs.js'
 import { openSyncControl } from '../../packages/runtime-browser/src/sync-control.js'
 import type { WorkerEndpoint } from '../../packages/runtime-browser/src/worker-rpc.js'
-import { connectGovernedBrowserPeer } from './event-connection.js'
+import { openHttpPeerConnection } from './event-connection.js'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contract.js'
 import { qualifyStorageQuota } from './storage-quota.js'
 
@@ -16,7 +16,7 @@ const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserEventPeer | undefined, identity: EnrollmentIdentity | undefined, operations: AtomicBytesStore | undefined
 let name = ''
 let connection: Awaited<ReturnType<BrowserEventPeer['connectPeer']>> | undefined
-let bootstrap: BrowserEventBootstrap | undefined
+let signalSubscriptions = 0
 let checkpointPause: 'before' | 'after' | undefined
 const checkpointBinding = utf8('events-browser-fixture/v1')
 const pause = async (point: string): Promise<never> => {
@@ -24,11 +24,6 @@ const pause = async (point: string): Promise<never> => {
   return new Promise(() => { /* The qualification runner terminates this real Worker. */ })
 }
 const checkpoint = () => new CheckpointStore(operations!, { id: 'browser-projection', binding: checkpointBinding })
-async function connect(): Promise<void> {
-  await connection?.close()
-  connection = await connectGovernedBrowserPeer({ bootstrap: bootstrap!, peer: peer! })
-  void connection.completion.catch((error: unknown) => endpoint.postMessage({ fixture: 'connection-error', error: String(error) }))
-}
 
 endpoint.addEventListener('message', (event) => {
   const request = event.data as { fixture?: string; id?: number; name?: string; bootstrap?: BrowserEventBootstrap;
@@ -64,9 +59,8 @@ endpoint.addEventListener('message', (event) => {
       }
       case 'open': {
         name = request.name!
-        bootstrap = request.bootstrap!
-        const enrollment = bootstrap
-        const genesis = decodeSignedGenesis(base64UrlToBytes(enrollment.genesis))
+        const bootstrap = request.bootstrap!
+        const genesis = decodeSignedGenesis(base64UrlToBytes(bootstrap.genesis))
         peer = await openBrowserEventPeer({ name, configure(context) {
           identity = context.identity; operations = context.operations
           const original = operations.put.bind(operations)
@@ -75,19 +69,26 @@ endpoint.addEventListener('message', (event) => {
             await original(key, bytes)
             if (checkpointPause === 'after' && key.startsWith('agent/checkpoint/')) await pause('checkpoint-after')
           }
-          return { governed: { genesis, groupRoute: base64UrlToBytes(enrollment.groupRoute),
-            initialEpochContentKey: base64UrlToBytes(enrollment.epochContentKey) },
+          return { governed: { genesis, groupRoute: base64UrlToBytes(bootstrap.groupRoute),
+            initialEpochContentKey: base64UrlToBytes(bootstrap.epochContentKey) },
             close: async () => { await connection?.close() } }
         } })
-        await connect()
+        connection = await peer.connectPeer({ connection: await openHttpPeerConnection(bootstrap.peerUrl, bootstrap.peerToken), peerIdentity: base64UrlToBytes(bootstrap.nativeIdentity) })
+        // Observe the real channel's subscription lifetime; traffic still uses
+        // ChronologClient -> WorkerRpcTransport -> NodeRpcService unchanged.
+        const subscribe = peer.signals.subscribe.bind(peer.signals)
+        peer.signals.subscribe = options => ({ async *[Symbol.asyncIterator]() {
+          signalSubscriptions++
+          try { yield* subscribe(options) } finally { signalSubscriptions-- }
+        } })
+        void connection.completion.catch((error: unknown) => endpoint.postMessage({ fixture: 'connection-error', error: String(error) }))
         await peer.transport.catchUp()
         await peer.node.waitForIdle()
         serveBrowserEventPeer(endpoint, peer)
         return { identity: bytesToBase64Url(peer.node.identity), groupId: bytesToBase64Url(genesis.manifest.groupId),
           isolated: globalThis.crossOriginIsolated }
       }
-      case 'connect': await connect(); return null
-      case 'disconnect': await connection?.close(); connection = undefined; return null
+      case 'signalSubscriptions': return signalSubscriptions
       case 'state': {
         await peer!.transport.catchUp()
         await peer!.node.waitForIdle()

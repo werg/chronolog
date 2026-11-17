@@ -9,7 +9,7 @@ describe('standalone signal package boundary', () => {
     })
     const inputs = Object.keys(result.metafile.inputs)
     expect(inputs).toContain('packages/signals/src/index.ts')
-    expect(inputs).not.toEqual(expect.arrayContaining([expect.stringMatching(/packages\/(?:protocol|capabilities|node-core|agent-service|materializer|runtime-browser|records)\//u)]))
+    expect(inputs.filter(path => path !== '<stdin>').every(path => path.startsWith('packages/signals/src/'))).toBe(true)
     expect(inputs).not.toEqual(expect.arrayContaining([expect.stringMatching(/(?:node:|doltlite|sqlite|\.node$|\.wasm$)/u)]))
     expect(result.outputFiles[0]!.text).toContain('SignalChannel')
   })

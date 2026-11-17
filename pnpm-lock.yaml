@@ -13,6 +13,9 @@ importers:
 
   .:
     devDependencies:
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:packages/signals
       '@chronolog/agent-service':
         specifier: workspace:*
         version: link:packages/agent-service
@@ -52,9 +55,6 @@ importers:
       '@chronolog/runtime-workerd':
         specifier: workspace:*
         version: link:packages/runtime-workerd
-      '@chronolog/signals':
-        specifier: workspace:*
-        version: link:packages/signals
       '@chronolog/transport-ssb':
         specifier: workspace:*
         version: link:packages/transport-ssb
@@ -130,6 +130,9 @@ importers:
 
   apps/chronologd:
     dependencies:
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:../../packages/signals
       '@chronolog/agent-service':
         specifier: workspace:*
         version: link:../../packages/agent-service
@@ -182,12 +185,15 @@ importers:
 
   packages/agent-service:
     dependencies:
-      '@chronolog/canonical':
+      '@chronolog/signals':
         specifier: workspace:*
-        version: link:../canonical
+        version: link:../signals
       '@chronolog/capabilities':
         specifier: workspace:*
         version: link:../capabilities
+      '@chronolog/canonical':
+        specifier: workspace:*
+        version: link:../canonical
       '@chronolog/node-core':
         specifier: workspace:*
         version: link:../node-core
@@ -197,9 +203,6 @@ importers:
       '@chronolog/records':
         specifier: workspace:*
         version: link:../records
-      '@chronolog/signals':
-        specifier: workspace:*
-        version: link:../signals
     devDependencies:
       '@chronolog/transport-ssb':
         specifier: workspace:*
@@ -213,12 +216,12 @@ importers:
 
   packages/capabilities:
     dependencies:
-      '@chronolog/protocol':
-        specifier: workspace:*
-        version: link:../protocol
       '@chronolog/signals':
         specifier: workspace:*
         version: link:../signals
+      '@chronolog/protocol':
+        specifier: workspace:*
+        version: link:../protocol
 
   packages/chaos:
     dependencies:
@@ -252,6 +255,9 @@ importers:
 
   packages/client:
     dependencies:
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:../signals
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
@@ -264,9 +270,6 @@ importers:
       '@chronolog/rpc':
         specifier: workspace:*
         version: link:../rpc
-      '@chronolog/signals':
-        specifier: workspace:*
-        version: link:../signals
 
   packages/conformance:
     dependencies:
@@ -390,6 +393,9 @@ importers:
 
   packages/rpc:
     dependencies:
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:../signals
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
@@ -402,12 +408,12 @@ importers:
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
-      '@chronolog/signals':
-        specifier: workspace:*
-        version: link:../signals
 
   packages/runtime-browser:
     dependencies:
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:../signals
       '@chronolog/agent-service':
         specifier: workspace:*
         version: link:../agent-service
@@ -435,9 +441,6 @@ importers:
       '@chronolog/rpc':
         specifier: workspace:*
         version: link:../rpc
-      '@chronolog/signals':
-        specifier: workspace:*
-        version: link:../signals
 
   packages/runtime-workerd:
     dependencies:
@@ -454,12 +457,6 @@ importers:
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
-
-  packages/signals:
-    dependencies:
-      '@chronolog/canonical':
-        specifier: workspace:*
-        version: link:../canonical
 
   packages/testkit:
     dependencies:
@@ -524,13 +521,12 @@ importers:
       '@chronolog/agent-service':
         specifier: workspace:*
         version: link:../agent-service
-      '@chronolog/signals':
-        specifier: workspace:*
-        version: link:../signals
     optionalDependencies:
       werift:
         specifier: 0.27.0
         version: 0.27.0
+
+  packages/signals: {}
 
 packages:
 

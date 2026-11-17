@@ -11,7 +11,7 @@ import { createCertificateFetcher, TendrillerTransport } from '@chronolog/transp
 import { createRecordLogClient } from '@tendriller/core/records'
 
 import type { BrowserBridgeBootstrap, BrowserBridgeIdentity, BrowserBridgeSnapshot } from './bridge-contract.js'
-import { connectGovernedBrowserPeer } from './event-connection.js'
+import { openHttpPeerConnection } from './event-connection.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 const closing = new AbortController()
@@ -20,7 +20,7 @@ let peer: BrowserPeer | undefined
 let relay: TendrillerTransport | undefined
 let nativeBootstrap: BrowserBridgeBootstrap | undefined
 let localIdentity: EnrollmentIdentity | undefined
-let nativePeer: Awaited<ReturnType<typeof connectGovernedBrowserPeer>> | undefined
+let nativePeer: Awaited<ReturnType<BrowserPeer['connectPeer']>> | undefined
 
 async function connectNative(): Promise<void> {
   if (nativeBootstrap === undefined || nativePeer !== undefined || peer?.governed === undefined || localIdentity === undefined) return
@@ -28,7 +28,8 @@ async function connectNative(): Promise<void> {
   const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
     isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, localIdentity!.signing.publicKeyBytes))
   if (reader === undefined) return
-  const connected = await connectGovernedBrowserPeer({ bootstrap: nativeBootstrap, peer })
+  const connected = await peer.connectPeer({ signal: closing.signal, peerIdentity: base64UrlToBytes(nativeBootstrap.nativeIdentity),
+    connection: await openHttpPeerConnection(nativeBootstrap.peerUrl, nativeBootstrap.peerToken, closing.signal) })
   nativePeer = connected
   void connected.completion.finally(() => { if (nativePeer === connected) nativePeer = undefined }).catch(() => undefined)
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
 
 import {
-  CoordinatedHistoryPolicy, ReferenceRecordLog, createPrefixAuthority,
+  SignedInclusionFinalityProvider, ReferenceRecordLog, createPrefixAuthority,
   decodeOrderingEvidence, encodeOrderingEvidence, orderedGenesisRoot,
   type CoordinatedHistoryConfiguration,
 } from './history-policy.js'
@@ -21,7 +21,7 @@ async function fixture() {
   const log = await ReferenceRecordLog.open(historyId, storage)
   const authority = createPrefixAuthority({ configuration, identity, readHead: () => log.head() })
   const peerStorage = new MemoryOperationStore()
-  const peer = await CoordinatedHistoryPolicy.open(configuration, peerStorage)
+  const peer = await SignedInclusionFinalityProvider.open(configuration, peerStorage)
   return { configuration, storage, log, authority, peer, peerStorage, identity }
 }
 
@@ -51,12 +51,12 @@ describe('portable coordinated prefix evidence', () => {
     const f = await fixture()
     for (const value of ['one', 'two']) await f.peer.ingest({ kind: 'ordered-entry', entry: await f.log.append(utf8(value)) })
     await f.peer.ingest({ kind: 'prefix-certificate', certificate: await f.authority.certify() })
-    const second = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const second = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     for (const evidence of [...f.peer.evidence()].reverse()) {
       await second.ingest(decodeOrderingEvidence(encodeOrderingEvidence(evidence)))
     }
     expect(second.progress).toEqual(f.peer.progress)
-    const reopened = await CoordinatedHistoryPolicy.open(f.configuration, f.peerStorage)
+    const reopened = await SignedInclusionFinalityProvider.open(f.configuration, f.peerStorage)
     expect(reopened.progress).toEqual(f.peer.progress)
     expect(reopened.entries()).toEqual(f.peer.entries())
   })
@@ -85,7 +85,7 @@ describe('portable coordinated prefix evidence', () => {
     expect(f.peer.progress).toMatchObject({ finalThrough: 0, missing: [1] })
     await f.peer.ingest({ kind: 'ordered-entry', entry: first })
     expect(f.peer.entries()).toEqual([first, second])
-    const reopened = await CoordinatedHistoryPolicy.open(f.configuration, f.peerStorage)
+    const reopened = await SignedInclusionFinalityProvider.open(f.configuration, f.peerStorage)
     expect(reopened.entries()).toEqual([first, second])
     expect(reopened.evidence().filter((item) => item.kind === 'ordered-entry')).toHaveLength(2)
   })
@@ -126,7 +126,7 @@ describe('portable coordinated prefix evidence', () => {
     const certificate = await f.authority.certify()
     const altered = structuredClone(certificate); altered.signature[0]! ^= 1
     await expect(f.peer.ingest({ kind: 'prefix-certificate', certificate: altered })).rejects.toThrow('SIGNATURE_INVALID')
-    const other = await CoordinatedHistoryPolicy.open({ ...f.configuration, executionManifestDigest: new Uint8Array(32).fill(4) }, new MemoryOperationStore())
+    const other = await SignedInclusionFinalityProvider.open({ ...f.configuration, executionManifestDigest: new Uint8Array(32).fill(4) }, new MemoryOperationStore())
     await expect(other.ingest({ kind: 'prefix-certificate', certificate })).rejects.toThrow('CONFIGURATION_MISMATCH')
     await f.peer.ingest({ kind: 'ordered-entry', entry })
     await f.peer.ingest({ kind: 'prefix-certificate', certificate })
@@ -139,7 +139,7 @@ describe('portable coordinated prefix evidence', () => {
   it('does not publish in-memory progress when the durable write fails', async () => {
     const f = await fixture()
     const store = { get: async () => null, put: async () => { throw new Error('disk full') } }
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, store)
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, store)
     await expect(peer.ingest({ kind: 'ordered-entry', entry: await f.log.append(utf8('one')) })).rejects.toThrow('disk full')
     expect(peer.progress.verifiedThrough).toBe(0)
   })
@@ -147,7 +147,7 @@ describe('portable coordinated prefix evidence', () => {
   it('retains a complete bounded page once and validates exact retries without writing', async () => {
     const f = await fixture(), storage = new MemoryOperationStore()
     let writes = 0
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, {
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, {
       get: key => storage.get(key), put: async (key, value) => { await storage.put(key, value); writes += 1 },
     })
     const entries = await Promise.all(Array.from({ length: 128 }, (_, i) => f.log.append(utf8(`entry-${i}`))))
@@ -156,7 +156,7 @@ describe('portable coordinated prefix evidence', () => {
     await peer.ingestBatch(batch)
     expect(writes).toBe(1)
     expect(peer.entries()).toEqual(entries)
-    expect((await CoordinatedHistoryPolicy.open(f.configuration, storage)).progress).toEqual(peer.progress)
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, storage)).progress).toEqual(peer.progress)
     await peer.ingestBatch(batch)
     await peer.ingest({ kind: 'prefix-certificate', certificate })
     expect(writes).toBe(1)
@@ -175,7 +175,7 @@ describe('portable coordinated prefix evidence', () => {
       { kind: 'prefix-certificate', certificate: await f.authority.certify() },
     ])).rejects.toThrow('DIGEST_MISMATCH')
     expect(f.peer.evidence()).toEqual([])
-    expect((await CoordinatedHistoryPolicy.open(f.configuration, f.peerStorage)).evidence()).toEqual([])
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, f.peerStorage)).evidence()).toEqual([])
   })
 
   it('refuses a conflicting certified batch without replacing the existing final prefix', async () => {
@@ -190,23 +190,25 @@ describe('portable coordinated prefix evidence', () => {
       { kind: 'ordered-entry', entry: successor }, { kind: 'prefix-certificate', certificate: await authority.certify() },
     ])).rejects.toThrow('HISTORY_AUTHORITY_EQUIVOCATION')
     expect(f.peer.entries()).toEqual([first])
-    expect((await CoordinatedHistoryPolicy.open(f.configuration, f.peerStorage)).entries()).toEqual([first])
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, f.peerStorage)).entries()).toEqual([first])
   })
 
-  it('keeps a failed batch unpublished and permits the exact page after storage recovery', async () => {
+  it('keeps a failed batch unpublished and permits the exact page after reopening recovered storage', async () => {
     const f = await fixture(), storage = new MemoryOperationStore()
     let full = true
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, {
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, {
       get: key => storage.get(key), put: async (key, value) => { if (full) throw new Error('disk full'); await storage.put(key, value) },
     })
     const entry = await f.log.append(utf8('one')), certificate = await f.authority.certify()
     const batch = [{ kind: 'ordered-entry' as const, entry }, { kind: 'prefix-certificate' as const, certificate }]
     await expect(peer.ingestBatch(batch)).rejects.toThrow('disk full')
     expect(peer.evidence()).toEqual([])
-    expect((await CoordinatedHistoryPolicy.open(f.configuration, storage)).progress.finalThrough).toBe(0)
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, storage)).progress.finalThrough).toBe(0)
     full = false
-    await peer.ingestBatch(batch)
-    expect(peer.progress.finalThrough).toBe(1)
+    await expect(peer.ingestBatch(batch)).rejects.toThrow('HISTORY_STORAGE_UNCERTAIN_REOPEN_REQUIRED')
+    const reopened = await SignedInclusionFinalityProvider.open(f.configuration, storage)
+    await reopened.ingestBatch(batch)
+    expect(reopened.progress.finalThrough).toBe(1)
   })
 
   it('signs a head it reads and binds empty histories', async () => {
@@ -215,6 +217,6 @@ describe('portable coordinated prefix evidence', () => {
     expect(certificate.position).toBe(0)
     expect(certificate.root).toBe(await orderedGenesisRoot(historyId))
     await f.peer.ingest({ kind: 'prefix-certificate', certificate })
-    await expect(CoordinatedHistoryPolicy.open({ ...f.configuration, historyId: 'h_00000000000000000000000000000000' }, f.peerStorage)).rejects.toThrow('CONFIGURATION_MISMATCH')
+    await expect(SignedInclusionFinalityProvider.open({ ...f.configuration, historyId: 'h_00000000000000000000000000000000' }, f.peerStorage)).rejects.toThrow('CONFIGURATION_MISMATCH')
   })
 })

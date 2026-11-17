@@ -96,37 +96,48 @@ try {
   await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sql('owner')), /SQL_DISABLED_FOR_EVENT_PROFILE/u)
   passed('real OPFS Worker opens without cross-origin isolation or a SQL engine; exclusive ownership and SQL refusal hold')
 
-  const signalRecordsBefore = (await native.transport.history()).map(record => record.id)
-  const signalEventsBefore = await native.client.events.read()
-  const nativeSignals = native.client.signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(30_000) })[Symbol.asyncIterator]()
-  let nextNativeSignal = nativeSignals.next()
-  void nextNativeSignal.catch(() => undefined)
-  await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.subscribeSignals('owner', 'live'))
+  const signalHistory = await native.transport.history(), signalEvidence = await native.transport.evidenceHistory()
+  const signalEvents = await native.client.events.read()
+  const live = new AbortController()
+  const nativeSignals = native.agent.context.signals.subscribe({ topics: ['typing'], signal: AbortSignal.any([live.signal, AbortSignal.timeout(20_000)]) })[Symbol.asyncIterator]()
   try {
-    const browserSignal = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: true, from: 'browser' }))
-    assert.deepEqual((await nextNativeSignal).value, browserSignal)
-    nextNativeSignal = nativeSignals.next()
-    void nextNativeSignal.catch(() => undefined)
-    const nativeSignal = await native.client.signals.send('typing', { typing: true, from: 'native' })
-    assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.nextSignal('owner', 'live')), nativeSignal)
-    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.unsubscribeSignals('owner', 'live'))
-    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.disconnect('owner'))
-    await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: true, from: 'disconnected' })), /SIGNAL_ROUTE_UNAVAILABLE/u)
-    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.connect('owner'))
-    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.subscribeSignals('owner', 'reconnected'))
-    const reconnectedBrowserSignal = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: false, from: 'reconnected-browser' }))
-    assert.deepEqual((await nextNativeSignal).value, reconnectedBrowserSignal, 'a disconnected send must never be queued or retried on reconnection')
-    const reconnectedNativeSignal = await native.client.signals.send('typing', { typing: false, from: 'reconnected-native' })
-    assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.nextSignal('owner', 'reconnected')), reconnectedNativeSignal,
-      'a newly opened subscription must not replay the previous live value')
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.watchSignals('owner'))
+    await page.waitForFunction(async () =>
+      (await (globalThis as unknown as TestWindow).chronologEventTest.signalState('owner')).activeSubscriptions === 1)
+    const incoming = nativeSignals.next()
+    const browserSent = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', 'typing', { chunk: 'browser' }))
+    assert.equal(browserSent.authorId, Buffer.from(identity.identity, 'base64url').toString('hex'))
+    assert.deepEqual((await incoming).value, browserSent)
+    const sent = [await native.client.signals.send('typing', { chunk: 'first' }),
+      await native.client.signals.send('typing', { chunk: 'second' })]
+    assert.equal(sent[0]!.authorId, Buffer.from(bootstrap.nativeIdentity, 'base64url').toString('hex'))
+    await page.waitForFunction(async () =>
+      (await (globalThis as unknown as TestWindow).chronologEventTest.signalState('owner')).values.length >= 2)
+    const observed = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.signalState('owner'))
+    assert.equal(observed.error, null)
+    assert.deepEqual(observed.values, sent)
+    const denied = await page.evaluate(async () => {
+      try { await (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', 'ungranted-topic', true); return null }
+      catch (error) {
+        const failure = error as { code?: string; retryable?: boolean; details?: Record<string, string> }
+        return { code: failure.code, retryable: failure.retryable, details: failure.details }
+      }
+    })
+    assert.deepEqual(denied, { code: 'permission_denied', retryable: false, details: { signalCode: 'signal_unauthorized' } })
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.stopSignals('owner'))
+    await page.waitForFunction(async () =>
+      (await (globalThis as unknown as TestWindow).chronologEventTest.signalState('owner')).activeSubscriptions === 0)
+    assert.deepEqual(await native.transport.history(), signalHistory)
+    assert.deepEqual(await native.transport.evidenceHistory(), signalEvidence)
+    assert.deepEqual(await native.client.events.read(), signalEvents)
+    deviceEvidence.signals = { connection: 'public browser peer.connectPeer', rpc: 'ChronologClient and WorkerRpcTransport',
+      nativeReceived: browserSent, browserReceived: observed.values, policyRefusal: denied,
+      activeSubscriptionsAfterCancel: 0, addedRecords: 0, addedFinalityEvidence: 0, addedEvents: 0 }
+    passed('public browser/native peer connections exchange signed FIFO signals through Worker RPC, enforce topic rights, cancel consumers, and add no durable records or finality evidence')
   } finally {
-    await nativeSignals.return?.()
-    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.unsubscribeSignals('owner', 'reconnected'))
+    live.abort(); await nativeSignals.return?.()
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.stopSignals('owner')).catch(() => undefined)
   }
-  assert.deepEqual((await native.transport.history()).map(record => record.id), signalRecordsBefore)
-  assert.deepEqual(await native.client.events.read(), signalEventsBefore)
-  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.read('owner')), signalEventsBefore)
-  passed('public Worker client and native client exchange authenticated live signals in both directions without records, retained events, disconnected retries or subscription replay')
 
   const events = [{ topic: 'chat', payload: { message: 'first' } }, { topic: 'tasks', payload: { task: 'same atomic proposal' } }]
   const published = await page.evaluate(({ events }) => (globalThis as unknown as TestWindow).chronologEventTest.publish('owner', events, 'browser-atomic-1'), { events })

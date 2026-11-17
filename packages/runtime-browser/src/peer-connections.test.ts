@@ -32,9 +32,9 @@ async function fixture() {
 describe('browser composition uses the shared governed connection owner', () => {
   it('releases the authenticated session without retaining replication when signal attachment fails', async () => {
     const f = await fixture(), owner = await createGovernedPeerService(f)
-    vi.spyOn(SignalChannel.prototype, 'attachRoute').mockImplementation(() => { throw new Error('SIGNAL_ROUTE_QUOTA_EXCEEDED') })
+    vi.spyOn(SignalChannel.prototype, 'attachRoute').mockImplementation(() => { throw new Error('signal_route_limit') })
     try {
-      await expect(owner.connectPeer({ connection: f.connection })).rejects.toThrow('SIGNAL_ROUTE_QUOTA_EXCEEDED')
+      await expect(owner.connectPeer({ connection: f.connection })).rejects.toThrow('signal_route_limit')
       expect(f.attach).not.toHaveBeenCalled()
       expect(f.close).toHaveBeenCalledTimes(1)
     } finally { await owner.close() }

@@ -69,6 +69,16 @@ export interface TransportAuthorContext {
   readonly validatorCapability?: Uint8Array
 }
 
+/** Policy identity is available before the first proposal in a group. */
+export type MembershipPolicyContext = Pick<TransactionCore, 'groupId' | 'membershipRevision' | 'validationPolicy'>
+
+export interface PotentialAdmissionEvidence {
+  /** Already authenticated, candidate-bound proofs from distinct signing keys. */
+  readonly attestations: readonly StoredAttestation[]
+  /** Complete policy validators whose consumed feed has not closed author time. */
+  readonly openValidatorIds: readonly Uint8Array[]
+}
+
 /** One revision in the complete history of authorized peer admission policies. */
 export interface AdmissionScope {
   readonly membershipRevision: Uint8Array
@@ -103,7 +113,21 @@ export interface MembershipResolver {
     context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>,
     attestations: readonly StoredAttestation[],
   ): readonly StoredAttestation[] | Promise<readonly StoredAttestation[]>
-  watermarkPolicy?(core: TransactionCore): WatermarkPolicy | null | Promise<WatermarkPolicy | null>
+  /**
+   * The exact pinned policy and complete eligible validator universe. A policy
+   * identity is available even before the revision's first proposal.
+   */
+  watermarkPolicy?(context: MembershipPolicyContext): WatermarkPolicy | null | Promise<WatermarkPolicy | null>
+  /**
+   * False proves no possible additional evidence from the open validators can
+   * satisfy this proposal's exact pinned admission policy. Custom admission
+   * selectors without this witness conservatively keep undecided proposals
+   * pending. The built-in threshold selector needs no custom witness.
+   */
+  canStillAdmit?(
+    context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>,
+    evidence: PotentialAdmissionEvidence,
+  ): boolean | Promise<boolean>
   /**
    * Exhaustive activated revision/policy history for this group. Bounds require
    * authenticated activation evidence, not a local clock. Missing completeness
@@ -117,8 +141,11 @@ export interface MembershipResolver {
 export interface ValidatorOptions {
   readonly capabilityId: Uint8Array
   readonly policyVersion?: bigint
-  readonly cutoffLagMs?: number
+  /** Raw embeddings choose timing explicitly; governed nodes use signed genesis. */
+  readonly cutoffLagMs: number
+  /** Raw embedding default: 30,000 ms. Governed nodes use signed genesis. */
   readonly maxFutureSkewMs?: number
+  /** Omit to advance with publishHeartbeat(); governed nodes use signed genesis. */
   readonly heartbeatIntervalMs?: number
   readonly initialAcceptedAboveMs?: bigint
 }
@@ -131,9 +158,15 @@ export interface OperationalMembershipState {
   readonly validatorCapability?: Uint8Array
 }
 
-/** All validators have stopped signing this revision and exposed their prior admissions. */
+/**
+ * Authenticated governance activation: all validators stopped signing the old
+ * revision and exposed its admissions. The successor authorizes only timestamps
+ * strictly after closedThroughMs. The membership resolver must enforce that
+ * author-time boundary, not merely use it as a local clock hint.
+ */
 export interface ClosedAdmissionRevision {
   readonly membershipRevision: Uint8Array
+  readonly nextMembershipRevision: Uint8Array
   readonly closedThroughMs: bigint
   readonly proposalIds: readonly Uint8Array[]
   /** Admission indexing must consume these complete authenticated feed prefixes. */

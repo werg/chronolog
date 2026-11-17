@@ -1,19 +1,20 @@
-import type { SignalDispatchResult } from '@chronolog/signals'
+/** A safe local refusal: no frame bytes were queued or dispatched. */
+export class PeerFrameBackpressureError extends Error {
+  constructor() { super('PEER_FRAME_BACKPRESSURE'); this.name = 'PeerFrameBackpressureError' }
+}
 
 /** A bounded connection-owned lane. Sending is local dispatch, not delivery. */
-export interface PeerFrameLane<DispatchResult = void> {
-  send(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<DispatchResult>
+export interface PeerFrameLane {
+  send(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
   frames(signal?: AbortSignal): AsyncIterable<Uint8Array>
   close(): Promise<void>
 }
-/** A live lane may refuse dispatch without queueing bytes or ending its owner. */
-export type PeerLiveLane = PeerFrameLane<SignalDispatchResult>
 
 export interface FramedPeerConnection extends PeerFrameLane {
   /** Ends before frame readers finish; preserves the physical failure or close reason. */
   readonly signal: AbortSignal
   /** Independent disposable traffic; never multiplex it into reliable history. */
-  readonly live?: PeerLiveLane
+  readonly live?: PeerFrameLane
 }
 
 /**
@@ -46,7 +47,7 @@ export function framePeerStream(options: {
     send(input, sendOptions = {}) {
       if (closed) return Promise.reject(new Error('PEER_CONNECTION_CLOSED'))
       if (!(input instanceof Uint8Array) || input.length < 1 || input.length > maximum) return Promise.reject(new Error('PEER_FRAME_TOO_LARGE'))
-      if (pending >= maxPending) return Promise.reject(new Error('PEER_FRAME_BACKPRESSURE'))
+      if (pending >= maxPending) return Promise.reject(new PeerFrameBackpressureError())
       const frame = new Uint8Array(input.length + 4)
       new DataView(frame.buffer).setUint32(0, input.length, false)
       frame.set(input, 4)

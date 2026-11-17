@@ -1,4 +1,4 @@
-import { decodeChangeProgram, emit, program, type EventBatch, type ViewChange } from '@chronolog/protocol'
+import { decodeChangeProgram, emit, program, type EventBatch, type ApplicationChange } from '@chronolog/protocol'
 import { ChronologRpcError, type RpcCallOptions, type RpcTransport, type SubmitChangeRequest } from '@chronolog/rpc'
 import type { EphemeralSignal } from '@chronolog/signals'
 import { describe, expect, it } from 'vitest'
@@ -50,7 +50,7 @@ describe('application client', () => {
     const client = new ChronologClient({ transport, groupId: 'group', unaryRetryAttempts: 5, requestId: () => 'live-attempt' })
     await expect(client.signals.send('typing', { active: true }, { ttlMs: 1000 })).rejects.toMatchObject({ code: 'transport_unavailable' })
     expect(calls).toEqual([{ method: 'signals.send', request: {
-      groupId: 'group', topic: 'typing', payload: { active: true }, ttlMs: 1000,
+      groupId: 'group', topic: 'typing', payload: { active: true }, ttlMs: 1000, expiresAtMs: expect.any(Number),
     } }])
     await client.close()
   })
@@ -211,7 +211,7 @@ describe('application client', () => {
     let startBurst!: () => void, drained!: () => void, stopped = false, lifetime: AbortSignal | undefined
     const burst = new Promise<void>(resolve => { startBurst = resolve })
     const caughtUp = new Promise<void>(resolve => { drained = resolve })
-    const value = (revision: number): ViewChange => ({ view: 'local', revision: `local-${revision}`, finalRevision: 'final-1' })
+    const value = (revision: number): ApplicationChange => ({ view: 'local', revision: `local-${revision}`, finalRevision: 'final-1' })
     const transport = { stream: (method: string, request: unknown, options: RpcCallOptions) => ({ async *[Symbol.asyncIterator]() {
       calls.push({ method, request }); lifetime = options.signal
       try {

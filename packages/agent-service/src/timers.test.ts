@@ -1,10 +1,13 @@
 import { MemoryOperationStore } from '@chronolog/node-core'
+import type { DurableOperationStore } from '@chronolog/node-core'
 import type { EventPayload } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
 import { DurableTimerScheduler } from './timers.js'
 import type { TimerOccurrence } from './timers.js'
+import { FinalEventPublicationRejectedError } from './event-source.js'
 import type { EventReadOptions, FinalEventBatch, FinalEventSource } from './event-source.js'
+import { SqlTimerRejectedError } from './sql-timers.js'
 
 class TimerSource implements FinalEventSource {
   readonly entries: EventPayload[] = []
@@ -63,9 +66,9 @@ describe('durable agent timers', () => {
     const restarted = await DurableTimerScheduler.open(options)
     await expect(restarted.tick(100)).rejects.toThrow('publication reply lost')
     const saved = (await restarted.status()).pending!
-    expect(saved.configurationEventId).toBe(verified.id)
-    expect(saved.configurationOrigin).toEqual(verified.origin)
-    Object.assign(saved.configurationOrigin, { authorId: '22'.repeat(32) })
+    expect(saved.occurrence.configurationEventId).toBe(verified.id)
+    expect(saved.occurrence.configurationOrigin).toEqual(verified.origin)
+    Object.assign(saved.occurrence.configurationOrigin, { authorId: '22'.repeat(32) })
     expect(await (await DurableTimerScheduler.open(options)).tick(500)).toEqual({ emitted: 1, needsCatchUp: false })
     expect(f.delivered).toHaveLength(2)
     expect(f.delivered[1]).toEqual(f.delivered[0])
@@ -137,10 +140,119 @@ describe('durable agent timers', () => {
     } }
     await expect((await DurableTimerScheduler.open({ ...f.options, publisher })).tick(20)).rejects.toThrow('lost final response')
     const reopened = await DurableTimerScheduler.open({ ...f.options, publisher })
-    expect((await reopened.status()).pending?.observedAtMs).toBe(20)
+    expect((await reopened.status()).pending?.occurrence.observedAtMs).toBe(20)
     await reopened.tick(200)
     expect(f.delivered).toHaveLength(2)
     expect(f.delivered[1]).toEqual(f.delivered[0])
+  })
+
+  it('recovers a proved rejection across lost checkpoint replies without changing the occurrence or replaying an accepted timer', async () => {
+    const f = fixture(), disk = new MemoryOperationStore()
+    let loseCheckpointReply = false, losePublicationReply = true
+    const store: DurableOperationStore = { get: key => disk.get(key), async put(key, value) {
+      await disk.put(key, value)
+      if (loseCheckpointReply && key.startsWith('agent/checkpoint/')) {
+        loseCheckpointReply = false; throw new Error('checkpoint reply lost')
+      }
+    } }
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'g1', timerId: 'job', dueAtMs: 10, payload: { job: 'reviewed' } })
+    const options = { ...f.options, store, publisher: {
+      async publishOccurrence(occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> {
+        f.delivered.push({ occurrence: structuredClone(occurrence), operationId })
+        if (occurrence.publication.attempt === 0) {
+          loseCheckpointReply = true
+          throw new SqlTimerRejectedError('expired-timer-proposal', 'FINALITY_TIMESTAMP_CLOSED', null)
+        }
+        if (losePublicationReply) { losePublicationReply = false; throw new Error('publication reply lost') }
+        return 'accepted'
+      },
+    } }
+    await expect((await DurableTimerScheduler.open(options)).tick(20)).rejects.toThrow('checkpoint reply lost')
+    const rejected = await DurableTimerScheduler.open(options)
+    const pending = (await rejected.status()).pending!, occurrenceId = pending.occurrence.occurrenceId
+    expect(pending).toMatchObject({ stage: 'publication-rejected', publicationAttempt: 0,
+      occurrence: { observedAtMs: 20, scheduledAtMs: 10, payload: { job: 'reviewed' } },
+      publicationRejections: [{ attempt: 0, operationId: f.delivered[0]!.operationId,
+        proposalId: 'expired-timer-proposal', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' }] })
+    await expect(rejected.tick(100)).rejects.toBeInstanceOf(FinalEventPublicationRejectedError)
+    expect(f.delivered).toHaveLength(1)
+
+    loseCheckpointReply = true
+    await expect(rejected.retryPublication(occurrenceId)).rejects.toThrow('checkpoint reply lost')
+    const resumed = await DurableTimerScheduler.open(options)
+    expect((await resumed.status()).pending).toMatchObject({ stage: 'publishing', publicationAttempt: 1,
+      publicationOperationId: `timer-occurrence:${occurrenceId}:1`, occurrence: pending.occurrence })
+    await expect(resumed.tick(200)).rejects.toThrow('publication reply lost')
+    await expect(resumed.retryPublication(occurrenceId)).rejects.toThrow('TIMER_PUBLICATION_NOT_REJECTED')
+    const reopened = await DurableTimerScheduler.open(options)
+    expect(await reopened.tick(300)).toEqual({ emitted: 1, needsCatchUp: false })
+    expect(f.delivered).toHaveLength(3)
+    expect(f.delivered[2]).toEqual(f.delivered[1])
+    expect(f.delivered[1]!.occurrence).toEqual({ ...pending.occurrence,
+      publication: { attempt: 1, rejections: pending.publicationRejections } })
+    expect(await reopened.publicationStatus(occurrenceId)).toMatchObject({ stage: 'accepted', publicationAttempt: 1,
+      publicationRejections: pending.publicationRejections })
+    expect(await (await DurableTimerScheduler.open(options)).tick(400)).toEqual({ emitted: 0, needsCatchUp: false })
+    expect(f.delivered).toHaveLength(3)
+  })
+
+  it('keeps rejected publication audit when a final cancellation wins before explicit recovery', async () => {
+    const f = fixture()
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'g1', timerId: 'job', dueAtMs: 10 })
+    const configuration = (await f.source.read()).transactions[0]!.events[0]!
+    const accepted: TimerOccurrence[] = []
+    const options = { ...f.options, publisher: {
+      async publishOccurrence(occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted' | 'cancelled'> {
+        f.delivered.push({ occurrence: structuredClone(occurrence), operationId })
+        if (occurrence.generation === 'g1') {
+          if (occurrence.publication.attempt === 0) throw new SqlTimerRejectedError('old-attempt', 'FINALITY_TIMESTAMP_CLOSED', null)
+          return 'cancelled'
+        }
+        accepted.push(occurrence); return 'accepted'
+      },
+    } }
+    const scheduler = await DurableTimerScheduler.open(options)
+    await expect(scheduler.tick(20)).rejects.toThrow('FINALITY_TIMESTAMP_CLOSED')
+    const occurrenceId = (await scheduler.status()).pending!.occurrence.occurrenceId
+    f.source.entries.push({ type: 'timer.cancelled', version: 1, timerId: 'job', generation: 'g1' },
+      { type: 'timer.scheduled', version: 1, timerId: 'job', generation: 'g2', dueAtMs: 200 })
+    await expect(scheduler.tick(100)).rejects.toBeInstanceOf(FinalEventPublicationRejectedError)
+    expect(f.delivered).toHaveLength(1)
+    await scheduler.retryPublication(occurrenceId)
+    expect(await scheduler.tick(100)).toEqual({ emitted: 0, needsCatchUp: false })
+    expect(accepted).toHaveLength(0)
+    expect(await scheduler.status()).toMatchObject({ active: 1, pending: null })
+    const reopened = await DurableTimerScheduler.open(options)
+    expect(await reopened.publicationStatus(occurrenceId)).toMatchObject({ stage: 'cancelled', publicationAttempt: 1,
+      configurationEventId: configuration.id, configurationOrigin: configuration.origin,
+      publicationRejections: [{ proposalId: 'old-attempt', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' }] })
+    expect(await reopened.tick(200)).toEqual({ emitted: 1, needsCatchUp: false })
+    expect(accepted.map(occurrence => occurrence.generation)).toEqual(['g2'])
+    await expect(reopened.retryPublication(occurrenceId)).rejects.toThrow('TIMER_PUBLICATION_NOT_REJECTED')
+  })
+
+  it('cannot allocate a newer attempt while the current attempt still waits for final acceptance', async () => {
+    const f = fixture()
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'g1', timerId: 'job', dueAtMs: 10 })
+    let entered!: () => void, finish!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const released = new Promise<void>(resolve => { finish = resolve })
+    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
+      async publishOccurrence(occurrence) {
+        if (occurrence.publication.attempt === 0) throw new SqlTimerRejectedError('expired', 'FINALITY_TIMESTAMP_CLOSED', null)
+        entered(); await released; return 'accepted'
+      },
+    } })
+    await expect(scheduler.tick(20)).rejects.toThrow('FINALITY_TIMESTAMP_CLOSED')
+    const occurrenceId = (await scheduler.status()).pending!.occurrence.occurrenceId
+    await scheduler.retryPublication(occurrenceId)
+    const publishing = scheduler.tick(30)
+    await started
+    const retry = expect(scheduler.retryPublication(occurrenceId)).rejects.toThrow('TIMER_PUBLICATION_NOT_REJECTED')
+    finish()
+    expect(await publishing).toEqual({ emitted: 1, needsCatchUp: false })
+    await retry
+    expect(await scheduler.publicationStatus(occurrenceId)).toMatchObject({ stage: 'accepted', publicationAttempt: 1 })
   })
 })
 
@@ -160,10 +272,10 @@ describe('timer shutdown and explicit generations', () => {
     await started; stop.abort()
     await expect(tick).rejects.toThrow('stopped')
     const pending = (await scheduler.status()).pending
-    expect(pending).toMatchObject({ generation: 'reviewed-generation', configurationEventId: 'proposal-0:0', observedAtMs: 20 })
+    expect(pending?.occurrence).toMatchObject({ generation: 'reviewed-generation', configurationEventId: 'proposal-0:0', observedAtMs: 20 })
     const reopened = await DurableTimerScheduler.open(f.options)
     await reopened.tick(100)
-    expect(f.delivered[0]!.occurrence).toEqual(pending)
+    expect(f.delivered[0]!.occurrence).toEqual({ ...pending!.occurrence, publication: { attempt: 0, rejections: [] } })
   })
 
   it('rejects an event without a preallocated generation before advancing its checkpoint', async () => {

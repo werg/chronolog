@@ -7,7 +7,7 @@ import { parseArgs } from 'node:util'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
 import { createDoltLiteExecutionManifest, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
-import { CoordinatedHistoryPolicy, decodeLedgerRecord, decodeOrderingEvidence, isFinalityClosureRecord, ReferenceRecordLog,
+import { SignedInclusionFinalityProvider, decodeLedgerRecord, decodeOrderingEvidence, isFinalityClosureRecord, ReferenceRecordLog,
   type CoordinatedHistoryConfiguration, type OrderedRecordHead } from '@chronolog/node-core'
 import { base64UrlToBytes } from '@chronolog/protocol'
 
@@ -58,12 +58,14 @@ const report = { format: 'chronolog-authority-recovery/v1', passed: false, start
     filesystemTypeHex: `0x${(await statfs(volumes)).type.toString(16)}`,
     storage: 'disposable directory on selected volume root; SQLite WAL, synchronous=FULL, exclusive connection fence', volumeRoot,
     process: 'actual Node child processes and SIGKILL; native governed SQL core with portable durable feed transport',
+    clock: 'durable controlled author/finality clock; advances after inclusion so crash cases preserve their admission window',
     network: 'no network service; retained evidence exchanged between independent policy stores' },
   acknowledgementContract: { durableCopiesRequired: 1, automaticFailover: false, immediateDiskLossSurvival: false },
   checks, limits: [
     'These disposable fixture identities are synthetic. No deployed Cloudflare service, administrator root move or production volume is exercised.',
     'The exclusive SQLite fence protects the same database file. It does not fence independent disk copies or prove storage-provider attachment semantics.',
     'SIGKILL tests process death at observed durable-port boundaries, not power-loss behavior inside a storage controller.',
+    'The controlled clock qualifies recovery outcomes, not wall-clock admission latency or availability under real network delay.',
     'The backup is a quiesced whole-directory copy. Application snapshot export alone is not an authority backup.',
     'Authority-task outage and retained-evidence relay use in-process portable peers; public-network outage and deployed service recovery remain separate.',
     'No independent second-durable-copy acknowledgement or automatic failover is promised.',
@@ -180,8 +182,8 @@ try {
       genesisDigest: base64UrlToBytes(held.value.configuration.genesisDigest), executionManifestDigest: base64UrlToBytes(held.value.configuration.executionManifestDigest),
       ...(held.value.configuration.providerId === undefined ? {} : { providerId: held.value.configuration.providerId }),
       ...(held.value.configuration.providerParameters === undefined ? {} : { providerParameters: base64UrlToBytes(held.value.configuration.providerParameters) }) }
-    const first = await CoordinatedHistoryPolicy.open(publicConfiguration, one)
-    const second = await CoordinatedHistoryPolicy.open(publicConfiguration, two)
+    const first = await SignedInclusionFinalityProvider.open(publicConfiguration, one)
+    const second = await SignedInclusionFinalityProvider.open(publicConfiguration, two)
     projection = await DeterministicMaterializer.open({ path: projectionPath, executionManifest: createDoltLiteExecutionManifest(),
       rootAdministrator: base64UrlToBytes(held.value.state.authorityIdentity) })
     for (const bytes of [...held.value.evidence].reverse()) await first.ingest(decodeOrderingEvidence(base64UrlToBytes(bytes)))

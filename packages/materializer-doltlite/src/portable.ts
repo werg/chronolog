@@ -127,7 +127,6 @@ function verifyEngineAndManifests(
 function transactionFromLogRow(row: TransactionLogRow): AdmittedTransaction {
   return {
     txId: row.txId.slice(),
-    authorFeedSequence: row.authorFeedSequence,
     candidateDigest: row.candidateDigest.slice(),
     canonicalCandidate: row.canonicalCandidate.slice(),
     core: decodeTransactionCore(row.canonicalCandidate),
@@ -137,7 +136,6 @@ function transactionFromLogRow(row: TransactionLogRow): AdmittedTransaction {
 function clonePortableTransaction(transaction: PortableAdmittedTransaction): AdmittedTransaction {
   return {
     txId: transaction.txId.slice(),
-    authorFeedSequence: transaction.authorFeedSequence,
     candidateDigest: transaction.candidateDigest.slice(),
     canonicalCandidate: transaction.canonicalCandidate.slice(),
     core: structuredClone(transaction.core),

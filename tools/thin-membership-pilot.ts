@@ -45,6 +45,7 @@ const report = { format: 'chronolog-thin-membership/v3', passed: false, status: 
     application: ['DedicatedWorker with OPFS/WASM', 'authenticated RTCDataChannel', 'native full replica and finality service'],
     nativeImplementation: 'werift@0.27.0' },
   measurement: { applicationBytes: 'Logical authenticated RTC frame payload; excludes framing headers/credit and SCTP/DTLS/IP overhead.',
+    finalityClock: 'Native workload authoring holds the fixture authority clock until each original signed proposal has a retained inclusion receipt, then releases it before waiting for finality. Snapshots and diagnostics record every held window. Device publication uses the advancing clock.',
     rtcSdpBytes: 'UTF-8 bytes of the complete offer and answer SDP descriptions.',
     rtcSignalingRequestBytes: 'Actual direct introduction HTTP request bodies, including the protocol JSON envelope; excludes HTTP headers.',
     rtcSignalingResponseBytes: 'Actual direct introduction HTTP response bodies, including the protocol JSON envelope; excludes HTTP headers.' },
@@ -55,6 +56,7 @@ const report = { format: 'chronolog-thin-membership/v3', passed: false, status: 
     'The built Cloudflare Worker runs in the real local workerd test harness with synthetic authenticated accounts; this is not a deployed Cloudflare service or public-network qualification.',
     'Descriptor/body byte counters cover the actual loopback membership and peer boundaries; they do not predict provider billing or NAT traversal.',
     'Application peer bytes are logical authenticated RTC frame payloads, excluding framing headers/credit and SCTP/DTLS/IP overhead. SDP HTTP body bytes are measured separately.',
+    'Native workload admission uses explicitly recorded fixture clock holds. Phase timings include those holds and do not measure production finality latency; no proposal is re-authored to repair a closed timestamp.',
   ] }
 let saving = Promise.resolve()
 function save(): Promise<void> {

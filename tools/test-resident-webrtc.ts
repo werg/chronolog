@@ -170,8 +170,10 @@ try {
   lifetime.abort()
   await bounded(running, 5_000)
   await bounded(session.completion.catch(() => undefined), 5_000)
-  await assert.rejects(native.client.signals.send('typing', { typing: false }), /SIGNAL_ROUTE_UNAVAILABLE/u)
-  await assert.rejects(signals.send('typing', { typing: false }), /SIGNAL_ROUTE_UNAVAILABLE/u)
+  await assert.rejects(native.client.signals.send('typing', { typing: false }), {
+    code: 'transport_unavailable', retryable: false, details: { signalCode: 'signal_disconnected' },
+  })
+  await assert.rejects(signals.send('typing', { typing: false }), { code: 'signal_disconnected' })
   assert.equal(task.stats?.closed, true); assert.equal(task.stats?.active, 0); assert.equal(task.stats?.pending, 0)
   assert.equal(getEventListeners(lifetime.signal, 'abort').length, 0)
   await assert.rejects(fetch(endpoint))

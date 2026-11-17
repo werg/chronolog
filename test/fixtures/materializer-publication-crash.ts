@@ -42,7 +42,6 @@ const core: TransactionCore = {
 const canonicalCandidate = encodeTransactionCore(core)
 const transaction: AdmittedTransaction = {
   txId: utf8('crash-probe'),
-  authorFeedSequence: 1n,
   candidateDigest: await transactionDigest(canonicalCandidate),
   canonicalCandidate,
   core,

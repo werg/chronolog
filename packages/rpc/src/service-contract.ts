@@ -1,4 +1,4 @@
-import type { ChangeProgram, EventBatch, EventReadOptions, ViewChange, ViewChangeOptions } from '@chronolog/protocol'
+import type { ChangeProgram, EventBatch, EventReadOptions, ApplicationChange, ApplicationChangeOptions } from '@chronolog/protocol'
 
 import type {
   ApproveEnrollmentRequest,
@@ -49,7 +49,6 @@ export interface RpcNodeCandidate {
   readonly orderKey: {
     readonly authorTimestampMs: bigint
     readonly authorId: Uint8Array
-    readonly authorFeedSequence: bigint
     readonly txId: Uint8Array
   }
 }
@@ -63,6 +62,7 @@ export interface RpcNodeCandidateCore {
 
 export interface RpcNodeSettlementEvidence {
   readonly unresolvedAttestationIds: readonly Uint8Array[]
+  readonly pendingCandidateIds: readonly Uint8Array[]
   readonly belowWatermark: boolean
   readonly watermark: { readonly cutoffMs: bigint | null; readonly heartbeatIds: readonly Uint8Array[] }
 }
@@ -124,7 +124,7 @@ export interface ChronologRpcNodeService {
     subscribe(options?: EventReadOptions & { readonly signal?: AbortSignal }): AsyncIterable<EventBatch>
   }
   readView?(options?: { readonly view?: SqlView }): Promise<RpcReadHandle>
-  changes?(options?: ViewChangeOptions): AsyncIterable<ViewChange>
+  changes?(options?: ApplicationChangeOptions): AsyncIterable<ApplicationChange>
   operation?(operationId: string): Promise<OperationStatus | null>
   submitSigned?(signedWire: Uint8Array): Promise<RpcPublishedTransaction>
   readonly identity: Uint8Array

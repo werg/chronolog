@@ -20,10 +20,10 @@ import type {
 import { ChronologRpcError, toChronologRpcError, type RpcErrorCode } from './errors.js'
 
 const unaryDispatch: Record<UnaryRpcMethod, keyof ChronologRpcService> = {
+  'signals.send': 'sendSignal',
   'change.submit': 'submitChange',
   'ingress.submit': 'submitSigned',
   'events.read': 'readEvents',
-  'signals.send': 'sendSignal',
   'operation.get': 'getOperation',
   'view.open': 'openReadView',
   'view.query': 'queryReadView',
@@ -47,9 +47,9 @@ const unaryDispatch: Record<UnaryRpcMethod, keyof ChronologRpcService> = {
 }
 
 const streamDispatch: Record<StreamRpcMethod, keyof ChronologRpcService> = {
-  'view.changes': 'viewChanges',
-  'events.subscribe': 'subscribeEvents',
   'signals.subscribe': 'subscribeSignals',
+  'view.changes': 'changes',
+  'events.subscribe': 'subscribeEvents',
   'operation.subscribe': 'subscribeOperations',
   'node.streamStatus': 'streamStatus',
   'query.liveSql': 'liveSql',
@@ -228,6 +228,10 @@ export class HttpRpcServer {
       const context: RpcCallContext = {
         method: method as UnaryRpcMethod,
         signal: controller.signal,
+        // This server authenticates one node owner. A bearer rotation changes
+        // credentials, never durable operation identity or read-lease ownership.
+        // Caller-supplied body metadata cannot select another principal.
+        metadata: { principal: 'node-owner' },
         ...(socket.remoteAddress === undefined ? {} : { peer: socket.remoteAddress }),
         ...(request.headers.authorization === undefined ? {} : { token: request.headers.authorization.replace(/^Bearer\s+/iu, '') }),
       }

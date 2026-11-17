@@ -221,6 +221,7 @@ async function startRuntime() {
       service: new NodeRpcService({
         ...(agent === undefined ? {} : { signals: agent.context.signals }),
         node,
+        ...(agent === undefined ? {} : { signals: agent.context.signals }),
         ...(enrollment === undefined ? {} : { enrollment }),
         ...(governance === undefined ? {} : {
           governanceAdmin: createGovernanceRpcAdmin({ governance, rootPrivateKey: identity.privateKey }),

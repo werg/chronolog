@@ -338,7 +338,6 @@ export function decodeMaterializationInvocation(
 
 function admittedTransactionToCbor(value: ChronologAdmittedSuffix['transactions'][number]): CborValue {
   canonicalInvariant(value.txId.length > 0, 'SCHEMA_INVALID', 'Transaction ID cannot be empty')
-  canonicalInvariant(value.authorFeedSequence >= 0n, 'INTEGER_OUT_OF_RANGE', 'Author feed sequence cannot be negative')
   canonicalInvariant(value.candidateDigest.length === 32, 'SCHEMA_INVALID', 'Candidate digest must contain 32 bytes')
   canonicalInvariant(value.canonicalCandidate.length > 0, 'SCHEMA_INVALID', 'Canonical candidate cannot be empty')
   canonicalInvariant(
@@ -348,17 +347,17 @@ function admittedTransactionToCbor(value: ChronologAdmittedSuffix['transactions'
     'SCHEMA_INVALID',
     'Candidate bytes are not canonical',
   )
-  return [value.txId, value.authorFeedSequence, value.candidateDigest, value.canonicalCandidate]
+  return [value.txId, value.candidateDigest, value.canonicalCandidate]
 }
 
 export function encodeAdmittedSuffix(value: ChronologAdmittedSuffix): Uint8Array {
-  canonicalInvariant(value.version === 1, 'SCHEMA_INVALID', 'Unsupported admitted suffix version')
+  canonicalInvariant(value.version === 2, 'SCHEMA_INVALID', 'Unsupported admitted suffix version')
   canonicalInvariant(value.groupId.length === 32, 'SCHEMA_INVALID', 'Admitted suffix group ID must contain 32 bytes')
   requireIndex(value.replayFromIndex, 'replayFromIndex')
   requireIndex(value.targetOrderLength, 'targetOrderLength')
   canonicalInvariant(value.replayFromIndex + value.transactions.length === value.targetOrderLength, 'SCHEMA_INVALID', 'Admitted suffix length does not reach target order length')
   return encodeCanonicalCbor(integerMap([
-    [0, 1n],
+    [0, 2n],
     [1, value.groupId],
     [2, BigInt(value.replayFromIndex)],
     [3, BigInt(value.targetOrderLength)],
@@ -373,11 +372,11 @@ export function decodeAdmittedSuffix(
 ): ChronologAdmittedSuffix {
   const map = root(bytes, 'admitted_suffix', limits)
   assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5], 'admitted_suffix')
-  canonicalInvariant(expectBigint(required(map, 0, 'admitted_suffix.version'), 'admitted_suffix.version') === 1n, 'SCHEMA_INVALID', 'Unsupported admitted suffix version')
+  canonicalInvariant(expectBigint(required(map, 0, 'admitted_suffix.version'), 'admitted_suffix.version') === 2n, 'SCHEMA_INVALID', 'Unsupported admitted suffix version')
   const transactions = expectArray(required(map, 5, 'admitted_suffix.transactions'), 'admitted_suffix.transactions').map((value, index) => {
     const tuple = expectArray(value, `admitted_suffix.transactions[${index}]`)
-    canonicalInvariant(tuple.length === 4, 'SCHEMA_INVALID', `admitted_suffix.transactions[${index}] has invalid arity`)
-    const canonicalCandidate = expectBytes(tuple[3] ?? null, `admitted_suffix.transactions[${index}].canonical_candidate`)
+    canonicalInvariant(tuple.length === 3, 'SCHEMA_INVALID', `admitted_suffix.transactions[${index}] has invalid arity`)
+    const canonicalCandidate = expectBytes(tuple[2] ?? null, `admitted_suffix.transactions[${index}].canonical_candidate`)
     const core = decodeTransactionCore(canonicalCandidate)
     canonicalInvariant(
       encodeTransactionCore(core).every((byte, offset) => byte === canonicalCandidate[offset]),
@@ -386,21 +385,19 @@ export function decodeAdmittedSuffix(
     )
     return {
       txId: expectBytes(tuple[0] ?? null, `admitted_suffix.transactions[${index}].tx_id`),
-      authorFeedSequence: expectBigint(tuple[1] ?? null, `admitted_suffix.transactions[${index}].author_feed_sequence`),
-      candidateDigest: expectBytes(tuple[2] ?? null, `admitted_suffix.transactions[${index}].candidate_digest`, 32),
+      candidateDigest: expectBytes(tuple[1] ?? null, `admitted_suffix.transactions[${index}].candidate_digest`, 32),
       canonicalCandidate,
       core,
     }
   })
   for (const [index, transaction] of transactions.entries()) {
     canonicalInvariant(transaction.txId.length > 0, 'SCHEMA_INVALID', `admitted_suffix.transactions[${index}].tx_id cannot be empty`)
-    canonicalInvariant(transaction.authorFeedSequence >= 0n, 'INTEGER_OUT_OF_RANGE', `admitted_suffix.transactions[${index}].author_feed_sequence cannot be negative`)
   }
   const replayFromIndex = expectUint(required(map, 2, 'admitted_suffix.replay_from_index'), 'admitted_suffix.replay_from_index')
   const targetOrderLength = expectUint(required(map, 3, 'admitted_suffix.target_order_length'), 'admitted_suffix.target_order_length')
   canonicalInvariant(replayFromIndex + transactions.length === targetOrderLength, 'SCHEMA_INVALID', 'Admitted suffix length does not reach target order length')
   return {
-    version: 1,
+    version: 2,
     groupId: expectBytes(required(map, 1, 'admitted_suffix.group_id'), 'admitted_suffix.group_id', 32),
     replayFromIndex,
     targetOrderLength,

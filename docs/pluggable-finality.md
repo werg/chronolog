@@ -4,7 +4,7 @@ Chronolog has one application ordering rule:
 
 `(signed author timestamp, signing public key, stable proposal ID)`.
 
-The outer feed sequence is fixed to zero in this comparator. Given the same
+The comparator accepts only those three fields. Given the same finalized
 proposals, every replica derives the same relative application order.
 Relay choice, network arrival and receipt-log position are not sorting keys.
 The provider can change the included set, but cannot choose an ordering rule
@@ -27,9 +27,11 @@ policy is implemented here, and it would not implement a disabled live frontier.
 
 The core sorts the valid included proposals and applies them locally. A receipt
 certificate alone proves an included set, not final application state. Missing
-bodies, keys, proof predecessors or execution support block progress. A new late
-proposal receives `FINALITY_TIMESTAMP_CLOSED`; an exact retry of an earlier
-proposal returns its original outcome and does not enter history again.
+bodies, keys, proof predecessors or execution support block progress. A proposal
+proved unable to enter a closed history receives a final rejection; an exact
+retry of an earlier proposal returns its original outcome and does not enter
+history again. A timestamp below a validator watermark alone is not enough to
+reject a partially admitted proposal.
 
 The fixed-validator implementation supplies admission attestations and signed
 cutoff/closure promises. The signed-inclusion implementation supplies certified
@@ -42,7 +44,9 @@ family; it no longer selects append-order execution.
 `LiveFinalityFrontier` is the common result consumed by live execution. Its
 `provenThroughMs` records the proof's raw time boundary; `closedThroughMs` also
 accounts for every unresolved earlier admission. A blocker at timestamp T caps
-that usable boundary at T - 1. Final application publication additionally waits
+that usable boundary at T - 1 (or no boundary when T is zero). `blockers` retain
+the proposal and available proof IDs; `exclusions` carry each proved impossible
+proposal and its precise rejection reason. Final application publication additionally waits
 for the corresponding proposal bodies, keys and replay to complete. This is a
 live consensus capability, independent of the common operation and ordering
 primitives.
@@ -119,6 +123,113 @@ The provider is pinned for a continuing group. Automatic provider replacement,
 validator-set reconfiguration and authority failover are not introduced here.
 This is a pre-release format change; there is no old-prefix-only finality fallback.
 
+## Fixed-validator closure and partial admission
+
+A validator's signed heartbeat promises that its subsequent feed will contain
+no admission at or below its cutoff. The promise becomes usable only after this
+replica has consumed the complete authenticated feed prefix through that
+heartbeat. Having the bytes in a transport cache is insufficient: a preceding
+vote may not have reached the admission index yet. Filling a feed gap completes
+an existing heartbeat without requiring the validator to sign another one.
+Unprocessed admission records, missing signed proposal bodies and unresolved
+decryption dependencies keep affected application history provisional.
+
+For a plain `k`-of-`n` policy, cutoffs from `n-k+1` validators intersect every
+possible admission proof. The corresponding raw watermark establishes that
+every earlier possible proof has some evidence in those complete feeds. It
+does **not** establish that every proof is already complete or impossible.
+
+For example, take a two-of-three policy with validators A, B and C. An earlier
+proposal P has A's vote; a later proposal Q has A's and B's votes. A and B then
+close time past both proposals. C can still legitimately provide P's second
+vote. Freezing Q at that point would let P arrive before an immutable prefix.
+Chronolog keeps Q provisional until P is admitted or proved impossible.
+
+For each known pending proposal, the core combines its existing authenticated
+votes with every policy validator whose complete feed has not closed that
+proposal's signed timestamp. If the exact pinned policy can still admit from
+that set, the proposal remains a blocker for any later application prefix.
+It does not block an earlier prefix. Unknown proposal bodies referenced by
+admission records also block finality until their meaning can be verified.
+
+When no possible remaining evidence can admit a proposal, its persisted
+candidate state becomes `excluded`. Applications observe `final` with outcome
+`rejected`; no synthetic transaction is inserted into SQL or effective events.
+The rejection is `FINALITY_TIMESTAMP_CLOSED` when time or revision closure
+caused the impossibility, or `ADMISSION_IMPOSSIBLE` when the pinned policy and
+grants could never admit it even with every validator still open. A proposal
+with sufficient existing votes is not rejected merely because its timestamp
+is now below a cutoff. These decisions and the final application prefix survive
+restart and exact retry.
+
+### Policy scope and custom resolvers
+
+Every verified membership revision has one active validator grant per signing
+key, with one authorized replication feed. A key contributes one vote;
+additional grant IDs or repeated attestations do not create independent voters.
+Genesis and successor reduction reject overlapping grants with `SCHEMA_INVALID`
+before the new snapshot can affect admission or watermark calculation. Local
+governance authoring validates that transition before retaining or publishing
+the operation, and received invalid controls do not stop subsequent valid ones.
+At the capability layer, revocation and replacement are one atomic transition,
+so historical snapshots retain the old feed without authorizing it in the new
+revision. The fixed-finality profiles still pin their validator set; this
+invariant does not introduce live validator reconfiguration.
+
+`MembershipResolver.watermarkPolicy({ groupId, membershipRevision,
+validationPolicy })` describes the requested policy's complete validator
+universe and threshold. The exhaustive `admissionScopes({ groupId })` contract
+also covers activated revisions with no locally observed application proposal.
+The global frontier is constrained by every policy in every still-open scope:
+considering only Q's policy could miss an unknown earlier P that uses a lower
+threshold. The capability resolver enumerates the authenticated activation
+history. Static membership supplies one scope and one threshold; a separate
+configurable watermark threshold would permit unsound closure. Omitting the
+complete scope enumeration keeps provisional replay available without claiming
+heartbeat finality.
+
+Actual admission and potential admission still use each proposal's exact
+policy, version, signing keys, grants and timestamp floors. A custom
+`selectAdmission` implementation can supply
+`canStillAdmit(context, { attestations, openValidatorIds })`. Returning `false`
+is a proof obligation: no subset or future combination of legitimate evidence
+from the open validators can satisfy that pinned policy. Returning `true` may
+be conservative. Without that evaluator, a custom selector's undecided
+proposals remain blockers even after a raw watermark advances. This preserves
+safety but can delay finality indefinitely; custom policies must implement the
+evaluator for automatic exclusion and progress.
+
+Revision closure additionally requires every predecessor validator's complete
+admission feed. The core waits for the referenced signed proposal bodies and
+consumed decisions before closing that revision's application results. A new
+governance head does not turn a partial old proof into a final result.
+
+`ClosedAdmissionRevision` names both the closed revision and its authenticated
+`nextMembershipRevision`. The successor authorizes only author timestamps
+strictly after `closedThroughMs`; the governed membership resolver enforces this
+against the timestamp-effective snapshot. A local author-clock hint alone is
+insufficient. The evaluator follows the verified activation chain from genesis
+and uses each boundary only as its successor's lower bound. Every still-open
+revision contributes its own safe boundary, and the global frontier is their
+minimum. A closed revision cannot lift an unrelated open revision. Conversely,
+fully consumed old work can become final at the activation boundary before the
+successor publishes its first heartbeat. Custom governance and membership
+adapters must uphold the same complete revision/activation contract.
+
+`node.watermark()` resolves the current operational policy, including in an
+empty group; it is raw policy evidence. `node.liveFinality()` reports the usable
+history-wide proof. Newly authored timestamps advance beyond observed verified
+history cutoffs and applied history even if the local wall clock moves backward.
+Applications do not calculate their own timestamp offsets.
+
+The fixed-validator model trusts its selected validators to honor their signed
+cutoff and revision-closure promises and retain their feed continuity. It is
+not a Byzantine consensus protocol: detecting a contradictory promise or feed
+fork cannot make an already dishonest signer truthful. Transport identity,
+authenticated signatures, consumed prefixes and exact policy evaluation are
+all necessary parts of this trust model; arrival order is not evidence of
+finality.
+
 ## Durable signed-inclusion closures
 
 The native service retains exact descriptors and detached bodies. Its receipt
@@ -138,8 +249,11 @@ selecting an extension must agree with that exact predecessor before its new
 suffix is checked. Newly added closures are verified once against the retained
 admission floors, first covering closures and control projection; an arbitrary
 caller-supplied snapshot cannot serve as a trusted baseline. The extension stays
-staged until its durable store write succeeds. Reopening and the public
-`evaluateFinalitySnapshot()` still verify the supplied history from genesis.
+staged until its durable store write succeeds. A failed storage acknowledgment
+fences further ingestion until the verifier is reopened: the write may already
+have committed, and a stale in-memory prefix must not overwrite that retained
+proof. Reopening and the public `evaluateFinalitySnapshot()` still verify the
+supplied history from genesis.
 All proof bytes remain available for replay and peer transfer.
 
 Closures can advance during an idle period. Future-dated included proposals stay
@@ -152,6 +266,12 @@ bound is accepted. `NativeFinalityService.open` and `withTendrillerFinality` req
 a verified enrollment descriptor and derive timing directly from its signed clock
 policy. Governed validators do the same. There is no separate local override for
 the cutoff lag, skew allowance or heartbeat interval.
+
+Raw `ChronologNode` embeddings without governed construction must supply
+`validator.cutoffLagMs` explicitly. Omitting `heartbeatIntervalMs` means the
+embedding advances the validator with `publishHeartbeat()`; omitting
+`maxFutureSkewMs` uses a thirty-second allowance. These low-level choices do not
+override any signed group policy.
 
 `DEFAULT_LIVE_CLOCK_POLICY` supplies a one-second cutoff lag, one-second
 heartbeat interval and thirty-second future-clock allowance. Native bootstrap
@@ -210,9 +330,17 @@ of control discovery.
 
 ## Regression evidence
 
+- `packages/capabilities/src/reducer.test.ts` and `capabilities.test.ts`, with
+  `packages/node-core/src/governance.test.ts`: one active validator grant per
+  signing key, deterministic distinct-key votes, historical feed binding,
+  rejected local preparations and continued replay after invalid controls.
 - `packages/node-core/src/pluggable-finality.test.ts`: opposite receipt orders,
   timestamp ties, prefix-only pending state, late exclusion, exact retry/restart,
   future time, missing bodies and an alternate opaque proof verifier.
+- `packages/node-core/src/peer-finality-safety.test.ts`: partial validator votes,
+  legitimate late admission and replay, complete consumed feeds, gap recovery,
+  missing bodies, custom policy blockers, durable exclusion and restart, and
+  author clocks in an empty group with a verified cutoff.
 - `packages/control-store/src/control-store.test.ts` and
   `packages/node-core/src/live-finality.test.ts`: delayed partial-quorum votes,
   policy-wide frontier bounds, closed-revision exclusions and feed-gap recovery.

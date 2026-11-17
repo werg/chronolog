@@ -51,6 +51,7 @@ jobs:
             artifacts/conformance/production-native.json
             artifacts/distribution/*.tar.gz
             artifacts/signals/*.tgz
+            artifacts/signals/provenance.json
             artifacts/signals/*.consumer.json
             artifacts/distribution/*.consumer.json
           if-no-files-found: error

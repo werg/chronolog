@@ -1,3 +1,4 @@
+// This focused fixture has no finality policy and explicitly inspects provisional outcomes.
 // Owner-controlled rows from an app's point of view: two nodes, Alice and
 // Bob, each with its own ChronologClient. Rows belong to the key that wrote
 // them; Alice shares one row with Bob, they work in a team, and Alice hands
@@ -54,7 +55,7 @@ try {
   await reached(bob, setup)
 
   // Bob cannot change Alice's note at the current local position.
-  const denied = await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).settled()
+  const denied = await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).provisional()
   assert.equal(denied.outcome.type, 'rejected')
   if (denied.outcome.type === 'rejected') console.log('Bob editing Alice\'s note:', parseRejectionCode(denied.outcome.rejection.code))
 
@@ -98,7 +99,7 @@ async function list<T>(client: ChronologClient, query: OwnershipQuery<T>): Promi
 
 /** The walkthrough has no closure service; each displayed result is tentative. */
 async function expectLocalAcceptance(handle: TransactionHandle): Promise<void> {
-  const result = await handle.settled()
+  const result = await handle.provisional()
   assert.equal(result.outcome.type, 'accepted')
   assert.equal(result.final, false)
 }

@@ -66,7 +66,8 @@ const created = await alice.sealed.setReaders({
 })
 await created.handle.accepted()
 
-// accepted() waited for the policy update's immutable locally applied success.
+// accepted() waits for the policy update's final acceptance. A different
+// replica may still need to apply that final policy before it can encrypt.
 // put() rechecks the selected policy and refuses an unresolved newer update.
 try {
   const change = await alice.sealed.put(
@@ -76,8 +77,8 @@ try {
   await change.handle.accepted()
 } catch (error) {
   if (error instanceof SealedPolicyNotFinalError) {
-    // Wait for the selected policy update's final accepted outcome and all
-    // required references, then explicitly retry the operation.
+    // Wait for the policy operation's final acceptance on this replica,
+    // then explicitly retry with the same durable operation identity.
   } else {
     throw error
   }
@@ -162,12 +163,18 @@ the ciphertext and reader wraps. A recipient can attempt decryption even when
 the transaction later fails a row-write check, a trigger or compare-and-swap.
 SQL rollback and deterministic replay cannot withdraw those bytes.
 
-For that reason `put()` checks the policy update's settlement evidence before
-encrypting. Its default requires an accepted outcome with `final === true` and
-no unresolved references. This condition uses the selected finality provider;
-it does not require peer-validator watermark metadata for a coordinated group.
-Otherwise it throws `SealedPolicyNotFinalError` without encrypting or submitting
-the value. Tests or development tools can explicitly pass
+For that reason `put()` reads the current local policy and checks that policy
+update's outcome before encrypting. It requires `final === true` and an
+`accepted` result, using the same provider-independent finality contract as
+`handle.accepted()`. This works with validator, signed-inclusion and custom
+finality providers. Validator watermark diagnostics do not gate encryption.
+A locally observed provisional audience change blocks the helper even when an
+older policy is already final. Policy and current data-version reads use one
+materialized revision, and finality preflight must refer to that same revision.
+A replay between those reads returns `revision_unavailable`; retry from a new
+policy snapshot. A policy that is not finally accepted produces
+`SealedPolicyNotFinalError` without encrypting or submitting the value.
+Tests or development tools can explicitly pass
 `allowProvisionalPolicy: true`; that permits irreversible disclosure under a
 policy that may later change during replay.
 

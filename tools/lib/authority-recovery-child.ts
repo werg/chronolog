@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { base64UrlToBytes, bytesToBase64Url, emit, program } from '@chronolog/protocol'
-import { CoordinatedHistoryPolicy, decodeOrderingEvidence, encodeOrderingEvidence, MemoryOperationStore, type OrderedRecordHead } from '@chronolog/node-core'
+import { SignedInclusionFinalityProvider, decodeOrderingEvidence, encodeOrderingEvidence, MemoryOperationStore, type OrderedRecordHead } from '@chronolog/node-core'
 
 import {
   AUTHORITY_CRASH_POINTS, inspectStoppedAuthority, openAuthorityRecoveryFixture, recoveryJson,
@@ -84,9 +84,9 @@ if (action === 'raw') {
       const retained = await retainedEvidence(before)
       await fixture.agent.close()
       const stoppedHead = await fixture.authority.head()
-      const observer = await CoordinatedHistoryPolicy.open(fixture.authority.configuration, new MemoryOperationStore())
+      const observer = await SignedInclusionFinalityProvider.open(fixture.authority.configuration, new MemoryOperationStore())
       for (const evidence of [...retained].reverse()) await observer.ingest(decodeOrderingEvidence(evidence))
-      const secondObserver = await CoordinatedHistoryPolicy.open(fixture.authority.configuration, new MemoryOperationStore())
+      const secondObserver = await SignedInclusionFinalityProvider.open(fixture.authority.configuration, new MemoryOperationStore())
       for (const evidence of [...observer.evidence()].reverse()) await secondObserver.ingest(evidence)
       assert.equal(observer.progress.finalThrough, before.head.position)
       assert.deepEqual(secondObserver.progress, observer.progress)

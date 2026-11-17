@@ -37,7 +37,6 @@ function transaction(index: number): AdmittedTransaction {
   const value = core(index)
   return {
     txId: bytes(0x10 + index),
-    authorFeedSequence: BigInt(index + 1),
     candidateDigest: bytes(0x20 + index),
     canonicalCandidate: encodeTransactionCore(value),
     core: value,
@@ -48,14 +47,13 @@ function logRow(item: AdmittedTransaction, orderIndex: number): TransactionLogRo
   return {
     operationId: item.core.operationId,
     txId: item.txId,
-    orderKey: { authorTimestampMs: item.core.authorTimestampMs, authorId: item.core.authorId, authorFeedSequence: item.authorFeedSequence, txId: item.txId },
+    orderKey: { authorTimestampMs: item.core.authorTimestampMs, authorId: item.core.authorId, txId: item.txId },
     orderIndex,
     outcome: 'accepted',
     rejectionCode: null,
     failingStatementIndex: null,
     authorId: item.core.authorId,
     authorTimestampMs: item.core.authorTimestampMs,
-    authorFeedSequence: item.authorFeedSequence,
     candidateDigest: item.candidateDigest,
     canonicalCandidate: item.canonicalCandidate,
   }

@@ -1,4 +1,4 @@
-import { bytesToBase64Url, type ViewChangeOptions } from '@chronolog/protocol'
+import { bytesToBase64Url, type ApplicationChangeOptions } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 
 import { HttpRpcServer, HttpRpcTransport } from './http.js'
@@ -8,11 +8,11 @@ import type { ChronologRpcNodeService } from './service-contract.js'
 
 const groupId = new Uint8Array(32).fill(8), group = bytesToBase64Url(groupId)
 function fixture() {
-  const subscriptions: ViewChangeOptions[] = []
+  const subscriptions: ApplicationChangeOptions[] = []
   const readView = vi.fn(async () => { throw new Error('No read lease is needed') })
   let stopped!: () => void
   const closed = new Promise<void>(resolve => { stopped = resolve })
-  const changes = vi.fn((options: ViewChangeOptions = {}) => ({ async *[Symbol.asyncIterator]() {
+  const changes = vi.fn((options: ApplicationChangeOptions = {}) => ({ async *[Symbol.asyncIterator]() {
     subscriptions.push(options)
     try {
       yield { view: options.view ?? 'final', revision: 'opaque-applied-view', finalRevision: 'opaque-final-prefix' }
@@ -49,7 +49,7 @@ describe('view changes RPC', () => {
   })
 
   it('closes an idle subscription when its service closes', async () => {
-    const f = fixture(), iterator = f.service.viewChanges({ groupId: group, view: 'local' }, { method: 'view.changes' })[Symbol.asyncIterator]()
+    const f = fixture(), iterator = f.service.changes({ groupId: group, view: 'local' }, { method: 'view.changes' })[Symbol.asyncIterator]()
     await iterator.next()
     const pending = iterator.next()
     await f.service.close()

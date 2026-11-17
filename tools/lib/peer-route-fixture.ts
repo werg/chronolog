@@ -14,6 +14,7 @@ import { Miniflare, Response as HostResponse } from 'miniflare'
 import { WebSocketServer, type WebSocket } from 'ws'
 
 import type { NativeBrowserFixture } from '../browser-event-fixture.js'
+import { isExpectedPeerTermination } from './peer-termination.js'
 
 interface SessionMeasurement {
   readonly id: number
@@ -156,9 +157,13 @@ export async function createPeerRouteFixture(options: {
       if (measurement.closed) { await authenticated.close(); await rtc.close(); return }
       void authenticated.completion.catch((error: unknown) => {
         appendTrace({ session: id, event: 'ended', error: String(error) })
-        if (!measurement.closed) failures.push(String(error))
+        if (!measurement.closed && !isExpectedPeerTermination(error)) failures.push(String(error))
       }).finally(close)
-    } catch (error) { appendTrace({ session: id, event: 'opening-failed', error: String(error) }); if (!measurement.closed) failures.push(String(error)); await close() }
+    } catch (error) {
+      appendTrace({ session: id, event: 'opening-failed', error: String(error) })
+      if (!measurement.closed && !isExpectedPeerTermination(error)) failures.push(String(error))
+      await close()
+    }
   }
   server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url ?? '/', 'https://localhost')

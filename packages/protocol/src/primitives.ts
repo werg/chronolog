@@ -23,7 +23,7 @@ export const DOMAINS = {
   publisherApproval: 'chronolog/publisher-approval/v1',
   governanceClosure: 'chronolog/governance-closure/v1',
   snapshotManifest: 'chronolog/snapshot-manifest/v1',
-  materializedLog: 'chronolog/materialized-log/v1',
+  materializedLog: 'chronolog/materialized-log/v2',
   epochManifest: 'chronolog/epoch-manifest/v1',
   epochWrap: 'chronolog/epoch-wrap/v1',
   epochPayload: 'chronolog/epoch-payload/v1',

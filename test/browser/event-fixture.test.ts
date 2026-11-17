@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { waitForFinalAcceptance } from '../../apps/chronologd/src/agent-runtime.js'
 import { createNativeBrowserFixture } from '../../tools/browser-event-fixture.js'
 import { createAgent } from '../../examples/resident-agent.js'
-import { connectGovernedBrowserPeer } from './event-connection.js'
+import { openHttpPeerConnection } from './event-connection.js'
 
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
@@ -32,7 +32,7 @@ describe('browser qualification native fixture', () => {
     const setup = await native.client.transaction([
       'CREATE TABLE tasks(id TEXT PRIMARY KEY, title TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL)',
       "INSERT INTO tasks(id,title,status) VALUES('task-1','Inspect evidence','open')",
-    ], { idempotencyKey: 'native-pilot-schema' })
+    ], { operationId: 'native-pilot-schema' })
     try { expect((await setup.final({ signal: AbortSignal.timeout(5000) })).outcome.type).toBe('accepted') }
     finally { setup.dispose() }
     const request = await native.client.events.publish('job-requests', { type: 'job.requested', version: 1,
@@ -68,8 +68,19 @@ describe('browser qualification native fixture', () => {
     const peerService = await createGovernedPeerService({ identity: identity.signing, groupId: replica.descriptor.history.groupId,
       activeMembership: () => replica.activeSnapshot, local: transport.asLink(), attach: link => transport.connect(link) })
     cleanup.push(() => peerService.close())
-    const session = await connectGovernedBrowserPeer({ bootstrap: native.bootstrap, peer: peerService })
+    const session = await peerService.connectPeer({
+      connection: await openHttpPeerConnection(native.bootstrap.peerUrl, native.bootstrap.peerToken),
+      peerIdentity: base64UrlToBytes(native.bootstrap.nativeIdentity),
+    })
     cleanup.push(() => session.close())
+    const liveLifetime = AbortSignal.timeout(5000)
+    const nativeSignals = native.agent.context.signals.subscribe({ topics: ['typing'], signal: liveLifetime })[Symbol.asyncIterator]()
+    const fromReplica = nativeSignals.next(), sentByReplica = await peerService.signals.send('typing', { source: 'replica' })
+    expect((await fromReplica).value).toEqual(sentByReplica)
+    const replicaSignals = peerService.signals.subscribe({ topics: ['typing'], signal: liveLifetime })[Symbol.asyncIterator]()
+    const fromNative = replicaSignals.next(), sentByNative = await native.client.signals.send('typing', { source: 'native' })
+    expect((await fromNative).value).toEqual(sentByNative)
+    await nativeSignals.return?.(); await replicaSignals.return?.()
     await transport.catchUp()
     await replica.node.waitForIdle()
     const first = await replica.node.events.publish('chat', { text: 'replica' }, { operationId: 'replica-1' })

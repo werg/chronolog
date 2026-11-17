@@ -1,11 +1,10 @@
-import { execFile } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
+import { runInNewContext } from 'node:vm'
 
 import * as sealedCrypto from '@chronolog/crypto'
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { encodeSealedEnvelope, utf8, type SealedEnvelope, type SealedPlatformOp } from '@chronolog/protocol'
-import type { SettlementEvidence } from '@chronolog/rpc'
+import type { TransactionOutcome } from '@chronolog/rpc'
+import { build } from 'esbuild'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { LocalSqlQueryResponse, TransactionHandle, TransactionStepInput } from './client.js'
@@ -14,7 +13,6 @@ import { SealedDataActions, SealedPolicyNotFinalError, SealedVersionConflictErro
 
 const bytes = (seed: number): Uint8Array => new Uint8Array(32).fill(seed)
 const GROUP = Buffer.from(bytes(1)).toString('base64url')
-const execFileAsync = promisify(execFile)
 
 afterEach(() => { vi.restoreAllMocks() })
 
@@ -29,10 +27,9 @@ function fixture(publicKey: Uint8Array) {
   const state = {
     policyVersion: 1n,
     policyClosed: false,
-    confidence: 'policy_watermark_reached' as SettlementEvidence['confidence'],
+    materializedRevision: '7',
     final: true,
-    unresolvedReferences: [] as SettlementEvidence['unresolvedReferences'],
-    accepted: true,
+    outcome: { type: 'accepted' } as TransactionOutcome['outcome'],
     envelope: undefined as SealedEnvelope | undefined,
   }
   const handle = { createdId: async () => bytes(2) } as unknown as TransactionHandle
@@ -50,10 +47,11 @@ function fixture(publicKey: Uint8Array) {
       throw new Error(`Unexpected query ${sql}`)
     }),
     transaction: vi.fn(async (_steps: readonly TransactionStepInput[]) => handle),
-    getSettlementEvidence: vi.fn(async (transactionId: string): Promise<SettlementEvidence> => ({
-      transactionId, confidence: state.confidence, unresolvedReferences: state.unresolvedReferences,
-      outcome: { final: state.final, outcome: { type: state.accepted ? 'accepted' : 'pending' } },
-    }) as SettlementEvidence),
+    getTransactionOutcome: vi.fn(async (transactionId: string): Promise<TransactionOutcome> => ({
+      transactionId, phase: state.outcome.type === 'pending' ? 'admissible' : state.outcome.type,
+      outcome: state.outcome, eventSetRevision: '9', materializedRevision: state.materializedRevision, changedByReplay: false,
+      admissible: true, final: state.final, observedAt: '2026-11-17T00:00:00.000Z',
+    })),
   }
   return { client, state, actions: new SealedDataActions(client), handle }
 }
@@ -61,7 +59,6 @@ function fixture(publicKey: Uint8Array) {
 describe('sealed client helpers', () => {
   it('preserves caller-owned Buffer plaintext when policy preflight rejects', async () => {
     const { actions, state } = fixture(bytes(8))
-    state.confidence = 'provisional'
     state.final = false
     const plaintext = Buffer.from('the caller still owns these bytes')
     const expected = Uint8Array.from(plaintext)
@@ -89,13 +86,29 @@ describe('sealed client helpers', () => {
     expect(policyId.every((byte) => byte === 0xa6)).toBe(true)
   })
 
-  it('encrypts and decrypts using browser globals without Node Buffer', async () => {
-    // Vitest's concurrent IPC also uses Buffer. Remove it only in an isolated
-    // process, where the real client and crypto calls run without the runner.
-    const { stdout } = await execFileAsync(process.execPath, ['--import', 'tsx',
-      fileURLToPath(new URL('../../../test/fixtures/sealed-browser-globals.ts', import.meta.url)),
-    ], { timeout: 20_000 })
-    expect(stdout.trim()).toBe('sealed-browser-globals-ok')
+  it('encrypts finally accepted policies without validator evidence in a portable browser bundle', async () => {
+    const reader = await generateX25519KeyPair()
+    const { state, client } = fixture(reader.publicKeyBytes)
+    const bundle = await build({ entryPoints: [new URL('./sealed.ts', import.meta.url).pathname],
+      bundle: true, platform: 'browser', format: 'iife', globalName: 'SealedBrowser', write: false,
+      // Exercise package browser exports, not the repo's Node typecheck aliases.
+      tsconfigRaw: { compilerOptions: {} } })
+    // Keep browser globals separate: removing Buffer from the Vitest process
+    // also breaks its asynchronous IPC decoder, invalidating test results.
+    const browser = runInNewContext(`${bundle.outputFiles[0]!.text}; SealedBrowser`, {
+      Uint8Array, ArrayBuffer, TextEncoder, TextDecoder, crypto: globalThis.crypto,
+      atob, btoa, AbortController, AbortSignal, DOMException,
+    }) as { readonly SealedDataActions: typeof SealedDataActions }
+    const actions = new browser.SealedDataActions(client)
+    const change = await actions.put(bytes(2), 'body', utf8('browser secret'))
+    expect(client.getTransactionOutcome).toHaveBeenCalledWith('policy-tx-id')
+    expect(client.query.mock.calls[0]![2]).toEqual({ view: 'local' })
+    expect(client.query.mock.calls[1]![2]).toEqual({ view: 'local', atRevision: '7' })
+    const step = client.transaction.mock.calls[0]![0][0] as SealedPlatformOp
+    if (step.op !== 'sealed_put') throw new Error('Expected sealed put')
+    state.envelope = step.envelope
+    const stored = await actions.get(bytes(2), 'body')
+    expect(await actions.decrypt(stored!, reader.privateKey, bytes(4), change.context)).toEqual(utf8('browser secret'))
   })
 
   it('submits explicit key registration and versioned reader policy changes', async () => {
@@ -124,28 +137,25 @@ describe('sealed client helpers', () => {
     await expect(actions.getPolicy('notes', [10n])).rejects.toThrow('primary-key')
   })
 
-  it('refuses unfinalized policies before encryption or publication, including unresolved evidence', async () => {
+  it('refuses provisional, pending and finally rejected policies before encryption or publication', async () => {
     const reader = await generateX25519KeyPair()
     const { actions, state, client } = fixture(reader.publicKeyBytes)
     const seal = vi.spyOn(sealedCrypto, 'sealSealedValue')
-    // A watermark observation alone is insufficient until its result is applied.
     state.final = false
     await expect(actions.put(bytes(2), 'body', utf8('never encrypt yet'))).rejects.toBeInstanceOf(SealedPolicyNotFinalError)
+    state.outcome = { type: 'pending' }
+    await expect(actions.put(bytes(2), 'body', utf8('still pending'))).rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
     state.final = true
-    state.unresolvedReferences = [{ kind: 'attestation', reference: 'missing' }]
-    await expect(actions.put(bytes(2), 'body', utf8('still unresolved'))).rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
-    state.unresolvedReferences = []
-    state.accepted = false
-    await expect(actions.put(bytes(2), 'body', utf8('not accepted'))).rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
+    state.outcome = { type: 'rejected', rejection: { code: 'conflict', statementIndex: 0 } }
+    await expect(actions.put(bytes(2), 'body', utf8('finally rejected'))).rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
     expect(seal).not.toHaveBeenCalled()
     expect(client.transaction).not.toHaveBeenCalled()
-    expect(client.getSettlementEvidence).toHaveBeenCalledWith('policy-tx-id')
+    expect(client.getTransactionOutcome).toHaveBeenCalledWith('policy-tx-id')
   })
 
   it('uses immutable acceptance rather than requiring a peer-policy watermark from the selected provider', async () => {
     const reader = await generateX25519KeyPair()
     const { actions, state, client } = fixture(reader.publicKeyBytes)
-    state.confidence = 'insufficient'
     state.final = true
     const change = await actions.put(bytes(2), 'body', utf8('final coordinated policy'))
     expect(change.context.policyVersion).toBe(1n)
@@ -155,10 +165,10 @@ describe('sealed client helpers', () => {
   it('encrypts only the explicit reader snapshot, with an explicit provisional override for development', async () => {
     const reader = await generateX25519KeyPair()
     const { actions, state, client } = fixture(reader.publicKeyBytes)
-    state.confidence = 'provisional'
     state.final = false
     const change = await actions.put(bytes(2), 'body', utf8('secret'), { allowProvisionalPolicy: true })
-    expect(client.getSettlementEvidence).not.toHaveBeenCalled()
+    expect(client.getTransactionOutcome).not.toHaveBeenCalled()
+    expect(client.query.mock.calls[0]![2]).toEqual({ view: 'local' })
     expect(change.context).toEqual({ groupId: bytes(1), policyId: bytes(2), policyVersion: 1n, slot: 'body', dataVersion: 1n })
     const step = client.transaction.mock.calls[0]![0][0] as SealedPlatformOp
     expect(step.op).toBe('sealed_put')
@@ -166,6 +176,17 @@ describe('sealed client helpers', () => {
     expect(step.expectedDataVersion).toBe(0n)
     expect(step.envelope.wraps.map((wrap) => wrap.readerId)).toEqual([bytes(4)])
     expect(await sealedCrypto.openSealedValue({ envelope: step.envelope, expectedContext: change.context, readerId: bytes(4), recipientPrivateKey: reader.privateKey })).toEqual(utf8('secret'))
+  })
+
+  it('does not combine recipients from a provisional revision with final acceptance after replay', async () => {
+    const reader = await generateX25519KeyPair()
+    const { actions, state, client } = fixture(reader.publicKeyBytes)
+    const seal = vi.spyOn(sealedCrypto, 'sealSealedValue')
+    state.materializedRevision = '8'
+    await expect(actions.put(bytes(2), 'body', utf8('never encrypt stale recipients')))
+      .rejects.toMatchObject({ code: 'revision_unavailable' })
+    expect(seal).not.toHaveBeenCalled()
+    expect(client.transaction).not.toHaveBeenCalled()
   })
 
   it('checks expected versions before encryption and reads old values under their original policy version', async () => {
@@ -185,7 +206,7 @@ describe('sealed client helpers', () => {
     expect(await actions.decrypt(stored!, reader.privateKey)).toEqual(utf8('old secret'))
     const change = await actions.put(bytes(2), 'body', utf8('new'), { expectedPolicyVersion: 2n, expectedDataVersion: 3n })
     expect(change.context).toMatchObject({ policyVersion: 2n, dataVersion: 4n })
-    expect(client.getSettlementEvidence).toHaveBeenCalledWith('policy-tx-id')
+    expect(client.getTransactionOutcome).toHaveBeenCalledWith('policy-tx-id')
   })
 
   it('binds reads/decryption to the configured group and requested policy/column, not ciphertext claims', async () => {

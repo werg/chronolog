@@ -67,6 +67,7 @@ async function genesisSnapshot(genesis: SignedGenesis): Promise<CapabilitySnapsh
     protocolInvariant(!capabilities.has(bytesToHex(id)), 'SCHEMA_INVALID', 'Genesis contains a duplicate capability')
     capabilities.set(bytesToHex(id), { id, grant, grantedAtRevision: 0n })
   }
+  assertUniqueActiveValidators(capabilities, 0n)
   const policies = new Map<string, EffectivePolicy>()
   for (const policy of manifest.validationPolicies) {
     const id = await validationPolicyId(policy)
@@ -131,6 +132,10 @@ export async function applyCapabilityRevision(
       protocolInvariant(!capabilities.has(bytesToHex(id)), 'SCHEMA_INVALID', 'Capability revision contains a duplicate grant')
       capabilities.set(bytesToHex(id), { id, grant, grantedAtRevision: revision.revision })
     }
+    // Revocation and replacement form one transition. An old validator grant
+    // can remain as historical evidence, but one signing key has only one
+    // active grant and replication feed in any revision.
+    assertUniqueActiveValidators(capabilities, revision.revision)
     const policies = new Map(snapshot.policies)
     for (const policy of revision.validationPolicies) {
       const id = await validationPolicyId(policy)
@@ -153,6 +158,17 @@ export async function applyCapabilityRevision(
 export function isCapabilityActive(capability: EffectiveCapability, revision: bigint): boolean {
   return capability.grant.validFromRevision <= revision
     && (capability.revokedAtRevision === undefined || revision < capability.revokedAtRevision)
+}
+
+function assertUniqueActiveValidators(capabilities: ReadonlyMap<string, EffectiveCapability>, revision: bigint): void {
+  const validators = new Set<string>()
+  for (const capability of capabilities.values()) {
+    if (capability.grant.role !== 'validator' || !isCapabilityActive(capability, revision)) continue
+    const validatorId = bytesToHex(capability.grant.signingPublicKey)
+    protocolInvariant(!validators.has(validatorId), 'SCHEMA_INVALID', 'Validator signing key has multiple active grants',
+      { validatorId, revision: String(revision) })
+    validators.add(validatorId)
+  }
 }
 
 export function capabilitiesForSubject(

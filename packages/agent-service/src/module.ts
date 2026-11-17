@@ -18,7 +18,7 @@ export interface AgentApplicationContext {
   readonly node: ChronologNode
   readonly store: DurableOperationStore
   readonly finality: NativeFinalityService | null
-  /** Live replaceable messages; receiving requires no writer grant. */
+  /** Live messages with explicit FIFO/latest delivery; receiving requires no writer grant. */
   readonly signals: Signals
   readonly publisher: FinalEventPublisher
   readonly sourceId: string

@@ -245,7 +245,6 @@ async function transaction(
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(id),
-    authorFeedSequence: timestamp,
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

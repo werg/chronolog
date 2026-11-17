@@ -2,7 +2,7 @@ import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { assertCanonicalCbor, encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, type CborValue } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 
-import { CoordinatedHistoryPolicy, ReferenceRecordLog, createPrefixAuthority } from './history-policy.js'
+import { SignedInclusionFinalityProvider, ReferenceRecordLog, createPrefixAuthority } from './history-policy.js'
 import {
   MAX_LEDGER_INLINE_PAYLOAD_BYTES, MAX_LEDGER_PAYLOAD_BYTES, MAX_LEDGER_RECORD_BYTES,
   createLedgerRecord, decodeLedgerRecord, resolveLedgerPayload, verifyLedgerPayload,
@@ -60,7 +60,7 @@ describe('authenticated ledger descriptor and detached envelope boundary', () =>
     const first = await log.append(prepared[0].recordBytes)
     const second = await log.append(prepared[1].recordBytes)
     const authority = createPrefixAuthority({ configuration, identity, readHead: () => log.head() })
-    const verifier = await CoordinatedHistoryPolicy.open(configuration, new MemoryOperationStore())
+    const verifier = await SignedInclusionFinalityProvider.open(configuration, new MemoryOperationStore())
     await verifier.ingest({ kind: 'prefix-certificate', certificate: await authority.certify() })
     await verifier.ingest({ kind: 'ordered-entry', entry: first })
     // Omitting an inline governance record cannot yield the certified prefix.

@@ -9,7 +9,7 @@ export function materializedLogDigest(rows: readonly TransactionLogRow[]): Promi
     [1n, BigInt(row.orderIndex)],
     [2n, row.authorId],
     [3n, row.authorTimestampMs],
-    [4n, row.authorFeedSequence],
+    [4n, row.operationId],
     [5n, row.candidateDigest],
     [6n, row.canonicalCandidate],
     [7n, row.outcome],

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { bytesToHex, emit, encodeTransactionCore, program, transactionDigest, utf8, type ChangeProgram, type TransactionCore } from '@chronolog/protocol'
+import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, encodeTransactionCore, program, transactionDigest, utf8, type ChangeProgram, type TransactionCore } from '@chronolog/protocol'
 import { createEventMaterializationRuntime } from './events.js'
 import type { AdmittedTransaction } from './types.js'
 
@@ -12,7 +12,7 @@ async function admitted(digest: Uint8Array, sequence: number, change: ChangeProg
   const core: TransactionCore = { operationId, groupId: new Uint8Array(32), membershipRevision: new Uint8Array(32), validationPolicy: new Uint8Array(32),
     authorId: new Uint8Array(32), authorTimestampMs: BigInt(sequence), nonce: new Uint8Array(32).fill(sequence), executionManifestDigest: digest, program: change }
   const canonicalCandidate = encodeTransactionCore(core), candidateDigest = await transactionDigest(canonicalCandidate)
-  return { txId: utf8(`tx_${bytesToHex(candidateDigest)}`), authorFeedSequence: BigInt(sequence), candidateDigest, canonicalCandidate, core }
+  return { txId: utf8(`tx_${bytesToHex(candidateDigest)}`), candidateDigest, canonicalCandidate, core }
 }
 describe('SQL-free durable event execution', () => {
   it('reopens final outcomes and deterministic operation conflicts without an SQL runtime', async () => {
@@ -23,6 +23,8 @@ describe('SQL-free durable event execution', () => {
     const conflict = await admitted(digest, 2, program(emit('chat', 'changed')), 'same')
     const sql = await admitted(digest, 3, program('SELECT 1', emit('chat', 'suppressed')))
     await first.coordinator.materialize([one, conflict, sql])
+    expect(first.queries.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([one.txId, conflict.txId, sql.txId])
+    expect(first.queries.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId)).toEqual([])
     await first.coordinator.publishFinal!(3)
     expect(first.queries.outcome(one.txId)?.outcome).toBe('accepted')
     expect(first.queries.outcome(conflict.txId)?.rejectionCode).toBe('operation_conflict')
@@ -30,6 +32,7 @@ describe('SQL-free durable event execution', () => {
     await first.close()
     const reopened = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
     expect(reopened.queries.finalOrderLength).toBe(3)
+    expect(reopened.queries.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId)).toEqual([one.txId, conflict.txId, sql.txId])
     expect(reopened.queries.outcome(one.txId)?.outcome).toBe('accepted')
     expect(() => reopened.queries.localSql('SELECT 1')).toThrow('SQL_DISABLED')
     await expect(reopened.coordinator.materialize([conflict, sql])).rejects.toThrow('FINAL_PREFIX_CHANGED')
@@ -41,14 +44,38 @@ describe('SQL-free durable event execution', () => {
     bytes.fail = true
     await expect(runtime.coordinator.materialize([entry])).rejects.toThrow('power loss')
     expect(runtime.queries.orderLength).toBe(0)
+    expect(() => runtime.queries.captureApplication({ view: 'local' })).toThrow('EVENT_EXECUTION_CLOSED')
     expect(runtime.queries.outcome(entry.txId)).toBeNull()
     bytes.fail = false
     await expect(runtime.coordinator.materialize([entry])).rejects.toThrow('EVENT_EXECUTION_CLOSED')
     runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
+    expect(runtime.queries.captureApplication({ view: 'local' }).transactions).toEqual([])
     await runtime.coordinator.materialize([entry])
+    const ids = runtime.queries.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)
+    ids[0]!.fill(0)
+    expect(runtime.queries.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([entry.txId])
     bytes.fail = true
     await expect(runtime.coordinator.publishFinal!(1)).rejects.toThrow('power loss')
     expect(runtime.queries.finalOrderLength).toBe(0)
+    expect(() => runtime.queries.captureApplication({ view: 'final' })).toThrow('EVENT_EXECUTION_CLOSED')
+    const reopened = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
+    expect(reopened.queries.captureApplication({ view: 'final' }).transactions).toEqual([])
+  })
+
+  it('rejects old persisted envelopes and transport-bearing rows', async () => {
+    const bytes = store(), runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
+    const entry = await admitted(runtime.queries.executionManifestDigest, 1, program(emit('chat', 'one')))
+    await runtime.coordinator.materialize([entry])
+    const persisted = assertCanonicalCbor((await bytes.get('event-execution/group'))!)
+    if (!Array.isArray(persisted)) throw new Error('Expected persisted array')
+    await runtime.close()
+    await bytes.put('event-execution/group', encodeCanonicalCbor(['chronolog/event-execution/v1', ...persisted.slice(1)]))
+    await expect(createEventMaterializationRuntime({ store: bytes, namespace: 'group' })).rejects.toThrow('EVENT_EXECUTION_STORE_INVALID')
+
+    await bytes.put('event-execution/group', encodeCanonicalCbor([
+      ...persisted.slice(0, 5), [[entry.txId, 123n, entry.candidateDigest, entry.canonicalCandidate]],
+    ]))
+    await expect(createEventMaterializationRuntime({ store: bytes, namespace: 'group' })).rejects.toThrow('EVENT_EXECUTION_STORE_INVALID')
   })
 
   it('cannot overwrite a committed durable final prefix after its reply was lost', async () => {
@@ -179,8 +206,8 @@ describe('SQL-free durable event execution', () => {
     const removed = await runtime.coordinator.materialize([final, two])
     expect(runtime.queries.outcome(two.txId)?.outcome).toBe('accepted')
     expect(runtime.queries.outcome(one.txId)).toBeNull()
-    expect(runtime.queries.proposalIdAt(1)).toEqual(two.txId)
-    expect(runtime.queries.proposalIdAt(2)).toBeNull()
+    expect(runtime.queries.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)[1]).toEqual(two.txId)
+    expect(runtime.queries.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)[2]).toBeUndefined()
     expect(removed?.revision.outcomeChanges).toContainEqual({ txId: one.txId, previous: 'accepted', current: null,
       previousRejectionCode: null, currentRejectionCode: null })
     await runtime.coordinator.materialize([final, one, two])
@@ -188,7 +215,8 @@ describe('SQL-free durable event execution', () => {
     expect(runtime.queries.outcome(two.txId)?.rejectionCode).toBe('operation_conflict')
     await expect(runtime.coordinator.materialize([final, two, one])).rejects.toThrow('ORDER_NOT_CHRONOLOGICAL')
     await runtime.coordinator.materialize([final, two])
-    await expect(runtime.coordinator.materialize([final, { ...two, authorFeedSequence: 99n }])).rejects.toThrow('IDENTITY_CONFLICT')
+    const replacement = await admitted(digest, 4, program(emit('chat', 'replacement')))
+    await expect(runtime.coordinator.materialize([final, { ...replacement, txId: two.txId }])).rejects.toThrow('IDENTITY_CONFLICT')
     await expect(runtime.coordinator.materialize([two])).rejects.toThrow('FINAL_PREFIX_CHANGED')
     await runtime.coordinator.publishFinal!(2)
     const reopened = await createEventMaterializationRuntime({ store: bytes, namespace: 'identity' })

@@ -1,5 +1,5 @@
 import type { EventBatch, EventPayload, EventReadOptions } from '@chronolog/protocol'
-import type { SignalPayload } from '@chronolog/signals'
+import type { SignalPayload, SignalSubscribeOptions } from '@chronolog/signals'
 import type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
 export type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
 
@@ -67,18 +67,18 @@ export interface SubmitSignedRequest {
 }
 export interface EventReadRequest extends EventReadOptions { readonly groupId: GroupId; readonly requestId: RequestId }
 export type EventReadResponse = EventBatch
-/** A live publication has no durable operation identity or replay cursor. */
-export interface SendSignalRequest {
+export interface SignalSendRequest {
   readonly groupId: GroupId
   readonly topic: string
   readonly payload: SignalPayload
   readonly ttlMs?: number
+  /** Absolute caller deadline; transit and dispatch never refresh this live intent. */
+  readonly expiresAtMs: number
 }
-export interface SubscribeSignalsRequest {
+export interface SignalSubscribeRequest extends Omit<SignalSubscribeOptions, 'signal'> {
   readonly groupId: GroupId
-  readonly topics?: readonly string[]
-  readonly mode?: 'all' | 'latest'
 }
+export interface ChangesRequest { readonly groupId: GroupId; readonly view?: SqlView }
 export interface OperationStatus {
   readonly operationId: string
   readonly proposalId: string
@@ -93,8 +93,6 @@ export interface GetOperationRequest { readonly groupId: GroupId; readonly reque
 export interface StreamOperationsRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly operationId: string }
 
 export interface OpenReadViewRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly view?: SqlView }
-export interface ViewChangesRequest { readonly groupId: GroupId; readonly view?: SqlView }
-export type { ViewChange } from '@chronolog/protocol'
 export interface OpenReadViewResponse {
   readonly viewId: string
   readonly revision: string
@@ -169,7 +167,7 @@ export interface SubmitTransactionRequest {
   /** SQL, emitted events and platform operations, executed in order as this node's key. */
   readonly steps: readonly RpcProgramStep[]
   /** Repeating a key with the same steps returns the original submission. */
-  readonly idempotencyKey?: string
+  readonly operationId?: string
 }
 export interface SubmitTransactionResponse {
   readonly transactionId: TransactionId
@@ -208,6 +206,7 @@ export interface TransactionOutcome {
 export interface GetOutcomeRequest { readonly groupId: GroupId; readonly transactionId: TransactionId; readonly requestId: RequestId }
 export interface StreamOutcomeRequest extends GetOutcomeRequest { readonly resumeAfterEventSetRevision?: Revision }
 
+/** Validator-proof diagnostics; application decisions use TransactionOutcome.final for every provider. */
 export type SettlementConfidence = 'insufficient' | 'provisional' | 'policy_watermark_reached'
 export interface EvidenceReference { readonly kind: 'candidate' | 'attestation' | 'heartbeat' | 'membership' | 'epoch'; readonly reference: string }
 export interface SettlementEvidence {
@@ -221,6 +220,7 @@ export interface SettlementEvidence {
   readonly policyWatermarkTimestamp?: string
   readonly blockingHeartbeats: readonly string[]
   readonly unresolvedReferences: readonly EvidenceReference[]
+  /** Describes validator evidence, independently of the provider-neutral outcome.final flag. */
   readonly confidence: SettlementConfidence
   readonly calculatedAt: string
 }

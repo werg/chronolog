@@ -14,7 +14,7 @@ import {
   MembershipAdministrator, createMembershipLedgerClient, encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity,
   prepareEnrollmentRequest, provisionMembership, verifyEnrollmentApproval,
 } from '@chronolog/node-core/membership'
-import { bytesToBase64Url, decodeEnvelope, equalBytes } from '@chronolog/protocol'
+import { bytesToBase64Url, equalBytes } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { createHttpWebRtcSignaling, openWebRtcConnection } from '@chronolog/transport-webrtc'
@@ -29,7 +29,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 
 describe('thin membership qualification native boundary', () => {
   // Large-body replay and two real replica revocations can exceed 120 s on
-  // shared runners. Individual publication deadlines remain bounded at 20 s;
+  // shared runners. Admission is bounded at 25 s and each final wait at 20 s;
   // allow the complete sequence to finish without dropping any qualification.
   it('keeps large SQL payloads off the administrator and recovers a lost enrollment append through the real native handler', async () => {
     const started = performance.now()
@@ -84,6 +84,10 @@ describe('thin membership qualification native boundary', () => {
     const beforeJoinSnapshot = await native.snapshot()
     await administrator.sync()
     expect(small.count).toBe(4); expect(large.count).toBe(4)
+    expect(large.admissionWindows.map(window => window.proposalIds)).toEqual(large.proposals.map(id => [id]))
+    expect(large.admissionWindows.every(window => window.status === 'included')).toBe(true)
+    expect(beforeJoinSnapshot.admission).toMatchObject({ mode: 'hold-until-original-inclusion', base: 'controlled-author-and-finality' })
+    expect(beforeJoinSnapshot.admission.windows).toHaveLength(9)
     expect(large.detachedEnvelopeBytes).toBeGreaterThan(700_000)
     expect(large.detachedEnvelopeBytes).toBeGreaterThan(small.detachedEnvelopeBytes * 100)
     // A larger encoded length can add a few bytes to the canonical descriptor;
@@ -196,22 +200,13 @@ describe('thin membership qualification native boundary', () => {
     await connect()
     await expect.poll(async () => (await client.enrollment.getStatus(request.request.requestId)).state, { timeout: 10_000 }).toBe('ready')
     expect((await client.events.read({ topics: ['qualification'] })).transactions).toHaveLength(8)
-    let deviceCandidates = 0
-    const closeDeviceCandidate = async (signal: AbortSignal) => {
-      const candidates = (await transport.history()).filter(record => record.author === transport.identity &&
-        decodeEnvelope(record.payload).messageType === 'candidate')
-      expect(candidates).toHaveLength(++deviceCandidates)
-      await native.advanceAfterInclusion(candidates.at(-1)!.payload, signal)
-    }
-
     observe('original accepted device operation')
     const beforeOrdinaryOperation = native.traffic()
-    const first = await client.events.publish('qualification', { text: 'before writer removal' }, { operationId: 'device-before-removal' })
-    try {
-      const signal = AbortSignal.timeout(10_000)
-      await closeDeviceCandidate(signal)
-      expect((await first.final({ signal })).outcome.type).toBe('accepted')
-    }
+    const first = await native.includeProposals('connected native device before writer removal', async () => {
+      const value = await client.events.publish('qualification', { text: 'before writer removal' }, { operationId: 'device-before-removal' })
+      return { value, proposalIds: [value.proposalId] }
+    })
+    try { expect((await first.final({ signal: AbortSignal.timeout(10_000) })).outcome.type).toBe('accepted') }
     finally { first.dispose() }
     const afterOrdinaryOperation = native.traffic()
     // The authenticated peer carries both the proposal and its finality. No
@@ -222,15 +217,22 @@ describe('thin membership qualification native boundary', () => {
     expect(afterOrdinaryOperation.peerInboundBytes).toBeGreaterThan(beforeOrdinaryOperation.peerInboundBytes)
     expect(afterOrdinaryOperation.peerOutboundBytes).toBeGreaterThan(beforeOrdinaryOperation.peerOutboundBytes)
     await session!.close(); session = undefined
+    await expect.poll(() => native.diagnostics().peerTerminations.count, { timeout: 10_000 }).toBeGreaterThan(0)
+    expect(native.diagnostics().failure).toBeNull()
+    await native.snapshot()
     const writer = activeDevice.find(capability => capability.grant.role === 'writer')!
     observe('writer revocation')
     await administrator.revoke({ operationId: 'remove-writer', capabilityIds: [writer.id] })
-    const rejected = await client.events.publish('qualification', { text: 'after writer removal' }, { operationId: 'device-after-removal' })
-    observe('RTC reconnect and rejected writer operation')
-    await connect()
+    const rejected = await native.includeProposals('disconnected native device after writer removal', async () => {
+      const value = await client.events.publish('qualification', { text: 'after writer removal' }, { operationId: 'device-after-removal' })
+      try {
+        observe('RTC reconnect and rejected writer operation')
+        await connect()
+        return { value, proposalIds: [value.proposalId] }
+      } catch (error) { value.dispose(); throw error }
+    })
     try {
       const signal = AbortSignal.timeout(10_000)
-      await closeDeviceCandidate(signal)
       expect((await rejected.final({ signal })).outcome.type).toBe('rejected')
     }
     finally { rejected.dispose() }
@@ -249,7 +251,8 @@ describe('thin membership qualification native boundary', () => {
     observe('future epoch workload')
     await native.publishWorkload({ namespace: 'future-epoch', count: 1, payloadBytes: 4096 })
     observe('future epoch healthy snapshot')
-    expect((await native.snapshot()).availableEpochs).toContain(String(revoked.epoch))
+    const beforeDenial = await native.snapshot()
+    expect(beforeDenial.availableEpochs).toContain(String(revoked.epoch))
     expect(native.traffic().candidateDescriptorBytes).toBe(0)
     expect(native.traffic().inlineControlDescriptorBytes).toBeGreaterThan(0)
     expect(native.traffic().closureRecordBytes).toBeGreaterThan(0)
@@ -260,8 +263,8 @@ describe('thin membership qualification native boundary', () => {
     expect(native.traffic().peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
     native.assertHealthy()
 
-    // A denied peer leaves its originating error observable without stopping
-    // the authority, future application work or the membership service.
+    // Denial ends that peer only. Keep its reason observable without poisoning
+    // the shared membership endpoint, finality service or other native work.
     observe('diagnostic revoked-reader RTC introduction')
     const bootstrap = native.bootstrap()
     const connection = await openWebRtcConnection({ role: 'offerer',
@@ -277,19 +280,24 @@ describe('thin membership qualification native boundary', () => {
         observe('diagnostic revoked-reader authenticated connection termination')
         await peer.completion
       }).catch((error: unknown) => error)
-    observe('retained failure diagnostics')
+    observe('isolated peer termination diagnostics')
     expect(denied).toBeInstanceOf(Error)
-    await expect.poll(() => native.diagnostics().peers.lastFailure).toMatchObject({ message: 'PEER_READ_UNAUTHORIZED' })
+    await expect.poll(() => native.diagnostics().peerTerminations.recent.some(value => value.message === 'PEER_READ_UNAUTHORIZED'))
+      .toBe(true)
     native.assertHealthy()
-    expect(native.diagnostics().failure).toBeNull()
-    await native.publishWorkload({ namespace: 'after-denied-peer', count: 1, payloadBytes: 128 })
-    expect((await native.snapshot()).availableEpochs).toContain(String(revoked.epoch))
+    await administrator.sync()
+    await native.publishWorkload({ namespace: 'after-denied-reader', count: 1, payloadBytes: 16 })
+    await administrator.sync()
+    const afterDenial = await native.snapshot()
+    expect(afterDenial.finalThrough).toBeGreaterThan(beforeDenial.finalThrough)
+    expect(afterDenial.availableEpochs).toContain(String(revoked.epoch))
     const diagnostic = native.diagnostics()
+    expect(diagnostic.failure).toBeNull()
     expect(diagnostic.finalThrough).toBeGreaterThan(0)
     expect(diagnostic.availableEpochs).toContain(String(revoked.epoch))
     expect(diagnostic.traffic.rtcSignalingDescriptions).toBe(6)
     expect(diagnostic.traffic.peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
-    expect(diagnostic.peers).toEqual(native.diagnostics().peers)
+    expect(diagnostic.peerTerminations.recent.length).toBeLessThanOrEqual(32)
     observe('complete')
   }, 180_000)
 })

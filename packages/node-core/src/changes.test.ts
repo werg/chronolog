@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { ControlStore, MemoryControlStorePersistence } from '@chronolog/control-store'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
 import { emit, generateEd25519KeyPair, program, sqlStatement } from '@chronolog/protocol'
-import type { ChangeProgram, ViewChange } from '@chronolog/protocol'
+import type { ChangeProgram, ApplicationChange } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -59,7 +59,7 @@ async function fixture(profile: 'events' | 'sql' = 'events') {
   }
 }
 
-async function viewState(node: ChronologNode, view: 'local' | 'final'): Promise<ViewChange> {
+async function viewState(node: ChronologNode, view: 'local' | 'final'): Promise<ApplicationChange> {
   const captured = await node.readView({ view })
   try {
     expect(captured.readEvents().revision).toBe(captured.revision)

@@ -1,7 +1,7 @@
 import { createCapabilitySignals, isCapabilityActive, type CapabilitySnapshot } from '@chronolog/capabilities'
 import { bytesToHex, equalBytes, type Ed25519KeyPair } from '@chronolog/protocol'
 import type { FeedLink } from '@chronolog/records'
-import type { SignalRoute, Signals } from '@chronolog/signals'
+import { SignalError, type SignalRoute, type Signals } from '@chronolog/signals'
 
 import type { FramedPeerConnection } from './framing.js'
 import { openAuthenticatedPeerLink, type PeerAuthorization } from './peer-link.js'
@@ -17,7 +17,12 @@ export interface GovernedPeerService {
   connectPeer(options: GovernedPeerConnectionOptions): Promise<GovernedPeerSession>
   close(): Promise<void>
 }
-export interface GovernedPeerConnectionOptions { readonly connection: FramedPeerConnection; readonly peerIdentity?: Uint8Array }
+export interface GovernedPeerConnectionOptions {
+  readonly connection: FramedPeerConnection
+  readonly peerIdentity?: Uint8Array
+  /** Owns both authentication and the connected session. */
+  readonly signal?: AbortSignal
+}
 
 /**
  * One replica's live routes. Membership authorizes the current connection and
@@ -32,12 +37,12 @@ export async function createGovernedPeerService(options: {
 }): Promise<GovernedPeerService> {
   if (!(options.groupId instanceof Uint8Array) || options.groupId.length !== 32) throw new Error('PEER_GROUP_INVALID')
   const groupId = options.groupId.slice(), identity = { ...options.identity, publicKeyBytes: options.identity.publicKeyBytes.slice() }
-  const lifetime = new AbortController(), openings = new Map<FramedPeerConnection, number>()
+  const lifetime = new AbortController(), openings = new Map<FramedPeerConnection, { readonly attempt: number; close(): Promise<void> }>()
   const sessions = new Map<string, GovernedPeerSession>()
   const accepted = new Map<string, number>()
   let nextOpening = 0
   const pruneAttempts = (): void => {
-    const oldest = Math.min(...openings.values())
+    const oldest = Math.min(...[...openings.values()].map(opening => opening.attempt))
     for (const [feed, attempt] of accepted) if (!sessions.has(feed) && attempt < oldest) accepted.delete(feed)
   }
   const current = (): CapabilitySnapshot => {
@@ -57,8 +62,14 @@ export async function createGovernedPeerService(options: {
       const peerIdentity = input.peerIdentity?.slice()
       if (peerIdentity !== undefined && peerIdentity.length !== 32) { await input.connection.close(); throw new Error('PEER_IDENTITY_INVALID') }
       const { connection } = input
+      const attemptSignal = input.signal === undefined ? lifetime.signal : AbortSignal.any([lifetime.signal, input.signal])
+      let connectionClosing: Promise<void> | undefined
+      const closeConnection = (): Promise<void> => connectionClosing ??= Promise.resolve().then(() => connection.close())
+      const abort = (): void => { void closeConnection().catch(() => undefined) }
+      attemptSignal.addEventListener('abort', abort, { once: true })
+      if (attemptSignal.aborted) { attemptSignal.removeEventListener('abort', abort); await closeConnection(); attemptSignal.throwIfAborted() }
       const attempt = ++nextOpening
-      openings.set(connection, attempt)
+      openings.set(connection, { attempt, close: closeConnection })
       let resolveRoute!: (route: SignalRoute | undefined) => void, rejectRoute!: (error: unknown) => void
       const routeReady = new Promise<SignalRoute | undefined>((resolve, reject) => { resolveRoute = resolve; rejectRoute = reject })
       void routeReady.catch(() => undefined)
@@ -80,17 +91,22 @@ export async function createGovernedPeerService(options: {
           receiveSignal: async frame => { await (await routeReady)?.receive(frame) },
         })
         if (lifetime.signal.aborted) throw new Error('PEER_SERVICE_CLOSED')
+        attemptSignal.throwIfAborted()
         if ((accepted.get(raw.peer.feedId) ?? 0) > attempt) throw new Error('PEER_CONNECTION_SUPERSEDED')
         if (!accepted.has(raw.peer.feedId) && accepted.size >= 1024) throw new Error('PEER_SESSION_QUOTA_EXCEEDED')
         const authenticated = raw, controller = new AbortController()
         let closed = false
         const dispose = (): void => {
           if (closed) return
-          closed = true; controller.abort(); route?.close(); detach?.()
-          if (sessions.get(authenticated.peer.feedId) === session) sessions.delete(authenticated.peer.feedId)
-          pruneAttempts()
+          closed = true; controller.abort(); attemptSignal.removeEventListener('abort', abort)
+          try { route?.close() } finally {
+            try { detach?.() } finally {
+              if (sessions.get(authenticated.peer.feedId) === session) sessions.delete(authenticated.peer.feedId)
+              pruneAttempts()
+            }
+          }
         }
-        const close = async (): Promise<void> => { dispose(); await authenticated.close() }
+        const close = async (): Promise<void> => { try { dispose() } finally { await authenticated.close() } }
         if (connection.live !== undefined) route = signals.attachRoute({ close, async send(frame, { signal }) {
           signal.throwIfAborted()
           try {
@@ -98,7 +114,7 @@ export async function createGovernedPeerService(options: {
             if (localReader === undefined || !isCapabilityActive(localReader, active.revision)) throw new Error('PEER_LOCAL_READER_GRANT_REQUIRED')
             return await authenticated.sendSignal(frame, { signal })
           } catch (error) {
-            if (!signal.aborted) void close().catch(() => undefined)
+            if (!signal.aborted && !(error instanceof SignalError && error.code === 'signal_route_backpressure')) void close().catch(() => undefined)
             throw error
           }
         } })
@@ -113,15 +129,18 @@ export async function createGovernedPeerService(options: {
         resolveRoute(route)
         return session
       } catch (error) {
-        rejectRoute(error); route?.close(); detach?.()
-        try { if (raw === undefined) await connection.close(); else await raw.close() } catch { /* Preserve the opening failure. */ }
+        rejectRoute(error); attemptSignal.removeEventListener('abort', abort)
+        try { route?.close(); detach?.() } catch { /* Preserve the opening failure. */ }
+        try { if (raw === undefined) await closeConnection(); else await raw.close() } catch { /* Preserve the opening failure. */ }
+        if (lifetime.signal.aborted) throw new Error('PEER_SERVICE_CLOSED', { cause: error })
+        input.signal?.throwIfAborted()
         throw error
       } finally { openings.delete(connection); pruneAttempts() }
     },
     async close() {
       if (lifetime.signal.aborted) return
       lifetime.abort(); signals.close()
-      await Promise.allSettled([...openings.keys()].map(connection => connection.close()).concat([...sessions.values()].map(session => session.close())))
+      await Promise.allSettled([...openings.values()].map(opening => opening.close()).concat([...sessions.values()].map(session => session.close())))
       sessions.clear(); openings.clear(); accepted.clear()
     },
   }

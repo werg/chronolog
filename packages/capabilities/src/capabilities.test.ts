@@ -98,7 +98,7 @@ describe('capability chain', () => {
 })
 
 describe('validation policy', () => {
-  it('selects the smallest distinct capability ids, independent of evidence order', () => {
+  it('selects the smallest capability ids for distinct validators, independent of evidence order', () => {
     const evidence: ValidatorEvidence[] = [
       { capabilityId: bytes(4), validatorId: bytes(14) },
       { capabilityId: bytes(3), validatorId: bytes(13) },
@@ -112,11 +112,22 @@ describe('validation policy', () => {
     expect(evaluateValidationPolicy(policy, [...evidence].reverse()).selected).toEqual(result.selected)
   })
 
-  it('counts distinct capabilities against the threshold', () => {
+  it('counts a repeated capability only once against the threshold', () => {
     const duplicate = { capabilityId: bytes(1), validatorId: bytes(11) }
     const result = evaluateValidationPolicy(policy, [duplicate, duplicate, duplicate])
     expect(result.satisfied).toBe(false)
     expect(result.missing).toEqual(['validators:2'])
+  })
+
+  it('does not multiply one signing key into several votes through different grants', () => {
+    const repeatedSigner = [1, 2, 3].map(value => ({ capabilityId: bytes(value), validatorId: bytes(11) }))
+    expect(evaluateValidationPolicy(policy, repeatedSigner)).toMatchObject({ satisfied: false, missing: ['validators:2'] })
+    const evidence = [...repeatedSigner, { capabilityId: bytes(4), validatorId: bytes(12) },
+      { capabilityId: bytes(5), validatorId: bytes(13) }]
+    const selected = evaluateValidationPolicy(policy, evidence)
+    expect(selected.satisfied).toBe(true)
+    expect(selected.selected.map(item => item.capabilityId[0])).toEqual([1, 4, 5])
+    expect(evaluateValidationPolicy(policy, [...evidence].reverse())).toEqual(selected)
   })
 })
 

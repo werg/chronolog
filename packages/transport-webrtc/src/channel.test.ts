@@ -183,7 +183,7 @@ describe('independent live WebRTC lane', () => {
       const controller = new AbortController(); controller.abort(new Error('preview expired'))
       await expect(a.send(new Uint8Array([2]), { signal: controller.signal })).rejects.toThrow('preview expired')
       source.left.bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
-      await expect(a.send(new Uint8Array([3]))).resolves.toEqual({ refused: 'backpressure' })
+      await expect(a.send(new Uint8Array([3]))).rejects.toThrow('PEER_FRAME_BACKPRESSURE')
       source.left.bufferedAmount = 0
       await a.send(new Uint8Array([4]))
       expect(source.left.sent).toEqual([new Uint8Array([4])])

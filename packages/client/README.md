@@ -5,6 +5,18 @@ operations and reader/writer enrollment over the shared
 [replica RPC contract](../rpc/README.md). The same client talks to an embedded
 node, a native daemon, or a browser Worker running a local replica.
 
+## Choose the primitive
+
+| Need | API | Recovery behavior |
+| --- | --- | --- |
+| Typing, presence, previews, device samples | `client.signals.send()` / `.subscribe()` | Live only; no retry, replay, or finality wait. |
+| Atomic SQL changes and durable emits | `client.submit(program, { operationId })` | Retain one signed program and inspect its provisional or final outcome. |
+| Recoverable facts and agent intent | `client.events.publish()` / `.subscribe()` | Final accepted whole-transaction batches; checkpoint processed cursors. |
+| Refresh a local or final screen | `client.changes({ view, signal })` + `client.readView({ view })` | Coalesced invalidations followed by a coherent captured view. |
+
+The [application primitives guide](../../docs/application-primitives.md) explains
+their shared finality, replay and authority contract.
+
 ## Connect to a replica
 
 For a native daemon:
@@ -60,6 +72,20 @@ topic rights, and routes it through authenticated reader connections. Public
 `scope`, `authorId` and `sessionId` values are strings. Signed expiry remains
 unchanged across relay hops. Expired updates are discarded.
 
+The client captures the expiry when `send()` is invoked. Time spent reaching
+its RPC owner consumes that same lifetime; the owner rejects expired requests
+and passes only the remaining TTL to its signal channel. The local wait also
+has an elapsed-time deadline, so moving the wall clock backward cannot renew
+it. RPC defaults to five seconds; if a channel is configured with a smaller
+maximum, pass a compatible explicit `ttlMs` or the send fails closed.
+
+Absolute expiry across different processes assumes synchronized wall clocks.
+The service caps remaining time by the original requested duration even when
+its clock is behind, and does not revive expiry it has already observed. This
+is an expiry rule, not a delivery guarantee. Timeout or cancellation stops the
+caller's wait and requests transport cancellation; it cannot retract bytes
+already handed to a live route.
+
 `subscribe()` defaults to `mode: 'all'`, preserving accepted unexpired messages
 in a bounded FIFO; overflow fails that subscription explicitly. `latest`
 coalesces queued updates by author, session and topic, retaining the newest
@@ -71,9 +97,11 @@ Each send makes one attempt, even when the client's durable unary retries are
 enabled. A lost reply does not resend a typing or presence update. Without an
 attached live route, sending fails immediately rather than saving an outbox.
 Subscriptions have no replay cursor and surface RPC stream failures; a new
-subscription observes new live traffic. A retained local subscription can
-observe future traffic after peer routes reconnect. The Worker pulls only when
-the page advances its iterator and forwards cancellation. Closing the client
+subscription observes new live traffic. A subscription whose local RPC owner
+remains connected can observe future traffic after individual peer routes
+reconnect. Caller abort ends the iteration normally; losing the owning RPC
+transport remains a visible failure. The Worker pulls only when the page
+advances its iterator and forwards cancellation. Closing the client
 cancels its live sends and streams. Durable application events use
 `client.events` and stable operation identities.
 
@@ -82,8 +110,7 @@ For standalone use without any Chronolog database, use
 
 ## Consume authenticated durable events
 
-Use `client.events.subscribe()` for durable
-processing: it delivers whole final event batches and advances received progress
+Use `client.events.subscribe()` for durable processing: it delivers whole final event batches and advances received progress
 only on the next pull. Persist the processed cursor together with derived state.
 
 Each effective event includes authenticated `origin`, derived from its signed
@@ -114,7 +141,7 @@ const transaction = await client.transaction([
     sql: 'UPDATE accounts SET balance = balance - ? WHERE id = ?',
     params: [amount, accountId],
   },
-], { idempotencyKey: durableApplicationOperationId })
+], { operationId: durableApplicationOperationId })
 
 const result = await transaction.final({ signal: AbortSignal.timeout(30_000) })
 if (result.outcome.type === 'rejected') {
@@ -127,17 +154,18 @@ if (result.outcome.type === 'rejected') {
 transaction.dispose()
 ```
 
-A transaction is one atomic program of SQL statements and/or platform
-operations. A failed statement rejects and rolls back the whole program.
+A transaction is one atomic program of SQL statements, platform operations
+and literal durable-event emits. A failed step rejects and rolls back the whole
+program.
 Bindings preserve SQLite storage classes; use `bigint` for exact integers,
 `Uint8Array` for BLOBs and `sqlValue.real(...)` when an integral JavaScript number
 must remain REAL. Put assumptions in SQL with `chronolog_assert`.
 
 | API | What it waits for |
 | --- | --- |
-| `client.transaction(...)` | Durable local publication of the signed proposal. |
-| `handle.settled()` | The current accepted/rejected SQL result, which can still change through replay. |
-| `handle.accepted()` | Immutable acceptance applied locally; throws `TransactionRejectedError` only for a final rejection. |
+| `client.submit(...)` / `client.transaction(...)` | Durable local publication of the signed proposal. |
+| `handle.provisional()` | The current accepted/rejected program result, which can still change through replay. |
+| `handle.accepted()` | Final acceptance; throws `TransactionRejectedError` for a final rejection. |
 | `handle.final()` | The immutable accepted/rejected result after its policy-final prefix is applied locally. |
 
 `final()` returns final rejections as well as final acceptances. Always inspect
@@ -146,17 +174,25 @@ cancelled even while the stream is quiet; cancellation stops that waiter, not
 the transaction. A final result may wait indefinitely while required validators,
 certificates, records or keys are unavailable.
 
-Use `await handle.accepted({ signal })` when the next step requires immutable
-success and rejection should throw. Its return type guarantees `final: true`
-and `outcome.type: 'accepted'`. `settled()` is the explicit provisional
-inspection API; both its acceptance and rejection can change during replay.
+For the common dependent-write case, `await handle.accepted({ signal })` is the
+short form: its return type guarantees `final: true` and
+`outcome.type: 'accepted'`. `provisional()` narrows the current result to
+accepted or rejected, but either can change through replay. The node authors a new
+operation after the applied observations and verified closed author-time
+frontier. Applications do not calculate timestamps. Retries retain the original
+signed proposal, including its original timestamp.
 
-The `idempotencyKey` is the application's durable operation identity. Persist
+The `operationId` is the application's durable operation identity. Persist
 and reuse it with the same program after a lost response or client/process
 restart. A retry returns the original proposal, even if its author was later
 revoked. A changed program under the same identity fails with `already_exists`.
-Without a supplied key, each `transaction()` call generates a fresh request ID;
-automatic retries of that call reuse it, while a new call is a new operation.
+Without a supplied operation ID, each `transaction()` call generates one and
+returns it on the handle. Automatic retries of that call reuse it, while a new
+call is a new operation. Unary request retries are bounded (two retries by
+default); the client has no offline intent queue. If a response is still lost,
+explicitly resubmit the same program and retained operation ID. The owning node
+recovers its original prepared bytes, even after reopening. An RPC reconnect
+cannot recover intent that never reached that durable owner.
 
 ## Read local or final SQL explicitly
 
@@ -172,12 +208,12 @@ console.log(final.revision.view)             // 'final'
 console.log(final.revision.finalOrderLength) // decimal string
 ```
 
-The default `local` reader includes the applied final prefix and a selected
-provisional suffix. A locally authorized proposal can appear before consensus
-admission and disappear if excluded. Admission makes its inclusion immutable,
-but its provisional application outcome can still change through replay.
-The `final` reader is a separate SQL snapshot of the locally applied immutable
-prefix.
+The default `local` reader includes the applied final prefix and an admitted
+provisional suffix. The standard node waits for admission before materializing
+a proposal; submission alone does not make it visible here. Admission makes its
+inclusion immutable, but its provisional application outcome can still change
+through replay. The `final` reader is a separate SQL snapshot of the locally
+applied immutable prefix.
 Both carry view, selected revision, order length, final-prefix metadata and
 execution-manifest identity. A final replica can still be behind other peers.
 
@@ -286,7 +322,7 @@ administration belongs to the genesis root key, independently of these grants.
 
 `client.ownership` handles row grants, teams and ownership transfers. Those are
 application transactions, separate from group enrollment. Their handles offer
-the same `settled()`, `accepted()` and `final()` distinction.
+the same `provisional()`, `accepted()` and `final()` distinction.
 
 Close the client with `await client.close()` to dispose its live resources and
 close its transport. See [client.ts](src/client.ts) for the complete typed API.

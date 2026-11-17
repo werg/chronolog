@@ -7,6 +7,7 @@ import { MemoryTransportNetwork, type ChronologTransport } from '@chronolog/tran
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { encodeSignedGovernanceClosure, signGovernanceClosure } from './peer-governance-proof.js'
+import { CapabilityMembershipResolver } from './capability-membership.js'
 import { GovernanceControlPlane } from './governance.js'
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { PeerGovernanceController } from './peer-governance.js'
@@ -30,7 +31,16 @@ describe('live peer governance activation controller', () => {
     await first.refresh()
     expect(first.activeSnapshot.revision).toBe(1n)
     expect(first.minimumAuthorTimestampMs).toBe(1_001n)
-    expect(first.closedAdmissionRevisions().some(item => equalBytes(item.membershipRevision, f.initial.revisionDigest))).toBe(true)
+    const activated = first.closedAdmissionRevisions().find(item => equalBytes(item.membershipRevision, f.initial.revisionDigest))!
+    expect(activated.nextMembershipRevision).toEqual(first.activeSnapshot.revisionDigest)
+    expect(activated.closedThroughMs).toBe(1_000n)
+    const writer = [...first.activeSnapshot.capabilities.values()].find(item => equalBytes(item.grant.signingPublicKey, bytes(60)))!
+    const resolver = new CapabilityMembershipResolver({ snapshotForRevision: digest => f.governance[0]!.snapshotForRevision(digest),
+      authorizationSnapshot: context => first.snapshotFor(context) })
+    const context = { groupId: f.initial.groupId, membershipRevision: first.activeSnapshot.revisionDigest,
+      validationPolicy: [...first.activeSnapshot.policies.values()][0]!.id, writerId: bytes(60), writerCapability: writer.id }
+    expect(await resolver.canWrite({ ...context, authorTimestampMs: 1_000n })).toBe(false)
+    expect(await resolver.canWrite({ ...context, authorTimestampMs: 1_001n })).toBe(true)
     const closure = (await f.transports[0]!.history()).filter((record) => record.author === f.transports[0]!.identity).at(-1)!
     expect(await first.allowsAttestation(f.initial.revisionDigest, f.identities[0].publicKeyBytes, closure.sequence + 1n)).toBe(false)
     expect(await first.allowsAttestation(first.activeSnapshot.revisionDigest, f.identities[0].publicKeyBytes, closure.sequence + 1n)).toBe(true)

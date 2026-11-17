@@ -13,18 +13,20 @@ describe('group signal authorization adapter', () => {
     let snapshot: CapabilitySnapshot = { groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
       capabilityLogFeed: new Uint8Array(32), capabilities: new Map([[bytesToHex(grantId), grant]]), policies: new Map(), validatorFloorMs: 0n }
     const outgoing: Uint8Array[] = []
-    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, send: async frame => { outgoing.push(frame) } })
-    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, send: async () => {} })
+    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot })
+    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot })
+    sender.attachRoute({ send: async frame => { outgoing.push(frame) } })
+    const receiveRoute = receiver.attachRoute({ send: async () => {} })
     const iterator = receiver.subscribe({ topics: ['presence'] })[Symbol.asyncIterator](), pending = iterator.next()
     const sent = await sender.send('presence', { online: true })
-    await receiver.receive(outgoing[0]!)
+    await receiveRoute.receive(outgoing[0]!)
     expect((await pending).value).toEqual(sent)
-    await expect(receiver.send('presence', { online: true })).rejects.toThrow('SIGNAL_UNAUTHORIZED')
-    await expect(sender.send('admin', true)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    await expect(receiver.send('presence', { online: true })).rejects.toThrow('signal_unauthorized')
+    await expect(sender.send('admin', true)).rejects.toThrow('signal_unauthorized')
     await sender.send('presence', { online: false })
     snapshot = { ...snapshot, revision: 1n, capabilities: new Map([[bytesToHex(grantId), { ...grant, revokedAtRevision: 1n }]]) }
-    await expect(receiver.receive(outgoing[1]!)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
-    await expect(sender.send('presence', null)).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    await expect(receiveRoute.receive(outgoing[1]!)).rejects.toThrow('signal_unauthorized')
+    await expect(sender.send('presence', null)).rejects.toThrow('signal_unauthorized')
     await iterator.return?.(); sender.close(); receiver.close()
   })
 })

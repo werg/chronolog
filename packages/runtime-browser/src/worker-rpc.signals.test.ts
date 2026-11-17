@@ -3,7 +3,7 @@ import { MessageChannel } from 'node:worker_threads'
 import { ChronologClient } from '@chronolog/client'
 import { bytesToBase64Url, bytesToHex, generateEd25519KeyPair } from '@chronolog/protocol'
 import { InProcessRpcTransport, NodeRpcService, type ChronologRpcNodeService } from '@chronolog/rpc/browser'
-import { SignalChannel, type Signals } from '@chronolog/signals'
+import { SignalChannel, type SignalRoute, type Signals } from '@chronolog/signals'
 import { expect, it, vi } from 'vitest'
 
 import { serveWorkerRpc, WorkerRpcTransport, type WorkerEndpoint } from './worker-rpc.js'
@@ -13,8 +13,8 @@ it('uses the ordinary Worker bridge for signed live delivery, latest backpressur
   const identity = await generateEd25519KeyPair(), remoteIdentity = await generateEd25519KeyPair()
   const local = new SignalChannel({ scope: group, identity, authorize: () => true })
   const remote = new SignalChannel({ scope: group, identity: remoteIdentity, authorize: () => true })
-  local.attachRoute({ send: async frame => { await remote.receive(frame) } })
-  remote.attachRoute({ send: async frame => { await local.receive(frame) } })
+  const localRoute: SignalRoute = local.attachRoute({ send: async frame => { await remoteRoute.receive(frame) } })
+  const remoteRoute: SignalRoute = remote.attachRoute({ send: async frame => { await localRoute.receive(frame) } })
   let pulls = 0, stopped = 0
   const signals: Signals = { send: (topic, payload, options) => local.send(topic, payload, options),
     subscribe: options => ({ async *[Symbol.asyncIterator]() {
@@ -68,10 +68,9 @@ it('uses the ordinary Worker bridge for signed live delivery, latest backpressur
     expect(publish).not.toHaveBeenCalled()
 
     const waiting = incoming.next()
-    const cancelled = expect(waiting).rejects.toMatchObject({ code: 'cancelled' })
     await expect.poll(() => pulls).toBe(3)
     abort.abort()
-    await cancelled
+    expect((await waiting).done).toBe(true)
     await expect.poll(() => stopped).toBe(1)
     await client.close()
     expect(closePeer).toHaveBeenCalledTimes(1)

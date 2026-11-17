@@ -8,7 +8,7 @@ import { ChronologClient, DurableProjection, ProjectionConflictError, type Proje
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
-import { bytesToBase64Url, bytesToHex, emit, equalBytes, generateEd25519KeyPair, program, sqlStatement, type ViewChange } from '@chronolog/protocol'
+import { bytesToBase64Url, bytesToHex, emit, equalBytes, generateEd25519KeyPair, program, sqlStatement, type ApplicationChange } from '@chronolog/protocol'
 import { feedIdFromPublicKey, PortableFeedTransport } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { FeedStore, nativeFeedCrypto } from '@chronolog/transport-ssb'
@@ -102,7 +102,7 @@ describe('public application backend with native durable execution', () => {
 
     const acceptedProgram = program(
       sqlStatement("UPDATE tasks SET value = 10 WHERE id = 'one'"),
-      emit('tasks', { type: 'task.updated', taskId: 'one', value: 10 }),
+      emit('tasks', { type: 'task.updated', taskId: 'one', value: 10, authorId: 'untrusted-payload-author' }),
       emit('conversation', { type: 'message.posted', messageId: 'm1', text: 'Updated' }),
     )
     const rejectedProgram = program(
@@ -121,7 +121,8 @@ describe('public application backend with native durable execution', () => {
 
     const core = node.candidateCore(new TextEncoder().encode(accepted.proposalId))!
     const origin = { kind: 'chronolog', groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
-      operationId: core.operationId, membershipRevision: bytesToBase64Url(core.membershipRevision), writerCapability: null,
+      operationId: core.operationId, membershipRevision: bytesToBase64Url(core.membershipRevision),
+      writerCapability: core.writerCapability === undefined ? null : bytesToBase64Url(core.writerCapability),
       authorTimestampMs: core.authorTimestampMs.toString() }
     const view = await backend.readView({ view: 'final' })
     try {
@@ -130,8 +131,8 @@ describe('public application backend with native durable execution', () => {
       expect(rows).toMatchObject({ revision: view.revision, rows: [[10n]] })
       expect(history.revision).toBe(view.revision)
       expect(history.transactions).toEqual([{ proposalId: accepted.proposalId, events: [
-        { id: `${accepted.proposalId}:0`, proposalId: accepted.proposalId, eventOrdinal: 0, topic: 'tasks', payload: { type: 'task.updated', taskId: 'one', value: 10 }, origin },
-        { id: `${accepted.proposalId}:1`, proposalId: accepted.proposalId, eventOrdinal: 1, topic: 'conversation', payload: { type: 'message.posted', messageId: 'm1', text: 'Updated' }, origin },
+        { id: `${accepted.proposalId}:0`, proposalId: accepted.proposalId, eventOrdinal: 0, topic: 'tasks', origin, payload: { type: 'task.updated', taskId: 'one', value: 10, authorId: 'untrusted-payload-author' } },
+        { id: `${accepted.proposalId}:1`, proposalId: accepted.proposalId, eventOrdinal: 1, topic: 'conversation', origin, payload: { type: 'message.posted', messageId: 'm1', text: 'Updated' } },
       ] }])
       expect((await client.events.read()).transactions).toEqual(history.transactions)
       expect((await node.events.read()).transactions).toEqual(history.transactions)
@@ -151,6 +152,7 @@ describe('public application backend with native durable execution', () => {
     expect(retryRejected.proposalId).toBe(rejected.proposalId)
     expect(await fixture.current.backend.operations.get('accepted')).toMatchObject({ status: 'final', outcome: 'accepted' })
     expect(await fixture.current.backend.operations.get('rejected')).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
+    expect((await fixture.current.backend.events.read()).transactions[0]?.events.map(event => event.origin)).toEqual([origin, origin])
     expect(retryRejected).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
     await expect(fixture.current.backend.submit(program(emit('tasks', { changed: true })), { operationId: 'accepted' })).rejects.toMatchObject({ code: 'already_exists' })
     await expect(fixture.current.backend.submit(acceptedProgram, { operationId: 'new-after-revocation' })).rejects.toMatchObject({ code: 'failed_precondition' })
@@ -181,7 +183,7 @@ describe('public application backend with native durable execution', () => {
     const statuses = backend.operations.subscribe({ operationId: 'later', signal: AbortSignal.timeout(10_000) })[Symbol.asyncIterator]()
     try {
       expect((await statuses.next()).value).toMatchObject({ status: 'provisional', outcome: 'accepted' })
-      expect((await later.settled()).outcome).toEqual({ type: 'accepted' })
+      expect((await later.provisional()).outcome).toEqual({ type: 'accepted' })
       expect(acceptanceFinished).toBe(false)
       const afterRebase = statuses.next()
       const predecessor = await node.publish({ operationId: 'earlier-arrival', authorTimestampMs: setupTime + 1n,
@@ -216,6 +218,71 @@ describe('public application backend with native durable execution', () => {
       expect((await oldFinal.readEvents()).transactions).toEqual([])
       expect((await oldFinal.query("SELECT name FROM sqlite_schema WHERE name = 'balances'")).rows).toEqual([])
     } finally { later.dispose(); await statuses.return?.(); await oldLocal.release(); await oldFinal.release() }
+  })
+
+  it('keeps events with their published SQL while a late admission cannot yet materialize', async () => {
+    const fixture = await nativeReplica('sql')
+    const { backend, client, node, materialization } = fixture.current
+    const setup = await backend.submit(program(sqlStatement('CREATE TABLE t (value INTEGER PRIMARY KEY) STRICT')), { operationId: 'setup' })
+    await terminal(client, setup.proposalId)
+    const setupTime = node.candidateCore(new TextEncoder().encode(setup.proposalId))!.authorTimestampMs
+    fixture.clock.now += 20
+    const later = await backend.submit(program(sqlStatement('INSERT INTO t (value) VALUES (20)'), emit('values', 20)), { operationId: 'later' })
+    expect((await terminal(client, later.proposalId)).outcome).toEqual({ type: 'accepted' })
+    const materialize = materialization.coordinator.materialize.bind(materialization.coordinator)
+    let interrupted = true
+    materialization.coordinator.materialize = async ordered => {
+      if (interrupted && ordered.some(item => item.core.operationId === 'late-admission')) throw new Error('injected materialization interruption')
+      return materialize(ordered)
+    }
+    const earlier = await node.publish({ operationId: 'late-admission', authorTimestampMs: setupTime + 1n,
+      program: program(sqlStatement('INSERT INTO t (value) VALUES (10)'), emit('values', 10)) })
+    await waitFor(async () => node.candidate(earlier.txId)?.state === 'admissible')
+    await expect(node.waitForIdle()).rejects.toThrow('injected materialization interruption')
+    const published = await backend.readView({ view: 'local' })
+    try {
+      expect((await published.query('SELECT value FROM t ORDER BY value')).rows).toEqual([[20n]])
+      expect((await published.readEvents()).transactions.map(transaction => transaction.proposalId)).toEqual([later.proposalId])
+      interrupted = false
+      await node.waitForIdle()
+      const repaired = await backend.readView({ view: 'local' })
+      try {
+        expect((await repaired.query('SELECT value FROM t ORDER BY value')).rows).toEqual([[10n], [20n]])
+        expect((await repaired.readEvents()).transactions.map(transaction => transaction.proposalId)).toEqual([earlier.txIdText, later.proposalId])
+      } finally { await repaired.release() }
+      expect((await published.query('SELECT value FROM t ORDER BY value')).rows).toEqual([[20n]])
+      expect((await published.readEvents()).transactions.map(transaction => transaction.proposalId)).toEqual([later.proposalId])
+    } finally { interrupted = false; await published.release() }
+  })
+
+  it('coalesces view invalidations and wakes on finality without creating another event', async () => {
+    const fixture = await nativeReplica('events')
+    const { backend, client } = fixture.current
+    const lifetime = new AbortController()
+    const changes = backend.changes({ view: 'local', signal: lifetime.signal })[Symbol.asyncIterator]()
+    try {
+      const initial = (await changes.next()).value!
+      for (const value of [1, 2]) {
+        const submitted = await backend.events.publish('values', value, { operationId: `value-${value}` })
+        await terminal(client, submitted.proposalId)
+      }
+      // No reads while two revisions advance: only the latest invalidation is needed.
+      const updated = (await changes.next()).value!
+      const local = await backend.readView({ view: 'local' })
+      try {
+        expect(updated.revision).toBe(local.revision)
+        expect(updated.revision).not.toBe(initial.revision)
+        expect(updated.finalRevision).toBe(initial.finalRevision)
+        expect((await local.readEvents()).transactions).toHaveLength(2)
+      } finally { await local.release() }
+      const finalityOnly = changes.next()
+      await fixture.finalize()
+      expect((await finalityOnly).value!.finalRevision).not.toBe(updated.finalRevision)
+      expect((await backend.events.read()).transactions).toHaveLength(2)
+      const stopped = changes.next()
+      lifetime.abort()
+      expect((await stopped).done).toBe(true)
+    } finally { lifetime.abort(); await changes.return?.() }
   })
 
   it('resumes complete event-only transactions after replica restart, including empty filtered progress', async () => {
@@ -328,7 +395,7 @@ describe('public application backend with native durable execution', () => {
   })
 })
 
-async function nextChange(iterator: AsyncIterator<ViewChange>, matches: (value: ViewChange) => boolean): Promise<ViewChange> {
+async function nextChange(iterator: AsyncIterator<ApplicationChange>, matches: (value: ApplicationChange) => boolean): Promise<ApplicationChange> {
   for (;;) {
     const next = await iterator.next()
     if (next.done) throw new Error('View changes ended before the expected applied view')
@@ -376,7 +443,7 @@ async function nativeReplica(profile: 'sql' | 'events') {
     const client = new ChronologClient({ groupId: bytesToBase64Url(groupId), transport: new InProcessRpcTransport(new NodeRpcService({ node })) })
     const backend = createChronologApplicationBackend({ id: 'application-pilot', replica: client, sql: profile === 'sql' })
     let closed = false
-    return { client, backend, node, feed, async close() {
+    return { client, backend, node, feed, materialization, async close() {
       if (closed) return
       closed = true
       await client.close(); await node.close(); control.close(); store.close()

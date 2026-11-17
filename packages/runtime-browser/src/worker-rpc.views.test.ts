@@ -1,7 +1,7 @@
 import { MessageChannel } from 'node:worker_threads'
 
 import { ChronologClient } from '@chronolog/client'
-import { bytesToBase64Url, type ViewChangeOptions } from '@chronolog/protocol'
+import { bytesToBase64Url, type ApplicationChangeOptions } from '@chronolog/protocol'
 import { InProcessRpcTransport, NodeRpcService, type ChronologRpcNodeService } from '@chronolog/rpc/browser'
 import { expect, it, vi } from 'vitest'
 
@@ -12,7 +12,7 @@ it('carries application invalidations through the Worker and releases an idle su
   const readView = vi.fn()
   let lifetime: AbortSignal | undefined, stopped!: () => void
   const sourceStopped = new Promise<void>(resolve => { stopped = resolve })
-  const node = { groupId, readView, changes: (options: ViewChangeOptions = {}) => ({ async *[Symbol.asyncIterator]() {
+  const node = { groupId, readView, changes: (options: ApplicationChangeOptions = {}) => ({ async *[Symbol.asyncIterator]() {
     lifetime = options.signal!
     try {
       yield { view: options.view ?? 'final', revision: 'current-local', finalRevision: 'current-final' }

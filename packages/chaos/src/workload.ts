@@ -89,7 +89,7 @@ export async function runWorkload(options: {
           },
         })
         const handle = await client.transaction(statements, {
-          idempotencyKey: `${options.random.seed}:${operationId}`,
+          operationId: `${options.random.seed}:${operationId}`,
           signal: AbortSignal.timeout(15_000),
         })
         published += 1

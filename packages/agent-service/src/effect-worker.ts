@@ -6,8 +6,9 @@ import type { CborValue, EventPayload } from '@chronolog/protocol'
 
 import { CheckpointStore } from './checkpoint.js'
 import { decodeEventOrigin, encodeEventOrigin } from './event-origin.js'
-import { batchEvents, canonicalTopics, cloneFinalEvent, validateConsumerId } from './event-source.js'
-import type { FinalEvent, FinalEventBatch, FinalEventPublisher, FinalEventSource } from './event-source.js'
+import { batchEvents, canonicalTopics, cloneFinalEvent, FinalEventPublicationRejectedError, validateConsumerId } from './event-source.js'
+import type { FinalEvent, FinalEventBatch, FinalEventPublisher, FinalEventPublicationRejection, FinalEventSource } from './event-source.js'
+import { decodePublicationRejections, encodePublicationRejections, MAX_PUBLICATION_ATTEMPTS, publicationOperationId as operationIdForPublication } from './publication.js'
 
 export interface EffectContext {
   readonly effectId: string
@@ -48,8 +49,10 @@ export interface EffectWorkerOptions {
 
 interface ActiveEffect {
   readonly effectId: string
-  readonly stage: 'prepared' | 'dispatching' | 'result'
+  readonly stage: 'prepared' | 'dispatching' | 'result' | 'publication-rejected'
   readonly result: EventPayload | null
+  readonly publicationAttempt: number
+  readonly publicationRejections: readonly FinalEventPublicationRejection[]
 }
 interface PendingBatch {
   readonly events: readonly FinalEvent[]
@@ -97,7 +100,7 @@ export class DurableEffectWorker {
     this.#options = options
     this.#checkpoint = new CheckpointStore(options.store, {
       id: `effects/${options.handler.id}`,
-      binding: encodeCanonicalCbor([1n, 'effects', options.sourceId, options.handler.id, options.handler.version,
+      binding: encodeCanonicalCbor([4n, 'effects', options.sourceId, options.handler.id, options.handler.version,
         this.#topics, options.resultTopic, options.handler.recovery]),
     })
   }
@@ -113,13 +116,14 @@ export class DurableEffectWorker {
     readonly cursor: string | null
     readonly revision: string | null
     readonly remaining: number
-    readonly effect: ActiveEffect | null
+    readonly effect: (ActiveEffect & { readonly publicationOperationId: string }) | null
   }> {
     return this.#mutex.run(async () => {
       const state = await this.#load()
       return { cursor: state.cursor, revision: state.revision,
         remaining: state.pending === null ? 0 : state.pending.events.length - state.pending.next,
-        effect: structuredClone(state.pending?.active ?? null) }
+        effect: state.pending?.active == null ? null : { ...structuredClone(state.pending.active),
+          publicationOperationId: publicationOperationId(state.pending.active.effectId, state.pending.active.publicationAttempt) } }
     })
   }
 
@@ -166,9 +170,24 @@ export class DurableEffectWorker {
       const state = await this.#load(), pending = state.pending
       if (pending?.active?.effectId !== effectId || pending.active.stage !== 'dispatching') throw new Error('EFFECT_NOT_UNCERTAIN')
       const active: ActiveEffect = result.kind === 'completed'
-        ? { effectId, stage: 'result', result: clonePayload(result.result) }
-        : { effectId, stage: 'prepared', result: null }
+        ? { ...pending.active, stage: 'result', result: clonePayload(result.result) }
+        : { ...pending.active, stage: 'prepared', result: null }
       await this.#save({ ...state, pending: { ...pending, active } })
+    })
+  }
+
+  /** Explicitly reauthor a saved result after proved rejection, without repeating its external effect. */
+  async retryPublication(effectId: string): Promise<{ readonly operationId: string }> {
+    return this.#mutex.run(async () => {
+      const state = await this.#load(), pending = state.pending
+      if (pending?.active?.effectId !== effectId || pending.active.stage !== 'publication-rejected') {
+        throw new Error('EFFECT_PUBLICATION_NOT_REJECTED')
+      }
+      const publicationAttempt = pending.active.publicationAttempt + 1
+      if (publicationAttempt >= MAX_PUBLICATION_ATTEMPTS) throw new Error('EFFECT_PUBLICATION_ATTEMPTS_EXHAUSTED')
+      const active: ActiveEffect = { ...pending.active, stage: 'result', publicationAttempt }
+      await this.#save({ ...state, pending: { ...pending, active } })
+      return { operationId: publicationOperationId(effectId, publicationAttempt) }
     })
   }
 
@@ -196,12 +215,16 @@ export class DurableEffectWorker {
       const effectId = await effectIdentity(this.#options.sourceId, event.id, this.#options.handler.id, this.#options.handler.version)
       let active = pending.active
       if (active === null) {
-        active = { effectId, stage: 'prepared', result: null }
+        active = { effectId, stage: 'prepared', result: null, publicationAttempt: 0, publicationRejections: [] }
         pending = { ...pending, active }
         state = { ...state, pending }
         await this.#save(state)
       }
       if (active.effectId !== effectId) throw new Error('EFFECT_CHECKPOINT_ID_MISMATCH')
+      if (active.stage === 'publication-rejected') {
+        const rejection = active.publicationRejections.at(-1)!
+        throw new FinalEventPublicationRejectedError(rejection.proposalId, rejection.rejectionCode)
+      }
       const context = { effectId, idempotencyKey: effectId, event: cloneFinalEvent(event) }
       if (active.stage === 'dispatching') {
         if (this.#options.handler.recovery === 'manual') throw new EffectUncertainError(effectId)
@@ -211,8 +234,8 @@ export class DurableEffectWorker {
           catch (cause) { throw new EffectUncertainError(effectId, cause) }
           if (reconciliation.kind === 'uncertain') throw new EffectUncertainError(effectId)
           active = reconciliation.kind === 'completed'
-            ? { effectId, stage: 'result', result: clonePayload(reconciliation.result) }
-            : { effectId, stage: 'prepared', result: null }
+            ? { ...active, stage: 'result', result: clonePayload(reconciliation.result) }
+            : { ...active, stage: 'prepared', result: null }
           pending = { ...pending, active }; state = { ...state, pending }
           await this.#save(state)
         }
@@ -220,24 +243,38 @@ export class DurableEffectWorker {
       if (active.stage !== 'result') {
         // A crash from this point may have reached the provider. Retrying needs
         // its idempotency guarantee, reconciliation, or explicit resolution.
-        active = { effectId, stage: 'dispatching', result: null }
+        active = { ...active, stage: 'dispatching', result: null }
         pending = { ...pending, active }; state = { ...state, pending }
         await this.#save(state)
         let result: EventPayload
         try { result = clonePayload(await this.#provider(context, signal, (request) => this.#options.handler.dispatch(request))) }
         catch (cause) { throw new EffectUncertainError(effectId, cause) }
-        active = { effectId, stage: 'result', result }
+        active = { ...active, stage: 'result', result }
         pending = { ...pending, active }; state = { ...state, pending }
         await this.#save(state)
       }
       const result: EventPayload = {
-        type: 'effect.completed', version: 1, effectId, originEventId: event.id,
+        type: 'effect.completed', version: 2, effectId, originEventId: event.id,
         handlerId: this.#options.handler.id, handlerVersion: this.#options.handler.version,
         result: active.result,
+        publication: { attempt: active.publicationAttempt, rejections: active.publicationRejections.map(item => ({ ...item })) },
       }
-      // A lost publication response repeats this exact result without dispatch.
-      await this.#options.publisher.publishFinal(this.#options.resultTopic, result, { operationId: `effect-result:${effectId}`,
-        ...(signal === undefined ? {} : { signal }) })
+      // Ambiguous publication repeats this exact attempt. Only a proved final
+      // rejection authorizes an explicit new identity for the saved result.
+      const operationId = publicationOperationId(effectId, active.publicationAttempt)
+      try {
+        await this.#options.publisher.publishFinal(this.#options.resultTopic, result, { operationId,
+          ...(signal === undefined ? {} : { signal }) })
+      } catch (error) {
+        if (error instanceof FinalEventPublicationRejectedError) {
+          validateConsumerId(error.proposalId)
+          active = { ...active, stage: 'publication-rejected', publicationRejections: [...active.publicationRejections,
+            { attempt: active.publicationAttempt, operationId, proposalId: error.proposalId, rejectionCode: error.rejectionCode }] }
+          state = { ...state, pending: { ...pending, active } }
+          await this.#save(state)
+        }
+        throw error
+      }
       state = { ...state, pending: { ...pending, next: pending.next + 1, active: null } }
       await this.#save(state)
     }
@@ -276,7 +313,7 @@ export class DurableEffectWorker {
     const checkpoint = await this.#checkpoint.load()
     if (checkpoint === null) return { cursor: null, revision: null, pending: null }
     const value = assertCanonicalCbor(checkpoint.state)
-    if (!Array.isArray(value) || value.length !== 2 || value[0] !== 2n) throw new Error('EFFECT_CHECKPOINT_INVALID')
+    if (!Array.isArray(value) || value.length !== 2 || value[0] !== 4n) throw new Error('EFFECT_CHECKPOINT_INVALID')
     let pending: PendingBatch | null = null
     if (value[1] !== null) {
       const batch: unknown = value[1]
@@ -287,10 +324,21 @@ export class DurableEffectWorker {
       let active: ActiveEffect | null = null
       if (batch[4] !== null) {
         const entry: unknown = batch[4]
-        if (!Array.isArray(entry) || entry.length !== 3 || typeof entry[0] !== 'string' ||
-            (entry[1] !== 'prepared' && entry[1] !== 'dispatching' && entry[1] !== 'result') ||
-            (entry[2] !== null && typeof entry[2] !== 'string')) throw new Error('EFFECT_CHECKPOINT_INVALID')
-        active = { effectId: entry[0], stage: entry[1] as ActiveEffect['stage'], result: entry[2] === null ? null : parsePayload(entry[2] as string) }
+        if (!Array.isArray(entry) || entry.length !== 5 || typeof entry[0] !== 'string' ||
+            (entry[1] !== 'prepared' && entry[1] !== 'dispatching' && entry[1] !== 'result' && entry[1] !== 'publication-rejected') ||
+            (entry[2] !== null && typeof entry[2] !== 'string') || typeof entry[3] !== 'bigint' || entry[3] < 0n ||
+            entry[3] >= BigInt(MAX_PUBLICATION_ATTEMPTS) || !Array.isArray(entry[4]) ||
+            entry[4].length > MAX_PUBLICATION_ATTEMPTS) throw new Error('EFFECT_CHECKPOINT_INVALID')
+        const effectId = entry[0], publicationAttempt = Number(entry[3])
+        validateConsumerId(effectId)
+        const publicationRejections = decodePublicationRejections(entry[4], attempt => publicationOperationId(effectId, attempt))
+        const hasResult = entry[1] === 'result' || entry[1] === 'publication-rejected'
+        if (publicationRejections.length !== publicationAttempt + (entry[1] === 'publication-rejected' ? 1 : 0) ||
+            (hasResult ? typeof entry[2] !== 'string' : entry[2] !== null || publicationAttempt !== 0)) {
+          throw new Error('EFFECT_CHECKPOINT_INVALID')
+        }
+        active = { effectId, stage: entry[1] as ActiveEffect['stage'], result: entry[2] === null ? null : parsePayload(entry[2] as string),
+          publicationAttempt, publicationRejections }
       }
       pending = { events, scannedThrough: batch[1], revision: batch[2], next: Number(batch[3]), active }
     }
@@ -301,10 +349,13 @@ export class DurableEffectWorker {
     const p = state.pending
     const batch: CborValue = p === null ? null : [p.events.map(encodeEvent), p.scannedThrough, p.revision, BigInt(p.next),
       p.active === null ? null : [p.active.effectId, p.active.stage,
-        p.active.stage === 'result' ? canonicalEventPayload(p.active.result) : null]]
-    await this.#checkpoint.commit({ cursor: state.cursor, revision: state.revision, state: encodeCanonicalCbor([2n, batch]) })
+        p.active.stage === 'result' || p.active.stage === 'publication-rejected' ? canonicalEventPayload(p.active.result) : null,
+        BigInt(p.active.publicationAttempt), encodePublicationRejections(p.active.publicationRejections)]]
+    await this.#checkpoint.commit({ cursor: state.cursor, revision: state.revision, state: encodeCanonicalCbor([4n, batch]) })
   }
 }
+
+function publicationOperationId(effectId: string, attempt: number): string { return operationIdForPublication('effect-result', effectId, attempt) }
 
 export async function effectIdentity(sourceId: string, eventId: string, handlerId: string, handlerVersion: string): Promise<string> {
   return `effect_${bytesToHex(await sha256(encodeCanonicalCbor(['chronolog/effect/v1', sourceId, eventId, handlerId, handlerVersion])))}`

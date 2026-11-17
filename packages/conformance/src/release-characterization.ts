@@ -186,7 +186,6 @@ async function transaction(
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(`characterization-${id.toString().padStart(8, '0')}`),
-    authorFeedSequence: BigInt(id),
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

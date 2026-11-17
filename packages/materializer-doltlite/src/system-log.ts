@@ -4,8 +4,8 @@ import type { DatabaseLike, StoredExecutionManifest, TransactionLogRow } from '.
 export const TRANSACTION_LOG_TABLE = 'chronolog_transactions' as const
 export const EXECUTION_MANIFEST_TABLE = 'chronolog_execution_manifest' as const
 
-export function initializeSystemLog(database: DatabaseLike): void {
-  database.exec(`
+/** Part of the execution manifest: the public query schema is replicated state. */
+export const SYSTEM_LOG_SQL = `
     CREATE TABLE ${EXECUTION_MANIFEST_TABLE} (
       singleton_key INTEGER PRIMARY KEY NOT NULL CHECK (singleton_key = 1),
       manifest_digest BLOB NOT NULL CHECK (length(manifest_digest) = 32),
@@ -17,7 +17,6 @@ export function initializeSystemLog(database: DatabaseLike): void {
       author_id BLOB NOT NULL,
       operation_id TEXT NOT NULL,
       author_timestamp_ms INTEGER NOT NULL,
-      author_feed_sequence INTEGER NOT NULL,
       candidate_digest BLOB NOT NULL,
       canonical_candidate BLOB NOT NULL,
       outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'rejected')),
@@ -29,8 +28,9 @@ export function initializeSystemLog(database: DatabaseLike): void {
       )
     ) STRICT;
     CREATE INDEX chronolog_operation_identity ON ${TRANSACTION_LOG_TABLE}(author_id, operation_id)
-  `)
-}
+  `
+
+export function initializeSystemLog(database: DatabaseLike): void { database.exec(SYSTEM_LOG_SQL) }
 
 export function insertExecutionManifest(database: DatabaseLike, manifest: StoredExecutionManifest): void {
   database.prepare(`
@@ -48,7 +48,7 @@ export function readExecutionManifest(database: DatabaseLike): StoredExecutionMa
 
 export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
   const statement = database.prepare(`
-    SELECT tx_id, order_index, author_id, operation_id, author_timestamp_ms, author_feed_sequence,
+    SELECT tx_id, order_index, author_id, operation_id, author_timestamp_ms,
            candidate_digest, canonical_candidate, outcome, rejection_code, failing_statement_index
       FROM ${TRANSACTION_LOG_TABLE}
      ORDER BY order_index
@@ -61,17 +61,15 @@ export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
     const txId = asBytes(raw.tx_id)
     const authorId = asBytes(raw.author_id)
     const authorTimestampMs = asBigint(raw.author_timestamp_ms)
-    const authorFeedSequence = asBigint(raw.author_feed_sequence)
     return {
       txId,
       operationId: asString(raw.operation_id),
       orderIndex: Number(raw.order_index),
       authorId,
       authorTimestampMs,
-      authorFeedSequence,
       candidateDigest: asBytes(raw.candidate_digest),
       canonicalCandidate: asBytes(raw.canonical_candidate),
-      orderKey: { authorTimestampMs, authorId, authorFeedSequence, txId },
+      orderKey: { authorTimestampMs, authorId, txId },
       outcome,
       rejectionCode: raw.rejection_code === null ? null : asString(raw.rejection_code),
       failingStatementIndex: raw.failing_statement_index === null ? null : Number(asBigint(raw.failing_statement_index)),
@@ -82,16 +80,15 @@ export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
 export function insertSystemLogRow(database: DatabaseLike, row: Omit<TransactionLogRow, 'orderKey'>): void {
   database.prepare(`
     INSERT INTO ${TRANSACTION_LOG_TABLE} (
-      tx_id, order_index, author_id, operation_id, author_timestamp_ms, author_feed_sequence,
+      tx_id, order_index, author_id, operation_id, author_timestamp_ms,
       candidate_digest, canonical_candidate, outcome, rejection_code, failing_statement_index
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     row.txId,
     BigInt(row.orderIndex),
     row.authorId,
     row.operationId,
     row.authorTimestampMs,
-    row.authorFeedSequence,
     row.candidateDigest,
     row.canonicalCandidate,
     row.outcome,

@@ -109,6 +109,12 @@ describe('genesis verification', () => {
     const policyRepeat = await fixture({ validationPolicies: [policy, policy] }).then(() => undefined, (error: unknown) => error)
     expect(policyRepeat).toMatchObject({ code: 'SCHEMA_INVALID' })
   })
+
+  it('rejects distinct active validator grants that share a signing key', async () => {
+    const validator = validatorAt(21, 0n, 1_000n)
+    await expect(fixture({ initialCapabilities: [writer, validator, { ...validator, transportAuthor: '@second.feed' }] }))
+      .rejects.toMatchObject({ code: 'SCHEMA_INVALID', message: 'Validator signing key has multiple active grants' })
+  })
 })
 
 describe('capability revision chain', () => {
@@ -160,6 +166,24 @@ describe('capability revision chain', () => {
     const lowFloor = validatorAt(22, 1n, 500n)
     const signed = await signCapabilityRevision(revisionAfter(f, { grants: [lowFloor] }), f.root.privateKey)
     await expect(applyCapabilityRevision(f.snapshot, signed)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
+  })
+
+  it('allows a validator feed replacement only when the previous grant is revoked in the same transition', async () => {
+    const f = await fixture()
+    const previous = validatorAt(21, 0n, 1_000n), previousId = await capabilityId(previous)
+    const replacement = { ...validatorAt(21, 1n, 1_000n), transportAuthor: '@replacement.feed' }
+    const overlap = await signCapabilityRevision(revisionAfter(f, { grants: [replacement] }), f.root.privateKey)
+    await expect(applyCapabilityRevision(f.snapshot, overlap))
+      .rejects.toMatchObject({ code: 'SCHEMA_INVALID', message: 'Validator signing key has multiple active grants' })
+    expect(f.snapshot.revision).toBe(0n)
+
+    const signed = await signCapabilityRevision(revisionAfter(f, { revocations: [previousId], grants: [replacement] }), f.root.privateKey)
+    const next = await applyCapabilityRevision(f.snapshot, signed)
+    const validators = [...next.capabilities.values()].filter(entry => entry.grant.role === 'validator')
+    expect(validators.filter(entry => isCapabilityActive(entry, 0n)).map(entry => entry.grant)).toEqual([previous])
+    expect(validators.filter(entry => isCapabilityActive(entry, 1n)).map(entry => entry.grant)).toEqual([replacement])
+    expect(next.validatorFloorMs).toBe(1_000n)
+    expect(await reduceCapabilityLog(f.genesis, [signed])).toEqual(next)
   })
 
   it('keeps the floor of a validator revoked in the same revision that grants a lower-floor one', async () => {

@@ -106,8 +106,6 @@ export interface MaterializedQueryService {
   readonly finalRevision?: bigint
   readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
-  /** Original proposal identity at this position in the currently applied local order. */
-  proposalIdAt(index: number): Uint8Array | null
   localSql(
     sql: string,
     parameters?: readonly MaterializedLocalSqlValue[],

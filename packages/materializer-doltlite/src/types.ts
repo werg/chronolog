@@ -1,12 +1,5 @@
-import type { ExecutionManifest, TransactionCore, TransactionOrderKey } from '@chronolog/protocol'
-
-export interface AdmittedTransaction {
-  readonly txId: Uint8Array
-  readonly authorFeedSequence: bigint
-  readonly candidateDigest: Uint8Array
-  readonly canonicalCandidate: Uint8Array
-  readonly core: TransactionCore
-}
+import type { ExecutionManifest, TransactionOrderKey } from '@chronolog/protocol'
+export type { AdmittedTransaction } from '@chronolog/materializer'
 
 export type TransactionOutcomeKind = 'accepted' | 'rejected'
 
@@ -25,7 +18,6 @@ export interface TransactionLogRow extends TransactionOutcome {
   readonly operationId: string
   readonly authorId: Uint8Array
   readonly authorTimestampMs: bigint
-  readonly authorFeedSequence: bigint
   readonly candidateDigest: Uint8Array
   readonly canonicalCandidate: Uint8Array
 }

@@ -8,7 +8,7 @@ import {
   evaluateFinalitySnapshot, verifyFinalityClosureRecord,
 } from './finality.js'
 import {
-  CoordinatedHistoryPolicy, ReferenceRecordLog, createPrefixAuthority, encodeOrderingEvidence,
+  SignedInclusionFinalityProvider, ReferenceRecordLog, createPrefixAuthority, encodeOrderingEvidence,
   type CoordinatedHistoryConfiguration,
 } from './history-policy.js'
 import { createLedgerRecord } from './ledger-record.js'
@@ -23,7 +23,7 @@ async function fixture() {
   }
   const log = await ReferenceRecordLog.open(configuration.historyId, new MemoryOperationStore())
   const storage = new MemoryOperationStore()
-  const policy = await CoordinatedHistoryPolicy.open(configuration, storage)
+  const policy = await SignedInclusionFinalityProvider.open(configuration, storage)
   const authority = createPrefixAuthority({ configuration, identity, readHead: () => log.head() })
   const close = async (closedThroughMs: bigint) => log.append(await createFinalityClosureRecord({
     configuration, identity, includedHead: await log.head(), closedThroughMs,
@@ -61,7 +61,7 @@ describe('inclusion and chronological closure proofs', () => {
       expect(await evaluateFinalitySnapshot(f.configuration, entries)).toEqual(expected)
       expect(verify).toHaveBeenCalledTimes(updates.length)
       verify.mockClear()
-      expect((await CoordinatedHistoryPolicy.open(f.configuration, f.storage)).snapshot()).toEqual(expected)
+      expect((await SignedInclusionFinalityProvider.open(f.configuration, f.storage)).snapshot()).toEqual(expected)
       expect(verify).toHaveBeenCalledTimes(updates.length * 2)
       const altered = structuredClone(entries)
       altered[0]!.bytes[0]! ^= 1
@@ -102,19 +102,19 @@ describe('inclusion and chronological closure proofs', () => {
     expect(expected.controls[0]).toEqual(firstControl)
     expect(expected.records.map(record => [record.admissionFloorMs, record.closedThroughMs]))
       .toEqual([[-1n, 100n], [-1n, 100n], [100n, 200n], [100n, 200n]])
-    const offline = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const offline = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     await offline.ingest({ kind: 'prefix-certificate', certificate: await f.authority.certify() })
     for (const entry of [...await f.log.read()].reverse()) await offline.ingest({ kind: 'ordered-entry', entry })
     expect(offline.snapshot()).toEqual(expected)
-    expect((await CoordinatedHistoryPolicy.open(f.configuration, f.storage)).snapshot()).toEqual(expected)
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, f.storage)).snapshot()).toEqual(expected)
   })
 
-  it('re-verifies a staged suffix after a failed durable write and only then publishes the extension', async () => {
+  it('reopens after a failed durable write before re-verifying and publishing the staged suffix', async () => {
     const f = await fixture()
     await f.log.append(utf8('first proposal')); await f.close(100n)
     await f.share()
     let fail = false
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, {
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, {
       get: key => f.storage.get(key),
       put: async (key, bytes) => { if (fail) throw new Error('disk full'); await f.storage.put(key, bytes) },
     })
@@ -127,15 +127,50 @@ describe('inclusion and chronological closure proofs', () => {
       await expect(policy.ingest({ kind: 'prefix-certificate', certificate })).rejects.toThrow('disk full')
       expect(verify).toHaveBeenCalledTimes(2)
       expect(policy.snapshot()).toEqual(prior)
-      expect((await CoordinatedHistoryPolicy.open(f.configuration, f.storage)).snapshot()).toEqual(prior)
+      expect((await SignedInclusionFinalityProvider.open(f.configuration, f.storage)).snapshot()).toEqual(prior)
       verify.mockClear()
       fail = false
-      await policy.ingest({ kind: 'prefix-certificate', certificate })
+      await expect(policy.ingest({ kind: 'prefix-certificate', certificate })).rejects.toThrow('HISTORY_STORAGE_UNCERTAIN_REOPEN_REQUIRED')
+      expect(verify).not.toHaveBeenCalled()
+      const reopened = await SignedInclusionFinalityProvider.open(f.configuration, f.storage)
+      verify.mockClear()
+      await reopened.ingest({ kind: 'prefix-certificate', certificate })
       // A failed stage is not a reusable verification cache, even for exact bytes.
       expect(verify).toHaveBeenCalledTimes(2)
-      expect(policy.snapshot().closedThroughMs).toBe(200n)
-      expect(policy.snapshot()).toEqual(await evaluateFinalitySnapshot(f.configuration, await f.log.read()))
+      expect(reopened.snapshot().closedThroughMs).toBe(200n)
+      expect(reopened.snapshot()).toEqual(await evaluateFinalitySnapshot(f.configuration, await f.log.read()))
     } finally { verify.mockRestore() }
+  })
+
+  it('cannot overwrite a newer durable certified prefix after its storage acknowledgment is lost', async () => {
+    const f = await fixture()
+    await f.log.append(utf8('first proposal')); await f.close(100n)
+    await f.share()
+    let loseReply = true, writes = 0
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, {
+      get: key => f.storage.get(key),
+      async put(key, bytes) {
+        await f.storage.put(key, bytes); writes++
+        if (loseReply) { loseReply = false; throw new Error('storage acknowledgment lost') }
+      },
+    })
+    const prior = policy.snapshot()
+    const proposal = await f.log.append(utf8('next proposal')), closure = await f.close(200n)
+    const evidence = [{ kind: 'ordered-entry' as const, entry: proposal }, { kind: 'ordered-entry' as const, entry: closure },
+      { kind: 'prefix-certificate' as const, certificate: await f.authority.certify() }]
+    await expect(policy.ingestBatch(evidence)).rejects.toThrow('storage acknowledgment lost')
+    expect(policy.snapshot()).toEqual(prior)
+    await expect(policy.ingestBatch(evidence)).rejects.toThrow('HISTORY_STORAGE_UNCERTAIN_REOPEN_REQUIRED')
+    const next = await f.log.append(utf8('later receipt'))
+    await expect(policy.ingest({ kind: 'ordered-entry', entry: next })).rejects.toThrow('HISTORY_STORAGE_UNCERTAIN_REOPEN_REQUIRED')
+    expect(writes).toBe(1)
+
+    const reopened = await SignedInclusionFinalityProvider.open(f.configuration, f.storage)
+    expect(reopened.snapshot().closedThroughMs).toBe(200n)
+    await reopened.ingestBatch(evidence)
+    await reopened.ingest({ kind: 'ordered-entry', entry: next })
+    expect(reopened.snapshot()).toMatchObject({ closedThroughMs: 200n, includedThrough: closure.position, receivedThrough: next.position })
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, f.storage)).snapshot()).toEqual(reopened.snapshot())
   })
 
   it('does not publish staged control coverage when a later signed closure omits a newly included control', async () => {
@@ -154,7 +189,7 @@ describe('inclusion and chronological closure proofs', () => {
     await expect(f.policy.ingest({ kind: 'prefix-certificate', certificate: await f.authority.certify() }))
       .rejects.toThrow('FINALITY_CONTROL_PROJECTION_MISMATCH')
     expect(f.policy.snapshot()).toEqual(prior)
-    expect((await CoordinatedHistoryPolicy.open(f.configuration, f.storage)).snapshot()).toEqual(prior)
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, f.storage)).snapshot()).toEqual(prior)
     await expect(evaluateFinalitySnapshot(f.configuration, await f.log.read())).rejects.toThrow('FINALITY_CONTROL_PROJECTION_MISMATCH')
   })
 
@@ -201,8 +236,8 @@ describe('inclusion and chronological closure proofs', () => {
     expect(f.policy.snapshot()).toMatchObject({ includedThrough: 0, closedThroughMs: -1n })
     expect(f.policy.progress.missing).toContain(firstClosure.position)
     await f.policy.ingest({ kind: 'ordered-entry', entry: firstClosure })
-    const reopened = await CoordinatedHistoryPolicy.open(f.configuration, f.storage)
-    const offline = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const reopened = await SignedInclusionFinalityProvider.open(f.configuration, f.storage)
+    const offline = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     for (const bytes of [...reopened.evidenceBytes()].reverse()) await offline.ingestEvidence(bytes)
     expect(reopened.snapshot()).toEqual(f.policy.snapshot())
     expect(offline.snapshot()).toEqual(reopened.snapshot())
@@ -231,7 +266,7 @@ describe('inclusion and chronological closure proofs', () => {
     await expect(f.share()).rejects.toThrow('FINALITY_CLOSURE_REGRESSION')
     expect(f.policy.snapshot().closedThroughMs).toBe(100n)
     expect(f.policy.snapshot().includedThrough).toBe(prior.includedThrough)
-    const reopened = await CoordinatedHistoryPolicy.open(f.configuration, f.storage)
+    const reopened = await SignedInclusionFinalityProvider.open(f.configuration, f.storage)
     expect(reopened.closedThroughMs).toBe(100n)
   })
 
@@ -260,12 +295,12 @@ describe('inclusion and chronological closure proofs', () => {
       get: (key: string) => f.storage.get(key),
       put: (key: string, bytes: Uint8Array) => fail ? Promise.reject(new Error('disk full')) : f.storage.put(key, bytes),
     }
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, store)
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, store)
     for (const entry of await f.log.read()) await policy.ingest({ kind: 'ordered-entry', entry })
     fail = true
     await expect(policy.ingest({ kind: 'prefix-certificate', certificate: await f.authority.certify() })).rejects.toThrow('disk full')
     expect(policy.closedThroughMs).toBe(-1n)
-    expect((await CoordinatedHistoryPolicy.open(f.configuration, f.storage)).closedThroughMs).toBe(-1n)
+    expect((await SignedInclusionFinalityProvider.open(f.configuration, f.storage)).closedThroughMs).toBe(-1n)
   })
 
   it('keeps forged and foreign marker-shaped writer bytes inert in an opaque hosted log', async () => {

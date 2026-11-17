@@ -11,10 +11,10 @@
     "./browser": "./src/browser.ts"
   },
   "dependencies": {
+    "@chronolog/signals": "workspace:*",
     "@chronolog/canonical": "workspace:*",
     "@chronolog/capabilities": "workspace:*",
     "@chronolog/protocol": "workspace:*",
-    "@chronolog/node-core": "workspace:*",
-    "@chronolog/signals": "workspace:*"
+    "@chronolog/node-core": "workspace:*"
   }
 }

@@ -84,6 +84,13 @@ its proposal, position, final outcome, SQL values and effective events, without
 another ordered record. Changing contents under the original operation ID fails.
 The rejected program's attempted row update and event never become final.
 
+A separate regression deliberately closes author time before a prepared
+proposal's first inclusion. It verifies a final `FINALITY_TIMESTAMP_CLOSED`
+rejection, unchanged SQL and events, and the same result after restart and exact
+retry. Retaining prepared bytes locally is not a promise of their inclusion.
+The controlled-clock crash cases preserve an open admission window so they can
+test the original SQL outcome independently of that distinct rejection path.
+
 The operational command also runs seven separate checks:
 
 - A second real process is refused while the first process owns the same store.

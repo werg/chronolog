@@ -20,13 +20,14 @@ there is no compatibility decoder or data migration path for earlier prototypes.
 | `@chronolog/materializer-doltlite` | One SQL reducer, ownership checks, checkpoints, replay, and separate immutable local/final readers. Native and browser entrypoints inject their engine driver. |
 | `@chronolog/runtime-browser` | An owning Worker, OPFS storage, Web Lock ownership, real patched DoltLite WASM, and the shared RPC contract over Worker messages. |
 | `@chronolog/transport-webrtc` | Provider-independent WebRTC negotiation, bounded data channels, direct Worker ownership and optional native Werift adapter. |
-| `@chronolog/transport-tendriller` | An optional adapter and on-demand prefix authority composed with public Tendriller packages. |
+| `@chronolog/transport-tendriller` | An optional adapter and signed inclusion/finality service composed with public Tendriller packages. |
 | `@chronolog/client`, `@chronolog/rpc` | The common application interface across native HTTP, embedded peers, and browser Workers. |
 
 Tendriller's own core owns opaque bytes, exact-byte deduplication, rolling roots,
 retained reads, quotas, and host access control. It has no Chronolog membership,
-SQL engine, or certificate interpretation. The authority reads its own committed
-head and signs the immutable group/history configuration plus that head. It does
+SQL engine, or certificate interpretation. The optional finality service reads
+its committed head and signs the immutable group/history configuration plus that
+head. It does
 not execute SQL, accept a caller-selected root, or put certificates into the log
 being certified.
 
@@ -84,19 +85,19 @@ with a visible error.
 const handle = await client.transaction([
   { sql: "SELECT chronolog_assert((SELECT claimed_by FROM tasks WHERE id = ?) IS NULL, 'already_claimed')", params: [taskId] },
   { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = ?', params: [workerName, taskId] },
-], { idempotencyKey: operationId })
+], { operationId: operationId })
 
-const provisional = await handle.settled()
+const provisional = await handle.provisional()
 const finalOutcome = await handle.final({ signal })
 const finalRows = await client.query('SELECT * FROM tasks ORDER BY id', [], {
   view: 'final',
 })
 ```
 
-`settled()` describes the current local order. Under peer chronological history,
-later evidence can change a tentative outcome. `final()` waits for the
-transaction's actual locally applied final position. `accepted()` waits for
-that immutable acceptance and throws if the final outcome is rejection.
+`provisional()` describes the current local order. Later evidence can change a
+tentative outcome. `final()` waits for the transaction's actual locally applied
+final outcome, including rejection. `accepted()` waits for final acceptance and
+throws `TransactionRejectedError` on final rejection.
 `query(..., { view: 'final' })` reads a separately pinned SQL revision; it does
 not read tentative rows and attach final metadata to them. Live queries include
 the selected view in their identity and resume after finality-only events too.

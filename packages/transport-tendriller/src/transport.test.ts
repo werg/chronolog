@@ -11,7 +11,7 @@ import {
   type RecordLogEntry,
 } from '@tendriller/core/records'
 import {
-  CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog, verifyPrefixCertificate,
+  SignedInclusionFinalityProvider, decodeOrderingEvidence, ReferenceRecordLog, verifyPrefixCertificate,
   type OrderedRecordEntry,
 } from '@chronolog/node-core/history'
 import { encodeEnvelope, generateEd25519KeyPair, type EnvelopeMessageType } from '@chronolog/protocol'
@@ -130,22 +130,23 @@ describe('public Tendriller adapter', () => {
     expect((await f.log.head()).position).toBe(0)
   })
 
-  it('pins the built public SDK/engine artifacts and provenance', async () => {
-    const manifestUrl = new URL('../package.json', import.meta.url)
-    const manifest = JSON.parse(await readFile(manifestUrl, 'utf8')) as { devDependencies: Record<string, string> }
-    for (const [dependency, name] of [['@tendriller/core', 'sdk'], ['@tendriller/engine', 'engine']]) {
-      const reference = manifest.devDependencies[dependency!]!
-      expect(reference).toMatch(new RegExp(`^file:.*tendriller-${name}-[0-9a-f]{8}\\.tgz$`))
-      const artifact = new URL(reference.slice('file:'.length), manifestUrl)
-      const provenance = JSON.parse(await readFile(new URL(artifact.href.replace(/\.tgz$/u, '.provenance.json')), 'utf8')) as {
-        sha256: string; sourceCommit: string; sourceDirty: boolean; package: string; repository: string
+  it('pins the built public SDK/engine dependencies and provenance', async () => {
+    // Independent reviewed source pin: never infer the expected commit from
+    // the provenance being checked. Package dependencies must select it too.
+    const sourceCommit = '62b6e1c4fca530a70a02c1043c482752147a81a9'
+    const revision = sourceCommit.slice(0, 8)
+    const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
+      devDependencies: Record<string, string>
+    }
+    for (const [name, packageName] of [['sdk', '@tendriller/core'], ['engine', '@tendriller/engine']] as const) {
+      const filename = `tendriller-${name}-${revision}.tgz`
+      const artifact = new URL(`../../../test/artifacts/${filename}`, import.meta.url)
+      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-${revision}.provenance.json`, import.meta.url), 'utf8')) as {
+        sha256: string; sourceCommit: string; sourceDirty: boolean; artifact: string; package: string; repository: string
       }
       expect(createHash('sha256').update(await readFile(artifact)).digest('hex')).toBe(provenance.sha256)
-      expect(provenance.repository).toBe('https://github.com/werg/tendriller')
-      expect(provenance.package).toBe(dependency)
-      expect(provenance.sourceCommit).toMatch(/^[0-9a-f]{40}$/u)
-      expect(provenance.sourceDirty).toBe(false)
-      expect(artifact.pathname.endsWith(`-${provenance.sourceCommit.slice(0, 8)}.tgz`)).toBe(true)
+      expect(provenance).toMatchObject({ sourceCommit, sourceDirty: false, artifact: filename, package: packageName, repository: 'https://github.com/werg/tendriller' })
+      expect(manifest.devDependencies[packageName]).toBe(`file:../../test/artifacts/${filename}`)
     }
     expect(RECORD_LOG_FORMAT).toBe('record-log/v1')
   })
@@ -180,7 +181,7 @@ describe('public Tendriller adapter', () => {
     expect(await reader.transport.get(original.id)).toMatchObject({
       id: original.id, author: original.author, sequence: original.sequence, payload: original.payload,
     })
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
     for (const item of await reader.transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(2)
     expect(policy.snapshot().closedThroughMs).toBe(1_000n)
@@ -208,7 +209,7 @@ describe('public Tendriller adapter', () => {
     f.offline()
     await expect(adapter.publish(envelope('candidate', 2))).rejects.toThrow('Hub unavailable')
     expect(await adapter.history()).toHaveLength(2)
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
     for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(2)
     expect((await adapter.status()).lastCatchUpError).toContain('Hub unavailable')
@@ -279,7 +280,7 @@ describe('public Tendriller adapter', () => {
     const adapter = new TendrillerTransport({ local: author.transport, configuration: f.configuration, groupRoute,
       records: { ...f.records, watch: () => () => undefined }, certificate: f.certificate, finalityPollIntervalMs: 5 })
     closers.push(() => adapter.close())
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
     const frontier = async () => {
       for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
       return policy.snapshot().closedThroughMs

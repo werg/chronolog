@@ -18,8 +18,8 @@ export interface EventExecutionStore {
 /** A pinned SQL-absent execution profile; importing it never loads an SQL engine. */
 export async function eventExecutionManifest() {
   return createExecutionManifest({
-    profile: 'chronolog-events-v1', engine: 'none',
-    engineDigest: await sha256(utf8('chronolog/events-only/v1')),
+    profile: 'chronolog-events-v2', engine: 'none',
+    engineDigest: await sha256(utf8('chronolog/events-only/v2')),
     platformDigest: await sha256(utf8('chronolog/change-program/v3;literal-events;operation-conflicts/v1')),
   })
 }
@@ -51,15 +51,15 @@ export async function createEventMaterializationRuntime(options: {
     try { if (closed) throw new Error('EVENT_EXECUTION_CLOSED'); return await task() } finally { release() }
   }
   const encode = (next: readonly AdmittedTransaction[], rev: bigint, final: number, finalRev: bigint): Uint8Array => encodeCanonicalCbor([
-    'chronolog/event-execution/v1', digest, rev, BigInt(final), finalRev,
-    next.map((entry) => [entry.txId, entry.authorFeedSequence, entry.candidateDigest, entry.canonicalCandidate]),
+    'chronolog/event-execution/v2', digest, rev, BigInt(final), finalRev,
+    next.map((entry) => [entry.txId, entry.candidateDigest, entry.canonicalCandidate]),
   ])
   const evaluate = async (next: readonly AdmittedTransaction[]): Promise<MaterializedTransactionOutcome[]> => {
     const operations = new Set<string>(), transactions = new Set<string>(), proposals = new Set<string>()
     const result: MaterializedTransactionOutcome[] = []
     for (const [index, entry] of next.entries()) {
       const core = entry.core
-      if (entry.txId.length === 0 || entry.authorFeedSequence < 0n || entry.authorFeedSequence > (1n << 63n) - 1n) {
+      if (entry.txId.length === 0) {
         throw new Error('EVENT_EXECUTION_INPUT_INVALID')
       }
       if (!equalBytes(core.executionManifestDigest, digest)) throw new Error('EVENT_EXECUTION_PROFILE_UNAVAILABLE')
@@ -70,7 +70,7 @@ export async function createEventMaterializationRuntime(options: {
       if (transactions.has(transactionId)) throw new Error('EVENT_EXECUTION_DUPLICATE_TRANSACTION')
       if (proposals.has(proposalId)) throw new Error('EVENT_EXECUTION_DUPLICATE_PROPOSAL')
       transactions.add(transactionId); proposals.add(proposalId)
-      const orderKey = transactionOrderKey(core, entry)
+      const orderKey = transactionOrderKey(core, entry.txId)
       if (index > 0 && compareTransactionOrder(result[index - 1]!.orderKey, orderKey) >= 0) {
         throw new Error('EVENT_EXECUTION_ORDER_NOT_CHRONOLOGICAL')
       }
@@ -88,15 +88,15 @@ export async function createEventMaterializationRuntime(options: {
   if (persisted !== null) {
     if (persisted.length > quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
     const value = assertCanonicalCbor(persisted, { maxBytes: quota, maxByteStringBytes: quota, maxItems: quota })
-    if (!Array.isArray(value) || value.length !== 6 || value[0] !== 'chronolog/event-execution/v1' ||
+    if (!Array.isArray(value) || value.length !== 6 || value[0] !== 'chronolog/event-execution/v2' ||
         !(value[1] instanceof Uint8Array) || !equalBytes(value[1], digest) || typeof value[2] !== 'bigint' ||
         typeof value[3] !== 'bigint' || typeof value[4] !== 'bigint' || !Array.isArray(value[5]) ||
         value[2] < 0n || value[3] < 0n || value[3] > BigInt(value[5].length) || value[4] < 0n) throw new Error('EVENT_EXECUTION_STORE_INVALID')
     revision = value[2]; finalLength = Number(value[3]); finalRevision = value[4]
     order = value[5].map((row) => {
-      if (!Array.isArray(row) || row.length !== 4 || !(row[0] instanceof Uint8Array) || typeof row[1] !== 'bigint' ||
-          !(row[2] instanceof Uint8Array) || !(row[3] instanceof Uint8Array)) throw new Error('EVENT_EXECUTION_STORE_INVALID')
-      return { txId: row[0], authorFeedSequence: row[1], candidateDigest: row[2], canonicalCandidate: row[3], core: decodeTransactionCore(row[3]) }
+      if (!Array.isArray(row) || row.length !== 3 || !(row[0] instanceof Uint8Array) ||
+          !(row[1] instanceof Uint8Array) || !(row[2] instanceof Uint8Array)) throw new Error('EVENT_EXECUTION_STORE_INVALID')
+      return { txId: row[0], candidateDigest: row[1], canonicalCandidate: row[2], core: decodeTransactionCore(row[2]) }
     })
     outcomes = await evaluate(order)
   }
@@ -115,6 +115,7 @@ export async function createEventMaterializationRuntime(options: {
   const captureApplication = (input: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot => {
     if (closed) throw new Error('EVENT_EXECUTION_CLOSED')
     const view = input.view ?? 'final'
+    if (view !== 'local' && view !== 'final') throw new Error('EVENT_EXECUTION_VIEW_INVALID')
     const length = view === 'final' ? finalLength : order.length
     return {
       view, revision: view === 'final' ? finalRevision : revision, orderLength: length,
@@ -178,7 +179,6 @@ export async function createEventMaterializationRuntime(options: {
       get revision() { return revision }, get orderLength() { return order.length },
       get finalRevision() { return finalRevision }, get finalOrderLength() { return finalLength },
       get executionManifestDigest() { return digest.slice() },
-      proposalIdAt(index) { return order[index]?.txId.slice() ?? null },
       localSql() { throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
       outcome(id) { return structuredClone(outcomes.find((entry) => equalBytes(entry.txId, id)) ?? null) },
       subscribe(subscriber) { subscribers.add(subscriber); return () => { subscribers.delete(subscriber) } },
@@ -208,6 +208,6 @@ export async function createEventMaterializationRuntime(options: {
 }
 
 function sameIdentity(left: AdmittedTransaction, right: AdmittedTransaction): boolean {
-  return left.authorFeedSequence === right.authorFeedSequence && equalBytes(left.txId, right.txId) &&
+  return equalBytes(left.txId, right.txId) &&
     equalBytes(left.candidateDigest, right.candidateDigest) && equalBytes(left.canonicalCandidate, right.canonicalCandidate)
 }

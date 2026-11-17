@@ -31,12 +31,12 @@ try {
   const tree = JSON.parse(execFileSync('npm', ['ls', '--all', '--json'], { cwd: directory, encoding: 'utf8' }));
   assert.deepEqual(Object.keys(tree.dependencies), ['@chronolog/signals']);
   assert.deepEqual(tree.dependencies['@chronolog/signals'].dependencies ?? {}, {});
-  assert.deepEqual((await readdir(installed)).sort(), ['README.md', 'index.d.ts', 'index.mjs', 'package.json', 'payload.d.ts', 'provenance.json']);
+  assert.deepEqual((await readdir(installed)).sort(), ['README.md', 'channel.d.ts', 'codec.d.ts', 'index.d.ts', 'index.mjs', 'package.json', 'provenance.json', 'types.d.ts']);
   const provenance = JSON.parse(await readFile(join(installed, 'provenance.json'), 'utf8'));
   assert.equal(provenance.format, 'chronolog-signals-package/v1');
   assert.match(provenance.source, /^[0-9a-f]{40}$/u);
   if (!values['allow-dirty']) assert.equal(provenance.dirty, false, 'Use a clean-source artifact for release qualification');
-  for (const name of ['index.mjs', 'index.d.ts', 'payload.d.ts', 'README.md', 'package.json']) {
+  for (const name of ['index.mjs', 'index.d.ts', 'channel.d.ts', 'codec.d.ts', 'types.d.ts', 'README.md', 'package.json']) {
     assert.equal(hash(await readFile(join(installed, name))), provenance.sha256[name], `Artifact hash mismatch: ${name}`);
   }
   report.source = { commit: provenance.source, dirty: provenance.dirty, version: metadata.version };
@@ -47,8 +47,9 @@ import { SignalChannel, generateSignalIdentity } from '@chronolog/signals';
 const identity = await generateSignalIdentity();
 const receiver = new SignalChannel({ scope: 'isolated-artifact', identity: await generateSignalIdentity(), authorize: () => true });
 const sender = new SignalChannel({ scope: 'isolated-artifact', identity, authorize: () => true });
-await assert.rejects(sender.send('typing', true), /SIGNAL_ROUTE_UNAVAILABLE/);
-const route = sender.attachRoute({ send: async frame => { await receiver.receive(frame); } });
+await assert.rejects(sender.send('typing', true), /signal_disconnected/);
+const route = sender.attachRoute({ send: async frame => { await receivedRoute.receive(frame); } });
+const receivedRoute = receiver.attachRoute({ send: async frame => { await route.receive(frame); } });
 const iterator = receiver.subscribe({ topics: ['typing'] })[Symbol.asyncIterator]();
 const next = iterator.next();
 const first = await sender.send('typing', { active: true }, { ttlMs: 5000 });
@@ -62,7 +63,7 @@ const idle = iterator.next();
 assert.equal((await iterator.return()).done, true);
 assert.equal((await idle).done, true);
 route.close();
-await assert.rejects(sender.send('typing', false), /SIGNAL_ROUTE_UNAVAILABLE/);
+await assert.rejects(sender.send('typing', false), /signal_disconnected/);
 sender.close(); receiver.close();
 `;
   await writeFile(join(directory, 'consumer.mjs'), runtime);
@@ -72,7 +73,7 @@ sender.close(); receiver.close();
   await writeFile(join(directory, 'consumer.ts'), `import { SignalChannel, generateSignalIdentity,
   type Signals, type SignalPayload, type EphemeralSignal, type SignalSendOptions, type SignalSubscribeOptions } from '@chronolog/signals';
 const signalChannel = new SignalChannel({ scope: 'typed-artifact', identity: await generateSignalIdentity(),
-  authorize: ({ scope, authorId, credential, topic }) => scope.length > 0 && authorId.length === 32 && credential === null && topic.length > 0 });
+  authorize: ({ scope, authorId, topic }) => scope.length > 0 && authorId.length === 64 && topic.length > 0 });
 const route = signalChannel.attachRoute({ send: async (frame, { signal }) => { signal.throwIfAborted(); void frame; } });
 const channel: Signals = signalChannel;
 const payload: SignalPayload = { values: [null, true, 2, 'preview'] };

@@ -78,7 +78,6 @@ export async function admitted(
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(id),
-    authorFeedSequence: timestamp,
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

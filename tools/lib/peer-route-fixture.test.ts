@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
-import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
+import { createGovernedPeerService, type GovernedPeerSession } from '@chronolog/agent-service/governed-peer'
 import { loadOrCreateEnrollmentIdentity } from '@chronolog/node-core'
 import { bytesToBase64Url } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
@@ -15,7 +15,6 @@ import { expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 
 import { createNativeBrowserFixture } from '../browser-event-fixture.js'
-import { attachPilotPeer } from '../../test/application-pilot/peer.js'
 import { createPeerRouteFixture } from './peer-route-fixture.js'
 
 it('introduces through the packaged host then replicates signed records over RTC with its listener stopped', async () => {
@@ -33,7 +32,7 @@ it('introduces through the packaged host then replicates signed records over RTC
   let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
   let routes: Awaited<ReturnType<typeof createPeerRouteFixture>> | undefined
   let rtc: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
-  let authenticated: Awaited<ReturnType<typeof attachPilotPeer>> | undefined
+  let authenticated: GovernedPeerSession | undefined
   let peerService: Awaited<ReturnType<typeof createGovernedPeerService>> | undefined
   try {
     const engine = join(directory, 'engine')
@@ -59,7 +58,8 @@ it('introduces through the packaged host then replicates signed records over RTC
         { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }) })
     peerService = await createGovernedPeerService({ identity: identity.signing, groupId: native.governed.descriptor.history.groupId,
       activeMembership: () => native!.governed.activeSnapshot, local: transport.asLink(), attach: link => transport.connect(link) })
-    authenticated = await attachPilotPeer({ connection: rtc, peer: peerService, nativeIdentity: bytesToBase64Url(native.identity.signing.publicKeyBytes) })
+    await rtc.ready
+    authenticated = await peerService.connectPeer({ connection: rtc, peerIdentity: native.identity.signing.publicKeyBytes })
     // The exact Worker attachment boundary must finish even if replay cannot
     // publish its first durable record. A slow OPFS/materializer is not a failed
     // RTC handshake and cannot tear down the established peer session.

@@ -90,14 +90,13 @@ export interface ChronologMaterializationInvocation {
 
 export interface AdmittedTransaction {
   readonly txId: Uint8Array
-  readonly authorFeedSequence: bigint
   readonly candidateDigest: Uint8Array
   readonly canonicalCandidate: Uint8Array
   readonly core: TransactionCore
 }
 
 export interface ChronologAdmittedSuffix {
-  readonly version: 1
+  readonly version: 2
   readonly groupId: Uint8Array
   readonly replayFromIndex: number
   readonly targetOrderLength: number

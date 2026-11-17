@@ -247,6 +247,10 @@ export class GovernanceControlPlane {
           ...(change.successorCapabilityLogFeed === undefined ? {} : { successorCapabilityLogFeed: change.successorCapabilityLogFeed }),
         }
         const signed = await signCapabilityRevision(revision, rootPrivateKey)
+        // Reject an invalid transition before retaining an operation or
+        // publishing bytes. A failed request must not strand the authoring
+        // journal behind a successor that every replica will reject.
+        await applyCapabilityRevision(this.#snapshot, signed)
         const result = encodeSignedCapabilityRevisionBytes(signed)
         return this.#prepare(result, [await this.#envelope('capability', encodeCanonicalCbor([1n, result]))])
       },

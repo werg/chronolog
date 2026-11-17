@@ -1,11 +1,27 @@
 import { createCapabilitySignals, type CapabilitySnapshot, type EffectiveCapability } from '@chronolog/capabilities'
 import { bytesToBase64Url, bytesToHex, generateEd25519KeyPair } from '@chronolog/protocol'
 import { ChronologRpcError, InProcessRpcTransport, NodeRpcService, type ChronologRpcNodeService, type RpcTransport } from '@chronolog/rpc'
-import type { EphemeralSignal } from '@chronolog/signals'
+import type { EphemeralSignal, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
 import { describe, expect, it, vi } from 'vitest'
 import { ChronologClient } from './client.js'
 
 describe('public live signal client', () => {
+  it('rejects unknown options before stripping them from an RPC request', async () => {
+    const unary = vi.fn(), stream = vi.fn()
+    const client = new ChronologClient({ groupId: 'group', transport: { unary, stream } as RpcTransport })
+    try {
+      const expected = { code: 'invalid_argument', retryable: false, details: { signalCode: 'signal_options_invalid' } }
+      for (const options of [{ operationId: 'durable' }, { retry: true }, { ttl: 5000 }, { expiresAtMs: Date.now() + 5000 }, [], null]) {
+        await expect(client.signals.send('preview', true, options as unknown as SignalSendOptions)).rejects.toMatchObject(expected)
+      }
+      for (const options of [{ cursor: 'old' }, { topic: 'preview' }, [], null]) {
+        expect(() => client.signals.subscribe(options as unknown as SignalSubscribeOptions))
+          .toThrow(expect.objectContaining(expected))
+      }
+      expect(unary).not.toHaveBeenCalled(); expect(stream).not.toHaveBeenCalled()
+    } finally { await client.close() }
+  })
+
   it('lets a read-only client subscribe with no SQL, transactions, finality or private Worker commands', async () => {
     const writer = await generateEd25519KeyPair(), reader = await generateEd25519KeyPair()
     const groupId = new Uint8Array(32).fill(4), writerId = new Uint8Array(32).fill(5), readerId = new Uint8Array(32).fill(6)
@@ -17,8 +33,10 @@ describe('public live signal client', () => {
     ]
     const snapshot: CapabilitySnapshot = { groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
       capabilityLogFeed: new Uint8Array(32), capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), validatorFloorMs: 0n }
-    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, send: async () => {} })
-    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, send: async frame => { await receiver.receive(frame) } })
+    const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot })
+    const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot })
+    const receiveRoute = receiver.attachRoute({ send: async () => {} })
+    sender.attachRoute({ send: async frame => { await receiveRoute.receive(frame) } })
     // Deliberately no authoring, SQL, operation or finality service exists here.
     const node = { groupId } as ChronologRpcNodeService
     const client = new ChronologClient({ groupId: bytesToBase64Url(groupId), transport: new InProcessRpcTransport(new NodeRpcService({ node, signals: receiver })) })
@@ -29,7 +47,7 @@ describe('public live signal client', () => {
     const sent = await sender.send('presence', { online: true })
     expect((await pending).value).toEqual(sent)
     await expect(client.signals.send('presence', { online: true })).rejects.toMatchObject({ code: 'permission_denied', retryable: false })
-    await expect(client.signals.send('bad topic', true)).rejects.toMatchObject({ code: 'invalid_argument', retryable: false })
+    await expect(client.signals.send('', true)).rejects.toMatchObject({ code: 'invalid_argument', retryable: false })
     await iterator.return?.()
     const idle = client.signals.subscribe()[Symbol.asyncIterator](), reading = idle.next()
     await Promise.resolve(); await Promise.resolve()

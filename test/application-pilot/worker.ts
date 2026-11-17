@@ -7,7 +7,6 @@ import { frameRtcPeerChannels, type PeerDataChannelConnection, type WebRtcChanne
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
 import type { PilotPeerBootstrap, PilotProgress, PilotRouteStats } from './contract.js'
 import { routeState } from './route-state.js'
-import { attachPilotPeer } from './peer.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined
@@ -24,11 +23,13 @@ async function connect(channels: WebRtcChannels, connectionId: number): Promise<
   const framed = frameRtcPeerChannels(channels)
   opening = framed
   try {
-    const authenticated = await attachPilotPeer({ connection: framed, peer, nativeIdentity: bootstrap.nativeIdentity })
+    const started = performance.now()
+    await framed.ready
+    const authenticated = await peer.connectPeer({ connection: framed, peerIdentity: base64UrlToBytes(bootstrap.nativeIdentity) })
+    const authenticatedMs = performance.now() - started
     if (generation !== connectionGeneration) { await authenticated.close(); throw new Error('PILOT_CONNECTION_SUPERSEDED') }
     let closed = false
-    const current = {
-      stats: (): PilotRouteStats => { const stats = framed.stats; return { route: 'webrtc', authenticatedMs: authenticated.authenticatedMs,
+    const current = { stats: (): PilotRouteStats => { const stats = framed.stats; return { route: 'webrtc', authenticatedMs,
         sentBytes: stats.sentBytes, receivedBytes: stats.receivedBytes, queuedBytes: stats.queuedSendBytes + stats.queuedReceiveBytes } },
       async close() { if (closed) return; closed = true; await authenticated.close() } }
     connection = current

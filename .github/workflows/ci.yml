@@ -48,6 +48,7 @@ jobs:
           path: |
             artifacts/signals/*.tgz
             artifacts/signals/*.consumer.json
+            artifacts/signals/provenance.json
           if-no-files-found: error
           retention-days: 30
       - run: pnpm test:coverage

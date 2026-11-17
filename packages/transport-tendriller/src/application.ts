@@ -3,7 +3,7 @@ import {
   type ChronologClient, type DecodedLocalSqlValue, type LocalSqlInput,
 } from '@chronolog/client'
 import type { ChronologNode } from '@chronolog/node-core'
-import { emit, program, type ChangeProgram, type EventPayload, type ViewChangeOptions } from '@chronolog/protocol'
+import { emit, program, type ChangeProgram, type EventPayload, type ApplicationChangeOptions } from '@chronolog/protocol'
 import { ChangeSignal } from '@chronolog/records'
 import {
   assertApplicationOperationId, applicationSelection,
@@ -145,7 +145,7 @@ export function createChronologApplicationBackend(options: {
   return Object.freeze({
     id, capabilities: Object.freeze([...(supportsSql ? ['sql'] : []), 'events', 'conversation', 'revision-views', 'operation-status']),
     submit,
-    changes: (changeOptions: ViewChangeOptions = {}) => replica.changes(changeOptions),
+    changes: (changeOptions: ApplicationChangeOptions = {}) => replica.changes(changeOptions),
     events: Object.freeze({
       publish: (topic: string, payload: unknown, submitOptions: ApplicationSubmitOptions) => submit(program(emit(topic, payload as EventPayload)), submitOptions),
       read: (readOptions: ApplicationEventReadOptions = {}) => replica.events.read(readOptions),

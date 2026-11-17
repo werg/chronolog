@@ -3,12 +3,14 @@ import {
   signCapabilityRevision,
   signGenesis,
   validationPolicyId,
+  type CapabilityGrant,
   type CapabilityGrantInput,
   type CapabilityRevision,
   type GenesisManifest,
   type ValidationPolicy,
 } from '@chronolog/capabilities'
 import { createEpochManifest, encodeSignedEpochManifest, generateX25519KeyPair } from '@chronolog/crypto'
+import type { StoredAttestation } from '@chronolog/control-store'
 import { DOMAINS, encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, signDomain } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -221,6 +223,85 @@ describe('replicated governance control plane', () => {
     await attacker.publish((await fixture.adminTransport.history())[0]!.payload)
     await fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(34))] }, fixture.root.privateKey)
     await waitFor(() => participant.snapshot.revision === 2n)
+  })
+
+  it('rejects overlapping validator grants before journaling and keeps admission, feeds and watermark aligned after replacement', async () => {
+    const f = await governanceFixture(new MemoryOperationStore())
+    const before = f.admin.snapshot
+    const previous = [...before.capabilities.values()].find(item => item.grant.role === 'validator')!
+    const replacement = grant(f.root.publicKeyBytes, 'validator', { minimumAuthorTimestampMs: 0n, transportAuthor: 'replacement' })
+    await expect(f.admin.publishCapabilityChange({ grants: [replacement] }, f.root.privateKey, { operationId: 'validator-change' }))
+      .rejects.toMatchObject({ code: 'SCHEMA_INVALID', message: 'Validator signing key has multiple active grants' })
+    expect(f.admin.snapshot).toEqual(before)
+    expect(await f.adminTransport.history()).toEqual([])
+
+    // The rejected preparation retained no operation fingerprint. The caller
+    // can correct the transition, including revocation, under the same ID.
+    await f.admin.publishCapabilityChange({ revocations: [previous.id], grants: [replacement] }, f.root.privateKey,
+      { operationId: 'validator-change' })
+    const current = f.admin.snapshot
+    const next = [...current.capabilities.values()].find(item => item.grant.role === 'validator' && item.revokedAtRevision === undefined)!
+    const resolver = new CapabilityMembershipResolver({ snapshotForRevision: digest => f.admin.snapshotForRevision(digest) })
+    const context = { groupId: f.groupId, membershipRevision: current.revisionDigest,
+      validationPolicy: await validationPolicyId(f.policy), writerId: f.root.publicKeyBytes, authorTimestampMs: 5_000n }
+    const proof = (validatorCapability: Uint8Array, transportAuthor: string, id: number): StoredAttestation => ({
+      attestationId: bytes32(id), txId: bytes32(80), candidateDigest: bytes32(81), validatorId: f.root.publicKeyBytes,
+      validatorCapability, membershipRevision: current.revisionDigest, validatorFeedSequence: 1n,
+      authorTimestampMs: 5_000n, acceptedAboveMs: 0n, policyVersion: 1n, transportAuthor,
+    })
+    const oldProof = proof(previous.id, 'admin', 82), newProof = proof(next.id, 'replacement', 83)
+    expect(await resolver.selectAdmission(context, [oldProof, newProof])).toEqual([newProof])
+    expect(await resolver.canStillAdmit(context, { attestations: [oldProof], openValidatorIds: [] })).toBe(false)
+    expect(await resolver.canStillAdmit(context, { attestations: [newProof], openValidatorIds: [] })).toBe(true)
+    for (const membershipRevision of [before.revisionDigest, current.revisionDigest]) {
+      expect(await resolver.watermarkPolicy({ ...context, membershipRevision }))
+        .toMatchObject({ threshold: 1, validatorIds: [f.root.publicKeyBytes] })
+    }
+    const binding = { groupId: f.groupId, membershipRevision: current.revisionDigest, role: 'validator' as const,
+      signingId: f.root.publicKeyBytes, validatorCapability: next.id, transportAuthor: 'replacement' }
+    expect(await resolver.canUseTransportAuthor(binding)).toBe(true)
+    expect(await resolver.canUseTransportAuthor({ ...binding, validatorCapability: previous.id, transportAuthor: 'admin' })).toBe(false)
+    expect(await resolver.canUseTransportAuthor({ ...binding, membershipRevision: before.revisionDigest,
+      validatorCapability: previous.id, transportAuthor: 'admin' })).toBe(true)
+  })
+
+  it('rejects received duplicate validator grants without blocking a valid successor or canonical replay', async () => {
+    const f = await governanceFixture()
+    await f.admin.close()
+    const received = await GovernanceControlPlane.create({ genesis: f.genesis, groupRoute: f.groupRoute,
+      transport: f.adminTransport, identity: f.root })
+    const canonical = await GovernanceControlPlane.create({ genesis: f.genesis, groupRoute: f.groupRoute,
+      transport: f.network.createNode('validator-control-reader'), identity: await generateEd25519KeyPair() })
+    controllers.push(received, canonical)
+    const initial = received.snapshot
+    const log = await ReferenceRecordLog.open('h_0123456789abcdef0123456789abcdef', new MemoryOperationStore())
+    const publish = async (grants: readonly CapabilityGrant[]) => {
+      const signed = await signCapabilityRevision({ groupId: f.groupId, revision: 1n,
+        previousRevisionDigest: initial.revisionDigest, issuerRootPublicKey: f.root.publicKeyBytes,
+        grants, revocations: [], validationPolicies: [] }, f.root.privateKey)
+      const payload = encodeCanonicalCbor([1n, encodeSignedCapabilityRevision(signed)])
+      const signature = await signDomain(DOMAINS.capabilityRevision, payload, f.root.privateKey)
+      const envelope = encodeEnvelope({ groupRoute: f.groupRoute, messageType: 'capability', encryptionEpoch: null,
+        payload: encodeCanonicalCbor([1n, payload, f.root.publicKeyBytes, signature]) })
+      return { record: await f.adminTransport.publish(envelope), entry: await log.append((await createLedgerRecord(envelope)).recordBytes) }
+    }
+    const invalid = await publish([{ ...grant(f.root.publicKeyBytes, 'validator',
+      { minimumAuthorTimestampMs: 0n, transportAuthor: 'duplicate' }), validFromRevision: 1n }])
+    for (const error of [await received.ingest(invalid.record).catch((error: unknown) => error),
+      await canonical.ingestFinalized(invalid.entry, initial, 100n).catch((error: unknown) => error)]) {
+      expect(error).toMatchObject({ code: 'SCHEMA_INVALID', message: 'Validator signing key has multiple active grants' })
+      expect(isInvalidGovernanceRecord(error)).toBe(true)
+    }
+    expect(received.snapshot).toEqual(initial)
+    expect(canonical.snapshot).toEqual(initial)
+    const valid = await publish([{ ...sqlWriter(bytes32(104)), validFromRevision: 1n }])
+    // The ordinary history consumer must discard the invalid predecessor and
+    // reach this valid revision, rather than leave a retriable proof blocker.
+    await received.start()
+    expect(received.snapshot.revision).toBe(1n)
+    expect(received.pendingRecordCount).toBe(0)
+    expect((await canonical.ingestFinalized(valid.entry, initial, 100n))?.revision).toBe(1n)
+    expect(canonical.snapshot).toEqual(received.snapshot)
   })
 
   it('does not author a successor before a locally retained predecessor reaches the canonical relay', async () => {

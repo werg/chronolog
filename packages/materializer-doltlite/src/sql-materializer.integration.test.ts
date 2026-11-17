@@ -47,6 +47,7 @@ describe('replicated SQL materialization', () => {
       sqlStatement('UPDATE accounts SET balance = balance - 50 WHERE id = 1'),
     ], digest)
     await materializer.materialize([setup, withdraw])
+    expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([setup.txId, withdraw.txId])
     expect(materializer.outcome(withdraw.txId)).toMatchObject({
       outcome: 'rejected', rejectionCode: 'assert:insufficient_funds', failingStatementIndex: 1,
     })
@@ -63,6 +64,7 @@ describe('replicated SQL materialization', () => {
     const deposit = await transaction(3n, 'deposit', [sqlStatement('UPDATE accounts SET balance = balance + 100 WHERE id = 1')], digest)
     try {
       const revision = await materializer.materialize([setup, deposit, withdraw])
+      expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([setup.txId, deposit.txId, withdraw.txId])
       expect(revision?.outcomeChanges.map((change) => [new TextDecoder().decode(change.txId), change.previous, change.current]))
         .toEqual([['deposit', null, 'accepted'], ['withdraw', 'rejected', 'accepted']])
       expect(rows(materializer, 'SELECT balance FROM accounts')).toEqual([['60']])
@@ -216,6 +218,7 @@ describe('replicated SQL materialization', () => {
     await expect(materializer.materialize([tx])).rejects.toThrow('MATERIALIZER_EXECUTION_MANIFEST_UNAVAILABLE')
     expect(materializer.outcome(tx.txId)).toBeNull()
     expect(materializer.orderLength).toBe(0)
+    expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([])
     materializer.close()
   })
 
@@ -249,8 +252,8 @@ describe('replicated SQL materialization', () => {
     const removed = await materializer.materialize([setup, second])
     expect(materializer.outcome(second.txId)?.outcome).toBe('accepted')
     expect(materializer.outcome(first.txId)).toBeNull()
-    expect(materializer.proposalIdAt(1)).toEqual(second.txId)
-    expect(materializer.proposalIdAt(2)).toBeNull()
+    expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)[1]).toEqual(second.txId)
+    expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)[2]).toBeUndefined()
     expect(removed?.outcomeChanges).toContainEqual({ txId: first.txId, previous: 'accepted', current: null,
       previousRejectionCode: null, currentRejectionCode: null })
     expect(captured.query('SELECT value FROM drafts').rows).toEqual([[{ kind: 'text', value: 'first' }]])
@@ -278,7 +281,12 @@ describe('replicated SQL materialization', () => {
     const first = await transaction(2n, 'first', [sqlStatement('INSERT INTO views (id) VALUES (1)')], digest)
     const second = await transaction(3n, 'second', [sqlStatement('INSERT INTO views (id) VALUES (2)')], digest)
     await materializer.materialize([create, first, second])
+    expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([create.txId, first.txId, second.txId])
+    expect(materializer.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId)).toEqual([])
     await materializer.publishFinal(2)
+    expect(materializer.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId)).toEqual([create.txId, first.txId])
+    materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)[0]!.fill(0)
+    expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([create.txId, first.txId, second.txId])
     expect(materializer.localSql('SELECT count(*) FROM views').rows).toEqual([[{ kind: 'integer', value: '2' }]])
     expect(materializer.localSql('SELECT count(*) FROM views', [], { view: 'final' })).toMatchObject({
       view: 'final', orderLength: 2, rows: [[{ kind: 'integer', value: '1' }]],
@@ -287,10 +295,13 @@ describe('replicated SQL materialization', () => {
     materializer.close()
     materializer = await open(path, manifest, 100)
     expect(materializer.finalOrderLength).toBe(2)
+    expect(materializer.captureApplication({ view: 'local' }).transactions.map(entry => entry.txId)).toEqual([create.txId, first.txId, second.txId])
+    expect(materializer.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId)).toEqual([create.txId, first.txId])
     expect(materializer.localSql('SELECT id FROM views ORDER BY id', [], { view: 'final' }).rows).toEqual([[{ kind: 'integer', value: '1' }]])
     const late = await transaction(0n, 'late', [sqlStatement('SELECT 1')], digest)
     await expect(materializer.materialize([late, create, first, second])).rejects.toThrow('MATERIALIZER_FINAL_PREFIX_CHANGED')
     await materializer.publishFinal(3)
+    expect(materializer.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId)).toEqual([create.txId, first.txId, second.txId])
     expect(materializer.localSql('SELECT count(*) FROM views', [], { view: 'final' }).rows).toEqual([[{ kind: 'integer', value: '2' }]])
     materializer.close()
   })

@@ -90,10 +90,10 @@ describe('native SQL timer publication', () => {
     } })
     await expect(losing.tick(2000)).rejects.toThrow('final occurrence response lost')
     const saved = (await losing.status()).pending!
-    expect(saved.observedAtMs).toBe(2000)
+    expect(saved.occurrence.observedAtMs).toBe(2000)
     const configuration = await f.configuration('g2')
-    expect(saved.configurationEventId).toBe(configuration.id)
-    expect(saved.configurationOrigin).toEqual(configuration.origin)
+    expect(saved.occurrence.configurationEventId).toBe(configuration.id)
+    expect(saved.occurrence.configurationOrigin).toEqual(configuration.origin)
     const before = await f.fired()
     expect(before).toHaveLength(1)
     expect(before[0]!.payload).toMatchObject({ configurationEventId: configuration.id, configurationOrigin: configuration.origin })
@@ -109,14 +109,15 @@ describe('native SQL timer publication', () => {
     f.native.assertHealthy()
   })
 
-  it('rejects stale due times and payloads, advances recurring due times in bounded turns, and refuses overflow', async () => {
+  it('rejects stale due times and payloads and advances recurring due times in bounded turns', async () => {
     const f = await fixture()
     await f.publisher.schedule({ timerId: 'recurring', generation: 'recurring-g1', dueAtMs: 1000, intervalMs: 100,
       payload: { action: 'poll' } }, { operationId: 'schedule-recurring', expectedGeneration: null })
     const configuration = await f.configuration('recurring-g1')
-    const occurrence: TimerOccurrence = { type: 'timer.fired', version: 1, timerId: 'recurring', generation: 'recurring-g1',
+    const occurrence: TimerOccurrence = { type: 'timer.fired', version: 2, timerId: 'recurring', generation: 'recurring-g1',
       configurationEventId: configuration.id, configurationOrigin: configuration.origin,
-      occurrenceId: 'mismatched-payload', scheduledAtMs: 1000, observedAtMs: 1250, payload: { action: 'tampered' } }
+      occurrenceId: 'mismatched-payload', scheduledAtMs: 1000, observedAtMs: 1250, payload: { action: 'tampered' },
+      publication: { attempt: 0, rejections: [] } }
     expect(await f.publisher.publishOccurrence(occurrence, { operationId: 'mismatched-payload' })).toBe('cancelled')
     expect(await f.publisher.publishOccurrence({ ...occurrence, occurrenceId: 'stale-time', scheduledAtMs: 900,
       payload: { action: 'poll' } }, { operationId: 'stale-time' })).toBe('cancelled')
@@ -131,12 +132,27 @@ describe('native SQL timer publication', () => {
     expect(fired.map((event) => (event.payload as { scheduledAtMs: number }).scheduledAtMs)).toEqual([1000, 1100, 1200])
     expect(fired.map((event) => (event.payload as { observedAtMs: number }).observedAtMs)).toEqual([1250, 1250, 1250])
     expect((await f.native.client.query('SELECT next_due_at_ms FROM agent_timer_heads')).result.rows).toEqual([[1300n]])
-    await f.publisher.cancel({ timerId: 'recurring', generation: 'recurring-g1' }, { operationId: 'cancel-recurring' })
+    f.native.assertHealthy()
+  })
+
+  it('retains a final SQL rejection and safely recovers it after cancellation without emitting an occurrence', async () => {
+    const f = await fixture()
     await f.publisher.schedule({ timerId: 'overflow', generation: 'overflow-g1', dueAtMs: Number.MAX_SAFE_INTEGER - 1, intervalMs: 2 },
       { operationId: 'schedule-overflow', expectedGeneration: null })
-    await expect(restarted.tick(Number.MAX_SAFE_INTEGER)).rejects.toThrow('timer_time_overflow')
-    expect((await restarted.status()).pending?.generation).toBe('overflow-g1')
-    expect(await f.fired()).toHaveLength(3)
+    const scheduler = await DurableTimerScheduler.open(f.options)
+    await expect(scheduler.tick(Number.MAX_SAFE_INTEGER)).rejects.toBeInstanceOf(SqlTimerRejectedError)
+    const restarted = await DurableTimerScheduler.open(f.options)
+    const rejected = (await restarted.status()).pending!
+    expect(rejected).toMatchObject({ stage: 'publication-rejected', occurrence: { generation: 'overflow-g1' },
+      publicationRejections: [{ rejectionCode: 'assert:timer_time_overflow' }] })
+    expect(await f.fired()).toHaveLength(0)
+    await f.publisher.cancel({ timerId: 'overflow', generation: 'overflow-g1' }, { operationId: 'cancel-overflow' })
+    await restarted.retryPublication(rejected.occurrence.occurrenceId)
+    expect(await restarted.tick(Number.MAX_SAFE_INTEGER)).toEqual({ emitted: 0, needsCatchUp: false })
+    expect(await restarted.publicationStatus(rejected.occurrence.occurrenceId)).toMatchObject({ stage: 'cancelled',
+      publicationAttempt: 1, publicationRejections: rejected.publicationRejections })
+    expect(await f.fired()).toHaveLength(0)
+    expect((await f.native.client.query('SELECT count(*) FROM agent_timer_occurrences')).result.rows).toEqual([[0n]])
     f.native.assertHealthy()
   })
 })

@@ -88,7 +88,7 @@ endpoint.addEventListener('message', (event) => {
           revision: String(peer!.materializer.revision), finalRevision: String(peer!.materializer.finalRevision),
           records: (await peer!.transport.asLink().read(peer!.transport.identity, 0n, 1_000)).map(bytesToBase64Url),
           transactions: peer!.materializer.transactionLog().map((row) => ({
-            txId: bytesToBase64Url(row.txId), canonical: bytesToBase64Url(row.canonicalCandidate), sequence: String(row.authorFeedSequence),
+            txId: bytesToBase64Url(row.txId), canonical: bytesToBase64Url(row.canonicalCandidate),
           })),
         }
       }

@@ -1,4 +1,4 @@
-import type { ViewChange } from '@chronolog/protocol'
+import type { ApplicationChange } from '@chronolog/protocol'
 import { ChronologRpcError, type RpcCallOptions, type RpcTransport } from '@chronolog/rpc'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -12,7 +12,7 @@ function deferred() {
 function untilAborted(signal: AbortSignal) {
   return signal.aborted ? Promise.resolve() : new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
 }
-const state = (revision: string): ViewChange => ({ view: 'local', revision, finalRevision: 'immutable' })
+const state = (revision: string): ApplicationChange => ({ view: 'local', revision, finalRevision: 'immutable' })
 
 describe('application change subscriptions', () => {
   it('uses one bounded latest snapshot without read leases or unary queries', async () => {

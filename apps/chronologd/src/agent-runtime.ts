@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
-  DurableEffectWorker, DurableTimerScheduler, NativeFinalityService, ResidentAgentService,
+  DurableEffectWorker, DurableTimerScheduler, FinalEventPublicationRejectedError, NativeFinalityService, ResidentAgentService,
 } from '@chronolog/agent-service'
 import type {
   AgentApplicationContext, AgentApplicationModule, FinalEventPublisher, ResidentTask,
@@ -132,7 +132,7 @@ export async function waitForFinalAcceptance(node: ChronologNode, txId: Uint8Arr
     if (!node.isFinal(txId)) return false
     const outcome = node.outcome(txId)
     if (outcome === null) throw new Error('AGENT_FINAL_OUTCOME_MISSING')
-    if (outcome.outcome !== 'accepted') throw new Error(`AGENT_PUBLICATION_REJECTED: ${outcome.rejectionCode ?? 'unknown'}`)
+    if (outcome.outcome !== 'accepted') throw new FinalEventPublicationRejectedError(new TextDecoder().decode(txId), outcome.rejectionCode)
     return true
   }
   try {

@@ -1,3 +1,4 @@
+// This focused fixture has no finality policy and explicitly inspects provisional outcomes.
 // App-facing ownership and sealed-data APIs against two real nodes in one group.
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -199,10 +200,10 @@ describe('ownership client API', () => {
 
 // This static-membership fixture deliberately never closes its final prefix.
 async function expectLocalAcceptance(handle: TransactionHandle): Promise<void> {
-  await expect(handle.settled()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
+  await expect(handle.provisional()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
 }
 async function expectLocalRejection(handle: TransactionHandle, code: string) {
-  const outcome = await handle.settled()
+  const outcome = await handle.provisional()
   expect(outcome).toMatchObject({ final: false, outcome: { type: 'rejected', rejection: { code } } })
   if (outcome.outcome.type !== 'rejected') throw new Error('Expected a provisional rejection')
   return outcome.outcome.rejection
@@ -216,7 +217,7 @@ async function rows(client: ChronologClient, sql: string, parameters: readonly (
   return (await client.query(sql, parameters)).result.rows
 }
 
-/** Waits until `client`'s node has settled a transaction submitted elsewhere. */
+/** Waits until `client`'s node has provisionally executed a transaction submitted elsewhere. */
 async function seenBy(client: ChronologClient, handle: TransactionHandle): Promise<void> {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {

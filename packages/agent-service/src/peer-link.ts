@@ -6,9 +6,9 @@ import {
 import type { CborValue, Ed25519KeyPair } from '@chronolog/protocol'
 import { assertFeedPosition, ChangeSignal } from '@chronolog/records'
 import type { FeedLink } from '@chronolog/records'
-import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN, type SignalDispatchResult } from '@chronolog/signals'
+import { isSignalFrame, MAX_SIGNAL_BYTES, SignalError } from '@chronolog/signals'
 
-import type { FramedPeerConnection } from './framing.js'
+import { PeerFrameBackpressureError, type FramedPeerConnection } from './framing.js'
 
 const PEER_DOMAIN = 'chronolog/peer/v1'
 const MAX_RANGE = 64
@@ -30,6 +30,7 @@ export interface AuthenticatedPeerLinkOptions {
   /** Check an active read grant for this group, independently of host/relay login. */
   readonly authorizePeer: (peer: PeerAuthorization) => boolean | Promise<boolean>
   readonly receiveSignal?: (frame: Uint8Array) => void | Promise<void>
+  readonly onSignalError?: (error: unknown) => void
   /** Absolute identity-proof deadline, default 10 seconds. */
   readonly handshakeTimeoutMs?: number
   /** Time allowed to dispatch a request through local framing, default 30 seconds. */
@@ -65,7 +66,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   readonly link: FeedLink
   readonly peer: PeerAuthorization
   readonly completion: Promise<void>
-  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<SignalDispatchResult>
+  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
   close(): Promise<void>
 }> {
   for (const bytes of [options.groupId, options.identity.publicKeyBytes, options.grantId]) {
@@ -288,26 +289,31 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       if (!controller.signal.aborted) fail(new Error('PEER_CONNECTION_ENDED'))
     } catch (error) { fail(error) }
   })()
+  const reportSignalError = (error: unknown): void => {
+    try { options.onSignalError?.(error) } catch { /* Diagnostics do not own the session. */ }
+  }
   const liveReading = (async () => {
     if (options.connection.live === undefined) return
     try {
       await ready
       for await (const bytes of options.connection.live.frames(controller.signal)) {
         if (controller.signal.aborted) break
-        try {
-          if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
-          const frame = assertCanonicalCbor(bytes)
-          if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
-          // The live lane is lossy. Drop before admission at capacity instead of
-          // interrupting reliable history; admitted validation failures still retire.
-          if (signalsInFlight >= 8) continue
-          const incoming = bytes.slice()
-          signalsInFlight += 1
-          void (async () => {
-            if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
-            if (!controller.signal.aborted) await options.receiveSignal?.(incoming)
-          })().catch(fail).finally(() => { signalsInFlight -= 1 })
-        } catch (error) { fail(error); break }
+        if (bytes.length > MAX_SIGNAL_BYTES || !isSignalFrame(bytes)) {
+          reportSignalError(new SignalError(bytes.length > MAX_SIGNAL_BYTES ? 'signal_frame_too_large' : 'signal_frame_invalid'))
+          continue
+        }
+        // This lane is disposable. Refuse overload before application admission,
+        // and let verification suspend independently of retained range handling.
+        if (signalsInFlight >= 8) { reportSignalError(new SignalError('signal_backpressure')); continue }
+        if (options.receiveSignal === undefined) continue
+        const incoming = bytes.slice()
+        signalsInFlight++
+        void (async () => {
+          try {
+            if (!await authorized()) { fail(new Error('PEER_READ_UNAUTHORIZED')); return }
+          } catch (error) { fail(error); return }
+          if (!controller.signal.aborted) await options.receiveSignal!(incoming)
+        })().catch(reportSignalError).finally(() => { signalsInFlight-- })
       }
       if (!controller.signal.aborted) fail(new Error('PEER_LIVE_ENDED'))
     } catch (error) { fail(error) }
@@ -374,38 +380,33 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       readEvidence: (after, limit) => requestRange(null, after, limit), readPayload: requestPayload,
       watch: (signal) => changes.watch(signal) },
     completion,
-    async sendSignal(bytes, sendOptions = {}) {
+    async sendSignal(bytes, input = {}) {
       const live = options.connection.live
       if (live === undefined) throw new Error('PEER_LIVE_UNAVAILABLE')
-      const signal = sendOptions.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, sendOptions.signal])
+      const signal = input.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, input.signal])
       signal.throwIfAborted()
-      if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
-      if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
-      const frame = assertCanonicalCbor(bytes)
-      if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
-      // Signals contain application data too. A completed handshake is not a
-      // permanent reader grant, and writer authorization at the signal layer
-      // does not authorize this recipient after its read grant is revoked.
+      if (bytes.length > MAX_SIGNAL_BYTES) throw new SignalError('signal_frame_too_large')
+      if (!isSignalFrame(bytes)) throw new SignalError('signal_frame_invalid')
+      // Recheck current recipient rights before releasing any live bytes. The
+      // reliable handshake does not grant permanent access to later messages.
       const outgoing = bytes.slice()
       if (!await interruptible(authorized(), signal)) throw new Error('PEER_READ_UNAUTHORIZED')
       signal.throwIfAborted()
-      if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
-      // Live transports must honor cancellation before dispatch. Bound a stuck
-      // implementation too; data already handed to the network is not recallable.
       const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
-      try {
-        const result = await interruptible(live.send(outgoing, { signal }), signal)
-        if (result !== undefined && (typeof result !== 'object' || result === null || result.refused !== 'backpressure')) {
-          throw new Error('PEER_SIGNAL_DISPATCH_RESULT_INVALID')
-        }
-        return result
-      }
+      let settled = false
+      const writing = Promise.resolve().then(() => live.send(outgoing, { signal })).finally(() => { settled = true })
+      try { await interruptible(writing, signal) }
       catch (error) {
         if (controller.signal.aborted) throw failure ?? controller.signal.reason
-        if (!signal.aborted) fail(error)
+        // A bounded lane may refuse before handoff. This does not compromise
+        // ordered replication and must not retire a healthy connection.
+        if (error instanceof PeerFrameBackpressureError) throw new SignalError('signal_route_backpressure')
+        // Preserve accounting at the actual write boundary. An interruptible
+        // wrapper must not hide a transport that ignores cancellation.
+        if (signal.aborted && !settled) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+        if (!signal.aborted || !settled) fail(error)
         throw error
-      }
-      finally { clearTimeout(timer) }
+      } finally { clearTimeout(timer) }
     },
     async close() {
       if (!controller.signal.aborted) {
@@ -429,10 +430,10 @@ function validPayloadHash(value: unknown): value is string {
 }
 
 function interruptible<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) { void operation.catch(() => undefined); return Promise.reject(signal.reason) }
   return new Promise((resolve, reject) => {
-    const abort = (): void => { reject(signal.reason) }
+    const abort = (): void => { signal.removeEventListener('abort', abort); reject(signal.reason) }
     signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
     void operation.then(resolve, reject).finally(() => { signal.removeEventListener('abort', abort) })
   })
 }

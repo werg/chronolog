@@ -151,7 +151,7 @@ export class ChaosCluster {
       const bootstrapClient = cluster.client(cluster.adminNodeName())
       const writers = options.prepared.nodes.slice(1).map((node) => Uint8Array.from(Buffer.from(node.publicKey, 'base64')))
       for (let attempt = 1; attempt <= 3; attempt += 1) {
-        const bootstrap = await bootstrapClient.transaction(chaosBootstrapStatements(options.scenario.workload.accounts, writers), { idempotencyKey: `chronolog-chaos-bootstrap-v2-attempt-${attempt}` })
+        const bootstrap = await bootstrapClient.transaction(chaosBootstrapStatements(options.scenario.workload.accounts, writers), { operationId: `chronolog-chaos-bootstrap-v2-attempt-${attempt}` })
         try {
           const deadline = Date.now() + 30_000
           let settlement = 'unavailable'

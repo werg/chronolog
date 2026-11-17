@@ -8,18 +8,18 @@ const bytes = (fill: number, length = 32): Uint8Array => new Uint8Array(length).
 function row(index: number, overrides: Partial<TransactionLogRow> = {}): TransactionLogRow {
   return {
     txId: bytes(0x10 + index),
-    orderKey: { authorTimestampMs: 1_000n + BigInt(index), txId: bytes(0x10 + index) },
+    orderKey: { authorTimestampMs: 1_000n + BigInt(index), authorId: bytes(0x50), txId: bytes(0x10 + index) },
     orderIndex: index,
     outcome: 'accepted',
     rejectionCode: null,
     failingStatementIndex: null,
     authorId: bytes(0x50),
     authorTimestampMs: 1_000n + BigInt(index),
-    authorFeedSequence: BigInt(index + 1),
+    operationId: `operation-${index}`,
     candidateDigest: bytes(0x60 + index),
     canonicalCandidate: bytes(0x70 + index, 16),
     ...overrides,
-  } as TransactionLogRow
+  }
 }
 
 const hex = (value: Uint8Array): string => Buffer.from(value).toString('hex')
@@ -50,7 +50,7 @@ describe('materializedLogDigest', () => {
     ['orderIndex', { orderIndex: 9 }],
     ['authorId', { authorId: bytes(0xee) }],
     ['authorTimestampMs', { authorTimestampMs: 5_000n }],
-    ['authorFeedSequence', { authorFeedSequence: 99n }],
+    ['operationId', { operationId: 'changed-operation' }],
     ['candidateDigest', { candidateDigest: bytes(0xee) }],
     ['canonicalCandidate', { canonicalCandidate: bytes(0xee, 16) }],
     ['outcome', { outcome: 'rejected' }],

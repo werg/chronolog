@@ -383,6 +383,15 @@ describe('CapabilityMembershipResolver watermark policy', () => {
     expect(await resolverFor(snapshot(), { maximumWatermarkValidators: 2 }).watermarkPolicy(core())).toBeNull()
   })
 
+  it('keeps exact candidate policy separate from the complete revision policy set', async () => {
+    const value = snapshot()
+    const lowerPolicy = { id: bytes(0x22), policy: policy({ minimumValidators: 1n }), installedAtRevision: 2n }
+    const resolver = resolverFor({ ...value, policies: new Map([...value.policies, [bytesToHex(lowerPolicy.id), lowerPolicy]]) },
+      { finalityRevisions: () => [{ membershipRevision: revisionDigest, authorTimeAfterMs: -1n }] })
+    expect((await resolver.watermarkPolicy(context()))?.threshold).toBe(2)
+    expect((await resolver.admissionScopes({ groupId }))?.[0]?.policies.map(item => item.threshold)).toEqual([2, 1])
+  })
+
   it('enumerates every authenticated policy for a safe global live frontier', async () => {
     const two = snapshot(), one = { id: unknownPolicyId, policy: policy({ minimumValidators: 1n }), installedAtRevision: 1n }
     const value = { ...two, policies: new Map([...two.policies, [bytesToHex(one.id), one]]) }
@@ -398,5 +407,24 @@ describe('CapabilityMembershipResolver watermark policy', () => {
     revisions = [{ membershipRevision: otherRevisionDigest, authorTimeAfterMs: -1n }]
     expect(await resolver.admissionScopes({ groupId })).toBeNull()
     expect(await resolverFor(value).admissionScopes({ groupId })).toBeNull()
+  })
+})
+
+describe('CapabilityMembershipResolver possible admission', () => {
+  it('keeps an existing partial vote plus an eligible open validator possible', async () => {
+    const resolver = resolverFor(snapshot())
+    const evidence = { attestations: [attestation(capabilities.validator0)], openValidatorIds: [validatorKeys[2]] }
+    expect(await resolver.canStillAdmit({ ...context(), authorTimestampMs: 5_000n }, evidence)).toBe(true)
+    expect(await resolver.canStillAdmit({ ...context(), authorTimestampMs: 5_000n }, { ...evidence, openValidatorIds: [] })).toBe(false)
+  })
+
+  it('uses the pinned policy, active grants and grant timestamp floors without counting one signer twice', async () => {
+    const resolver = resolverFor(snapshot())
+    const existing = [attestation(capabilities.validator0)]
+    const atGrantFloor = { ...context(), authorTimestampMs: 1_000n }
+    expect(await resolver.canStillAdmit(atGrantFloor, { attestations: existing, openValidatorIds: [validatorKeys[0], validatorKeys[1], revokedValidatorKey] })).toBe(false)
+    expect(await resolver.canStillAdmit({ ...atGrantFloor, authorTimestampMs: 1_001n }, { attestations: existing, openValidatorIds: [validatorKeys[1]] })).toBe(true)
+    expect(await resolver.canStillAdmit({ ...context(), validationPolicy: unknownPolicyId, authorTimestampMs: 5_000n },
+      { attestations: [], openValidatorIds: [] })).toBe(true)
   })
 })

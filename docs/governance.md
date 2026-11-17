@@ -444,15 +444,17 @@ validator. The frontier accounts for each pending proposal's own policy and
 revision, every allowed admission policy, and complete indexed feed prefixes.
 Once the revoke is final, no later admission can be inserted before it.
 
-`TransactionHandle.settled()` reports the materialized outcome at the
-transaction's **current position** and does not wait for finality.
-`accepted()` waits for locally applied immutable acceptance and throws on final
-rejection; `final()` returns either immutable outcome. External
-effects consume final events and retain their own dispatch checkpoint and
-idempotency key. Settlement evidence explains pending proof and admission
-blockers; a raw cutoff or an accepted speculative outcome does not establish
-finality. The common timestamp order and replay primitives do not themselves
-require finality; these readers and effects belong to the live history policy.
+`TransactionHandle.provisional()` reports the materialized outcome at the
+transaction's **current position**, which can still change during replay.
+`final()` waits for an immutable accepted or rejected outcome after the required
+evidence and prefix are locally applied. `accepted()` additionally checks final
+acceptance and throws on final rejection. Use these public waits for dependent
+intent and external-effect authorization. External effects consume final events
+and retain their own dispatch checkpoint and effect idempotency key. Settlement
+evidence explains pending proof and admission blockers; applications use the
+public waits instead of reconstructing the finality predicate. The timestamp
+order and replay primitives do not themselves require finality; final readers
+and effects belong to a history policy that supplies a finality provider.
 
 Group capability revocations are signed control records. A new membership
 revision takes effect after its verified closed-time boundary; authorization
@@ -462,7 +464,8 @@ final result. A newer revision's heartbeat cannot close an older revision.
 Complete revision-closure evidence must expose the earlier admissions and
 their authenticated feed prefixes first. If a pending proposal can no longer
 obtain its required proof, it receives the terminal rejection
-`ADMISSION_CLOSED`. Missing bodies or keys remain blocked inputs while they can
+`FINALITY_TIMESTAMP_CLOSED` (closed admission time) or `ADMISSION_IMPOSSIBLE`
+(an unsatisfiable admission policy). Missing bodies or keys remain blocked inputs while they can
 still arrive. Retrying exact signed bytes preserves their identity and time;
 an intentional new attempt creates a new operation.
 

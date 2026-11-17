@@ -1,6 +1,7 @@
 import { createSha256, utf8 } from '@chronolog/canonical'
 
 import { SQL_PROFILE_VERSION } from '../sql-profile.js'
+import { SYSTEM_LOG_SQL } from '../system-log.js'
 
 import { PLATFORM_TABLES_SQL, PLATFORM_VIEWS_SQL } from './schema.js'
 import { platformTriggers, type TableShape } from './tables.js'
@@ -10,7 +11,7 @@ import { platformTriggers, type TableShape } from './tables.js'
  * any change to what an operation checks or writes: the platform code decides
  * replicated state, so replicas must run the same version.
  */
-export const PLATFORM_CODE_VERSION = 'chronolog-platform-ops-v8-change-program-v3-events-v1'
+export const PLATFORM_CODE_VERSION = 'chronolog-platform-v9-proposal-order-v2'
 
 /** A fixed table that exercises the trigger generator (composite key, odd names, a cap column). */
 const REFERENCE_TABLE: TableShape = {
@@ -32,7 +33,7 @@ export function computePlatformDigest(): Uint8Array {
   hash.update('chronolog-platform-digest-v2\n')
   hash.update(`${PLATFORM_CODE_VERSION}\n`)
   hash.update(`${SQL_PROFILE_VERSION}\n`)
-  for (const sql of [...PLATFORM_TABLES_SQL, ...PLATFORM_VIEWS_SQL, ...platformTriggers(REFERENCE_TABLE).map((trigger) => trigger.sql)]) {
+  for (const sql of [SYSTEM_LOG_SQL, ...PLATFORM_TABLES_SQL, ...PLATFORM_VIEWS_SQL, ...platformTriggers(REFERENCE_TABLE).map((trigger) => trigger.sql)]) {
     hash.update(`${utf8(sql).length}\n${sql}\n`)
   }
   return Uint8Array.from(hash.digest())

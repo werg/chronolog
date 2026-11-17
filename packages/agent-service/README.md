@@ -6,7 +6,8 @@ depend on model turns. Provider calls stay in trusted application modules;
 Chronolog's execution and UI replay never call them.
 
 Start with the [application primitives guide](../../docs/application-primitives.md)
-for the choice between signals, durable events and SQL, and for the separate
+for the choice between live signals, atomic programs, durable facts and captured
+views, and for the separate
 membership, finality and external-effect roles.
 
 ## Run the native profile
@@ -30,9 +31,9 @@ creates the ordinary peer profile for a new daemon.
 The `coordinated` configuration selects a signed-inclusion provider; it never
 changes application ordering. Every replica executes proposals by their signed
 author timestamp and the protocol's deterministic tie-breakers. Its genesis
-records one history ID and the daemon's persistent signing key as finality
-authority. Another enrolled node does not become that authority
-unless its key is the one that genesis explicitly names. The daemon uses its
+records one history ID and the daemon's persistent signing key as the finality
+signer. Another enrolled node does not acquire that role unless its key is the
+one that genesis explicitly names. The daemon uses its
 existing fenced data directory and FULL-synchronous SQLite operation store.
 `CHRONOLOG_FINALITY_RECORD_QUOTA_BYTES` bounds retained descriptors and closure records;
 `CHRONOLOG_FINALITY_PAYLOAD_QUOTA_BYTES` separately bounds detached application
@@ -204,8 +205,11 @@ export function createAgent(): AgentApplication {
 }
 ```
 
-`provider` and `policy` in this sketch are application-owned integrations. A
-policy denial returns an explicit result before calling the provider. Throwing
+`provider` and `policy` in this sketch are application-owned
+integrations. The policy uses authenticated original-author provenance and
+validated application data, never a claimed payload role. A narrowly scoped
+intent-topic grant may itself be the explicit delegation for an action; a
+subscription alone grants no new permission. A policy denial returns an explicit result before calling the provider. Throwing
 after entering dispatch is treated as an uncertain provider outcome. The runnable
 `examples/resident-agent.ts` module reads shared final task rows and formats a
 bounded `job.completed`/`job.failed` result without an external provider. It is
@@ -215,7 +219,7 @@ stable request event in `originEventId`. Browser grants allow `job-requests`;
 only the designated native worker receives `job-results` publication rights.
 
 The context supplies the public node, atomic private store, final event
-publisher, optional finality service, live `context.signals`, and authenticated
+publisher, optional `context.finality` service, `context.signals`, and authenticated
 peer connection setup. The module is trusted native code. Keep credentials,
 private model context, and private workflow state in its local store or another
 explicitly authorized group; topic filtering is not confidentiality.
@@ -272,6 +276,32 @@ remains `dispatching`; a late completion is not published by the stopped worker.
 Timeout or cancellation does not prove that the external action was prevented,
 so the same explicit recovery policy still applies on restart.
 
+The complete input event, including verified `origin`, is checkpointed with the
+pending batch. Restart or provider reconciliation cannot substitute a relay's
+identity or a role claimed by the payload. The source must be a trusted final
+event source; shape validation inside the worker does not independently verify
+the source's cryptographic history.
+
+Result publication can itself be finally rejected after the provider has
+completed, for example when its prepared proposal misses the admission window.
+A trusted `FinalEventPublisher` reports that proof with
+`FinalEventPublicationRejectedError(proposalId, rejectionCode)`; transport errors,
+lost replies and cancelled waits must not use this error. The worker preserves
+the provider result and enters `publication-rejected`. `status()` includes the
+current publication operation ID, attempt number and rejection audit. Restart
+keeps that paused state and does not call the provider or publish another attempt.
+
+After reviewing the rejection and correcting its cause, call
+`await worker.retryPublication(effectId)`. It durably allocates a new publication
+attempt and returns its operation ID. Resume `processNext()` or `run()` to publish
+the saved result under current authorization. This method is unavailable while
+a publication is ambiguous; those retries preserve the original operation ID.
+A lost reply while allocating an attempt is recovered through `status()`, without
+allocating another identity. An effect permits at most 64 publication attempts.
+The final `effect.completed` v2 envelope includes `publication.attempt` and
+`publication.rejections`, so completing its checkpoint does not erase the audit.
+The worker checkpoint is v4 and rejects earlier formats directly.
+
 One designated worker owns each handler. A changed handler version, topic filter,
 or source cannot silently reuse its checkpoint. Pure UI caches may rebuild;
 discarding an external-effect checkpoint can repeat actions and requires an
@@ -312,7 +342,7 @@ const publisher = createSqlTimerPublisher({
   occurrenceTopic: 'timers.fired',
 });
 
-// Run after the resident authority/replication loops have started. Persist these
+// Run after the resident finality/replication loops have started. Persist these
 // operation IDs with the reviewed requests; do not mint new IDs on retry.
 await publisher.initialize({ operationId: 'timer-schema-1', signal });
 const proposalId = await publisher.schedule({
@@ -326,7 +356,7 @@ await publisher.cancel({ timerId: 'review-reminder', generation }, {
 
 These methods return the original proposal ID only after final acceptance and
 throw `SqlTimerRejectedError` for final rejection. They use ordinary public
-`node.publish`, `node.operation`, and `node.revisions`; no private authority
+`node.publish`, `node.operation`, and `node.revisions`; no private finality
 hooks or local acceptance shortcut is used. Schema initialization is an explicit
 one-time application program under a stable operation ID. The default tables are
 `agent_timer_heads`, `agent_timer_generations`, and `agent_timer_occurrences`;
@@ -349,6 +379,29 @@ waits and retains an unfinished occurrence for exact retry. Do not await final
 publication from `createAgent` before the daemon starts its resident loops.
 Event-only groups can use the smaller `TimerOccurrencePublisher` port with their
 own defined atomic acceptance model; they cannot use the SQL implementation.
+
+Timer publication uses the same recovery distinction as effect results.
+`SqlTimerRejectedError` extends `FinalEventPublicationRejectedError`: it proves
+a final outcome, whereas a lost reply does not. A proved rejection leaves
+`status().pending.stage === 'publication-rejected'`, with the original occurrence,
+observed time, operation ID and rejection audit intact. Correct the cause, then
+call `retryPublication(occurrenceId)` and resume `tick()` or `run()`. The new
+attempt retains the logical occurrence ID, generation, due time and payload;
+its guarded program checks the current final history again. It cannot revive a
+cancelled generation or emit an already accepted occurrence. The scheduler never
+executes the requested outside action itself.
+
+`status().pending.publicationOperationId` recovers an uncertain reply from
+attempt allocation. An ambiguous publication error retains that exact attempt;
+it does not permit `retryPublication`. Each occurrence permits at most 64
+publication attempts. `timer.fired` version 2 includes prior rejected attempts.
+`publicationStatus(occurrenceId)` also retains the original configuration event
+and authenticated requester, the local attempt audit, and
+terminal `accepted` or `cancelled` outcome, including cancellation that correctly
+emits no occurrence. These records belong to the durable operation store and its
+storage quota; they are diagnostic evidence, not application events. The timer
+checkpoint format is version 3 with no migration fallback. Run only one active
+scheduler for a checkpoint; the method mutex does not create a distributed lease.
 
 The application-supplied occurrence publisher receives `configurationOrigin`
 alongside the active generation and requested action. Use the original author,
@@ -377,12 +430,13 @@ an external call atomic with a later cancellation.
 
 The default browser/native composition uses independent reliable and live data
 channels from [`@chronolog/transport-webrtc`](../transport-webrtc/README.md). The
-page negotiates one connection and synchronously transfers both untouched
-channels to the exclusive replica Worker. The Worker frames them, awaits the
-bounded reliable handshake, then authenticates the Chronolog peer and attaches
-replication. Signals use the separate unordered datagram lane after the same
-authentication; a large body or exhausted history credit cannot queue a signal
-behind durable replication. A reliable-only stream has no implicit signal path.
+page synchronously transfers both untouched channels to the exclusive replica
+Worker. The Worker frames them, awaits readiness, authenticates the peer and
+attaches replication. Signals use the separate unordered datagram lane after
+the same authentication, so a large body or exhausted history credit cannot
+queue them behind replicated records. Both lanes share the network connection
+and its bandwidth; this provides queue isolation, not reserved capacity. A
+reliable-only stream has no implicit signal path.
 A reachable resident accepts one direct HTTPS offer/answer; optional Tendriller
 rendezvous requires both endpoints to join the same attempt. Neither introduction
 path carries application frames or supplies an automatic hosted data fallback.
@@ -403,7 +457,7 @@ original authors; endpoint and record identities remain distinct.
 
 Normal disconnect, revocation and bad peer data retire that session;
 `session.completion` and `onError` report it without stopping unrelated peers or
-authority work. Resident task failures and storage failures remain service-fatal.
+finality work. Resident task failures and storage failures remain service-fatal.
 
 `FeedLink.head(feed)` and `evidenceHead()` report retained availability as
 nonnegative integer positions. They do not certify ordering or finality.
@@ -431,28 +485,29 @@ The native `FeedTransport` exports `asLink()`, `connectLink()`,
 connections share the same signed record store. The portable browser transport
 uses `asLink()` and `connect()`. The daemon module context exposes `signals` on every governed replica and
 `finality` only when it owns the signed native provider.
-`connectPeer({ connection, peerIdentity? })` performs active reader authorization,
-attaches replication and the connection's optional live signal lane, and returns a session with an
+`connectPeer({ connection, peerIdentity?, signal? })` performs active reader authorization,
+attaches replication and the connection's optional live route, and returns a session with an
 `AbortSignal`, `completion` and `close()`. No writer grant or callback injection is
-needed to receive signals. Sending selects the currently active writer credential
-for that topic at the time of publication. `connect()` and `connectLink()` return a detach function bound to that
+needed to receive signals. Sending checks the original signer
+against currently verified signal-topic rights. `connect()` and `connectLink()` return a detach function bound to that
 connection. Session owners use it on completion or close: delayed cleanup from an
 old route cannot remove a replacement connection for the same identity. The
 explicit `disconnect(identity)` / `disconnectLink(identity)` methods deliberately
 remove whichever connection currently owns that identity.
 
-Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
-use `chronolog/signal/v1`. The reliable lane multiplexes scalar availability-head
-responses, bounded range responses, content-addressed payload responses and change hints. Best-effort signals use
-the separately bounded `connection.live` lane after the same peer authentication;
-a reliable-only connection provides replication without advertising a signal route.
-Signals cannot hold up retained range handling. At most eight signal callbacks run per
-connection; excess live frames are dropped before admission while durable
-replication continues. An admitted frame that fails authentication or protocol
-validation still terminates its session. There are at most four pending requests in either direction and each
-range is bounded to 64 records / 64 MiB. The event program limit normally makes
-actual batches considerably smaller. Connections require deployment measurement
-before making direct-connect, relay-bandwidth, or cost claims.
+Peer frames use canonical CBOR with domain `chronolog/peer/v1`; live frames use
+`@chronolog/signals`' independent `signal/1` envelope. Availability-head responses,
+reliable ranges, detached bodies and change hints share the reliable lane. Signals
+use `connection.live`; a reliable-only connection installs no signal route.
+At most eight signal callbacks run per connection; additional datagrams are
+refused before application admission and cannot block reliable work. Invalid
+or denied application messages do not retire a valid reader's session. Reader
+revocation and actual transport failure do. A safe pre-dispatch congestion
+refusal reports `signal_route_backpressure`, retains the healthy route, and
+never queues the old signal for retry. There are at most four pending retained
+requests in either direction, and a range is bounded to 64 records / 64 MiB.
+Connections require deployment measurements before direct-connect, bandwidth
+or cost claims.
 
 `openAuthenticatedPeerLink` separates four deadline options:
 
@@ -477,36 +532,42 @@ expiry fails the session and rejects its pending requests. Completion, remote
 errors, cancellation and session failure clear every request timer. Reconnection
 resumes from retained verified history with the original operation identities.
 
-## Live signals
+A closed, replaced or revoked-reader connection ends only its session. Its
+completion reason remains available for diagnostics; it does not stop the
+resident's membership endpoint, finality service or other authenticated peers.
+An unexpected local storage or invariant failure remains an owner failure and
+must not be mistaken for an ordinary peer departure.
 
-Native application modules use `context.signals.send(topic, payload, { ttlMs })`
-and `context.signals.subscribe({ topics, mode, signal })`. The public
-`ChronologClient.signals` uses the same interface through native or Worker RPC.
-`context.connectPeer()` automatically attaches signal routes when the framed
-connection supplies its separate `live` lane, and the resident
-forwards verified original frames to its other current readers. Application code
-no longer constructs a separate channel or hand-wires forwarding. Connection
-completion and shutdown detach the exact route that owns the session.
+## Live application signals
 
-The default `mode: 'all'` preserves accepted messages in a bounded FIFO and raises
-`SIGNAL_SUBSCRIPTION_OVERFLOW` when a subscriber falls behind. Choose
-`mode: 'latest'` for replaceable presence/cursor values per author, session and
-topic. Messages expire, have no catch-up history, and never advance a durable
-cursor or trigger a finality wait. TTL begins at the original `send()` call,
-including queued work. No route means immediate `SIGNAL_ROUTE_UNAVAILABLE`; the client
-never retries sends or reconnects subscriptions behind the application's back.
+Use `context.signals.send(topic, payload, { ttlMs?, signal? })` and
+`context.signals.subscribe({ topics?, mode?, signal? })` for live application work.
+`all` is bounded FIFO; `latest` explicitly coalesces author/session/topic values.
+Overflow ends that subscription with `signal_subscription_overflow`. TTL begins
+at the original send call and is unchanged by authorization, dispatch or relay
+delay. No live route means immediate `signal_disconnected`. No signal enters a
+durable outbox, creates an operation or advances an event cursor. Each send is
+one attempt; a lost reply is not automatically resent. A failed preview must not
+block a separate durable completion.
 
-The group adapter checks independent current `program.signals` rights; a
-signal-only grant may set `sql: false` and `topics: []`. Reading alone does not
-allow sending. A reader needs no writer grant to subscribe. Peer links recheck
-recipient reader access before signal release, including after asynchronous
-work. An offline peer cannot know a revocation it has not received.
+Both resident `context.connectPeer()` and browser `peer.connectPeer()` use the
+shared `createGovernedPeerService()` composition: active reader admission, record
+attachment, live signal routes, verified original-message relay, and connection
+cleanup. `ChronologClient.signals` exposes the same interface through native or
+Worker RPC. Applications do not manually forward packets or repeat capability
+checks. A retained service subscription can survive an individual peer route
+closing, while losing its owning RPC transport terminates that RPC subscription.
+Caller abort ends iteration normally. Reconnecting has no signal replay.
+Signal-topic rights authorize the original author independently of SQL and
+durable-event rights. A reader-only
+peer may receive without being allowed to send.
 
-The standalone [`@chronolog/signals`](../signals/README.md) package provides
-`SignalChannel` for applications without a database. Its caller supplies scope,
-identity, byte transport and an explicit authorization callback. Credentials are
-optional and opaque; there is no SQL, membership, log, finality or authority
-prerequisite. The group integration is one policy adapter over that core.
+The standalone [@chronolog/signals package](../signals/README.md) has no database,
+protocol-record, grant or finality dependency. `createCapabilitySignals()` from `@chronolog/capabilities` is its
+small explicit membership adapter. It uses already verified local governance;
+an offline receiver cannot know a revocation it has not received. A signature
+proves sender and bytes, not permission to issue an external instruction.
+Confidentiality and recipient admission belong to the encrypted live route.
 
 ## Signed membership ledger endpoint
 
@@ -514,8 +575,8 @@ prerequisite. The group integration is one policy adapter over that core.
 `@chronolog/agent-service/membership-http`, serves exact `POST /_chronolog/membership`
 requests as raw canonical CBOR. Each request is signed by the genesis roster root
 and binds the group, exact history configuration, request, nonce and short expiry.
-The native authority key remains separate. The daemon mounts this handler only
-when it hosts the group's pinned native authority. The ordinary owner RPC bearer
+The finality signer remains separate. The daemon mounts this handler only
+when it hosts the group's pinned native finality service. The ordinary owner RPC bearer
 does not authorize this route; its independently verified signature does.
 
 Reads return consecutive finalized controls, the signed cumulative projection
@@ -538,7 +599,7 @@ Focused tests cover native fencing/reopen, lost append responses, visible quotas
 continuity refusal, peer evidence relay, worker crash ambiguity and reconciliation,
 checkpoint atomicity, timer generations and lost responses, signed signal replay,
 framing/backpressure, and native/portable framed range exchange. The daemon
-composition test runs the actual governed event-only core, authority and worker.
+composition test runs the actual governed event-only core, finality service and worker.
 The framed native test uses no SSB listener/NAT and stubs only optional host
 interface discovery. These tests do not qualify home/mobile/corporate networks,
 browser suspension, provider-specific idempotency, or production relay byte

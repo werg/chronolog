@@ -68,7 +68,7 @@ const MAX_RETAINED_EVIDENCE = MAX_RETAINED_HISTORY_ENTRIES * 2
 const DEFAULT_EVIDENCE_QUOTA_BYTES = 128 * 1024 * 1024
 const MAX_LOCAL_HISTORY_BYTES = 512 * 1024 * 1024
 
-export interface CoordinatedHistoryStorageOptions {
+export interface SignedInclusionStorageOptions {
   readonly quotaBytes?: number
 }
 
@@ -210,7 +210,7 @@ export function decodeOrderingEvidence(bytes: Uint8Array): OrderingEvidence {
  * certificates. Receipt order enumerates inclusion evidence only. Application
  * finality additionally requires the independently signed closure markers.
  */
-export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
+export class SignedInclusionFinalityProvider implements LiveInclusionFinalityProvider {
   readonly #configuration: CoordinatedHistoryConfiguration
   readonly #store: DurableOperationStore
   readonly #key: string
@@ -224,6 +224,7 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
   #progress: CoordinatedProgress
   #finality: SignedInclusionSnapshot
   #prefix: VerifiedFinalityPrefix
+  #storageUncertain = false
 
   private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, prefix: VerifiedFinalityPrefix, quotaBytes: number) {
     this.#configuration = structuredClone(configuration)
@@ -237,12 +238,12 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
   }
 
   static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore,
-    options: CoordinatedHistoryStorageOptions = {}): Promise<CoordinatedHistoryPolicy> {
+    options: SignedInclusionStorageOptions = {}): Promise<SignedInclusionFinalityProvider> {
     configuration = structuredClone(configuration)
     encodeHistoryConfiguration(configuration)
     const quotaBytes = options.quotaBytes ?? DEFAULT_EVIDENCE_QUOTA_BYTES
     if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1024 || quotaBytes > MAX_LOCAL_HISTORY_BYTES) throw new Error('HISTORY_STORAGE_QUOTA_INVALID')
-    const policy = new CoordinatedHistoryPolicy(configuration, store, await VerifiedFinalityPrefix.empty(configuration), quotaBytes)
+    const policy = new SignedInclusionFinalityProvider(configuration, store, await VerifiedFinalityPrefix.empty(configuration), quotaBytes)
     const saved = await store.get(policy.#key)
     if (saved !== null) {
       if (saved.length > quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
@@ -314,6 +315,7 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
     if (!Array.isArray(evidence) || evidence.length > 129) throw new Error('HISTORY_EVIDENCE_BATCH_INVALID')
     const captured: readonly OrderingEvidence[] = structuredClone(evidence)
     return this.#mutex.run(async () => {
+      if (this.#storageUncertain) throw new Error('HISTORY_STORAGE_UNCERTAIN_REOPEN_REQUIRED')
       const entries = new Map([...this.#entries].map(([position, alternatives]) => [position, new Map(alternatives)]))
       const certificates = new Map(this.#certificates)
       let changed = false
@@ -336,7 +338,15 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
         1n, encodeHistoryConfiguration(this.#configuration), all.map(encodeOrderingEvidence),
       ])
       if (persisted.length > this.#quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
-      await this.#store.put(this.#key, persisted)
+      try { await this.#store.put(this.#key, persisted) }
+      catch (error) {
+        // The new certified prefix may be durable even when its acknowledgment
+        // is lost. An old in-memory proof set must never overwrite it. Retain
+        // the last confirmed read snapshot, but require reopening before any
+        // further ingestion or exact retry can change the retained evidence.
+        this.#storageUncertain = true
+        throw error
+      }
       this.#entries = entries
       this.#certificates = certificates
       this.#selectedEntries = selectedEntries
@@ -438,9 +448,6 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
     }
   }
 }
-
-/** Preferred name: this provider certifies inclusion and closes author time. */
-export { CoordinatedHistoryPolicy as SignedInclusionFinalityProvider }
 
 function allEntries(entries: ReadonlyMap<number, ReadonlyMap<string, OrderedRecordEntry>>): OrderedRecordEntry[] {
   const result: OrderedRecordEntry[] = []

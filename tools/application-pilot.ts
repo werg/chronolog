@@ -41,7 +41,7 @@ await mkdir(resolve(output, '..'), { recursive: true })
 await mkdir(output) // Never mix an earlier run's assets or evidence into this run.
 const deployment = join(output, 'deployment'), pages = join(output, 'pages')
 await mkdir(deployment)
-const report = { format: 'chronolog-application-pilot/v2', status: 'building', passed: false,
+const report = { format: 'chronolog-application-pilot/v3', status: 'building', passed: false,
   startedAt: new Date().toISOString(), command: process.argv.slice(1), checks: [] as string[],
   revisions: { chronolog: gitState(workspace), contrib: gitState(contrib), tendrillerRuntime: gitState(runtime) },
   publicArtifacts: {} as Record<string, unknown>, counts: { effectDispatches: 0, hostApplicationRequests: 0, hostApplicationWrites: 0 },
@@ -127,7 +127,7 @@ try {
         })) })
       readInclusions = observeIncludedProposals(native)
       await accepted(await native.client.submit(program(sqlStatement("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL CHECK(status IN ('open','done'))) STRICT")), { operationId: 'pilot-schema' }))
-      const team = await native.client.ownership.createTeam({ invite: [...registrations.values()].map(value => base64UrlToBytes(value.identity.identity)) }, { idempotencyKey: 'pilot-team' })
+      const team = await native.client.ownership.createTeam({ invite: [...registrations.values()].map(value => base64UrlToBytes(value.identity.identity)) }, { operationId: 'pilot-team' })
       await accepted(team.handle)
       await accepted(await native.client.submit(program(sqlStatement(`INSERT INTO tasks (id, title, claimed_by, status, chronolog_owner) VALUES (?, ?, NULL, 'open', ${OWNER_FOR_KEY_SQL})`,
         ['task-1', 'Review the shared inspection evidence', team.id])), { operationId: 'pilot-task' }))
@@ -305,6 +305,7 @@ try {
     await Promise.all(all.map(page => browserHasProposal(page, delayed.proposalId)))
     await expect(compact.locator('#conversation')).toContainText('A note whose append reply is delayed')
     await expect(board.locator(`#operations > li[data-operation="${delayed.operationId}"]`)).toHaveAttribute('data-status', 'final')
+    await expect(board.locator(`#operations > li[data-operation="${delayed.operationId}"]`)).toHaveAttribute('data-outcome', 'accepted')
     await board.locator('#message').fill('Newer unsent text must survive')
     await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.releaseSubmission())
     await expect(board.locator('#send')).toBeEnabled()
@@ -326,6 +327,7 @@ try {
     assert.equal(await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.identity), identities[0])
     await Promise.all(all.map(page => browserHasProposal(page, interrupted.proposalId)))
     await expect(board.locator(`#operations > li[data-operation="${interrupted.operationId}"]`)).toHaveAttribute('data-status', 'final')
+    await expect(board.locator(`#operations > li[data-operation="${interrupted.operationId}"]`)).toHaveAttribute('data-outcome', 'accepted')
     const recovered = await board.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), interrupted.operationId)
     assert.equal(recovered?.proposalId, interrupted.proposalId)
     await expect(compact.locator('#conversation')).toContainText('One original intent across abrupt reload')

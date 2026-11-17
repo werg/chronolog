@@ -1,3 +1,5 @@
+import { DEFAULT_SIGNAL_TTL_MS, MAX_SIGNAL_TTL_MS, SignalError,
+  type Signals, type SignalPayload, type SignalSendOptions, type SignalSubscribeOptions, type EphemeralSignal } from '@chronolog/signals'
 import {
   base64UrlToBytes,
   bytesToBase64Url as toBase64Url,
@@ -21,11 +23,13 @@ import {
   type EventPayload,
   type EventBatch,
   type EventReadOptions,
-  type ViewChange, type ViewChangeOptions,
+  type ApplicationChange,
+  type ApplicationChangeOptions,
 } from '@chronolog/protocol'
 import {
   ChronologRpcError,
   isChronologRpcError,
+  toChronologRpcError,
   type ApproveEnrollmentResponse,
   type CreateEnrollmentResponse,
   type EnrollmentRole,
@@ -52,7 +56,6 @@ import {
   type OpenReadViewResponse,
   type SubmitChangeResponse,
 } from '@chronolog/rpc'
-import type { EphemeralSignal, SignalPayload, Signals, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
 
 import {
   decodeLocalSqlResult,
@@ -105,8 +108,8 @@ export interface LiveQueryValue {
 
 export interface TransactionOptions {
   readonly signal?: AbortSignal
-  /** Repeating a key with the same steps returns the original submission. */
-  readonly idempotencyKey?: string
+  /** Durable application identity. A generated identity is returned on the handle when omitted. */
+  readonly operationId?: string
 }
 
 export interface ChangeOptions { readonly operationId: string; readonly signal?: AbortSignal }
@@ -138,11 +141,11 @@ export type TransactionStatementInput = string | CompiledSqlStatement | SqlState
 export type TransactionStepInput = TransactionStatementInput | PlatformOp | EmitStep
 
 /** A current accepted/rejected result; it may still change through replay. */
-export type SettledTransactionOutcome = TransactionOutcome & {
+export type ProvisionalTransactionOutcome = TransactionOutcome & {
   readonly outcome: Exclude<TransactionOutcome['outcome'], { readonly type: 'pending' }>
 }
 /** The immutable accepted/rejected result applied on this replica. */
-export type FinalTransactionOutcome = SettledTransactionOutcome & { readonly final: true }
+export type FinalTransactionOutcome = ProvisionalTransactionOutcome & { readonly final: true }
 export type AcceptedTransactionOutcome = FinalTransactionOutcome & {
   readonly outcome: Extract<TransactionOutcome['outcome'], { readonly type: 'accepted' }>
 }
@@ -164,8 +167,8 @@ export class TransactionHandle {
   get proposalId(): string { return this.submission.transactionId }
 
   /** The current speculative result. Replay can change this until final() resolves. */
-  settled(options: { readonly signal?: AbortSignal } = {}): Promise<SettledTransactionOutcome> {
-    return this.#waitForOutcome((value): value is SettledTransactionOutcome => value.outcome.type !== 'pending', options.signal)
+  provisional(options: { readonly signal?: AbortSignal } = {}): Promise<ProvisionalTransactionOutcome> {
+    return this.#waitForOutcome((value): value is ProvisionalTransactionOutcome => value.outcome.type !== 'pending', options.signal)
   }
 
   /** Resolves only when the accepted or rejected result is applied in the immutable prefix. */
@@ -235,14 +238,15 @@ export class ChronologClient {
   readonly #abort = new AbortController()
   #identity: Promise<Uint8Array> | undefined
   #closed = false
+  #observedSignalTime = 0
   /** Sharing, teams and transfers of owned rows; each call submits one transaction. */
   readonly ownership: OwnershipActions = new OwnershipActions(this)
   readonly enrollment: EnrollmentActions = new EnrollmentActions(this)
-  /** One live send attempt; a failed RPC stream is never resumed automatically. */
+  /** Live, lossy messages. Calls never use the durable retry/replay machinery. */
   readonly signals: Signals = {
-    send: (topic, payload, options) => this.#sendSignal(topic, payload, options),
-    subscribe: options => this.#liveSignals(options),
-
+    send: (topic: string, payload: SignalPayload, options: SignalSendOptions = {}): Promise<EphemeralSignal> =>
+      this.#sendSignal(topic, payload, options),
+    subscribe: (options: SignalSubscribeOptions = {}): AsyncIterable<EphemeralSignal> => this.#liveSignals(options),
   }
   /** At-least-once final batches; never coalesced into snapshot notifications. */
   readonly events = {
@@ -290,14 +294,14 @@ export class ChronologClient {
   }
 
   /** Current applied view, then latest-state invalidations. Reconnects without a history cursor. */
-  changes(options: ViewChangeOptions = {}): AsyncIterable<ViewChange> {
+  changes(options: ApplicationChangeOptions = {}): AsyncIterable<ApplicationChange> {
     const self = this, view = options.view ?? 'final', external = options.signal
     if (view !== 'local' && view !== 'final') throw new TypeError('view must be local or final')
     return { [Symbol.asyncIterator]() {
       if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
       const controller = new AbortController()
       const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(external === undefined ? [] : [external])])
-      const resource = self.#track(new StreamResource<ViewChange>({
+      const resource = self.#track(new StreamResource<ApplicationChange>({
         open: (_cursor, lifetime) => self.#transport.stream('view.changes', { groupId: self.groupId, view },
           self.#callOptions(AbortSignal.any([signal, lifetime]))),
         cursor: () => undefined,
@@ -425,13 +429,15 @@ export class ChronologClient {
    * unless a grant or collective says otherwise.
    */
   async transaction(steps: readonly TransactionStepInput[], options: TransactionOptions = {}): Promise<TransactionHandle> {
+    const requestId = this._requestId()
+    const operationId = options.operationId ?? requestId
     const submission = await this._unary('transaction.submit', {
       groupId: this.groupId,
-      requestId: this._requestId(),
+      requestId,
       steps: steps.map(encodeTransactionStep),
-      ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+      operationId,
     }, options.signal === undefined ? {} : { signal: options.signal })
-    return new TransactionHandle(this, submission)
+    return new TransactionHandle(this, submission, operationId)
   }
 
   async getTransactionOutcome(transactionId: string): Promise<TransactionOutcome> {
@@ -532,6 +538,79 @@ export class ChronologClient {
     await this.#transport.close?.()
   }
 
+  async #sendSignal(topic: string, payload: SignalPayload, options: SignalSendOptions): Promise<EphemeralSignal> {
+    // The caller owns this lifetime, including RPC transit. Wall time carries
+    // the deadline across processes; elapsed time bounds this wait despite rollback.
+    const startedAt = performance.now(), issuedAtMs = this.#signalNow()
+    assertLiveSignalOptions(options, ['ttlMs', 'signal'])
+    if (this.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
+    const ttlMs = options.ttlMs ?? DEFAULT_SIGNAL_TTL_MS
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_SIGNAL_TTL_MS) {
+      throw toChronologRpcError(new SignalError('signal_ttl_invalid'))
+    }
+    const expiresAtMs = issuedAtMs + ttlMs
+    if (!Number.isSafeInteger(expiresAtMs)) throw toChronologRpcError(new SignalError('signal_clock_invalid'))
+    const expired = toChronologRpcError(new SignalError('signal_expired'))
+    const remaining = Math.min(ttlMs - (performance.now() - startedAt), expiresAtMs - this.#signalNow())
+    if (remaining <= 0) throw expired
+    const deadline = new AbortController()
+    const signal = AbortSignal.any([this.#abort.signal, deadline.signal, ...(options.signal === undefined ? [] : [options.signal])])
+    const timer = setTimeout(() => deadline.abort(expired), remaining)
+    try {
+      const result = await dispatchLiveCall(() => this.#transport.unary('signals.send', {
+        groupId: this.groupId, topic, payload, ttlMs, expiresAtMs,
+      }, this.#callOptions(signal)), signal)
+      if (performance.now() - startedAt >= ttlMs || this.#signalNow() >= expiresAtMs) throw expired
+      return result
+    } finally { clearTimeout(timer) }
+  }
+
+  #signalNow(): number {
+    const now = Date.now()
+    if (!Number.isSafeInteger(now) || now < 0) throw toChronologRpcError(new SignalError('signal_clock_invalid'))
+    this.#observedSignalTime = Math.max(this.#observedSignalTime, now)
+    return this.#observedSignalTime
+  }
+
+  #liveSignals(options: SignalSubscribeOptions): AsyncIterable<EphemeralSignal> {
+    assertLiveSignalOptions(options, ['topics', 'mode', 'signal'])
+    const self = this
+    const request = { groupId: this.groupId,
+      ...(options.topics === undefined ? {} : { topics: Array.isArray(options.topics) ? [...options.topics as readonly string[]] : options.topics }),
+      ...(options.mode === undefined ? {} : { mode: options.mode }),
+    }
+    return { [Symbol.asyncIterator]() {
+      if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
+      const controller = new AbortController()
+      const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(options.signal === undefined ? [] : [options.signal])])
+      const iterator = self.#transport.stream('signals.subscribe', request, self.#callOptions(signal))[Symbol.asyncIterator]()
+      let returned = false
+      return {
+        async next() {
+          try {
+            const result = await iterator.next()
+            if (result.done) controller.abort()
+            return result
+          } catch (error) {
+            if (returned || options.signal?.aborted === true) return { done: true as const, value: undefined }
+            controller.abort(error); throw error
+          }
+        },
+        async return() {
+          // Cancel a pending pull before awaiting return; do not reconnect it.
+          returned = true; controller.abort()
+          await iterator.return?.()
+          return { done: true as const, value: undefined }
+        },
+        async throw(error: unknown) {
+          returned = true; controller.abort(error)
+          if (iterator.throw !== undefined) return iterator.throw(error)
+          await iterator.return?.(); throw error
+        },
+      }
+    } }
+  }
+
   #durableEvents(options: EventReaderOptions): AsyncIterable<EventBatch> {
     const request = { groupId: this.groupId, requestId: this._requestId(), ...eventReadOptions(options) }
     const self = this
@@ -545,58 +624,6 @@ export class ChronologClient {
         // Only the next pull advances received progress. Durable processing is
         // the consumer's state/cursor commit, never this in-memory variable.
         cursor = batch.scannedThrough
-      }
-    } }
-  }
-
-  async #sendSignal(topic: string, payload: SignalPayload, options: SignalSendOptions = {}): Promise<EphemeralSignal> {
-    if (this.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
-    const signal = options.signal === undefined ? this.#abort.signal : AbortSignal.any([this.#abort.signal, options.signal])
-    signal.throwIfAborted()
-    // A lost reply must not repeat transient intent or extend its signed expiry.
-    return this.#transport.unary('signals.send', {
-      groupId: this.groupId, topic, payload,
-      ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
-    }, this.#callOptions(signal))
-  }
-
-  #liveSignals(options: SignalSubscribeOptions = {}): AsyncIterable<EphemeralSignal> {
-    const request = { groupId: this.groupId,
-      ...(options.topics === undefined ? {} : { topics: [...options.topics] }),
-      ...(options.mode === undefined ? {} : { mode: options.mode }),
-    }
-    const externalSignal = options.signal
-    const self = this
-    return { [Symbol.asyncIterator]() {
-      if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
-      const controller = new AbortController()
-      const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(externalSignal === undefined ? [] : [externalSignal])])
-      signal.throwIfAborted()
-      // No cursor, persisted outbox or automatic reconnection for live signals.
-      const iterator = self.#transport.stream('signals.subscribe', request, self.#callOptions(signal))[Symbol.asyncIterator]()
-      return {
-        async next() {
-          try {
-            const next = await iterator.next()
-            if (next.done) controller.abort()
-            return next
-          } catch (error) {
-            if (controller.signal.aborted) return { done: true as const, value: undefined }
-            controller.abort(error)
-            throw error
-          }
-        },
-        async return() {
-          // Abort before awaiting return: an in-flight pull must be released too.
-          controller.abort()
-          await iterator.return?.()
-          return { done: true as const, value: undefined }
-        },
-        async throw(error: unknown) {
-          controller.abort(error)
-          await iterator.return?.()
-          throw error
-        },
       }
     } }
   }
@@ -870,6 +897,41 @@ function scanNamedParameters(sql: string): readonly string[] {
 
 async function* mapAsync<A, B>(source: AsyncIterable<A>, map: (value: A) => B): AsyncIterable<B> {
   for await (const value of source) yield map(value)
+}
+
+/** Bound the caller even when an injected transport ignores cancellation. */
+function dispatchLiveCall<T>(dispatch: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const cancelled = () => {
+      signal.removeEventListener('abort', cancelled)
+      reject(isChronologRpcError(signal.reason) ? signal.reason :
+        new ChronologRpcError('cancelled', 'Live signal send was cancelled', { cause: signal.reason, retryable: false }))
+    }
+    if (signal.aborted) { cancelled(); return }
+    signal.addEventListener('abort', cancelled, { once: true })
+    try {
+      void dispatch().then(value => {
+        signal.removeEventListener('abort', cancelled); resolve(value)
+      }, (error: unknown) => {
+        signal.removeEventListener('abort', cancelled)
+        if (signal.aborted) cancelled()
+        else reject(error)
+      })
+    } catch (error) {
+      signal.removeEventListener('abort', cancelled); reject(error)
+    }
+  })
+}
+
+function assertLiveSignalOptions(value: unknown, names: readonly string[]): void {
+  const prototype: unknown = typeof value === 'object' && value !== null ? Object.getPrototypeOf(value) : undefined
+  if (typeof value !== 'object' || value === null ||
+      (prototype !== Object.prototype && prototype !== null) ||
+      Object.keys(value).some(name => !names.includes(name))) {
+    throw new ChronologRpcError('invalid_argument', 'Live signal options have no durable retry or replay fields', {
+      retryable: false, details: { signalCode: 'signal_options_invalid' },
+    })
+  }
 }
 
 function stableClientValue(value: unknown): string {

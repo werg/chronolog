@@ -11,7 +11,7 @@ export interface ChronologEventOrigin {
   readonly operationId: string
   /** Signed ordering timestamp as an exact decimal integer, not delivery time. */
   readonly authorTimestampMs: string
-  /** Canonical unpadded base64url membership revision digest. */
+  /** Canonical unpadded base64url signed membership digest, not a numeric revision. */
   readonly membershipRevision: string
   /** Canonical unpadded base64url signed grant digest; null only for explicit static membership. */
   readonly writerCapability: string | null

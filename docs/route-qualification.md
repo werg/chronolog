@@ -25,7 +25,7 @@ workflow checks out exact public artifact sources, builds the engine and both
 layouts, and preserves reports, screenshots, bundle provenance and
 `route-trace.ndjson`. `--build-only` compiles and audits assets without claiming
 that browser scenarios ran. The runtime report format is
-`chronolog-application-pilot/v2`.
+`chronolog-application-pilot/v3`.
 
 | Boundary | Actual local topology | Responsibility |
 | --- | --- | --- |
@@ -154,6 +154,18 @@ application descriptors and bodies. The current `chronolog-thin-membership/v3`
 gate verifies compact control completeness, zero application receipt bytes at
 the administrator, and fresh Worker grant/key readiness before complete application
 history arrives over RTC. See [the proof contract](membership-control-proofs.md).
+
+The thin-membership native workload holds its fixture authority clock from
+authoring until each original signed proposal has a retained inclusion receipt,
+then releases it before waiting for actual closure and final publication. This
+prevents large-payload signing and local storage scheduling from consuming the
+fixture's admission margin. Snapshots, failure diagnostics and workload results
+record every held window and its exact proposal IDs. Browser device publication
+uses the advancing clock. The native semantic integration instead shares an
+injected author/finality clock and advances it by the signed policy's closure
+lag only after exact original inclusion; its connected and reconnecting device
+holds are recorded too. No proposal is re-authored after timestamp closure, and
+these phase timings are not production finality latency measurements.
 
 ## Deployment qualification
 

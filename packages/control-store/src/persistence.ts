@@ -34,12 +34,16 @@ export function encodeControlStoreSnapshot(snapshot: ControlStoreSnapshot): stri
 }
 
 export function decodeControlStoreSnapshot(text: string): ControlStoreSnapshot {
-  const parsed = decodeTagged(text) as ControlStoreSnapshot
-
-  if (parsed.format !== 'chronolog-control-store/v1') {
+  const parsed = decodeTagged(text)
+  if (!isRecord(parsed) || parsed.format !== 'chronolog-control-store/v2') {
     throw new Error('CONTROL_STORE_UNSUPPORTED_FORMAT')
   }
-  return parsed
+  if ('orderPolicy' in parsed ||
+      typeof parsed.deltaFloor !== 'bigint' || !Array.isArray(parsed.validatorCutoffs) ||
+      !Array.isArray(parsed.candidates) || !parsed.candidates.every(hasCandidateShape)) {
+    throw new Error('CONTROL_STORE_SNAPSHOT_INVALID')
+  }
+  return parsed as unknown as ControlStoreSnapshot
 }
 
 const JOURNAL_CHECKSUM_LENGTH = 16
@@ -54,7 +58,7 @@ const JOURNAL_OPERATION_KINDS = new Set([
 
 /** One journal line: a truncated SHA-256 of the body, a space, the body. */
 export function encodeControlStoreJournalEntry(entry: ControlStoreJournalEntry): string {
-  const body = encodeTagged({ sequence: entry.sequence, operation: entry.operation })
+  const body = encodeTagged({ format: 'chronolog-control-journal/v2', sequence: entry.sequence, operation: entry.operation })
   return `${journalChecksum(body)} ${body}\n`
 }
 
@@ -75,12 +79,30 @@ export function decodeControlStoreJournal(text: string): ControlStoreJournalEntr
       throw new Error('CONTROL_STORE_JOURNAL_INVALID', { cause: error })
     }
     if (
-      !isRecord(value) || typeof value.sequence !== 'bigint' || value.sequence < 1n ||
+      !isRecord(value) || value.format !== 'chronolog-control-journal/v2' ||
+      typeof value.sequence !== 'bigint' || value.sequence < 1n ||
       !isRecord(value.operation) || typeof value.operation.kind !== 'string' ||
-      !JOURNAL_OPERATION_KINDS.has(value.operation.kind)
+      !JOURNAL_OPERATION_KINDS.has(value.operation.kind) ||
+      (value.operation.kind === 'put_candidate' && !hasCandidateShape(value.operation.candidate)) ||
+      (value.operation.kind === 'set_candidate_state' && !isCandidateState(value.operation.state))
     ) throw new Error('CONTROL_STORE_JOURNAL_INVALID')
-    return value as unknown as ControlStoreJournalEntry
+    return { sequence: value.sequence, operation: value.operation } as unknown as ControlStoreJournalEntry
   })
+}
+
+function hasCandidateShape(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.orderKey) ||
+      !(value.canonicalPayload instanceof Uint8Array) || !isCandidateState(value.state)) return false
+  const key = value.orderKey
+  return Object.keys(key).length === 3 &&
+    typeof key.authorTimestampMs === 'bigint' && key.authorTimestampMs >= 0n &&
+    key.authorId instanceof Uint8Array && key.authorId.length > 0 &&
+    key.txId instanceof Uint8Array && key.txId.length > 0
+}
+
+function isCandidateState(value: unknown): boolean {
+  return value === 'pending_validation' || value === 'provisional' || value === 'admissible' ||
+    value === 'unauthorized' || value === 'excluded'
 }
 
 function journalChecksum(body: string): string {

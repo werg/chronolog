@@ -27,15 +27,16 @@ interpret a SQL group's history.
 ## Live signals and peer connections
 
 Both governed browser profiles expose `peer.signals` and
-`peer.connectPeer({ connection, peerIdentity? })`. Supply a ready framed connection,
+`peer.connectPeer({ connection, peerIdentity?, signal? })`. Supply a ready framed connection,
 for example `frameRtcPeerChannels({ reliable, live })` after its `ready` promise
 resolves. Its independent live lane carries signals without waiting for history
 credits or large body transfers. A reliable-only connection carries replication
 and installs no signal route.
 The runtime selects the local reader grant, verifies the remote current reader,
 attaches replication and signals through the same governed service used by native
-peers, and returns `{ peer, signal, completion, close }`. The session's `signal`
-aborts when that exact connection ends. An optional
+peers, and returns `{ peer, signal, completion, close }`. The returned session's `signal`
+aborts when that exact connection ends; the supplied signal owns both opening
+and connected work. An optional
 `peerIdentity` pins a particular endpoint in addition to its group capability.
 The owning Worker retains all keys and signs outgoing messages there.
 
@@ -105,9 +106,12 @@ source/package hashes and raw reports; historical runs retain their own inputs.
 
 The [SQL-free browser gate](../../tools/test-browser-events.ts) serves no engine
 assets and no cross-origin isolation headers. It checks the emitted browser
-bundle for SQL/WASM implementation bytes, connects an actual OPFS Worker to a
-durable native fixed authority through authenticated framed ranges, and checks
-bidirectional final events and cursor delivery. It terminates the Worker both
+bundle for SQL/WASM implementation bytes and connects an actual OPFS Worker to a
+native peer with coordinated finality through the public `peer.connectPeer` API.
+It checks signed FIFO signals in both directions through `ChronologClient` and
+`WorkerRpcTransport`, current topic permissions, cancellation reaching the live
+subscription, and unchanged durable records, finality evidence and event history.
+It also checks bidirectional final events and cursor delivery. It terminates the Worker both
 before and after replacing a projection's state/cursor checkpoint, then verifies
 that recovery reads the whole prior pair or the whole new pair. A separate abrupt
 termination checks a private synchronous cutoff flush. It writes

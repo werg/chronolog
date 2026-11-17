@@ -3,7 +3,7 @@ import { assertEventTopic, canonicalEventPayload, emit, program, sqlStatement, t
 import type { EventPayload } from '@chronolog/protocol'
 import { ChangeSignal } from '@chronolog/records'
 
-import { validateConsumerId } from './event-source.js'
+import { FinalEventPublicationRejectedError, validateConsumerId } from './event-source.js'
 import { validateTimerOccurrence, type TimerOccurrence, type TimerOccurrencePublisher } from './timers.js'
 
 export interface SqlTimerSchedule {
@@ -22,9 +22,10 @@ export interface SqlTimerPublisher extends TimerOccurrencePublisher {
   schedule(value: SqlTimerSchedule, options: SqlTimerChangeOptions & { readonly expectedGeneration: string | null }): Promise<string>
   cancel(value: { readonly timerId: string; readonly generation: string }, options: SqlTimerChangeOptions): Promise<string>
 }
-export class SqlTimerRejectedError extends Error {
-  constructor(readonly proposalId: string, readonly rejectionCode: string | null, readonly failingStatementIndex: number | null) {
-    super(`Timer program rejected: ${rejectionCode ?? 'unknown'}${failingStatementIndex === null ? '' : ` at step ${failingStatementIndex}`}`)
+export class SqlTimerRejectedError extends FinalEventPublicationRejectedError {
+  constructor(proposalId: string, rejectionCode: string | null, readonly failingStatementIndex: number | null) {
+    super(proposalId, rejectionCode)
+    this.message = `Timer program rejected: ${rejectionCode ?? 'unknown'}${failingStatementIndex === null ? '' : ` at step ${failingStatementIndex}`}`
     this.name = 'SqlTimerRejectedError'
   }
 }
@@ -39,8 +40,8 @@ function timestamp(value: number): void {
 /**
  * Concrete native timer publication over the ordinary public SQL + emit model.
  * Configuration, cancellation and occurrence admission all share the same final
- * history. No local clock check, provider action, or Cloudflare authority enters
- * SQL execution. The daemon must keep its authority/replication loops running
+ * history. No local clock check, provider action, or transport relay enters
+ * SQL execution. The daemon must keep its finality/replication loops running
  * while these methods wait for finality.
  */
 export function createSqlTimerPublisher(options: {
@@ -144,7 +145,8 @@ export function createSqlTimerPublisher(options: {
         sqlStatement(`INSERT INTO ${occurrences} (occurrence_id, timer_id, generation, configuration_event_id, scheduled_at_ms, observed_at_ms) VALUES (?, ?, ?, ?, ?, ?)`,
           [occurrence.occurrenceId, occurrence.timerId, occurrence.generation, occurrence.configurationEventId, occurrence.scheduledAtMs, occurrence.observedAtMs]),
         sqlStatement(`UPDATE ${heads} SET next_due_at_ms = CASE WHEN interval_ms IS NULL THEN next_due_at_ms ELSE next_due_at_ms + interval_ms END, active = CASE WHEN interval_ms IS NULL THEN 0 ELSE 1 END WHERE timer_id = ? AND generation = ?`, [occurrence.timerId, occurrence.generation]),
-        emit(occurrenceTopic, { ...occurrence, configurationOrigin: { ...occurrence.configurationOrigin } }),
+        emit(occurrenceTopic, { ...occurrence, configurationOrigin: { ...occurrence.configurationOrigin }, publication: { attempt: occurrence.publication.attempt,
+          rejections: occurrence.publication.rejections.map(rejection => ({ ...rejection })) } }),
       ), changeOptions)
       if (result.outcome.outcome === 'accepted') return 'accepted' as const
       if (result.outcome.rejectionCode === 'assert:timer_inactive_generation') return 'cancelled' as const

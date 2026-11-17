@@ -354,7 +354,7 @@ client finality preflight and the limits of revocation after disclosure.
 transactions:
 
 ```text
-tx_id, order_index, author_id, author_timestamp_ms, author_feed_sequence,
+tx_id, order_index, author_id, operation_id, author_timestamp_ms,
 candidate_digest, canonical_candidate,
 outcome ('accepted' | 'rejected'), rejection_code, failing_statement_index
 ```

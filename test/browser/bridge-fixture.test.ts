@@ -7,14 +7,14 @@ import { NativeAgentStore } from '@chronolog/agent-service'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { createGovernedNode, encodeSignedEnrollmentRequest, loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest } from '@chronolog/node-core'
 import { LedgerRecordError } from '@chronolog/node-core/ledger'
-import { bytesToBase64Url } from '@chronolog/protocol'
+import { base64UrlToBytes, bytesToBase64Url } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { createCertificateFetcher, TendrillerTransport } from '@chronolog/transport-tendriller'
 import { createRecordLogClient } from '@tendriller/core/records'
 import { afterEach, expect, it, onTestFailed } from 'vitest'
 
 import { createBrowserBridgeFixture } from '../../tools/browser-bridge-fixture.js'
-import { connectGovernedBrowserPeer } from './event-connection.js'
+import { openHttpPeerConnection } from './event-connection.js'
 
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
@@ -69,7 +69,10 @@ it('bootstraps the public retained-log bridge before fetching SQL bodies from it
   const peerService = await createGovernedPeerService({ identity: identity.signing, groupId: replica.descriptor.history.groupId,
     activeMembership: () => replica.activeSnapshot, local: transport.asLink(), attach: link => transport.connect(link) })
   cleanup.push(() => peerService.close())
-  const peer = await connectGovernedBrowserPeer({ bootstrap: native.bootstrap, peer: peerService })
+  const peer = await peerService.connectPeer({
+      connection: await openHttpPeerConnection(native.bootstrap.peerUrl, native.bootstrap.peerToken),
+      peerIdentity: base64UrlToBytes(native.bootstrap.nativeIdentity),
+    })
   cleanup.push(() => peer.close())
   observe('fetch retained SQL bodies')
   await transport.catchUp()

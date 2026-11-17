@@ -14,7 +14,8 @@
     "@chronolog/protocol": "workspace:*",
     "@chronolog/rpc": "workspace:*",
     "@chronolog/transport-ssb": "workspace:*",
-    "tsx": "^4.20.3"
+    "tsx": "^4.20.3",
+    "@chronolog/signals": "workspace:*"
   },
   "devDependencies": {
     "@dolthub/doltlite": "0.11.29"

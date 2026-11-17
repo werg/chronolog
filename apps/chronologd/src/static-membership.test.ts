@@ -32,6 +32,7 @@ describe('static membership bootstrap', () => {
     expect(await resolver.canValidate({ ...context, validatorId: validator, validatorCapability: capability })).toBe(true)
     expect(await resolver.canValidate({ ...context, validatorId: validator, validatorCapability: bytes(9) })).toBe(false)
     expect(await resolver.threshold(context)).toBe(1)
+    expect((await resolver.watermarkPolicy?.(context))?.threshold).toBe(1)
     expect(await resolver.policyVersion?.(context)).toBe(4n)
     expect(await resolver.admissionScopes?.({ groupId })).toEqual([{
       membershipRevision, authorTimeAfterMs: -1n, policies: [{

@@ -45,14 +45,21 @@ governance, transaction codec, node orchestration and materializer.
 | --- | --- |
 | Signed messages, transaction and value codecs, execution manifest | `protocol`, `canonical`, `crypto` |
 | Membership: genesis, capability revisions, validation policy | `capabilities` |
+| Independent in-memory live messages with TTL, FIFO/latest delivery and bounded queues | `signals` |
 | Signed feed records, immutable evidence, durable storage ports and replication | `records` |
 | Native authenticated SSB connection and SQLite storage | `transport-ssb` |
-| Optional Tendriller connection and prefix authority composition | `transport-tendriller` |
+| Optional Tendriller connection and signed inclusion/finality service composition | `transport-tendriller` |
 | Node: ingest, history policy, membership activation, enrollment and finality | `node-core`, `control-store` |
 | Deterministic execution on DoltLite | `materializer-doltlite`, `materializer` |
 | Dedicated Worker, OPFS storage, Web Locks and WASM engine | `runtime-browser` |
 | Client API, RPC, React hooks, CLI, daemon | `client`, `rpc`, `react`, `apps/*` |
 | Experimental workerd execution path | `runtime-workerd` ([plan](workerd-reconstruction-plan.md)) |
+
+Ephemeral signals use their own live transport and do not enter the transaction
+log, SQL materializer or finality pipeline. The standalone channel requires no
+group membership; a governed peer adapter adds the group's explicit signal-topic
+permissions. Applications can use this live primitive without adopting durable
+history.
 
 ## 3. Transactions
 
@@ -75,7 +82,8 @@ DDL and DML travel in the same stream. Application schema is whatever the
 accepted transactions created; the execution manifest identifies the engine
 and execution rules, not the application's tables.
 Only schema administrators (admins of the `group` collective, starting with
-the root administrator) may run DDL.
+the schema administrator explicitly pinned in genesis) may run DDL. Membership
+root administration does not grant schema access.
 
 A transaction that depends on earlier state says so in SQL, usually with
 `chronolog_assert(condition, 'code')`. If any statement fails, the transaction
@@ -98,10 +106,10 @@ stamped with the signer of the transaction that inserted the row (stored as
 a small integer id; `chronolog_principals` maps ids to keys).
 Platform-generated triggers, enforced by the pinned engine on every replica,
 let only the owner, a collective the signer belongs to, or a key the owner
-granted access insert, update or delete a row. The root administrator and
-schema administrators are ordinary actors under these checks: they cannot
-widen anyone's rights, but they may narrow them with ordinary app triggers,
-whose writes are themselves checked as the signer. Any violation aborts the
+granted access insert, update or delete a row. Neither the membership root nor
+schema administrators bypass these checks. Schema administrators may narrow
+row access with ordinary app triggers, whose writes are themselves checked as
+the signer. Any violation aborts the
 whole transaction (`policy:<table>:<command>`); rows are never skipped.
 Ownership moves only by an offer accepted by the recipient; a planned key
 change is a bulk transfer. Every reader node holds every row's stored bytes.
@@ -142,19 +150,20 @@ validator's clock by the group's `cutoff_lag_ms`. A candidate is **admitted**
 once the attestations a replica sees satisfy the pinned validation policy
 (at least N distinct validators). Admission is monotonic.
 
-Before admission, a locally authorized candidate may be selected provisionally
-for a preview. That selection can be removed if the candidate is excluded or
-loses authorization. An admitted candidate cannot be removed or replaced, but
-its application outcome can still change when the provisional suffix replays.
-Admission establishes inclusion, not successful SQL execution.
+The standard node waits for admission before selecting a candidate for
+materialization. An admitted candidate cannot be removed or replaced, but its
+application outcome can still change when the provisional suffix replays.
+Admission establishes inclusion, not successful SQL execution. The lower-level
+control and materializer ports also support removable, unadmitted selections;
+the standard node does not use that capability for speculative previews.
 
 Admitted transactions are ordered by the immutable key
 
 `(author_timestamp_ms, signing_public_key, proposal_id)`.
 
-The node fixes the transport-sequence component of the underlying order key
-to zero. Outer feed sequence is replication and fork evidence; it cannot move
-a proposal when the same signed content travels over another connection.
+The order key contains only those three proposal fields. Outer feed sequence
+belongs to replication and fork evidence; it is absent from application order
+and materialized transaction records.
 
 Validators never choose the position; more attestations never move it. A
 transaction that becomes visible late sorts into its fixed position in the
@@ -220,7 +229,7 @@ progress visibly. Neither Chronolog core nor Tendriller core imports the other.
 
 ## 7. Membership and encryption
 
-A group starts from a signed **genesis**; the root administrator then
+A group starts from a signed **genesis**; its membership root then
 publishes signed **capability revisions** on the administration feed. The
 protocol has three grant roles: writer, validator and reader. Membership
 administration belongs to the root key and administration feed pinned in
@@ -259,18 +268,19 @@ Dolt commit (`chronolog_head`, `chronolog_rev_*`); checkpoints
 only from the nearest checkpoint. Publication binds the durable SQL revision
 to its applied prefix and reconciles control metadata after interruption.
 
-Readers choose `local` or `final`. The local view includes the applied final
-prefix and its selected provisional suffix. An unadmitted preview can leave that
-suffix; an admitted candidate remains included while its application outcome
-may still change on replay. The final view uses an actual separate immutable SQL
-revision of the locally applied final prefix; it is not a label on the tentative reader.
+Readers choose `local` or `final`. In the standard node, the local view includes
+the applied final prefix and an admitted but provisional suffix. Those admitted
+candidates remain included while their application outcomes may still change
+on replay. The final view uses an actual separate immutable SQL revision of the
+locally applied final prefix; it is not a label on the tentative reader.
 Queries and live queries report the selected view and revision. A replica's
 final view can still be behind another replica's.
 
 `transaction.final()` waits for final acceptance or rejection after local
-application. `accepted()` waits for immutable acceptance and throws on final
-rejection. `settled()` describes the current result, which can still change
-through peer-policy replay. See the
+application. `accepted()` waits for final acceptance and throws on final
+rejection. `provisional()` describes the current result, which can still change
+through replay. Applications do not manage author timestamps: the node advances
+its clock after applied observations and verified closed author time. See the
 [client guide](../packages/client/README.md). The replicated
 log of outcomes is the table `chronolog_transactions`, readable by
 transactions.

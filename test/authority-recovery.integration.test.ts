@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { emit, program } from '@chronolog/protocol'
+import { decodeEnvelope, emit, program } from '@chronolog/protocol'
 
-import { AUTHORITY_CRASH_POINTS, certifiedRecoveryFloor, inspectStoppedAuthority, openAuthorityRecoveryFixture } from '../tools/lib/authority-recovery-fixture.js'
+import { AUTHORITY_CRASH_POINTS, certifiedRecoveryFloor, inspectStoppedAuthority, openAuthorityRecoveryFixture, recoveryProgram } from '../tools/lib/authority-recovery-fixture.js'
 
 const directories: string[] = []
 afterEach(async () => { await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true }))) })
@@ -115,4 +115,42 @@ describe('native authority process crash recovery', () => {
       }, 40_000)
     }
   }
+
+  it('preserves a prepared proposal and its final rejection when time legitimately closes before first inclusion', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'chronolog-authority-expired-'))
+    directories.push(parent)
+    const directory = join(parent, 'volume')
+    const initial = await openAuthorityRecoveryFixture(directory, { create: true })
+    let originalId: string
+    let before: Awaited<ReturnType<typeof initial.inspect>>
+    try {
+      await initial.initialize()
+      await initial.agent.close()
+      const prepared = await initial.node.publish({ operationId: 'recovery-accepted', program: recoveryProgram('accepted') })
+      originalId = prepared.txIdText
+      expect((await initial.node.operation('recovery-accepted'))?.final).toBe(false)
+      // The publisher retained exact bytes locally, but no service promised
+      // their inclusion. This real durable closure is allowed to exclude them.
+      await initial.advanceFinalityClock(prepared.core.authorTimestampMs)
+      await initial.authority.share(initial.transport)
+      const source = (await initial.transport.history()).findLast(record => decodeEnvelope(record.payload).messageType === 'candidate')!
+      await initial.authority.append(source.payload)
+      await initial.authority.share(initial.transport)
+      const outcome = await initial.terminal('recovery-accepted')
+      expect(outcome).toMatchObject({ proposalId: originalId, final: true,
+        outcome: { outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' } })
+      before = await initial.inspect()
+    } finally { await initial.close() }
+    const recovered = await openAuthorityRecoveryFixture(directory, { continuity: before.head })
+    try {
+      const retried = await recovered.submit('accepted')
+      expect(retried).toMatchObject({ proposalId: originalId, final: true,
+        outcome: { outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_CLOSED' } })
+      const after = await recovered.inspect()
+      expect(after.rows).toEqual([[{ kind: 'integer', value: '1' }, { kind: 'integer', value: '10' }]])
+      expect(after.events).toEqual([])
+      expect(after.proposalCount).toBe(before.proposalCount)
+      expect(after.payloads).toEqual(before.payloads)
+    } finally { await recovered.close() }
+  }, 40_000)
 })

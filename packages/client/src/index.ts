@@ -5,9 +5,8 @@ export * from './sealed.js'
 export * from './stream-resource.js'
 export * from './values.js'
 export * from './projections.js'
-export type { ViewChange, ViewChangeOptions } from '@chronolog/protocol'
-export type { Signals, EphemeralSignal, SignalPayload, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
-export { program, emit, sqlStatement, type ChangeProgram, type EmitStep, type EventBatch, type EventReadOptions, type EventPayload, type EffectiveEvent, type ChronologEventOrigin } from '@chronolog/protocol'
+export { program, emit, sqlStatement, type ChangeProgram, type EmitStep, type EventBatch, type EventReadOptions, type EventPayload, type EffectiveEvent } from '@chronolog/protocol'
+export type { ChronologEventOrigin, ApplicationChange, ApplicationChangeOptions } from '@chronolog/protocol'
 
 export {
   ChronologRpcError,
@@ -29,3 +28,5 @@ export {
   type TransactionOutcome,
   type ValidatorWatermark,
 } from '@chronolog/rpc'
+
+export type { Signals, EphemeralSignal, SignalPayload, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'

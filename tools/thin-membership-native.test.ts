@@ -2,7 +2,7 @@ import type { OrderedRecordEntry, OrderedRecordHead } from '@chronolog/node-core
 import { utf8 } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 
-import { collectRetainedRange } from './thin-membership-native.js'
+import { collectRetainedRange } from './lib/retained-range.js'
 
 const historyId = 'h_0123456789abcdef0123456789abcdef'
 const head = (position: number): OrderedRecordHead => ({ historyId, position, root: `root-${position}` })

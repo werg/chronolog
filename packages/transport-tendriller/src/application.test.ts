@@ -8,8 +8,9 @@ function fixture() {
   let current: RawStatus | null = null, revision = 0n, reads = 0, watchers = 0, released = 0, changesReleased = 0
   const calls: unknown[] = [], parameters: unknown[] = [], changeCalls: unknown[] = [], revisions = new RevisionBroadcaster<NodeRevisionEvent>()
   const batch = { revision: 'pinned', transactions: [], scannedThrough: 'cursor', hasMore: false }
+  let changesView: 'local' | 'final' = 'final'
   const changes = { async *[Symbol.asyncIterator]() {
-    try { yield { view: 'final' as const, revision: batch.revision, finalRevision: batch.revision } }
+    try { yield { view: changesView, revision: batch.revision, finalRevision: changesView === 'final' ? batch.revision : 'pinned-final' } }
     finally { changesReleased++ }
   } }
   const source = {
@@ -22,9 +23,8 @@ function fixture() {
       finally { watchers-- }
     },
     events: { read: async () => batch, async *subscribe() { yield batch } },
-    changes(options: unknown) { changeCalls.push(options); return changes },
-    async readView(options: { view?: 'local' | 'final' } = {}) { return { view: options.view ?? 'final', revision: batch.revision,
-      finalRevision: options.view === 'local' ? 'pinned-final' : batch.revision,
+    changes(options: { view?: 'local' | 'final'; signal?: AbortSignal } = {}) { changeCalls.push(options); changesView = options.view ?? 'final'; return changes },
+    async readView(options = { view: 'final' as const }) { return { view: options.view, revision: batch.revision, finalRevision: options.view === 'final' ? batch.revision : 'pinned-final',
       query(_sql: string, values: unknown[]) { parameters.push(values); return { columns: [{ name: 'count' }], rows: [[{ kind: 'integer', value: '7' }]] } },
       readEvents: () => batch, release() { released++ },
     } },
@@ -66,6 +66,14 @@ describe('selected Chronolog application adapter', () => {
     expect((await iterator.next()).value).toMatchObject({ operationId: 'stable', proposalId: 'original-proposal', status: 'final', outcome: 'rejected' })
     expect((await iterator.next()).done).toBe(true)
     expect(f.watchers).toBe(0)
+  })
+
+  it('observes selected view revisions independently of durable event delivery', async () => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: false })
+    const values = []
+    for await (const value of backend.changes({ view: 'local' })) values.push(value)
+    expect(values).toEqual([{ view: 'local', revision: 'pinned', finalRevision: 'pinned-final' }])
+    expect(f.reads).toBe(0)
   })
 
   it('releases an abandoned operation observer while its next pull is waiting', async () => {

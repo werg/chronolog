@@ -55,7 +55,7 @@ describe('TransactionHandle finality', () => {
     try {
       await waitFor(() => f.opened === 1)
       f.values.push(outcome(1, false))
-      await expect(handle.settled()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
+      await expect(handle.provisional()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
       expect(finished).toBe(false)
       f.values.push(outcome(2, false, true))
       await waitFor(() => handle.outcome.getSnapshot().value?.eventSetRevision === '2')
@@ -78,7 +78,7 @@ describe('TransactionHandle finality', () => {
     const handle = await fixture_.client.transaction(['SELECT 1'])
     let finished = false
     const final = handle.final().then((value) => { finished = true; return value })
-    const speculative = handle.settled()
+    const speculative = handle.provisional()
     await waitFor(() => fixture_.opened === 1)
     fixture_.values.push(outcome(1, false))
     await expect(speculative).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
@@ -92,6 +92,28 @@ describe('TransactionHandle finality', () => {
     // waiting for another event or disrupting other subscribers.
     await expect(handle.final()).resolves.toMatchObject({ eventSetRevision: '3', final: true })
     await fixture_.client.close()
+  })
+
+  it('accepted waits through provisional rejection and only accepts the final result', async () => {
+    const f = fixture(), handle = await f.client.transaction(['SELECT 1'])
+    let accepted = false
+    const result = handle.accepted().then(value => { accepted = true; return value })
+    await waitFor(() => f.opened === 1)
+    f.values.push(outcome(1, false, true))
+    await waitFor(() => handle.outcome.getSnapshot().value?.eventSetRevision === '1')
+    expect(accepted).toBe(false)
+    f.values.push(outcome(2, true))
+    await expect(result).resolves.toMatchObject({ final: true, outcome: { type: 'accepted' } })
+    await f.client.close()
+  })
+
+  it('accepted rejects only the final rejection', async () => {
+    const f = fixture(), handle = await f.client.transaction(['SELECT 1'])
+    const result = expect(handle.accepted()).rejects.toMatchObject({ name: 'TransactionRejectedError', code: 'constraint' })
+    await waitFor(() => f.opened === 1)
+    f.values.push(outcome(1, false))
+    f.values.push(outcome(2, true, true))
+    await result; await f.client.close()
   })
 
   it.each(['final', 'accepted'] as const)('%s aborts immediately while the outcome stream is quiet', async method => {

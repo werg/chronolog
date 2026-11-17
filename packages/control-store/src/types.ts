@@ -5,8 +5,8 @@ export type CandidateState =
   /** Locally authorized and selected for preview, but not admitted by consensus. */
   | 'provisional'
   | 'admissible'
+  | 'excluded'
   | 'unauthorized'
-  | 'inadmissible'
 
 export interface StoredCandidate {
   readonly txId: Uint8Array
@@ -47,11 +47,15 @@ export interface ValidatorHeartbeat {
   readonly membershipRevision: Uint8Array
   readonly validatorFeedSequence: bigint
   readonly acceptanceCutoffMs: bigint
-  /** True only if the validator feed is known contiguous through this message. */
+  /** True only after the node consumed the complete authenticated feed prefix through this message. */
   readonly feedContiguous: boolean
 }
 
-/** The watermark is the cutoff that `threshold` of these validators have all passed. */
+/**
+ * A complete validator universe and minimum votes required by every admissible
+ * policy in the revision. A blocking set of n-k+1 closed feeds exposes every
+ * possible earlier admission, including its incomplete proofs.
+ */
 export interface WatermarkPolicy {
   readonly kind: 'threshold'
   readonly policyId: string
@@ -78,41 +82,8 @@ export interface SettlementEvidence {
   readonly watermark: WatermarkEvidence
   readonly belowWatermark: boolean
   readonly unresolvedAttestationIds: readonly Uint8Array[]
-  readonly frontier: AdmissionFrontier
-}
-
-/** An authentic admission promise whose eventual effect is not yet resolved. */
-export interface AdmissionBlocker {
-  readonly proposalId: Uint8Array
-  readonly authorTimestampMs: bigint
-  readonly reason: 'missing-proposal' | 'pending-admission'
-  readonly attestationIds: readonly Uint8Array[]
-}
-
-/** A closed timestamp range, reduced by every still possible earlier admission. */
-export interface AdmissionFrontier {
-  readonly provenThroughMs: bigint | null
-  /** A blocker at T limits this safe chronological frontier to T - 1. */
-  readonly closedThroughMs: bigint | null
-  readonly blockers: readonly AdmissionBlocker[]
-  /** Known proposals whose remaining eligible validators cannot satisfy their policy. */
-  readonly excludedProposalIds: readonly Uint8Array[]
-}
-
-export interface AdmissionFrontierOptions {
-  /** The adapter's frontier across every permitted policy, when not a single-policy store. */
-  readonly provenThroughMs?: bigint | null
-  /** Fully verified revision closures, after every preceding admission was evaluated. */
-  readonly closedMembershipRevisions?: ReadonlySet<string>
-  /** Fully verified proof IDs, encoded as lowercase hexadecimal, for known payloads. */
-  readonly verifiedAttestationIds?: ReadonlySet<string>
-  /** Heartbeat IDs whose complete feed prefixes the current admission index has consumed. */
-  readonly verifiedHeartbeatIds?: ReadonlySet<string>
-  /** Every known pending proposal's own policy and signed membership revision. */
-  readonly candidatePolicies?: ReadonlyMap<string, {
-    readonly policy: WatermarkPolicy
-    readonly membershipRevision: Uint8Array
-  }>
+  /** Known earlier proposals whose admission or exclusion is not decided yet. */
+  readonly pendingCandidateIds: readonly Uint8Array[]
 }
 
 export interface MaterializedHead {
@@ -179,7 +150,7 @@ export type ControlStoreDelta =
     }
 
 export interface ControlStoreSnapshot {
-  readonly format: 'chronolog-control-store/v1'
+  readonly format: 'chronolog-control-store/v2'
   readonly sequence: bigint
   readonly candidates: readonly StoredCandidate[]
   readonly attestations: readonly StoredAttestation[]

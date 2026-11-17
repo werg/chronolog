@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { collectRetainedRange } from './lib/retained-range.js'
 import { once } from 'node:events'
 import { mkdir } from 'node:fs/promises'
 import { createServer, type IncomingMessage } from 'node:http'
@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import { join } from 'node:path'
 
-import { NativeAgentStore, waitForAbortableDelay, type NativeFinalityService } from '@chronolog/agent-service'
+import { NativeAgentStore } from '@chronolog/agent-service'
 import { createMembershipLedgerHandler } from '@chronolog/agent-service/membership-http'
 import { decodeSignedGenesis, encodeSignedGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
@@ -15,10 +15,9 @@ import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, 
 import { createGovernedNode, loadOrCreateEnrollmentIdentity, type GovernedNode } from '@chronolog/node-core'
 import { decodeLedgerRecord } from '@chronolog/node-core/ledger'
 import { isFinalityClosureRecord } from '@chronolog/node-core/finality'
-import type { OrderedRecordEntry, OrderedRecordHead } from '@chronolog/node-core/history'
 import { decodeMembershipLedgerResponse, verifyMembershipLedgerRequest } from '@chronolog/node-core/membership'
 import {
-  GROUP_COLLECTIVE_ID, base64UrlToBytes, bytesToBase64Url, decodeEnvelope, digestExecutionManifest, emit, encodeExecutionManifest, equalBytes, program, sqlStatement, utf8,
+  GROUP_COLLECTIVE_ID, base64UrlToBytes, bytesToBase64Url, digestExecutionManifest, emit, encodeExecutionManifest, equalBytes, program, sqlStatement, utf8,
 } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
@@ -26,6 +25,9 @@ import { createWebRtcOfferHandler, WEBRTC_HTTP_LIMITS, type DataChannelConnectio
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
 
 import { createDaemonAgentRuntime } from '../apps/chronologd/src/agent-runtime.js'
+import { createAdmissionClock, observeIncludedProposals } from './lib/application-admission.js'
+import { isExpectedPeerTermination } from './lib/peer-termination.js'
+
 import { observeFeedLink } from '../test/thin-membership/link-observation.js'
 
 export interface ThinMembershipBootstrap {
@@ -67,9 +69,13 @@ export interface ThinMembershipTraffic {
 export async function createThinMembershipNative(options: {
   readonly directory: string
   readonly extraRequest?: (request: Request) => Promise<Response | null>
-  /** Semantic tests may advance shared author/finality time after retained inclusion. Live qualification uses the wall clock. */
+  /** Semantic tests share author/finality time and advance it only after retained inclusion. Omitted: wall clock with recorded admission holds. */
   readonly clock?: { now(): number; advanceTo(timestampMs: number): void }
 }) {
+  const admission = createAdmissionClock({ now: () => options.clock?.now() ?? Date.now() })
+  const admissionReport = () => ({ mode: 'hold-until-original-inclusion', base: options.clock === undefined ? 'wall-clock' : 'controlled-author-and-finality',
+    clockNowMs: admission.now(),
+    windows: admission.windows.map(window => ({ ...window, proposalIds: [...window.proposalIds] })) })
   await mkdir(options.directory, { recursive: true })
   const store = new NativeAgentStore(join(options.directory, 'native.sqlite'))
   const identity = await loadOrCreateEnrollmentIdentity(store, 'native')
@@ -102,16 +108,14 @@ export async function createThinMembershipNative(options: {
   let client: ChronologClient | undefined
   let membershipHandler: ((request: Request) => Promise<Response>) | undefined
   let failure: Error | undefined
-  type FailureDiagnostic = { observedAt: string; name: string; message: string; stack: string | null }
-  const diagnostic = (error: Error): FailureDiagnostic => ({ observedAt: new Date().toISOString(),
-    name: error.name, message: error.message, stack: error.stack ?? null })
-  let firstFailure: (FailureDiagnostic & { source: 'agent' }) | null = null
-  let peerFailures = 0, lastPeerFailure: FailureDiagnostic | null = null
-  const retainFailure = (error: unknown): void => {
+  let peerTerminationCount = 0
+  const peerTerminations: Array<{ readonly observedAt: string; readonly message: string }> = []
+  let firstFailure: { source: 'peer' | 'agent'; observedAt: string; name: string; message: string; stack: string | null } | null = null
+  const retainFailure = (error: unknown, source: 'peer' | 'agent'): void => {
     if (failure !== undefined) return
     failure = asError(error)
-    firstFailure = { ...diagnostic(failure), source: 'agent' }
-    process.stderr.write(`Thin native agent failure: ${failure.stack ?? failure.message}\n`)
+    firstFailure = { source, observedAt: new Date().toISOString(), name: failure.name, message: failure.message, stack: failure.stack ?? null }
+    process.stderr.write(`Thin native ${source} failure: ${failure.stack ?? failure.message}\n`)
   }
   let schemaReady = false
   let dropAppendReply = false
@@ -136,26 +140,23 @@ export async function createThinMembershipNative(options: {
     if (governed === undefined || agent === undefined || client === undefined) throw new Error('THIN_NATIVE_NOT_STARTED')
     return { governed, agent, client }
   }
-  const advancedCandidates = new Set<string>()
-  const advanceAfterInclusion = async (envelope: Uint8Array, signal: AbortSignal): Promise<void> => {
-    if (options.clock === undefined) throw new Error('THIN_CONTROLLED_CLOCK_REQUIRED')
-    if (decodeEnvelope(envelope).messageType !== 'candidate') throw new Error('THIN_CANDIDATE_REQUIRED')
-    const hash = createHash('sha256').update(envelope).digest('hex')
-    if (advancedCandidates.has(hash)) return
-    for (;;) {
-      signal.throwIfAborted()
-      const current = checked()
-      const receipts = await current.agent.finality!.read({ limit: 256 })
-      if (receipts.hasMore) throw new Error('THIN_FIXTURE_RECEIPT_LIMIT')
-      if (receipts.entries.some(entry => !isFinalityClosureRecord(entry.bytes) && decodeLedgerRecord(entry.bytes).payloadHash === hash)) {
-        const next = options.clock.now() + Number(current.governed.descriptor.genesis.manifest.clockPolicy.cutoffLagMs) + 1
-        if (!Number.isSafeInteger(next)) throw new Error('THIN_CLOCK_EXHAUSTED')
-        options.clock.advanceTo(next)
-        advancedCandidates.add(hash)
-        return
-      }
-      await waitForAbortableDelay(5, signal)
+  let readInclusions: ReturnType<typeof observeIncludedProposals> | undefined
+  const includeProposals = async <T>(scenario: string,
+    author: () => Promise<{ readonly value: T; readonly proposalIds: readonly string[] }>): Promise<T> => {
+    const current = checked()
+    readInclusions ??= observeIncludedProposals({ ...current, transport })
+    const value = await admission.include(scenario, author, async ids => {
+      const observed = await readInclusions!()
+      return ids.every(id => observed.has(id))
+    })
+    if (options.clock !== undefined) {
+      // Only the semantic fixture advances time. Both its author and finality
+      // service use the same clock and the authenticated genesis policy.
+      const next = options.clock.now() + Number(current.governed.descriptor.genesis.manifest.clockPolicy.cutoffLagMs) + 1
+      if (!Number.isSafeInteger(next)) throw new Error('THIN_CLOCK_EXHAUSTED')
+      options.clock.advanceTo(next)
     }
+    return value
   }
   const server = createServer((incoming, outgoing) => {
     outgoing.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
@@ -242,11 +243,12 @@ export async function createThinMembershipNative(options: {
     createPeerConnection: configuration => createNativePeerConnection(configuration,
       { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
     onError(error) {
-      // This observer belongs to a single peer lifetime. Disconnects, revoked
-      // readers and malformed requests retire that peer, never the authority or
-      // unrelated peers. Retain bounded diagnostics without poisoning checked().
-      peerFailures += 1
-      lastPeerFailure = diagnostic(asError(error))
+      const value = asError(error)
+      if (isExpectedPeerTermination(value)) {
+        peerTerminationCount++
+        if (peerTerminations.length === 32) peerTerminations.shift()
+        peerTerminations.push({ observedAt: new Date().toISOString(), message: value.message })
+      } else retainFailure(value, 'peer')
     },
     async accept(connection) {
       connections.add(connection)
@@ -269,7 +271,7 @@ export async function createThinMembershipNative(options: {
   let closed = false
   return {
     base, membershipUrl: `${base}/_chronolog/membership`, identity, historyId, executionManifestDigest, initialCapabilities,
-    traffic: measuredTraffic, bootstrap, advanceAfterInclusion,
+    traffic: measuredTraffic, bootstrap, includeProposals,
     async start(input: { readonly genesis: string; readonly groupRoute: string }) {
       if (governed !== undefined) throw new Error('THIN_NATIVE_ALREADY_STARTED')
       const genesis = decodeSignedGenesis(base64UrlToBytes(input.genesis))
@@ -290,7 +292,7 @@ export async function createThinMembershipNative(options: {
       await governed.start()
       agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, descriptor: governed.descriptor,
         store, transport, activeMembership: () => governed!.activeSnapshot,
-        ...(options.clock === undefined ? {} : { finalityClock: () => options.clock!.now() }),
+        finalityClock: admission.now,
         peerLinks: { local: servedRanges.link, attach(link) {
           const observation = observeFeedLink(link)
           remoteRanges.push(observation); if (remoteRanges.length > 8) remoteRanges.shift()
@@ -298,7 +300,7 @@ export async function createThinMembershipNative(options: {
         } } })
       if (agent.finality === null) throw new Error('THIN_NATIVE_FINALITY_REQUIRED')
       membershipHandler = createMembershipLedgerHandler({ finality: agent.finality, descriptor: governed.descriptor, sink: transport })
-      void agent.run().catch(retainFailure)
+      void agent.run().catch(error => retainFailure(error, 'agent'))
       client = new ChronologClient({ groupId: bytesToBase64Url(genesis.manifest.groupId),
         transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node, signals: agent.context.signals })), unaryRetryAttempts: 1 })
       return bootstrap()
@@ -307,33 +309,32 @@ export async function createThinMembershipNative(options: {
       if (!Number.isSafeInteger(input.count) || input.count < 1 || input.count > 64 || !Number.isSafeInteger(input.payloadBytes) ||
           input.payloadBytes < 0 || input.payloadBytes > 196_608 || !/^[a-z0-9-]{1,40}$/u.test(input.namespace)) throw new Error('THIN_WORKLOAD_INVALID')
       const { client, governed, agent } = checked()
-      const finalize = async (handle: Awaited<ReturnType<typeof client.submit>>) => {
+      const firstWindow = admission.windows.length
+      const finalize = async (operationId: string, author: () => Promise<Awaited<ReturnType<typeof client.submit>>>) => {
+        let published: Awaited<ReturnType<typeof client.submit>> | undefined, ended = false
         try {
-          const signal = AbortSignal.timeout(20_000)
-          if (options.clock !== undefined) {
-            // This fixture submits one native operation at a time. The one
-            // new exact envelope must reach the actual service before time
-            // can close; payload size or host load cannot consume its window.
-            const pending = (await transport.history()).filter(record => record.author === transport.identity &&
-              decodeEnvelope(record.payload).messageType === 'candidate' &&
-              !advancedCandidates.has(createHash('sha256').update(record.payload).digest('hex')))
-            if (pending.length !== 1) throw new Error('THIN_FIXTURE_CANDIDATE_COUNT')
-            await advanceAfterInclusion(pending[0]!.payload, signal)
-          }
-          const final = await handle.final({ signal })
+          // Hold before signing and release only after this exact signed core
+          // has a retained inclusion receipt. Finality still requires the real
+          // provider closure and local publication after the hold ends.
+          const handle = await includeProposals(`native workload: ${operationId}`, async () => {
+            const value = await author()
+            if (ended) value.dispose(); else published = value
+            return { value, proposalIds: [value.proposalId] }
+          })
+          const final = await handle.final({ signal: AbortSignal.timeout(20_000) })
           if (final.outcome.type !== 'accepted') throw new Error(`THIN_WORKLOAD_REJECTED: ${JSON.stringify(final.outcome)}`)
           return handle.proposalId
-        } finally { handle.dispose() }
+        } finally { ended = true; published?.dispose() }
       }
       if (!schemaReady) {
-        await finalize(await client.submit(program(sqlStatement('CREATE TABLE qualification_payloads(id TEXT PRIMARY KEY, body TEXT NOT NULL)')),
+        await finalize('thin-schema', () => client.submit(program(sqlStatement('CREATE TABLE qualification_payloads(id TEXT PRIMARY KEY, body TEXT NOT NULL)')),
           { operationId: 'thin-schema' }))
         schemaReady = true
       }
       const before = await agent.finality!.head(), proposals: string[] = []
       for (let index = 0; index < input.count; index += 1) {
         const id = `${input.namespace}-${index}`
-        proposals.push(await finalize(await client.submit(program(
+        proposals.push(await finalize(id, () => client.submit(program(
           sqlStatement('INSERT INTO qualification_payloads(id,body) VALUES(?,?)', [id, 'x'.repeat(input.payloadBytes)]),
           emit('qualification', { id, bytes: input.payloadBytes }),
         ), { operationId: id })))
@@ -347,7 +348,7 @@ export async function createThinMembershipNative(options: {
       if (candidates.length !== input.count) throw new Error('THIN_WORKLOAD_RECEIPT_COUNT_MISMATCH')
       return { proposals, count: candidates.length, descriptorBytes: candidates.reduce((sum, value) => sum + value.entry.bytes.length, 0),
         detachedEnvelopeBytes: candidates.reduce((sum, value) => sum + value.record.payloadLength, 0),
-        finalThrough: governed.node.finalThrough }
+        finalThrough: governed.node.finalThrough, admissionWindows: admissionReport().windows.slice(firstWindow) }
     },
     async snapshot() {
       const current = checked(); await current.governed.node.waitForIdle()
@@ -364,7 +365,7 @@ export async function createThinMembershipNative(options: {
       } finally { await view.release() }
       return { finalThrough: current.governed.node.finalThrough, membershipRevision: String(current.governed.activeSnapshot.revision),
         availableEpochs: current.governed.governance.cipherRing.epochs().map(String), head: await current.agent.finality!.head(),
-        schemaRoles: { nativeSchemaAdministrators, membershipRootGroupMembers }, traffic: measuredTraffic(),
+        schemaRoles: { nativeSchemaAdministrators, membershipRootGroupMembers }, traffic: measuredTraffic(), admission: admissionReport(),
         rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift', restrictedInterfaceEnumeration,
           byteBoundary: 'Logical authenticated peer frame payload; excludes framing headers/credit and SCTP/DTLS/IP overhead.' } }
     },
@@ -372,11 +373,12 @@ export async function createThinMembershipNative(options: {
     // cached frontiers and counters without requesting SQL replay or a view.
     diagnostics() {
       return { failure: firstFailure === null ? null : { ...firstFailure }, started: governed !== undefined,
-        peers: { failures: peerFailures, lastFailure: lastPeerFailure === null ? null : { ...lastPeerFailure } },
+        peerTerminations: { count: peerTerminationCount, recent: peerTerminations.map(value => ({ ...value })) },
         finalThrough: governed?.node.finalThrough ?? null,
         membershipRevision: governed === undefined ? null : String(governed.activeSnapshot.revision),
         availableEpochs: governed?.governance.cipherRing.epochs().map(String) ?? [],
-        traffic: measuredTraffic(), rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift' },
+        traffic: measuredTraffic(), admission: admissionReport(),
+        rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift' },
         ranges: rangeDiagnostics() }
     },
     loseNextAppendReply() { dropAppendReply = true },
@@ -394,40 +396,6 @@ export async function createThinMembershipNative(options: {
       }
     },
   }
-}
-
-/** Collect one fixed retained interval; later closure ticks cannot extend the measurement. */
-export async function collectRetainedRange(source: Pick<NativeFinalityService, 'read'>,
-  after: OrderedRecordHead, through: OrderedRecordHead): Promise<readonly OrderedRecordEntry[]> {
-  let cursor = { ...after }
-  const target = { ...through }, retained: OrderedRecordEntry[] = []
-  const validHead = (head: OrderedRecordHead): boolean => Number.isSafeInteger(head.position) && head.position >= 0 &&
-    typeof head.historyId === 'string' && head.historyId.length > 0 && typeof head.root === 'string' && head.root.length > 0
-  if (!validHead(cursor) || !validHead(target) || cursor.historyId !== target.historyId || cursor.position > target.position) {
-    throw new Error('THIN_WORKLOAD_RANGE_BOUNDS_INVALID')
-  }
-  const expectedLength = target.position - cursor.position
-  while (cursor.position < target.position) {
-    const limit = Math.min(128, target.position - cursor.position)
-    const page = await source.read({ after: cursor.position, limit })
-    if (!validHead(page.head) || page.head.historyId !== target.historyId || page.head.position < target.position || page.entries.length > limit) {
-      throw new Error('THIN_WORKLOAD_RANGE_BOUNDS_INVALID')
-    }
-    if (page.entries.length === 0) throw new Error('THIN_WORKLOAD_RANGE_NO_PROGRESS')
-    for (const entry of page.entries) {
-      if (entry.historyId !== target.historyId || entry.position !== cursor.position + 1 || entry.position > target.position ||
-          entry.previousRoot !== cursor.root || typeof entry.root !== 'string' || entry.root.length === 0) {
-        throw new Error('THIN_WORKLOAD_RANGE_DISCONTINUOUS')
-      }
-      retained.push(entry)
-      cursor = { historyId: entry.historyId, position: entry.position, root: entry.root }
-    }
-    if (page.hasMore !== (cursor.position < page.head.position) || cursor.position === page.head.position && cursor.root !== page.head.root) {
-      throw new Error('THIN_WORKLOAD_RANGE_COVERAGE_INVALID')
-    }
-  }
-  if (cursor.root !== target.root || retained.length !== expectedLength) throw new Error('THIN_WORKLOAD_RANGE_COVERAGE_INVALID')
-  return retained
 }
 
 async function webRequest(request: IncomingMessage, maximum?: number): Promise<Request> {

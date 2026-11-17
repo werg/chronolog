@@ -3,7 +3,6 @@ import { bytesToHex, sha256 } from '@chronolog/canonical'
 import {
   ControlStore,
   ControlStoreConflictError,
-  type SettlementEvidence,
   type StoredAttestation,
   type StoredCandidate,
   type WatermarkEvidence,
@@ -38,7 +37,7 @@ import {
   type ValidatorHeartbeat,
   emit, program, bytesToBase64Url,
   type EventPayload,
-  type ViewChange, type ViewChangeOptions,
+  type ApplicationChange, type ApplicationChangeOptions,
 } from '@chronolog/protocol'
 import { ChangeSignal, type TransportRecord } from '@chronolog/records'
 import { readEffectiveEvents, type EventBatch, type EventReadOptions, type EventHistorySnapshot, type EventHistoryItem } from './events.js'
@@ -46,7 +45,7 @@ import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
 import { decodeLedgerRecord, LedgerRecordError, verifyLedgerPayload, type LedgerRecord } from './ledger-record.js'
 import { orderFinalizedGovernanceRecords } from './governance.js'
-import type { FinalityClosureBoundary, IncludedRecord, LiveFinalityFrontier } from './finality.js'
+import type { FinalityClosureBoundary, FinalitySettlementEvidence, IncludedRecord, LiveFinalityFrontier } from './finality.js'
 import { evaluatePeerLiveFinality } from './peer-finality.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
@@ -62,7 +61,7 @@ import { WIRE_ENCRYPTION_EPOCH_UNAVAILABLE, decodeSignedEnvelope, encodeSignedEn
 import { FeedForkRegistry } from './feed-forks.js'
 import { ValidatorRevisionClosures } from './validator-closures.js'
 
-export type { ViewChange, ViewChangeOptions } from '@chronolog/protocol'
+export type { ApplicationChange, ApplicationChangeOptions } from '@chronolog/protocol'
 
 interface AppliedApplicationSnapshot {
   readonly historyId: string
@@ -124,6 +123,8 @@ export class ChronologNode {
   #materializationError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
+  /** Only proposals deferred by this validator's future-time window. */
+  readonly #futureAttestations = new Map<string, { readonly txId: Uint8Array; readonly eligibleAt: bigint }>()
   #heartbeatTimer: ReturnType<typeof setInterval> | undefined
   #materializationDebounceTimer: ReturnType<typeof setTimeout> | undefined
   #materializationRetryTimer: ReturnType<typeof setTimeout> | undefined
@@ -132,7 +133,8 @@ export class ChronologNode {
   #materializationPending = false
   #materializationReady = false
   #lastAuthoredTimestampMs = -1n
-  #observedAuthorTimestampMs = -1n
+  #observedTimestampMs = -1n
+  #observedClosedThroughMs = -1n
   readonly #authorFutureSkewMs: number | undefined
 
   constructor(options: ChronologNodeOptions) {
@@ -140,6 +142,9 @@ export class ChronologNode {
     this.#authorFutureSkewMs = options.authorClockPolicy?.maxFutureSkewMs
     if (this.#authorFutureSkewMs !== undefined && (!Number.isSafeInteger(this.#authorFutureSkewMs) || this.#authorFutureSkewMs < 0)) {
       throw new Error('AUTHOR_CLOCK_POLICY_INVALID')
+    }
+    if (options.validator !== undefined && (!Number.isSafeInteger(options.validator.cutoffLagMs) || options.validator.cutoffLagMs < 0)) {
+      throw new Error('VALIDATOR_CUTOFF_LAG_INVALID')
     }
     this.#control = options.controlStore ?? new ControlStore()
     const operationStore = options.operationStore ?? new MemoryOperationStore()
@@ -375,9 +380,9 @@ export class ChronologNode {
   }
 
   /** Current applied view, then coalesced invalidations; no read lease or event replay. */
-  changes(options: ViewChangeOptions = {}): AsyncIterable<ViewChange> {
+  changes(options: ApplicationChangeOptions = {}): AsyncIterable<ApplicationChange> {
     const view = options.view ?? 'final', external = options.signal, node = this
-    if (view !== 'local' && view !== 'final') throw new Error('VIEW_INVALID')
+    if (view !== 'local' && view !== 'final') throw new TypeError('APPLICATION_VIEW_INVALID')
     return { [Symbol.asyncIterator]() {
       const controller = new AbortController()
       const signal = AbortSignal.any([controller.signal, node.#abort.signal, ...(external === undefined ? [] : [external])])
@@ -408,13 +413,13 @@ export class ChronologNode {
     } }
   }
 
-  async *#subscribeViewChanges(view: 'local' | 'final', signal: AbortSignal): AsyncGenerator<ViewChange, void> {
-    let previous: ViewChange | undefined
+  async *#subscribeViewChanges(view: 'local' | 'final', signal: AbortSignal): AsyncGenerator<ApplicationChange, void> {
+    let previous: ApplicationChange | undefined
     while (!this.#closed && !signal.aborted) {
       const version = this.#applicationChanges.version
       const applied = this.#currentApplicationSnapshot(view)
       if (applied !== undefined) {
-        const current: ViewChange = { view, revision: applied[view].revision, finalRevision: applied.final.revision }
+        const current: ApplicationChange = { view, revision: applied[view].revision, finalRevision: applied.final.revision }
         if (current.revision !== previous?.revision || current.finalRevision !== previous?.finalRevision) {
           previous = current
           yield { ...current }
@@ -616,6 +621,20 @@ export class ChronologNode {
       validatorCapability,
     )) throw new Error('LOCAL_TRANSPORT_AUTHOR_UNAUTHORIZED')
     const now = this.#clockNow()
+    await this.#mutex.run(async () => {
+      // Capture a finite due set before advancing this heartbeat's promise.
+      // Ordinary admissions and distant future proposals need no repeated work.
+      const due = [...this.#futureAttestations].filter(([, value]) => value.eligibleAt <= BigInt(Math.trunc(now)))
+      for (const [key, value] of due) {
+        const core = this.#candidateCores.get(key)
+        const candidate = core === undefined ? null : this.#control.getCandidate(value.txId)
+        if (core === undefined || candidate === null || !isAdmissionPending(candidate.state)) {
+          this.#futureAttestations.delete(key)
+          continue
+        }
+        await this.#maybeAttest(candidate.txId, candidate, core)
+      }
+    })
     this.#advanceValidatorCutoff(now)
     this.#persistValidatorCutoff()
     const heartbeat: ValidatorHeartbeat = {
@@ -704,7 +723,7 @@ export class ChronologNode {
     const outcome = this.#options.materialization.queries.outcome(txId)
     if (outcome !== null) return outcome
     const candidate = this.#control.getCandidate(txId)
-    if ((candidate?.state === 'unauthorized' || candidate?.state === 'inadmissible') && this.isFinal(txId)) return {
+    if ((candidate?.state === 'unauthorized' || candidate?.state === 'excluded') && this.isFinal(txId)) return {
       txId: candidate.txId, orderKey: candidate.orderKey, orderIndex: -1,
       outcome: 'rejected', rejectionCode: candidate.stateReason ?? 'WRITER_UNAUTHORIZED', failingStatementIndex: null,
     }
@@ -712,9 +731,7 @@ export class ChronologNode {
   }
 
   isFinal(txId: Uint8Array): boolean {
-    if (this.#control.getCandidate(txId)?.state === 'inadmissible') {
-      return this.#options.materialization.queries.outcome(txId) === null
-    }
+    if (this.#control.getCandidate(txId)?.state === 'excluded') return true
     if (this.historyPolicy === 'coordinated') {
       const position = this.#canonicalPositions.get(this.#idKey(txId))
       const candidate = this.#control.getCandidate(txId)
@@ -724,8 +741,8 @@ export class ChronologNode {
             candidate.orderKey.authorTimestampMs <= this.#appliedClosedThroughMs)
       }
     }
-    const index = this.#control.orderedTransactionIds().findIndex((id) => equalBytes(id, txId))
-    return index >= 0 && index < this.finalOrderLength
+    const applied = this.#options.materialization.queries.outcome(txId)
+    return applied !== null && applied.orderIndex >= 0 && applied.orderIndex < this.finalOrderLength
   }
 
   async finalTarget(): Promise<Uint8Array> {
@@ -736,7 +753,7 @@ export class ChronologNode {
         BigInt(this.#coordinatedAppliedThrough), closure?.includedRoot ?? await orderedGenesisRoot(this.#finalityHistoryId()),
         this.#appliedClosedThroughMs])
     }
-    const ids = this.#control.orderedTransactionIds().slice(0, this.finalOrderLength)
+    const ids = this.#options.materialization.queries.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId)
     return encodeCanonicalCbor([2n, this.groupId, this.historyPolicy, BigInt(ids.length), await sha256(encodeCanonicalCbor(ids)),
       null, null,
     ])
@@ -757,7 +774,7 @@ export class ChronologNode {
     if (!Array.isArray(value) || value.length !== 7 || value[0] !== 2n || !(value[1] instanceof Uint8Array) ||
         !equalBytes(value[1], this.groupId) || value[2] !== this.historyPolicy || typeof value[3] !== 'bigint' ||
         value[3] < 0n || value[3] > BigInt(this.finalOrderLength) || !(value[4] instanceof Uint8Array)) return false
-    const ids = this.#control.orderedTransactionIds().slice(0, Number(value[3]))
+    const ids = this.#options.materialization.queries.captureApplication({ view: 'final' }).transactions.map(entry => entry.txId).slice(0, Number(value[3]))
     if (value[5] !== null || value[6] !== null) return false
     return equalBytes(await sha256(encodeCanonicalCbor(ids)), value[4])
   }
@@ -936,7 +953,7 @@ export class ChronologNode {
     return structuredClone(this.#candidateCores.get(this.#idKey(txId)) ?? null)
   }
 
-  async settlementEvidence(txId: Uint8Array): Promise<SettlementEvidence | null> {
+  async settlementEvidence(txId: Uint8Array): Promise<FinalitySettlementEvidence | null> {
     return this.#mutex.run(async () => {
       const candidate = this.#control.getCandidate(txId), core = this.candidateCore(txId)
       if (candidate === null || core === null) return null
@@ -945,10 +962,12 @@ export class ChronologNode {
       const frontier = await this.#liveFinalityFrontier()
       return { txId: candidate.txId, candidateState: candidate.state, orderKey: candidate.orderKey,
         proofAttestationIds: candidate.proofAttestationIds,
-        watermark: this.#control.watermark(policy, core.membershipRevision), frontier,
+        watermark: this.#control.watermark(policy, core.membershipRevision, await this.#verifiedHeartbeatIds()), frontier,
         belowWatermark: frontier.closedThroughMs !== null && core.authorTimestampMs <= frontier.closedThroughMs,
-        unresolvedAttestationIds: frontier.blockers.filter(item => item.authorTimestampMs <= core.authorTimestampMs)
+        unresolvedAttestationIds: frontier.blockers.filter(item => item.reason === 'missing-candidate' && item.authorTimestampMs <= core.authorTimestampMs)
           .flatMap(item => item.attestationIds),
+        pendingCandidateIds: frontier.blockers.filter(item => item.authorTimestampMs <= core.authorTimestampMs &&
+          this.#control.getCandidate(item.proposalId) !== null).map(item => item.proposalId),
       }
     })
   }
@@ -965,12 +984,24 @@ export class ChronologNode {
       return { mode: 'live', checkpointId: snapshot.checkpointId,
         provenThroughMs: snapshot.closedThroughMs < 0n ? null : snapshot.closedThroughMs,
         closedThroughMs: this.#processedClosedThroughMs < 0n ? null : this.#processedClosedThroughMs,
-        blockers: [], excludedProposalIds: [],
+        blockers: [], exclusions: [],
       }
     }
     if (this.#retryRecords.size > 0 || this.#retryOverflow || this.#feedForks.quarantined()) {
-      return { mode: 'live', provenThroughMs: null, closedThroughMs: null, blockers: [], excludedProposalIds: [] }
+      return { mode: 'live', provenThroughMs: null, closedThroughMs: null, blockers: [], exclusions: [] }
     }
+    const verifiedHeartbeatIds = await this.#verifiedHeartbeatIds()
+    return evaluatePeerLiveFinality({
+      groupId: this.#options.groupId, initialMembershipRevision: this.#options.membershipRevision,
+      membershipRevision: this.membershipRevision, membership: this.#options.membership,
+      control: this.#control, candidateCores: this.#candidateCores, verifiedHeartbeatIds,
+      closedRevisions: this.#options.peerGovernance?.closedAdmissionRevisions() ?? [],
+      isPrefixApplied: (author, sequence) => this.#isPrefixApplied(author, sequence),
+      eligibleAttestations: (candidate, core) => this.#eligibleAttestations(candidate, core),
+    })
+  }
+
+  async #verifiedHeartbeatIds(): Promise<ReadonlySet<string>> {
     const verifiedHeartbeatIds = new Set<string>()
     for (const heartbeat of this.#control.listHeartbeats()) {
       const record = await this.#options.transport.get(new TextDecoder().decode(heartbeat.heartbeatId))
@@ -978,24 +1009,18 @@ export class ChronologNode {
       verifiedHeartbeatIds.add(this.#idKey(heartbeat.heartbeatId))
       if (!heartbeat.feedContiguous) this.#control.recordHeartbeat({ ...heartbeat, feedContiguous: true })
     }
-    return evaluatePeerLiveFinality({
-      groupId: this.#options.groupId, membership: this.#options.membership,
-      control: this.#control, candidateCores: this.#candidateCores, verifiedHeartbeatIds,
-      closedRevisions: this.#options.peerGovernance?.closedAdmissionRevisions() ?? [],
-      isPrefixApplied: (author, sequence) => this.#isPrefixApplied(author, sequence),
-      isValidAdmissionProof: (candidate, core, proof) => this.#isValidAdmissionProof(candidate, core, proof),
-    })
+    return verifiedHeartbeatIds
   }
 
   async watermark(txId?: Uint8Array): Promise<WatermarkEvidence | null> {
-    const candidate = txId === undefined
-      ? this.#control.orderedCandidates().at(-1)
-      : this.#control.getCandidate(txId)
-    if (!candidate) return null
-    const core = this.candidateCore(candidate.txId)
-    if (!core) return null
-    const policy = await this.#options.membership.watermarkPolicy?.(core)
-    return policy ? this.#control.watermark(policy, core.membershipRevision) : null
+    return this.#mutex.run(async () => {
+      const context = txId === undefined
+        ? { groupId: this.groupId, membershipRevision: this.membershipRevision, validationPolicy: this.validationPolicy }
+        : this.candidateCore(txId)
+      if (context === null) return null
+      const policy = await this.#options.membership.watermarkPolicy?.(context)
+      return policy ? this.#control.watermark(policy, context.membershipRevision, await this.#verifiedHeartbeatIds()) : null
+    })
   }
 
   revisions(afterRevision = 0n, signal?: AbortSignal): AsyncIterable<NodeRevisionEvent> {
@@ -1164,7 +1189,7 @@ export class ChronologNode {
       groupId: core.groupId,
       candidateDigest,
       validationPolicy: core.validationPolicy,
-      orderKey: transactionOrderKey(core, { authorFeedSequence: 0n, txId }),
+      orderKey: transactionOrderKey(core, txId),
       canonicalPayload: canonical,
       state,
       ...(rejection === undefined ? {} : { stateReason: rejection }),
@@ -1186,6 +1211,10 @@ export class ChronologNode {
       this.#setConsumerPhase('attesting')
       await this.#maybeAttest(txId, candidate, core)
     }
+    // A retained proposal can become finally excluded without ever entering
+    // the materialized order, including one received after its cutoff.
+    this.#materializationPending = true
+    this.#scheduleMaterialization()
   }
 
   async #maybeAttest(txId: Uint8Array, candidate: StoredCandidate, core: TransactionCore): Promise<void> {
@@ -1200,7 +1229,15 @@ export class ChronologNode {
     // fsynced once per record during history replay (seconds per restart).
     this.#advanceValidatorCutoff(now)
     const futureLimit = BigInt(Math.trunc(now)) + BigInt(validator.maxFutureSkewMs ?? 30_000)
-    if (core.authorTimestampMs > futureLimit || core.authorTimestampMs <= this.#acceptedAboveMs) return
+    const key = this.#idKey(txId)
+    if (core.authorTimestampMs > futureLimit) {
+      this.#futureAttestations.set(key, { txId: txId.slice(), eligibleAt: core.authorTimestampMs - BigInt(validator.maxFutureSkewMs ?? 30_000) })
+      return
+    }
+    if (core.authorTimestampMs <= this.#acceptedAboveMs) {
+      this.#futureAttestations.delete(key)
+      return
+    }
     const context = {
       groupId: core.groupId,
       membershipRevision: core.membershipRevision,
@@ -1220,7 +1257,10 @@ export class ChronologNode {
       core.membershipRevision,
       validatorCapability,
     )) throw new Error('LOCAL_TRANSPORT_AUTHOR_UNAUTHORIZED')
-    if (this.#control.attestationsFor(txId).some((item) => equalBytes(item.validatorId, this.identity))) return
+    if (this.#control.attestationsFor(txId).some((item) => equalBytes(item.validatorId, this.identity))) {
+      this.#futureAttestations.delete(key)
+      return
+    }
     const policyVersion = await this.#expectedPolicyVersion(core)
     if (policyVersion < 0n) return
     const configuredPolicyVersion = validator.policyVersion ?? policyVersion
@@ -1240,10 +1280,19 @@ export class ChronologNode {
     }
     const payload = encodeValidatorAttestation(attestation)
     const envelope = await encodeSignedEnvelope(this.#groupRoute(), 'attestation', payload, this.#options.identity, this.#options.envelopeCipher)
-    // Publishing before returning is the validator durability rule. The newly
-    // appended record is handled by the normal subscription path.
+    // Publishing before returning is the validator durability rule. Consume
+    // the committed local vote before releasing the mutex, so another clock
+    // tick cannot author a second vote while the feed consumer catches up.
     this.#setConsumerPhase('publishing-attestation')
-    await this.#options.transport.publish(envelope, { timestampMs: now })
+    try {
+      const record = await this.#options.transport.publish(envelope, { timestampMs: now })
+      await this.#ingestAttestation(record, payload, this.identity)
+      this.#markSeen(record)
+      this.#futureAttestations.delete(key)
+    } catch (error) {
+      this.#futureAttestations.set(key, { txId: txId.slice(), eligibleAt: core.authorTimestampMs - BigInt(validator.maxFutureSkewMs ?? 30_000) })
+      throw error
+    }
   }
 
   async #ingestAttestation(record: TransportRecord, encoded: Uint8Array, signer: Uint8Array): Promise<void> {
@@ -1300,14 +1349,7 @@ export class ChronologNode {
     }
     const threshold = await this.#options.membership.threshold(context)
     if (!Number.isSafeInteger(threshold) || threshold < 1) throw new Error('INVALID_VALIDATION_THRESHOLD')
-    const eligible: StoredAttestation[] = []
-    const validators = new Set<string>()
-    for (const attestation of this.#control.attestationsFor(txId)) {
-      const key = this.#idKey(attestation.validatorId)
-      if (validators.has(key) || !await this.#isValidAdmissionProof(candidate, core, attestation)) continue
-      validators.add(key)
-      eligible.push(attestation)
-    }
+    const eligible = await this.#eligibleAttestations(candidate, core)
     const customSelection = await this.#options.membership.selectAdmission?.(
       context,
       eligible,
@@ -1333,6 +1375,17 @@ export class ChronologNode {
     this.#scheduleMaterialization()
   }
 
+  async #eligibleAttestations(candidate: StoredCandidate, core: TransactionCore): Promise<StoredAttestation[]> {
+    const eligible: StoredAttestation[] = [], validators = new Set<string>()
+    for (const attestation of this.#control.attestationsFor(candidate.txId)) {
+      const key = this.#idKey(attestation.validatorId)
+      if (validators.has(key) || !await this.#isValidAdmissionProof(candidate, core, attestation)) continue
+      validators.add(key)
+      eligible.push(attestation)
+    }
+    return eligible
+  }
+
   async #ingestHeartbeat(record: TransportRecord, encoded: Uint8Array, signer: Uint8Array): Promise<void> {
     const heartbeat = this.#decodeHeartbeat(encoded)
     if (!equalBytes(heartbeat.groupId, this.#options.groupId)) invalid('HEARTBEAT_WRONG_GROUP')
@@ -1355,6 +1408,8 @@ export class ChronologNode {
       this.#acceptedAboveMs = heartbeat.acceptanceCutoffMs
       this.#persistValidatorCutoff()
     }
+    const previous = this.#control.heartbeatFor(heartbeat.validatorId, heartbeat.membershipRevision)
+    const alreadyComplete = previous?.validatorFeedSequence === record.sequence && previous.feedContiguous
     const recorded = this.#control.recordHeartbeat({
       heartbeatId: utf8(record.id),
       validatorId: heartbeat.validatorId,
@@ -1362,7 +1417,7 @@ export class ChronologNode {
       membershipRevision: heartbeat.membershipRevision,
       validatorFeedSequence: record.sequence,
       acceptanceCutoffMs: heartbeat.acceptanceCutoffMs,
-      feedContiguous: this.#isPrefixApplied(record.author, record.sequence - 1n) && await this.#isFeedContiguous(record),
+      feedContiguous: alreadyComplete || (this.#isPrefixApplied(record.author, record.sequence - 1n) && await this.#isFeedContiguous(record)),
     })
     if (recorded !== null) {
       this.#emit('heartbeat')
@@ -1393,21 +1448,20 @@ export class ChronologNode {
     await this.#processCoordinatedHistory()
     const frontier = await this.#liveFinalityFrontier()
     let admissionClosed = false
-    for (const id of frontier.excludedProposalIds) {
-      const candidate = this.#control.getCandidate(id)
-      if (candidate !== null && isAdmissionPending(candidate.state)) {
-        this.#control.setCandidateState(id, 'inadmissible', { reason: 'ADMISSION_CLOSED' })
-        admissionClosed = true
-      }
+    for (const exclusion of frontier.exclusions) {
+      const state = this.#control.getCandidate(exclusion.proposalId)?.state
+      if (state !== 'pending_validation' && state !== 'provisional') continue
+      this.#control.setCandidateState(exclusion.proposalId, 'excluded', { reason: exclusion.reason })
+      this.#futureAttestations.delete(this.#idKey(exclusion.proposalId))
+      this.#emit('candidate', exclusion.proposalId)
+      admissionClosed = true
     }
-    // Exclusion can remove a provisional preview. Reconcile that selected
-    // suffix before publishing an immutable prefix over the remaining order.
+    // Remove an excluded preview before publishing the remaining immutable prefix.
     const ordered: AdmittedTransaction[] = this.#control.orderedCandidates().map((candidate) => {
       const core = this.#candidateCores.get(this.#idKey(candidate.txId))
       if (!core || !candidate.canonicalPayload) throw new Error('ADMITTED_CANDIDATE_PAYLOAD_MISSING')
       return {
         txId: candidate.txId,
-        authorFeedSequence: candidate.orderKey.authorFeedSequence,
         candidateDigest: candidate.candidateDigest,
         canonicalCandidate: candidate.canonicalPayload,
         core,
@@ -1438,6 +1492,14 @@ export class ChronologNode {
       !equalBytes(reconciled.executionManifestDigest, queries.executionManifestDigest)
     ) {
       throw new Error('MATERIALIZATION_RECONCILIATION_RESULT_MISMATCH')
+    }
+    const latest = ordered.at(-1)
+    const observed = latest === undefined ? null : this.#control.getCandidate(latest.txId)
+    if (observed !== null && observed.orderKey.authorTimestampMs > this.#observedTimestampMs) {
+      this.#observedTimestampMs = observed.orderKey.authorTimestampMs
+    }
+    if (frontier.provenThroughMs !== null && frontier.provenThroughMs > this.#observedClosedThroughMs) {
+      this.#observedClosedThroughMs = frontier.provenThroughMs
     }
     let finalLength = this.finalOrderLength
     for (let index = finalLength; index < ordered.length; index += 1) {
@@ -1479,10 +1541,6 @@ export class ChronologNode {
     // Reads can now expose this applied history. New intent must sort after
     // it even when the local wall clock trails another writer. Startup runs
     // the same reconciliation over retained inputs before allowing authoring.
-    const observed = ordered.at(-1)?.core.authorTimestampMs ?? -1n
-    const closed = frontier.closedThroughMs ?? -1n
-    if (observed > this.#observedAuthorTimestampMs) this.#observedAuthorTimestampMs = observed
-    if (closed > this.#observedAuthorTimestampMs) this.#observedAuthorTimestampMs = closed
     this.#cacheApplicationSnapshot(ordered)
     this.#applicationChanges.notify()
     if (coordinated !== null || admissionClosed || this.finalOrderLength !== previousFinalLength ||
@@ -1742,6 +1800,9 @@ export class ChronologNode {
       attestation.policyVersion !== await this.#expectedPolicyVersion(core) ||
       typeof attestation.transportAuthor !== 'string'
     ) return false
+    const heartbeat = this.#control.heartbeatFor(attestation.validatorId, core.membershipRevision)
+    if (heartbeat?.feedContiguous === true && heartbeat.validatorFeedSequence < attestation.validatorFeedSequence &&
+        heartbeat.acceptanceCutoffMs >= core.authorTimestampMs) return false
     const transportAuthorized = await this.#options.membership.canUseTransportAuthor?.({
       groupId: core.groupId,
       membershipRevision: core.membershipRevision,
@@ -1799,13 +1860,19 @@ export class ChronologNode {
   }
   #nextAuthorTimestamp(): bigint {
     const wallClock = BigInt(Math.max(0, Math.trunc(this.#clockNow())))
-    const previous = this.#lastAuthoredTimestampMs > this.#observedAuthorTimestampMs
-      ? this.#lastAuthoredTimestampMs : this.#observedAuthorTimestampMs
+    const previous = this.#lastAuthoredTimestampMs > this.#observedTimestampMs
+      ? this.#lastAuthoredTimestampMs : this.#observedTimestampMs
     const next = wallClock > previous ? wallClock : previous + 1n
     const membershipFloor = this.#membershipState().minimumAuthorTimestampMs ?? 0n
     const selected = this.#options.historyPolicy
     const closedFloor = selected?.kind === 'coordinated' ? selected.policy.snapshot().closedThroughMs + 1n : 0n
-    const floor = membershipFloor > closedFloor ? membershipFloor : closedFloor
+    // A new local intent causally follows the state already exposed by this
+    // replica. This also applies to fixed-validator peers and clock rollback.
+    // Only applied/admitted inputs contribute: unverified future proposals must
+    // not advance the author clock. Exact retries never allocate a new context.
+    const observedFloor = this.#observedTimestampMs + 1n
+    const validatorFloor = this.#options.validator === undefined ? 0n : this.#acceptedAboveMs + 1n
+    const floor = [membershipFloor, closedFloor, observedFloor, this.#observedClosedThroughMs + 1n, validatorFloor].reduce((a, b) => a > b ? a : b)
     const timestamp = next < floor ? floor : next
     if (this.#authorFutureSkewMs !== undefined && timestamp > wallClock + BigInt(this.#authorFutureSkewMs)) {
       throw new Error('AUTHOR_CLOCK_AHEAD')
@@ -1889,7 +1956,7 @@ export class ChronologNode {
   #advanceValidatorCutoff(now: number): void {
     const validator = this.#options.validator
     if (!validator) return
-    const proposed = BigInt(Math.max(0, Math.trunc(now - (validator.cutoffLagMs ?? 60_000))))
+    const proposed = BigInt(Math.max(0, Math.trunc(now - validator.cutoffLagMs)))
     if (proposed > this.#acceptedAboveMs) this.#acceptedAboveMs = proposed
   }
   #randomBytes(length: number): Uint8Array { return this.#options.random?.bytes(length) ?? crypto.getRandomValues(new Uint8Array(length)) }

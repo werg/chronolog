@@ -1,167 +1,176 @@
 # Live signals
 
-`@chronolog/signals` is a portable signed JSON channel. It has no database,
-governance, SQL engine, finality provider, durable identity or reconnect outbox.
-Its `Signals` interface matches the application port exposed by Tendriller:
+`@chronolog/signals` is a standalone messaging primitive for data useful only
+while peers are connected: presence, typing, pointers, previews, response chunks,
+device readings and progress. It has **no database, record log, SQL, grant,
+validator or finality dependency**. It uses WebCrypto and JSON values.
+
+Use `send(topic, payload, { ttlMs?, signal? })` and
+`subscribe({ topics?, mode?, signal? })` everywhere. The same `Signals` interface
+is exposed by the Chronolog client, browser peer, resident agent context, and
+Tendriller's independently installed signal binding.
+
+Unknown options, including operation IDs, retry flags and replay cursors, fail
+with `signal_options_invalid`; they cannot silently imply durable semantics.
 
 ```ts
-await signals.send('typing', { active: true }, { ttlMs: 2500, signal })
-for await (const message of signals.subscribe({ topics: ['typing'], mode: 'latest', signal })) {
-  render(message.authorId, message.payload, message.expiresAtMs)
+import { SignalChannel, generateSignalIdentity } from '@chronolog/signals'
+
+const identity = await generateSignalIdentity()
+const signals = new SignalChannel({
+  scope: 'studio:rehearsal',
+  identity,
+  // Application policy, independent of any database or connection identity.
+  authorize: ({ authorId, topic }) => members.has(authorId) && topics.has(topic),
+})
+
+// An admitted encrypted transport supplies this small adapter. A route belongs
+// to one connection lifetime; closing cancels its pending verification.
+const route = signals.attachRoute({
+  send: (frame, { signal }) => connection.send(frame, { signal }),
+  close: () => connection.close(),
+})
+connection.onFrame(frame => route.receive(frame))
+connection.onClose(() => route.close())
+
+await signals.send('typing', { active: true }, { ttlMs: 1500 })
+for await (const message of signals.subscribe({ topics: ['typing'], mode: 'latest', signal: viewLifetime })) {
+  showTyping(message.authorId, message.sessionId, message.payload, message.expiresAtMs)
 }
 ```
 
-Each authenticated message contains string `scope`, `authorId` and `sessionId`
-(the latter two are 64-character lowercase hex identifiers),
-plus `sequence`, `topic`, `payload`, `issuedAtMs` and `expiresAtMs`. Payloads are
-bounded canonical JSON. The signing key and an optional opaque credential are
-bound into the wire signature; the supplied authorization callback interprets
-that credential and checks the current topic policy.
+The envelope contains `scope`, `authorId`, `sessionId`, `sequence`, `topic`,
+`payload`, `issuedAtMs`, and `expiresAtMs`. `authorId` is the lowercase hexadecimal
+Ed25519 public key. A random session ID and positive sequence identify messages
+within this live channel lifetime. They are not durable operation IDs or cursors.
+`generateSignalIdentity()` supplies a non-extractable signing key; applications
+can instead supply their own existing WebCrypto signing identity.
 
-## Build and consume the standalone package
+## Delivery choices
 
-This package is not yet published to npm. The source workspace and the native
-distribution already include it; an independent browser/Node package is built
-deliberately from a source checkout:
+| Mode | Contract | Typical use |
+| --- | --- | --- |
+| `all` (default) | Bounded FIFO in receive order. Distinct messages are never silently coalesced. | Preview chunks, transient actions, sensor samples |
+| `latest` | Replace pending values for the same author, session and topic. Delayed older values cannot regress an already consumed newer value. | Presence, pointers, typing, current progress |
 
-```sh
-pnpm install --frozen-lockfile
-pnpm package:signals
-pnpm test:signals-package
-```
+Subscriptions are live from their first iterator `next()` call and do not replay
+earlier messages. RPC or transport setup may still be asynchronous: creating an
+iterator is not a cross-peer readiness acknowledgment. A local send is not
+echoed back as a received message; use its returned envelope for optimistic
+local display. Consumers see only unexpired messages. When the FIFO or latest-key bound is exceeded, that
+subscription ends with `signal_subscription_overflow`; it cannot falsely appear
+complete after silently losing a queued chunk. Latest mode keeps independent
+senders and independent sessions separate.
 
-Run these commands from the Chronolog repository root with its pinned pnpm.
-Packaging requires committed package inputs and creates
-`artifacts/signals/chronolog-signals-<commit8>.tgz`. The archive contains a bundled
-ES module, public TypeScript declarations, this guide and source provenance with
-content hashes. It has no runtime, optional or peer dependencies. It needs no
-workspace aliases, TypeScript loader, database or Chronolog protocol package.
-The repository's CI and release-evidence workflows build and verify this same
-archive and preserve it as a workflow artifact. They do not publish it to npm.
+Send completion means dispatch on at least one attached live route, not remote
+receipt, processing or dispatch to every peer. A stalled route does not delay a
+healthy route's dispatch. Partial route failures are visible
+through `onError`. Zero routes, total route failure, overload and cancellation
+reject the call. A send uses the routes attached when it began; it never waits
+for a reconnect, switches to a replacement route, or enters a persistent outbox.
+Cancellation stops waiting and cancels route work. Bytes already handed to a
+transport cannot be unsent. Routes must honor their abort signal. A transport may refuse before accepting bytes with
+`SignalError('signal_route_backpressure')`; this preserves the route and does not
+queue a retry. A failed or noncooperative write retires that route and invokes its optional `close()` hook.
+Unsettled writes and policy callbacks keep their capacity slots even after
+cancellation; replacing the connection cannot evade these bounds.
 
-`test:signals-package` installs the current commit's tarball in a separate
-directory with an empty npm cache and offline mode. It verifies signed delivery
-from ordinary Node ESM, compiles a strict TypeScript consumer, checks the content
-hashes and bundles the installed browser entry. Pass `--artifact /path/package.tgz`
-to qualify another exact archive. For local debugging, pass `--allow-dirty` to
-`package:signals`, then select its `-dirty.tgz` archive with
-`test:signals-package --artifact /path/package-dirty.tgz --allow-dirty`. These
-packages are explicitly marked dirty and are not release evidence.
+Direct channels throw `SignalError` with a typed `SignalErrorCode`. The RPC client
+maps these to actionable RPC categories such as `permission_denied`,
+`transport_unavailable`, `resource_exhausted` and `invalid_argument`, preserves
+the original code in `details.signalCode`, and marks them `retryable: false`.
+The application may send a new current observation after recovery; an old live
+message is not a durable operation to retry.
 
-Install an exact archive into the consuming application, then use the imports
-shown below:
+Loss, disconnect and expiration remain possible even on a reliable transport.
+Use application sequence numbers when a preview must detect a missing chunk,
+and replace an incomplete preview with the durable completed result. Use durable
+events when every item must survive recovery.
 
-```sh
-npm install --offline --ignore-scripts --no-audit --no-fund "/absolute/path/chronolog-signals-<commit8>.tgz"
-```
+## Peer forwarding, trust and resource limits
 
-Use Node.js 22 or newer, or a browser with WebCrypto Ed25519 and the standard
-`AbortSignal` APIs. Browser applications bundle the package through its public
-ESM export. The package uses platform cryptography and has no Node-specific code.
+Every message is signed over a separate `signal/1` envelope. Set `relay: true`
+explicitly to forward accepted originals to other attached routes; a standalone
+channel does not relay by default. Receiving verifies
+the signature, scope, expiry and current authorization before delivering or
+forwarding. Relays preserve the original bytes and author; duplicate paths return
+`null` from `receive()` and cannot create echo loops. Expired valid messages also
+return `null`. Each transport uses its returned route's `receive()` so
+connection close cancels pending verification before admission. Concurrent verification and policy checks retain receive-call order at admission.
+FIFO delivery admits distinct out-of-order messages; a high sequence number does not silently discard an older
+unseen event. Duplicate protection retains entries through expiry and refuses
+new entries when full, rather than evicting protection for live messages. A full
+shared receive-work budget rejects `route.receive()` with `signal_backpressure`
+before admission; it does not retain the frame for retry. The governed peer
+adapter treats that refused live datagram separately from reliable replication.
 
-## Standalone composition
+Signatures authenticate author and contents. **Confidentiality and recipient
+admission belong to the transport.** A message topic or a payload claiming a role
+grants no authority. A scope is an application isolation name, not a secret.
 
-Construct `new SignalChannel({ scope, identity, authorize })` with an Ed25519
-identity and the application's current authorization policy. Use
-`generateSignalIdentity()` for a fresh standalone key; persisting or restoring
-that key belongs to the application. The package depends only on canonical
-encoding and browser WebCrypto, with its own strict JSON payload validation. An
-optional `credential` may be fixed bytes or a function that selects the current
-credential for each topic. An optional `send` callback supplies a standalone
-outgoing transport; pass its incoming frames to `channel.receive(frame)`.
+The default limits are 16 KiB per signed message, 30-second maximum TTL,
+5-second default TTL, 2-second clock skew, 32 pending sends, 32 pending receives,
+one in-flight send per route, 32 routes and outstanding route operations,
+16 subscriptions, 64 pending messages or latest keys per subscription,
+256 KiB queued bytes per subscription, and 4096 live duplicate entries. Send deadlines
+default to 5 seconds and cover asynchronous authorization as well as transport
+dispatch. Receive verification and authorization have their own 5-second deadline
+and are interrupted by channel or source-route closure. Iterator return and
+subscription abort release their quota even when a consumer is idle or paused at
+a yielded value. Local time never moves backward after expiry has been observed. Bounds are configurable; TTL and deadlines cannot exceed five
+minutes. Validate deployment clock synchronization for the configured skew.
 
-For bidirectional routes, call `channel.attachRoute({ send })` and give incoming
-frames to that returned route's `receive(frame)`. Verified messages are delivered
-locally. Set `relay: true` to relay their original signed bytes to the other live
-routes; standalone relay is disabled by default. Close the route when
-its connection ends. Distinct fresh sequences may arrive out of order through
-different paths; duplicate author/session/sequence identities are suppressed.
-A bounded replay cache fails explicitly when full instead of evicting protection
-for still-fresh messages. `receive()` returns `null` for a duplicate or an
-otherwise valid, authorized expired message. Ordinary expiry neither relays a
-frame nor tears down its authenticated connection. Invalid signatures, malformed
-frames and failed current authorization remain errors.
+An expired message is not evidence of another peer's disconnect. Applications
+expire their own presence or progress display at `expiresAtMs`. Slow or offline
+peers have only the authorization state they already know.
 
-An attached route also returns `null` when the channel's shared receive-work
-capacity is full. This is a drop before admission: it does not authenticate,
-deliver, remember or relay that frame, and it does not close the route. The
-direct `channel.receive(frame)` port instead rejects with `SIGNAL_BACKPRESSURE`
-at capacity so its caller can choose its own admission policy. Neither port
-retains a frame for later replay.
+## Chronolog composition
 
-Start a subscription before the messages it should observe. A new subscriber
-receives no earlier value, and a channel does not echo its own outgoing messages
-to its subscriptions; use the result of `send()` for optimistic local display.
-Returning an iterator cancels even an idle pending read. Closing and reopening a
-channel creates a fresh random session with no retained outbox.
+`createCapabilitySignals()` in `@chronolog/capabilities` adapts already
+verified group membership to this standalone primitive. It checks the original
+signer's current signal-topic rights. It creates no proposal, receipt, event
+cursor or durable write, and does not request finality. SQL and durable topic
+rights remain independent; a signal-only writer grant can set `sql: false` and
+`topics: []`. A read-only device can receive without having send rights.
 
-The transport supplies confidentiality and connection access. Signatures alone
-do not encrypt a message or authorize a connection to read a database.
+`peer.connectPeer({ connection })` in both browser profiles, and resident
+`context.connectPeer({ connection })`, attach the same governed connection
+composition, `createGovernedPeerService()` from
+`@chronolog/agent-service/governed-peer`. An optional `signal` owns authentication
+and the whole session; `peerIdentity` pins a specific endpoint. They authenticate current reader rights, attach record replication,
+and attach signal routes only when the connection provides an independent live
+lane. They relay verified originals and retire both attachments on close. The
+channel and its subscriptions outlive individual routes; losing one route does
+not end delivery from other peers. Reconnect creates a fresh route with no signal replay. Applications
+call `peer.signals`, `client.signals`, or `context.signals`; they do not manage
+grant IDs, signatures, packet forwarding or private keys themselves.
 
-## Delivery and bounds
+The governed service binds each endpoint's signing key and advertised feed to
+its current reader grant. Compact finalized membership controls can establish
+these permissions before application history is applied. Constructing the
+service requires no writer grant; sending still requires current signal-topic
+rights.
 
-`subscribe()` defaults to `mode: 'all'`, a bounded FIFO in local admission order.
-`mode: 'latest'` keeps the highest sequence for the same author/session/topic,
-including after that value is consumed, so a reordered older message cannot
-replace a newer one. Its bounded per-key sequence memory lasts for the maximum
-remaining signal lifetime. Both
-modes fail the subscriber with `SIGNAL_SUBSCRIPTION_OVERFLOW` when the selected
-queue cannot hold another distinct value. Consumers must treat that failure as a
-gap. Cancellation releases the subscription even when its consumer is paused.
+Signal policy can use known membership while a finality provider is unavailable.
+That does not make a new governance revision active or make a pending durable
+transaction final. A receiving agent must separately decide whether the original
+sender has permission to request an external action. Recovery-sensitive effects
+start from final accepted durable intent; never replay signals in a projection.
 
-| Bound | Default |
-| --- | --- |
-| Encoded frame / credential | 16 KiB / 1 KiB |
-| Maximum TTL / tolerated future clock skew | 30 seconds / 2 seconds |
-| Outgoing attempt timeout | 10 seconds, also bounded by the message TTL |
-| Pending sends / receives | 32 / 32 |
-| Live routes / subscriptions | 64 / 16 |
-| Queue per subscription / remembered latest keys | 64 messages and 256 KiB / 64 keys |
-| Sender sessions / distinct remembered identities | 1,024 / 8,192 |
-| Distinct remembered identities per sender session | 1,024 |
+## Packaging and verification
 
-Topics contain at most 128 characters matching `[A-Za-z0-9][A-Za-z0-9._/-]*`.
-Scopes contain 1–256 UTF-8 bytes. JSON payloads permit finite numbers, at most
-32 nesting levels and 4,096 nodes, without accessors, sparse arrays or lossy
-serialization.
+`pnpm package:signals` builds a dependency-free ESM package, TypeScript
+declarations, exact input/module provenance and a local npm archive. It rejects
+dirty source unless `--allow-dirty` is supplied for local development. The build
+audits that every runtime input belongs to this package and that the output has
+no imports. Packing does not publish anything. `pnpm test:signals-package`
+installs that exact tarball offline into a fresh directory, checks an ordinary
+Node consumer, typechecks portable declarations, and bundles the installed public
+browser entry without workspace aliases or dependencies.
 
-These limits are independently configurable within fixed upper bounds. The
-maximum configurable TTL is 60 seconds. Queueing does not restart a message's
-TTL, and a local clock rollback cannot revive an expired frame.
-
-A send is one attempt on the currently attached routes. Resolution means at
-least one route accepted local dispatch; it does not acknowledge remote receipt
-or application processing. A healthy route can complete a send while another
-route remains busy; every route permits at most one unsettled dispatch and has
-its own deadline. Policy work that ignores cancellation stays counted against
-its work quota until it settles. A low-level transport may return
-`{ refused: 'backpressure' }` only when that attempt queued and dispatched no
-frame. The application send rejects visibly while the route stays usable for a
-later fresh message; nothing retries the refused value. Normal dispatch returns
-`undefined`. Any other return value is a transport error. Some
-routes can receive a message even when the operation later rejects; cancellation
-cannot recall bytes already handed to a transport. A failed publication does not
-revoke healthy routes. A transport failure or a dispatched write that ignores
-cancellation retires that route and invokes its optional `close()` callback;
-the connection owner should close its underlying session there. The public
-`signals.send()` reports refused capacity with `SignalBackpressureError` (code
-`SIGNAL_BACKPRESSURE`). Low-level transports return the explicit refusal above;
-throwing an exception does not establish that no dispatch occurred and retires
-the route. Reconnect never resends prior messages.
-
-## Governed replicas
-
-`createCapabilitySignals` from `@chronolog/capabilities` supplies the current
-membership authorization adapter. `createGovernedPeerService` from
-`@chronolog/agent-service/governed-peer` uses that adapter with authenticated
-replication routes and relay enabled. It dynamically
-selects a current writer-kind capability with the requested signal topic. A
-read-only or unenrolled replica can construct the service without publisher
-rights; a send fails while those rights are absent.
-
-The service binds the peer's signing key and advertised feed to its current
-reader capability. It owns signal routes, replication attachment and session
-replacement. Each session exposes `signal`, `completion` and `close()`. Compact
-membership controls can establish these permissions before application history
-is applied. Rights are evaluated against the latest verified local membership;
-an offline replica cannot know a revocation it has not yet received. Signal traffic never advances an application frontier or finality.
+The standalone tests exercise delivery, reordered paths, expiry, replay bounds,
+authorization, overload and cancellation. Governed composition tests connect
+three real framed peers, relay original messages, and require zero durable
+history reads even when history and finality providers are unavailable. The
+contrib `share-live-signals` check independently consumes the built public module
+without a database or finality service.

@@ -10,19 +10,36 @@ import {
   type CoordinatedHistoryConfiguration,
   type OrderedRecordEntry, type OrderedRecordHead,
 } from './history-policy.js'
-import type { AdmissionFrontier } from '@chronolog/control-store/browser'
+import type { SettlementEvidence } from '@chronolog/control-store'
 
-/**
- * Live history closes an irrevocable chronological prefix. The proof mechanism
- * may be a validator set or an inclusion signer; neither chooses execution
- * order. Asynchronous branching has no finality; it shares proposal identity,
- * chronological ordering and replay without implementing this live-only port.
- */
-export interface LiveFinalityFrontier extends AdmissionFrontier {
-  readonly mode: 'live'
-  readonly checkpointId?: string
+export interface LiveFinalityBlocker {
+  readonly proposalId: Uint8Array
+  readonly authorTimestampMs: bigint
+  readonly reason: 'pending-admission' | 'missing-candidate'
+  readonly attestationIds: readonly Uint8Array[]
 }
 
+export interface LiveFinalityExclusion {
+  readonly proposalId: Uint8Array
+  readonly reason: 'FINALITY_TIMESTAMP_CLOSED' | 'ADMISSION_IMPOSSIBLE'
+}
+
+/** Verified time proof, before application replay publication. */
+export interface LiveFinalityFrontier {
+  readonly mode: 'live'
+  readonly checkpointId?: string
+  /** All admissible revision/policy combinations are closed through this time. */
+  readonly provenThroughMs: bigint | null
+  /** Raw proof restricted by every unresolved earlier admission/body. */
+  readonly closedThroughMs: bigint | null
+  readonly blockers: readonly LiveFinalityBlocker[]
+  /** Pending candidates whose exact policy is now proved impossible. */
+  readonly exclusions: readonly LiveFinalityExclusion[]
+}
+
+export interface FinalitySettlementEvidence extends SettlementEvidence {
+  readonly frontier: LiveFinalityFrontier
+}
 /** Runtime timers are derived from the authenticated genesis, never local defaults. */
 export function resolveFinalityClockPolicy(policy: {
   readonly maxFutureSkewMs: bigint

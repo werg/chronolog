@@ -23,7 +23,6 @@ export interface DoltLiteMaterializerRuntimeBackend {
   readonly finalRevision?: bigint
   readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
-  proposalIdAt(index: number): Uint8Array | null
   materialize(orderedTransactions: readonly AdmittedTransaction[]): Promise<MaterializedRevision | null>
   publishFinal?(prefixLength: number): Promise<void>
   localSql(
@@ -81,7 +80,6 @@ export function createDoltLiteMaterializationRuntime(
       get finalRevision() { return materializer.finalRevision ?? 0n },
       get finalOrderLength() { return materializer.finalOrderLength ?? 0 },
       get executionManifestDigest() { return materializer.executionManifestDigest },
-      proposalIdAt(index) { return materializer.proposalIdAt(index) },
       localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
       outcome(txId) { return materializer.outcome(txId) },
       captureApplication(options) { return materializer.captureApplication(options) },

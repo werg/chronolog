@@ -211,8 +211,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   get checkpointError(): string | null { return this.#checkpointError }
   get databaseContentHash(): string { return this.#published.contentHash }
 
-  proposalIdAt(index: number): Uint8Array | null { return this.#order[index]?.slice() ?? null }
-
   transactionLogDigest(): Promise<Uint8Array> { return materializedLogDigest(this.#log) }
 
   checkpoints(): readonly MaterializerCheckpointInfo[] {
@@ -260,6 +258,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   captureApplication(options: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot {
     this.#assertOpen()
     const view = options.view ?? 'final'
+    if (view !== 'local' && view !== 'final') throw new MaterializerInputError('MATERIALIZER_VIEW_INVALID')
     const log = view === 'final' ? this.#finalLog : this.#log
     return {
       view, revision: view === 'final' ? this.finalRevision : this.revision, orderLength: log.length,
@@ -462,7 +461,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         for (let index = checkpoint.prefixLength; index < prefixLength; index += 1) {
           const row = prefix[index]!
           this.#applyTransaction({
-            txId: row.txId, authorFeedSequence: row.authorFeedSequence,
+            txId: row.txId,
             candidateDigest: row.candidateDigest, canonicalCandidate: row.canonicalCandidate,
             core: decodeTransactionCore(row.canonicalCandidate),
           }, index)
@@ -665,9 +664,6 @@ async function validateTransactionSet(
   const proposals = new Set<string>()
   for (const [index, transaction] of transactions.entries()) {
     if (transaction.txId.length === 0) throw new MaterializerInputError('MATERIALIZER_TRANSACTION_ID_INVALID')
-    if (transaction.authorFeedSequence < 0n || transaction.authorFeedSequence > (1n << 63n) - 1n) {
-      throw new MaterializerInputError('MATERIALIZER_AUTHOR_FEED_SEQUENCE_INVALID')
-    }
     if (!bytesEqual(encodeTransactionCore(transaction.core), transaction.canonicalCandidate)) {
       throw new MaterializerInputError('MATERIALIZER_CANONICAL_CANDIDATE_MISMATCH')
     }
@@ -770,7 +766,7 @@ function sameIdentity(row: TransactionLogRow, transaction: AdmittedTransaction):
     bytesEqual(row.canonicalCandidate, transaction.canonicalCandidate) &&
     bytesEqual(row.authorId, transaction.core.authorId) &&
     row.authorTimestampMs === transaction.core.authorTimestampMs &&
-    row.authorFeedSequence === transaction.authorFeedSequence &&
+    row.operationId === transaction.core.operationId &&
     compareTransactionOrder(row.orderKey, orderKeyOf(transaction)) === 0
 }
 
@@ -823,7 +819,6 @@ function logRow(
     operationId: transaction.core.operationId,
     authorId: transaction.core.authorId,
     authorTimestampMs: transaction.core.authorTimestampMs,
-    authorFeedSequence: transaction.authorFeedSequence,
     candidateDigest: transaction.candidateDigest,
     canonicalCandidate: transaction.canonicalCandidate,
     outcome: rejection === null ? 'accepted' : 'rejected',
@@ -848,7 +843,7 @@ function verifyStoredManifest(stored: StoredExecutionManifest, artifacts: Manife
 
 function rollbackIfActive(database: DatabaseLike): void { if (database.inTransaction) database.exec('ROLLBACK') }
 function orderKeyOf(transaction: AdmittedTransaction): TransactionOrderKey {
-  return { authorTimestampMs: transaction.core.authorTimestampMs, authorId: copyBytes(transaction.core.authorId), authorFeedSequence: transaction.authorFeedSequence, txId: copyBytes(transaction.txId) }
+  return { authorTimestampMs: transaction.core.authorTimestampMs, authorId: copyBytes(transaction.core.authorId), txId: copyBytes(transaction.txId) }
 }
 function cloneTransaction(transaction: AdmittedTransaction): AdmittedTransaction { return structuredClone(transaction) }
 function cloneLogRow(row: TransactionLogRow): TransactionLogRow { return structuredClone(row) }

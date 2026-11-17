@@ -1,4 +1,6 @@
+import { once } from 'node:events'
 import { mkdir } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { join } from 'node:path'
 
 import { NativeAgentStore, type AgentApplicationModule } from '@chronolog/agent-service'
@@ -11,9 +13,10 @@ import { base64UrlToBytes, bytesToBase64Url, encodeExecutionManifest, executionM
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 
+import { createHttpPeerFixture } from './lib/http-peer-fixture.js'
+
 import { createDaemonAgentRuntime } from '../apps/chronologd/src/agent-runtime.js'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from '../test/browser/event-contract.js'
-import { createHttpPeerFixture } from './lib/http-peer-fixture.js'
 
 /**
  * Real native fixed authority used by browser and contrib acceptance gates.
@@ -82,22 +85,43 @@ export async function createNativeBrowserFixture(options: {
   void running.catch((error: unknown) => { serviceFailure = error instanceof Error ? error : new Error('NATIVE_AGENT_FAILED', { cause: error }) })
   const client = new ChronologClient({ groupId: bytesToBase64Url(groupId),
     transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node, signals: agent.context.signals })), unaryRetryAttempts: 1 })
-  const failures: string[] = []
-  const http = await createHttpPeerFixture({ accept: connection => agent.context.connectPeer({ connection }),
-    onError: error => { failures.push(error instanceof Error ? error.message : String(error)) } })
+  const token = crypto.randomUUID()
+  const peerHttp = createHttpPeerFixture({ token, connect: connection => agent.context.connectPeer({ connection }) })
+  const server = createServer((request, response) => {
+    response.setHeader('Access-Control-Allow-Origin', '*')
+    response.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+    response.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    response.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+    response.setHeader('Cache-Control', 'no-store')
+    if (request.method === 'OPTIONS') { response.writeHead(204); response.end(); return }
+    const handle = async () => {
+      if (await peerHttp.handle(request, response)) return
+      response.writeHead(404); response.end()
+    }
+    void handle().catch((error: unknown) => {
+      if (!response.headersSent) { response.writeHead(500); response.end(error instanceof Error ? error.message : String(error)) }
+      else response.destroy()
+    })
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new Error('BROWSER_FIXTURE_ADDRESS_UNAVAILABLE')
   const bootstrap: BrowserEventBootstrap = { genesis: bytesToBase64Url(encodeSignedGenesis(genesis)), groupRoute: bytesToBase64Url(groupRoute),
     epochContentKey: bytesToBase64Url(epochContentKey), executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
-    nativeIdentity: bytesToBase64Url(identity.signing.publicKeyBytes), peerUrl: http.url, peerToken: http.token }
+    nativeIdentity: bytesToBase64Url(identity.signing.publicKeyBytes), peerUrl: `http://127.0.0.1:${address.port}/peer`, peerToken: token }
   let closed = false
   return { bootstrap, node: governed.node, governed, client, store, feedStore, identity, agent, transport,
     assertHealthy() {
       if (serviceFailure !== undefined) throw serviceFailure
-      if (failures.length > 0) throw new Error(`BROWSER_PEER_SESSION_FAILED: ${failures.join('; ')}`)
+      peerHttp.assertHealthy()
     },
     async close() {
       if (closed) return
       closed = true
-      await http.close()
+      await peerHttp.close()
+      server.closeAllConnections()
+      await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)))
       try { await agent.close(); await client.close(); await governed.close() }
       finally { control.close(); store.close() }
     },

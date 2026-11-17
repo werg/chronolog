@@ -146,12 +146,16 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
       backlog = { eligible: eligible.length, included: range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes)).length, head: range.head }
       return backlog.included === backlog.eligible
     }
-    const advanceClock = async () => {
-      const next = clockNow + Number(bootstrap.genesis.manifest.clockPolicy.cutoffLagMs) + 1
-      assert(Number.isSafeInteger(next), 'RECOVERY_CLOCK_EXHAUSTED')
+    // The expiry regression deliberately advances this before inclusion. The
+    // crash cases call it only after retaining the backlog they intend to test.
+    const advanceFinalityClock = async (throughMs: bigint) => {
+      const target = throughMs + bootstrap.genesis.manifest.clockPolicy.cutoffLagMs
+      assert(throughMs >= 0n && target <= BigInt(Number.MAX_SAFE_INTEGER), 'RECOVERY_CLOCK_EXHAUSTED')
+      const next = Math.max(clockNow, Number(target))
       await store.put(clockKey, encodeCanonicalCbor(BigInt(next)))
       clockNow = next
     }
+    const advanceClock = () => advanceFinalityClock(BigInt(clockNow) + 1n)
     let pending: readonly string[] = []
     const settled = async () => {
       const next: string[] = []
@@ -232,7 +236,7 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
         events: (await node.events.read()).transactions,
         payloads, retainedValueBytes: store.usageBytes() }
     }
-    return { store, node, authority, transport: activeTransport, agent, governed, identity,
+    return { store, node, authority, transport: activeTransport, agent, governed, identity, advanceFinalityClock,
       arm() { armed = true },
       async initialize() {
         const receipt = await node.publish({ operationId: 'recovery-schema', program: program(

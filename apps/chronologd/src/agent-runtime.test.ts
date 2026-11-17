@@ -3,12 +3,12 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { NativeAgentStore, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
+import { FinalEventPublicationRejectedError, NativeAgentStore, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
 import { signGenesis } from '@chronolog/capabilities'
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { createGovernedNode, decodeLedgerRecord, isFinalityClosureRecord, membershipDescriptor, MemoryOperationStore } from '@chronolog/node-core'
-import { bytesToHex, decodeEnvelope, executionManifestArtifacts, generateEd25519KeyPair } from '@chronolog/protocol'
+import { bytesToHex, decodeEnvelope, executionManifestArtifacts, generateEd25519KeyPair, program } from '@chronolog/protocol'
 import {
   DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner,
 } from '@chronolog/records'
@@ -132,6 +132,11 @@ describe('native agent composition', () => {
       await waitForFinalAcceptance(governed.node, duplicate.txId, deadline.signal)
       expect(dispatches).toBe(1)
       expect(() => governed.node.localSql('SELECT 1')).toThrow('SQL_DISABLED_FOR_EVENT_PROFILE')
+      const rejected = await governed.node.publish({ operationId: 'sql-in-event-profile', program: program('SELECT 1') })
+      await closePublishedCandidate(3)
+      const rejection = await waitForFinalAcceptance(governed.node, rejected.txId, deadline.signal).catch((error: unknown) => error)
+      expect(rejection).toBeInstanceOf(FinalEventPublicationRejectedError)
+      expect(rejection).toMatchObject({ proposalId: rejected.txIdText, rejectionCode: 'profile:sql-disabled' })
     } finally { clearTimeout(timeout); deadline.abort() }
     const publication = new AbortController(), reason = new Error('resident task stopped')
     const waiting = agent.context.publisher.publishFinal('jobs.results', { cancelledWait: true },
@@ -183,12 +188,12 @@ describe('native agent composition', () => {
         framePeerStream({ readable: toReader.readable, writable: toOwner.writable })] as const
     }
     const reliable = lane(), live = lane()
-    const connections = reliable.map((connection, index) => ({ ...connection, live: live[index]!,
-      signal: AbortSignal.any([connection.signal, live[index]!.signal]),
-      async close() { await Promise.all([connection.close(), live[index]!.close()]) } }))
+    const connection = (index: 0 | 1) => ({ ...reliable[index], live: live[index],
+      signal: AbortSignal.any([reliable[index].signal, live[index].signal]),
+      async close() { await Promise.all([reliable[index].close(), live[index].close()]) } })
     const sessions = await Promise.all([
-      publisher.context.connectPeer({ connection: connections[0]!, peerIdentity: reader.publicKeyBytes }),
-      subscriber.context.connectPeer({ connection: connections[1]!, peerIdentity: owner.publicKeyBytes }),
+      publisher.context.connectPeer({ connection: connection(0), peerIdentity: reader.publicKeyBytes }),
+      subscriber.context.connectPeer({ connection: connection(1), peerIdentity: owner.publicKeyBytes }),
     ])
     const before = await publisher.finality!.head()
     const iterator = subscriber.context.signals.subscribe({ topics: ['presence'], signal: AbortSignal.timeout(2_000) })[Symbol.asyncIterator]()
@@ -198,7 +203,7 @@ describe('native agent composition', () => {
     expect(received.done).toBe(false)
     expect(received.value).toEqual(sent)
     expect(received.value?.authorId).toBe(bytesToHex(owner.publicKeyBytes))
-    await expect(subscriber.context.signals.send('presence', { active: false })).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    await expect(subscriber.context.signals.send('presence', { active: false })).rejects.toThrow('signal_unauthorized')
     expect(await publisher.finality!.head()).toEqual(before)
     await subscriber.close()
     expect(sessions[1].signal.aborted).toBe(true)
