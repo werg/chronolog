@@ -2,7 +2,7 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { NativeBytesStore } from '@chronolog/records/native'
-import { type AgentApplicationModule } from '@chronolog/agent-service'
+import type { AgentApplicationModule } from '@chronolog/agent-service'
 import { encodeSignedGenesis, signGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
