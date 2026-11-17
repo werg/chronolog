@@ -54,7 +54,8 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
 } = {}): { close(): Promise<void> } {
   let port: MessagePort | undefined, closed = false, lastId = 0, nextView = 0
   let closing: Promise<void> | undefined
-  const calls = new Map<number, AbortController>(), streams = new Map<number, Stream>(), views = new Map<number, ApplicationReadView>()
+  const calls = new Map<number, AbortController>(), streams = new Map<number, Stream>()
+  const views = new Map<number, { readonly handle: ApplicationReadView; readonly requestId: number }>()
   const send = (value: unknown): void => { bounded(value); port?.postMessage(value) }
   const respond = (id: number, value: unknown): void => { send({ id, value, snapshot: snapshot(session) } satisfies Response) }
   const cancelStream = async (id: number): Promise<void> => {
@@ -69,7 +70,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     endpoint.removeEventListener('message', connect)
     session.signal.removeEventListener('abort', aborted)
     for (const controller of calls.values()) controller.abort(reason)
-    for (const view of views.values()) view.release()
+    for (const view of views.values()) view.handle.release()
     views.clear()
     port?.removeEventListener('message', receive); port?.removeEventListener('messageerror', messageError)
     closing = Promise.allSettled([...streams.keys()].map(cancelStream)).then(async () => {
@@ -96,9 +97,9 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
   const view = (id: unknown): ApplicationReadView => {
     const result = typeof id === 'number' ? views.get(id) : undefined
     if (result === undefined) throw new Error('APPLICATION_VIEW_RELEASED')
-    return result
+    return result.handle
   }
-  const invoke = async (method: string, args: readonly unknown[], signal: AbortSignal): Promise<unknown> => {
+  const invoke = async (method: string, args: readonly unknown[], signal: AbortSignal, requestId: number): Promise<unknown> => {
     switch (method) {
       case 'command': return (await session.command(args[0] as string, args[1] as never, args[2] as CommandOptions)).operationId
       case 'reapply': return (await session.reapply(args[0] as string, args[1] as string, args[2] as never, args[3] as CommandOptions)).operationId
@@ -121,12 +122,12 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'view.open': {
         const captured = await session.readView()
         if (signal.aborted) { captured.release(); signal.throwIfAborted() }
-        const id = ++nextView; views.set(id, captured)
+        const id = ++nextView; views.set(id, { handle: captured, requestId })
         return { id, revision: captured.revision }
       }
       case 'view.query': return view(args[0]).query(args[1] as string, args[2] as readonly QueryParameter[])
       case 'view.events': return view(args[0]).readEvents(args[1] as ApplicationEventOptions)
-      case 'view.release': { const captured = views.get(args[0] as number); views.delete(args[0] as number); captured?.release(); return null }
+      case 'view.release': { const captured = views.get(args[0] as number); views.delete(args[0] as number); captured?.handle.release(); return null }
       case 'content.stage': return (await session.content.stage(args[0] as { bytes: number; mediaType?: string })).id
       case 'content.resume': return (await session.content.resume(args[0] as string)).id
       case 'content.write': return (await session.content.resume(args[0] as string)).write(args[1] as number, args[2] as Uint8Array)
@@ -168,7 +169,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
         try { result = await stream.iterator.next() }
         finally { stream.busy = false }
         if ((result as IteratorResult<unknown>).done) await cancelStream(request.args[0] as number)
-      } else result = await invoke(request.method, request.args, controller.signal)
+      } else result = await invoke(request.method, request.args, controller.signal, request.id)
       if (!closed && !controller.signal.aborted) respond(request.id, result)
     } finally { calls.delete(request.id) }
   }
@@ -180,6 +181,11 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
         if (!Number.isSafeInteger(input.cancel)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
         calls.get(input.cancel as number)?.abort(new Error('APPLICATION_WORKER_CANCELLED'))
         void cancelStream(input.cancel as number)
+        // A captured view can outlive the request that created it. If its reply
+        // crossed a cancelled page waiter, that request still owns its disposal.
+        for (const [id, captured] of views) {
+          if (captured.requestId === input.cancel) { views.delete(id); captured.handle.release() }
+        }
         return
       }
       if (!input || !Number.isSafeInteger(input.id) || input.id! <= lastId || typeof input.method !== 'string' || !Array.isArray(input.args)) {
@@ -233,7 +239,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   readonly operations = {
     get: (id: string, options: { readonly author?: string } = {}): Promise<OperationState | null> => this.#call('operation.get', [id, options]),
     inspect: (id: string, options: { readonly author?: string } = {}): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null> => this.#call('operation.inspect', [id, options]),
-    wait: (id: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => this.#call('operation.wait', [id], options.signal),
+    wait: (id: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => this.#call('operation.wait', [id], options.signal, true),
   }
   readonly recovery = {
     inspect: (): Promise<readonly ApplicationTransition[]> => this.#call('recovery.inspect', []),
@@ -409,7 +415,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   #operation(id: string): WorkerApplicationOperation {
     return Object.freeze({ operationId: id, get: () => this.operations.get(id),
       applied: (options: { readonly signal?: AbortSignal } = {}) => this.operations.wait(id, options),
-      retry: () => this.retry(id), shared: (options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> => this.#call('operation.shared', [id], options.signal) })
+      retry: () => this.retry(id), shared: (options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> => this.#call('operation.shared', [id], options.signal, true) })
   }
   #upload(id: string): ContentUpload {
     return { id, write: (index, bytes) => this.#call('content.write', [id, index, bytes]),
@@ -424,7 +430,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
     try {
       bounded(event.data)
       const response = event.data as Response & { ended?: WireError }
-      if (response.ended !== undefined) { this.#fail(fromError(response.ended)); return }
+      if (response.ended !== undefined) { this.#fail(fromError(response.ended), false); return }
       if (!Number.isSafeInteger(response.id)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
       const pending = this.#pending.get(response.id)
       if (pending === undefined) return // A cancelled waiter can have an already posted result.
@@ -448,8 +454,12 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       try { listener(structuredClone(value.participation!)) } catch { /* Observation cannot choose recovery. */ }
     }
   }
-  #fail(reason: unknown): void {
+  #fail(reason: unknown, notifyOwner = true): void {
     if (this.signal.aborted) return
+    if (notifyOwner) {
+      try { this.#port.postMessage({ id: ++this.#nextId, method: 'close', args: [] } satisfies Request) }
+      catch { /* A failed port cannot acknowledge cleanup; the Worker lifetime still fences all work. */ }
+    }
     this.#lifetime.abort(reason); this.#stopExternal?.()
     this.#participationLifetime.abort(reason)
     this.#snapshot = { ...this.#snapshot, status: { ...this.#snapshot.status, phase: 'closed' },

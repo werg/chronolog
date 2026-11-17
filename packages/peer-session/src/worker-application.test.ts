@@ -49,12 +49,18 @@ async function fixture(options: { readonly closeA?: () => Promise<void> } = {}) 
   return { a: sessions[0]!, b: sessions[1]!, registry }
 }
 
-async function facade(session: ApplicationSession, host?: ApplicationControlHost) {
+async function facade(session: ApplicationSession, host?: ApplicationControlHost, options: {
+  readonly timeoutMs?: number; readonly observePort?: (port: MessagePort) => void
+} = {}) {
   const endpoint = new MessageChannel()
   cleanup.push(() => { endpoint.port1.close(); endpoint.port2.close() })
   const server = serveApplicationWorker(session, endpoint.port1, host === undefined ? {} : { host })
   cleanup.push(() => server.close())
-  const client = await connectApplicationWorker<typeof definition>(endpoint.port2, { timeoutMs: 5000 })
+  if (options.observePort !== undefined) endpoint.port1.addEventListener('message', event => {
+    const port = (event.data as { port?: MessagePort }).port
+    if (port !== undefined) options.observePort!(port)
+  })
+  const client = await connectApplicationWorker<typeof definition>(endpoint.port2, { timeoutMs: options.timeoutMs ?? 5000 })
   cleanup.push(() => client.close())
   return { client, endpoint }
 }
@@ -70,6 +76,47 @@ describe('owned browser application facade', () => {
     await vi.waitFor(() => expect(client.signal.aborted).toBe(true))
     expect(settled).toBe(true)
     await rejected
+    await vi.waitFor(() => expect(f.a.status.phase).toBe('closed'))
+  })
+
+  it('releases a captured view when its completed response crosses a timed-out page waiter', async () => {
+    const f = await fixture(), released = vi.fn(), read = f.a.readView.bind(f.a)
+    const capture = vi.spyOn(f.a, 'readView').mockImplementation(async () => {
+      const view = await read()
+      return { ...view, release() { released(); view.release() } }
+    })
+    cleanup.push(() => { capture.mockRestore() })
+    let dropped = false
+    const { client } = await facade(f.a, undefined, { timeoutMs: 500, observePort(port) {
+      const send = port.postMessage.bind(port)
+      vi.spyOn(port, 'postMessage').mockImplementation(value => {
+        const response = value as { value?: { id?: number; revision?: unknown } }
+        if (!dropped && response.value?.id !== undefined && response.value.revision !== undefined) { dropped = true; return }
+        send(value)
+      })
+    } })
+    await expect(client.readView()).rejects.toThrow('APPLICATION_WORKER_TIMEOUT')
+    expect(dropped).toBe(true)
+    await vi.waitFor(() => expect(released).toHaveBeenCalledOnce())
+    capture.mockRestore()
+    const views: ApplicationReadView[] = []
+    for (let index = 0; index < 8; index++) views.push(await f.a.readView())
+    for (const view of views) view.release()
+    expect(client.signal.aborted).toBe(false)
+  })
+
+  it('keeps applied and shared waits alive beyond the generic RPC deadline', async () => {
+    const f = await fixture(), { client } = await facade(f.b, undefined, { timeoutMs: 500 })
+    const operation = await client.command('say', 'waiting for a peer', { operationId: 'long-wait' })
+    let appliedSettled = false, sharedSettled = false
+    const applied = operation.applied(), shared = operation.shared()
+    void applied.then(() => { appliedSettled = true }, () => { appliedSettled = true })
+    void shared.then(() => { sharedSettled = true }, () => { sharedSettled = true })
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(appliedSettled).toBe(false); expect(sharedSettled).toBe(false)
+    const link = await connectApplications(f.a, f.b); cleanup.push(() => link.close())
+    expect(await applied).toMatchObject({ operationId: 'long-wait', outcome: 'accepted' })
+    expect(await shared).toHaveLength(1)
   })
 
   it('observes the owner participation policy and forwards exact broader-recovery approval', async () => {
