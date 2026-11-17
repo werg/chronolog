@@ -1,0 +1,20 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "2e8200a33a47da4029a96b3699e23d2b1441f823",
+  "sourceTree": "c74862ec912c3dcdc769df5cc1adf0849eb62176",
+  "sourceDirty": false,
+  "buildCommand": "npm run build:artifacts && npm run test:consumer && npm run release:artifacts",
+  "dependencyInstallCommand": "npm ci",
+  "consumerCommand": "npm run test:consumer",
+  "consumerQualification": "Built from the clean source tree and checked with the packed public consumer in this workspace.",
+  "membershipSource": "4efa3546f930734328879bdca3984282bd19156b",
+  "membershipArtifactSha256": "9f293978c1b43eea3998d0ef75cbe1911f1ee5eafdf47da6d303b053ea0d9008",
+  "peerGenerationControlSource": "dacea5d1d864ad6cca300b956f0a655e58178a2c",
+  "peerGenerationControlArtifactSha256": "737bc40c36f3ff6f5f5ffd5d73db56a772082c408ded0330fd5e48975e5e6b43",
+  "purpose": "Current peer-generation publication, invitations, owned application binding and explicit hosted-service contracts.",
+  "package": "@tendriller/core",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-sdk-2e8200a3.tgz",
+  "bytes": 74860,
+  "sha256": "71cc9b1c32f34531a650e3eeb04eeec15158106c7187c01f601d72177f5d6614"
+}
