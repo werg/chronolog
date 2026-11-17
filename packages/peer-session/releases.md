@@ -84,6 +84,45 @@ lifecycle. Closing it cancels remote waits and settles active durable writes.
 Closing a shared publisher leaves its application session open; closing the
 session closes its registered publisher before releasing storage.
 
+## Observe updates without a signing key
+
+An open page can observe approved releases without owning a device, joining the
+application, or receiving publication rights:
+
+```ts
+import { openReleaseObserver } from '@chronolog/peer-session/releases'
+
+const observer = await openReleaseObserver({
+  applicationId, controlPublicKey,
+  host: client.peers.releases,
+  store: pageControlStore,
+  initial: bootstrap.peerRelease,
+})
+const available = await observer.refresh()
+if (available.selection !== null) offerUpdate(available.selection)
+```
+
+The observer requires only state, manifest, content-read, and optional watch
+capabilities. The supplied `PeerStore` must have one storage owner; the observer
+also prevents duplicate observers for the same application within that owner.
+Its private namespace persists the verified policy and activation history.
+Learned controls become durable before asset verification, so missing content
+cannot permit a later stale head to erase a learned revocation or activation.
+
+`state()` and `refresh()` return `{ state, selection }`. A selection becomes
+available only after verifying its signed manifest and every asset's length and
+digest. Unavailable or corrupt bytes reject the refresh and leave the new
+verified state retained with no applicable selection. Reopening rechecks selected
+bytes; cached controls do not imply that content remains available. An older
+bootstrap or signed host response cannot roll retained controls backward.
+
+`watch({ signal })` verifies bounded activation hints through the same path.
+The UI owns the decision to apply or defer an update and preserve a draft.
+The observer never polls or reloads. Close it before closing its store; shutdown
+cancels active reads and awaits admitted durable writes. Content verification
+has one 30-second deadline across the selected graph, propagated into active
+host reads.
+
 ## Content and resource boundaries
 
 Manifests permit at most 256 safe relative asset paths, 32 MiB per asset and

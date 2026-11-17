@@ -10,6 +10,7 @@ import { ownSessionResource, sessionInternals } from './internals.js'
 import type { ApplicationSession } from './session.js'
 
 export * from '@chronolog/peer-generation/control'
+export * from './release-observer.js'
 
 export interface ReleaseHost {
   state(options?: { readonly signal?: AbortSignal }): Promise<ReleaseState>
