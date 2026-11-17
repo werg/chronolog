@@ -54,6 +54,7 @@ export class ApplicationProjection<State extends EventPayload> {
           const batch = await readBatch(view, { ...(cursor === undefined ? {} : { cursor }),
             ...(this.#topics === null ? {} : { topics: this.#topics }), limit: this.#limit })
           for (const event of batch.events) state = this.#options.reduce(state, event)
+          state = this.#clone(state)
           cursor = batch.cursor
           if (!batch.hasMore) break
         }
