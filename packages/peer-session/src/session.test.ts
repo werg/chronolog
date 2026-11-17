@@ -12,6 +12,7 @@ import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolo
 import { defineApplication, defineCommand, defineQuery, applicationDefinitionDigest } from './definition.js'
 import { connectApplications, AbandonedOperationError, RecoveredViewError, type ApplicationReadView, type ApplicationSession } from './session.js'
 import { openNativeApplication, openNativeDevice } from './native.js'
+import { createApplicationTools, serveApplicationToolLines } from './tools.js'
 
 const definition = defineApplication({ id: 'messages', version: '1', commands: {
   say: defineCommand({ description: 'Post a message', input: { type: 'string', minLength: 1 }, prepare: text => program(emit('message', { text })) }),
@@ -131,5 +132,48 @@ describe('public peer application sessions', () => {
     expect(reopened.deviceId).toBe(publicKey)
     expect((await reopened.operations.get('saved'))?.status).toBe('applied')
     expect((await reopened.query('messages', null)).value.events).toHaveLength(1)
+  })
+
+  it('persists the exact recovery request across a lost hosted reply and device reopen', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const link = await connectApplications(a, b)
+    await applied(a, 'retained', 'retained'); await link.synchronize(); link.close()
+    let lost = true
+    const host = { application: () => f.registry.read(), selectGeneration: async (...args: Parameters<typeof f.registry.select>) => {
+      const result = await f.registry.select(...args)
+      if (lost) { lost = false; throw new Error('LOST_SELECTION_REPLY') }
+      return result
+    } }
+    await expect(b.recovery.takeover(host, { transitionId: 'recover-once' })).rejects.toThrow('LOST_SELECTION_REPLY')
+    const original = (await b.recovery.inspect())[0]!.request
+    await b.close()
+    await applied(a, 'excluded tail', 'tail')
+    const reopened = await f.open(await openNativeDevice({ path: join(f.directory, 'b.sqlite') }))
+    await reopened.recovery.takeover(host, { transitionId: 'recover-once' })
+    expect((await reopened.recovery.inspect())[0]).toMatchObject({ request: original, selected: reopened.revision.generation })
+    expect((await f.registry.read()).generations).toHaveLength(2)
+    const recovered = await connectApplications(a, reopened)
+    cleanup.push(() => recovered.close())
+    expect((await a.operations.get('tail'))?.status).toBe('abandoned')
+    expect((await reopened.query('messages', null)).value.events).toHaveLength(1)
+  })
+
+  it('executes local agent and CLI tools through the same validated operation journal', async () => {
+    const f = await fixture(), app = await f.open(f.a), tools = createApplicationTools(app)
+    expect(tools.list().map(tool => tool.name)).toContain('command')
+    await expect(tools.call('command', { name: 'say', input: 123, operationId: 'invalid' })).rejects.toThrow('APPLICATION_INPUT_INVALID')
+    expect(await app.operations.get('invalid')).toBeNull()
+    const lines = [
+      { id: 1, tool: 'command', input: { name: 'say', input: 'from local tool', operationId: 'tool-once' } },
+      { id: 2, tool: 'wait', input: { operationId: 'tool-once' } },
+      { id: 3, tool: 'retry', input: { operationId: 'tool-once' } },
+      { id: 4, tool: 'query', input: { name: 'messages', input: null } },
+    ], output: string[] = []
+    await serveApplicationToolLines(app, { input: { async *[Symbol.asyncIterator]() { for (const line of lines) yield JSON.stringify(line) } },
+      write(line) { output.push(line) } })
+    expect(output).toHaveLength(4)
+    expect(JSON.parse(output[1]!)).toMatchObject({ id: 2, result: { status: 'applied', outcome: 'accepted' } })
+    expect(JSON.parse(output[3]!)).toMatchObject({ id: 4, result: { value: { events: [expect.objectContaining({ operationId: 'tool-once', payload: { text: 'from local tool' } })] } } })
+    expect((await app.query('messages', null)).value.events).toHaveLength(1)
   })
 })

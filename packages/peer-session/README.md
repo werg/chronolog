@@ -84,6 +84,71 @@ and independent-store qualification. It carries commands, verified history,
 retention acknowledgments and signed live signals. It is not a measurement of
 Internet WebRTC routing. No recipe needs its own application retry queue.
 
+`session.recovery.takeover(host, { transitionId })` validates this device's
+complete recovery point, saves one signed transition request, selects it through
+the host, and adopts the verified result. Retry the same transition ID after a
+lost hosted reply, including after device reopen. A planned
+`session.recovery.handover(host, { coordinator, transitionId })` additionally
+requires the successor's signed retention of the exact current prefix. These
+methods never reinterpret an excluded branch as an eligible recovery base.
+
+## Peer connections and Worker ownership
+
+`connectApplicationTransport(session, { connection, expectedPeerId })` owns the
+signed challenge handshake, bounded requests, captured history ranges and
+retention acknowledgments over a framed reliable connection. Its optional live
+lane carries disposable signed signals independently. Each side must call this
+function; close or cancellation fences pending responses.
+
+The `/webrtc` entry provides `connectApplicationWebRtc(session, options)` for a
+runtime with a usable RTC factory. The optional `/webrtc-native` entry supplies
+`connectNativeApplicationWebRtc(session, options)` with the exact supported
+Werift implementation. Returned connections expose logical frame byte counts,
+request counts, and `rtc.getRoute()` observations. An unknown observed route
+stays unknown.
+
+In a browser, install `installApplicationWorkerTransport(session, self)` beside
+the Worker-owned session. The page calls
+`connectWorkerApplicationWebRtc(worker, { role, signaling, expectedPeerId })`.
+The helper transfers both negotiated channels synchronously, owns the dedicated
+control port, and waits for authentication and initial replay. The page retains
+the peer connection for ICE lifecycle and route diagnostics. This API requires a
+browser that supports transferring RTC data channels; unsupported browsers fail
+explicitly. Actual browser qualification is separate from native stream tests.
+
+A session with a selected recovery prefix that has not arrived reports
+`status.phase === 'recovering'`. Queries fail with `PEER_RECOVERING` until a
+complete verified prefix is materialized. Change subscriptions wait for that
+first coherent view. Sessions permit at most eight simultaneously held read
+views; release them promptly. Closing the session releases all remaining views
+and connections before closing its durable store.
+
+## Content and local agent tools
+
+`session.content.stage({ bytes, mediaType })` returns an upload handle with
+bounded `write(index, bytes)`, `progress()` and `commit()` methods. `resume(id)`
+reopens an interrupted upload. Only a complete upload produces a content
+reference. References and encrypted 64 KiB chunks are separate from command
+history. Readers fetch missing chunks from authenticated peers, verify them,
+and retain verified chunks for bounded resumption.
+
+`content.read(reference, { offset, length, signal })` yields plaintext chunks.
+`content.retain(reference)` fetches the complete object and sends a signed
+durable-copy observation to available sources. `content.retention(reference)`
+reports those observations. Missing content returns `CONTENT_UNAVAILABLE`
+without invalidating the application history that refers to it. Current read
+permissions are rechecked at every fetch; a reference is never a credential.
+
+`createApplicationTools(session, { host })` derives local query/command tool
+schemas from the same application definition. It exposes inspection, exact
+retry, wait, recovery inspection and explicit reapplication. A host port enables
+the takeover tool. `serveApplicationToolLines(session, { input, write, host })`
+accepts bounded JSON lines such as
+`{"id":1,"tool":"command","input":{"name":"say","input":{"text":"Hello"},"operationId":"message-1"}}`.
+Use `tool: "list"` for schemas and `tool: "wait"` with the operation ID for its
+current applied result. The transport creates no second identity, outbox, or
+hosted command proxy.
+
 The portable entry and the browser entry are SQL-free. SQL applications supply
 a qualified materializer with the same authenticated profile; the pinned schema
 is initialized before application history. Irreversible effects require a
@@ -95,3 +160,6 @@ Run `node tools/package-peer-session.mjs`. The tarball includes shared ESM chunk
 self-contained TypeScript declarations, and commit/tree/file-hash provenance.
 `--allow-dirty` produces an explicitly marked development artifact. Native and
 browser entries share session classes and ownership state through those chunks.
+Use `--native-rtc` to include the optional native RTC entry. That archive declares
+the exact `werift@0.27.0` peer dependency; the default archive has no runtime
+package dependencies and remains SQL-free.

@@ -4,6 +4,7 @@ import { createEventMaterializationRuntime, type ChronologMaterializationRuntime
 import { applicationDefinitionDigest, type ApplicationDefinition } from './definition.js'
 import { claimApplicationDevice, type ApplicationDevice } from './device.js'
 import { openApplication, type ApplicationSession } from './session.js'
+import { ApplicationContent } from './content.js'
 
 export interface OpenPeerApplicationOptions<D extends ApplicationDefinition = ApplicationDefinition> {
   readonly device: ApplicationDevice
@@ -29,7 +30,8 @@ export async function openPeerApplication<const D extends ApplicationDefinition>
       ...(options.maxRecords === undefined ? {} : { maxRecords: options.maxRecords }),
       ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) }
     const replica = await createPeerReplica(input)
-    return await openApplication({ replica, definition: options.definition,
+    const content = new ApplicationContent({ replica, store: options.device.store, storageId: options.device.storageId, epochKeys: options.epochKeys })
+    return await openApplication({ replica, definition: options.definition, store: options.device.store, content,
       close: async () => { release(); await options.device.close() } })
   } catch (error) {
     release(); await materializer?.close(); await options.device.close(); throw error
