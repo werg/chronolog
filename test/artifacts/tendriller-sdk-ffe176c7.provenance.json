@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "ffe176c740151f4af6c4c652905ba56bf193676f",
+  "sourceTree": "5f3ce37f163eab7274173969d3c88e189c0b18c1",
+  "sourceDirty": false,
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm install --save-dev --offline --ignore-scripts --no-audit --no-fund ./test/artifacts/chronolog-membership-7fcebd4c.tgz",
+  "consumerCommand": "npm run test:consumer",
+  "consumerQualification": "The clean published-source rebuild is byte-identical to the archives that passed the independent strict consumer.",
+  "membershipSource": "7fcebd4c371a2d62811b24a91ff9baf9e0be19a8",
+  "membershipArtifactSha256": "81e818696c5e86d4ed4600b43ded42cc372ba56a4e805ce7deb56e31b0e9613b",
+  "purpose": "Captured application views, bounded cancellable hosted signals, explicit publication rights and signed encryption epoch revisions.",
+  "package": "@tendriller/core",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-sdk-ffe176c7.tgz",
+  "sha256": "93cd50683025bc1a6c401fb92e8c4e4e276d7c74e453cc57ee4e1786559f189c"
+}
