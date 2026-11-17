@@ -11,7 +11,8 @@
     "./webrtc": "./src/webrtc.ts",
     "./webrtc-native": "./src/webrtc-native.ts",
     "./tendriller": "./src/tendriller.ts",
-    "./sql-browser": "./src/sql-browser.ts"
+    "./sql-browser": "./src/sql-browser.ts",
+    "./releases": "./src/releases.ts"
   },
   "dependencies": {
     "@chronolog/peer-generation": "workspace:*",

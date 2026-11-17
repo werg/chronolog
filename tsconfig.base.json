@@ -162,6 +162,9 @@
       ],
       "@chronolog/peer-session/sql-browser": [
         "packages/peer-session/src/sql-browser.ts"
+      ],
+      "@chronolog/peer-session/releases": [
+        "packages/peer-session/src/releases.ts"
       ]
     }
   }

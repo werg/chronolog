@@ -572,6 +572,14 @@ initializer's schema authority and the host's administration rights. Later
 enrollment is a signed control change through the host's
 public membership API, followed by peer-to-peer key delivery.
 
+## Signed page releases
+
+The optional `/releases` entry shares the owned device's signer and store for
+immutable page manifests, resumable publication, and exact activation retries.
+Publisher policy and release selection remain independent of application-data
+recovery. See [Signed page releases](releases.md) for the public API, explicit
+rollback, content verification, and lifetime contract.
+
 ## Build a packed preview
 
 Run `node tools/package-peer-session.mjs`. The tarball includes shared ESM chunks,

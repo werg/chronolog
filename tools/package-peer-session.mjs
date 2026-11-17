@@ -17,7 +17,7 @@ const { values } = parseArgs({ options: { output: { type: 'string', default: 'ar
 const output = resolve(values.output), packageRoot = join(output, 'package');
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 const engineImport = '#chronolog-peer-native-engine';
-const entries = Object.fromEntries(['index', 'native', 'browser', 'webrtc', 'tendriller', ...(values['native-rtc'] ? ['webrtc-native'] : []),
+const entries = Object.fromEntries(['index', 'native', 'browser', 'webrtc', 'tendriller', 'releases', ...(values['native-rtc'] ? ['webrtc-native'] : []),
   ...(values['sql-native'] ? ['sql-native'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]
   .map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
