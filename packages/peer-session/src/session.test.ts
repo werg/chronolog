@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   createGenerationRegistry, createPeerIdentity, MemoryPeerStore, signApplicationDescriptor,
-  signControlRevision, signTransitionRequest, bytesDigest, type PeerIdentity, type PrefixProof,
+  signControlRevision, signTransitionRequest, bytesDigest, participantGrant, peerDigest, type PeerIdentity, type PrefixProof,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -49,7 +49,7 @@ async function fixture() {
     const session = await openNativeApplication({ device, authority: await registry.read(), epochKeys, definition })
     cleanup.push(() => session.close()); return session
   }
-  return { a, b, directory, registry, select, open }
+  return { a, b, directory, registry, select, open, host }
 }
 
 async function applied(session: ApplicationSession<typeof definition>, text: string, id: string) {
@@ -58,6 +58,31 @@ async function applied(session: ApplicationSession<typeof definition>, text: str
 }
 
 describe('public peer application sessions', () => {
+  it('learns a newly granted reader’s signed authority before authorizing its direct connection', async () => {
+    const f = await fixture(), a = await f.open(f.a)
+    await applied(a, 'before the new reader', 'before-grant')
+    const device = await openNativeDevice({ path: join(f.directory, 'c.sqlite'), create: true })
+    cleanup.push(() => device.close())
+    const before = await f.registry.read(), previous = before.controls[0]!
+    const control = await signControlRevision({ ...previous.payload, revision: 1, previous: await peerDigest(previous),
+      grants: [...previous.payload.grants, participantGrant(device.identity.publicKey)] }, f.host)
+    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+      expectedGeneration: before.generations.at(-1)!.id, coordinator: a.deviceId, requester: a.deviceId,
+      controlRevision: 1, base: await a.recoveryPoint(), transitionId: 'enroll-reader', reason: 'control-change' }, f.a.identity), { control })
+    const c = await openNativeApplication({ device, definition, authority: await f.registry.read() })
+    cleanup.push(() => c.close())
+    expect(a.status.generation).not.toBe(c.status.generation)
+    expect(c.status.phase).toBe('awaiting-keys')
+    const link = await connectApplications(a, c)
+    cleanup.push(() => link.close())
+    expect(a.status.generation).toBe(c.status.generation)
+    expect(c.status.phase).toBe('ready')
+    expect((await c.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['before-grant'])
+    expect(await applied(c, 'new reader contribution', 'after-grant')).toMatchObject({ outcome: 'accepted', author: c.deviceId })
+    await link.synchronize()
+    expect((await a.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['before-grant', 'after-grant'])
+  })
+
   it('owns a single saved attempt, exposes authenticated current results and isolates cancelled waiters', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const operation = await b.command('say', 'saved offline', { operationId: 'once' })

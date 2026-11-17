@@ -345,22 +345,28 @@ export async function connectApplications(left: ApplicationSession, right: Appli
   let detachA = () => {}, detachB = () => {}, unsubscribeA = () => {}, unsubscribeB = () => {}
   let contentA = () => {}, contentB = () => {}, keysA = () => {}, keysB = () => {}
   let signalA: ReturnType<SignalChannel['attachRoute']> | undefined, signalB: ReturnType<SignalChannel['attachRoute']> | undefined
-  const assertOpen = (): void => {
+  const assertConnected = (): void => {
     if (closed) throw new Error('APPLICATION_PEER_DISCONNECTED')
+  }
+  const assertOpen = (): void => {
+    assertConnected()
     if (!currentReader(a.replica, right.deviceId) || !currentReader(b.replica, left.deviceId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
   }
   const synchronize = async (): Promise<void> => {
-    assertOpen(); requested = true
+    assertConnected(); requested = true
     const previous = pending
     const task = previous.then(async () => {
       while (requested && !closed) {
-        requested = false; assertOpen()
+        requested = false; assertConnected()
+        // Like the network Hello, learn the newer signed authority before
+        // checking reader grants. A newly admitted peer may carry that grant
+        // to an existing reader that has not consulted the host again.
         if (a.replica.generation.id !== b.replica.generation.id) {
           const [source, target] = a.replica.generation.payload.number > b.replica.generation.payload.number ? [a.replica, b.replica] : [b.replica, a.replica]
           try { await target.adopt(source.authority) }
           catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') throw error }
-          assertOpen()
         }
+        assertOpen()
         for (const [receiver, issuer] of [[a, b], [b, a]] as const) {
           for (let batch = 0; batch < 256; batch++) {
             const ticket = await receiver.keys.request()
