@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 1a63e2a69bdcb80b36a10759f7dac10cdf690a45
+          ref: aa7a445b968a752df17a7860e98f1008283a6750
           path: artifacts/tendriller-contrib
           persist-credentials: false
       - name: Qualify native and browser WebRTC after signaling host shutdown
