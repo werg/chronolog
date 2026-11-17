@@ -138,11 +138,13 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
     const running = agent.run()
     void running.catch((error: unknown) => { serviceFailure = error instanceof Error ? error : new Error('RECOVERY_SERVICE_FAILED', { cause: error }) })
     const healthy = () => { if (serviceFailure !== undefined) throw serviceFailure }
+    let backlog: { readonly eligible: number; readonly included: number; readonly head: OrderedRecordHead } | undefined
     const backlogIncluded = async () => {
       const eligible = (await activeTransport.history()).filter(record => ['candidate', 'capability', 'epoch-manifest'].includes(decodeEnvelope(record.payload).messageType))
       const range = await authority.read({ limit: 256 })
       assert(!range.hasMore, 'RECOVERY_FIXTURE_RECEIPT_LIMIT')
-      return range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes)).length === eligible.length
+      backlog = { eligible: eligible.length, included: range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes)).length, head: range.head }
+      return backlog.included === backlog.eligible
     }
     const advanceClock = async () => {
       const next = clockNow + Number(bootstrap.genesis.manifest.clockPolicy.cutoffLagMs) + 1
@@ -150,28 +152,46 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
       await store.put(clockKey, encodeCanonicalCbor(BigInt(next)))
       clockNow = next
     }
+    let pending: readonly string[] = []
+    const settled = async () => {
+      const next: string[] = []
+      if (!governed!.governance.hasFinalizedEpoch(governed!.governance.cipherRing.current().epochId)) next.push('encryption-epoch')
+      for (const kind of ['schema', 'accepted', 'rejected', 'after-backup', 'authority-offline'] as const) {
+        const operation = await node.operation(`recovery-${kind}`)
+        if (operation !== null && !operation.final) next.push(`recovery-${kind}`)
+      }
+      pending = next
+      return pending.length === 0
+    }
     const settle = async () => {
-      await eventually(async () => {
-        healthy()
-        if (!await backlogIncluded()) return false
-        await node.waitForIdle()
-        let pending = !governed!.governance.hasFinalizedEpoch(governed!.governance.cipherRing.current().epochId)
-        for (const kind of ['schema', 'accepted', 'rejected', 'after-backup', 'authority-offline'] as const) {
-          const operation = await node.operation(`recovery-${kind}`)
-          if (operation !== null && !operation.final) pending = true
-        }
-        if (pending) { await advanceClock(); return false }
-        return true
-      }, 'RECOVERY_FIXTURE_NOT_SETTLED')
+      try {
+        await eventually(async () => {
+          healthy()
+          if (!await backlogIncluded()) return false
+          await node.waitForIdle()
+          if (await settled()) return true
+          await advanceClock()
+          return settled()
+        }, 'RECOVERY_FIXTURE_NOT_SETTLED')
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== 'RECOVERY_FIXTURE_NOT_SETTLED') throw error
+        throw new Error(`RECOVERY_FIXTURE_NOT_SETTLED:${recoveryJson({ clockNow, backlog, pending })}`, { cause: error })
+      }
     }
     await settle()
     const terminal = async (operationId: string) => {
-      await eventually(async () => {
-        healthy()
-        if ((await node.operation(operationId))?.final === true) return true
-        if (await backlogIncluded()) await advanceClock()
-        return false
-      }, 'RECOVERY_OPERATION_NOT_FINAL')
+      try {
+        await eventually(async () => {
+          healthy()
+          if ((await node.operation(operationId))?.final === true) return true
+          if (await backlogIncluded()) await advanceClock()
+          return (await node.operation(operationId))?.final === true
+        }, 'RECOVERY_OPERATION_NOT_FINAL')
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== 'RECOVERY_OPERATION_NOT_FINAL') throw error
+        throw new Error(`RECOVERY_OPERATION_NOT_FINAL:${recoveryJson({ clockNow, backlog,
+          operation: await node.operation(operationId), node: await node.status() })}`, { cause: error })
+      }
       const operation = await node.operation(operationId)
       assert(operation !== null && operation.final)
       return operation
@@ -258,7 +278,9 @@ export async function inspectStoppedAuthority(directory: string) {
     // Authenticate every retained closure, including a suffix committed after
     // the last certificate. An interrupted certificate write must not turn that
     // suffix into trusted finality or allow its signed prefix to be rewritten.
-    await evaluateFinalitySnapshot(configuration, entries)
+    const snapshot = await evaluateFinalitySnapshot(configuration, entries)
+    const retainedClosures = entries.filter(entry => isFinalityClosureRecord(entry.bytes))
+    assert.equal(snapshot.closures.length, retainedClosures.length, 'RECOVERY_UNAUTHENTICATED_CLOSURE')
     const certificate = saved === null ? null : decodeOrderingEvidence(saved)
     if (certificate !== null) {
       assert.equal(certificate.kind, 'prefix-certificate')
@@ -272,7 +294,7 @@ export async function inspectStoppedAuthority(directory: string) {
     }
     return { head: await log.head(), entries: entries.map(entry => ({ position: entry.position, root: entry.root, recordId: entry.recordId,
       kind: isFinalityClosureRecord(entry.bytes) ? 'closure' as const : decodeLedgerRecord(entry.bytes).kind })),
-      closures: entries.filter(entry => isFinalityClosureRecord(entry.bytes)).map(entry => ({
+      closures: retainedClosures.map(entry => ({
         position: entry.position, ...decodeFinalityClosureRecord(entry.bytes),
       })),
       proposalCount: entries.filter(entry => !isFinalityClosureRecord(entry.bytes) && decodeLedgerRecord(entry.bytes).kind === 'candidate').length,

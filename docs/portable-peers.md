@@ -93,9 +93,10 @@ const finalRows = await client.query('SELECT * FROM tasks ORDER BY id', [], {
 })
 ```
 
-`settled()` and `accepted()` describe the current local order. Under peer
-chronological history, later evidence can change a tentative outcome.
-`final()` waits for the transaction's actual locally applied final position.
+`settled()` describes the current local order. Under peer chronological history,
+later evidence can change a tentative outcome. `final()` waits for the
+transaction's actual locally applied final position. `accepted()` waits for
+that immutable acceptance and throws if the final outcome is rejection.
 `query(..., { view: 'final' })` reads a separately pinned SQL revision; it does
 not read tentative rows and attach final metadata to them. Live queries include
 the selected view in their identity and resume after finality-only events too.

@@ -41,7 +41,7 @@ import type {
   SendSignalRequest, SubscribeSignalsRequest,
   GetOperationRequest, OperationStatus, StreamOperationsRequest,
   OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
-  ViewChangesRequest, ViewChangesResponse,
+  ViewChangesRequest, ViewChange,
 } from './types.js'
 
 export interface RpcCallOptions { readonly signal?: AbortSignal; readonly token?: string; readonly timeoutMs?: number; readonly metadata?: Readonly<Record<string, string>> }
@@ -74,7 +74,7 @@ export interface UnaryRpcMethods {
   'enrollment.getStatus': { request: GetEnrollmentStatusRequest; response: EnrollmentStatus }
 }
 export interface StreamRpcMethods {
-  'view.changes': { request: ViewChangesRequest; response: ViewChangesResponse }
+  'view.changes': { request: ViewChangesRequest; response: ViewChange }
   'signals.subscribe': { request: SubscribeSignalsRequest; response: EphemeralSignal }
   'events.subscribe': { request: EventReadRequest; response: EventReadResponse }
   'operation.subscribe': { request: StreamOperationsRequest; response: OperationStatus }
@@ -106,7 +106,7 @@ export interface ChronologRpcService {
   getOperation(request: GetOperationRequest, context: RpcCallContext): Promise<OperationStatus | null>
   subscribeOperations(request: StreamOperationsRequest, context: RpcCallContext): AsyncIterable<OperationStatus>
   openReadView(request: OpenReadViewRequest, context: RpcCallContext): Promise<OpenReadViewResponse>
-  streamViewChanges(request: ViewChangesRequest, context: RpcCallContext): AsyncIterable<ViewChangesResponse>
+  viewChanges(request: ViewChangesRequest, context: RpcCallContext): AsyncIterable<ViewChange>
   queryReadView(request: QueryReadViewRequest, context: RpcCallContext): Promise<LocalSqlResult>
   eventsReadView(request: EventsReadViewRequest, context: RpcCallContext): Promise<EventReadResponse>
   releaseReadView(request: ReadViewRequest, context: RpcCallContext): Promise<{ readonly released: true }>

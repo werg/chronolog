@@ -2,7 +2,6 @@ import { createCapabilitySignals, isCapabilityActive, type CapabilitySnapshot } 
 import { bytesToHex, equalBytes, type Ed25519KeyPair } from '@chronolog/protocol'
 import type { FeedLink } from '@chronolog/records'
 import type { SignalRoute, Signals } from '@chronolog/signals'
-import { SignalBackpressureError } from '@chronolog/signals'
 
 import type { FramedPeerConnection } from './framing.js'
 import { openAuthenticatedPeerLink, type PeerAuthorization } from './peer-link.js'
@@ -97,9 +96,9 @@ export async function createGovernedPeerService(options: {
           try {
             const active = current(), localReader = active.capabilities.get(bytesToHex(reader.id))
             if (localReader === undefined || !isCapabilityActive(localReader, active.revision)) throw new Error('PEER_LOCAL_READER_GRANT_REQUIRED')
-            await authenticated.sendSignal(frame, { signal })
+            return await authenticated.sendSignal(frame, { signal })
           } catch (error) {
-            if (!signal.aborted && !(error instanceof SignalBackpressureError)) void close().catch(() => undefined)
+            if (!signal.aborted) void close().catch(() => undefined)
             throw error
           }
         } })

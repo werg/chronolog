@@ -1,7 +1,8 @@
 import type { CapabilitySnapshot, EffectiveCapability } from '@chronolog/capabilities'
 import { MemoryOperationStore } from '@chronolog/node-core'
-import { assertCanonicalCbor, bytesToHex, generateEd25519KeyPair, type Ed25519KeyPair } from '@chronolog/protocol'
+import { assertCanonicalCbor, bytesToHex, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
+import { frameRtcPeerChannels, WEBRTC_LIVE_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { framePeerStream } from './framing.js'
@@ -52,7 +53,62 @@ async function connect(left: GovernedPeerService, right: GovernedPeerService, ex
     right.connectPeer({ connection: connections[1]! })])
 }
 
+class RtcChannel extends EventTarget implements RtcDataChannel {
+  readonly label = 'test-lane'
+  readonly maxPacketLifeTime = null
+  readyState = 'connecting'
+  bufferedAmount = 0
+  bufferedAmountLowThreshold = 0
+  binaryType = 'arraybuffer'
+  other!: RtcChannel
+  readonly sent: Uint8Array[] = []
+  constructor(readonly ordered: boolean, readonly maxRetransmits: number | null) { super() }
+  send(bytes: ArrayBuffer): void {
+    if (this.readyState !== 'open') throw new Error('test lane closed')
+    const copy = bytes.slice(0)
+    this.sent.push(new Uint8Array(copy))
+    queueMicrotask(() => { if (this.other.readyState === 'open') this.other.dispatchEvent(new MessageEvent('message', { data: copy })) })
+  }
+  close(): void {
+    if (this.readyState === 'closed') return
+    this.readyState = 'closed'; this.dispatchEvent(new Event('close')); this.other.close()
+  }
+}
+
+function rtcConnections() {
+  const lane = (ordered: boolean, retransmits: number | null) => {
+    const a = new RtcChannel(ordered, retransmits), b = new RtcChannel(ordered, retransmits)
+    a.other = b; b.other = a
+    return [a, b] as const
+  }
+  const reliable = lane(true, null), live = lane(false, 0)
+  const connections = reliable.map((channel, index) => frameRtcPeerChannels({ reliable: channel, live: live[index]! }))
+  for (const channel of [...reliable, ...live]) channel.readyState = 'open'
+  for (const channel of [...reliable, ...live]) channel.dispatchEvent(new Event('open'))
+  return { connections, live }
+}
+
 describe('owned governed peer composition', () => {
+  it('refuses congested live dispatch while preserving authenticated history and the next healthy signal', async () => {
+    const { services, transports } = await replicas(), { connections, live } = rtcConnections()
+    const sessions = await Promise.all(services.map((service, index) => service.connectPeer({ connection: connections[index]! })))
+    const iterator = services[1]!.signals.subscribe()[Symbol.asyncIterator](), receiving = iterator.next()
+    try {
+      live[0].bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
+      await expect(services[0]!.signals.send('typing', 'discarded preview')).rejects.toThrow('SIGNAL_BACKPRESSURE')
+      expect(live[0].sent).toEqual([])
+      expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+      const record = await transports[0]!.publish(utf8('durable history during live congestion'))
+      await transports[1]!.catchUp()
+      expect((await transports[1]!.get(record.id))?.payload).toEqual(record.payload)
+      live[0].bufferedAmount = 0
+      const sent = await services[0]!.signals.send('typing', 'current preview')
+      expect((await receiving).value).toEqual(sent)
+      expect(live[0].sent).toHaveLength(1)
+      expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+    } finally { await iterator.return?.(); await Promise.all(sessions.map(session => session.close())) }
+  })
+
   it('attaches reliable-only peers for replication without claiming a live route', async () => {
     const { services, transports } = await replicas()
     const sessions = await connect(services[0]!, services[1]!, undefined, false)

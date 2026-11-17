@@ -18,7 +18,7 @@ import {
   FeedStore,
   type FeedKeys,
 } from './feed-store.js'
-import { consumeFeed, decodeBase64, pullFeed, validatePayloadHash, verifyPayloadHash, type FeedLink } from '@chronolog/records'
+import { consumeFeed, decodeBase64, pullFeedLink, validatePayloadHash, verifyPayloadHash, type FeedLink } from '@chronolog/records'
 import type { ChronologTransport, ImmutableEvidence, PublishOptions, TransportRecord, TransportStatus } from './types.js'
 
 const require = createRequire(import.meta.url)
@@ -104,6 +104,7 @@ const SUBSCRIPTION_BATCH = 256
 const RESTREAM_DELAY_MS = 250
 
 export class FeedTransport implements ChronologTransport {
+  readonly #linkSyncTasks = new Set<Promise<void>>()
   readonly #server: Server
   readonly #store: FeedStore
   readonly #keys: FeedKeys
@@ -217,7 +218,7 @@ export class FeedTransport implements ChronologTransport {
     if (this.#wanted.has(feedId)) return
     this.#wanted.add(feedId)
     for (const rpc of this.#streams.keys()) this.#startStream(rpc, feedId)
-    for (const connection of this.#links.values()) this.#queueLinkSync(connection)
+    for (const connection of this.#links.values()) void this.#queueLinkSync(connection)
   }
 
   /** Attach a grant-authenticated link; detach only this connection on cleanup. */
@@ -227,12 +228,12 @@ export class FeedTransport implements ChronologTransport {
     this.#wanted.add(link.identity)
     const connection: FramedLinkConnection = { link, controller: new AbortController(), pending: Promise.resolve(), evidenceAfter: 0n }
     this.#links.set(link.identity, connection)
-    this.#queueLinkSync(connection)
+    void this.#queueLinkSync(connection)
     void (async () => {
       try {
         for await (const _hint of link.watch(connection.controller.signal)) {
           if (connection.controller.signal.aborted) return
-          this.#queueLinkSync(connection)
+          void this.#queueLinkSync(connection)
           await connection.pending
         }
       } catch (error) {
@@ -251,11 +252,9 @@ export class FeedTransport implements ChronologTransport {
   }
 
   async catchUpLinks(): Promise<void> {
-    const connections = [...this.#links.values()]
-    for (const connection of connections) this.#queueLinkSync(connection)
-    await Promise.all(connections.map((connection) => connection.pending))
-    const failed = connections.find((connection) => connection.error !== undefined)
-    if (failed?.error !== undefined) throw new Error(failed.error)
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const connections = [...this.#links.values()], feeds = [...this.#wanted]
+    await Promise.all(connections.map(connection => this.#queueLinkSync(connection, feeds)))
   }
 
   /** Replace the configured peers; their feeds become wanted. */
@@ -351,6 +350,8 @@ export class FeedTransport implements ChronologTransport {
     }
     return {
       identity: this.identity,
+      head: async feed => { range(0n, 1); return this.#store.head(feed).sequence },
+      evidenceHead: async () => { range(0n, 1); return this.#store.evidenceHead() },
       read: async (feed, after, limit) => {
         range(after, limit)
         return this.#store.feedAfter(feed, after, limit).map(({ raw }) => raw.slice())
@@ -468,40 +469,31 @@ export class FeedTransport implements ChronologTransport {
     this.#links.clear()
     this.#notify()
     await closeServer(this.#server)
-    await Promise.all(links.map((connection) => connection.pending))
+    await Promise.all(this.#linkSyncTasks)
     this.#store.close()
   }
 
   // ── replication ────────────────────────────────────────────────────────
 
-  #queueLinkSync(connection: FramedLinkConnection): void {
-    connection.pending = connection.pending.then(async () => {
-      if (connection.controller.signal.aborted || this.#closed) return
-      try {
-        for (const feed of this.#wanted) {
-          await pullFeed(connection.link, feed, { store: this.#store, crypto: nativeFeedCrypto,
-            maxRecordBytes: this.#maxRecordBytes,
-            onStored: (record, result) => {
-              if (result.kind === 'appended') this.#progress.set(record.author, Date.now())
-              this.#notify()
-            },
-          }, connection.controller.signal)
-        }
-        while (!connection.controller.signal.aborted) {
-          const batch = await connection.link.readEvidence(connection.evidenceAfter, 64)
-          if (batch.length > 64) throw new Error('FEED_RANGE_TOO_LARGE')
-          for (const bytes of batch) {
-            if (connection.controller.signal.aborted) return
-            await this.putEvidence(bytes)
-            connection.evidenceAfter += 1n
-          }
-          if (batch.length < 64) break
-        }
-        delete connection.error
-      } catch (error) {
-        if (!connection.controller.signal.aborted) connection.error = errorMessage(error)
-      }
+  #queueLinkSync(connection: FramedLinkConnection, feeds = [...this.#wanted]): Promise<void> {
+    const work = connection.pending.then(async () => {
+      connection.controller.signal.throwIfAborted()
+      if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+      await pullFeedLink(connection.link, feeds, connection, { store: this.#store, crypto: nativeFeedCrypto,
+        maxRecordBytes: this.#maxRecordBytes,
+        onStored: (record, result) => {
+          if (result.kind === 'appended') this.#progress.set(record.author, Date.now())
+          this.#notify()
+        }, onEvidenceStored: () => { this.#notify() },
+      }, connection.controller.signal)
     })
+    connection.pending = work.then(() => { delete connection.error }, (error: unknown) => {
+      if (!connection.controller.signal.aborted) connection.error = errorMessage(error)
+    })
+    const settled = connection.pending
+    this.#linkSyncTasks.add(settled)
+    void settled.then(() => { this.#linkSyncTasks.delete(settled) })
+    return work
   }
 
   #register(feedId: string, rpc: Rpc): void {

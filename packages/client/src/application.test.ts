@@ -24,7 +24,7 @@ describe('application client', () => {
         })
       } finally { stopped++ }
     } }) } as unknown as RpcTransport
-    const client = new ChronologClient({ transport, groupId: 'group', streamRetryDelayMs: () => 0, requestId: () => 'view-notifications' })
+    const client = new ChronologClient({ transport, groupId: 'group', streamRetryDelayMs: () => 0 })
     const selection: { view: 'local' | 'final' } = { view: 'local' }
     const changes = client.changes(selection)
     selection.view = 'final'
@@ -32,7 +32,7 @@ describe('application client', () => {
     expect((await iterator.next()).value?.revision).toBe('local-1')
     disconnect()
     expect((await iterator.next()).value?.revision).toBe('local-2')
-    expect(requests).toEqual([{ groupId: 'group', requestId: 'view-notifications', view: 'local' }, { groupId: 'group', requestId: 'view-notifications', view: 'local' }])
+    expect(requests).toEqual([{ groupId: 'group', view: 'local' }, { groupId: 'group', view: 'local' }])
     const pending = iterator.next()
     await iterator.return?.()
     expect(await pending).toMatchObject({ done: true })
@@ -225,7 +225,7 @@ describe('application client', () => {
         })
       } finally { stopped = true }
     } }) } as unknown as RpcTransport
-    const client = new ChronologClient({ transport, groupId: 'group', requestId: () => 'view-watch' })
+    const client = new ChronologClient({ transport, groupId: 'group' })
     const iterator = client.changes({ view: 'local' })[Symbol.asyncIterator]()
     expect((await iterator.next()).value).toEqual(value(0))
     startBurst(); await caughtUp
@@ -235,7 +235,7 @@ describe('application client', () => {
     expect((await pending).done).toBe(true)
     expect(lifetime?.aborted).toBe(true)
     await expect.poll(() => stopped).toBe(true)
-    expect(calls).toEqual([{ method: 'view.changes', request: { groupId: 'group', requestId: 'view-watch', view: 'local' } }])
+    expect(calls).toEqual([{ method: 'view.changes', request: { groupId: 'group', view: 'local' } }])
     await client.close()
   })
 
@@ -246,12 +246,12 @@ describe('application client', () => {
       yield { view: 'final', revision: `final-${requests.length}`, finalRevision: `final-${requests.length}` }
       throw new ChronologRpcError('transport_unavailable', 'Disconnected')
     } }) } as unknown as RpcTransport
-    const client = new ChronologClient({ transport, groupId: 'group', requestId: () => 'watch', streamRetryDelayMs: () => 0 })
+    const client = new ChronologClient({ transport, groupId: 'group', streamRetryDelayMs: () => 0 })
     const iterator = client.changes()[Symbol.asyncIterator]()
     expect((await iterator.next()).value?.revision).toBe('final-1')
     expect((await iterator.next()).value?.revision).toBe('final-2')
     await iterator.return?.()
-    expect(requests).toEqual(Array.from({ length: 2 }, () => ({ groupId: 'group', requestId: 'watch', view: 'final' })))
+    expect(requests).toEqual(Array.from({ length: 2 }, () => ({ groupId: 'group', view: 'final' })))
     await client.close()
   })
 })

@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "62b6e1c4fca530a70a02c1043c482752147a81a9",
+  "sourceTree": "5d12238f08d53c8ebd764fbe36e67f7be1f4e702",
+  "sourceDirty": false,
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm install --ignore-scripts --offline --no-audit --no-fund",
+  "consumerCommand": "npm run test:consumer",
+  "membershipSource": "92264b64cff41746aa9520f8c9f9047e616659cc",
+  "purpose": "Independent hosted and peer signals, bounded live lifetimes, captured application view metadata and separate final operation outcomes.",
+  "package": "@tendriller/core",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-sdk-62b6e1c4.tgz",
+  "sha256": "d6ed7a3fa21bddeef1c5bc771b682174c127f5e35b55802ecc135bb8ccbcfccb"
+}

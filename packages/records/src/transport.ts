@@ -1,5 +1,5 @@
 import { createFeedRecord, DEFAULT_MAX_RECORD_BYTES, type FeedCrypto, type FeedSigner } from './feed-codec.js'
-import { ChangeSignal, type FeedLink, pullFeed } from './replication.js'
+import { ChangeSignal, type FeedLink, pullFeedLink } from './replication.js'
 import type { FeedStorePort } from './store.js'
 import { validatePayloadHash, verifyPayloadHash } from './payload.js'
 import { cloneRecord, type ChronologTransport, type ImmutableEvidence, type PublishOptions, type TransportRecord, type TransportStatus } from './types.js'
@@ -21,6 +21,7 @@ export class PortableFeedTransport implements ChronologTransport {
   readonly #changes = new ChangeSignal()
   readonly #wanted = new Set<string>()
   readonly #connections = new Map<string, Connection>()
+  readonly #syncTasks = new Set<Promise<void>>()
   #publish: Promise<unknown> = Promise.resolve()
   #closed = false
 
@@ -104,7 +105,7 @@ export class PortableFeedTransport implements ChronologTransport {
   requestFeed(feed: string): void {
     if (this.#wanted.has(feed)) return
     this.#wanted.add(feed)
-    for (const connection of this.#connections.values()) this.#queueSync(connection)
+    for (const connection of this.#connections.values()) void this.#queueSync(connection)
   }
 
   /** Attaches a link; the returned detach belongs only to this connection. */
@@ -114,12 +115,12 @@ export class PortableFeedTransport implements ChronologTransport {
     this.#wanted.add(link.identity)
     const connection: Connection = { link, controller: new AbortController(), pending: Promise.resolve(), evidenceAfter: 0n }
     this.#connections.set(link.identity, connection)
-    this.#queueSync(connection)
+    void this.#queueSync(connection)
     void (async () => {
       try {
         for await (const _hint of link.watch(connection.controller.signal)) {
           if (connection.controller.signal.aborted) return
-          this.#queueSync(connection)
+          void this.#queueSync(connection)
           await connection.pending
         }
       } catch (error) { connection.error = error instanceof Error ? error.message : String(error) }
@@ -135,17 +136,24 @@ export class PortableFeedTransport implements ChronologTransport {
     this.#connections.delete(identity)
   }
 
-  /** Explicit repair after a missed hint; no cursor is advanced without durable storage. */
+  /** Copy finite advertised prefixes for the connections and feeds present at this call. */
   async catchUp(): Promise<void> {
-    for (const connection of this.#connections.values()) this.#queueSync(connection)
-    await Promise.all([...this.#connections.values()].map((connection) => connection.pending))
-    const error = [...this.#connections.values()].find((connection) => connection.error !== undefined)?.error
-    if (error !== undefined) throw new Error(error)
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const connections = [...this.#connections.values()], feeds = [...this.#wanted]
+    await Promise.all(connections.map(connection => this.#queueSync(connection, feeds)))
   }
 
   asLink(): FeedLink {
     return {
       identity: this.identity,
+      head: async feed => {
+        if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+        return (await this.#store.head(feed)).sequence
+      },
+      evidenceHead: async () => {
+        if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+        return this.#store.evidenceHead()
+      },
       read: async (feed, after, limit) => {
         if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
         return (await this.#store.feedAfter(feed, after, limit)).map(({ raw }) => raw.slice())
@@ -200,34 +208,30 @@ export class PortableFeedTransport implements ChronologTransport {
     this.#closed = true
     for (const connection of this.#connections.values()) connection.controller.abort()
     await this.#publish
-    await Promise.all([...this.#connections.values()].map((connection) => connection.pending))
+    await Promise.all(this.#syncTasks)
     this.#connections.clear()
     this.#changes.close()
     await this.#store.close()
   }
 
-  #queueSync(connection: Connection): void {
-    connection.pending = connection.pending.then(async () => {
-      if (connection.controller.signal.aborted || this.#closed) return
-      try {
-        for (const feed of this.#wanted) {
-          await pullFeed(connection.link, feed, {
-            store: this.#store, crypto: this.#crypto, maxRecordBytes: this.#maxRecordBytes,
-            onStored: () => { this.#changes.notify() },
-          }, connection.controller.signal)
-        }
-        while (!connection.controller.signal.aborted) {
-          const batch = await connection.link.readEvidence(connection.evidenceAfter, 64)
-          if (batch.length > 64) throw new Error('FEED_RANGE_TOO_LARGE')
-          for (const bytes of batch) {
-            await this.putEvidence(bytes)
-            connection.evidenceAfter += 1n
-          }
-          if (batch.length < 64) break
-        }
-        delete connection.error
-      } catch (error) { connection.error = error instanceof Error ? error.message : String(error) }
+  #queueSync(connection: Connection, feeds = [...this.#wanted]): Promise<void> {
+    const work = connection.pending.then(async () => {
+      connection.controller.signal.throwIfAborted()
+      if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+      await pullFeedLink(connection.link, feeds, connection, {
+        store: this.#store, crypto: this.#crypto, maxRecordBytes: this.#maxRecordBytes,
+        onStored: () => { this.#changes.notify() }, onEvidenceStored: () => { this.#changes.notify() },
+      }, connection.controller.signal)
     })
+    // A failed attempt must not poison later repair. Its caller still observes
+    // that exact attempt's failure, even if the connection has been replaced.
+    connection.pending = work.then(() => { delete connection.error }, (error: unknown) => {
+      if (!connection.controller.signal.aborted) connection.error = error instanceof Error ? error.message : String(error)
+    })
+    const settled = connection.pending
+    this.#syncTasks.add(settled)
+    void settled.then(() => { this.#syncTasks.delete(settled) })
+    return work
   }
 }
 

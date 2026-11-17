@@ -406,10 +406,10 @@ export class ControlStore {
    * Callers verify proof eligibility and consume complete heartbeat feed
    * prefixes before using this result to publish application finality.
    */
-  admissionFrontier(policy: WatermarkPolicy, membershipRevision?: Uint8Array,
+  admissionFrontier(policy: WatermarkPolicy | null, membershipRevision?: Uint8Array,
     options: AdmissionFrontierOptions = {}): AdmissionFrontier {
     const provenThroughMs = options.provenThroughMs === undefined
-      ? this.watermark(policy, membershipRevision, options.verifiedHeartbeatIds).cutoffMs : options.provenThroughMs
+      ? policy === null ? null : this.watermark(policy, membershipRevision, options.verifiedHeartbeatIds).cutoffMs : options.provenThroughMs
     const blockers: AdmissionBlocker[] = [], excludedProposalIds: Uint8Array[] = []
     const proposals = new Map<string, StoredAttestation[]>()
     for (const attestation of this.#attestations.values()) {
@@ -447,6 +447,11 @@ export class ControlStore {
         continue
       }
       const candidatePolicy = context?.policy ?? policy
+      if (candidatePolicy === null) {
+        blockers.push({ proposalId: copyBytes(candidate.txId), authorTimestampMs: candidate.orderKey.authorTimestampMs,
+          reason: 'pending-admission', attestationIds: attestations.map(value => copyBytes(value.attestationId)) })
+        continue
+      }
       const validators = new Set(candidatePolicy.validatorIds.map(idKey))
       const votes = attestations.filter(value => validators.has(idKey(value.validatorId)))
       const possible = new Set(votes.map(value => idKey(value.validatorId)))

@@ -34,12 +34,12 @@ describe('application RPC', () => {
       } }),
     }) })
     const transport = new InProcessRpcTransport(service)
-    const iterator = transport.stream('view.changes', { ...request, view: 'local' })[Symbol.asyncIterator]()
+    const iterator = transport.stream('view.changes', { groupId: group, view: 'local' })[Symbol.asyncIterator]()
     expect((await iterator.next()).value).toEqual({ view: 'local', revision: 'current', finalRevision: 'final' })
     expect(options).toEqual([expect.objectContaining({ view: 'local', signal: expect.any(AbortSignal) })])
     expect(readView).not.toHaveBeenCalled(); expect(read).not.toHaveBeenCalled()
     await iterator.return?.()
-    for (const malformed of [{ groupId: group, view: 'branch' }, { groupId: group, cursor: 'durable-progress' }]) {
+    for (const malformed of [{ groupId: group, view: 'branch' }, { groupId: group, cursor: 'durable-progress' }, request]) {
       await expect(transport.stream('view.changes', malformed as never)[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'invalid_argument' })
     }
     await transport.close()
@@ -77,11 +77,11 @@ describe('application RPC', () => {
       })
     } }) }) })
     const transport = new InProcessRpcTransport(service)
-    const iterator = transport.stream('view.changes', request)[Symbol.asyncIterator]()
+    const iterator = transport.stream('view.changes', { groupId: group })[Symbol.asyncIterator]()
     expect((await iterator.next()).value).toEqual({ view: 'final', revision: 'view-1', finalRevision: 'final-1' })
     expect(calls).toHaveLength(1)
     expect(calls[0]!.view).toBe('final')
-    await expect(transport.stream('view.changes', { ...request, view: 'invalid' as never })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'invalid_argument' })
+    await expect(transport.stream('view.changes', { groupId: group, view: 'invalid' as never })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'invalid_argument' })
     const pending = iterator.next()
     await service.close()
     expect((await pending).done).toBe(true)
@@ -238,7 +238,7 @@ describe('application RPC', () => {
     const service = new NodeRpcService({ node: node({}) })
     await expect(service.readEvents(request, { method: 'events.read' })).rejects.toMatchObject({ code: 'failed_precondition' })
     await expect(service.openReadView(request, { method: 'view.open' })).rejects.toMatchObject({ code: 'failed_precondition' })
-    await expect(service.streamViewChanges(request, { method: 'view.changes' })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'failed_precondition' })
+    expect(() => service.viewChanges({ groupId: group }, { method: 'view.changes' })).toThrowError(expect.objectContaining({ code: 'failed_precondition' }))
     await expect(service.sendSignal({ ...request, topic: 'typing', payload: null }, { method: 'signals.send' })).rejects.toMatchObject({ code: 'failed_precondition' })
     await expect(service.subscribeSignals(request, { method: 'signals.subscribe' })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'failed_precondition' })
     await service.close()

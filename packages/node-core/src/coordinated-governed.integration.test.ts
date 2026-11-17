@@ -236,7 +236,7 @@ describe('governed chronological native replicas with a finality provider', () =
       .rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
     expect(relayOnly.activeSnapshot.revision).toBe(3n)
     // Fetch application envelopes by hash without replicating any author feed.
-    relayOnly.transport.connect({ ...admin.transport.asLink(), read: async () => [] })
+    relayOnly.transport.connect({ ...admin.transport.asLink(), head: async () => 0n, read: async () => [] })
     await relayOnly.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: retainedCertificate })
     expect(relayOnly.node.outcome(staleAgain.txId)?.rejectionCode).toBe('WRITER_UNAUTHORIZED')
     expect(relayOnly.node.localSql('SELECT id, value FROM notes ORDER BY id', [], { view: 'final' }).rows)

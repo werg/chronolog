@@ -66,9 +66,8 @@ const created = await alice.sealed.setReaders({
 })
 await created.handle.accepted()
 
-// put() additionally requires the policy update's accepted outcome to be below
-// a resolved policy watermark. accepted() alone is not that finality condition.
-// If necessary, observe created.handle.evidence until the condition is met.
+// accepted() waited for the policy update's immutable locally applied success.
+// put() rechecks the selected policy and refuses an unresolved newer update.
 try {
   const change = await alice.sealed.put(
     created.id, 'body', new TextEncoder().encode('A private note'),
@@ -77,8 +76,8 @@ try {
   await change.handle.accepted()
 } catch (error) {
   if (error instanceof SealedPolicyNotFinalError) {
-    // Wait for policy_watermark_reached, no unresolved references, and an
-    // accepted outcome, then explicitly retry the operation.
+    // Wait for the selected policy update's final accepted outcome and all
+    // required references, then explicitly retry the operation.
   } else {
     throw error
   }
@@ -130,7 +129,7 @@ const changed = await alice.sealed.setReaders({
   expectedVersion: current.version,
 })
 await changed.handle.accepted()
-// Wait for policy settlement before the next put(), which checks it by default.
+// The policy is now final; the next put() checks its selected snapshot again.
 ```
 
 Every `put` generates a fresh random AES-256-GCM content key. It wraps that key
@@ -164,8 +163,9 @@ the transaction later fails a row-write check, a trigger or compare-and-swap.
 SQL rollback and deterministic replay cannot withdraw those bytes.
 
 For that reason `put()` checks the policy update's settlement evidence before
-encrypting. Its default requires an accepted outcome,
-`confidence === 'policy_watermark_reached'` and no unresolved references.
+encrypting. Its default requires an accepted outcome with `final === true` and
+no unresolved references. This condition uses the selected finality provider;
+it does not require peer-validator watermark metadata for a coordinated group.
 Otherwise it throws `SealedPolicyNotFinalError` without encrypting or submitting
 the value. Tests or development tools can explicitly pass
 `allowProvisionalPolicy: true`; that permits irreversible disclosure under a

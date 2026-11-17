@@ -5,6 +5,9 @@ owner-controlled rows. The rules themselves are in
 [design-owner-rows.md](design-owner-rows.md). The runnable version of this page
 is [`examples/shared-notes.ts`](../examples/shared-notes.ts)
 (`pnpm demo:ownership`).
+That walkthrough intentionally inspects provisional local outcomes with
+`settled()`; applications use `accepted()` when later work requires immutable
+success.
 
 ## The model in four sentences
 
@@ -39,8 +42,8 @@ await client.transaction([{
 
 ## Knowing why a write failed
 
-`handle.accepted()` resolves on acceptance and throws a `TransactionRejectedError`
-on rejection. `error.reason` says what went wrong:
+`handle.accepted()` waits for locally applied immutable acceptance and throws a
+`TransactionRejectedError` on final rejection. `error.reason` says what went wrong:
 
 | `reason.kind` | Meaning |
 | --- | --- |
@@ -50,9 +53,10 @@ on rejection. `error.reason` says what went wrong:
 | `schema` | DDL left a table without an owner column or primary key (`schema_unregistered`), or a trigger used `RAISE(IGNORE)`. |
 | `engine` | SQLite refused the statement: `constraint`, `denied`, `step_limit`, … |
 
-`error.stepIndex` is the failing step. The outcome is the one at the
-transaction's current position: a late predecessor can still change it on
-replay (`TransactionOutcome.changedByReplay`).
+`error.stepIndex` is the failing step. For provisional UI inspection, use
+`handle.settled()` and inspect its outcome. A late predecessor can still change
+that provisional result on replay (`TransactionOutcome.changedByReplay`);
+`accepted()` waits through those changes.
 
 ## Sharing, teams and transfers
 

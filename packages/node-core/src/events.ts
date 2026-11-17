@@ -3,7 +3,7 @@ import {
   cloneEventOrigin, encodeCanonicalCbor, equalBytes, isEmitStep, type ChangeProgram, type CborValue,
 } from '@chronolog/protocol'
 
-export type { EffectiveEvent, EventTransaction, EventReadOptions, EventBatch } from '@chronolog/protocol'
+export type { ChronologEventOrigin, EffectiveEvent, EventTransaction, EventReadOptions, EventBatch } from '@chronolog/protocol'
 import type { ChronologEventOrigin, EffectiveEvent, EventTransaction, EventReadOptions, EventBatch } from '@chronolog/protocol'
 export interface EventHistoryItem {
   readonly anchor: string

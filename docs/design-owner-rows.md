@@ -11,7 +11,8 @@ wrong, this document is changed first and the change is logged (§11).
 
 Written against the simplified core (commits `1fb41d8`–`a8e5954`), where:
 
-- membership is four roles (writer, validator, reader, administrator);
+- membership originally had four roles; the current protocol has three grant
+  roles (`writer`, `validator`, `reader`) and separately pinned root administration;
 - a program was `{version: 1, statements}` (now `{version: 3, steps}`);
 - node state and feeds live in SQLite.
 
@@ -76,14 +77,20 @@ What carries over from Namlu:
   - the deterministic context.
 - **Admission stays in the protocol.** Validators attest inclusion by
   timestamp, and a transaction's order position must not depend on
-  materialized state. So the four capability roles are unchanged.
-  - The `writer` grant still decides who may author at all. That is spam and
-    Sybil control.
-  - Data authorization lives in the database.
+  materialized state. The grant roles are `writer`, `validator` and `reader`;
+  membership administration belongs to the root key and administration feed
+  pinned in genesis, not an administrator grant.
+  - One exact `writer` grant must explicitly permit the program's SQL and
+    durable-event topics. Ephemeral signal topics are a separate permission on
+    that grant. Missing rights grant nothing, and several grants cannot pool
+    their permissions to authorize one program.
+  - Row and schema authorization lives in the database, within those publication
+    rights.
 
 | Concern | Today | Proposed |
 | --- | --- | --- |
-| Admin, validators, readers, writer admission | capability log | **unchanged** |
+| Membership administration | signed root key and administration feed | Separate from application administration |
+| Validators, readers and writer publication rights | capability log | Separate from row and schema authorization |
 | Who may run DDL (including triggers) | any writer | admins of the `group` collective (§3) |
 | Which rows a writer may insert, update or delete | any | owner, collectives, grants (§4, §6), narrowed by app triggers (§5) |
 
