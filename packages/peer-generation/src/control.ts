@@ -14,6 +14,8 @@ import {
 export * from './control-types.js'
 export * from './definition.js'
 export * from './schema.js'
+export * from './release-types.js'
+export * from './release-verify.js'
 export { createPeerIdentity, exportPeerIdentity, importPeerIdentity, PeerGenerationError, encodePeerValue, decodePeerValue, peerDigest, bytesDigest } from './codec.js'
 
 /** Monotonic learned authority: a signed older state or a divergent chain cannot replace it. */
