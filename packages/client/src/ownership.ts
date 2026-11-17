@@ -22,26 +22,6 @@ import type { DecodedLocalSqlResult, DecodedLocalSqlValue, LocalSqlInput } from 
  * a grant id or a transfer offer id.
  */
 
-/** The column that holds each row's owner (a principal id; see `ownerKeySql`). */
-export const OWNER_COLUMN = 'chronolog_owner'
-
-/**
- * SQL expression for the 32-byte key that owns a row, for local reads:
- * `SELECT n.*, ${ownerKeySql('n')} AS owner FROM notes AS n`, or
- * `WHERE ${ownerKeySql('n')} = ?` with your key bound.
- */
-export function ownerKeySql(alias?: string): string {
-  const column = alias === undefined ? OWNER_COLUMN : `${alias}.${OWNER_COLUMN}`
-  return `(SELECT key FROM chronolog_principals WHERE id = ${column})`
-}
-
-/**
- * SQL expression for the owner value of a key bound to its `?`. Use it to
- * write a row owned by a team you may insert for:
- * `INSERT INTO notes (id, body, chronolog_owner) VALUES (?, ?, ${OWNER_FOR_KEY_SQL})`.
- */
-export const OWNER_FOR_KEY_SQL = '(SELECT id FROM chronolog_principals WHERE key = ?)'
-
 // ── rejections ──────────────────────────────────────────────────────────────
 
 export type OwnedOperation = 'insert' | 'update' | 'delete'

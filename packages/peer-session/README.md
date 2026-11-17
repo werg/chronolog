@@ -368,8 +368,8 @@ JavaScript/WASM content types and the same cross-origin isolation policy as the
 Worker. The engine directory URL may include or omit its final slash. The
 session verifies the engine bytes and execution identity before opening its
 OPFS pool, scopes the database to the device and application, and waits for the
-pool to release its handles before closing device storage. Both SQL paths authenticate the same
-peer-generation engine profile. `prepareApplicationSession` and the explicit
+pool to release its handles before closing device storage. Both SQL paths
+authenticate the same peer-generation engine profile. `prepareApplicationSession` and the explicit
 SQL openers remain available for custom engine/provider composition; callers do
 not implement control signing or bootstrap retry journals.
 
@@ -379,6 +379,84 @@ controls define its current data roles, so creator departure does not freeze
 shared data and data-role revocation survives history rollback. Private row
 ownership remains tied to its actual author. Irreversible effects require a
 separately declared protected boundary.
+
+### A shared SQL command with a domain guard
+
+The signed initializer creates the application tables. The materializer adds
+`chronolog_owner`, whose value is an internal principal ID. Use
+`OWNER_FOR_KEY_SQL` with a bound `APPLICATION_COLLECTIVE_ID` to create shared
+rows; do not put the 32-byte key directly into that integer column. Omitting an
+explicit owner creates a row owned by its signing author.
+
+```ts
+import {
+  APPLICATION_COLLECTIVE_ID, OWNER_FOR_KEY_SQL, defineApplication,
+  defineCommand, defineQuery, emit, program, sqlStatement,
+} from '@chronolog/peer-session'
+
+const tasks = defineApplication({
+  id: 'tasks', version: '1',
+  schema: program(`CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1))
+  )`),
+  commands: {
+    create: defineCommand({
+      description: 'Create a shared task',
+      input: { type: 'object', properties: {
+        id: { type: 'string', minLength: 1, maxLength: 128 },
+        title: { type: 'string', minLength: 1, maxLength: 200 },
+      }, required: ['id', 'title'] },
+      prepare: ({ id, title }) => program(
+        sqlStatement(
+          `INSERT INTO tasks (id, title, chronolog_owner)
+           VALUES (?, ?, ${OWNER_FOR_KEY_SQL})`,
+          [id, title, APPLICATION_COLLECTIVE_ID],
+        ),
+        emit('task.created', { id, title }),
+      ),
+    }),
+    complete: defineCommand({
+      description: 'Complete an open task',
+      input: { type: 'string', minLength: 1, maxLength: 128 },
+      prepare: id => program(
+        sqlStatement(
+          `SELECT chronolog_assert(
+            EXISTS (SELECT 1 FROM tasks WHERE id = ? AND done = 0),
+            'task_not_open')`, [id],
+        ),
+        sqlStatement('UPDATE tasks SET done = 1 WHERE id = ?', [id]),
+        emit('task.completed', { id }),
+      ),
+    }),
+  },
+  queries: {
+    tasks: defineQuery({
+      description: 'Read shared tasks', input: { type: 'null' },
+      read: view => view.query('SELECT id, title, done FROM tasks ORDER BY id'),
+    }),
+  },
+})
+```
+
+Pass `definition: tasks` to either SQL session opener. `sqlStatement` binds
+ordinary numbers, strings, booleans, nulls and byte arrays without interpolation.
+`chronolog_assert(condition, code)` rejects the whole command when the condition
+is false or null. A rejected command publishes neither its row changes nor its
+events. Inspect `operation.applied()` for `outcome` and `rejectionCode`; an
+applied rejection is still an ordered outcome. Domain guards run against the
+selected history at execution, including when two peers act on the same earlier
+view. A command's optional `basedOn` revision also makes its observed view
+explicit, but does not replace those domain guards.
+
+For first publication, `create.members` can name the public keys of devices
+already created with `openNativeDevice` or `openBrowserDevice`:
+`create: { members: [{ publicKey: a.identity.publicKey },
+{ publicKey: b.identity.publicKey }] }`. Those ordinary participants can read,
+write, coordinate and request recovery. These grants are separate from the
+initializer's schema authority and the host's administration rights. Later
+enrollment is a signed control change through the host's
+public membership API, followed by peer-to-peer key delivery.
 
 
 ## Build a packed preview

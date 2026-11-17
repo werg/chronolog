@@ -1,7 +1,8 @@
 import { platformObjectId } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
-import { TransactionRejectedError, createdObjectId, ownerKeySql, ownershipSteps, parseRejectionCode } from './ownership.js'
+import { ownerKeySql } from './index.js'
+import { TransactionRejectedError, createdObjectId, ownershipSteps, parseRejectionCode } from './ownership.js'
 
 describe('parseRejectionCode', () => {
   it('parses policy, platform, assert, schema and engine codes', () => {

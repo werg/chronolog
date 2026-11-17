@@ -5,6 +5,7 @@ export * from './runtime.js'
 export * from '@chronolog/peer-generation'
 export { eventExecutionManifest } from '@chronolog/materializer'
 export { emit, program, sqlStatement, executionManifestArtifacts, bytesToHex, hexToBytes, APPLICATION_COLLECTIVE_ID } from '@chronolog/protocol'
+export { OWNER_COLUMN, OWNER_FOR_KEY_SQL, ownerKeySql } from '@chronolog/protocol'
 
 export * from './network.js'
 export * from './recovery.js'

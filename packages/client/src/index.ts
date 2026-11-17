@@ -8,6 +8,7 @@ export * from './projections.js'
 export type { ViewChange, ViewChangeOptions } from '@chronolog/protocol'
 export type { Signals, EphemeralSignal, SignalPayload, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
 export { program, emit, sqlStatement, type ChangeProgram, type EmitStep, type EventBatch, type EventReadOptions, type EventPayload, type EffectiveEvent, type ChronologEventOrigin } from '@chronolog/protocol'
+export { OWNER_COLUMN, OWNER_FOR_KEY_SQL, ownerKeySql } from '@chronolog/protocol'
 
 export {
   ChronologRpcError,

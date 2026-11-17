@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import process from 'node:process';
 import { webcrypto as crypto } from 'node:crypto';
 import {
-  APPLICATION_COLLECTIVE_ID, bytesDigest, bytesToHex, connectApplications, controlParticipantGrant,
+  APPLICATION_COLLECTIVE_ID, OWNER_FOR_KEY_SQL, bytesDigest, bytesToHex, connectApplications, controlParticipantGrant,
   createGenerationRegistry, createPeerIdentity, defineApplication, defineCommand, defineQuery, emit,
   MemoryPeerStore, participantGrant, program, signApplicationDescriptor, signControlRevision, signTransitionRequest, sqlStatement,
 } from '@chronolog/peer-session';
@@ -11,14 +11,13 @@ import { openNativeDevice } from '@chronolog/peer-session/native';
 import { openNativeSqlApplication, prepareNativeSqlApplication } from '@chronolog/peer-session/sql-native';
 
 const directory = process.argv[2], sessions = [], links = [];
-const team = bytesToHex(APPLICATION_COLLECTIVE_ID);
 const definition = defineApplication({ id: 'packed-shared-board', version: '1',
   schema: program('CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE)'),
   commands: {
     create: defineCommand({ description: 'Create a shared task', input: { type: 'object', properties: {
       id: { type: 'integer' }, title: { type: 'string', minLength: 1, maxLength: 100 },
     }, required: ['id', 'title'] }, prepare: ({ id, title }) => program(sqlStatement(
-      `INSERT INTO tasks (id,title,chronolog_owner) VALUES (?, ?, (SELECT id FROM chronolog_principals WHERE key=X'${team}'))`, [id, title]), emit('task.created', { id, title })) }),
+      `INSERT INTO tasks (id,title,chronolog_owner) VALUES (?, ?, ${OWNER_FOR_KEY_SQL})`, [id, title, APPLICATION_COLLECTIVE_ID]), emit('task.created', { id, title })) }),
     rename: defineCommand({ description: 'Rename a shared task', input: { type: 'string', minLength: 1, maxLength: 100 },
       prepare: title => program(sqlStatement('UPDATE tasks SET title=? WHERE id=1', [title]), emit('task.renamed', { title })) }),
   },
