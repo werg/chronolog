@@ -85,6 +85,7 @@ export function createWebRtcOfferHandler(options: {
   readonly maxPending?: number
   readonly maxConnections?: number
   readonly timeoutMs?: number
+  /** Per-introduction or per-peer diagnostics; failure retires only that session. */
   readonly onError?: (error: unknown) => void | Promise<void>
 }): WebRtcOfferHandler {
   if (typeof options.authorize !== 'function' || typeof options.accept !== 'function' || typeof options.createPeerConnection !== 'function') {

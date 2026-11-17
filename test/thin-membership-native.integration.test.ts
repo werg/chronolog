@@ -251,8 +251,8 @@ describe('thin membership qualification native boundary', () => {
     expect(native.traffic().peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
     native.assertHealthy()
 
-    // A real denied peer must leave its originating native error observable
-    // even though the success snapshot now refuses to return healthy evidence.
+    // A denied peer leaves its originating error observable without stopping
+    // the authority, future application work or the membership service.
     observe('diagnostic revoked-reader RTC introduction')
     const bootstrap = native.bootstrap()
     const connection = await openWebRtcConnection({ role: 'offerer',
@@ -270,14 +270,17 @@ describe('thin membership qualification native boundary', () => {
       }).catch((error: unknown) => error)
     observe('retained failure diagnostics')
     expect(denied).toBeInstanceOf(Error)
-    await expect.poll(() => native.diagnostics().failure).toMatchObject({ source: 'peer', message: 'PEER_READ_UNAUTHORIZED' })
-    await expect(native.snapshot()).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    await expect.poll(() => native.diagnostics().peers.lastFailure).toMatchObject({ message: 'PEER_READ_UNAUTHORIZED' })
+    native.assertHealthy()
+    expect(native.diagnostics().failure).toBeNull()
+    await native.publishWorkload({ namespace: 'after-denied-peer', count: 1, payloadBytes: 128 })
+    expect((await native.snapshot()).availableEpochs).toContain(String(revoked.epoch))
     const diagnostic = native.diagnostics()
     expect(diagnostic.finalThrough).toBeGreaterThan(0)
     expect(diagnostic.availableEpochs).toContain(String(revoked.epoch))
     expect(diagnostic.traffic.rtcSignalingDescriptions).toBe(6)
     expect(diagnostic.traffic.peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
-    expect(diagnostic.failure).toEqual(native.diagnostics().failure)
+    expect(diagnostic.peers).toEqual(native.diagnostics().peers)
     observe('complete')
   }, 180_000)
 })

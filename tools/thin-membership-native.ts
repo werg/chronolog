@@ -99,12 +99,16 @@ export async function createThinMembershipNative(options: {
   let client: ChronologClient | undefined
   let membershipHandler: ((request: Request) => Promise<Response>) | undefined
   let failure: Error | undefined
-  let firstFailure: { source: 'peer' | 'agent'; observedAt: string; name: string; message: string; stack: string | null } | null = null
-  const retainFailure = (error: unknown, source: 'peer' | 'agent'): void => {
+  type FailureDiagnostic = { observedAt: string; name: string; message: string; stack: string | null }
+  const diagnostic = (error: Error): FailureDiagnostic => ({ observedAt: new Date().toISOString(),
+    name: error.name, message: error.message, stack: error.stack ?? null })
+  let firstFailure: (FailureDiagnostic & { source: 'agent' }) | null = null
+  let peerFailures = 0, lastPeerFailure: FailureDiagnostic | null = null
+  const retainFailure = (error: unknown): void => {
     if (failure !== undefined) return
     failure = asError(error)
-    firstFailure = { source, observedAt: new Date().toISOString(), name: failure.name, message: failure.message, stack: failure.stack ?? null }
-    process.stderr.write(`Thin native ${source} failure: ${failure.stack ?? failure.message}\n`)
+    firstFailure = { ...diagnostic(failure), source: 'agent' }
+    process.stderr.write(`Thin native agent failure: ${failure.stack ?? failure.message}\n`)
   }
   let schemaReady = false
   let dropAppendReply = false
@@ -235,8 +239,11 @@ export async function createThinMembershipNative(options: {
     createPeerConnection: configuration => createNativePeerConnection(configuration,
       { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
     onError(error) {
-      const value = asError(error)
-      if (!['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED'].includes(value.message)) retainFailure(value, 'peer')
+      // This observer belongs to a single peer lifetime. Disconnects, revoked
+      // readers and malformed requests retire that peer, never the authority or
+      // unrelated peers. Retain bounded diagnostics without poisoning checked().
+      peerFailures += 1
+      lastPeerFailure = diagnostic(asError(error))
     },
     async accept(connection) {
       connections.add(connection)
@@ -284,7 +291,7 @@ export async function createThinMembershipNative(options: {
         peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
       if (agent.finality === null) throw new Error('THIN_NATIVE_FINALITY_REQUIRED')
       membershipHandler = createMembershipLedgerHandler({ finality: agent.finality, descriptor: governed.descriptor, sink: transport })
-      void agent.run().catch((error: unknown) => { retainFailure(error, 'agent') })
+      void agent.run().catch(retainFailure)
       client = new ChronologClient({ groupId: bytesToBase64Url(genesis.manifest.groupId),
         transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node, signals: agent.context.signals })), unaryRetryAttempts: 1 })
       return bootstrap()
@@ -358,6 +365,7 @@ export async function createThinMembershipNative(options: {
     // cached frontiers and counters without requesting SQL replay or a view.
     diagnostics() {
       return { failure: firstFailure === null ? null : { ...firstFailure }, started: governed !== undefined,
+        peers: { failures: peerFailures, lastFailure: lastPeerFailure === null ? null : { ...lastPeerFailure } },
         finalThrough: governed?.node.finalThrough ?? null,
         membershipRevision: governed === undefined ? null : String(governed.activeSnapshot.revision),
         availableEpochs: governed?.governance.cipherRing.epochs().map(String) ?? [],
