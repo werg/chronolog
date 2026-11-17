@@ -25,6 +25,14 @@ export interface WebSocketPeerOptions {
   readonly openTimeoutMs?: number
 }
 
+/** Acquire both lanes synchronously, then return only after bounded admission and framing. */
+export async function openWebSocketConnection(sockets: WebSocketPeerChannels,
+  options: WebSocketPeerOptions = {}): Promise<PeerMessageConnection> {
+  const connection = frameWebSocketPeerConnection(sockets, options)
+  try { await connection.ready; return connection }
+  catch (error) { await connection.close(); throw error }
+}
+
 /**
  * Two independent WebSockets use the same bounded framing owner as WebRTC.
  * Install this synchronously when acquiring the sockets: no frame may arrive

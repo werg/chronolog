@@ -75,7 +75,7 @@ encoded as canonical CBOR inside `TransactionCore.program`: a step is
 
 The transaction core is version 2 and signs `operationId` alongside author, exact writer grant, membership revision, execution profile and program. Different proposals reusing one author/operation identity deterministically reject as `operation_conflict`. SQL/platform failure rolls back the whole program and exposes no effective emit. Accepted events are reconstructed from the canonical program and its durable outcome anchor; final readers never advance beyond missing or unresolved outcomes.
 
-The SQL-free execution profile accepts only emits. SQL/platform steps are a deterministic `profile:sql-disabled` rejection in that profile. See [public application session](../../packages/peer-session/README.md) for cursors, coherent views and application consumers.
+An application without a SQL engine accepts only emits. SQL/platform steps are rejected deterministically when that explicit engine capability is absent. All applications use the same session and execution pipeline. See [public application session](../../packages/peer-session/README.md) for cursors, coherent views and application consumers.
 
 The grant, collective or offer created by step `i` of transaction `txId` has
 the id `SHA-256(domain("chronolog/platform-object") ‖ len(txId) ‖ txId ‖ u32(i))`

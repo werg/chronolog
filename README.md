@@ -8,7 +8,9 @@ The application API has one command journal, one query and event model, and one
 replication and recovery lifecycle. Participant roles determine what a participant
 may receive or do. Transports deliver those same scoped messages. A server can
 participate in control, discovery and signed code publication without receiving
-application bodies or executing ordinary commands.
+application bodies or executing ordinary commands. Its separate WebSocket relay
+capability forwards opaque peer ciphertext when a direct WebRTC route is
+unavailable. Both routes use the same authenticated encrypted channel and session.
 
 This is prerelease software. Breaking changes update every maintained consumer;
 there are no alternate legacy applications, profile selectors or migration layers.
@@ -27,11 +29,13 @@ there are no alternate legacy applications, profile selectors or migration layer
 - Revocation and other control state do not roll back with application data.
   Reader, writer, coordinator, recovery and administration rights are explicit.
 - Live signals and encrypted chunked content use the same session identity,
-  ownership and lifetime. They do not create another outbox or host data path.
+  ownership and lifetime. They do not create another outbox or execution path.
 - Irreversible external effects require an explicit protected service. Applying
   an ordinary command never dispatches such an effect automatically.
 
-A healthy generation continues with every host endpoint blocked. If both the
+A healthy generation on direct peer connections continues with every host
+endpoint blocked. Relayed connections require their forwarding service, while
+control-service outages do not interrupt an already selected generation. If both the
 coordinator and control service are unavailable, commands stay saved locally.
 The system does not fabricate a successor or promise that all data copies survive.
 
@@ -76,6 +80,7 @@ to that owner. Closing the session releases owned transports, streams and storag
 | `materializer` | Execution contract and SQL-free event implementation |
 | `materializer-doltlite` | Deterministic SQL execution with native and WASM engine adapters |
 | `transport-webrtc` | RTC connections, bounded delivery and signaling mechanics |
+| `transport-websocket` | Two independent binary sockets using the same bounded message framing |
 | `signals` | Replaceable, bounded ephemeral application signals |
 | `protocol`, `crypto`, `canonical` | Programs, canonical encodings, digests and cryptography |
 | `conformance` | Execution equivalence, crash/reopen and resource qualification |
@@ -114,9 +119,10 @@ archive requires explicit `--allow-dirty` and records that fact.
 
 The [independent Tendriller recipes](https://github.com/werg/tendriller-contrib/tree/refactor/owned-peer-data-plane/cookbooks/run-a-peer-application)
 consume these packages and qualify conversation, guarded tasks, native RTC,
-browser ownership and actual hosted control/publication. CI pins exact consumer
-commits. Loopback and local Worker results do not establish Internet reachability,
-TURN behavior, browser suspension, or provider cost savings.
+browser ownership, WebSocket fallback and actual hosted control/publication. CI
+pins exact consumer commits. Loopback and local Worker results do not establish
+Internet reachability, browser suspension or provider cost savings. TURN is not
+required; relay bandwidth and availability remain explicit operating costs.
 
 Read the [architecture](docs/peer-generation-v1.md), [SQL contract](docs/implementation-specs/10-deterministic-sql-transactions.md)
 and [qualification guide](docs/release-hardening.md) for the trust and operating

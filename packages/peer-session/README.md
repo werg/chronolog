@@ -5,7 +5,9 @@ same signed records, operation journal, replication, materialization and query
 contracts. `peer-generation-v1` identifies the signed record format; it is not
 an application mode or a selector for a second implementation.
 One eligible peer sequences commands. Ordinary commands, queries, history and
-live signals need no hosted request while that generation is healthy. A signed
+live signals need no control-service request while that generation is healthy.
+Direct WebRTC carries peer traffic without a relay; the WebSocket fallback
+forwards encrypted peer traffic through the relay. A signed
 control service selects a successor during takeover. Recovery can abandon a
 recent suffix, which remains inspectable and requires explicit reapplication.
 
@@ -207,13 +209,16 @@ declare a peer authorized or choose a recovery prefix.
 ```ts
 import { createPeerIntroductions } from '@tendriller/core/peers'
 import { openWebRtcConnection } from '@chronolog/peer-session/webrtc'
+import { openWebSocketConnection } from '@chronolog/peer-session/websocket'
 
 const participation = session.participate({
   control,
   ...createPeerIntroductions({
     peers: client.peers,
     identity: session.deviceId,
-    openConnection: options => openWebRtcConnection(options),
+    openDirectConnection: options => openWebRtcConnection(options),
+    openRelayConnection: ({ relay, signal }) =>
+      openWebSocketConnection(relay, { ready: relay.ready, signal }),
   }),
   recovery: { graceMs: 3000, freshnessMs: 300_000 },
 })
@@ -224,7 +229,12 @@ await participation.approveRecovery(proposal.id)
 
 A native process supplies an RTC factory through its raw opener. A browser
 Worker uses `openWorkerWebRtcConnection(self, options)` as shown below. The same
-controller and authenticated protocol run in both environments.
+controller and authenticated protocol run in both environments. The introduction
+attempt tries the direct connection for a bounded interval, then opens two relay
+WebSockets on the same invitation channel. It returns one raw connection to the
+session. The session owns authentication, synchronization and every later retry;
+transport fallback creates no second operation journal or recovery controller.
+WebSockets are available in the owning Worker directly and need no page bridge.
 
 The default controller owns at most four connections, with a hard maximum of
 eight. Attempts have a 15-second deadline and bounded exponential backoff with
@@ -233,7 +243,8 @@ cancellation continues to occupy its bounded opening slot; a late connection is
 closed rather than attached. Discoverability leases renew every 60 seconds.
 Healthy peers synchronize on that coarse cadence, and directory reads occur
 only while the graph is underfilled or the coordinator is absent. Ordinary
-commands and live signals do not cause host requests.
+commands and live signals do not cause control-service requests. A relayed
+connection does carry their ciphertext through its WebSockets.
 
 After coordinator loss, the controller first gives reconnection its configured
 grace. It verifies the current signed authority and synchronizes reachable peers
@@ -343,9 +354,9 @@ clears those claims; the new generation needs fresh retention acknowledgments.
 
 `session.connectPeer({ connection, peerIdentity?, signal? })` owns an authenticated
 connection to another current reader. `connection` supplies reliable framed byte
-lanes (`send`, `frames`, `signal`, `close`) and an optional separate lossy `live`
-lane. The existing `openWebRtcConnection()` and `frameRtcPeerChannels()` results
-implement this structural interface directly, in a native process or an owning
+lanes (`send`, `frames`, `signal`, `close`) and an optional separate disposable
+`live` lane. `openWebRtcConnection()` and `openWebSocketConnection()` implement
+this structural interface directly, in a native process or an owning
 browser Worker. A discovery result identifies a possible route; the session
 independently verifies a fresh signed challenge bound to both identities, the
 application descriptor, and the signed record format before attaching that route.
@@ -353,6 +364,16 @@ An optional `peerIdentity` pins the discovered identity. A control-only host
 identity cannot attach without an explicit reader grant.
 The hello can carry a newer signed authority bundle, so an existing reader can
 verify a newly enrolled peer's grant before checking its proof of possession.
+
+Every transport uses the same authenticated encrypted channel. Signed hello
+transcripts bind the application, both identities, fresh ephemeral receiver keys
+and the selected cipher suite. RFC 9180 HPKE exports distinct traffic keys and
+nonces for each direction and lane. AES-GCM protects every subsequent reliable
+frame and live signal; reliable sequences reject replay or gaps, while disposable
+traffic may lose frames and drops stale sequence numbers. Channel keys expire at
+bounded byte and record counts and renew through the existing reconnect owner.
+The relay sees public handshake authority, packet sizes and timing. It receives
+no channel keys or application plaintext and obtains no application-reader grant.
 
 The returned link exposes `peerId`, `signal`, `completion`, `synchronize()` and
 `close()`. History requests select one advertised head and check each original
@@ -377,7 +398,7 @@ set the three corresponding timeout options up to 120 seconds. Closing fences
 pending replies and detaches routes synchronously, then retires transport work.
 Already committed commands remain eligible for exact retry after a lost reply.
 
-Signed live signals use only the optional lossy lane and its independent bounded
+Signed live signals use only the optional disposable lane and its independent bounded
 queue. Congestion drops live traffic before dispatch; it never enters the durable
 history queue. Live signal authors and connected peers must remain current
 readers. Command submission and ordering additionally recheck current writer
@@ -387,8 +408,8 @@ The initial creator provisions its epoch key explicitly. Maintained connections
 acquire a granted reader's missing keys through the authenticated keyring port;
 each share is HPKE-wrapped for that device's fresh signed request. The request's
 recipient and the share's issuer must match their authenticated peer connection.
-Keys are never sent in plaintext or through an automatic hosted fallback. Use a
-confidential transport such as WebRTC when live signal contents require privacy.
+Keys are never sent in plaintext. The same authenticated key exchange operates
+over either physical transport, inside the shared encrypted peer channel.
 
 `connectApplications(a, b)` is a built-in in-process transport for embedded peers
 and independent-store qualification. It executes this same authenticated framed
@@ -454,9 +475,30 @@ available when that attempt began; reconnecting never replays missed signals.
 The `/webrtc` entry provides `connectApplicationWebRtc(session, options)` for a
 runtime with a usable RTC factory. The optional `/webrtc-native` entry supplies
 `connectNativeApplicationWebRtc(session, options)` with the exact supported
-Werift implementation. Returned connections expose reliable framed byte counts (including authentication and fragmentation),
-request counts, and `rtc.getRoute()` observations. An unknown observed route
-stays unknown.
+Werift implementation. Application links expose encoded application-wire byte
+and request counts. These byte counts precede channel encryption; physical
+transport statistics include encrypted frame payloads, and relay reports account
+for relay traffic separately. `rtc.getRoute()` observes the selected ICE route.
+An unknown observed route stays unknown.
+
+The `/websocket` entry supplies `openWebSocketConnection({ reliable, live },
+options)`. It attaches both binary readers synchronously, waits for optional
+transport admission and the common framing handshake, then returns one owned
+connection. `frameWebSocketPeerConnection()` exposes the same connection and its
+`ready` promise when a transport needs to install readers before admission ends.
+Both WebRTC and WebSocket use the shared reliable fragment/credit implementation
+and shared disposable queue. Only physical socket readiness and writable-buffer
+notifications differ.
+
+The relay uses separate WebSockets for reliable and live frames. Live traffic
+never waits behind application history and is refused before dispatch when its
+socket is congested; it is not retried. Once dispatched, WebSocket traffic has
+TCP delivery semantics, so delayed live records still rely on the common signal
+expiry checks. Relay admission and recipient receipts bound host forwarding
+buffers without inspecting application records. A relay outage ends relayed
+connections; exact saved commands resume through ordinary participation when a
+route becomes available. Direct connections can continue without the relay.
+TURN is not required by this fallback architecture.
 
 In a browser, the page serves `serveWorkerWebRtcConnections(worker)`. The owning
 Worker calls `openWorkerWebRtcConnection(self, options)` through its raw transport
@@ -476,7 +518,7 @@ and signaling HTTP server stops, then an offline session reopen. The artifact
 contains the emitted page and Worker JavaScript as well as their hashes. A local
 `--build-only` run checks the browser graph without claiming browser execution.
 This fixture provisions epoch keys explicitly and uses loopback ICE; it does not
-qualify hosted enrollment, automatic key delivery, public NAT traversal or TURN.
+qualify hosted enrollment, automatic key delivery or public network traversal.
 
 A session with a selected recovery prefix that has not arrived reports
 `status.phase === 'recovering'`. Queries fail with `PEER_RECOVERING` until a

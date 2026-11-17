@@ -17,7 +17,7 @@ replica with selected-history replay and recovery. The public
 replica into commands, queries, operation inspection, applied/shared waits,
 reapplication, live signals and coherent change notifications. It supplies native
 and browser device entries, a maintained in-process link, authenticated framed
-network transport and native/browser RTC composition. SQL applications project
+network transport and native/browser WebRTC and WebSocket composition. SQL applications project
 signed data-collective membership separately from sequencing/control rights.
 Consumers use an explicitly built, source-pinned package archive during
 prerelease qualification.
@@ -45,12 +45,14 @@ One replaceable peer sequences ordinary application commands. Every peer verifie
 the author's original signed, encrypted attempt, the selected coordinator's order,
 and the execution manifest, then independently executes that order. Author time is
 provenance, not the order comparator. Local persistence precedes acknowledgment.
-No command requires a host request, second-copy acknowledgment or finality service.
+No command requires a control-service request, second-copy acknowledgment or finality service.
 
 The host is a control participant. It retains the signed application descriptor,
 monotonic controls and generation selections and atomically chooses successors.
 It sees prefix proofs and delegated order headers at transitions, not application
-bodies or SQL. Existing generations continue while all host endpoints are blocked.
+bodies or SQL. Existing generations on direct peer connections continue while all
+host endpoints are blocked. WebSocket relay connections require their forwarding
+service, but do not require control-service availability for ordinary commands.
 If both host and coordinator are unavailable, attempts stay saved locally until a
 valid successor can be selected. No peer creates an authoritative generation alone.
 
@@ -88,7 +90,7 @@ The reserved `APPLICATION_COLLECTIVE_ID` is the durable shared SQL owner. Its
 members come from signed `dataRole` grants. Inherited commands replay against
 their historical control revision inside the candidate view; the newest control
 is reapplied before publication. Rolling back data cannot restore revoked team
-membership. The separately signed initial schema remains fixed for this profile;
+membership. The separately signed initial schema remains fixed for this application;
 ordinary commands cannot perform administrative platform operations or DDL.
 
 ## Participant roles and transport
@@ -104,6 +106,24 @@ bootstrap metadata and rare signed transitions; rendezvous carries bounded
 connection setup. Ordinary peers carry encrypted application history, live signals
 and content. Coarse availability refresh is separately accounted discovery work
 and never a condition for current-generation command completion.
+
+The server can also provide an opaque pairwise WebSocket relay. This is a byte
+transport capability, not an application-reader role. Direct WebRTC and relay
+WebSockets feed one framed connection interface, one authenticated encrypted
+channel and one application wire. The shared message framer bounds reliable
+history and keeps disposable traffic on an independent lane. The introduction
+attempt may select the relay after a direct connection times out; participation
+continues to own authentication, retries, synchronization and recovery. TURN is
+not required. Relay traffic, availability and provider cost are accounted
+separately from the control participant's requests.
+
+Fresh signed connection transcripts authenticate both identities and ephemeral
+HPKE keys. Independent direction and lane keys encrypt all post-handshake
+frames, including live signals and participant request metadata. The relay can
+observe public handshake evidence, frame lengths and timing; it cannot decrypt
+application messages, impersonate an authenticated peer or alter signed control
+authority. Invalid authenticated records close the connection and the same owner
+reconnects with fresh channel keys.
 
 The same scoped participant envelope carries control, publication, discovery,
 database, content and ephemeral messages. Each transport enforces its role's
