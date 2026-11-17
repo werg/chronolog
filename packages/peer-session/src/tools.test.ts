@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
-  signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  signApplicationDescriptor, signControlRevision, signTransitionRequest, type PrefixProof,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -38,8 +38,8 @@ async function fixture() {
     const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
     cleanup.push(() => session.close()); return session
   }))
-  return { a: sessions[0]!, b: sessions[1]!, async recover() {
-    const base = await sessions[1]!.recoveryPoint(), authority = await registry.read()
+  return { a: sessions[0]!, b: sessions[1]!, async recover(point?: PrefixProof) {
+    const base = point ?? await sessions[1]!.recoveryPoint(), authority = await registry.read()
     await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
       policy: descriptor.payload.policy, transitionId: 'recover', expectedGeneration: authority.generations.at(-1)!.id,
       coordinator: devices[1]!.identity.publicKey, requester: devices[1]!.identity.publicKey, controlRevision: 0,
@@ -66,11 +66,17 @@ describe('local application tool revisions and bounded changes', () => {
     const command = (schemas.find(tool => tool.name === 'command')!.inputSchema.oneOf as Array<Record<string, unknown>>)[0]!
     const reapply = (schemas.find(tool => tool.name === 'reapply')!.inputSchema.oneOf as Array<Record<string, unknown>>)[0]!
     const changes = schemas.find(tool => tool.name === 'changes')!.inputSchema
+    for (const name of ['operation', 'wait']) {
+      const schema = schemas.find(tool => tool.name === name)!.inputSchema
+      expect(schema.required).toEqual(['operationId'])
+      expect((schema.properties as Record<string, unknown>).author).toEqual({ type: 'string', pattern: '^[0-9a-f]{64}$' })
+    }
     expect(command.required).toEqual(['name', 'input', 'operationId'])
     expect(reapply.required).toEqual(['name', 'input', 'operationId', 'originalOperationId'])
     expect(changes.required).toEqual([])
     const revision = (command.properties as Record<string, unknown>).basedOn
     expect((reapply.properties as Record<string, unknown>).basedOn).toEqual(revision)
+    expect((reapply.properties as Record<string, unknown>).originalAuthor).toEqual({ type: 'string', pattern: '^[0-9a-f]{64}$' })
     expect((changes.properties as Record<string, unknown>).after).toEqual(revision)
     expect(revision).toMatchObject({ additionalProperties: false,
       required: ['applicationId', 'historyId', 'generation', 'point', 'controlRevision', 'materializationRevision'],
@@ -81,6 +87,51 @@ describe('local application tool revisions and bounded changes', () => {
     await expect(tools.call('command', { name: 'say', input: 'foreign', operationId: 'foreign',
       basedOn: { ...basedOn, historyId: 'another-history' } })).rejects.toThrow('APPLICATION_TOOL_REVISION_SCOPE_MISMATCH')
     expect(await a.operations.get('foreign')).toBeNull()
+  })
+
+  it('scopes duplicate operation IDs by original author and reapplies vanished-author work as the current device', async () => {
+    const f = await fixture(), tools = createApplicationTools(f.b), originalAuthor = f.a.deviceId
+    const link = await connectApplications(f.a, f.b)
+    await post(f.a, 'collision'); await link.synchronize()
+    const base = await f.b.recoveryPoint()
+    await post(f.b, 'collision'); await post(f.a, 'other-abandoned'); await link.synchronize()
+    const local = await tools.call('operation', { operationId: 'collision' })
+    const remote = await tools.call('operation', { operationId: 'collision', author: originalAuthor })
+    expect(local).toMatchObject({ attempt: { payload: { header: { author: f.b.deviceId } } } })
+    expect(remote).toMatchObject({ attempt: { payload: { header: { author: originalAuthor } } } })
+    await link.close(); await f.recover(base)
+    const recovered = await connectApplications(f.a, f.b)
+    await recovered.synchronize()
+    const retained = await f.b.operations.wait('collision', { author: originalAuthor })
+    expect(await tools.call('wait', { operationId: 'collision', author: originalAuthor })).toEqual(retained)
+    expect(retained.author).toBe(originalAuthor)
+    await expect(tools.call('wait', { operationId: 'collision' })).rejects.toMatchObject({ operation: { status: 'abandoned' } })
+    expect(await f.b.waitForCoverage(retained, { signal: AbortSignal.timeout(5000) })).not.toHaveLength(0)
+    await recovered.close(); await f.a.close()
+    const abandoned = await f.b.operations.inspect('other-abandoned', { author: originalAuthor })
+    expect(await tools.call('operation', { operationId: 'other-abandoned' })).toBeNull()
+    expect(await tools.call('operation', { operationId: 'other-abandoned', author: originalAuthor })).toEqual(abandoned)
+    await expect(tools.call('wait', { operationId: 'other-abandoned', author: originalAuthor }))
+      .rejects.toMatchObject({ operation: { status: 'abandoned', attemptId: abandoned!.attempt.id } })
+    const basedOn = (await f.b.query('messages', null)).revision
+    await tools.call('reapply', { name: 'say', input: 'Reviewed after recovery', operationId: 'reapplied-by-b',
+      originalOperationId: 'other-abandoned', originalAuthor, basedOn })
+    expect(await tools.call('wait', { operationId: 'reapplied-by-b' })).toMatchObject({ status: 'applied', author: f.b.deviceId })
+    expect((await f.b.operations.inspect('reapplied-by-b'))!.attempt.payload.header).toMatchObject({
+      author: f.b.deviceId, reapplyOf: abandoned!.attempt.id, basedOn,
+    })
+    await expect(tools.call('retry', { operationId: 'other-abandoned', author: originalAuthor })).rejects.toThrow('APPLICATION_TOOL_INPUT_INVALID')
+  })
+
+  it('rejects malformed explicit authors before reading or creating an operation', async () => {
+    const { a } = await fixture(), tools = createApplicationTools(a)
+    for (const author of [null, 1, '', 'ff', 'GG'.repeat(32)]) {
+      await expect(tools.call('operation', { operationId: 'missing', author })).rejects.toThrow('APPLICATION_TOOL_INPUT_INVALID')
+      await expect(tools.call('wait', { operationId: 'missing', author })).rejects.toThrow('APPLICATION_TOOL_INPUT_INVALID')
+      await expect(tools.call('reapply', { name: 'say', input: 'invalid', operationId: 'new', originalOperationId: 'missing', originalAuthor: author }))
+        .rejects.toThrow('APPLICATION_TOOL_INPUT_INVALID')
+    }
+    expect(await a.operations.get('new')).toBeNull()
   })
 
   it('returns the current coherent revision and bounds an unchanged observation without a replay queue', async () => {

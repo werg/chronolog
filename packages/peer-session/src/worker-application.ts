@@ -128,7 +128,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'query': return session.query(args[0] as string, args[1] as never)
       case 'operation.get': return session.operations.get(args[0] as string, args[1] as { author?: string })
       case 'operation.inspect': return session.operations.inspect(args[0] as string, args[1] as { author?: string })
-      case 'operation.wait': return session.operations.wait(args[0] as string, { signal })
+      case 'operation.wait': return session.operations.wait(args[0] as string, { ...args[1] as { author?: string }, signal })
       case 'operation.shared': return session.waitForCoverage(await session.operations.wait(args[0] as string, { signal }), { signal })
       case 'retry': return session.retry(args[0] as string)
       case 'resume': return session.resume()
@@ -275,7 +275,10 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   readonly operations = {
     get: (id: string, options: { readonly author?: string } = {}): Promise<OperationState | null> => this.#call('operation.get', [id, options]),
     inspect: (id: string, options: { readonly author?: string } = {}): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null> => this.#call('operation.inspect', [id, options]),
-    wait: (id: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => this.#call('operation.wait', [id], options.signal, true),
+    wait: (id: string, options: { readonly author?: string; readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => {
+      const { signal, ...scope } = options
+      return this.#call('operation.wait', [id, scope], signal, true)
+    },
   }
   readonly recovery = {
     inspect: (): Promise<readonly ApplicationTransition[]> => this.#call('recovery.inspect', []),

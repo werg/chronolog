@@ -102,7 +102,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly operations: {
     get(operationId: string, options?: { readonly author?: string }): Promise<OperationState | null>
     inspect(operationId: string, options?: { readonly author?: string }): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null>
-    wait(operationId: string, options?: { readonly signal?: AbortSignal }): Promise<AppliedResult>
+    wait(operationId: string, options?: { readonly author?: string; readonly signal?: AbortSignal }): Promise<AppliedResult>
   }
   readonly #replica: PeerReplica
   readonly #store: BytesStore
@@ -149,7 +149,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const state = await replica.operation(operationId, options.author), attempt = await replica.attempt(operationId, options.author)
         return state === null || attempt === null ? null : { state, attempt }
       },
-      wait: (operationId: string, waitOptions: { readonly signal?: AbortSignal } = {}) => this.waitFor(operationId, waitOptions) })
+      wait: (operationId: string, waitOptions: { readonly author?: string; readonly signal?: AbortSignal } = {}) => this.waitFor(operationId, waitOptions) })
   }
 
   get signal(): AbortSignal { return this.#lifetime.signal }
@@ -329,10 +329,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     for (const attempt of await this.#replica.pendingAttempts()) await this.retry(attempt.payload.header.operationId)
   }
 
-  async waitFor(operationId: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> {
+  async waitFor(operationId: string, options: { readonly author?: string; readonly signal?: AbortSignal } = {}): Promise<AppliedResult> {
     return waitFor(this.#replica, this.#lifetime.signal, options.signal, async () => {
       if (!this.#replica.ready) return undefined
-      const current = await this.#replica.operation(operationId)
+      const current = await this.#replica.operation(operationId, options.author)
       if (current?.status === 'applied') return current
       if (current?.status === 'abandoned' || current?.status === 'needsReapply') throw new AbandonedOperationError(current)
       if (current === null) throw new Error('APPLICATION_OPERATION_NOT_FOUND')
@@ -343,7 +343,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async waitForCoverage(applied: AppliedResult, options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> {
     return waitFor(this.#replica, this.#lifetime.signal, options.signal, async () => {
       if (!this.#replica.ready) return undefined
-      const current = await this.#replica.operation(applied.operationId)
+      const current = await this.#replica.operation(applied.operationId, applied.author)
       if (current?.status === 'abandoned' || current?.status === 'needsReapply') throw new AbandonedOperationError(current)
       const commands = await this.#replica.exportCommands()
       const command = commands.find(value => value.attempt.id === applied.attemptId)

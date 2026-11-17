@@ -66,6 +66,19 @@ async function facade(session: ApplicationSession, host?: ApplicationControlHost
 }
 
 describe('owned browser application facade', () => {
+  it('waits for the specified author when different peers reuse an operation ID', async () => {
+    const f = await fixture(), link = await connectApplications(f.a, f.b)
+    cleanup.push(() => link.close())
+    const { client } = await facade(f.a)
+    const own = await (await client.command('say', 'page author', { operationId: 'same-id' })).applied()
+    const other = await (await f.b.command('say', 'other author', { operationId: 'same-id' })).applied()
+    await link.synchronize()
+    expect(await client.operations.wait('same-id')).toEqual(own)
+    expect(await client.operations.wait('same-id', { author: f.b.deviceId })).toEqual(other)
+    expect((await client.operations.inspect('same-id', { author: f.b.deviceId }))?.state).toEqual(other)
+    expect(own.attemptId).not.toBe(other.attemptId)
+  })
+
   it('reads and observes durable projections without moving reducers or storage to the page', async () => {
     const f = await fixture(), reduce = vi.fn((count: number) => count + 1)
     f.a.project({ id: 'message-count', version: '1', topics: ['message'], initial: 0, reduce })

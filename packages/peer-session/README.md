@@ -574,6 +574,15 @@ validated before use. A revision guard does not replace domain transaction guard
 The tools share operation inspection, exact retry, wait, recovery inspection and
 explicit reapplication. A host port enables the takeover tool.
 
+`operation` and `wait` accept an optional `author` public key; omitting it selects
+this device's operation. Operation IDs are scoped to their actual signer, so
+another participant can use the same ID without changing which command is read.
+`reapply` accepts `originalAuthor` to identify another participant's retained
+abandoned work. The replacement is signed by the current device under its
+current permissions and links to the original attempt. `retry` remains scoped
+to this device's exact saved bytes. Native and Worker `operations.wait(id,
+{ author, signal })` use the same author scope.
+
 `changes({ after?, waitMs? })` observes at most one coalesced coherent change from
 `session.changes()`. Without `after` it returns the current ready revision; with
 an unchanged revision it waits for at most `waitMs` (0 by default, maximum 30,000

@@ -82,13 +82,13 @@ export function createApplicationTools(session: ApplicationSession, options: { r
     { name: 'describe', description: 'Inspect authenticated application definitions, current role and supported guarantees.', inputSchema: object({}) },
     { name: 'query', description: 'Execute a declared query against one coherent captured application revision.', inputSchema: entries('queries', {}) },
     { name: 'command', description: 'Save one signed command under a caller-owned operation ID, optionally guarded by a captured revision. Returns saved or currently applied state.', inputSchema: entries('commands', { operationId, basedOn: revisionSchema }, ['operationId']) },
-    { name: 'operation', description: 'Inspect saved attempt bytes, current outcome and explicit reapplication linkage.', inputSchema: object({ operationId }) },
-    { name: 'retry', description: 'Retry the exact saved command. Never recreates an abandoned operation.', inputSchema: object({ operationId }) },
-    { name: 'wait', description: 'Wait for the current applied result. Cancellation only cancels this wait.', inputSchema: object({ operationId }) },
+    { name: 'operation', description: 'Inspect saved attempt bytes, current outcome and explicit reapplication linkage. Author defaults to this device; specify the original signer to inspect another participant\'s retained work.', inputSchema: object({ operationId, author: digestSchema }, ['operationId']) },
+    { name: 'retry', description: 'Retry this device\'s exact saved command. Never recreates an abandoned operation.', inputSchema: object({ operationId }) },
+    { name: 'wait', description: 'Wait for the current applied result of this device or an explicit original author. Cancellation only cancels this wait.', inputSchema: object({ operationId, author: digestSchema }, ['operationId']) },
     { name: 'changes', description: 'Observe one coalesced coherent revision, optionally waiting after a captured revision. A generation change requires a reread; this is not an event replay cursor.',
       inputSchema: object({ after: revisionSchema, waitMs: { type: 'integer', minimum: 0, maximum: 30_000, default: 0 } }, []) },
     { name: 'recoveries', description: 'Inspect generation recovery notices and preserved abandoned operations.', inputSchema: object({}) },
-    { name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment, optionally guarded by a captured revision.', inputSchema: entries('commands', { operationId, originalOperationId: operationId, basedOn: revisionSchema }, ['operationId', 'originalOperationId']) },
+    { name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment, optionally guarded by a captured revision. Specify originalAuthor for another participant\'s work; the new command is always signed by this device.', inputSchema: entries('commands', { operationId, originalOperationId: operationId, originalAuthor: digestSchema, basedOn: revisionSchema }, ['operationId', 'originalOperationId']) },
     ...(options.host === undefined ? [] : [{ name: 'takeover', description: 'Select this eligible device\'s complete recovery point through the hosted authority; may abandon a recent suffix.', inputSchema: object({ transitionId: { type: 'string', minLength: 1, maxLength: 128 } }) }]),
   ]
   return {
@@ -99,6 +99,12 @@ export function createApplicationTools(session: ApplicationSession, options: { r
         if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new Error('APPLICATION_TOOL_INPUT_INVALID')
         const value = input as Record<string, unknown>
         const text = (key: string): string => { if (typeof value[key] !== 'string') throw new Error('APPLICATION_TOOL_INPUT_INVALID'); return value[key] }
+        const author = (key: string): string | undefined => {
+          if (value[key] === undefined) return undefined
+          const identity = text(key)
+          if (!/^[0-9a-f]{64}$/u.test(identity)) throw new Error('APPLICATION_TOOL_INPUT_INVALID')
+          return identity
+        }
         const fields = (...keys: string[]): void => { if (Object.keys(value).some(key => !keys.includes(key))) throw new Error('APPLICATION_TOOL_INPUT_INVALID') }
         switch (name) {
           case 'describe': fields(); return { definition: description, status: session.status }
@@ -110,15 +116,25 @@ export function createApplicationTools(session: ApplicationSession, options: { r
               ...(basedOn === undefined ? {} : { basedOn }) })
             return operation.get()
           }
-          case 'operation': fields('operationId'); return session.operations.inspect(text('operationId'))
+          case 'operation': {
+            fields('operationId', 'author')
+            const signer = author('author')
+            return session.operations.inspect(text('operationId'), signer === undefined ? {} : { author: signer })
+          }
           case 'retry': fields('operationId'); await session.retry(text('operationId')); return session.operations.get(text('operationId'))
-          case 'wait': fields('operationId'); return session.operations.wait(text('operationId'), callOptions)
+          case 'wait': {
+            fields('operationId', 'author')
+            const signer = author('author')
+            return session.operations.wait(text('operationId'), { signal, ...(signer === undefined ? {} : { author: signer }) })
+          }
           case 'changes': fields('after', 'waitMs'); return observeChange(session, inputRevision(session, value.after), value.waitMs === undefined ? 0 : value.waitMs, signal)
           case 'recoveries': fields(); return session.inspectRecovery()
           case 'reapply': {
-            fields('name', 'input', 'operationId', 'originalOperationId', 'basedOn')
+            fields('name', 'input', 'operationId', 'originalOperationId', 'originalAuthor', 'basedOn')
             const basedOn = inputRevision(session, value.basedOn)
+            const originalAuthor = author('originalAuthor')
             const operation = await session.reapply(text('originalOperationId'), text('name'), value.input as never, { operationId: text('operationId'),
+              ...(originalAuthor === undefined ? {} : { originalAuthor }),
               ...(basedOn === undefined ? {} : { basedOn }) })
             return operation.get()
           }
