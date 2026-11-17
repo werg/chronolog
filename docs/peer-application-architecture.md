@@ -1,143 +1,171 @@
 # Peer application architecture
 
-Chronolog owns application data, peer authentication, live messages and finality.
-Tendriller supplies the initial page and participant administration. A resident
-Chronolog process supplies an independently reachable peer; its finality role is
-optional and selected by the signed group descriptor. Ordinary application
-traffic does not pass through a Cloudflare application API.
+The default shared-application composition uses `peer-generation-v1`. Chronolog
+owns signed commands, deterministic local execution, live signals, encrypted
+content and peer recovery. Tendriller serves the initial application and acts as
+a constrained control participant. A browser Worker and a resident native
+process use the same authenticated history rules.
 
-```mermaid
-flowchart TD
-  Host["Tendriller: page and participants"]
-  BrowserA["Browser A: owning Worker and OPFS"]
-  BrowserB["Browser B: owning Worker and OPFS"]
-  Resident["Resident Chronolog peer"]
-  Host -->|"Initial assets and compact controls"| BrowserA
-  Host -->|"Initial assets and compact controls"| BrowserB
-  BrowserA <-->|"Authenticated WebRTC"| Resident
-  BrowserB <-->|"Authenticated WebRTC"| Resident
-  BrowserA <-->|"Authenticated WebRTC"| BrowserB
-```
+The host is small in data volume, but its generation registry is an authority:
+it durably selects one successor against an expected generation. Ordinary
+collaboration continues without it; creating or changing that selection needs
+its control service. A directory entry or an open transport grants no authority.
 
-The edges show permitted connections, not a requirement for every device to
-maintain a full mesh. A resident can relay original signed records and live
-signals. The application chooses its reachable peers and ICE configuration.
+## Participants, policy and transports
 
-## Responsibilities
+A participant combines an identity, explicit protocol rights, the record types
+it handles, and durable resources it owns. The current host role is
+`controlParticipantGrant`: administrator and recovery rights, no application
+reader, writer, coordinator or data-collective membership. That is a protocol
+role, not a special all-powerful replica.
 
-| Component | Owns | Does not establish |
+| Participant | Receives and retains | May publish or select |
 | --- | --- | --- |
-| Tendriller host | Published assets, participant requests and approvals, compact signed membership state, initial resident hints | Application execution, application event delivery or finality |
-| Browser Worker | Private keys, original signed records, durable operations, local materialization, peer sessions and live signals | Permission from a display name or a successful RTC connection |
-| Resident peer | Durable replica, reachable HTTPS introduction endpoint, authenticated replication and verified relay | Finality merely by being online |
-| Configured finality service | Inclusion receipts and signed closure commitments under the group descriptor | SQL execution order or external tool authority |
-| Application effect worker | Final intent consumption and durable dispatch/reconciliation state | Exactly-once effects at a provider without idempotency or reconciliation |
+| Hosted control participant | Public application definition, signed schema, control revisions, generation selections and bounded prefix proofs | Authorized membership/control changes and compare-and-swap successor selections |
+| Browser Worker | Its private keys, authorized epoch keys, complete verified selected history, original saved commands and requested content | Commands and signals allowed by its grants; order receipts only when selected; recovery requests when eligible |
+| Resident native peer | The same application evidence in an independent durable store | The same explicitly granted actions; being continuously online adds no authority |
+| Page or local tool adapter | Captured application views, operation status, recovery notices and explicitly requested content | Validated domain commands through the owning session |
 
-The optional retained-log adapter remains an explicit deployment choice. The
-peer composition does not silently fall back to it when WebRTC is unavailable.
+Transport adapters provide delivery, framing, backpressure, size limits and
+connection lifetime. Protocol admission verifies signatures, scope, current
+rights and the relevant history rules. Keep these concerns separate: routing
+should avoid transmitting irrelevant or forbidden data, and admission must
+reject it even when a different route delivers it.
 
-## Three distinct application primitives
+The current adapters deliberately differ. Hosted controls use bounded HTTPS
+requests to a durable registry. Application sessions use authenticated WebRTC
+lanes. Both consume Chronolog's public signed structures and verification rules;
+the hosted registry does not load SQL, application callbacks or a full replica.
+Adding an adapter should not require another authority implementation.
 
-**Durable operations** append original signed proposals. Their operation IDs
-survive retries and device restart. SQL and durable events are produced by the
-same accepted change program. The client exposes local progress separately from
-final acceptance; receiving a proposal or successfully sending a network frame
-does not make it final.
+## One protocol family, explicit semantics
 
-**Live signals** use `Signals.send()` and `Signals.subscribe()` from
-`@chronolog/signals`. A signal names its scope, author, session, sequence, topic
-and expiry. The portable channel signs and verifies bounded frames without a
-database, a finality service or a durable outbox. The governed composition binds
-that channel to the currently verified topic grants. A relay keeps the original
-signed frame and author identity.
+Sharing identity, encoding, verification and transport machinery does not make
+all updates interchangeable. The receiving participant dispatches each record
+to a small handler with its own storage and consistency requirements.
 
-Subscriptions select bounded FIFO delivery with `mode: 'all'`, or explicit
-coalescing with `mode: 'latest'` for replaceable values such as typing. Live
-messages have no replay cursor. A send is one attempt; reconnect does not resend
-old signals, and an interrupted subscription is visible to its consumer.
-Expired messages are not useful history. Applications requiring durable delivery
-must publish a durable event instead.
+| Record family | Ordering and retention | Recovery meaning |
+| --- | --- | --- |
+| Application commands and durable events | Original encrypted signed attempts, ordered by the selected generation and executed deterministically | A successor may adopt an older complete prefix. Available excluded work is quarantined. |
+| Membership, key epochs and generation selection | Signed monotonic controls; controls and their activating generation commit together | Application rollback cannot restore a revoked permission or an old key epoch. |
+| Live signals | Bounded authenticated messages with expiry, no durable outbox and no replay cursor | Reconnection sends current activity; expired activity is discarded. |
+| Attachments | Immutable encrypted chunks, content commitments and complete-retention acknowledgments | Missing chunks remain visibly unavailable. Receiving a reference does not claim retention. |
+| Application definition and SQL initializer | Public schemas and exact initializer bytes authenticated by the descriptor and schema signature | Ordinary commands cannot replace the definition, execution profile, schema or ownership policy. |
 
-**Final effects** consume final durable intents. A resident can run effect and
-timer tasks independently of the device that authored an intent. An effect
-worker records dispatch and reconciliation state and uses a stable provider
-idempotency key where supported. A signal, a provisional event, and a signed
-record are not themselves authorization to perform an external action.
+Application code declares domain commands, input schemas and queries once.
+Hosted metadata and local tools consume the same validated public description
+and digest. The executing session validates inputs and turns a command into its
+change program. The host does not execute the domain callback.
 
-## Public composition and ownership
+## Authority and ownership
 
-Governed `BrowserPeer` and the SQL-free `BrowserEventPeer` expose `signals` and
-`connectPeer({ connection, peerIdentity? })`. The connection method owns the
-reader-authenticated handshake, replication attachment, live routes and cleanup.
-Native applications receive the same composition through `context.signals` and
-`context.connectPeer`. They do not write fixture-specific frame forwarding loops.
+The descriptor pins the application/history identity, control key, definition,
+execution manifest and schema authority. A signed generation delegates ordering
+to an eligible reader. Delegation does not authorize that reader to impersonate
+an author or edit another owner's rows.
 
-The low-level browser configuration that supplies its own `node` policy has no
-implicit capability resolver. It can supply an explicit `SignalChannel` through
-`configuration.signals`, with its own authorization and routes. Without that
-channel, accessing `signals` fails with `PEER_GOVERNANCE_REQUIRED`. Its
-`connectPeer` method requires governance; an application choosing the low-level
-mode owns its connection composition explicitly.
+Shared SQL rows belong to the application collective. Its membership is derived
+from verified control revisions, independently of which device coordinates.
+Replay uses historical controls for inherited commands and current controls for
+new commands. Restrictive controls remain effective when application state rolls
+back. Protected schema, ownership and policy changes cannot travel as ordinary
+lossy edits.
 
-The page uses the ordinary `ChronologClient`. Its `client.signals` crosses the
-existing bounded Worker RPC boundary. A Tendriller page installs that port with
-`tendril.signals.install(client.signals)`, independently of the durable
-application backend. Installed, connected, authenticated, caught up and final
-are separate states.
-
-A browser peer can open before enrollment, and a reader can receive without a
-writer grant. Sending selects and checks the current eligible topic grant when
-the operation occurs. Reader and publisher permission are checked again across
-asynchronous work; closing or replacing a session fences its late completions.
-These checks use the replica's verified membership knowledge. They do not claim
-instantaneous revocation knowledge across a partition.
+Device signing keys and retained epoch keys belong to the Worker or native
+device owner. A newly granted reader requests missing keys from a current data
+peer using a signed, generation-bound request and a fresh ephemeral HPKE
+receiver. The reply is encrypted for that receiver and checked against the
+authenticated epoch commitments before durable installation. The host has no
+parallel key-delivery store. Reader enrollment, writer authority, coordination
+eligibility and recovery permission remain distinct rights.
 
 ## Cold start and quiet steady state
 
-1. The host serves the page with immutable assets and an initial resident URL
-   snapshot. Serving fresh HTML refreshes those hints without a separate
-   background bootstrap request.
-2. An enrolled device verifies compact membership controls and obtains the keys
-   needed to authenticate. This does not mark application history applied.
-3. An HTTPS request exchanges the WebRTC introduction with a reachable resident.
-   ICE establishes the selected direct or relay route. The introduction request
-   is then finished.
-4. Chronolog authenticates the reader and exchanges original records, evidence,
-   detached bodies and live signals over the peer connection.
-5. A session supervisor observes the owned connection lifetime. Failure starts
-   bounded reconnect attempts; a healthy connection needs no host polling or
-   application keepalive timer. Reconnecting resumes durable synchronization,
-   not expired live messages.
+1. Tendriller serves the page, public application description and initial routing
+   hints. The initial asset delivery is separate from application replication.
+2. The owning Worker or native device opens exclusive storage, verifies the
+   pinned descriptor and control chain, and obtains its authorized epoch keys.
+3. An introduction exchanges the transport offer with a reachable peer. The
+   application session authenticates the peer independently of that offer.
+4. Peers exchange original command evidence, bounded captured history ranges,
+   live signals and requested content. The host receives no application bodies.
+5. Explicit lifecycle actions refresh controls or routing when needed. Healthy
+   application sessions require no host polling or application keepalive timer.
 
-WebRTC's own ICE/transport maintenance can still use the configured network
-services. A measured direct connection is different from a TURN relay. Browser
-suspension, NAT traversal and unreachable residents remain deployment concerns;
-the runtime reports observed routes instead of inferring them from configuration.
+A cold device may need the host to discover and enroll. A connected pair can
+continue authorized collaboration while host access is blocked. A device cannot
+know a revocation or successor it has not yet received; reconnect verifies new
+control evidence and reconciles the selected history instead of pretending that
+a partition provided instantaneous global revocation.
 
-## Compact membership and independent finality
+## Outcomes, recovery and retention
 
-The signed-inclusion-v2 closure commits a cumulative control count and root. A
-thin administrator retains original governance controls and the certificate
-that covers them; it does not retain application descriptors or bodies. Partial
-pages are staged within explicit bounds and do not activate grants or persist a
-verified checkpoint until the authenticated commitment matches. Synchronization
-pins the target it first authenticated, so concurrent application traffic cannot
-move that target indefinitely.
+A saved command has durable original bytes and an operation identity. Applied
+means the selected history produced an accepted or rejected execution result;
+shared means another storage owner acknowledged a retained prefix. Neither word
+promises irreversible finality.
 
-A full replica separately checks the control projection against its complete
-receipt history. It still needs original peer history to establish the captured
-application frontier. Control receipt progress, verified control progress,
-application receipts, checkpoints and closed author time are distinct.
+A captured view binds commands to the generation and history point the caller
+observed. A recovery switches SQL, effective events, outcomes and view revision
+together. Excluded views cause an explicit reread/reset condition. Quarantined
+work is never automatically resubmitted. Deliberate reapplication creates a new
+attempt under current authority and freshly evaluated domain guards.
 
-The canonical native finality service opens from the verified enrollment
-descriptor and derives its timing policy from signed genesis. A resident that
-does not hold the configured finality identity exposes `context.finality` as
-`null`. Live authorized connections can continue while coordinated finality is
-unavailable; new coordinated final decisions wait for the service to return.
+A successor adopts a prefix of the currently selected history. Once that choice
+excludes an old suffix, a later successor cannot resurrect it, even when the old
+records carry valid signatures. The same `PeerAuthority` verifier enforces this
+rule in browser, native and hosted control runtimes.
 
-See [compact proof semantics](membership-control-proofs.md),
-[portable peer history](portable-peers.md),
-[resident lifecycle and effects](../packages/agent-service/README.md), and
-[WebRTC transport](../packages/transport-webrtc/README.md) for the implementation
-contracts. The prerelease protocols are replaced directly; there is no migration
-or compatibility layer for the retired host framing or live-signal APIs.
+Retain complete replayable evidence initially. A SQL cache, an advertised last
+seen time or a signed checkpoint without its original bodies is not a recovery
+source. Prompt replication aims for an independently stored complete prefix;
+reports distinguish known abandoned work from unknown loss.
+
+`peer-generation-v1` does not expose `final()` or automatically dispatch
+irreversible external effects. Stronger Chronolog profiles remain explicit
+compositions with different guarantees; their finality is not inferred from an
+ordinary peer-session result.
+
+## Extending the same machinery to code and page updates
+
+The protocol boundaries above support a useful next step: immutable code/assets
+in the content layer, a signed release record naming their digests, and live
+signals for transient editing/preview activity. That would let a hosting
+participant subscribe to approved releases and materialize the page assets it
+serves, while ignoring ordinary application commands.
+
+This is an extension direction, not a claim that the current publishing service
+has already moved into Chronolog. A release protocol needs explicit publisher
+rights, monotonic release selection, content availability and activation rules.
+Approving a release and executing its JavaScript are separate decisions. An
+application-data recovery must not silently downgrade its code or restore a
+revoked publisher.
+
+The current descriptor pins the application definition and execution profile.
+Changing either requires an explicit supported history/version boundary; a page
+cannot reinterpret retained commands with arbitrary new code. The initial
+verifier and trust root also need a bootstrap channel before peer content can be
+authenticated. HTTP can continue serving that small shell even when subsequent
+release exchange shares Chronolog's content and control mechanisms.
+
+Prefer these concrete record families and handlers over an extensible framework
+of transport-specific authorization callbacks. Add the shared abstraction where
+two real consumers need it, with policy enforcement at the protocol boundary.
+
+## Qualification
+
+Meaningful evidence includes signed recovery model traces, encrypted deterministic
+replay, restrictive controls surviving rollback, lost durable acknowledgments,
+interrupted tails, independent storage, packed public consumers and real RTC
+connections. Browser qualification additionally exercises the owning Worker,
+OPFS, competing storage owners and reload.
+
+Loopback and local workerd runs establish those measured paths only. Internet
+connectivity, TURN deployment, browser suspension, provider cost and a sustained
+production operating envelope need separate measurements. Do not infer them
+from an installed backend or a successful simulated connection.
+
+See [peer-generation authority](peer-generation-v1.md),
+[the public application session](../packages/peer-session/README.md),
+[portable history](portable-peers.md) and
+[WebRTC transport](../packages/transport-webrtc/README.md).
