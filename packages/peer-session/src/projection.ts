@@ -1,34 +1,13 @@
 import type { BytesStore } from '@chronolog/records'
 import { decodePeerValue, encodePeerValue, samePeerValue, validatePeerRevision, type PeerRevision } from '@chronolog/peer-generation'
 import { assertEventTopic, canonicalJson, type EventPayload } from '@chronolog/protocol'
-import { APPLICATION_EVENT_CURSOR_LIMIT, RecoveredViewError, type ApplicationChange, type ApplicationEvent, type ApplicationReadView } from './session.js'
+import { APPLICATION_EVENT_CURSOR_LIMIT, type ApplicationChange, type ApplicationReadView } from './session-types.js'
+import { RecoveredViewError } from './errors.js'
 import { awaitOwnedTask } from './lifetime.js'
 
-export const APPLICATION_PROJECTION_LIMITS = Object.freeze({ active: 8, pending: 8, stateBytes: 524_288, checkpointBytes: 2_097_152 })
+export * from './projection-types.js'
+import { APPLICATION_PROJECTION_LIMITS, type ApplicationProjectionDefinition, type ApplicationProjectionHandle, type ApplicationProjectionSnapshot, type ApplicationProjectionReset } from './projection-types.js'
 
-/** A local derived view. Reducers may replay after recovery and must have no external effects. */
-export interface ApplicationProjectionDefinition<State extends EventPayload> {
-  readonly id: string
-  readonly version: string
-  readonly topics?: readonly string[]
-  readonly initial: State
-  readonly reduce: (state: State, event: ApplicationEvent) => State
-}
-export interface ApplicationProjectionReset {
-  readonly reason: 'recovery' | 'definition'
-  readonly previousRevision: PeerRevision
-}
-export interface ApplicationProjectionSnapshot<State extends EventPayload = EventPayload> {
-  readonly revision: PeerRevision
-  readonly state: State
-  readonly reset: ApplicationProjectionReset | null
-}
-export interface ApplicationProjectionHandle<State extends EventPayload = EventPayload> {
-  readonly id: string
-  read(options?: { readonly signal?: AbortSignal }): Promise<ApplicationProjectionSnapshot<State>>
-  changes(options?: { readonly signal?: AbortSignal }): AsyncIterable<ApplicationProjectionSnapshot<State>>
-  close(): Promise<void>
-}
 interface ProjectionSource {
   readonly applicationId: string
   readonly historyId: string

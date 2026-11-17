@@ -43,11 +43,15 @@ async function fixture(initialMembers = [0, 1, 2]) {
       requester: identity.publicKey, controlRevision: 0, base, transitionId, reason: base === null ? 'create' : 'takeover' }, identity))
   }
   await select(devices[0]!.identity, null, 'create')
-  const open = async (index: number, seedKeys = true) => {
+  const openCold = async (index: number, seedKeys = true) => {
     const app = await openPeerApplication({ device: devices[index]!, authority: await registry.read(), definition, ...(seedKeys ? { epochKeys } : {}) })
     cleanup.push(() => app.close()); return app
   }
-  return { devices, open, select, registry, key, directory, host }
+  const open = async (...args: Parameters<typeof openCold>) => {
+    const session = await openCold(...args)
+    await session.keys.missing(); return session
+  }
+  return { devices, open, openCold, select, registry, key, directory, host }
 }
 
 function pair(): readonly [FramedPeerConnection, FramedPeerConnection] {
@@ -116,9 +120,9 @@ describe('authenticated application transport', () => {
     const b = await f.open(1, false), phases: string[] = []
     cleanup.push(b.onStatus(status => { phases.push(status.phase) }))
     expect(b.status.phase).toBe('awaiting-keys')
-    expect(b.keys.missing()).toEqual([0])
+    expect(await b.keys.missing()).toEqual([0])
     const links = await connect(a, b)
-    expect(b.keys.missing()).toEqual([])
+    expect(await b.keys.missing()).toEqual([])
     expect(b.status.phase).toBe('ready')
     expect((await b.query('messages', null)).value.events).toHaveLength(1)
     const operation = await b.command('say', 'after enrollment', { operationId: 'enrolled' })
@@ -130,7 +134,7 @@ describe('authenticated application transport', () => {
     const reopened = await openPeerApplication({ device, authority: await f.registry.read(), definition })
     cleanup.push(() => reopened.close())
     expect(reopened.deviceId).toBe(identity)
-    expect(reopened.keys.missing()).toEqual([])
+    expect(await reopened.keys.missing()).toEqual([])
     expect((await reopened.query('messages', null)).value.events).toHaveLength(2)
     expect(await reopened.operations.get('enrolled')).toMatchObject({ status: 'applied', outcome: 'accepted' })
     expect(phases[0]).toBe('awaiting-keys')
@@ -186,7 +190,7 @@ describe('authenticated application transport', () => {
     expect((await c.query('messages', null)).value.events).toHaveLength(1)
     const oldLink = await connectApplications(a, c)
     cleanup.push(() => oldLink.close())
-    expect(a.revision.generation).toBe(c.revision.generation)
+    expect(a.revision!.generation).toBe(c.revision!.generation)
   })
 
   it('resumes encrypted content over bounded peer chunks without changing application history', async () => {
@@ -330,8 +334,8 @@ describe('authenticated application transport', () => {
       if (value.kind === 'response' && Array.isArray(value.message?.payload)) { pageSizes.push(value.message.payload.length); responseBytes.push(bytes) }
     })
     await connect(a, b, [left, channels[1]])
-    expect(b.revision.point).toEqual(a.revision.point)
-    expect(b.revision.point.sequence).toBe(65)
+    expect(b.revision!.point).toEqual(a.revision!.point)
+    expect(b.revision!.point.sequence).toBe(65)
     expect(pageSizes).toEqual([32, 32, 1])
     expect(Math.max(...pageSizes)).toBeLessThanOrEqual(32)
     expect(Math.max(...responseBytes)).toBeLessThanOrEqual(4 * 1024 * 1024)
@@ -345,7 +349,7 @@ describe('authenticated application transport', () => {
     const left = intercept(channels[0], a.deviceId, value => {
       const state = value.message?.payload
       if (value.kind === 'response' && value.message !== undefined && state !== null && typeof state === 'object' && 'authority' in state && 'revision' in state) {
-        const revision = a.revision
+        const revision = a.revision!
         expect(state.revision).toEqual(revision)
         // The authenticated head is a transfer target, not retained evidence.
         // Stop before a page arrives; the real 65-command case checks completion.
@@ -372,7 +376,7 @@ describe('authenticated application transport', () => {
       controller.abort(new Error('cancel before a retained page'))
       const results = await opening
       expect(results[1]).toMatchObject({ status: 'rejected', reason: expect.objectContaining({ message: 'cancel before a retained page' }) })
-      expect(b.revision.point.sequence).toBe(0)
+      expect(b.revision!.point.sequence).toBe(0)
     } finally {
       controller.abort(); release.resolve()
       await Promise.all(channels.map(channel => channel.close()))

@@ -15,6 +15,8 @@ export interface ApplicationPeerAdvertisement {
   readonly identity: string
   readonly storageId: string
   readonly generation: string
+  /** Durable availability is separate from a live authenticated participant. */
+  readonly data: boolean
   readonly point: HistoryPoint | null
 }
 export interface ApplicationDiscoveryPort {
@@ -55,7 +57,7 @@ export interface ApplicationRecoveryProposal {
   readonly ageMs: number | null
 }
 export interface ApplicationParticipationStatus {
-  readonly phase: 'connecting' | 'following' | 'coordinating' | 'recovering' | 'approval-required' | 'unavailable' | 'closed'
+  readonly phase: 'connecting' | 'connected' | 'following' | 'coordinating' | 'recovering' | 'approval-required' | 'unavailable' | 'closed'
   readonly connectedPeers: readonly string[]
   readonly recovery: ApplicationRecoveryProposal | null
   readonly error: string | null

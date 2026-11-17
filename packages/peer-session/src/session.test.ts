@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createGenerationRegistry, createPeerIdentity, MemoryBytesStore, signApplicationDescriptor,
-  signControlRevision, signTransitionRequest, participantGrant, bytesDigest, peerDigest, type PeerIdentity, type PrefixProof,
+  signControlRevision, signTransitionRequest, participantGrant, bytesDigest, peerDigest, type PeerIdentity, type PrefixProof, type AuthorityBundle,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -46,9 +46,9 @@ async function fixture() {
       requester: identity.publicKey, controlRevision: 0, base, transitionId, reason: base === null ? 'create' : 'takeover' }, identity))
   }
   await select(a.identity, null, 'create')
-  const open = async (device: typeof a) => {
-    const session = await openNativeApplication({ device, authority: await registry.read(), epochKeys, definition })
-    cleanup.push(() => session.close()); return session
+  const open = async (device: typeof a, options: { readonly data?: boolean; readonly authority?: AuthorityBundle } = {}) => {
+    const session = await openNativeApplication({ device, authority: options.authority ?? await registry.read(), epochKeys, definition })
+    cleanup.push(() => session.close()); if (options.data !== false) await session.keys.missing(); return session
   }
   return { a, b, c, directory, registry, select, open, host }
 }
@@ -132,7 +132,7 @@ describe('public peer application sessions', () => {
     expect(() => current.readEvents({ cursor: old.value.cursor })).toThrow(RecoveredViewError); current.release()
     expect((await a.query('messages', null)).value.events).toHaveLength(1)
     const prior = await a.operations.inspect('tail')
-    const retried = await a.reapply('tail', 'say', 'tail reviewed', { operationId: 'tail-again', basedOn: a.revision })
+    const retried = await a.reapply('tail', 'say', 'tail reviewed', { operationId: 'tail-again', basedOn: a.revision! })
     expect((await retried.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
     expect((await a.operations.inspect('tail-again'))?.attempt.payload.header.reapplyOf).toBe(prior?.attempt.id)
     expect((await a.operations.get('tail'))?.status).toBe('abandoned')
@@ -148,6 +148,18 @@ describe('public peer application sessions', () => {
     expect(reopened.deviceId).toBe(publicKey)
     expect((await reopened.operations.get('saved'))?.status).toBe('applied')
     expect((await reopened.query('messages', null)).value.events).toHaveLength(1)
+  })
+
+  it('retains recovered authority in protocol metadata before reopening without data', async () => {
+    const f = await fixture(), initial = await f.registry.read(), b = await f.open(f.b)
+    const host = { application: () => f.registry.read(), selectGeneration: (request: Parameters<typeof f.registry.select>[0]) => f.registry.select(request) }
+    await b.recovery.takeover(host, { transitionId: 'metadata-anchor' })
+    const selected = (await f.registry.read()).generations.at(-1)!.id
+    expect(selected).not.toBe(initial.generations.at(-1)!.id)
+    await b.close()
+    const reopened = await f.open(await openNativeDevice({ path: join(f.directory, 'b.sqlite') }), { data: false, authority: initial })
+    expect(reopened.status).toMatchObject({ database: 'idle', generation: selected, coordinator: reopened.deviceId })
+    expect(reopened.revision).toBeNull()
   })
 
   it('seeds a fresh peer with the selected inherited prefix before its application view is ready', async () => {
@@ -201,7 +213,7 @@ describe('public peer application sessions', () => {
     await applied(a, 'excluded tail', 'tail')
     const reopened = await f.open(await openNativeDevice({ path: join(f.directory, 'b.sqlite') }))
     await reopened.recovery.takeover(host, { transitionId: 'recover-once' })
-    expect((await reopened.recovery.inspect())[0]).toMatchObject({ request: original, selected: reopened.revision.generation })
+    expect((await reopened.recovery.inspect())[0]).toMatchObject({ request: original, selected: reopened.revision!.generation })
     expect((await f.registry.read()).generations).toHaveLength(2)
     const recovered = await connectApplications(a, reopened)
     cleanup.push(() => recovered.close())
@@ -256,7 +268,7 @@ describe('public peer application sessions', () => {
     const reopened = await f.open(await openNativeDevice({ path: join(f.directory, 'b.sqlite') }))
     await reopened.recovery.takeover(host, { transitionId: 'ancestor-once', expected })
     expect(requests).toEqual([original, original])
-    expect((await reopened.recovery.inspect())[0]).toMatchObject({ request: original, selected: reopened.revision.generation })
+    expect((await reopened.recovery.inspect())[0]).toMatchObject({ request: original, selected: reopened.revision!.generation })
     expect((await f.registry.read()).generations).toHaveLength(4)
     const resumed = await reopened.project(projectionDefinition).read()
     expect(resumed.state).toEqual(['retained'])
@@ -280,7 +292,7 @@ describe('public peer application sessions', () => {
       grants: previous.payload.grants.map(grant => grant.publicKey === b.deviceId ? { ...grant, [permission]: false } : grant),
     }, f.host)
     await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: bundle.descriptor.payload.profile,
-      policy: bundle.descriptor.payload.policy, expectedGeneration: a.revision.generation, requester: a.deviceId,
+      policy: bundle.descriptor.payload.policy, expectedGeneration: a.revision!.generation, requester: a.deviceId,
       coordinator: a.deviceId, controlRevision: 1, reason: 'control-change', transitionId: `revoke-${permission}`,
       base: await a.recoveryPoint() }, f.a.identity), { control })
     const host = { application: () => f.registry.read(), selectGeneration: vi.fn((request: Parameters<typeof f.registry.select>[0]) => f.registry.select(request)) }
@@ -356,7 +368,7 @@ describe('public peer application sessions', () => {
     await expect(b.recovery.takeover(host, { transitionId: 'lost-cas' })).rejects.toBe(conflict)
     const current = (await f.registry.read()).generations.at(-1)!
     expect(current.payload.coordinator).toBe(c.deviceId)
-    expect(b.revision.generation).toBe(current.id)
+    expect(b.revision!.generation).toBe(current.id)
     expect((await b.recovery.inspect())[0]).toEqual({ request: original, selected: null, superseded: true })
     await b.close()
     const reopened = await f.open(await openNativeDevice({ path: join(f.directory, 'b.sqlite') }))
@@ -371,7 +383,7 @@ describe('public peer application sessions', () => {
       selectGeneration: async () => { throw untyped },
     }, { transitionId: 'transport-failure' })).rejects.toBe(untyped)
     expect((await reopened.recovery.inspect())[1]).toMatchObject({ selected: null, superseded: false })
-    expect(reopened.revision.generation).toBe(current.id)
+    expect(reopened.revision!.generation).toBe(current.id)
   })
 
   it('executes local agent and CLI tools through the same validated operation journal', async () => {

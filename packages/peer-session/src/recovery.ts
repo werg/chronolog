@@ -23,14 +23,8 @@ export interface ApplicationRecoveryExpectation {
   readonly point: HistoryPoint
 }
 
-/** The portable control-port conflict; adapters may preserve an equivalent typed error. */
-export class ApplicationControlConflictError extends Error {
-  readonly code = 'peer_generation_conflict' as const
-  constructor(message = 'The expected application generation is no longer selected.', options?: ErrorOptions) {
-    super(message, options)
-    this.name = 'ApplicationControlConflictError'
-  }
-}
+export { ApplicationControlConflictError } from './errors.js'
+import { ApplicationControlConflictError } from './errors.js'
 
 function isControlConflict(error: unknown): error is { readonly code: 'peer_generation_conflict' } {
   return error !== null && typeof error === 'object' && 'code' in error && error.code === 'peer_generation_conflict'
@@ -46,13 +40,15 @@ export interface ApplicationTransition {
 export class ApplicationRecovery {
   readonly #replica: PeerReplica
   readonly #store: BytesStore
+  readonly #adoptAuthority: (authority: AuthorityBundle) => Promise<void>
   readonly #signal: AbortSignal
   readonly #lifetime = new AbortController()
   readonly #key: string
   #tail: Promise<unknown> = Promise.resolve()
 
-  constructor(options: { readonly replica: PeerReplica; readonly store: BytesStore; readonly signal: AbortSignal }) {
-    this.#replica = options.replica; this.#store = options.store; this.#signal = AbortSignal.any([options.signal, this.#lifetime.signal])
+  constructor(options: { readonly replica: PeerReplica; readonly store: BytesStore; readonly signal: AbortSignal;
+    readonly adoptAuthority: (authority: AuthorityBundle) => Promise<void> }) {
+    this.#replica = options.replica; this.#store = options.store; this.#adoptAuthority = options.adoptAuthority; this.#signal = AbortSignal.any([options.signal, this.#lifetime.signal])
     this.#key = `peer-session/transitions/v1/${options.replica.descriptor.applicationId}`
   }
 
@@ -105,7 +101,7 @@ export class ApplicationRecovery {
         signal.throwIfAborted()
         await verifyAuthorityBundle(bundle, this.#replica.authority.descriptor)
         signal.throwIfAborted()
-        await this.#replica.receiveHistory(bundle, [])
+        await this.#adoptAuthority(bundle)
         signal.throwIfAborted()
         const generation = this.#replica.generation
         if (expected !== undefined && (expected.generation !== generation.id || expected.controlRevision !== generation.payload.controlRevision)) {
@@ -158,6 +154,7 @@ export class ApplicationRecovery {
         // read. It may already have published this recovery while fetching the
         // selected bundle; return that same notice without publishing a reset twice.
         // Its previous published view can precede several incomplete selections.
+        await this.#adoptAuthority(bundle)
         const notice = await this.#replica.adopt(bundle) ?? this.#replica.inspectRecovery().findLast(value =>
           value.generation === selected.id) ?? null
         signal.throwIfAborted()
@@ -180,7 +177,7 @@ export class ApplicationRecovery {
           journal[journal.indexOf(entry)] = { ...entry, superseded: true }
           await this.#store.put(this.#key, encodePeerValue(journal))
           signal.throwIfAborted()
-          await this.#replica.receiveHistory(bundle, [])
+          await this.#adoptAuthority(bundle)
         }
         throw error
       }

@@ -18,7 +18,7 @@ const output = resolve(values.output), packageRoot = join(output, 'package');
 const sqlEnabled = values['sql-native'] || values['sql-browser'];
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 const engineImport = '#chronolog-peer-native-engine';
-const entries = Object.fromEntries(['index', 'native', 'browser', 'webrtc', 'websocket', 'tendriller', ...(values['native-rtc'] ? ['webrtc-native'] : []),
+const entries = Object.fromEntries(['index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(values['native-rtc'] ? ['webrtc-native'] : []),
   ...(sqlEnabled ? ['sql'] : []), ...(values['sql-native'] ? ['sql-native'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]
   .map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
@@ -38,7 +38,7 @@ assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).e
   'The session artifact must not fetch external runtime dependencies');
 // The common SQL path and browser adapter must stay independently browser-loadable,
 // even when the same archive also contains the optional native engine.
-for (const entry of ['index', 'browser', 'webrtc', 'websocket', 'tendriller', ...(sqlEnabled ? ['sql'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]) {
+for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(sqlEnabled ? ['sql'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]) {
   const output = Object.entries(bundled.metafile.outputs).find(([, value]) => value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(output, `Missing bundled entry: ${entry}`);
   const visited = new Set();
@@ -54,6 +54,32 @@ for (const entry of ['index', 'browser', 'webrtc', 'websocket', 'tendriller', ..
     }
   };
   inspect(output[0]);
+}
+// Actual emitted module closures are the boundary: shared chunks must not make
+// passive protocol imports load database implementation or persistent data storage.
+const outputName = path => relative(packageRoot, resolve(root, path)).replaceAll('\\', '/');
+const runtimeModules = Object.fromEntries(Object.entries(bundled.metafile.outputs).map(([path, value]) => [outputName(path), {
+  inputs: Object.entries(value.inputs).filter(([, input]) => input.bytesInOutput > 0).map(([source]) => source).sort(),
+  imports: value.imports.map(input => ({ path: input.external ? input.path : outputName(input.path), kind: input.kind, external: input.external === true })),
+}]));
+const durableImplementation = path => /^(?:packages\/peer-session\/src\/(?:application-data|content|keys|projection|recovery|network-data)\.ts|packages\/peer-generation\/src\/replica\.ts|packages\/materializer\/src\/(?:runtime|events|event-store)\.ts|packages\/materializer-doltlite\/|packages\/records\/src\/(?:browser|native)\.ts)/u.test(path);
+for (const entry of ['index', 'browser', 'worker', 'tendriller', ...(sqlEnabled ? ['sql'] : [])]) {
+  const output = Object.entries(bundled.metafile.outputs).find(([, value]) => value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
+  assert(output, `Missing protocol entry: ${entry}`);
+  const visited = new Set();
+  const inspect = path => {
+    if (visited.has(path)) return;
+    visited.add(path);
+    const module = runtimeModules[path];
+    assert(module, `Missing emitted module: ${path}`);
+    for (const input of module.inputs) {
+      assert(!durableImplementation(input), `Passive ${entry} entry loads durable implementation: ${input}`);
+      if (entry === 'browser' || entry === 'tendriller') assert(!/^packages\/peer-session\/src\/(?:session|runtime|device|browser-device|network|participation|control-participant|worker-application-server)\.ts$/u.test(input),
+        `Page ${entry} entry loads participant ownership: ${input}`);
+    }
+    for (const dependency of module.imports) if (!dependency.external && dependency.kind !== 'dynamic-import') inspect(dependency.path);
+  };
+  inspect(outputName(output[0]));
 }
 const declaration = declarations(Object.values(entries));
 const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
@@ -94,7 +120,7 @@ assert.equal(git(['status', '--porcelain', '--untracked-files=all', '--', ...inp
 const sha256 = Object.fromEntries([...files].map(([path, content]) => [path, hash(content)]));
 await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: 'chronolog-peer-session-package/v1',
   repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
-  inputs, runtimeInputs, optionalNativeRtc: values['native-rtc'], sqlEngines: [
+  inputs, runtimeInputs, runtimeModules, optionalNativeRtc: values['native-rtc'], sqlEngines: [
     ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : [])], nativeEngine, sha256 }, null, 2) + '\n');
 const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],

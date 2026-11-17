@@ -97,6 +97,9 @@
       "@chronolog/materializer/manifest": [
         "packages/materializer/src/manifest.ts"
       ],
+      "@chronolog/peer-session/worker": [
+        "packages/peer-session/src/worker.ts"
+      ],
       "@chronolog/peer-generation/metadata": [
         "packages/peer-generation/src/metadata.ts"
       ]

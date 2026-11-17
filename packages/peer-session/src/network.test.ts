@@ -11,6 +11,7 @@ import { openApplicationDevice } from './device.js'
 import { openPeerApplication } from './runtime.js'
 import { createFramedPeerConnectionPair, type FramedPeerConnection } from './network.js'
 import { observePeerWire } from './network.test-helpers.js'
+import { ApplicationKeyring } from './keys.js'
 
 const definition = defineApplication({ id: 'network', version: '1', commands: {
   say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
@@ -36,11 +37,15 @@ async function fixture(options: { readerOnly?: boolean } = {}) {
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
     profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
     coordinator: a.identity.publicKey, requester: a.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, a.identity))
-  const open = async (device: typeof a, epochKeys = keys) => {
+  const openCold = async (device: typeof a, epochKeys = keys) => {
     const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
     closing.push(() => session.close()); return session
   }
-  return { a, b, host, keys, descriptor, control, registry, open }
+  const open = async (...args: Parameters<typeof openCold>) => {
+    const session = await openCold(...args)
+    await session.keys.missing(); return session
+  }
+  return { a, b, host, keys, descriptor, control, registry, open, openCold }
 }
 
 /** The public handshake remains visible to an untrusted relay. */
@@ -60,6 +65,140 @@ function rewriteParticipant(connection: FramedPeerConnection, identity: string, 
 }
 
 describe('authenticated peer application connections', () => {
+  it('keeps authentication, state and live traffic cold, then adds data on the same connection only after local demand', async () => {
+    const f = await fixture(), openA = vi.fn(() => f.a.openStorage()), openB = vi.fn(() => f.b.openStorage())
+    const a = await f.openCold({ ...f.a, openStorage: openA }), b = await f.openCold({ ...f.b, openStorage: openB })
+    const states: unknown[] = [], requests: ParticipantRequest[] = []
+    for (const session of [a, b]) observePeerWire(session.deviceId, value => {
+      if (value.kind === 'request' && value.message !== undefined) requests.push(value.message)
+      if (value.kind === 'response' && value.message?.action === 'state') states.push(value.message.payload)
+    })
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize()))
+    const stream = a.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), received = stream.next()
+    const signal = await b.signals.send('typing', { active: true })
+    expect((await received).value).toEqual(signal); await stream.return?.()
+    expect(states.length).toBeGreaterThan(0)
+    expect(states.every(value => value !== null && typeof value === 'object' && 'data' in value && value.data === false &&
+      'point' in value && value.point === null && 'revision' in value && value.revision === null)).toBe(true)
+    expect(requests.every(value => value.facet === 'control' && value.action === 'state')).toBe(true)
+    expect([a.status.database, b.status.database]).toEqual(['idle', 'idle'])
+    expect(links.map(link => link.data)).toEqual(['idle', 'idle'])
+    expect([a.revision, b.revision]).toEqual([null, null])
+    expect(openA).not.toHaveBeenCalled(); expect(openB).not.toHaveBeenCalled()
+
+    await (await a.command('say', 'local data demand', { operationId: 'first' })).applied()
+    await Promise.all(links.map(link => link.synchronize()))
+    expect(openA).toHaveBeenCalledTimes(1); expect(openB).not.toHaveBeenCalled()
+    expect(links.map(link => link.data)).toEqual(['idle', 'active'])
+    expect(b.status.database).toBe('idle'); expect(b.revision).toBeNull()
+    const [view] = await Promise.all([b.readView(), b.operations.get('first', { author: a.deviceId })]); view.release()
+    await Promise.all(links.map(link => link.synchronize()))
+    expect(openB).toHaveBeenCalledTimes(1)
+    const populated = await b.readView()
+    expect(populated.readEvents().events).toHaveLength(1); populated.release()
+    expect(links.every(link => !link.signal.aborted)).toBe(true)
+    expect(links.map(link => link.data)).toEqual(['active', 'active'])
+    expect([a.status.connectedPeers, b.status.connectedPeers]).toEqual([1, 1])
+  })
+
+  it('lets actual follower demand activate its selected cold coordinator once without reconnecting', async () => {
+    const f = await fixture(), openA = vi.fn(() => f.a.openStorage()), openB = vi.fn(() => f.b.openStorage())
+    const a = await f.openCold({ ...f.a, openStorage: openA }), b = await f.openCold({ ...f.b, openStorage: openB })
+    const opens: ParticipantRequest[] = []
+    observePeerWire(b.deviceId, value => { if (value.kind === 'request' && value.message?.action === 'open') opens.push(value.message) })
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize()))
+    expect(openA).not.toHaveBeenCalled(); expect(openB).not.toHaveBeenCalled()
+    const operation = await b.command('say', 'coordinator service', { operationId: 'first' })
+    await operation.applied({ signal: AbortSignal.timeout(5000) })
+    await links[1].synchronize()
+    expect(opens).toHaveLength(1)
+    expect(openA).toHaveBeenCalledTimes(1); expect(openB).toHaveBeenCalledTimes(1)
+    expect(await b.operations.get('first')).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    expect(links.every(link => !link.signal.aborted)).toBe(true)
+  })
+
+  it('isolates failed coordinator storage from its authenticated control and live connection without retrying acquisition', async () => {
+    const f = await fixture(), failure = new Error('STORAGE_DENIED'), openA = vi.fn(async () => { throw failure })
+    const a = await f.openCold({ ...f.a, openStorage: openA }), b = await f.openCold(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize()))
+    expect(openA).not.toHaveBeenCalled()
+    const view = await b.readView(); view.release()
+    await expect(links[1].synchronize()).rejects.toThrow('APPLICATION_DATA_UNAVAILABLE')
+    expect(links[1].data).toBe('unavailable')
+    expect(a.status.database).toBe('failed'); expect(a.revision).toBeNull()
+    await expect(a.readView()).rejects.toBe(failure)
+    await expect(a.readView()).rejects.toBe(failure)
+    await links[0].synchronize()
+    const stream = a.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), received = stream.next()
+    const sent = await b.signals.send('typing', { active: true })
+    expect((await received).value).toEqual(sent); await stream.return?.()
+    expect(links.every(link => !link.signal.aborted)).toBe(true)
+    expect(openA).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects an invalid advertised data prefix even while both participants remain cold', async () => {
+    const f = await fixture(), openA = vi.fn(() => f.a.openStorage()), openB = vi.fn(() => f.b.openStorage())
+    const a = await f.openCold({ ...f.a, openStorage: openA }), b = await f.openCold({ ...f.b, openStorage: openB })
+    let inject = false
+    observePeerWire(a.deviceId, value => {
+      const message = value.message
+      if (inject && value.kind === 'response' && message?.action === 'state') return { ...value,
+        message: { ...message, payload: { ...message.payload as object, data: true,
+          point: { generation: '00'.repeat(32), sequence: 0, root: '00'.repeat(32) } } } }
+    })
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize())); inject = true
+    await expect(links[1].synchronize()).rejects.toThrow('APPLICATION_NETWORK_CURSOR_INVALID')
+    await expect.poll(() => links[1].signal.aborted).toBe(true)
+    expect(openA).not.toHaveBeenCalled(); expect(openB).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['database', 'open', 'PEER_NOT_COORDINATOR'],
+    ['control', 'keyShare', 'APPLICATION_DATA_NOT_ACTIVE'],
+  ] as const)('does not let an unsolicited %s/%s request activate a cold follower', async (facet, action, code) => {
+    const f = await fixture(), openB = vi.fn(() => f.b.openStorage())
+    const a = await f.openCold(f.a), b = await f.openCold({ ...f.b, openStorage: openB }), responses: unknown[] = []
+    let inject = false
+    observePeerWire(a.deviceId, value => inject && value.kind === 'request' && value.message?.action === 'state'
+      ? { ...value, message: { ...value.message, facet, action } } : value)
+    observePeerWire(b.deviceId, value => { if (value.kind === 'response') responses.push(value.message?.payload) })
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize())); inject = true
+    await expect(links[0].synchronize()).rejects.toThrow('PEER_PARTICIPANT_RESPONSE_MISMATCH')
+    expect(responses).toContain(code)
+    expect(openB).not.toHaveBeenCalled(); expect(b.status.database).toBe('idle')
+  })
+
+  it('checks writer authority before an unsolicited submit can activate a cold coordinator', async () => {
+    const f = await fixture({ readerOnly: true }), openA = vi.fn(() => f.a.openStorage())
+    const a = await f.openCold({ ...f.a, openStorage: openA }), b = await f.openCold(f.b), responses: unknown[] = []
+    let inject = false
+    observePeerWire(b.deviceId, value => inject && value.kind === 'request' && value.message?.action === 'state'
+      ? { ...value, message: { ...value.message, facet: 'database', action: 'submit', payload: { payload: { header: { author: b.deviceId } } } } } : value)
+    observePeerWire(a.deviceId, value => { if (value.kind === 'response') responses.push(value.message?.payload) })
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize())); inject = true
+    await expect(links[1].synchronize()).rejects.toThrow('PEER_PARTICIPANT_RESPONSE_MISMATCH')
+    expect(responses).toContain('PEER_AUTHOR_FORBIDDEN')
+    expect(openA).not.toHaveBeenCalled(); expect(a.status.database).toBe('idle')
+  })
+
   it('routes original saved commands, fragmented ciphertext, exact coverage and live signals over separate lanes', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const operation = await b.command('bulk', 'private payload '.repeat(500), { operationId: 'fragmented' })
@@ -181,7 +320,8 @@ describe('authenticated peer application connections', () => {
 
   it('keeps control ownership separate from reader and writer access', async () => {
     const f = await fixture({ readerOnly: true }), a = await f.open(f.a), b = await f.open(f.b)
-    const host = await f.open({ identity: f.host, storageId: 'control-only', store: new MemoryBytesStore(), close: async () => {} })
+    const hostStore = new MemoryBytesStore()
+    const host = await f.openCold({ identity: f.host, storageId: 'control-only', store: hostStore, openStorage: async () => ({ store: hostStore, close() {} }), close: async () => {} })
     const [forbidden, unused] = createFramedPeerConnectionPair()
     await expect(host.connectPeer({ connection: forbidden, peerIdentity: a.deviceId })).rejects.toThrow('APPLICATION_PEER_NOT_AUTHORIZED')
     await unused.close()
@@ -207,12 +347,12 @@ describe('authenticated peer application connections', () => {
   it.each(['overrun', 'root mismatch'])('rejects a signed page with %s against its fixed target before retaining any command', async fault => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     await (await a.command('say', 'one', { operationId: 'one' })).applied()
-    const one = a.revision.point
+    const one = a.revision!.point
     await (await a.command('say', 'two', { operationId: 'two' })).applied()
     // Obtain real ordered ciphertext from the owned store, not fabricated valid receipts.
     const commands: OrderedCommand[] = []
     for (let sequence = 1; sequence <= 2; sequence++) {
-      const bytes = await f.a.store.get(`peer-generation/replica/${f.descriptor.payload.applicationId}/record/${a.revision.generation}/${sequence}`)
+      const bytes = await f.a.store.get(`peer-generation/replica/${f.descriptor.payload.applicationId}/record/${a.revision!.generation}/${sequence}`)
       expect(bytes).not.toBeNull(); commands.push(decodePeerValue<OrderedCommand>(bytes!))
     }
     const [left, right] = createFramedPeerConnectionPair()
@@ -249,12 +389,12 @@ describe('authenticated peer application connections', () => {
     } }
     const links = await Promise.all([a.connectPeer({ connection: observed }), b.connectPeer({ connection: right })])
     await links[1].synchronize()
-    expect(b.keys.missing()).toEqual([])
+    expect(await b.keys.missing()).toEqual([])
     expect(wire.join('')).not.toContain(bytesToHex(f.keys.get(0)!))
     expect((await b.operations.inspect('secret', { author: a.deviceId }))?.attempt).toEqual(original?.attempt)
     await Promise.all(links.map(link => link.close())); await b.close()
     const enrolled = await f.open(await openApplicationDevice({ store: f.b.store }), new Map())
-    expect(enrolled.keys.missing()).toEqual([])
+    expect(await enrolled.keys.missing()).toEqual([])
     expect((await enrolled.operations.inspect('secret', { author: a.deviceId }))?.attempt).toEqual(original?.attempt)
   })
 
@@ -275,7 +415,7 @@ describe('authenticated peer application connections', () => {
     })
     const links = await Promise.all([a.connectPeer({ connection: response }), b.connectPeer({ connection: request })])
     await expect(links[1].synchronize()).rejects.toThrow(field === 'recipient' ? 'APPLICATION_KEY_REQUEST_INVALID' : 'APPLICATION_KEY_SHARE_INVALID')
-    expect(b.keys.missing()).toEqual([0])
+    expect(await b.keys.missing()).toEqual([0])
     await Promise.all(links.map(link => link.close()))
   })
 
@@ -289,18 +429,22 @@ describe('authenticated peer application connections', () => {
     const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control), epoch: 1,
       keyDigest: await bytesDigest(key) }, f.host)
     await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-      transitionId: 'rotate', expectedGeneration: a.revision.generation, requester: f.host.publicKey, coordinator: a.deviceId,
+      transitionId: 'rotate', expectedGeneration: a.revision!.generation, requester: f.host.publicKey, coordinator: a.deviceId,
       controlRevision: 1, reason: 'control-change', base: await a.recoveryPoint() }, f.host), { control })
     const authority = await f.registry.read(); await a.adopt(authority); await b.adopt(authority)
     await a.keys.install(new Map([[1, key]]))
-    expect(b.keys.missing()).toEqual([1])
+    expect(await b.keys.missing()).toEqual([1])
     const view = await b.readView()
     try { expect(view.readEvents().events).toHaveLength(1) } finally { view.release() }
 
     let entered!: () => void, release!: () => void
     const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
-    const offer = a.keys.offer.bind(a.keys), delayed = vi.spyOn(a.keys, 'offer').mockImplementation(async request => {
-      entered(); await gate; return offer(request)
+    // Delay the resource, not a serialized reliable write that would also block state replies.
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- The spy invokes the original with its actual keyring.
+    const offer = ApplicationKeyring.prototype.offer
+    const delayed = vi.spyOn(ApplicationKeyring.prototype, 'offer').mockImplementation(async function (this: ApplicationKeyring, request) {
+      if (request.payload.recipient === b.deviceId) { entered(); await gate }
+      return offer.call(this, request)
     })
     const coverage: unknown[] = [], [left, right] = createFramedPeerConnectionPair()
     const observed = rewriteParticipant(right, b.deviceId, value => {
@@ -319,11 +463,11 @@ describe('authenticated peer application connections', () => {
       await expect(a.recovery.handover(host, { coordinator: b.deviceId, transitionId: 'after-key' })).rejects.toThrow('APPLICATION_HANDOVER_REQUIRES_RETAINED_PREFIX')
       expect(await a.recovery.inspect()).toEqual([])
       release(); await receiving; await links[0].synchronize()
-      expect(b.keys.missing()).toEqual([])
-      expect(coverage.at(-1)).toMatchObject({ payload: { peer: b.deviceId, generation: a.revision.generation, point: a.revision.point } })
+      expect(await b.keys.missing()).toEqual([])
+      expect(coverage.at(-1)).toMatchObject({ payload: { peer: b.deviceId, generation: a.revision!.generation, point: a.revision!.point } })
       await a.recovery.handover(host, { coordinator: b.deviceId, transitionId: 'after-key' })
       expect((await f.registry.read()).generations.at(-1)?.payload.coordinator).toBe(b.deviceId)
-      expect((await a.recovery.inspect())[0]?.selected).toBe(a.revision.generation)
+      expect((await a.recovery.inspect())[0]?.selected).toBe(a.revision!.generation)
     } finally { release(); delayed.mockRestore(); await receiving.catch(() => undefined) }
   })
 
@@ -336,7 +480,7 @@ describe('authenticated peer application connections', () => {
       epoch: 1, keyDigest: await bytesDigest(crypto.getRandomValues(new Uint8Array(32))),
       grants: f.control.payload.grants.filter(value => value.publicKey !== b.deviceId) }, f.host)
     await f.registry.select(await signTransitionRequest({ applicationId: f.descriptor.payload.applicationId,
-      profile: f.descriptor.payload.profile, policy: f.descriptor.payload.policy, transitionId: 'revoke', expectedGeneration: a.revision.generation,
+      profile: f.descriptor.payload.profile, policy: f.descriptor.payload.policy, transitionId: 'revoke', expectedGeneration: a.revision!.generation,
       coordinator: a.deviceId, requester: f.host.publicKey, controlRevision: 1, reason: 'control-change', base: await a.recoveryPoint() }, f.host), { control: next })
     await a.adopt(await f.registry.read())
     expect(links[0].signal.aborted).toBe(true)

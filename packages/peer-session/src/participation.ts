@@ -1,10 +1,12 @@
 import {
   createParticipantRequest, decodePeerValue, encodePeerValue, peerDigest, validateHistoryPoint, verifyAuthorityBundle,
-  type HistoryPoint, type PeerReplica, type PeerRevision,
-} from '@chronolog/peer-generation'
+  type HistoryPoint,
+} from '@chronolog/peer-generation/control'
+import type { PeerRevision } from '@chronolog/peer-generation'
 import type { BytesStore, FramedPeerConnection } from '@chronolog/records'
-import type { ApplicationPeerConnectOptions, ApplicationPeerLink } from './network.js'
-import type { ApplicationRecovery, ApplicationRecoveryExpectation } from './recovery.js'
+import { isPeerDataUnavailable, type ApplicationPeerConnectOptions, type ApplicationPeerLink } from './network.js'
+import type { ApplicationRecoveryExpectation } from './recovery.js'
+import type { ApplicationParticipant } from './participant-types.js'
 import { awaitOwnedTask } from './lifetime.js'
 import type {
   ApplicationParticipation, ApplicationParticipationOptions, ApplicationParticipationStatus,
@@ -12,8 +14,7 @@ import type {
 } from './participation-types.js'
 
 interface Owner {
-  readonly replica: PeerReplica
-  readonly recovery: ApplicationRecovery
+  readonly participant: ApplicationParticipant
   readonly store: BytesStore
   readonly signal: AbortSignal
   connect(options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink>
@@ -70,6 +71,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   #generation: string
   #error: string | null = null
   #closed: Promise<void> | undefined
+  #dataActive: boolean
 
   constructor(owner: Owner, input: ApplicationParticipationOptions) {
     this.#owner = owner
@@ -89,10 +91,16 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     this.#timeoutMs = bound(input.connections?.timeoutMs, 15_000, 1, 120_000)
     this.#graceMs = bound(input.recovery?.graceMs, 3000, 1, 600_000)
     this.#freshnessMs = bound(input.recovery?.freshnessMs, 300_000, 1, 86_400_000)
-    this.#generation = owner.replica.generation.id
-    this.#observationKey = `peer-session/coordinator-observation/${owner.replica.descriptor.applicationId}`
+    this.#generation = owner.participant.generation.id
+    this.#dataActive = owner.participant.data !== undefined
+    this.#observationKey = `peer-session/coordinator-observation/${owner.participant.descriptor.applicationId}`
     this.signal = AbortSignal.any([owner.signal, this.#lifetime.signal])
-    this.#unsubscribe = owner.replica.subscribe(() => this.#wake())
+    this.#unsubscribe = owner.participant.subscribe(() => {
+      if (!this.#dataActive && owner.participant.data !== undefined) {
+        this.#dataActive = true; this.#missingSince = null; this.#nextScan = 0; this.#nextAdvertisement = 0
+      }
+      this.#wake()
+    })
     this.#invitations = Promise.resolve().then(() => this.#listen()).catch(error => { if (!this.signal.aborted) this.#error = message(error) })
     this.#task = Promise.resolve().then(() => this.#run()).catch(error => {
       if (!this.signal.aborted) { this.#error = message(error); this.#publish('unavailable') }
@@ -106,8 +114,8 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   }
   async approveRecovery(proposalId: string): Promise<void> {
     this.signal.throwIfAborted()
-    const proposal = this.#proposal, replica = this.#owner.replica
-    if (proposal === null || proposal.id !== proposalId) throw new Error('APPLICATION_RECOVERY_APPROVAL_STALE')
+    const proposal = this.#proposal, replica = this.#owner.participant.data?.replica
+    if (replica === undefined || proposal === null || proposal.id !== proposalId) throw new Error('APPLICATION_RECOVERY_APPROVAL_STALE')
     const base = await replica.recoveryPoint().catch(error => { throw new Error('APPLICATION_RECOVERY_APPROVAL_STALE', { cause: error }) })
     const generation = replica.generation
     const id = await peerDigest({ generation: generation.id, control: generation.payload.controlRevision, coordinator: proposal.coordinator, point: base.point })
@@ -119,8 +127,8 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
 
   /** Called only after this exact coordinator's authenticated head has been fully verified locally. */
   observeHead(peerId: string, revision: PeerRevision, requestedAt: number): void {
-    const replica = this.#owner.replica
-    if (this.signal.aborted || peerId !== replica.generation.payload.coordinator || revision.generation !== replica.generation.id ||
+    const replica = this.#owner.participant.data?.replica
+    if (replica === undefined || this.signal.aborted || peerId !== replica.generation.payload.coordinator || revision.generation !== replica.generation.id ||
         !Number.isSafeInteger(requestedAt) || requestedAt > Date.now() || requestedAt < 0) return
     if (this.#observation?.generation === revision.generation && this.#observation.observedAt > requestedAt) return
     this.#observation = { generation: revision.generation, point: structuredClone(revision.point), observedAt: requestedAt }
@@ -147,15 +155,16 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     }
     while (!this.signal.aborted) {
       this.#watchLinks()
-      const replica = this.#owner.replica, now = Date.now()
+      const participant = this.#owner.participant, replica = participant.data?.replica, now = Date.now()
       this.#observeGeneration()
-      if (this.#healthy()) { this.#missingSince = null; this.#proposal = null; this.#approved = null; this.#retry = 0 }
+      if (replica === undefined || this.#healthy()) { this.#missingSince = null; this.#proposal = null; this.#approved = null }
       else this.#missingSince ??= now
+      if (this.#healthy()) this.#retry = 0
       if (now >= this.#nextAdvertisement) {
         this.#nextAdvertisement = now + this.#advertiseMs
         try {
-          await this.#call('advertise', signal => this.#options.discovery.advertise({ identity: replica.device.publicKey,
-            storageId: replica.storageId, generation: replica.generation.id, point: replica.ready ? replica.revision.point : null },
+          await this.#call('advertise', signal => this.#options.discovery.advertise({ identity: participant.device.publicKey,
+            storageId: participant.storageId, generation: participant.generation.id, data: replica !== undefined, point: replica?.ready === true ? replica.revision.point : null },
           { ttlMs: 2 * this.#advertiseMs, signal }))
         } catch (error) { this.#error = message(error) }
       }
@@ -171,15 +180,15 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   }
 
   async #scan(): Promise<void> {
-    const replica = this.#owner.replica
+    const participant = this.#owner.participant
     let authorityError: Error | undefined
     if (this.#initial || !this.#healthy()) {
       try {
         const bundle = await this.#call('authority', signal => this.#options.control.application({ signal }))
         this.signal.throwIfAborted()
-        await verifyAuthorityBundle(bundle, replica.authority.descriptor)
+        await verifyAuthorityBundle(bundle, participant.authority.descriptor)
         this.signal.throwIfAborted()
-        await replica.receiveHistory(bundle, [])
+        await participant.adoptAuthority(bundle)
         this.#initial = false
       } catch (error) { authorityError = new Error(message(error), { cause: error }) }
     }
@@ -187,23 +196,30 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     if (!this.#healthy() || this.#links().length < this.#maxPeers) {
       try {
         const hints = this.#hints(await this.#call('directory', signal => this.#options.discovery.read({ signal })))
-        const coordinator = replica.generation.payload.coordinator
+        const coordinator = participant.generation.payload.coordinator
         hints.sort((left, right) => Number(right.identity === coordinator) - Number(left.identity === coordinator) ||
-          Number(replica.grant(right.identity)?.reader === true) - Number(replica.grant(left.identity)?.reader === true) || left.identity.localeCompare(right.identity))
+          Number(participant.grant(right.identity)?.reader === true) - Number(participant.grant(left.identity)?.reader === true) || left.identity.localeCompare(right.identity))
         await Promise.allSettled(hints.slice(0, this.#maxPeers).map(peer => this.#connect({ peer })))
       } catch (error) { directoryError = new Error(message(error), { cause: error }) }
     }
     this.signal.throwIfAborted()
     const links = this.#links(), synchronized = await Promise.allSettled(links.map(link => this.#call(`sync:${link.peerId}`, () => link.synchronize())))
     for (const [index, result] of synchronized.entries()) {
-      if (result.status === 'rejected') void links[index]!.close().catch(() => undefined)
+      if (result.status === 'rejected' && !isPeerDataUnavailable(result.reason)) void links[index]!.close().catch(() => undefined)
     }
-    const available = new Set(links.filter((link, index) => synchronized[index]?.status === 'fulfilled' && !link.signal.aborted).map(link => link.peerId))
+    const available = new Set(links.filter((link, index) => synchronized[index]?.status === 'fulfilled' && link.data === 'active' && !link.signal.aborted).map(link => link.peerId))
     this.signal.throwIfAborted()
     // Authority can advance during this scan. Retire an older choice before
     // creating its replacement, rather than clearing the new proposal next turn.
     this.#observeGeneration()
-    const pending = [...await this.#call('journal', () => this.#owner.recovery.inspect())].reverse().find(entry => entry.selected === null && !entry.superseded)
+    const data = participant.data
+    if (data === undefined) {
+      if (directoryError !== undefined) throw directoryError
+      if (authorityError !== undefined) throw authorityError
+      return
+    }
+    const replica = data.replica
+    const pending = [...await this.#call('journal', () => data.recovery.inspect())].reverse().find(entry => entry.selected === null && !entry.superseded)
     if (pending !== undefined) {
       if (pending.request.payload.reason !== 'takeover' && pending.request.payload.reason !== 'handover') throw new Error('APPLICATION_TRANSITION_JOURNAL_INVALID')
       await this.#select(pending.request.payload.coordinator, pending.request.payload.transitionId, pending.request.payload.reason)
@@ -246,8 +262,10 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   }
 
   async #select(coordinator: string, transitionId?: string, reason: 'takeover' | 'handover' = 'takeover', expected?: ApplicationRecoveryExpectation): Promise<void> {
+    const data = this.#owner.participant.data
+    if (data === undefined) throw new Error('APPLICATION_DATA_NOT_ACTIVE')
     this.#publish('recovering')
-    await this.#call('selection', signal => this.#owner.recovery[reason](this.#options.control, {
+    await this.#call('selection', signal => data.recovery[reason](this.#options.control, {
       coordinator, signal, ...(transitionId === undefined ? {} : { transitionId }),
       ...(expected === undefined ? {} : { expected }),
     }))
@@ -257,13 +275,13 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   }
 
   #hints(input: unknown): ApplicationPeerHint[] {
-    const payload = createParticipantRequest({ applicationId: this.#owner.replica.descriptor.applicationId,
+    const payload = createParticipantRequest({ applicationId: this.#owner.participant.descriptor.applicationId,
       requestId: 'directory', facet: 'discovery', action: 'read', payload: input }).payload
     if (!Array.isArray(payload) || payload.length > 64 || encodePeerValue(payload).length > 64 * 1024) throw new Error('APPLICATION_DIRECTORY_INVALID')
     const valid = (payload as unknown[]).map(value => {
       if (value === null || typeof value !== 'object' || Object.keys(value).length !== 2 || !('identity' in value) || !identity(value.identity) || !Object.hasOwn(value, 'route')) throw new Error('APPLICATION_DIRECTORY_INVALID')
       return value as ApplicationPeerHint
-    }).filter(value => value.identity !== this.#owner.replica.device.publicKey)
+    }).filter(value => value.identity !== this.#owner.participant.device.publicKey)
     return [...new Map(valid.map(value => [value.identity, value])).values()]
   }
 
@@ -276,7 +294,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
         while (!this.signal.aborted) {
           const next = await awaitOwnedTask(this.signal, () => iterator!.next())
           if (next.done) break
-          const value = createParticipantRequest({ applicationId: this.#owner.replica.descriptor.applicationId,
+          const value = createParticipantRequest({ applicationId: this.#owner.participant.descriptor.applicationId,
             requestId: 'invitation', facet: 'ephemeral', action: 'invite', payload: next.value }).payload as ApplicationPeerInvitation
           if (value === null || typeof value !== 'object' || Object.keys(value).length !== 2 || !Object.hasOwn(value, 'token')) throw new Error('APPLICATION_INVITATION_INVALID')
           const peer = this.#hints([value.peer])[0]
@@ -300,7 +318,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
         await awaitOwnedTask(this.signal, () => previous.finished)
         return
       }
-      if (previous.incoming || this.#owner.replica.device.publicKey < peer.identity) return
+      if (previous.incoming || this.#owner.participant.device.publicKey < peer.identity) return
       previous.controller.abort(new Error('APPLICATION_CONNECTION_SUPERSEDED'))
       await awaitOwnedTask(this.signal, () => previous.finished)
     }
@@ -322,7 +340,8 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       signal.throwIfAborted()
       link = await this.#owner.connect({ connection, peerIdentity: peer.identity, signal,
         handshakeTimeoutMs: this.#timeoutMs, requestTimeoutMs: this.#timeoutMs, transferTimeoutMs: this.#timeoutMs })
-      await awaitOwnedTask(signal, () => link!.synchronize())
+      try { await awaitOwnedTask(signal, () => link!.synchronize()) }
+      catch (error) { if (!isPeerDataUnavailable(error)) throw error }
       signal.throwIfAborted(); this.#ownedLinks.add(link); this.#watchLinks()
       this.#nextScan = 0; this.#wake()
     } catch (error) {
@@ -340,14 +359,15 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
 
   #links(): readonly ApplicationPeerLink[] { return this.#owner.links().filter(link => !link.signal.aborted) }
   #observeGeneration(): void {
-    const generation = this.#owner.replica.generation.id
+    const generation = this.#owner.participant.generation.id
     if (this.#generation === generation) return
     this.#generation = generation; this.#proposal = null; this.#approved = null
     this.#nextScan = 0; this.#nextAdvertisement = 0
   }
   #healthy(): boolean {
-    const replica = this.#owner.replica
-    return replica.ready && (replica.isCoordinator || this.#links().some(link => link.peerId === replica.generation.payload.coordinator))
+    const replica = this.#owner.participant.data?.replica
+    if (replica === undefined) return this.#links().length > 0
+    return replica.ready && (replica.isCoordinator || this.#links().some(link => link.peerId === replica.generation.payload.coordinator && link.data === 'active'))
   }
   #watchLinks(): void {
     for (const link of this.#links()) {
@@ -362,11 +382,14 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   }
   #backoff(attempt: number): number { return Math.max(1, Math.round(Math.min(this.#maximumRetry, this.#initialRetry * 2 ** Math.min(attempt, 20)) * (0.75 + Math.random() * 0.25))) }
   #publish(phase?: ApplicationParticipationStatus['phase']): void {
-    const replica = this.#owner.replica
+    const replica = this.#owner.participant.data?.replica
+    const error = this.#error ?? (replica !== undefined && this.#links().some(link => link.peerId === replica.generation.payload.coordinator && link.data === 'unavailable')
+      ? 'APPLICATION_DATA_UNAVAILABLE' : null)
     const next: ApplicationParticipationStatus = {
       phase: phase ?? (this.signal.aborted ? 'closed' : this.#proposal !== null && this.#approved !== this.#proposal.id ? 'approval-required'
-        : !replica.ready ? 'recovering' : replica.isCoordinator ? 'coordinating' : this.#healthy() ? 'following' : this.#error !== null ? 'unavailable' : 'connecting'),
-      connectedPeers: this.#links().map(link => link.peerId).sort(), recovery: structuredClone(this.#proposal), error: this.#error,
+        : replica === undefined ? error !== null ? 'unavailable' : this.#links().length > 0 ? 'connected' : 'connecting'
+          : !replica.ready ? 'recovering' : replica.isCoordinator ? 'coordinating' : this.#healthy() ? 'following' : error !== null ? 'unavailable' : 'connecting'),
+      connectedPeers: this.#links().map(link => link.peerId).sort(), recovery: structuredClone(this.#proposal), error,
     }
     if (JSON.stringify(next) === JSON.stringify(this.#status)) return
     this.#status = next

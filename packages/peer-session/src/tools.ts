@@ -62,7 +62,7 @@ async function observeChange(session: ApplicationSession, after: PeerRevision | 
       // A short-lived observer may start after the recovery notification. Reuse
       // the real recorded notice; a generation difference alone invents no loss.
       const recovery = change.recovery ?? (resetRequired
-        ? session.inspectRecovery().findLast(notice => notice.generation === change.revision.generation) ?? null : null)
+        ? (await session.inspectRecovery()).findLast(notice => notice.generation === change.revision.generation) ?? null : null)
       return { change: recovery === null ? change : { ...change, kind: 'recovery', recovery }, resetRequired }
     }
   } finally {

@@ -1,3 +1,4 @@
+import { serveApplicationWorker } from './worker-application-server.js'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,7 +16,7 @@ import { createNativeSqlEngine } from './sql-native.js'
 import { openSqlApplication, prepareSqlApplication, type SqlEngine } from './sql.js'
 import { openPeerApplication } from './runtime.js'
 import { createApplicationBackend } from './tendriller.js'
-import { connectApplicationWorker, serveApplicationWorker } from './worker-application.js'
+import { connectApplicationWorker } from './worker-application.js'
 import { connectApplications } from './session.js'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -41,7 +42,7 @@ async function fixture(executionManifest?: SqlEngine['executionManifest']) {
   await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     transitionId: 'initial', expectedGeneration: null, requester: device.identity.publicKey, coordinator: device.identity.publicKey,
     controlRevision: 0, reason: 'create', base: null }, device.identity))
-  return { engine, options: { engine, device, authority: await registry.read(), definition, epochKeys: new Map([[0, key]]),
+  return { engine, options: { createEngine: () => engine, device, authority: await registry.read(), definition, epochKeys: new Map([[0, key]]),
     databasePath: join(directory, 'application.db'), schema: prepared.schema } }
 }
 
@@ -59,40 +60,65 @@ it('claims the shared SQL session before opening another materializer or disturb
   } finally { opening.mockRestore(); captured.release() }
 })
 
-it('rejects a mismatched engine capability before it opens or initializes a database', async () => {
+it('rejects a mismatched engine on first data demand before it opens a database', async () => {
   const { options, engine } = await fixture(), openDatabase = vi.fn(engine.openDatabase.bind(engine))
   const executionManifest = structuredClone(engine.executionManifest)
   executionManifest.engineDigest[0] = executionManifest.engineDigest[0]! ^ 1
-  await expect(openSqlApplication({ ...options, engine: { executionManifest, openDatabase } })).rejects.toThrow('APPLICATION_EXECUTION_MANIFEST_MISMATCH')
+  const session = await openSqlApplication({ ...options, createEngine: () => ({ executionManifest, openDatabase }) })
+  cleanups.push(() => session.close())
+  expect(session.status.database).toBe('idle')
+  await expect(session.readView()).rejects.toThrow('APPLICATION_EXECUTION_MANIFEST_MISMATCH')
+  expect(session.status.database).toBe('failed')
   expect(openDatabase).not.toHaveBeenCalled()
 })
 
-it('captures the engine and signed schema before asynchronous ownership and verification', async () => {
+it('captures the engine factory and schema without loading either data implementation during protocol startup', async () => {
   const { options, engine } = await fixture(), openDatabase = vi.fn(engine.openDatabase.bind(engine))
   const suppliedEngine = { executionManifest: structuredClone(engine.executionManifest), openDatabase }
-  const schema = structuredClone(options.schema)
-  const opening = openSqlApplication({ ...options, engine: suppliedEngine, schema })
-  suppliedEngine.executionManifest.engineDigest.fill(0)
-  suppliedEngine.openDatabase = vi.fn(() => { throw new Error('late substituted factory') })
+  const createEngine = vi.fn(() => suppliedEngine), substituted = vi.fn(() => { throw new Error('late substituted factory') })
+  const schema = structuredClone(options.schema), input = { ...options, createEngine, schema }
+  const opening = openSqlApplication(input)
+  input.createEngine = substituted
   Object.assign(schema.payload, { program: '00' })
   const session = await opening
   cleanups.push(() => session.close())
-  const view = await session.readView()
-  try { expect(view.query('SELECT id,value FROM items').rows).toEqual([]) } finally { view.release() }
+  expect(createEngine).not.toHaveBeenCalled(); expect(openDatabase).not.toHaveBeenCalled()
+  expect(session.status.database).toBe('idle'); expect(session.capabilities.sql).toBe(true)
+  const views = await Promise.all([session.readView(), session.readView(), session.readView()])
+  try { for (const view of views) expect(view.query('SELECT id,value FROM items').rows).toEqual([]) }
+  finally { for (const view of views) view.release() }
+  expect(createEngine).toHaveBeenCalledTimes(1)
   expect(openDatabase).toHaveBeenCalled()
-  expect(suppliedEngine.openDatabase).not.toHaveBeenCalled()
+  expect(substituted).not.toHaveBeenCalled()
+})
+
+it('keeps the protocol participant available after a failed lazy engine load without retrying it', async () => {
+  const { options } = await fixture(), createEngine = vi.fn(async () => { throw new Error('ENGINE_DOWNLOAD_FAILED') })
+  const session = await openSqlApplication({ ...options, createEngine })
+  cleanups.push(() => session.close())
+  expect(createEngine).not.toHaveBeenCalled()
+  await expect(session.readView()).rejects.toThrow('ENGINE_DOWNLOAD_FAILED')
+  await expect(session.readView()).rejects.toThrow('ENGINE_DOWNLOAD_FAILED')
+  expect(session.status.database).toBe('failed'); expect(session.signal.aborted).toBe(false)
+  expect(createEngine).toHaveBeenCalledTimes(1)
+  expect(session.describe().capabilities.sql).toBe(true)
 })
 
 it.each([false, true])('rejects schema-bound applications with event-only execution (explicit factory: %s)', async explicit => {
   // Even a descriptor signed with the event execution digest must not silently
   // skip the definition's independently signed schema program.
   const { options } = await fixture(await eventExecutionManifest())
-  await expect(openPeerApplication({ ...options, ...(explicit ? {
-    createMaterializer: () => createEventMaterializationRuntime({ store: options.device.store, namespace: options.authority.descriptor.payload.historyId }),
-  } : {}) })).rejects.toThrow('APPLICATION_SCHEMA_REQUIRES_SQL')
+  if (!explicit) await expect(openPeerApplication(options)).rejects.toThrow('APPLICATION_SCHEMA_REQUIRES_SQL')
+  else {
+    const session = await openPeerApplication({ ...options,
+      createMaterializer: () => createEventMaterializationRuntime({ store: options.device.store, namespace: options.authority.descriptor.payload.historyId }) })
+    cleanups.push(() => session.close())
+    expect(session.status.database).toBe('idle')
+    await expect(session.readView()).rejects.toThrow('APPLICATION_SCHEMA_REQUIRES_SQL')
+  }
 })
 
-it('derives native and Worker-backed SQL adapter capabilities from the actual materializer', async () => {
+it('declares native and Worker-backed SQL capabilities from the authenticated schema before activation', async () => {
   const { options } = await fixture(), session = await openSqlApplication(options)
   cleanups.push(() => session.close())
   const endpoint = new MessageChannel()
@@ -137,9 +163,9 @@ it('keeps captured SQL and events coherent while privately validating an inherit
   }, first.identity))
   await select(null, 'first')
   const open = async (device: typeof first, name: string) => {
-    const session = await openSqlApplication({ engine, device, definition, authority: await registry.read(), epochKeys: new Map([[0, key]]),
+    const session = await openSqlApplication({ createEngine: () => engine, device, definition, authority: await registry.read(), epochKeys: new Map([[0, key]]),
       databasePath: join(directory, `${name}.db`), schema: prepared.schema })
-    cleanups.push(() => session.close()); return session
+    cleanups.push(() => session.close()); await session.keys.missing(); return session
   }
   const a = await open(first, 'a'), b = await open(survivor, 'b'), link = await connectApplications(a, b)
   await (await a.command('add', 1, { operationId: 'retained' })).applied(); await link.synchronize()

@@ -1,6 +1,6 @@
 import { sha256 } from '@chronolog/canonical'
 import { bytesToHex, hexToBytes } from '@chronolog/protocol'
-import { openBrowserApplication, openBrowserDevice } from '@chronolog/peer-session/browser'
+import { openBrowserApplication, openBrowserDevice } from '@chronolog/peer-session/worker'
 import { openWorkerWebRtcConnection, type WorkerWebRtcConnection } from '@chronolog/peer-session/webrtc'
 import { createHttpWebRtcSignaling } from '@chronolog/transport-webrtc'
 import type { ApplicationDevice, ApplicationSession, ApplicationPeerLink, ContentReference } from '@chronolog/peer-session'

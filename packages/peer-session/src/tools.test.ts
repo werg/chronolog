@@ -36,7 +36,7 @@ async function fixture() {
     requester: devices[0]!.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, devices[0]!.identity))
   const sessions = await Promise.all(devices.map(async device => {
     const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
-    cleanup.push(() => session.close()); return session
+    cleanup.push(() => session.close()); await session.keys.missing(); return session
   }))
   return { a: sessions[0]!, b: sessions[1]!, async recover(point?: PrefixProof) {
     const base = point ?? await sessions[1]!.recoveryPoint(), authority = await registry.read()
@@ -136,7 +136,7 @@ describe('local application tool revisions and bounded changes', () => {
 
   it('returns the current coherent revision and bounds an unchanged observation without a replay queue', async () => {
     const { a } = await fixture(), tools = createApplicationTools(a), released = observeReleases(a)
-    const revision = a.revision
+    const revision = a.revision!
     expect(await tools.call('changes', {})).toEqual({ change: { kind: 'applied', revision, recovery: null }, resetRequired: false })
     expect(await tools.call('changes', { after: revision, waitMs: 5 })).toEqual({ change: null, resetRequired: false })
     expect(released).toHaveBeenCalledTimes(2)
@@ -149,7 +149,7 @@ describe('local application tool revisions and bounded changes', () => {
   })
 
   it('rejects malformed and foreign observation revisions instead of accepting them as authority', async () => {
-    const { a } = await fixture(), tools = createApplicationTools(a), revision = a.revision
+    const { a } = await fixture(), tools = createApplicationTools(a), revision = a.revision!
     for (const input of [
       { after: { ...revision, applicationId: 'ff'.repeat(32) } },
       { after: { ...revision, historyId: 'foreign' } },
@@ -169,7 +169,7 @@ describe('local application tool revisions and bounded changes', () => {
     await post(f.a, 'abandoned')
     const after = f.a.revision
     await f.recover()
-    const notice = f.a.inspectRecovery().at(-1)!
+    const notice = (await f.a.inspectRecovery()).at(-1)!
     expect(notice.abandoned).toContainEqual(expect.objectContaining({ operationId: 'abandoned' }))
     expect(await tools.call('changes', { after })).toEqual({
       change: { kind: 'recovery', revision: f.a.revision, recovery: notice }, resetRequired: true,
@@ -180,7 +180,7 @@ describe('local application tool revisions and bounded changes', () => {
     expect(retried?.attempt.payload.header).toMatchObject({ basedOn, reapplyOf: old?.attempt.id })
     // A new observer may have no retained notice. A generation difference still
     // requires a reread, but cannot manufacture an abandoned range or loss claim.
-    vi.spyOn(f.a, 'inspectRecovery').mockReturnValue([])
+    vi.spyOn(f.a, 'inspectRecovery').mockResolvedValue([])
     expect(await tools.call('changes', { after })).toEqual({
       change: { kind: 'applied', revision: f.a.revision, recovery: null }, resetRequired: true,
     })

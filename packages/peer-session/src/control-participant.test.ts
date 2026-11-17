@@ -19,7 +19,12 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 
 async function fixture() {
   const signer = await createPeerIdentity(), stores = [new MemoryBytesStore(), new MemoryBytesStore()]
-  const devices = await Promise.all(stores.map(store => openApplicationDevice({ store, create: true })))
+  const storageOpens = [0, 0]
+  const openDevice = (index: number, create = false) => openApplicationDevice({ store: stores[index]!,
+    ...(create ? { create: true as const } : {}),
+    openStorage() { storageOpens[index] = storageOpens[index]! + 1; return { store: stores[index]!, close() {} } },
+  })
+  const devices = await Promise.all(stores.map((_store, index) => openDevice(index, true)))
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
   const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: 'ab'.repeat(32), historyId: 'participant-test',
@@ -55,15 +60,36 @@ async function fixture() {
     return createParticipantResponse(request, result)
   }
   const open = async (index: number, resume = false) => {
-    const device = resume ? await openApplicationDevice({ store: stores[index]! }) : devices[index]!
+    const device = resume ? await openDevice(index) : devices[index]!
     const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
     cleanup.push(() => session.close())
     return session
   }
-  return { open, registry, publications, exchange, traffic, faults, devices }
+  return { open, registry, publications, exchange, traffic, faults, devices, storageOpens }
 }
 
 describe('session-owned control participant', () => {
+  it('exchanges live signals and verified control/code before opening durable application data', async () => {
+    const f = await fixture(), a = await f.open(0), b = await f.open(1)
+    const control = a.connectControlParticipant({ exchange: f.exchange })
+    const links = await connectApplications(a, b); cleanup.push(() => links.close())
+    expect(a.status.database).toBe('idle'); expect(b.status.database).toBe('idle')
+    expect(a.revision).toBeNull(); expect(b.revision).toBeNull()
+    await control.application(); await control.definition(); expect(await control.publication()).toBeNull()
+    const bytes = new TextEncoder().encode('<main>Protocol only</main>')
+    const release = await control.preparePublication({ operationId: 'protocol-page', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    await control.publish(release, []); expect((await control.publication())?.publication.id).toBe(release.id)
+    const iterator = a.signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator]()
+    const incoming = iterator.next(); await b.signals.send('typing', { active: true })
+    expect((await incoming).value?.topic).toBe('typing'); await iterator.return?.()
+    expect(f.storageOpens).toEqual([0, 0])
+    const views = await Promise.all([a.readView(), a.readView()])
+    for (const view of views) view.release()
+    expect(f.storageOpens).toEqual([1, 0])
+    expect(a.status.database).toBe('ready'); expect(b.status.database).toBe('idle')
+  })
+
   it('drains a closing control participant journal before releasing the application session', async () => {
     const f = await fixture(), session = await f.open(0), control = session.connectControlParticipant({ exchange: f.exchange })
     const store = f.devices[0]!.store, put = store.put.bind(store)
@@ -118,21 +144,24 @@ describe('session-owned control participant', () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
     const old = await f.registry.read(), host = b.connectControlParticipant({ exchange: f.exchange })
     const link = await connectApplications(a, b)
-    await (await a.command('say', 'inherited', { operationId: 'inherited' })).applied(); await link.synchronize(); await link.close()
+    await (await a.command('say', 'inherited', { operationId: 'inherited' })).applied()
+    const inherited = await b.readView()
+    expect(inherited.readEvents().events.map(event => event.operationId)).toEqual(['inherited'])
+    inherited.release(); await link.synchronize(); await link.close()
     const ancestor = await b.recoveryPoint()
     await (await a.command('say', 'tail', { operationId: 'tail' })).applied()
     const identity = f.devices[0]!.identity
     await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-      expectedGeneration: a.revision.generation, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 0,
+      expectedGeneration: a.revision!.generation, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 0,
       transitionId: 'second', reason: 'takeover', base: ancestor }, identity))
     await a.adopt(await f.registry.read())
     await (await a.command('say', 'unavailable', { operationId: 'unavailable' })).applied()
     await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-      expectedGeneration: a.revision.generation, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 0,
+      expectedGeneration: a.revision!.generation, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 0,
       transitionId: 'third', reason: 'takeover', base: await a.recoveryPoint() }, identity))
     await host.application(); await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
     const notice = await b.recovery.takeover(host, { transitionId: 'recover' })
-    expect(notice).toMatchObject({ previousGeneration: old.generations[0]!.id, generation: b.revision.generation })
+    expect(notice).toMatchObject({ previousGeneration: old.generations[0]!.id, generation: b.revision!.generation })
     expect(b.status.role).toBe('coordinator')
     const rejoin = await connectApplications(a, b); cleanup.push(() => rejoin.close())
     expect((await a.operations.get('tail'))?.status).toBe('abandoned')
@@ -143,7 +172,8 @@ describe('session-owned control participant', () => {
   })
 
   it('correlates recovery replies with the entire saved signed request across custom control transports', async () => {
-    const f = await fixture(), b = await f.open(1), before = b.revision
+    const f = await fixture(), b = await f.open(1), view = await b.readView(), before = view.revision
+    view.release()
     const host = { application: () => f.registry.read(), async selectGeneration(request: SignedTransitionRequest) {
       const other = f.devices[0]!.identity
       return f.registry.select(await signTransitionRequest({ ...request.payload, requester: other.publicKey }, other))
@@ -173,7 +203,9 @@ describe('session-owned control participant', () => {
     expect(await resumed.preparePublication(input)).toEqual(first)
     f.faults.stalePublication = first
     await expect(resumed.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REGRESSION')
-    expect(reopened.revision.point.sequence).toBe(0)
+    expect(reopened.revision).toBeNull()
+    expect(reopened.status.database).toBe('idle')
+    expect(f.storageOpens).toEqual([0, 0])
   })
 
   it('verifies every skipped publication before remembering the new selected head', async () => {

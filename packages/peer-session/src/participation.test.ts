@@ -14,6 +14,7 @@ import { connectApplications, type ApplicationSession } from './session.js'
 import type { ApplicationControlHost } from './recovery.js'
 import type {
   ApplicationDiscoveryPort, ApplicationParticipationOptions, ApplicationPeerHint, ApplicationPeerInvitation, ApplicationTransportPort,
+  ApplicationPeerAdvertisement,
 } from './participation-types.js'
 
 const definition = defineApplication({ id: 'participation', version: '1', commands: {
@@ -25,6 +26,7 @@ afterEach(async () => { for (const close of closing.splice(0).reverse()) await c
 /** Delivery only: real session handshakes, signed authority and history run on these framed pairs. */
 class Introductions {
   readonly directory = new Map<string, ApplicationPeerHint>()
+  readonly advertised = new Map<string, ApplicationPeerAdvertisement>()
   readonly #listeners = new Map<string, (value: ApplicationPeerInvitation) => void>()
   readonly #connections = new Map<string, FramedPeerConnection>()
   readonly counts = { reads: 0, advertisements: 0, withdrawals: 0, opens: 0 }
@@ -36,6 +38,7 @@ class Introductions {
         async read({ signal }) { signal.throwIfAborted(); hub.counts.reads++; if (hub.unavailable) throw new Error('DIRECTORY_OFFLINE'); return [...hub.directory.values()] },
         async advertise(value, { signal }) {
           signal.throwIfAborted(); hub.counts.advertisements++; if (hub.unavailable) throw new Error('DIRECTORY_OFFLINE')
+          hub.advertised.set(identity, structuredClone(value))
           hub.directory.set(identity, { identity: value.identity, route: value.identity })
         },
         async withdraw({ signal }) { signal.throwIfAborted(); hub.counts.withdrawals++; hub.directory.delete(identity) },
@@ -105,16 +108,20 @@ async function fixture(options: { omitC?: boolean } = {}) {
       return selected
     },
   }
-  const open = async (device: typeof a, createMaterializer?: OpenPeerApplicationOptions['createMaterializer']) => {
+  const openCold = async (device: typeof a, createMaterializer?: OpenPeerApplicationOptions['createMaterializer']) => {
     const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys,
       ...(createMaterializer === undefined ? {} : { createMaterializer }) })
     closing.push(() => session.close()); return session
+  }
+  const open = async (...args: Parameters<typeof openCold>) => {
+    const session = await openCold(...args)
+    await session.keys.missing(); return session
   }
   const participate = (session: ApplicationSession, overrides: Partial<ApplicationParticipationOptions> = {}) => session.participate({
     control: host, ...hub.ports(session.deviceId), recovery: { graceMs: 25, freshnessMs: 300_000 },
     connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 2000, advertiseMs: 15_000 }, ...overrides,
   })
-  return { a, b, c, stores, registry, hub, host, counts, requests, open, participate, signer, descriptor, control,
+  return { a, b, c, stores, registry, hub, host, counts, requests, open, openCold, participate, signer, descriptor, control,
     offline(value: boolean) { offline = value }, loseSelection() { loseSelection = true } }
 }
 
@@ -157,7 +164,7 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
   closing.push(() => { directory.resolve(); release.resolve() })
   await until(() => participation.status.phase === 'following')
   await until(async () => await f.b.store.get(`peer-session/coordinator-observation/${b.applicationId}`) !== null)
-  const generation = b.revision.generation
+  const generation = b.revision!.generation
   reconnecting = true; await first.close()
   const connection = await f.hub.ports(a.deviceId).transport.open({ peer: { identity: b.deviceId, route: b.deviceId } }, { signal: a.signal })
   closing.push(() => connection.close())
@@ -166,6 +173,55 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
 }
 
 describe('owned application participation', () => {
+  it('keeps discovery, authenticated live traffic and controls active without recovery until local data use', async () => {
+    const f = await fixture(), openB = vi.fn(() => f.b.openStorage()), openC = vi.fn(() => f.c.openStorage())
+    const b = await f.openCold({ ...f.b, openStorage: openB }), c = await f.openCold({ ...f.c, openStorage: openC })
+    const first = f.participate(b), second = f.participate(c)
+    await until(() => first.status.phase === 'connected' && second.status.phase === 'connected')
+    const stream = c.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), received = stream.next()
+    const sent = await b.signals.send('typing', { active: true })
+    expect((await received).value).toEqual(sent); await stream.return?.()
+    await new Promise(resolve => setTimeout(resolve, 75))
+    expect(f.counts.reads).toBeGreaterThan(0); expect(f.counts.selections).toBe(0)
+    expect(first.status.recovery).toBeNull(); expect(second.status.recovery).toBeNull()
+    expect(openB).not.toHaveBeenCalled(); expect(openC).not.toHaveBeenCalled()
+    expect([b.revision, c.revision]).toEqual([null, null])
+    expect(f.hub.advertised.get(b.deviceId)).toMatchObject({ data: false, point: null })
+    expect(f.hub.advertised.get(c.deviceId)).toMatchObject({ data: false, point: null })
+    const connections = f.hub.counts.opens
+
+    const view = await b.readView(); view.release()
+    await until(() => first.status.phase === 'approval-required')
+    expect(openB).toHaveBeenCalledTimes(1); expect(openC).not.toHaveBeenCalled()
+    expect(first.status.recovery).toMatchObject({ coordinator: b.deviceId, reason: 'freshness-unknown' })
+    await first.approveRecovery(first.status.recovery!.id)
+    await until(() => first.status.phase === 'coordinating')
+    await until(() => c.status.generation === b.status.generation)
+    expect(f.counts.selections).toBe(1)
+    expect(f.hub.counts.opens).toBe(connections)
+    expect(b.participation).toBe(first); expect(c.participation).toBe(second)
+    expect(c.status.database).toBe('idle'); expect(openC).not.toHaveBeenCalled()
+  })
+
+  it('retains a live coordinator whose database failed without claiming data availability or reopening its transport', async () => {
+    const f = await fixture(), openA = vi.fn(async () => { throw new Error('STORAGE_DENIED') })
+    const a = await f.openCold({ ...f.a, openStorage: openA }), b = await f.openCold(f.b)
+    const first = f.participate(a), second = f.participate(b)
+    await until(() => first.status.phase === 'connected' && second.status.phase === 'connected')
+    const connections = f.hub.counts.opens
+    const view = await b.readView(); view.release()
+    await until(() => second.status.error === 'APPLICATION_DATA_UNAVAILABLE')
+    expect(second.status.phase).not.toBe('following')
+    expect(second.status.connectedPeers).toContain(a.deviceId)
+    const stream = a.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), received = stream.next()
+    const sent = await b.signals.send('typing', { active: true })
+    expect((await received).value).toEqual(sent); await stream.return?.()
+    expect(f.hub.counts.opens).toBe(connections)
+    expect(f.counts.selections).toBe(0)
+    expect(openA).toHaveBeenCalledTimes(1)
+    expect(a.status.database).toBe('failed')
+  })
+
   it('discovers authenticated peers and saves ordinary commands without command-correlated host traffic', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const first = f.participate(a), second = f.participate(b)
@@ -187,16 +243,16 @@ describe('owned application participation', () => {
     f.participate(a); const participation = f.participate(b)
     await until(() => participation.status.phase === 'following')
     await (await post(b, 'retained')).shared({ signal: AbortSignal.timeout(5000) })
-    const oldGeneration = b.revision.generation
+    const oldGeneration = b.revision!.generation
     f.loseSelection(); await a.close()
     const operation = await b.command('say', 'saved during grace', { operationId: 'during-grace' })
     await until(() => participation.status.phase === 'coordinating')
-    expect(b.revision.generation).not.toBe(oldGeneration)
+    expect(b.revision!.generation).not.toBe(oldGeneration)
     expect(f.requests.length).toBe(2); expect(f.requests[1]).toEqual(f.requests[0])
     expect(await operation.get()).toMatchObject({ status: 'needsReapply' })
     const reapplied = await b.reapply('during-grace', 'say', 'reviewed after recovery', { operationId: 'after-recovery' })
     expect((await reapplied.applied({ signal: AbortSignal.timeout(5000) })).status).toBe('applied')
-    expect((await b.recovery.inspect())[0]?.selected).toBe(b.revision.generation)
+    expect((await b.recovery.inspect())[0]?.selected).toBe(b.revision!.generation)
   })
 
   it('reconnects through available delivery routes while the control service is unavailable', async () => {
@@ -224,7 +280,7 @@ describe('owned application participation', () => {
       closing.push(() => link.close()); await link.synchronize()
       await until(() => h.participation.status.phase === 'following')
       expect(h.incoming()).toBe(1); expect(h.f.requests).toHaveLength(0)
-      expect(h.b.revision.generation).toBe(h.generation)
+      expect(h.b.revision!.generation).toBe(h.generation)
     } finally { clearTimeout(timer); h.release.resolve(); await connecting.catch(() => undefined) }
   })
 
@@ -233,7 +289,7 @@ describe('owned application participation', () => {
     await until(() => h.participation.status.phase === 'coordinating', 7500)
     expect(h.attemptSignal()?.aborted).toBe(true)
     expect(h.incoming()).toBe(1); expect(h.f.requests).toHaveLength(1)
-    expect(h.b.revision.generation).not.toBe(h.generation)
+    expect(h.b.revision!.generation).not.toBe(h.generation)
     expect(h.f.requests[0]?.payload).toMatchObject({ reason: 'takeover', coordinator: h.b.deviceId, expectedGeneration: h.generation })
     // The noncooperative factory remains physically owned until it returns.
     h.release.resolve()
@@ -244,7 +300,7 @@ describe('owned application participation', () => {
     const h = await holdIncomingCoordinator()
     await h.participation.close()
     expect(h.participation.status.phase).toBe('closed'); expect(h.f.requests).toHaveLength(0)
-    expect(h.b.revision.generation).toBe(h.generation)
+    expect(h.b.revision!.generation).toBe(h.generation)
     h.release.resolve()
     await until(() => h.connection.signal.aborted)
   })
@@ -277,7 +333,7 @@ describe('owned application participation', () => {
     // successor's signed retention of this exact newly applied prefix.
     const coverage = await operation.shared({ signal: AbortSignal.timeout(5000) })
     expect(coverage.map(receipt => ({ peer: receipt.payload.peer, point: receipt.payload.point }))).toEqual([
-      { peer: b.deviceId, point: a.revision.point },
+      { peer: b.deviceId, point: a.revision!.point },
     ])
     f.loseSelection()
     await expect(a.recovery.handover(f.host, { coordinator: b.deviceId, transitionId: 'handover' })).rejects.toThrow('LOST_SELECTION_REPLY')
@@ -286,7 +342,7 @@ describe('owned application participation', () => {
     await until(async () => (await a.recovery.inspect())[0]?.selected !== null)
     expect(f.requests).toEqual([original, original])
     expect(participation.status.phase).not.toBe('approval-required')
-    expect(a.revision.generation).toBe((await f.registry.read()).generations.at(-1)?.id)
+    expect(a.revision!.generation).toBe((await f.registry.read()).generations.at(-1)?.id)
   })
 
   it('requires approval after an idle coordinator observation exceeds the local freshness budget', async () => {
@@ -299,7 +355,7 @@ describe('owned application participation', () => {
     await until(async () => await f.b.store.get(`peer-session/coordinator-observation/${b.applicationId}`) !== null)
     await a.close()
     await until(() => participation.status.phase === 'approval-required')
-    expect(participation.status.recovery).toMatchObject({ reason: 'older-than-budget', point: b.revision.point })
+    expect(participation.status.recovery).toMatchObject({ reason: 'older-than-budget', point: b.revision!.point })
     expect(participation.status.recovery!.ageMs).toBeGreaterThan(50)
     expect(f.requests).toHaveLength(0)
   })
@@ -310,7 +366,7 @@ describe('owned application participation', () => {
     const control: ApplicationControlHost = { ...f.host, async application(options) {
       if (armed && ++reads === 2) {
         await f.registry.select(await signTransitionRequest({ applicationId: b.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-          expectedGeneration: b.revision.generation, coordinator: f.c.identity.publicKey, requester: f.c.identity.publicKey,
+          expectedGeneration: b.revision!.generation, coordinator: f.c.identity.publicKey, requester: f.c.identity.publicKey,
           controlRevision: 0, base: await b.recoveryPoint(), transitionId: 'competing', reason: 'takeover' }, f.c.identity))
       }
       return f.host.application(options)
@@ -327,7 +383,7 @@ describe('owned application participation', () => {
 
   it('rejects an expected recovery prefix if new authenticated history arrives before signing', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
-    const expected = { generation: b.revision.generation, controlRevision: b.revision.controlRevision, point: b.revision.point }
+    const expected = { generation: b.revision!.generation, controlRevision: b.revision!.controlRevision, point: b.revision!.point }
     const link = await connectApplications(a, b)
     closing.push(() => link.close())
     await post(a, 'new-head'); await link.synchronize()
@@ -340,7 +396,7 @@ describe('owned application participation', () => {
     const f = await fixture(), a = await f.open(f.a)
     await post(a, 'missing-from-b')
     await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-      expectedGeneration: a.revision.generation, coordinator: f.c.identity.publicKey, requester: f.c.identity.publicKey, controlRevision: 0,
+      expectedGeneration: a.revision!.generation, coordinator: f.c.identity.publicKey, requester: f.c.identity.publicKey, controlRevision: 0,
       base: await a.recoveryPoint(), transitionId: 'inherited', reason: 'takeover' }, f.c.identity))
     const b = await f.open(f.b), participation = f.participate(b)
     await until(() => participation.status.error === 'PEER_RECOVERY_PREFIX_INCOMPLETE')
@@ -385,17 +441,17 @@ describe('owned application participation', () => {
     const f = await fixture({ omitC: true }), a = await f.open(f.a)
     const first = f.participate(a)
     await until(() => first.status.phase === 'coordinating')
-    const old = a.revision.generation
+    const old = a.revision!.generation
     const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
       grants: [...f.control.payload.grants, participantGrant(f.c.identity.publicKey)] }, f.signer)
     const selected = await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
       expectedGeneration: old, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 1, base: await a.recoveryPoint(),
       transitionId: 'enroll', reason: 'control-change' }, f.a.identity), { control })
-    expect(a.revision.generation).toBe(old)
+    expect(a.revision!.generation).toBe(old)
     const c = await f.open(f.c), joined = f.participate(c)
     await until(() => joined.status.phase === 'following' && first.status.connectedPeers.includes(c.deviceId))
-    expect(a.revision.generation).toBe(selected.id)
-    expect(c.revision.generation).toBe(selected.id)
+    expect(a.revision!.generation).toBe(selected.id)
+    expect(c.revision!.generation).toBe(selected.id)
     await expect((await post(c, 'new-reader')).get()).resolves.toMatchObject({ status: 'applied' })
   })
 
@@ -452,7 +508,7 @@ describe('owned application participation', () => {
       if (request === undefined) { request = value; return late }
       return f.registry.read().then(bundle => createParticipantResponse(value, bundle))
     } })
-    const before = b.revision, participation = f.participate(b, { control })
+    const before = b.revision!, participation = f.participate(b, { control })
     await until(() => request !== undefined)
     await participation.close()
     await f.registry.select(await signTransitionRequest({ applicationId: b.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
@@ -463,7 +519,7 @@ describe('owned application participation', () => {
     expect(b.revision).toEqual(before)
     expect(control.signal.aborted).toBe(false)
     await control.application()
-    expect(b.revision.generation).not.toBe(before.generation)
+    expect(b.revision!.generation).not.toBe(before.generation)
   })
 
   it('reserves coherent view capacity before concurrent asynchronous captures', async () => {

@@ -1,3 +1,4 @@
+import { serveApplicationWorker } from './worker-application-server.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
@@ -7,10 +8,10 @@ import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 
 import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
-import { openApplicationDevice } from './device.js'
-import { openPeerApplication } from './runtime.js'
+import { openApplicationDevice, type ApplicationStorage } from './device.js'
+import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
 import { AbandonedOperationError, connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
-import { connectApplicationWorker, serveApplicationWorker } from './worker-application.js'
+import { connectApplicationWorker } from './worker-application.js'
 import type { ApplicationControlHost } from './recovery.js'
 import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
 
@@ -23,9 +24,11 @@ const definition = defineApplication({ id: 'worker-messages', version: '1', comm
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-async function fixture(options: { readonly closeA?: () => Promise<void> } = {}) {
+async function fixture(options: { readonly closeA?: () => Promise<void>; readonly data?: boolean;
+  readonly openStorageA?: () => Promise<ApplicationStorage>; readonly createMaterializerA?: OpenPeerApplicationOptions['createMaterializer'] } = {}) {
   const host = await createPeerIdentity()
-  const a = await openApplicationDevice({ store: new MemoryBytesStore(), create: true, ...(options.closeA === undefined ? {} : { close: options.closeA }) })
+  const a = await openApplicationDevice({ store: new MemoryBytesStore(), create: true, ...(options.closeA === undefined ? {} : { close: options.closeA }),
+    ...(options.openStorageA === undefined ? {} : { openStorage: options.openStorageA }) })
   const b = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
   const execution = await executionManifestArtifacts(await eventExecutionManifest())
@@ -44,8 +47,12 @@ async function fixture(options: { readonly closeA?: () => Promise<void> } = {}) 
     requester: a.identity.publicKey, coordinator: a.identity.publicKey, controlRevision: 0, reason: 'create', base: null,
   }, a.identity))
   const authority = await registry.read()
-  const sessions = await Promise.all([a, b].map(device => openPeerApplication({ device, definition, authority, epochKeys })))
-  for (const session of sessions) cleanup.push(() => session.close())
+  const sessions = await Promise.all([a, b].map((device, index) => openPeerApplication({ device, definition, authority, epochKeys,
+    ...(index !== 0 || options.createMaterializerA === undefined ? {} : { createMaterializer: options.createMaterializerA }) })))
+  for (const session of sessions) {
+    cleanup.push(() => session.close())
+    if (options.data !== false) await session.keys.missing()
+  }
   return { a: sessions[0]!, b: sessions[1]!, registry }
 }
 
@@ -66,6 +73,74 @@ async function facade(session: ApplicationSession, host?: ApplicationControlHost
 }
 
 describe('owned browser application facade', () => {
+  it('keeps an unused facade and live exchange cold, then shares first data initialization across callers', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve }), closeStorage = vi.fn()
+    const openStorage = vi.fn(async () => { await gate; return { store: new MemoryBytesStore(), close: closeStorage } })
+    const f = await fixture({ data: false, openStorageA: openStorage }), link = await connectApplications(f.a, f.b)
+    cleanup.push(() => link.close())
+    const { client } = await facade(f.a), statuses: string[] = []
+    const stopStatus = client.onStatus(status => statuses.push(status.database)), stopRecovery = client.onRecovery(() => {})
+    const projection = f.a.project<number>({ id: 'registered-only', version: '1', initial: 0, reduce: state => state + 1 })
+    expect(client.describe().id).toBe(definition.id)
+    expect(client.revision).toBeNull(); expect(client.status.database).toBe('idle')
+    const signals = f.b.signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator]()
+    const incoming = signals.next()
+    await client.signals.send('typing', { during: 'protocol' })
+    expect((await incoming).value?.payload).toEqual({ during: 'protocol' }); await signals.return?.()
+    expect(openStorage).not.toHaveBeenCalled(); expect(f.b.status.database).toBe('idle')
+    let reentrant: Promise<ApplicationReadView> | undefined
+    const stopReentrant = f.a.onStatus(status => { if (status.database === 'opening') reentrant ??= f.a.readView() })
+    const pageView = client.readView(), localView = f.a.readView()
+    await vi.waitFor(() => expect(openStorage).toHaveBeenCalledOnce())
+    expect(f.a.status.database).toBe('opening'); expect(closeStorage).not.toHaveBeenCalled()
+    release()
+    const [page, local, reentered] = await Promise.all([pageView, localView, reentrant!])
+    expect(page.revision).toEqual(local.revision); expect(reentered.revision).toEqual(local.revision)
+    await page.release(); local.release(); reentered.release()
+    expect(openStorage).toHaveBeenCalledOnce(); expect(client.status.database).toBe('ready')
+    expect(f.b.status.database).toBe('idle'); expect(statuses).toContain('opening')
+    stopReentrant(); stopRecovery(); stopStatus(); await projection.close(); await client.close()
+    expect(closeStorage).toHaveBeenCalledOnce()
+  })
+
+  it('releases failed data initialization once while the same live participant remains usable', async () => {
+    const failure = new Error('INITIAL_MATERIALIZER_FAILED'), closeStorage = vi.fn()
+    const openStorage = vi.fn(async () => ({ store: new MemoryBytesStore(), close: closeStorage }))
+    const createMaterializer = vi.fn(async () => { throw failure })
+    const f = await fixture({ data: false, openStorageA: openStorage, createMaterializerA: createMaterializer })
+    const link = await connectApplications(f.a, f.b); cleanup.push(() => link.close())
+    const { client } = await facade(f.a)
+    const requests = await Promise.allSettled([f.a.readView(), client.readView()])
+    expect(requests.every(value => value.status === 'rejected' && value.reason instanceof Error && value.reason.message === failure.message)).toBe(true)
+    expect(f.a.status.database).toBe('failed'); expect(f.a.signal.aborted).toBe(false)
+    await expect(f.a.readView()).rejects.toBe(failure)
+    expect(createMaterializer).toHaveBeenCalledOnce(); expect(openStorage).toHaveBeenCalledOnce(); expect(closeStorage).toHaveBeenCalledOnce()
+    const signals = f.b.signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator]()
+    const incoming = signals.next()
+    await client.signals.send('typing', { after: 'database-failure' })
+    expect((await incoming).value?.payload).toEqual({ after: 'database-failure' }); await signals.return?.()
+    await client.close(); expect(closeStorage).toHaveBeenCalledOnce()
+  })
+
+  it('cancels a projection pull during first initialization and releases late storage on owner close', async () => {
+    let release!: (storage: ApplicationStorage) => void
+    const gate = new Promise<ApplicationStorage>(resolve => { release = resolve }), closeStorage = vi.fn()
+    const openStorage = vi.fn(() => gate), createMaterializer = vi.fn(async () => { throw new Error('MUST_NOT_OPEN_AFTER_CLOSE') })
+    const f = await fixture({ data: false, openStorageA: openStorage, createMaterializerA: createMaterializer })
+    const projection = f.a.project<number>({ id: 'cancel-opening', version: '1', initial: 0, reduce: state => state + 1 })
+    const iterator = projection.changes()[Symbol.asyncIterator](), pending = iterator.next()
+    await vi.waitFor(() => expect(openStorage).toHaveBeenCalledOnce())
+    await expect(iterator.next()).rejects.toThrow('APPLICATION_PROJECTION_CONCURRENT_NEXT')
+    expect((await iterator.return?.())?.done).toBe(true); expect((await pending).done).toBe(true)
+    const closing = f.a.close()
+    expect(f.a.status.database).toBe('closed')
+    release({ store: new MemoryBytesStore(), close: closeStorage })
+    await closing
+    expect(createMaterializer).not.toHaveBeenCalled(); expect(closeStorage).toHaveBeenCalledOnce()
+    expect(f.a.revision).toBeNull()
+  })
+
   it('waits for the specified author when different peers reuse an operation ID', async () => {
     const f = await fixture(), link = await connectApplications(f.a, f.b)
     cleanup.push(() => link.close())
@@ -237,7 +312,7 @@ describe('owned browser application facade', () => {
     const f = await fixture(), lifetime = new AbortController()
     const listeners = new Set<(status: ApplicationParticipationStatus) => void>()
     let status: ApplicationParticipationStatus = { phase: 'approval-required', connectedPeers: [], error: null,
-      recovery: { id: 'one-proposal', coordinator: f.a.deviceId, point: f.a.revision.point,
+      recovery: { id: 'one-proposal', coordinator: f.a.deviceId, point: f.a.revision!.point,
         reason: 'freshness-unknown', observedAt: null, ageMs: null } }
     const publish = (): void => { for (const listener of listeners) listener(status) }
     const approveRecovery = vi.fn(async (id: string) => {

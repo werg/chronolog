@@ -13,7 +13,8 @@
     "./tendriller": "./src/tendriller.ts",
     "./sql": "./src/sql.ts",
     "./sql-browser": "./src/sql-browser.ts",
-    "./websocket": "./src/websocket.ts"
+    "./websocket": "./src/websocket.ts",
+    "./worker": "./src/worker.ts"
   },
   "dependencies": {
     "@chronolog/peer-generation": "workspace:*",

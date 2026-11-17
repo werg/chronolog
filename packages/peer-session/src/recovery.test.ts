@@ -50,7 +50,8 @@ it.each([false, true])('does not rebind a delayed ancestor candidate to newer au
     const value: unknown = Reflect.get(target, property, target)
     return typeof value === 'function' ? value.bind(target) : value
   } })
-  const recovery = new ApplicationRecovery({ replica: delayed, store: stores[1]!, signal: new AbortController().signal })
+  const recovery = new ApplicationRecovery({ replica: delayed, store: stores[1]!, signal: new AbortController().signal,
+    adoptAuthority: async authority => { await delayed.receiveHistory(authority, []) } })
   closing.push(() => recovery.close())
   const requests: SignedTransitionRequest[] = []
   const pending = recovery.takeover({ application: () => registry.read(), selectGeneration(request) { requests.push(request); return registry.select(request) } }, {

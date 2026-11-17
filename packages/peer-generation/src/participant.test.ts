@@ -14,7 +14,7 @@ describe('role-filtered participant transport', () => {
     const transport = createParticipantTransport({ applicationId: scope, exchange: async request => {
       calls++; return createParticipantResponse(request, null)
     } })
-    for (const [facet, action] of [['database', 'submit'], ['database', 'range'], ['content', 'chunk'], ['ephemeral', 'signal']] as const) {
+    for (const [facet, action] of [['database', 'open'], ['database', 'submit'], ['database', 'range'], ['content', 'chunk'], ['ephemeral', 'signal']] as const) {
       expect(participantAccepts(PEER_PARTICIPANT_POLICY, { facet, action })).toBe(true)
       expect(participantAccepts(CONTROL_PARTICIPANT_POLICY, { facet, action })).toBe(false)
       const request = createParticipantRequest({ applicationId: scope, facet, action, payload: { private: 'body' } }, PEER_PARTICIPANT_POLICY)

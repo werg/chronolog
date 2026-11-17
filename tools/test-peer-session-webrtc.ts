@@ -247,7 +247,7 @@ try {
       signaling: after.signaling, reliable: { before: before.stats, after: after.stats }, nativeChannels: { before: nativeBefore, after: nativeChannel!.stats },
       content: { bytes: content.length, expectedSha256: contentHash, receivedSha256: receivedContent.sha256, reopenedSha256: reopenedContent.sha256,
         referenceId: reference.id, retainedBy: receivedContent.retained.payload.peer },
-      history: { nativePoint: nativeRevision.point, browserPoint: converged.revision.point, reopenedPoint: reopened.revision.point,
+      history: { nativePoint: nativeRevision!.point, browserPoint: converged.revision.point, reopenedPoint: reopened.revision.point,
         events: converged.events, browserOriginal: browserOperation.applied, browserRetry: exactRetry.applied, native: nativeApplied },
       signals: { browser: afterSignals.signals, native: nativeSignals }, coverage, introduction: introduction.stats, expectedTerminations,
       byteBoundary: 'Reliable network counters include application framing; RTC adapter counters include its packets. Neither is provider billing or IP/DTLS overhead.' },

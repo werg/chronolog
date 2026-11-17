@@ -40,7 +40,7 @@ try {
     expectedGeneration: null, requester: aDevice.identity.publicKey, coordinator: aDevice.identity.publicKey,
     controlRevision: 0, base: null, reason: 'create', transitionId: 'initial' }, aDevice.identity));
   const open = async (device, name) => {
-    const app = await openSqlApplication({ engine, device, databasePath: join(directory, `${name}-materialized.sqlite`), definition,
+    const app = await openSqlApplication({ createEngine: () => engine, device, databasePath: join(directory, `${name}-materialized.sqlite`), definition,
       authority: await registry.read(), epochKeys: new Map([[0, key]]), schema: prepared.schema });
     sessions.push(app); return app;
   };

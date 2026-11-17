@@ -41,7 +41,7 @@ export const CONTROL_PARTICIPANT_POLICY = policy('control', {
 })
 export const PEER_PARTICIPANT_POLICY = policy('peer', {
   control: ['state', 'keyShare'], publication: ['definition', 'read'],
-  database: ['submit', 'range', 'coverage'], content: ['manifest', 'chunk', 'retained', 'observeRetention'], ephemeral: ['signal', 'hint'],
+  database: ['open', 'submit', 'range', 'coverage'], content: ['manifest', 'chunk', 'retained', 'observeRetention'], ephemeral: ['signal', 'hint'],
 })
 
 export class ParticipantProtocolError extends Error {

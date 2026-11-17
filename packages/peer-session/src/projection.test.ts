@@ -52,7 +52,7 @@ async function fixture() {
   const open = async (index: number) => {
     const device = await openApplicationDevice({ store: stores[index]! })
     const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
-    cleanup.push(() => session.close()); return session
+    cleanup.push(() => session.close()); await session.keys.missing(); return session
   }
   const a = await open(0), b = await open(1)
   return { a, b, stores, open, registry, async recover() {
