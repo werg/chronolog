@@ -56,7 +56,7 @@ describe('selected Chronolog application adapter', () => {
     f.set('rejected', true)
     await Promise.resolve()
     expect(f.reads, 'a paused consumer only receives replacement operation state on its next pull').toBe(before)
-    expect((await iterator.next()).value).toMatchObject({ operationId: 'stable', proposalId: 'original-proposal', status: 'rejected', outcome: 'rejected' })
+    expect((await iterator.next()).value).toMatchObject({ operationId: 'stable', proposalId: 'original-proposal', status: 'final', outcome: 'rejected' })
     expect((await iterator.next()).done).toBe(true)
     expect(f.watchers).toBe(0)
   })
@@ -75,5 +75,13 @@ describe('selected Chronolog application adapter', () => {
     const eventsOnly = await noSql.readView()
     await expect(eventsOnly.query('SELECT 1')).rejects.toThrow('SQL_DISABLED_FOR_EVENT_PROFILE')
     await eventsOnly.release()
+  })
+
+  it('returns an original terminal outcome immediately on exact retry', async () => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: true })
+    f.set('rejected', true)
+    expect(await backend.submit(program(emit('conversation', null)), { operationId: 'stable' })).toMatchObject({
+      operationId: 'stable', proposalId: 'original-proposal', status: 'final', outcome: 'rejected', error: 'claim_conflict',
+    })
   })
 })

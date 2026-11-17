@@ -62,7 +62,7 @@ export async function qualifyApplicationScope(modulePath: string) {
         await publishEvidence()
         await native.node.waitForIdle()
         const value = await backend.operations.get(pending.receipt.operationId)
-        if (value?.status === 'final' || value?.status === 'rejected') return value
+        if (value?.status === 'final') return value
         await new Promise(resolve => setTimeout(resolve, 10))
       }
       const txId = utf8(pending.receipt.proposalId)
@@ -84,23 +84,25 @@ export async function qualifyApplicationScope(modulePath: string) {
         typeof value === 'bigint' ? value.toString() : value)}`)
     }
     const scope = 'inspection-notes'
-    assert.equal((await include(await submit(recipe.initializeScopedState({ scope }), 'scope-initialize'))).status, 'final')
+    assert.equal((await include(await submit(recipe.initializeScopedState({ scope }), 'scope-initialize'))).outcome, 'accepted')
     const original = recipe.setScopedState({ scope, expectedGeneration: 0, value: { note: 'already accepted' } })
     const accepted = await include(await submit(original, 'scope-accepted'))
-    assert.equal(accepted.status, 'final')
+    assert.equal(accepted.outcome, 'accepted')
     const stale = await submit(recipe.setScopedState({ scope, expectedGeneration: 0, value: { note: 'offline edit' } }), 'scope-stale')
     assert.notEqual((await backend.operations.get('scope-stale'))?.status, 'final')
     const reset = await include(await submit(recipe.rotateScopedState({ scope, expectedGeneration: 0, value: { note: 'reset' } }), 'scope-reset'))
-    assert.equal(reset.status, 'final')
+    assert.equal(reset.outcome, 'accepted')
     const rejection = await include(stale)
-    assert.equal(rejection.status, 'rejected')
+    assert.equal(rejection.status, 'final')
+    assert.equal(rejection.outcome, 'rejected')
     assert.equal(rejection.error, 'FINALITY_TIMESTAMP_CLOSED')
     assert.equal(rejection.proposalId, stale.receipt.proposalId)
     // A newly authored edit carrying the captured old generation reaches SQL
     // in chronological order and is independently rejected by the application guard.
     const generationRejection = await include(await submit(recipe.setScopedState({ scope,
       expectedGeneration: 0, value: { note: 'stale captured generation' } }), 'scope-stale-generation'))
-    assert.equal(generationRejection.status, 'rejected')
+    assert.equal(generationRejection.status, 'final')
+    assert.equal(generationRejection.outcome, 'rejected')
     assert.equal(generationRejection.error, 'assert:scope_generation_changed')
 
     const beforeRetry = await native.transport.history()

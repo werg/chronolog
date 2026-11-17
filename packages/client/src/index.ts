@@ -7,6 +7,7 @@ export * from './values.js'
 export * from './projections.js'
 export type { Signals, EphemeralSignal, SignalPayload, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
 export { program, emit, sqlStatement, type ChangeProgram, type EmitStep, type EventBatch, type EventReadOptions, type EventPayload, type EffectiveEvent } from '@chronolog/protocol'
+export type { ChronologEventOrigin, ViewChange, ViewChangeOptions } from '@chronolog/protocol'
 
 export {
   ChronologRpcError,

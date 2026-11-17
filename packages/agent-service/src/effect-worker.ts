@@ -275,7 +275,7 @@ export class DurableEffectWorker {
     const checkpoint = await this.#checkpoint.load()
     if (checkpoint === null) return { cursor: null, revision: null, pending: null }
     const value = assertCanonicalCbor(checkpoint.state)
-    if (!Array.isArray(value) || value.length !== 2 || value[0] !== 1n) throw new Error('EFFECT_CHECKPOINT_INVALID')
+    if (!Array.isArray(value) || value.length !== 2 || value[0] !== 2n) throw new Error('EFFECT_CHECKPOINT_INVALID')
     let pending: PendingBatch | null = null
     if (value[1] !== null) {
       const batch: unknown = value[1]
@@ -301,7 +301,7 @@ export class DurableEffectWorker {
     const batch: CborValue = p === null ? null : [p.events.map(encodeEvent), p.scannedThrough, p.revision, BigInt(p.next),
       p.active === null ? null : [p.active.effectId, p.active.stage,
         p.active.stage === 'result' ? canonicalEventPayload(p.active.result) : null]]
-    await this.#checkpoint.commit({ cursor: state.cursor, revision: state.revision, state: encodeCanonicalCbor([1n, batch]) })
+    await this.#checkpoint.commit({ cursor: state.cursor, revision: state.revision, state: encodeCanonicalCbor([2n, batch]) })
   }
 }
 
@@ -316,10 +316,22 @@ function parsePayload(value: string): EventPayload {
   return payload
 }
 function encodeEvent(event: FinalEvent): CborValue {
-  return [event.id, event.proposalId, BigInt(event.eventOrdinal), event.topic, canonicalEventPayload(event.payload)]
+  const origin = event.origin
+  return [event.id, event.proposalId, BigInt(event.eventOrdinal), event.topic, canonicalEventPayload(event.payload),
+    [origin.kind, origin.groupId, origin.authorId, origin.operationId, origin.authorTimestampMs, origin.membershipRevision, origin.writerCapability]]
 }
 function decodeEvent(value: CborValue): FinalEvent {
-  if (!Array.isArray(value) || value.length !== 5 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
+  if (!Array.isArray(value) || value.length !== 6 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
       typeof value[2] !== 'bigint' || typeof value[3] !== 'string' || typeof value[4] !== 'string') throw new Error('EFFECT_CHECKPOINT_INVALID')
-  return cloneFinalEvent({ id: value[0], proposalId: value[1], eventOrdinal: Number(value[2]), topic: value[3], payload: parsePayload(value[4]) })
+  const rawOrigin: unknown = value[5]
+  if (!Array.isArray(rawOrigin) || rawOrigin.length !== 7) throw new Error('EFFECT_CHECKPOINT_INVALID')
+  const origin = rawOrigin as readonly CborValue[]
+  if (origin[0] !== 'chronolog' ||
+      typeof origin[1] !== 'string' || typeof origin[2] !== 'string' || typeof origin[3] !== 'string' ||
+      typeof origin[4] !== 'string' || typeof origin[5] !== 'string' || (origin[6] !== null && typeof origin[6] !== 'string')) {
+    throw new Error('EFFECT_CHECKPOINT_INVALID')
+  }
+  return cloneFinalEvent({ id: value[0], proposalId: value[1], eventOrdinal: Number(value[2]), topic: value[3], payload: parsePayload(value[4]),
+    origin: { kind: origin[0], groupId: origin[1], authorId: origin[2], operationId: origin[3], authorTimestampMs: origin[4],
+      membershipRevision: origin[5], writerCapability: origin[6] } })
 }

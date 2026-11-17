@@ -1,4 +1,4 @@
-import { bytesToBase64Url, emit, encodeChangeProgram, program, type EventBatch } from '@chronolog/protocol'
+import { bytesToBase64Url, emit, encodeChangeProgram, program, type EventBatch, type ViewChangeOptions } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 import type { EphemeralSignal, SignalSubscribeOptions } from '@chronolog/signals'
 
@@ -25,6 +25,50 @@ function readHandle(revision: string, release: () => void): RpcReadHandle {
 }
 
 describe('application RPC', () => {
+  it('preserves authenticated event origin on HTTP reads, subscriptions and captured views', async () => {
+    const origin = { kind: 'chronolog' as const, groupId: group, authorId: '11'.repeat(32), operationId: 'signed-operation',
+      authorTimestampMs: '9007199254740993', membershipRevision: group, writerCapability: group }
+    const history: EventBatch = { ...batch(), transactions: [{ proposalId: 'proposal', events: [{ id: 'proposal:0', proposalId: 'proposal', eventOrdinal: 0,
+      topic: 'jobs', payload: { origin: { authorId: 'forged-owner' }, $chronologRpc: ['bytes', 'AA=='] }, origin }] }] }
+    const service = new NodeRpcService({ node: node({
+      events: { read: async () => history, async *subscribe() { yield history } },
+      readView: async () => ({ ...readHandle(history.revision, () => undefined), readEvents: () => history }),
+    }) })
+    const server = new HttpRpcServer({ service, port: 0 })
+    const transport = new HttpRpcTransport({ baseUrl: (await server.listen()).url })
+    try {
+      expect(await transport.unary('events.read', request)).toEqual(history)
+      const received = []
+      for await (const value of transport.stream('events.subscribe', request)) received.push(value)
+      expect(received).toEqual([history])
+      const captured = await transport.unary('view.open', request)
+      expect(await transport.unary('view.events', { ...request, viewId: captured.viewId })).toEqual(history)
+    } finally { await transport.close(); await server.close() }
+  })
+
+  it('routes view changes separately from events and cancels them when their service closes', async () => {
+    const calls: ViewChangeOptions[] = []
+    const service = new NodeRpcService({ node: node({ changes: options => ({ async *[Symbol.asyncIterator]() {
+      calls.push(options!)
+      yield { view: options!.view!, revision: 'view-1', finalRevision: 'final-1' }
+      await new Promise<void>(resolve => {
+        if (options!.signal!.aborted) resolve()
+        else options!.signal!.addEventListener('abort', () => resolve(), { once: true })
+      })
+    } }) }) })
+    const transport = new InProcessRpcTransport(service)
+    const iterator = transport.stream('view.changes', request)[Symbol.asyncIterator]()
+    expect((await iterator.next()).value).toEqual({ view: 'final', revision: 'view-1', finalRevision: 'final-1' })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.view).toBe('final')
+    await expect(transport.stream('view.changes', { ...request, view: 'invalid' as never })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'invalid_argument' })
+    const pending = iterator.next()
+    await service.close()
+    expect((await pending).done).toBe(true)
+    expect(calls[0]!.signal!.aborted).toBe(true)
+    await transport.close()
+  })
+
   it('carries live signals over HTTP with exact string identities and no durable publication', async () => {
     const value: EphemeralSignal = { scope: group, authorId: 'author', sessionId: 'session', sequence: 1,
       topic: 'typing', payload: { active: true, $chronologRpc: ['bytes', 'AA=='] }, issuedAtMs: 1, expiresAtMs: 1000 }
@@ -174,6 +218,7 @@ describe('application RPC', () => {
     const service = new NodeRpcService({ node: node({}) })
     await expect(service.readEvents(request, { method: 'events.read' })).rejects.toMatchObject({ code: 'failed_precondition' })
     await expect(service.openReadView(request, { method: 'view.open' })).rejects.toMatchObject({ code: 'failed_precondition' })
+    await expect(service.streamViewChanges(request, { method: 'view.changes' })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'failed_precondition' })
     await expect(service.sendSignal({ ...request, topic: 'typing', payload: null }, { method: 'signals.send' })).rejects.toMatchObject({ code: 'failed_precondition' })
     await expect(service.subscribeSignals(request, { method: 'signals.subscribe' })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'failed_precondition' })
     await service.close()

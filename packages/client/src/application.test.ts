@@ -1,4 +1,4 @@
-import { decodeChangeProgram, emit, program, type EventBatch } from '@chronolog/protocol'
+import { decodeChangeProgram, emit, program, type EventBatch, type ViewChange } from '@chronolog/protocol'
 import { ChronologRpcError, type RpcCallOptions, type RpcTransport, type SubmitChangeRequest } from '@chronolog/rpc'
 import type { EphemeralSignal } from '@chronolog/signals'
 import { describe, expect, it } from 'vitest'
@@ -171,5 +171,54 @@ describe('application client', () => {
     expect(calls.slice(1, 4).every(call => call.viewId === 'lease-a')).toBe(true)
     await view.release()
     await expect(view.query('SELECT v')).rejects.toMatchObject({ code: 'revision_unavailable' })
+  })
+
+  it('coalesces view invalidations independently of durable event cursors and releases a waiting pull', async () => {
+    const calls: unknown[] = []
+    let startBurst!: () => void, drained!: () => void, stopped = false, lifetime: AbortSignal | undefined
+    const burst = new Promise<void>(resolve => { startBurst = resolve })
+    const caughtUp = new Promise<void>(resolve => { drained = resolve })
+    const value = (revision: number): ViewChange => ({ view: 'local', revision: `local-${revision}`, finalRevision: 'final-1' })
+    const transport = { stream: (method: string, request: unknown, options: RpcCallOptions) => ({ async *[Symbol.asyncIterator]() {
+      calls.push({ method, request }); lifetime = options.signal
+      try {
+        yield value(0)
+        await burst
+        for (let revision = 1; revision <= 100; revision++) yield value(revision)
+        drained()
+        await new Promise<void>(resolve => {
+          if (options.signal!.aborted) resolve()
+          else options.signal!.addEventListener('abort', () => resolve(), { once: true })
+        })
+      } finally { stopped = true }
+    } }) } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group', requestId: () => 'view-watch' })
+    const iterator = client.changes({ view: 'local' })[Symbol.asyncIterator]()
+    expect((await iterator.next()).value).toEqual(value(0))
+    startBurst(); await caughtUp
+    expect((await iterator.next()).value).toEqual(value(100))
+    const pending = iterator.next()
+    await iterator.return?.()
+    expect((await pending).done).toBe(true)
+    expect(lifetime?.aborted).toBe(true)
+    await expect.poll(() => stopped).toBe(true)
+    expect(calls).toEqual([{ method: 'view.changes', request: { groupId: 'group', requestId: 'view-watch', view: 'local' } }])
+    await client.close()
+  })
+
+  it('reconnects view changes from current confirmed state without a replay cursor', async () => {
+    const requests: unknown[] = []
+    const transport = { stream: (_method: string, request: unknown) => ({ async *[Symbol.asyncIterator]() {
+      requests.push(request)
+      yield { view: 'final', revision: `final-${requests.length}`, finalRevision: `final-${requests.length}` }
+      throw new ChronologRpcError('transport_unavailable', 'Disconnected')
+    } }) } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group', requestId: () => 'watch', streamRetryDelayMs: () => 0 })
+    const iterator = client.changes()[Symbol.asyncIterator]()
+    expect((await iterator.next()).value?.revision).toBe('final-1')
+    expect((await iterator.next()).value?.revision).toBe('final-2')
+    await iterator.return?.()
+    expect(requests).toEqual(Array.from({ length: 2 }, () => ({ groupId: 'group', requestId: 'watch', view: 'final' })))
+    await client.close()
   })
 })

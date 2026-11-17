@@ -1,12 +1,15 @@
 import { MemoryOperationStore } from '@chronolog/node-core'
 import type { DurableOperationStore } from '@chronolog/node-core'
-import type { EventPayload } from '@chronolog/protocol'
+import type { ChronologEventOrigin, EventPayload } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
 import { DurableEffectWorker, effectIdentity } from './effect-worker.js'
 import type { EffectHandler, EffectWorkerOptions } from './effect-worker.js'
 import type { EventReadOptions, FinalEventBatch, FinalEventSource } from './event-source.js'
 import { ResidentAgentService } from './service.js'
+
+const origin: ChronologEventOrigin = { kind: 'chronolog', groupId: 'A'.repeat(43), authorId: '11'.repeat(32),
+  operationId: 'signed-operation', authorTimestampMs: '123', membershipRevision: 'A'.repeat(43), writerCapability: 'B'.repeat(42) + 'A' }
 
 function source(batches: readonly { readonly topic: string; readonly payloads: readonly EventPayload[] }[]): FinalEventSource {
   return {
@@ -17,7 +20,7 @@ function source(batches: readonly { readonly topic: string; readonly payloads: r
           const proposalId = `proposal-${start + offset}`
           return options.topics?.includes(batch.topic) === false ? [] : [{ proposalId,
             events: batch.payloads.map((payload, eventOrdinal) => ({ id: `${proposalId}:${eventOrdinal}`, proposalId,
-              eventOrdinal, topic: batch.topic, payload })) }]
+              eventOrdinal, topic: batch.topic, payload, origin: { ...origin } })) }]
         }),
         scannedThrough: `c:${end}`, hasMore: end < batches.length, revision: `r:${end}`,
       }
@@ -58,6 +61,30 @@ describe('durable final-intent workers', () => {
     await worker.processNext()
     expect((await worker.status()).cursor).toBe('c:1')
     expect(f.calls).toHaveLength(0)
+  })
+
+  it('keeps authenticated provenance in the dispatch checkpoint across provider retry and ignores payload authority claims', async () => {
+    const f = fixture({ recovery: 'idempotent' }), received: ChronologEventOrigin[] = []
+    const payload = { origin: { authorId: 'forged-owner', writerCapability: 'forged-grant' }, role: 'owner' }
+    let attempts = 0
+    const configuration: EffectWorkerOptions = { ...f.configuration,
+      source: source([{ topic: 'jobs.requested', payloads: [payload] }]),
+      handler: { ...f.configuration.handler, dispatch: async ({ event }) => {
+        received.push(structuredClone(event.origin))
+        expect(event.payload).toEqual(payload)
+        expect(event.origin.authorId).toBe(origin.authorId)
+        if (++attempts === 1) {
+          Object.assign(event.origin, { authorId: '33'.repeat(32) })
+          throw new Error('provider response lost')
+        }
+        return { authorizedAuthor: event.origin.authorId }
+      } },
+    }
+    await expect((await DurableEffectWorker.open(configuration)).processNext()).rejects.toThrow('EFFECT_OUTCOME_UNCERTAIN')
+    await (await DurableEffectWorker.open(configuration)).processNext()
+    expect(received).toEqual([origin, origin])
+    expect(f.results).toHaveLength(1)
+    expect(f.results[0]!.payload).toMatchObject({ result: { authorizedAuthor: origin.authorId } })
   })
 
   it('leaves uncertain effects blocked after provider action and a failed result-state commit', async () => {

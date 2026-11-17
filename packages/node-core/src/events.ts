@@ -1,14 +1,15 @@
 import {
   assertCanonicalCbor, assertEventTopic, base64UrlToBytes, bytesToBase64Url,
-  encodeCanonicalCbor, equalBytes, isEmitStep, type ChangeProgram, type CborValue,
+  cloneEventOrigin, encodeCanonicalCbor, equalBytes, isEmitStep, type ChangeProgram, type CborValue,
 } from '@chronolog/protocol'
 
 export type { EffectiveEvent, EventTransaction, EventReadOptions, EventBatch } from '@chronolog/protocol'
-import type { EffectiveEvent, EventTransaction, EventReadOptions, EventBatch } from '@chronolog/protocol'
+import type { ChronologEventOrigin, EffectiveEvent, EventTransaction, EventReadOptions, EventBatch } from '@chronolog/protocol'
 export interface EventHistoryItem {
   readonly anchor: string
   readonly proposalId?: string
   readonly program?: ChangeProgram
+  readonly origin?: ChronologEventOrigin
   readonly outcome: 'accepted' | 'rejected' | 'skipped' | 'unresolved'
 }
 export interface EventHistorySnapshot {
@@ -66,7 +67,7 @@ export function readEffectiveEvents(snapshot: EventHistorySnapshot, options: Eve
     const item = snapshot.items[scan]!
     if (item.outcome === 'unresolved') break
     if (item.outcome === 'accepted') {
-      if (item.program === undefined || item.proposalId === undefined) throw new Error('EVENT_APPLIED_INPUT_MISSING')
+      if (item.program === undefined || item.proposalId === undefined || item.origin === undefined) throw new Error('EVENT_APPLIED_INPUT_MISSING')
       let ordinal = 0
       const events: EffectiveEvent[] = []
       for (const step of item.program.steps) {
@@ -74,7 +75,7 @@ export function readEffectiveEvents(snapshot: EventHistorySnapshot, options: Eve
         const eventOrdinal = ordinal++
         if (topics === null || topics.includes(step.topic)) events.push({
           id: `${item.proposalId}:${eventOrdinal}`, proposalId: item.proposalId,
-          eventOrdinal, topic: step.topic, payload: structuredClone(step.payload),
+          eventOrdinal, topic: step.topic, payload: structuredClone(step.payload), origin: cloneEventOrigin(item.origin),
         })
       }
       if (events.length > 0) {

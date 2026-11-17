@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "edd6fe913a0c7412acbf80b019793ff9aeb95934",
+  "sourceTree": "5aa166da7a98dad16b21ebf6d3496a2db44301b4",
+  "sourceDirty": false,
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm ci --ignore-scripts --no-audit --no-fund",
+  "purpose": "Authenticated event provenance, independent hosted and peer Signals, coalesced application view changes and separate operation lifecycle/outcome.",
+  "package": "@tendriller/core",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-sdk-edd6fe91.tgz",
+  "sha256": "602641216b88c7bda9ed346bb6dd3adb31b14d6dffb4b24adb82cc09f58ace8c"
+}

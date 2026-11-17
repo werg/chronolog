@@ -21,6 +21,8 @@ import {
   type EventPayload,
   type EventBatch,
   type EventReadOptions,
+  type ViewChange,
+  type ViewChangeOptions,
 } from '@chronolog/protocol'
 import {
   ChronologRpcError,
@@ -277,6 +279,31 @@ export class ChronologClient {
       groupId: this.groupId, requestId: this._requestId(), signedWire: signedWire.slice(),
     }, options)
     return new TransactionHandle(this, submission)
+  }
+
+  /** Current revision followed by coalesced invalidations. Reconnect reads current state; there is no replay cursor. */
+  changes(options: ViewChangeOptions = {}): AsyncIterable<ViewChange> {
+    const view = options.view ?? 'final', externalSignal = options.signal, self = this
+    return { [Symbol.asyncIterator]() {
+      if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
+      const request = { groupId: self.groupId, requestId: self._requestId(), view }
+      const resource = self.#revisionStream((_cursor, signal) => self.#transport.stream('view.changes', request, self.#callOptions(signal)), () => undefined)
+      const close = (): void => { externalSignal?.removeEventListener('abort', close); resource.dispose() }
+      externalSignal?.addEventListener('abort', close, { once: true })
+      if (externalSignal?.aborted === true) close()
+      const iterator = resource[Symbol.asyncIterator]()
+      return {
+        async next() {
+          try {
+            const result = await iterator.next()
+            if (result.done) close()
+            return result
+          } catch (error) { close(); throw error }
+        },
+        async return() { close(); await iterator.return?.(); return { done: true as const, value: undefined } },
+        async throw(error: unknown) { close(); await iterator.return?.(); throw error },
+      }
+    } }
   }
 
   async readView(options: { readonly view?: SqlView; readonly signal?: AbortSignal } = {}): Promise<ClientReadView> {

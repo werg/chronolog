@@ -8,6 +8,8 @@ const batch = (cursor: string, values: readonly number[] = [], hasMore = false, 
   scannedThrough: cursor, revision, hasMore,
   transactions: [{ proposalId: `tx-${cursor}`, events: values.map((value, eventOrdinal) => ({
     id: `${cursor}:${eventOrdinal}`, proposalId: `tx-${cursor}`, eventOrdinal, topic: 'counts', payload: value,
+    origin: { kind: 'chronolog', groupId: 'A'.repeat(43), authorId: '11'.repeat(32), operationId: `operation-${cursor}`,
+      authorTimestampMs: '123', membershipRevision: 'A'.repeat(43), writerCapability: null },
   })) }],
 })
 

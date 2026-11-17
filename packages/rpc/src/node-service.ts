@@ -61,6 +61,7 @@ import type {
   SendSignalRequest, SubscribeSignalsRequest,
   GetOperationRequest, OperationStatus, StreamOperationsRequest,
   OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
+  ViewChangesRequest, ViewChangesResponse,
 } from './types.js'
 import { RPC_API_VERSION } from './types.js'
 import type {
@@ -212,6 +213,14 @@ export class NodeRpcService implements ChronologRpcService {
       const fingerprint = stableFingerprint(operation)
       if (fingerprint !== previous) { previous = fingerprint; yield operation }
     }
+  }
+
+  async *streamViewChanges(request: ViewChangesRequest, context: RpcCallContext): AsyncIterable<ViewChangesResponse> {
+    this.#assertGroup(request.groupId)
+    const signal = context.signal === undefined ? this.#signalLifetime.signal : AbortSignal.any([this.#signalLifetime.signal, context.signal])
+    signal.throwIfAborted()
+    if (this.#node.changes === undefined) throw failed('View change notifications are not enabled for this node')
+    yield* this.#node.changes({ view: request.view === undefined ? 'final' : sqlView(request.view), signal })
   }
 
   async openReadView(request: OpenReadViewRequest, context: RpcCallContext): Promise<OpenReadViewResponse> {

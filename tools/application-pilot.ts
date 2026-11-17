@@ -229,11 +229,12 @@ try {
       heldAtMs: claimWindow.heldAtMs, heldForMs: claimWindow.heldForMs, proposalTimestamps: 'unchanged browser clocks',
       arbitraryOfflineAdmissionClaim: false }
     await Promise.all(all.map((page, index) => page.waitForFunction(id => {
-      const row = document.querySelector(`[data-operation="${id}"]`); return ['final', 'rejected'].includes(row?.getAttribute('data-status') ?? '')
+      const row = document.querySelector(`[data-operation="${id}"]`); return row?.getAttribute('data-status') === 'final'
     }, claimIds[index]!)))
     const claimStates = await Promise.all(all.map((page, index) => page.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), claimIds[index]!)))
-    assert.deepEqual(claimStates.map(state => state?.status).sort(), ['final', 'rejected'])
-    assert.equal(claimStates.find(state => state?.status === 'rejected')?.error, 'assert:task_unavailable')
+    assert(claimStates.every(state => state?.status === 'final'))
+    assert.deepEqual(claimStates.map(state => state?.outcome).sort(), ['accepted', 'rejected'])
+    assert.equal(claimStates.find(state => state?.outcome === 'rejected')?.error, 'assert:task_unavailable')
     await native.node.waitForIdle()
     const claimOrder = claimStates.map((state, index) => {
       assert(state?.proposalId !== undefined)
@@ -241,9 +242,9 @@ try {
       assert(candidate !== null)
       return { index, orderKey: candidate.orderKey }
     }).sort((left, right) => compareTransactionOrder(left.orderKey, right.orderKey))
-    assert.equal(claimStates[claimOrder[0]!.index]?.status, 'final', 'the earlier deterministic author-time key must win the SQL conflict')
-    const winner = all[claimStates[0]?.status === 'final' ? 0 : 1]!
-    const loser = all[claimStates[0]?.status === 'final' ? 1 : 0]!
+    assert.equal(claimStates[claimOrder[0]!.index]?.outcome, 'accepted', 'the earlier deterministic author-time key must win the SQL conflict')
+    const winner = all[claimStates[0]?.outcome === 'accepted' ? 0 : 1]!
+    const loser = all[claimStates[0]?.outcome === 'accepted' ? 1 : 0]!
     await Promise.all(all.map(page => expect(page.locator('#tasks [data-action="claim"]')).toBeDisabled()))
     assert.equal(await board.locator('#tasks .task > p').textContent(), await compact.locator('#tasks .task > p').textContent())
     passed('with the finality clock held through inclusion, disconnected competing claims resolve by deterministic author order to one acceptance and one SQL rejection')
@@ -256,11 +257,11 @@ try {
     // operation frontier before applying the renderer's short DOM deadline.
     await waitFor(async () => {
       const operation = await loser.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), rejectedJobId)
-      if (operation?.status === 'rejected') assert.equal(operation.error, 'assert:claim_required')
-      return operation?.status === 'rejected'
+      if (operation?.status === 'final' && operation.outcome === 'rejected') assert.equal(operation.error, 'assert:claim_required')
+      return operation?.status === 'final' && operation.outcome === 'rejected'
     }, 'losing claimant final job rejection')
     report.timingsMs.browserRejectedJob = Date.now() - rejectedJobStarted
-    await expect(loser.locator(`#operations > li[data-operation="${rejectedJobId}"]`)).toHaveAttribute('data-status', 'rejected')
+    await expect(loser.locator(`#operations > li[data-operation="${rejectedJobId}"]`)).toHaveAttribute('data-status', 'final')
     assert.equal(report.counts.effectDispatches, 0)
     const jobStarted = Date.now()
     const winningJob = await authorWithAdmission('winning claimant native job intent', () =>

@@ -47,6 +47,7 @@ const unaryDispatch: Record<UnaryRpcMethod, keyof ChronologRpcService> = {
 }
 
 const streamDispatch: Record<StreamRpcMethod, keyof ChronologRpcService> = {
+  'view.changes': 'streamViewChanges',
   'events.subscribe': 'subscribeEvents',
   'signals.subscribe': 'subscribeSignals',
   'operation.subscribe': 'subscribeOperations',

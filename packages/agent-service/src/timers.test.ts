@@ -13,7 +13,9 @@ class TimerSource implements FinalEventSource {
     const after = Number((options.cursor ?? 'c:0').slice(2)), end = Math.min(this.entries.length, after + this.maxRead)
     return { transactions: this.entries.slice(after, end).map((payload, offset) => {
       const proposalId = `proposal-${after + offset}`
-      return { proposalId, events: [{ id: `${proposalId}:0`, proposalId, eventOrdinal: 0, topic: 'timers.configuration', payload }] }
+      return { proposalId, events: [{ id: `${proposalId}:0`, proposalId, eventOrdinal: 0, topic: 'timers.configuration', payload,
+        origin: { kind: 'chronolog' as const, groupId: 'A'.repeat(43), authorId: '11'.repeat(32), operationId: `schedule-${after + offset}`,
+          authorTimestampMs: '123', membershipRevision: 'A'.repeat(43), writerCapability: null } }] }
     }), scannedThrough: `c:${end}`, hasMore: end < this.entries.length, revision: `r:${end}` }
   }
   async *subscribe(): AsyncIterable<FinalEventBatch> { throw new Error('timers use durable reads') }

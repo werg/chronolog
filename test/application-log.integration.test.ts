@@ -8,7 +8,7 @@ import { ChronologClient, DurableProjection, ProjectionConflictError, type Proje
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
-import { bytesToBase64Url, emit, equalBytes, generateEd25519KeyPair, program, sqlStatement } from '@chronolog/protocol'
+import { bytesToBase64Url, bytesToHex, emit, equalBytes, generateEd25519KeyPair, program, sqlStatement, type ViewChange } from '@chronolog/protocol'
 import { feedIdFromPublicKey, PortableFeedTransport } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { FeedStore, nativeFeedCrypto } from '@chronolog/transport-ssb'
@@ -50,15 +50,19 @@ describe('public application backend with native durable execution', () => {
       const history = await view.readEvents()
       expect(rows).toMatchObject({ revision: view.revision, rows: [[10n]] })
       expect(history.revision).toBe(view.revision)
+      const core = node.candidateCore(new TextEncoder().encode(accepted.proposalId))!
+      const origin = { kind: 'chronolog', groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
+        operationId: core.operationId, authorTimestampMs: core.authorTimestampMs.toString(),
+        membershipRevision: bytesToBase64Url(core.membershipRevision), writerCapability: null }
       expect(history.transactions).toEqual([{ proposalId: accepted.proposalId, events: [
-        { id: `${accepted.proposalId}:0`, proposalId: accepted.proposalId, eventOrdinal: 0, topic: 'tasks', payload: { type: 'task.updated', taskId: 'one', value: 10 } },
-        { id: `${accepted.proposalId}:1`, proposalId: accepted.proposalId, eventOrdinal: 1, topic: 'conversation', payload: { type: 'message.posted', messageId: 'm1', text: 'Updated' } },
+        { id: `${accepted.proposalId}:0`, proposalId: accepted.proposalId, eventOrdinal: 0, topic: 'tasks', payload: { type: 'task.updated', taskId: 'one', value: 10 }, origin },
+        { id: `${accepted.proposalId}:1`, proposalId: accepted.proposalId, eventOrdinal: 1, topic: 'conversation', payload: { type: 'message.posted', messageId: 'm1', text: 'Updated' }, origin },
       ] }])
     } finally { await view.release() }
     // Rejection stays auditable even though it contributes no effective events.
     expect(node.candidateCore(new TextEncoder().encode(rejected.proposalId))?.program).toEqual(rejectedProgram)
     expect(await backend.operations.get('accepted')).toMatchObject({ proposalId: accepted.proposalId, status: 'final', outcome: 'accepted' })
-    expect(await backend.operations.get('rejected')).toMatchObject({ proposalId: rejected.proposalId, status: 'rejected', error: 'assert:claim_lost' })
+    expect(await backend.operations.get('rejected')).toMatchObject({ proposalId: rejected.proposalId, status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
     const retained = await fixture.current.feed.history()
 
     fixture.revokeWriter()
@@ -69,7 +73,8 @@ describe('public application backend with native durable execution', () => {
     expect(retryAccepted.proposalId).toBe(accepted.proposalId)
     expect(retryRejected.proposalId).toBe(rejected.proposalId)
     expect(await fixture.current.backend.operations.get('accepted')).toMatchObject({ status: 'final', outcome: 'accepted' })
-    expect(await fixture.current.backend.operations.get('rejected')).toMatchObject({ status: 'rejected', error: 'assert:claim_lost' })
+    expect(await fixture.current.backend.operations.get('rejected')).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
+    expect(retryRejected).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
     await expect(fixture.current.backend.submit(program(emit('tasks', { changed: true })), { operationId: 'accepted' })).rejects.toMatchObject({ code: 'already_exists' })
     await expect(fixture.current.backend.submit(acceptedProgram, { operationId: 'new-after-revocation' })).rejects.toMatchObject({ code: 'failed_precondition' })
     expect(await fixture.current.feed.history()).toEqual(retained)
@@ -116,7 +121,7 @@ describe('public application backend with native durable execution', () => {
 
       const finalStatus = statuses.next()
       await fixture.finalize()
-      expect((await finalStatus).value).toMatchObject({ status: 'rejected', outcome: 'rejected', error: 'assert:balance_changed' })
+      expect((await finalStatus).value).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:balance_changed' })
       const confirmed = await backend.readView({ view: 'final' })
       try {
         expect((await confirmed.query('SELECT value FROM balances')).rows).toEqual([[80n]])
@@ -132,7 +137,8 @@ describe('public application backend with native durable execution', () => {
     const fixture = await nativeReplica('events')
     const { backend, client } = fixture.current
     expect(backend.capabilities).not.toContain('sql')
-    const first = await backend.submit(program(emit('conversation', { messageId: 'a' }), emit('conversation', { messageId: 'b' })), { operationId: 'first-pair' })
+    const spoofed = { messageId: 'a', origin: { authorId: 'forged-owner', writerCapability: 'forged-grant' }, role: 'administrator' }
+    const first = await backend.submit(program(emit('conversation', spoofed), emit('conversation', { messageId: 'b' })), { operationId: 'first-pair' })
     await terminal(client, first.proposalId)
     await terminal(client, (await backend.events.publish('jobs', { jobId: 'unrelated' }, { operationId: 'unrelated' })).proposalId)
     await fixture.finalize()
@@ -142,10 +148,16 @@ describe('public application backend with native durable execution', () => {
     const delivered = firstRead.value
     expect(delivered.transactions).toHaveLength(1)
     expect(delivered.transactions[0]!.events.map(event => event.id)).toEqual([`${first.proposalId}:0`, `${first.proposalId}:1`])
+    const core = fixture.current.node.candidateCore(new TextEncoder().encode(first.proposalId))!
+    const firstEvent = delivered.transactions[0]!.events[0]!
+    expect(firstEvent.payload).toEqual(spoofed)
+    expect(firstEvent.origin).toEqual({ kind: 'chronolog', groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
+      operationId: core.operationId, authorTimestampMs: core.authorTimestampMs.toString(), membershipRevision: bytesToBase64Url(core.membershipRevision), writerCapability: null })
     expect(delivered.hasMore).toBe(true)
     await read.return?.()
 
     await fixture.restart()
+    expect((await fixture.current.backend.events.read({ topics: ['conversation'] })).transactions[0]!.events[0]!.origin).toEqual(firstEvent.origin)
     const resumed = fixture.current.backend.events.subscribe({ topics: ['conversation'], cursor: delivered.scannedThrough, limit: 1, signal: AbortSignal.timeout(10_000) })[Symbol.asyncIterator]()
     try {
       const empty = (await resumed.next()).value!
@@ -166,6 +178,33 @@ describe('public application backend with native durable execution', () => {
         expect((await captured.readEvents()).revision).toBe(captured.revision)
       } finally { await captured.release() }
     } finally { await resumed.return?.() }
+  })
+
+  it('invalidates captured views for SQL-only changes and finality without using event delivery', async () => {
+    const fixture = await nativeReplica('sql'), { backend, client } = fixture.current
+    const lifetime = AbortSignal.timeout(10_000)
+    const local = backend.changes({ view: 'local', signal: lifetime })[Symbol.asyncIterator]()
+    const final = backend.changes({ signal: lifetime })[Symbol.asyncIterator]()
+    const initialLocal = (await local.next()).value!, initialFinal = (await final.next()).value!
+    expect(initialLocal).toMatchObject({ view: 'local', finalRevision: initialFinal.revision })
+    expect(initialFinal.view).toBe('final')
+    try {
+      const submitted = await backend.submit(program(sqlStatement('CREATE TABLE notifications (id INTEGER PRIMARY KEY) STRICT')), { operationId: 'sql-only' })
+      await terminal(client, submitted.proposalId)
+      const captured = await backend.readView({ view: 'local' })
+      const localRevision = captured.revision
+      await captured.release()
+      const sqlChange = await nextChange(local, value => value.revision === localRevision)
+      expect(sqlChange.finalRevision).toBe(initialFinal.revision)
+      expect((await backend.events.read()).transactions).toEqual([])
+      await fixture.finalize()
+      const finalChange = await nextChange(final, value => value.revision !== initialFinal.revision)
+      const localFinality = await nextChange(local, value => value.finalRevision === finalChange.revision)
+      expect(localFinality.finalRevision).not.toBe(initialLocal.finalRevision)
+      const confirmed = await backend.readView()
+      expect(confirmed.revision).toBe(finalChange.revision)
+      await confirmed.release()
+    } finally { await local.return?.(); await final.return?.() }
   })
 
   it('replays from the committed projection checkpoint after an actual SQLite transaction rollback and reopen', async () => {
@@ -203,6 +242,14 @@ describe('public application backend with native durable execution', () => {
     expect((await projection('messages/v2').catchUp()).state.messages).toEqual(['one', 'two'])
   })
 })
+
+async function nextChange(iterator: AsyncIterator<ViewChange>, matches: (value: ViewChange) => boolean): Promise<ViewChange> {
+  for (;;) {
+    const next = await iterator.next()
+    if (next.done) throw new Error('View changes ended before the expected applied view')
+    if (matches(next.value)) return next.value
+  }
+}
 
 async function nativeReplica(profile: 'sql' | 'events') {
   const directory = await mkdtemp(join(tmpdir(), `chronolog-application-${profile}-`))

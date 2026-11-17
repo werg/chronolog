@@ -1,9 +1,13 @@
 # Application primitives, finality and authority
 
 Start with the guarantee the application needs. Chronolog offers a live message
-path and a durable application log. The live path can be used on its own. The
-durable path adds immutable operation identity, deterministic replay and finality;
-SQL is an optional execution profile of that log.
+path and a durable application log. Signals can be used on their own. The default
+Tendriller application mode is live collaboration: signed timestamp ordering,
+deterministic replay, and a provisional suffix above an immutable final prefix.
+SQL is an optional execution profile of that log. A future asynchronous
+branch/merge mode can share signed operations, timestamp ordering and replay;
+it has no finality concept, API or provisional/final states. It would define its
+own inclusion and merge rules and is not implemented by the live API.
 
 ## Choose the primitive
 
@@ -123,6 +127,14 @@ events through the same read view when displaying them together, and release
 the read lease after rendering. Durable projections and effect workers consume
 the final event stream using stable event IDs and processed checkpoints.
 
+`changes({ view: 'final' | 'local', signal })` yields the current view identity
+and then coalesces invalidations, including SQL-only changes and finality-only
+advances. It defaults to `final`, like `readView()`. Its `{ revision,
+finalRevision }` tokens tell the UI to capture a new view; they are not durable
+event cursors. Reconnecting observes current state. A slow reader may skip
+intermediate invalidations, while durable event readers retain whole-batch
+delivery and explicit processed cursors.
+
 A backdated proposal first included after its timestamp is closed receives
 `FINALITY_TIMESTAMP_CLOSED`. Re-signing it silently under a new timestamp would
 change its meaning. Exact retries still recover the original result. If the
@@ -198,6 +210,24 @@ hard continuity error. Finality pauses while its selected service is unavailable
 existing final reads and live signals can continue over connected peers.
 
 ## External effects are a separate boundary
+
+Every effective event carries `origin` derived from its verified signed
+proposal, separate from `payload`. Chronolog supplies `kind: 'chronolog'`, the
+group, author, operation ID, signed author timestamp, membership revision and
+exact writer capability. The author is a lowercase hex signing public key,
+matching `Signals.authorId`; group, membership and grant IDs are canonical
+base64url strings. The timestamp is an exact decimal string. A null grant means
+explicit static membership, not an inferred broad grant. RPC, captured views,
+the Tendriller adapter and effect checkpoints preserve these facts on restart.
+
+Publication rights establish who could author an event. A final event does not
+by itself authorize every action an agent can perform. Before dispatch, the
+handler applies its own policy to `event.origin`, topic and bounded intent; a
+payload's `role`, `authorId` or `origin` field is ordinary untrusted data. The
+worker's signing identity, provider credentials and tool permissions remain
+separate. Revocation cannot rewrite a prior final outcome. A handler may deny
+future execution under current application policy, but it must still reconcile
+an uncertain provider call that was already dispatched.
 
 The database can make an intent final and persist a worker's state. It cannot
 atomically commit another provider's action. Use one designated worker per

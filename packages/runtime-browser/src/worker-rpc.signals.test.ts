@@ -30,7 +30,11 @@ it('uses the ordinary Worker bridge for signed live delivery, latest backpressur
     } }),
   }
   const publish = vi.fn()
-  const node = { groupId, publish } as unknown as ChronologRpcNodeService
+  const origin = { kind: 'chronolog' as const, groupId: group, authorId: bytesToHex(identity.publicKeyBytes), operationId: 'signed-operation',
+    authorTimestampMs: '1', membershipRevision: group, writerCapability: group }
+  const eventBatch = { transactions: [{ proposalId: 'proposal', events: [{ id: 'proposal:0', proposalId: 'proposal', eventOrdinal: 0,
+    topic: 'jobs', payload: { origin: { authorId: 'forged-owner' } }, origin }] }], scannedThrough: 'cursor', hasMore: false, revision: 'final-1' }
+  const node = { groupId, publish, events: { read: async () => eventBatch } } as unknown as ChronologRpcNodeService
   const service = new NodeRpcService({ node, signals })
   const channel = new MessageChannel()
   const closePeer = vi.fn(async () => { local.close() })
@@ -56,6 +60,10 @@ it('uses the ordinary Worker bridge for signed live delivery, latest backpressur
     const published = await client.signals.send('typing', { active: false }, { ttlMs: 1000 })
     expect((await receiving).value).toEqual(published)
     expect(published.authorId).toBe(bytesToHex(identity.publicKeyBytes))
+    const receivedEvent = (await client.events.read()).transactions[0]!.events[0]!
+    expect(receivedEvent.origin).toEqual(origin)
+    expect(receivedEvent.origin.authorId).toBe(published.authorId)
+    expect(receivedEvent.payload).toEqual({ origin: { authorId: 'forged-owner' } })
     await outgoing.return?.()
     expect(publish).not.toHaveBeenCalled()
 

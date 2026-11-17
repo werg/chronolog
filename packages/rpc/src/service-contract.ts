@@ -1,4 +1,4 @@
-import type { ChangeProgram, EventBatch, EventReadOptions } from '@chronolog/protocol'
+import type { ChangeProgram, EventBatch, EventReadOptions, ViewChange, ViewChangeOptions } from '@chronolog/protocol'
 
 import type {
   ApproveEnrollmentRequest,
@@ -124,6 +124,7 @@ export interface ChronologRpcNodeService {
     subscribe(options?: EventReadOptions & { readonly signal?: AbortSignal }): AsyncIterable<EventBatch>
   }
   readView?(options?: { readonly view?: SqlView }): Promise<RpcReadHandle>
+  changes?(options?: ViewChangeOptions): AsyncIterable<ViewChange>
   operation?(operationId: string): Promise<OperationStatus | null>
   submitSigned?(signedWire: Uint8Array): Promise<RpcPublishedTransaction>
   readonly identity: Uint8Array

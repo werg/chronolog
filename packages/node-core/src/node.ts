@@ -37,6 +37,8 @@ import {
   type ValidatorHeartbeat,
   emit, program, bytesToBase64Url,
   type EventPayload,
+  type ViewChange,
+  type ViewChangeOptions,
 } from '@chronolog/protocol'
 import { ChangeSignal, type TransportRecord } from '@chronolog/records'
 import { readEffectiveEvents, type EventBatch, type EventReadOptions, type EventHistorySnapshot, type EventHistoryItem } from './events.js'
@@ -336,7 +338,7 @@ export class ChronologNode {
       const sql: MaterializedReadHandle = queries.captureRead({ view })
       try {
       const snapshot = this.#eventSnapshot(view)
-      const finalRevision = this.#eventSnapshot('final').revision
+      const finalRevision = view === 'final' ? snapshot.revision : this.#viewIdentity('final').revision
       let released = false
       return { revision: snapshot.revision, finalRevision, view,
         query: (statement, parameters) => {
@@ -364,23 +366,52 @@ export class ChronologNode {
     }
   }
 
-  #eventSnapshot(view: 'local' | 'final'): EventHistorySnapshot {
+  /** Coalesced applied-view invalidations, independent of SQL and event cursors. */
+  async *changes(options: ViewChangeOptions = {}): AsyncIterable<ViewChange> {
+    const view = options.view ?? 'final'
+    let previous: ViewChange | undefined
+    while (!this.#closed && options.signal?.aborted !== true) {
+      const version = this.#applicationChanges.version
+      const change = await this.#mutex.run(() => {
+        const snapshot = this.#viewIdentity(view)
+        return { view, revision: snapshot.revision,
+          finalRevision: view === 'final' ? snapshot.revision : this.#viewIdentity('final').revision }
+      })
+      if (previous === undefined || previous.revision !== change.revision || previous.finalRevision !== change.finalRevision) {
+        previous = change
+        yield change
+      }
+      await this.#applicationChanges.wait(version, options.signal)
+    }
+  }
+
+  #viewIdentity(view: 'local' | 'final') {
     const policy = this.#options.historyPolicy
     const historyId = `${bytesToHex(this.groupId)}/${bytesToHex(this.executionManifestDigest)}/${policy?.kind === 'coordinated' ? this.#finalityHistoryId() : 'peer'}`
+    const ids = this.#control.orderedTransactionIds().slice(0, view === 'final' ? this.finalOrderLength : this.orderLength)
+    const revision = bytesToBase64Url(encodeCanonicalCbor(['chronolog/view/v1', historyId, view,
+      view === 'final' ? this.finalRevision : this.materializedRevision, BigInt(ids.length), ids.length === 0 ? null : this.#idKey(ids.at(-1)!),
+      view === 'local' ? this.#revision : null]))
+    return { historyId: view === 'local' ? `${historyId}/local/${revision}` : historyId, revision, ids }
+  }
+
+  #eventSnapshot(view: 'local' | 'final'): EventHistorySnapshot {
+    const { historyId, revision, ids } = this.#viewIdentity(view)
     const item = (id: Uint8Array, anchor: string): EventHistoryItem => {
       const core = this.#candidateCores.get(this.#idKey(id)) ?? null
       const outcome = this.outcome(id)
       return { anchor, proposalId: new TextDecoder().decode(id),
-        ...(core === null ? {} : { program: core.program }), outcome: outcome?.outcome ?? 'unresolved' }
+        ...(core === null ? {} : { program: core.program, origin: {
+          kind: 'chronolog' as const, groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
+          operationId: core.operationId, authorTimestampMs: core.authorTimestampMs.toString(),
+          membershipRevision: bytesToBase64Url(core.membershipRevision),
+          writerCapability: core.writerCapability === undefined ? null : bytesToBase64Url(core.writerCapability),
+        } }), outcome: outcome?.outcome ?? 'unresolved' }
     }
     // Event cursors follow the same chronological application prefix as SQL.
     // Receipt positions and administrative traffic are separate provider progress.
-    const ids = this.#control.orderedTransactionIds().slice(0, view === 'final' ? this.finalOrderLength : this.orderLength)
     const items = ids.map((id) => item(id, this.#idKey(id)))
-    const revision = bytesToBase64Url(encodeCanonicalCbor(['chronolog/view/v1', historyId, view,
-      view === 'final' ? this.finalRevision : this.materializedRevision, BigInt(items.length), items.at(-1)?.anchor ?? null,
-      view === 'local' ? this.#revision : null]))
-    return { historyId: view === 'local' ? `${historyId}/local/${revision}` : historyId, revision, items: structuredClone(items) }
+    return { historyId, revision, items: structuredClone(items) }
   }
 
   /** Permanently stops old-revision admission before publishing its signed promise. */

@@ -3,7 +3,7 @@ import {
   type ChronologClient, type DecodedLocalSqlValue, type LocalSqlInput,
 } from '@chronolog/client'
 import type { ChronologNode } from '@chronolog/node-core'
-import { emit, program, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
+import { emit, program, type ChangeProgram, type EventPayload, type ViewChangeOptions } from '@chronolog/protocol'
 import { ChangeSignal } from '@chronolog/records'
 import {
   assertApplicationOperationId, applicationSelection,
@@ -19,8 +19,8 @@ export interface ChronologApplicationQuery {
   readonly truncated: boolean
 }
 export type ChronologApplicationBackend = ApplicationBackend<ChangeProgram, ApplicationOperation, ChronologApplicationQuery, LocalSqlInput>
-export type NodeApplicationSource = Pick<ChronologNode, 'publish' | 'operation' | 'revisions' | 'revision' | 'readView' | 'events'>
-export type ClientApplicationSource = Pick<ChronologClient, 'submit' | 'operations' | 'readView' | 'events'>
+export type NodeApplicationSource = Pick<ChronologNode, 'publish' | 'operation' | 'revisions' | 'revision' | 'readView' | 'events' | 'changes'>
+export type ClientApplicationSource = Pick<ChronologClient, 'submit' | 'operations' | 'readView' | 'events' | 'changes'>
 
 interface OperationState {
   readonly operationId: string
@@ -37,7 +37,7 @@ function operation(value: OperationState): ApplicationOperation {
   // A speculative rejection can change under replay; never render it as final.
   return {
     operationId: value.operationId, proposalId: value.proposalId,
-    status: value.final && result !== null ? result.outcome === 'accepted' ? 'final' : 'rejected'
+    status: value.final && result !== null ? 'final'
       : result === null ? 'queued' : 'provisional',
     ...(result === null ? {} : { outcome: result.outcome }),
     ...(result?.rejectionCode == null ? {} : { error: result.rejectionCode,
@@ -70,10 +70,10 @@ export function createChronologApplicationBackend(options: {
     const operationId = assertApplicationOperationId(submitOptions.operationId)
     if (nodeSource(replica)) {
       const receipt = await replica.publish({ program: change, operationId })
-      return { operationId, proposalId: receipt.txIdText, status: 'queued' }
+      return await get(operationId) ?? { operationId, proposalId: receipt.txIdText, status: 'queued' }
     }
     const receipt = await replica.submit(change, { operationId })
-    try { return { operationId, proposalId: receipt.proposalId, status: 'queued' } }
+    try { return await get(operationId) ?? { operationId, proposalId: receipt.proposalId, status: 'queued' } }
     finally { receipt.dispose() }
   }
   const subscribe = async function* ({ operationId, signal }: { readonly operationId: string; readonly signal?: AbortSignal }): AsyncIterable<ApplicationOperation> {
@@ -83,7 +83,7 @@ export function createChronologApplicationBackend(options: {
       for await (const state of replica.operations.subscribe({ operationId, ...(signal === undefined ? {} : { signal }) })) {
         const current = operation(state)
         yield current
-        if (current.status === 'final' || current.status === 'rejected') return
+        if (current.status === 'final') return
       }
       return
     }
@@ -105,7 +105,7 @@ export function createChronologApplicationBackend(options: {
         const version = changed.version, current = await get(operationId)
         const encoded = JSON.stringify(current)
         if (current !== null && encoded !== previous) { previous = encoded; yield current }
-        if (current?.status === 'final' || current?.status === 'rejected') return
+        if (current?.status === 'final') return
         if (ended) { if (failure !== undefined) throw failure instanceof Error ? failure : new Error('Operation revision stream failed', { cause: failure }); return }
         await changed.wait(version, abort.signal)
       }
@@ -131,6 +131,7 @@ export function createChronologApplicationBackend(options: {
   return Object.freeze({
     id, capabilities: Object.freeze([...(supportsSql ? ['sql'] : []), 'events', 'conversation', 'revision-views', 'operation-status']),
     submit,
+    changes: (changeOptions: ViewChangeOptions = {}) => replica.changes(changeOptions),
     events: Object.freeze({
       publish: (topic: string, payload: unknown, submitOptions: ApplicationSubmitOptions) => submit(program(emit(topic, payload as EventPayload)), submitOptions),
       read: (readOptions: ApplicationEventReadOptions = {}) => replica.events.read(readOptions),

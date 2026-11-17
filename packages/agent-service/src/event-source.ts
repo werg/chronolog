@@ -1,5 +1,5 @@
-import { assertEventTopic, canonicalEventPayload } from '@chronolog/protocol'
-import type { EventPayload } from '@chronolog/protocol'
+import { assertEventTopic, canonicalEventPayload, cloneEventOrigin } from '@chronolog/protocol'
+import type { ChronologEventOrigin, EventPayload } from '@chronolog/protocol'
 
 /** Structural public port: provider integrations do not depend on node internals. */
 export interface FinalEvent {
@@ -8,6 +8,7 @@ export interface FinalEvent {
   readonly eventOrdinal: number
   readonly topic: string
   readonly payload: EventPayload
+  readonly origin: ChronologEventOrigin
 }
 
 export interface FinalEventBatch {
@@ -50,7 +51,7 @@ export function cloneFinalEvent(event: FinalEvent): FinalEvent {
     throw new Error('CONSUMER_EVENT_INVALID')
   }
   assertEventTopic(event.topic)
-  return { ...event, payload: JSON.parse(canonicalEventPayload(event.payload)) as EventPayload }
+  return { ...event, payload: JSON.parse(canonicalEventPayload(event.payload)) as EventPayload, origin: cloneEventOrigin(event.origin) }
 }
 
 /** A source cannot bypass consumer memory bounds or mix transaction identities. */

@@ -183,6 +183,9 @@ export function createAgent(): AgentApplication {
         topics: ['job-requests'],
         recovery: 'idempotent',
         async dispatch({ event, idempotencyKey, signal }) {
+          if (!policy.canRun(event.origin.authorId, event.origin.writerCapability, event.topic, event.payload)) {
+            return { denied: true, reason: 'Caller is not authorized for this action' }
+          }
           return provider.perform(event.payload, { idempotencyKey, signal })
         },
       },
@@ -191,7 +194,9 @@ export function createAgent(): AgentApplication {
 }
 ```
 
-`provider` in this sketch is an application-owned integration. The runnable
+`provider` and `policy` in this sketch are application-owned integrations. A
+policy denial returns an explicit result before calling the provider. Throwing
+after entering dispatch is treated as an uncertain provider outcome. The runnable
 `examples/resident-agent.ts` module reads shared final task rows and formats a
 bounded `job.completed`/`job.failed` result without an external provider. It is
 the handler used by the contrib task-board vocabulary. The worker publishes
@@ -211,6 +216,22 @@ explicitly authorized group; topic filtering is not confidentiality.
 snapshot subscription. It keeps the pending bounded batch, dispatch state, and
 processed cursor together. Individual programs and the source batch are bounded;
 slow workers resume from storage.
+
+`event.origin` contains the authenticated original proposal facts: group,
+author, operation ID, signed timestamp, membership revision and exact writer
+grant. `authorId` uses the same lowercase hex public key as live signals; opaque
+group/revision/grant IDs use base64url. The worker keeps this entire origin in
+its pending checkpoint, so recovery and reconciliation receive the same facts
+after restart. A payload can contain fields called `origin`, `role` or
+`authorId`; these remain application data and cannot replace the authenticated
+origin. This identifies the caller, not a promise that the caller may use all of
+the worker's credentials or tools. Check those permissions in the handler.
+
+Revocation prevents newly authorized work according to the relevant policy; it
+does not erase a historically final intent. A worker can refuse a future action
+under its current application policy, while preserving the original event and
+recording the refusal. Previously dispatched uncertain effects still require
+reconciliation or explicit recovery before claiming they did not happen.
 
 For each event it:
 

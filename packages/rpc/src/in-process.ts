@@ -52,6 +52,7 @@ const unaryDispatch: {
 const streamDispatch: {
   [M in StreamRpcMethod]: keyof ChronologRpcService
 } = {
+  'view.changes': 'streamViewChanges',
   'events.subscribe': 'subscribeEvents',
   'signals.subscribe': 'subscribeSignals',
   'operation.subscribe': 'subscribeOperations',
