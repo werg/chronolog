@@ -52,9 +52,22 @@ export interface CoordinatedMaterialization {
 export interface MaterializationCoordinator {
   materialize(
     orderedTransactions: readonly ReplayProposal[],
+    controls?: PeerExecutionControls,
   ): Promise<CoordinatedMaterialization | null>
   /** Materialize and pin an actual immutable final prefix, independently of local state. */
   publishFinal?(prefixLength: number): Promise<void>
+}
+
+/** A verified control projection supplied by the history owner, never an application callback. */
+export interface PeerExecutionControl {
+  readonly revision: number
+  readonly digest: Uint8Array
+  readonly members: readonly { readonly publicKey: Uint8Array; readonly role: 'member' | 'admin' }[]
+}
+export interface PeerExecutionControls {
+  readonly applicationId: Uint8Array
+  readonly currentRevision: number
+  readonly revisions: readonly PeerExecutionControl[]
 }
 
 export type MaterializedLocalSqlValue =
@@ -148,7 +161,7 @@ export function publicationRequestForRevision(
   revision: MaterializedRevision,
 ): MaterializationPublicationRequest {
   return {
-    publicationKey: `revision:${revision.contentHash}`,
+    publicationKey: `revision:${revision.revision}:${revision.contentHash}`,
     expectedRevision: revision.previousRevision,
     targetRevision: revision.revision,
     targetOrderLength: revision.orderLength,

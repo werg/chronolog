@@ -2,7 +2,7 @@ import {
   DOMAINS, encodeChangeProgram, encodeTransactionCore, transactionDigest,
   type TransactionCore,
 } from '@chronolog/protocol'
-import type { ReplayProposal } from '@chronolog/materializer'
+import type { ReplayProposal, PeerExecutionControls } from '@chronolog/materializer'
 import { createSignedAttempt, validatePeerRevision, verifyAttempt } from './attempt.js'
 import {
   boundedText, bytesDigest, bytesToHex, check, isArray, decodePeerValue, encodePeerValue,
@@ -197,7 +197,12 @@ class Replica implements PeerReplica {
       txId: hexToBytes(command.attempt.id), candidateDigest: hexToBytes(command.attempt.payload.header.coreDigest),
       canonicalCandidate: encodeTransactionCore(core), core,
     }))
-    const output = await this.#options.materializer.coordinator.materialize(admitted)
+    const controls: PeerExecutionControls = { applicationId: hexToBytes(authority.descriptor.applicationId),
+      currentRevision: authority.current!.payload.controlRevision,
+      revisions: await Promise.all(authority.bundle.controls.map(async control => ({ revision: control.payload.revision,
+        digest: hexToBytes(await peerDigest(control)), members: control.payload.grants.flatMap(grant => grant.dataRole === null ? [] :
+          [{ publicKey: hexToBytes(grant.publicKey), role: grant.dataRole }]) }))) }
+    const output = await this.#options.materializer.coordinator.materialize(admitted, controls)
     if (output !== null) await this.#options.materializer.publications.publish(output.publication)
     for (const item of selected) {
       const { receipt, attempt } = item.command
@@ -355,7 +360,7 @@ class Replica implements PeerReplica {
       this.#assertReady(); check(this.#options.materializer.queries.captureRead !== undefined, 'PEER_CAPTURE_UNSUPPORTED')
       const read = this.#options.materializer.queries.captureRead({ view: 'local' })
       const outcomes = this.#selected.map(value => this.#options.materializer.queries.outcome(hexToBytes(value.command.attempt.id))!)
-      return { revision: this.revision, read, outcomes: structuredClone(outcomes), release: () => read.release() }
+      return { authority: this.authority, revision: this.revision, read, outcomes: structuredClone(outcomes), release: () => read.release() }
     })
   }
   async #proof(point: HistoryPoint): Promise<PrefixProof> {
@@ -368,9 +373,14 @@ class Replica implements PeerReplica {
   }
   recoveryPoint(): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(this.revision.point) }) }
   prefixProof(point: HistoryPoint): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(point) }) }
-  exportCommands(options: { readonly after?: HistoryPoint; readonly limit?: number } = {}): Promise<readonly OrderedCommand[]> {
+  exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
     return this.#serial.run(async () => {
       this.#assertReady(); let start = 0
+      if (options.at !== undefined) this.#checkView(options.at)
+      if (options.offset !== undefined) {
+        check(options.after === undefined && Number.isSafeInteger(options.offset) && options.offset >= 0 && options.offset <= this.#selected.length, 'PEER_RANGE_OFFSET_INVALID')
+        start = options.offset
+      }
       if (options.after !== undefined) {
         check(this.#pointAvailable(options.after), 'PEER_CURSOR_RECOVERY_REQUIRED')
         if (options.after.sequence > 0) {

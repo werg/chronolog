@@ -13,6 +13,12 @@ export const SYSTEM_LOG_SQL = `
       history_profile TEXT NOT NULL,
       bootstrap_program BLOB NOT NULL
     ) STRICT;
+    CREATE TABLE chronolog_peer_control (
+      singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+      application_id BLOB NOT NULL CHECK (length(application_id) = 32),
+      revision INTEGER NOT NULL,
+      digest BLOB NOT NULL CHECK (length(digest) = 32)
+    ) STRICT;
     CREATE TABLE ${TRANSACTION_LOG_TABLE} (
       tx_id BLOB PRIMARY KEY NOT NULL,
       order_index INTEGER NOT NULL UNIQUE,

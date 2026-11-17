@@ -14,7 +14,7 @@ import {
   type ManifestArtifacts,
   type TransactionOrderKey,
 } from '@chronolog/protocol'
-import type { MaterializedApplicationSnapshot, MaterializedReadHandle } from '@chronolog/materializer'
+import type { MaterializedApplicationSnapshot, MaterializedReadHandle, PeerExecutionControls } from '@chronolog/materializer'
 
 import {
   HEAD_BRANCH,
@@ -34,6 +34,7 @@ import {
   type PublishedRef,
 } from './checkpoints.js'
 import { withAuthorizer } from './sql-profile.js'
+import { applyPeerExecutionControl, hasCurrentPeerControl, peerControlFor, validatePeerExecutionControls } from './peer-controls.js'
 import { executeTransactionProgram, SqlRejection } from './sql-executor.js'
 import { executeLocalSql } from './sql-values.js'
 import {
@@ -315,7 +316,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     return () => this.#subscribers.delete(subscriber)
   }
 
-  async materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null> {
+  async materialize(orderedTransactions: readonly ReplayProposal[], peerControls?: PeerExecutionControls): Promise<MaterializedRevision | null> {
     this.#assertOpen()
     if (this.#materializing) throw new Error('MATERIALIZER_REENTRANT_CALL')
     this.#materializing = true
@@ -327,6 +328,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     let replayBaseRef: string | null = null
     try {
       const transactions = orderedTransactions.map(cloneTransaction)
+      const controls = this.historyProfile === 'peer-generation-v1' ? validatePeerExecutionControls(peerControls, transactions) : undefined
+      if (this.historyProfile === 'chronological' && peerControls !== undefined) throw new Error('MATERIALIZER_HISTORY_PROFILE_MISMATCH')
       // Rows of the published log were fully verified when they were read;
       // byte-identical rows are not re-verified, so an append costs O(1)
       // verification work instead of O(history).
@@ -338,8 +341,9 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       }
       verifyFinalTransactions(this.#finalLog, transactions)
       validateExistingIdentities(this.#log, transactions)
-      const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
-      if (difference === null) return null
+      const changedAt = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
+      if (changedAt === null && (controls === undefined || hasCurrentPeerControl(this.#writer, controls))) return null
+      const difference = changedAt ?? transactions.length
 
       const previousRevision = this.revision
       // #log is replaced, never mutated, so the reference stays a stable copy.
@@ -359,13 +363,18 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
       for (let index = replayFrom; index < transactions.length; index += 1) {
         verifyNextLogIndex(this.#writer, index)
+        if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, peerControlFor(controls, transactions[index]!))
         this.#applyTransaction(transactions[index]!, index)
       }
 
+      if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, controls.revisions[controls.currentRevision]!)
       const candidateLog = readSystemLog(this.#writer)
       verifyDesiredLog(candidateLog, transactions)
       verifyDatabaseState(this.#writer, this.#expected)
-      const commitHash = this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
+      // Recovery can land exactly on a retained checkpoint. Publish its existing
+      // immutable content under the new view revision without an empty commit.
+      const commitHash = this.#writer.prepare('SELECT * FROM dolt_status').all().length === 0
+        ? baseRef : this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
       const contentHash = this.#writer.doltHashOf(commitHash)
       if (contentHash !== this.#writer.doltHashOf()) throw new Error('MATERIALIZER_COMMIT_CONTENT_MISMATCH')
       this.#publicationFault('after_candidate_commit')
