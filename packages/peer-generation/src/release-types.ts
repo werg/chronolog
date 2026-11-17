@@ -5,6 +5,7 @@ export const RELEASE_LIMITS = Object.freeze({
   publishers: 128, policies: 256, activations: 1024, publications: 1024,
   assets: 256, fileBytes: 32 * 1024 * 1024, totalBytes: 128 * 1024 * 1024,
   chunkBytes: 65_536, manifestBytes: 256 * 1024, pathCharacters: 512,
+  verificationMs: 30_000,
 })
 
 /** Pinned independently of application membership, encrypted data and recovery. */
@@ -86,7 +87,7 @@ export interface ReleaseState extends ReleaseTrust {
 
 /** Read exact immutable bytes in bounded chunks. No application epoch key is involved. */
 export interface ReleaseContentSource {
-  read(asset: ReleaseAsset): AsyncIterable<Uint8Array>
+  read(asset: ReleaseAsset, options?: { readonly signal?: AbortSignal }): AsyncIterable<Uint8Array>
 }
 export interface ReleaseRegistry {
   read(): Promise<ReleaseState>
