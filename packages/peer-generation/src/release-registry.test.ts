@@ -102,6 +102,23 @@ it('allows revocation while bytes are being read and rechecks it before publishi
   expect(await f.registry.manifest(await peerDigest(manifest))).toBeNull()
 })
 
+it('admits publisher revocation while all content verification slots are occupied', async () => {
+  const f = await fixture()
+  const manifests = await Promise.all(Array.from({ length: 8 }, (_, index) => f.release(`stalled-${index}`)))
+  let entered = 0, releaseReads!: () => void, allEntered!: () => void
+  const waiting = new Promise<void>(resolve => { releaseReads = resolve })
+  const started = new Promise<void>(resolve => { allEntered = resolve })
+  f.beforeRead(async () => { if (++entered === manifests.length) allEntered(); await waiting })
+  const publications = manifests.map(manifest => f.registry.publish(manifest))
+  await started
+  try {
+    await f.registry.configure({ requestId: 'revoke-full-capacity', expectedPolicy: await peerDigest(f.policy), publishers: [] })
+  } finally { releaseReads() }
+  const outcomes = await Promise.allSettled(publications)
+  expect(outcomes.every(outcome => outcome.status === 'rejected' &&
+    outcome.reason instanceof Error && outcome.reason.message === 'RELEASE_POLICY_CHANGED')).toBe(true)
+})
+
 it('rechecks activation authority and CAS after content verification', async () => {
   const f = await fixture(), release = await f.registry.publish(await f.release('staged'))
   let entered!: () => void, resume!: () => void

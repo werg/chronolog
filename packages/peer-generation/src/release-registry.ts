@@ -15,13 +15,13 @@ import {
 } from './release-verify.js'
 
 interface Head { readonly version: 1; readonly state: ReleaseState; readonly publications: readonly string[] }
-interface Owner { readonly serial: Serial; pending: number }
+interface Owner { readonly serial: Serial; pending: number; pendingPolicy: number }
 const owners = new WeakMap<BytesStore, Map<string, Owner>>()
 function ownerFor(store: BytesStore, key: string): Owner {
   let values = owners.get(store)
   if (values === undefined) { values = new Map(); owners.set(store, values) }
   let owner = values.get(key)
-  if (owner === undefined) { owner = { serial: new Serial(), pending: 0 }; values.set(key, owner) }
+  if (owner === undefined) { owner = { serial: new Serial(), pending: 0, pendingPolicy: 0 }; values.set(key, owner) }
   return owner
 }
 
@@ -66,7 +66,11 @@ export async function createReleaseRegistry(options: ReleaseRegistryOptions): Pr
     check(await verifyReleaseManifest(value, policy, trust) === id, 'RELEASE_MANIFEST_ID_INVALID')
     return value
   }
-  const admit = async <T>(action: () => Promise<T>): Promise<T> => {
+  const admit = async <T>(action: () => Promise<T>, policy = false): Promise<T> => {
+    if (policy) {
+      check(owner.pendingPolicy < 2, 'RELEASE_REQUEST_LIMIT'); owner.pendingPolicy++
+      try { return await action() } finally { owner.pendingPolicy-- }
+    }
     check(owner.pending < 8, 'RELEASE_REQUEST_LIMIT'); owner.pending++
     try { return await action() } finally { owner.pending-- }
   }
@@ -122,7 +126,7 @@ export async function createReleaseRegistry(options: ReleaseRegistryOptions): Pr
           revision: head.state.policies.length, previous: expected, requestId: request.requestId, publishers: request.publishers }, options.signer)
         await save({ ...head, state: { ...head.state, policies: [...head.state.policies, next] } })
         return structuredClone(next)
-      }))
+      }), true)
     },
     async publish(input: SignedReleaseManifest) {
       object(input, ['payload', 'signature']); validateReleaseManifest(input.payload); hex(input.signature, 64)
