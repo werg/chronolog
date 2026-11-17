@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { emit, program } from '@chronolog/protocol'
+import { applicationDescriptionDigest, validateApplicationDescription } from '@chronolog/peer-generation/control'
 
-import { defineApplication, defineCommand, defineQuery, describeApplication, parseApplicationInput, type ApplicationInputSchema } from './definition.js'
+import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery, describeApplication, parseApplicationInput, type ApplicationInputSchema } from './definition.js'
 
 const move = defineCommand({
   description: 'Move a task at the observed version',
@@ -15,6 +16,15 @@ const move = defineCommand({
 })
 
 describe('application definitions', () => {
+  it('uses the same authenticated public description in the host and executing peer', async () => {
+    const board = defineApplication({ id: 'board', version: '1', commands: { move }, queries: {} })
+    const description = describeApplication(board)
+    expect(await applicationDescriptionDigest(description)).toBe(await applicationDefinitionDigest(board))
+    const changed = { ...description, version: '2' }
+    expect(await applicationDescriptionDigest(changed)).not.toBe(await applicationDefinitionDigest(board))
+    expect(() => validateApplicationDescription({ ...description, commands: [...description.commands, ...description.commands] })).toThrow('APPLICATION_DEFINITION_NAME_INVALID')
+    expect(() => validateApplicationDescription({ ...description, commands: [{ ...description.commands[0]!, input: { type: 'object', properties: {} } }] })).toThrow('APPLICATION_SCHEMA_NOT_CANONICAL')
+  })
   it('validates domain input, preserves types, and publishes the same closed schema to agents', () => {
     const board = defineApplication({ id: 'board', version: '1', commands: { move }, queries: {
       task: defineQuery({ description: 'Read a task', input: { type: 'string' },

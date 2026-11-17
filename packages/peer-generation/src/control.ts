@@ -12,6 +12,8 @@ import {
 } from './control-types.js'
 
 export * from './control-types.js'
+export * from './definition.js'
+export * from './schema.js'
 export { createPeerIdentity, exportPeerIdentity, importPeerIdentity, PeerGenerationError, encodePeerValue, decodePeerValue, peerDigest, bytesDigest } from './codec.js'
 
 function scope(value: { applicationId: string; profile: string; policy?: string }, descriptor: ApplicationDescriptor): void {

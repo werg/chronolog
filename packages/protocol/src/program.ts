@@ -22,11 +22,12 @@ export function assertEventTopic(topic: string): void {
     'SCHEMA_INVALID', 'Event topic must be a bounded application label')
 }
 
-/** Canonical JSON embedded in canonical CBOR; rejects lossy/non-JSON inputs. */
-export function canonicalEventPayload(payload: EventPayload): string {
+/** Bounded canonical JSON, shared by event bodies and public application metadata. */
+export function canonicalJson(payload: EventPayload, limits: { readonly maxBytes: number; readonly maxNodes: number; readonly maxDepth: number }): string {
+  for (const bound of [limits.maxBytes, limits.maxNodes, limits.maxDepth]) protocolInvariant(Number.isSafeInteger(bound) && bound > 0, 'SCHEMA_INVALID', 'Invalid JSON limits')
   let nodes = 0
   const visit = (value: EventPayload, depth: number): string => {
-    protocolInvariant(depth <= 32 && ++nodes <= 4096, 'SCHEMA_INVALID', 'Event payload is too complex')
+    protocolInvariant(depth <= limits.maxDepth && ++nodes <= limits.maxNodes, 'SCHEMA_INVALID', 'JSON payload is too complex')
     if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
     if (typeof value === 'number') {
       protocolInvariant(Number.isFinite(value), 'SCHEMA_INVALID', 'Event numbers must be finite')
@@ -54,8 +55,13 @@ export function canonicalEventPayload(payload: EventPayload): string {
     }).join(',')}}`
   }
   const encoded = visit(payload, 0)
-  protocolInvariant(utf8(encoded).length <= MAX_EVENT_BYTES, 'SCHEMA_INVALID', 'Event payload is too large')
+  protocolInvariant(utf8(encoded).length <= limits.maxBytes, 'SCHEMA_INVALID', 'JSON payload is too large')
   return encoded
+}
+
+/** Canonical JSON embedded in canonical CBOR; rejects lossy/non-JSON inputs. */
+export function canonicalEventPayload(payload: EventPayload): string {
+  return canonicalJson(payload, { maxBytes: MAX_EVENT_BYTES, maxNodes: 4096, maxDepth: 32 })
 }
 
 export function emit(topic: string, payload: EventPayload): EmitStep {
