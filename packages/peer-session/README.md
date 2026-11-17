@@ -146,16 +146,17 @@ const session = await openSqlApplication({
       await import('@chronolog/peer-session/sql-browser')
     const loaded = await loadBrowserEngine(engineAssetBaseUrl)
     signal.throwIfAborted()
-    // Acquire the owned SQLite VFS here, within this same data-resource lifetime.
+    // Initialize the application's VFS provider here and retain its cleanup handle.
     return createBrowserSqlEngine({ ...loaded, vfs: ownedSqlVfsName })
   },
 })
 ```
 
-The Worker owns the initialized VFS and its storage handles. It releases any
-OPFS SQL pool only after application database handles have closed, within the
-same storage-owner lifetime. The engine adapter does not establish a second
-ownership service. Native and browser factories produce the same SQL execution
+Chronolog closes SQL database handles through its durable data lifetime. The
+application's VFS provider owns any OPFS pool and must release that pool after
+those database handles close. `createEngine` returns an engine capability; it
+does not transfer ownership of an externally supplied VFS. Native and browser
+factories produce the same SQL execution
 format and common manifest encoding from the qualified build identity; explicit
 execution limits are part of that manifest. There is no application-profile
 selector or platform-specific schema path.
