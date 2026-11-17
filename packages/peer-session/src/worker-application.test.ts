@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
-  signApplicationDescriptor, signControlRevision, signTransitionRequest, type RecoveryNotice,
+  signApplicationDescriptor, signControlRevision, signTransitionRequest, type RecoveryNotice, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -117,6 +117,31 @@ describe('owned browser application facade', () => {
     const link = await connectApplications(f.a, f.b); cleanup.push(() => link.close())
     expect(await applied).toMatchObject({ operationId: 'long-wait', outcome: 'accepted' })
     expect(await shared).toHaveLength(1)
+  })
+
+  it('cancels a hosted recovery wait while preserving its exact durable transition', async () => {
+    const f = await fixture(), requests: SignedTransitionRequest[] = []
+    let entered!: () => void, blocked = true
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const { client } = await facade(f.b, { application: () => f.registry.read(), selectGeneration(request) {
+      requests.push(request)
+      if (blocked) { entered(); return new Promise(() => {}) }
+      return f.registry.select(request)
+    } })
+    const cancel = new AbortController()
+    const waiting = client.recovery.takeover({ transitionId: 'cancelled-control-wait', signal: cancel.signal })
+    const rejected = expect(waiting).rejects.toThrow('stop waiting for control')
+    await started
+    cancel.abort(new Error('stop waiting for control')); await rejected
+    const journal = await client.recovery.inspect()
+    expect(journal).toHaveLength(1)
+    expect(journal[0]?.selected).toBeNull()
+    expect(journal[0]?.request).toEqual(requests[0])
+    blocked = false
+    await client.recovery.takeover({ transitionId: 'cancelled-control-wait' })
+    expect(requests).toHaveLength(2)
+    expect(requests[1]).toEqual(requests[0])
+    expect(client.status.role).toBe('coordinator')
   })
 
   it('observes the owner participation policy and forwards exact broader-recovery approval', async () => {

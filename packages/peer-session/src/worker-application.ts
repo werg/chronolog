@@ -114,8 +114,8 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'recoveryPoint': return session.recoveryPoint()
       case 'adopt': return session.adopt(args[0] as AuthorityBundle)
       case 'recovery.inspect': return session.recovery.inspect()
-      case 'recovery.takeover': return session.recovery.takeover(controlHost(), args[0] as { transitionId?: string })
-      case 'recovery.handover': return session.recovery.handover(controlHost(), args[0] as { coordinator: string; transitionId?: string })
+      case 'recovery.takeover': return session.recovery.takeover(controlHost(), { ...args[0] as { coordinator?: string; transitionId?: string }, signal })
+      case 'recovery.handover': return session.recovery.handover(controlHost(), { ...args[0] as { coordinator: string; transitionId?: string }, signal })
       case 'participation.approve': return participation().approveRecovery(args[0] as string)
       case 'participation.close': return participation().close()
       case 'signals.send': return session.signals.send(args[0] as string, args[1] as SignalPayload, { ...args[2] as SignalSendOptions, signal })
@@ -243,8 +243,14 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   }
   readonly recovery = {
     inspect: (): Promise<readonly ApplicationTransition[]> => this.#call('recovery.inspect', []),
-    takeover: (options: { readonly transitionId?: string } = {}): Promise<RecoveryNotice | null> => this.#call('recovery.takeover', [options]),
-    handover: (options: { readonly coordinator: string; readonly transitionId?: string }): Promise<RecoveryNotice | null> => this.#call('recovery.handover', [options]),
+    takeover: (options: { readonly coordinator?: string; readonly transitionId?: string; readonly signal?: AbortSignal } = {}): Promise<RecoveryNotice | null> => {
+      const { signal, ...request } = options
+      return this.#call('recovery.takeover', [request], signal, true)
+    },
+    handover: (options: { readonly coordinator: string; readonly transitionId?: string; readonly signal?: AbortSignal }): Promise<RecoveryNotice | null> => {
+      const { signal, ...request } = options
+      return this.#call('recovery.handover', [request], signal, true)
+    },
   }
   readonly signals: Signals = {
     send: (topic, payload, options = {}) => this.#call('signals.send', [topic, payload, options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }], options.signal),
