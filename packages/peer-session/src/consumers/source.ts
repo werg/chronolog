@@ -155,6 +155,12 @@ export function sameSelection(a: PeerRevision, b: PeerRevision): boolean {
 export function assertCurrent(session: ApplicationConsumerSession, view: ApplicationConsumerView): void {
   if (!sameSelection(session.revision, view.revision)) throw new Error('APPLICATION_CONSUMER_VIEW_CHANGED')
 }
+/** Authorization for external work must still describe the exact captured application state. */
+export function assertCurrentHead(session: ApplicationConsumerSession, view: ApplicationConsumerView): void {
+  const current = session.revision, captured = view.revision
+  if (!sameSelection(current, captured) || current.point.sequence !== captured.point.sequence || current.point.root !== captured.point.root ||
+      current.materializationRevision !== captured.materializationRevision) throw new Error('APPLICATION_CONSUMER_VIEW_CHANGED')
+}
 export function event(value: unknown): ApplicationEvent {
   const e = record(value)
   for (const field of ['attemptId', 'author']) if (typeof e[field] !== 'string' || !/^[0-9a-f]{64}$/u.test(e[field])) throw new Error('APPLICATION_CONSUMER_EVENT_INVALID')

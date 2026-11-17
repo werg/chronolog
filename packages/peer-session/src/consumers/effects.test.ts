@@ -1,7 +1,10 @@
 import { MemoryPeerStore, type PeerStore } from '@chronolog/peer-generation'
+import { assertCanonicalCbor, emit, program } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { defineApplication, defineCommand } from '../definition.js'
 import { ApplicationEffectUncertainError, ApplicationEffectWorker, type ApplicationEffectOptions } from './effects.js'
+import { consumerSqlFixture } from './sql-test-support.js'
 import { consumerFixture, publish } from './test-support.js'
 
 const cleanup: Array<() => void | Promise<void>> = []
@@ -18,6 +21,45 @@ async function setup() {
 }
 
 describe('retained application effects', () => {
+  it.each(['authorization', 'dispatch journal'] as const)('rechecks SQL permission after awaiting %s in the same generation', async boundary => {
+    const f = await consumerSqlFixture(defineApplication({ id: 'effect-permission', version: '1',
+      schema: program('CREATE TABLE permission (id INTEGER PRIMARY KEY, allowed INTEGER NOT NULL)', 'INSERT INTO permission(id,allowed) VALUES(1,1)'),
+      commands: {
+        request: defineCommand({ description: 'Request provider work', input: { type: 'null' }, prepare: () => program(emit('intent', payload)) }),
+        revoke: defineCommand({ description: 'Revoke provider permission', input: { type: 'null' }, prepare: () => program('UPDATE permission SET allowed=0 WHERE id=1') }),
+      }, queries: {} }))
+    cleanup.push(() => f.close())
+    await (await f.session.command('request', null, { operationId: 'intent' })).applied()
+    const captured = f.session.revision, durable = new MemoryPeerStore()
+    let entered!: () => void, release!: () => void, paused = false, calls = 0
+    const ready = new Promise<void>(resolve => { entered = resolve }), waiting = new Promise<void>(resolve => { release = resolve })
+    const pause = async () => { if (!paused) { paused = true; entered(); await waiting } }
+    const store: PeerStore = { get: key => durable.get(key), async put(key, bytes) {
+      const encoded = assertCanonicalCbor(bytes) as readonly unknown[]
+      const state = JSON.parse(encoded[2] as string) as { entries: readonly { stage: string }[] }
+      if (boundary === 'dispatch journal' && state.entries.some(e => e.stage === 'dispatching')) await pause()
+      await durable.put(key, bytes)
+    } }
+    const worker = await ApplicationEffectWorker.open({ id: 'permission-test', version: '1', session: f.session, store, topics: ['intent'], recovery: 'manual',
+      authorize: async ({ view }) => {
+        const allowed = (await view.query('SELECT allowed FROM permission WHERE id=1')).rows[0]?.[0] === 1
+        if (boundary === 'authorization') await pause()
+        return allowed
+      }, dispatch: async () => { calls++; return null } })
+    cleanup.push(() => worker.close())
+    const turn = worker.processNext(), rejected = expect(turn).rejects.toThrow('APPLICATION_CONSUMER_VIEW_CHANGED')
+    await ready
+    expect((await (await f.session.command('revoke', null, { operationId: 'revoke' })).applied()).outcome).toBe('accepted')
+    expect(f.session.revision.generation).toBe(captured.generation)
+    expect(f.session.revision.point.sequence).toBeGreaterThan(captured.point.sequence)
+    release(); await rejected
+    expect(calls).toBe(0)
+    expect((await worker.inspect())[0]?.stage).toBe('prepared')
+    await worker.processNext()
+    expect((await worker.inspect())[0]).toMatchObject({ stage: 'denied', reason: 'unauthorized' })
+    expect(calls).toBe(0)
+  })
+
   it('retains completed external facts across recovery and deduplicates explicit logical-intent reapplication', async () => {
     const f = await setup(), before = await f.b.recoveryPoint()
     await publish(f.a, 'intent', payload, 'send-mail')

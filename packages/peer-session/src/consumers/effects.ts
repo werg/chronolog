@@ -2,7 +2,7 @@ import { peerDigest, type PeerRevision } from '@chronolog/peer-generation'
 import { canonicalEventPayload, type EventPayload } from '@chronolog/protocol'
 
 import type { ApplicationEvent } from '../session.js'
-import { ConsumerJournal, assertCurrent, bounded, clonePayload, consumerId, event, readBatch, record, revision, sameSelection, selected, topics,
+import { ConsumerJournal, assertCurrent, assertCurrentHead, bounded, clonePayload, consumerId, event, readBatch, record, revision, sameSelection, selected, topics,
   type ApplicationConsumerOperation, type ApplicationConsumerOptions, type ApplicationConsumerView } from './source.js'
 
 export type ApplicationEffectResolution = { readonly kind: 'completed'; readonly result: EventPayload } |
@@ -208,7 +208,7 @@ export class ApplicationEffectWorker {
         const current = selectedEvent
         authorized = await this.#provider(entry, signal, async context => this.#options.authorize({ event: structuredClone(current), view, signal: context.signal }))
       }
-      signal.throwIfAborted(); assertCurrent(this.#options.session, view)
+      signal.throwIfAborted(); assertCurrentHead(this.#options.session, view)
     } finally { await view.release() }
     if (selectedEvent === undefined || !authorized) {
       if (entry.stage === 'dispatching') throw new ApplicationEffectUncertainError(entry.effectId)
@@ -218,12 +218,24 @@ export class ApplicationEffectWorker {
     const dispatching: ApplicationEffectEntry = { ...entry, stage: 'dispatching', reason: null }
     this.#journal.reserve(this.#replace(state, dispatching), 70_000)
     await this.#saveEntry(state, dispatching)
-    // Recheck the known selection after the durable write, immediately before
-    // entering provider code. A stopped owner cannot start another call.
-    signal.throwIfAborted(); assertCurrent(this.#options.session, view)
+    // A successful journal write can yield to an ordinary permission change.
+    // Check again within the provider callback, with no await before dispatch.
+    let entered = false
     let result: EventPayload
-    try { result = clonePayload(await this.#provider(entry, signal, context => this.#options.dispatch(context))) }
-    catch (cause) { throw new ApplicationEffectUncertainError(entry.effectId, cause) }
+    try {
+      signal.throwIfAborted(); assertCurrentHead(this.#options.session, view)
+      result = clonePayload(await this.#provider(entry, signal, context => {
+        assertCurrentHead(this.#options.session, view)
+        entered = true
+        return this.#options.dispatch(context)
+      }))
+    } catch (cause) {
+      if (entered || entry.stage === 'dispatching') throw new ApplicationEffectUncertainError(entry.effectId, cause)
+      // No call began, and the dispatching write was acknowledged. Restore the
+      // known prior state; an ambiguous write above never reaches this branch.
+      if (!this.#journal.signal.aborted) await this.#saveEntry(state, entry)
+      throw cause
+    }
     const completed: ApplicationEffectEntry = { ...entry, stage: 'completed', reason: null, result }
     await this.#saveEntry(state, completed); return completed
   }
