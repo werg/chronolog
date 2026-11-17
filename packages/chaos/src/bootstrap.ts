@@ -85,7 +85,6 @@ export async function prepareCluster(
       transportAuthor: node.ssb.id,
     })),
     threshold: scenario.threshold,
-    watermarkThreshold: scenario.threshold,
   }
   await Promise.all(nodes.map((node) => writeJson(join(node.directory, 'membership.json'), membership, 0o600)))
   await writeJson(join(runDirectory, 'cluster.json'), {

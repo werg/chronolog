@@ -15,7 +15,7 @@ import type { FeedForkRegistry } from './feed-forks.js'
 import { GovernanceActivationIndex } from './governance-activation.js'
 import { GovernanceControlPlane, GovernanceRecordPendingError, isInvalidGovernanceRecord, orderFinalizedGovernanceRecords } from './governance.js'
 import { SignedInclusionFinalityProvider, encodeHistoryConfiguration, type CoordinatedHistoryConfiguration, type OrderedRecordEntry } from './history-policy.js'
-import { resolveFinalityClockPolicy, type FinalityProvider } from './finality.js'
+import { resolveFinalityClockPolicy, type LiveInclusionFinalityProvider } from './finality.js'
 import { ChronologNode } from './node.js'
 import type { DurableOperationStore } from './operations.js'
 import { PeerGovernanceController } from './peer-governance.js'
@@ -23,8 +23,8 @@ import type { Clock, OperationalMembershipState, RandomSource, ValidatorOptions 
 
 export interface GovernedNodeOptions {
   /** Inclusion-family verifiers selected by signed provider ID and parameters; peer validators are built in. */
-  readonly finalityProviders?: Readonly<Record<string, (configuration: CoordinatedHistoryConfiguration,
-    store: DurableOperationStore) => Promise<FinalityProvider>>>
+  readonly liveInclusionProviders?: Readonly<Record<string, (configuration: CoordinatedHistoryConfiguration,
+    store: DurableOperationStore) => Promise<LiveInclusionFinalityProvider>>>
   readonly genesis: SignedGenesis
   readonly groupRoute: Uint8Array
   readonly identity: Ed25519KeyPair
@@ -74,10 +74,10 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
   const initial = governance.snapshot
   const validationPolicy = await validationPolicyId(genesis.manifest.validationPolicies[0]!)
   const activation = new GovernanceActivationIndex(initial)
-  let coordinated: FinalityProvider | undefined
+  let coordinated: LiveInclusionFinalityProvider | undefined
   if (descriptor.history.kind === 'coordinated') {
     const providerId = descriptor.history.providerId ?? 'signed-inclusion-v2'
-    const factory = options.finalityProviders?.[providerId]
+    const factory = options.liveInclusionProviders?.[providerId]
     if (factory !== undefined) coordinated = await factory(structuredClone(descriptor.history), options.operationStore)
     else if (providerId === 'signed-inclusion-v2') {
       coordinated = await SignedInclusionFinalityProvider.open(descriptor.history, options.operationStore)

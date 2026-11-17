@@ -6,7 +6,7 @@ import {
 
 import { Mutex } from './async.js'
 import { controlGenesisRoot } from './control-chain.js'
-import { evaluateFinalitySnapshot, type FinalityProvider, type SignedInclusionSnapshot } from './finality.js'
+import { evaluateFinalitySnapshot, type LiveInclusionFinalityProvider, type SignedInclusionSnapshot } from './finality.js'
 import type { DurableOperationStore } from './operations.js'
 
 /** Immutable group/provider binding. Execution always uses chronological order. */
@@ -210,7 +210,7 @@ export function decodeOrderingEvidence(bytes: Uint8Array): OrderingEvidence {
  * certificates. Receipt order enumerates inclusion evidence only. Application
  * finality additionally requires the independently signed closure markers.
  */
-export class CoordinatedHistoryPolicy implements FinalityProvider {
+export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
   readonly #configuration: CoordinatedHistoryConfiguration
   readonly #store: DurableOperationStore
   readonly #key: string

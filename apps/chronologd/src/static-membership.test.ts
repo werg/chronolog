@@ -33,6 +33,12 @@ describe('static membership bootstrap', () => {
     expect(await resolver.canValidate({ ...context, validatorId: validator, validatorCapability: bytes(9) })).toBe(false)
     expect(await resolver.threshold(context)).toBe(1)
     expect(await resolver.policyVersion?.(context)).toBe(4n)
+    expect(await resolver.liveFinalityPolicies?.({ groupId, membershipRevision })).toEqual([{
+      kind: 'threshold', policyId: Buffer.from(validationPolicy).toString('base64url'),
+      validatorIds: [validator], threshold: 1,
+    }])
+    expect(await resolver.liveFinalityPolicies?.({ groupId, membershipRevision: bytes(9) })).toBeNull()
+    expect(await resolver.liveFinalityPolicies?.({ groupId: bytes(9), membershipRevision })).toBeNull()
     expect(await resolver.canUseTransportAuthor?.({
       groupId,
       membershipRevision,
@@ -81,6 +87,8 @@ describe('static membership bootstrap', () => {
     await writeFile(path, JSON.stringify(document))
     await expect(loadStaticMembership(path, pins)).rejects.toThrow('STATIC_MEMBERSHIP_INVALID_TRANSPORT_AUTHOR')
     await writeFile(path, JSON.stringify({ ...document, writers: [], ambientAuthority: true }))
+    await expect(loadStaticMembership(path, pins)).rejects.toThrow('STATIC_MEMBERSHIP_INVALID')
+    await writeFile(path, JSON.stringify({ ...document, writers: [base64(bytes(4))], watermarkThreshold: 1 }))
     await expect(loadStaticMembership(path, pins)).rejects.toThrow('STATIC_MEMBERSHIP_INVALID')
   })
 })

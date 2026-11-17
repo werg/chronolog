@@ -5,13 +5,19 @@ Chronolog has one application ordering rule:
 `(signed author timestamp, signing public key, stable proposal ID)`.
 
 The outer feed sequence is fixed to zero in this comparator. Given the same
-finalized proposals, every replica derives the same relative application order.
+proposals, every replica derives the same relative application order.
 Relay choice, network arrival and receipt-log position are not sorting keys.
 The provider can change the included set, but cannot choose an ordering rule
 for that set. SQL and effective event cursors follow the same chronological
 application prefix.
 
-## Three separate decisions
+Chronological ordering does not require finality. The current live collaboration
+policy adds an irrevocable prefix and the final-only readers and effects that
+depend on it. An asynchronous branching and merging policy would reuse signed
+operations, timestamp ordering and replay, and would have no finality. No such
+policy is implemented here, and it would not implement a disabled live frontier.
+
+## Three separate decisions in live collaboration
 
 1. **Validity:** the core verifies original signatures, group/profile, program,
    writer permission and encryption dependencies.
@@ -31,11 +37,37 @@ receipts and explicit signed author-time closures. Both use the same sorter.
 The internal `coordinated` configuration discriminator names the latter proof
 family; it no longer selects append-order execution.
 
-## Provider interface and configuration
+## A shared live frontier, with separate proof adapters
 
-`FinalityProvider` is exported from `@chronolog/node-core/finality`. Its inputs
-are opaque proof bytes (`ingestEvidence`); its output is a verified inclusion
-snapshot with admission floors and closed-time boundaries. It has no comparator
+`LiveFinalityFrontier` is the common result consumed by live execution. Its
+`provenThroughMs` records the proof's raw time boundary; `closedThroughMs` also
+accounts for every unresolved earlier admission. A blocker at timestamp T caps
+that usable boundary at T - 1. Final application publication additionally waits
+for the corresponding proposal bodies, keys and replay to complete. This is a
+live consensus capability, independent of the common operation and ordering
+primitives.
+
+For fixed validators, a blocking set of cutoffs only excludes entirely unseen
+proposals. A known proposal with a partial quorum can still gain delayed votes
+from other validators. The adapter therefore considers each pending proposal's
+own policy and revision, including proposals with no local votes, and waits
+until it is admitted or its remaining eligible voters cannot form a quorum.
+The raw frontier must also be safe for every policy permitted by the history,
+including an easier policy than the latest applied proposal uses.
+
+A cutoff becomes usable only after both transport replication and the current
+admission index have consumed its complete authenticated feed prefix. Filling a
+gap upgrades this local proof monotonically; reopening a durable snapshot still
+requires the current admission index to catch up. Complete governance revision
+closures supply the same admission-completeness evidence through their verified
+feed prefixes. The execution core consumes the resulting frontier without a
+separate governance-finality shortcut.
+
+## Live inclusion verifier interface and configuration
+
+`LiveInclusionFinalityProvider` is exported from `@chronolog/node-core/finality`.
+Its inputs are opaque proof bytes (`ingestEvidence`); its `LiveInclusionSnapshot`
+output contains verified receipts, admission floors and closed-time boundaries. It has no comparator
 or application ordering callback. `evidenceBytes` retains the proof inputs for
 durable replay and peer transfer.
 
@@ -45,7 +77,7 @@ It is not a generic consensus framework. A threshold or dynamically reconfigured
 protocol would need its own authenticated configuration and proof rules. Merely
 registering a different factory does not supply those guarantees.
 
-`createGovernedNode` accepts a `finalityProviders` registry of asynchronous
+`createGovernedNode` accepts a `liveInclusionProviders` registry of asynchronous
 factories. The registry key is the `providerId` authenticated by signed genesis.
 `providerParameters` are bounded opaque configuration bytes, also authenticated.
 The built-in IDs are `peer-validators-v1` and `signed-inclusion-v2`; a custom
@@ -139,6 +171,9 @@ of control discovery.
 - `packages/node-core/src/pluggable-finality.test.ts`: opposite receipt orders,
   timestamp ties, prefix-only pending state, late exclusion, exact retry/restart,
   future time, missing bodies and an alternate opaque proof verifier.
+- `packages/control-store/src/control-store.test.ts` and
+  `packages/node-core/src/live-finality.test.ts`: delayed partial-quorum votes,
+  policy-wide frontier bounds, closed-revision exclusions and feed-gap recovery.
 - `packages/node-core/src/finality.test.ts`: closure signatures, full predecessor
   history, regression, contradictory heads and forged marker input.
 - `packages/node-core/src/governance-activation.test.ts` and

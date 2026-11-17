@@ -23,7 +23,6 @@ export interface StaticMembershipFile {
     readonly transportAuthor?: string
   }[]
   readonly threshold: number
-  readonly watermarkThreshold?: number
   readonly policyVersion?: string
 }
 
@@ -66,15 +65,15 @@ export async function loadStaticMembership(
   assertUnique(validators.map((validator) => validator.publicKey), 'validator public key')
   assertUnique(validators.map((validator) => validator.capability), 'validator capability')
   assertThreshold(document.threshold, validators.length, 'threshold')
-  const watermarkThreshold = document.watermarkThreshold ?? document.threshold
   const policyVersion = parsePolicyVersion(document.policyVersion)
-  assertThreshold(watermarkThreshold, validators.length, 'watermarkThreshold')
-  const watermarkPolicy: WatermarkPolicy = {
+  // Closure must exclude a future admission under the actual quorum. A second,
+  // independently configurable closure threshold could finalize too early.
+  const watermarkPolicy = (): WatermarkPolicy => ({
     kind: 'threshold',
     policyId: Buffer.from(validationPolicy).toString('base64url'),
-    validatorIds: validators.map((validator) => validator.publicKey),
-    threshold: watermarkThreshold,
-  }
+    validatorIds: validators.map((validator) => validator.publicKey.slice()),
+    threshold: document.threshold,
+  })
 
   const matchesPins = (context: {
     readonly groupId: Uint8Array
@@ -106,7 +105,9 @@ export async function loadStaticMembership(
         equalBytes(validator.capability, context.validatorCapability ?? new Uint8Array()) &&
         validator.transportAuthor === context.transportAuthor)
     },
-    watermarkPolicy: (core) => matchesPins(core) ? watermarkPolicy : null,
+    watermarkPolicy: (core) => matchesPins(core) ? watermarkPolicy() : null,
+    liveFinalityPolicies: (context) => equalBytes(context.groupId, groupId) &&
+      equalBytes(context.membershipRevision, membershipRevision) ? [watermarkPolicy()] : null,
   }
 }
 
@@ -121,7 +122,7 @@ function parseStaticMembership(value: unknown): StaticMembershipFile {
   }
   const fields = new Set([
     'format', 'groupId', 'membershipRevision', 'validationPolicy', 'rootAdministrator', 'writers', 'validators',
-    'threshold', 'watermarkThreshold', 'policyVersion',
+    'threshold', 'policyVersion',
   ])
   if (
     Object.keys(value).some((field) => !fields.has(field)) ||
@@ -139,7 +140,6 @@ function parseStaticMembership(value: unknown): StaticMembershipFile {
       typeof validator.capability === 'string' &&
       (validator.transportAuthor === undefined || typeof validator.transportAuthor === 'string')) ||
     typeof value.threshold !== 'number' ||
-    (value.watermarkThreshold !== undefined && typeof value.watermarkThreshold !== 'number') ||
     (value.policyVersion !== undefined && typeof value.policyVersion !== 'string')
   ) throw new Error('STATIC_MEMBERSHIP_INVALID')
   return value as unknown as StaticMembershipFile

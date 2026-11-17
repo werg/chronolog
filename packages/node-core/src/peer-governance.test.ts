@@ -23,14 +23,14 @@ describe('live peer governance activation controller', () => {
     await f.governance[0]!.publishCapabilityChange({ grants: [{ subjectId: bytes(60), signingPublicKey: bytes(60), role: 'writer' }] }, f.identities[0].privateKey)
     await first.refresh()
     expect(first.activeSnapshot.revision).toBe(0n)
-    expect(first.isRevisionClosed(f.initial.revisionDigest)).toBe(false)
+    expect(first.closedAdmissionRevisions().some(item => equalBytes(item.membershipRevision, f.initial.revisionDigest))).toBe(false)
     await waitFor(() => f.governance[1]!.snapshot.revision === 1n)
     const second = f.controller(1)
     await second.start()
     await first.refresh()
     expect(first.activeSnapshot.revision).toBe(1n)
     expect(first.minimumAuthorTimestampMs).toBe(1_001n)
-    expect(first.isRevisionClosed(f.initial.revisionDigest)).toBe(true)
+    expect(first.closedAdmissionRevisions().some(item => equalBytes(item.membershipRevision, f.initial.revisionDigest))).toBe(true)
     const closure = (await f.transports[0]!.history()).filter((record) => record.author === f.transports[0]!.identity).at(-1)!
     expect(await first.allowsAttestation(f.initial.revisionDigest, f.identities[0].publicKeyBytes, closure.sequence + 1n)).toBe(false)
     expect(await first.allowsAttestation(first.activeSnapshot.revisionDigest, f.identities[0].publicKeyBytes, closure.sequence + 1n)).toBe(true)
@@ -49,7 +49,7 @@ describe('live peer governance activation controller', () => {
     await waitFor(() => f.governance[1]!.snapshot.revision === 1n)
     const a = f.controller(0), b = f.controller(1)
     await a.start(); await b.start(); await a.refresh()
-    expect(a.closureAdmissions(f.initial.revisionDigest)).toEqual([txId])
+    expect(a.closedAdmissionRevisions().find(item => equalBytes(item.membershipRevision, f.initial.revisionDigest))?.proposalIds).toEqual([txId])
 
     const transport = f.network.createNode('observer')
     const all = await f.transports[0]!.history()
@@ -64,7 +64,7 @@ describe('live peer governance activation controller', () => {
     transport.receive(admission)
     await observer.refresh()
     expect(observer.activeSnapshot.revision).toBe(1n)
-    expect(observer.closureAdmissions(f.initial.revisionDigest)).toEqual([txId])
+    expect(observer.closedAdmissionRevisions().find(item => equalBytes(item.membershipRevision, f.initial.revisionDigest))?.proposalIds).toEqual([txId])
   })
 
   it('blocks an incomplete restore instead of reopening already closed membership', async () => {

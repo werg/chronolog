@@ -146,7 +146,7 @@ endpoint.addEventListener('message', event => {
           })
           return { materializer: { executionManifest: decodeExecutionManifest(base64UrlToBytes(bootstrap!.executionManifest)),
             rootAdministrator: genesis.manifest.schemaAdminPublicKey },
-            governed: { genesis, groupRoute: base64UrlToBytes(bootstrap!.groupRoute), finalityProviders: {
+            governed: { genesis, groupRoute: base64UrlToBytes(bootstrap!.groupRoute), liveInclusionProviders: {
               'signed-inclusion-v2': async (configuration, store) => {
                 const provider = await SignedInclusionFinalityProvider.open(configuration, {
                   get: key => measured('finalityStoreRead', () => store.get(key)),

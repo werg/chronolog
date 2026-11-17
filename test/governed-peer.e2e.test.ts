@@ -6,7 +6,7 @@ import type { SignedGenesis } from '@chronolog/capabilities'
 import { NodeStateDatabase, SqliteControlStorePersistence, ControlStore } from '../packages/control-store/src/index.js'
 import { DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite'
 import { createGovernedNode, type GovernedNode } from '@chronolog/node-core'
-import { generateEd25519KeyPair, executionManifestArtifacts, sqlStatement, decodeEnvelope } from '@chronolog/protocol'
+import { generateEd25519KeyPair, executionManifestArtifacts, sqlStatement, decodeEnvelope, equalBytes } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -118,7 +118,7 @@ describe('live native governed peer', () => {
       steps: [sqlStatement("INSERT INTO messages (id, body) VALUES (1, 'new device')")] } })).toEqual(authored)
     await expect(newcomer.runtime.node.publish({ operationId: 'after-revoke', program: { version: 3,
       steps: [sqlStatement("INSERT INTO messages (id, body) VALUES (2, 'forbidden')")] } })).rejects.toThrow('WRITER_UNAUTHORIZED')
-    expect(root.runtime.peerGovernance!.isRevisionClosed(oldRevision)).toBe(true)
+    expect(root.runtime.peerGovernance!.closedAdmissionRevisions().some(item => equalBytes(item.membershipRevision, oldRevision))).toBe(true)
     expect(root.runtime.node.localSql('SELECT body FROM messages ORDER BY id', [], { view: 'final' }).rows)
       .toEqual([[{ kind: 'text', value: 'historical' }], [{ kind: 'text', value: 'new device' }]])
     expect((await root.transport.history()).filter((record) => decodeEnvelope(record.payload).messageType === 'proof-bundle'))

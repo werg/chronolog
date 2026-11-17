@@ -8,7 +8,7 @@ import {
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createFinalityClosureRecord, type FinalityProvider, type FinalitySnapshot } from './finality.js'
+import { createFinalityClosureRecord, type LiveInclusionFinalityProvider, type LiveInclusionSnapshot } from './finality.js'
 import { createGovernedNode, type GovernedNodeOptions } from './governed-node.js'
 import { createPrefixAuthority, ReferenceRecordLog, SignedInclusionFinalityProvider, type CoordinatedHistoryConfiguration } from './history-policy.js'
 import { createLedgerRecord } from './ledger-record.js'
@@ -21,7 +21,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 const bytes = (value: number) => new Uint8Array(32).fill(value)
 const groupId = bytes(71), membershipRevision = bytes(72), validationPolicy = bytes(73)
 
-async function replica(decorate?: (provider: SignedInclusionFinalityProvider) => FinalityProvider,
+async function replica(decorate?: (provider: SignedInclusionFinalityProvider) => LiveInclusionFinalityProvider,
   options: { readonly futureAdmissionWindowMs?: number } = {}) {
   const identity = await generateEd25519KeyPair(), authorityIdentity = await generateEd25519KeyPair()
   const store = new MemoryOperationStore(), bodies = new Map<string, Uint8Array | null>()
@@ -247,17 +247,17 @@ describe('signed provider selection', () => {
   it('selects an injected verifier by the signed provider ID and passes opaque proof bytes', async () => {
     const options = await configured(), seen: Uint8Array[] = []
     let selected: CoordinatedHistoryConfiguration | undefined
-    const factory: NonNullable<GovernedNodeOptions['finalityProviders']>[string] = async configuration => {
+    const factory: NonNullable<GovernedNodeOptions['liveInclusionProviders']>[string] = async configuration => {
       selected = structuredClone(configuration)
-      const snapshot: FinalitySnapshot = { checkpointId: 'custom-proof-state', receivedThrough: 0, includedThrough: 0,
+      const snapshot: LiveInclusionSnapshot = { checkpointId: 'custom-proof-state', receivedThrough: 0, includedThrough: 0,
         closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [] }
-      const provider: FinalityProvider = {
+      const provider: LiveInclusionFinalityProvider = {
         configuration, snapshot: () => structuredClone(snapshot), evidenceBytes: () => [],
         async ingestEvidence(proof) { seen.push(proof.slice()) },
       }
       return provider
     }
-    const governed = await createGovernedNode({ ...options, finalityProviders: { 'custom-inclusion-v1': factory } })
+    const governed = await createGovernedNode({ ...options, liveInclusionProviders: { 'custom-inclusion-v1': factory } })
     cleanup.push(() => governed.close())
     await governed.start()
     const proof = utf8('an alternative provider proof, deliberately not a built-in CBOR certificate')
@@ -269,7 +269,7 @@ describe('signed provider selection', () => {
   it('refuses an unavailable or mismatched provider rather than falling back to different finality', async () => {
     const options = await configured()
     await expect(createGovernedNode(options)).rejects.toThrow('FINALITY_PROVIDER_UNAVAILABLE')
-    await expect(createGovernedNode({ ...options, finalityProviders: {
+    await expect(createGovernedNode({ ...options, liveInclusionProviders: {
       'custom-inclusion-v1': async configuration => ({ configuration: { ...configuration, providerParameters: Uint8Array.of(0) },
         snapshot: () => { throw new Error('mismatched provider must never run') },
         ingestEvidence: async () => { throw new Error('mismatched provider must never run') }, evidenceBytes: () => [] }),
@@ -287,7 +287,7 @@ describe('signed provider selection', () => {
   it('owns the signed genesis and route before asynchronous verification begins', async () => {
     const options = await configured()
     const genesis = structuredClone(options.genesis), groupRoute = options.groupRoute.slice()
-    const creating = createGovernedNode({ ...options, genesis, groupRoute, finalityProviders: {
+    const creating = createGovernedNode({ ...options, genesis, groupRoute, liveInclusionProviders: {
       'custom-inclusion-v1': async configuration => ({ configuration,
         snapshot: () => ({ checkpointId: 'owned-genesis', receivedThrough: 0, includedThrough: 0,
           closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [] }),

@@ -262,7 +262,10 @@ async function runtime(options: { readonly clockNow?: () => number; readonly wat
     canWrite: ({ writerId }) => equalBytes(writerId, identity.publicKeyBytes),
     canValidate: ({ validatorId, validatorCapability }) => equalBytes(validatorId, identity.publicKeyBytes) && equalBytes(validatorCapability, capability),
     threshold: () => 1,
-    ...(options.watermark === true ? { watermarkPolicy: () => ({ kind: 'threshold' as const, policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }) } : {}),
+    ...(options.watermark === true ? {
+      watermarkPolicy: () => ({ kind: 'threshold' as const, policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }),
+      liveFinalityPolicies: () => [{ kind: 'threshold' as const, policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }],
+    } : {}),
   }
   const node = new ChronologNode({
     groupId, membershipRevision, validationPolicy, identity,

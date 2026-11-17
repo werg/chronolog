@@ -67,7 +67,7 @@ const finality = await NativeFinalityService.open({
 })
 ```
 
-`FinalityProvider` is the replica's proof-verification port; the service above
+`LiveInclusionFinalityProvider` is the replica's proof-verification port; the service above
 produces those proofs. An agent can consume final events without hosting either
 the signing key or this service. The default daemon co-locates these roles as an
 explicit deployment choice, and exposes the optional service as `context.finality`.

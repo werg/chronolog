@@ -6,7 +6,7 @@ import { appendControl, controlGenesisRoot, isControlRecord, type ControlCommitm
 
 import {
   encodeHistoryConfiguration, orderedGenesisRoot, verifyOrderedEntry,
-  type CoordinatedHistoryConfiguration, type HistoryConfiguration,
+  type CoordinatedHistoryConfiguration,
   type OrderedRecordEntry, type OrderedRecordHead,
 } from './history-policy.js'
 import type { AdmissionFrontier } from '@chronolog/control-store/browser'
@@ -45,16 +45,16 @@ export function resolveFinalityClockPolicy(policy: {
 }
 
 /**
- * A provider proves inclusion and closes author time. It never chooses the
+ * A live inclusion provider proves receipts and closes author time. It never chooses the
  * application execution order: every replica uses the protocol comparator.
  * Provider evidence is deliberately opaque to the node and its SQL reducer.
  * This port currently normalizes a signed-inclusion receipt/closure history;
  * it does not define arbitrary consensus or dynamic signer reconfiguration.
  */
-export interface FinalityProvider {
-  readonly configuration: HistoryConfiguration
+export interface LiveInclusionFinalityProvider {
+  readonly configuration: CoordinatedHistoryConfiguration
   ingestEvidence(bytes: Uint8Array): Promise<unknown>
-  snapshot(): FinalitySnapshot
+  snapshot(): LiveInclusionSnapshot
   evidenceBytes(): readonly Uint8Array[]
 }
 
@@ -76,7 +76,7 @@ export interface IncludedRecord {
   readonly closureBoundary: FinalityClosureBoundary | null
 }
 
-export interface FinalitySnapshot {
+export interface LiveInclusionSnapshot {
   readonly checkpointId: string
   readonly receivedThrough: number
   /** Complete authenticated receipt prefix, including closure markers. */
@@ -91,7 +91,7 @@ export interface FinalitySnapshot {
 }
 
 /** Additional proof state owned by the signed-inclusion provider. */
-export interface SignedInclusionSnapshot extends FinalitySnapshot {
+export interface SignedInclusionSnapshot extends LiveInclusionSnapshot {
   readonly control: ControlCommitment
   readonly controls: readonly FinalizedControl[]
 }

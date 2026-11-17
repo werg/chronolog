@@ -13,7 +13,7 @@ import type {
 import type { ChronologTransport, TransportStatus } from '@chronolog/records'
 import type { FeedForkRegistry } from './feed-forks.js'
 import type { OrderedRecordEntry } from './history-policy.js'
-import type { FinalityProvider } from './finality.js'
+import type { LiveInclusionFinalityProvider } from './finality.js'
 import type { DurableOperationStore } from './operations.js'
 
 export interface Clock {
@@ -95,6 +95,16 @@ export interface MembershipResolver {
     attestations: readonly StoredAttestation[],
   ): readonly StoredAttestation[] | Promise<readonly StoredAttestation[]>
   watermarkPolicy?(core: TransactionCore): WatermarkPolicy | null | Promise<WatermarkPolicy | null>
+  /**
+   * Complete admission policy set for this revision's live chronological
+   * history. A global prefix must be safe under every permitted policy, not
+   * only the policy selected by its last proposal. Omission keeps local replay
+   * available without claiming heartbeat-based finality.
+   */
+  liveFinalityPolicies?(context: {
+    readonly groupId: Uint8Array
+    readonly membershipRevision: Uint8Array
+  }): readonly WatermarkPolicy[] | null | Promise<readonly WatermarkPolicy[] | null>
 }
 
 export interface ValidatorOptions {
@@ -114,16 +124,24 @@ export interface OperationalMembershipState {
   readonly validatorCapability?: Uint8Array
 }
 
+/** All validators have stopped signing this revision and exposed their prior admissions. */
+export interface ClosedAdmissionRevision {
+  readonly membershipRevision: Uint8Array
+  readonly closedThroughMs: bigint
+  readonly proposalIds: readonly Uint8Array[]
+  /** Admission indexing must consume these complete authenticated feed prefixes. */
+  readonly feedPrefixes: readonly { readonly author: string; readonly throughSequence: bigint }[]
+}
+
 export interface ChronologNodeOptions {
   readonly peerGovernance?: {
-    isRevisionClosed(revision: Uint8Array): boolean
-    closureAdmissions(revision: Uint8Array): readonly Uint8Array[]
+    closedAdmissionRevisions(): readonly ClosedAdmissionRevision[]
     allowsAttestation(revision: Uint8Array, validatorId: Uint8Array, sequence: bigint): Promise<boolean>
   }
   readonly operationStore?: DurableOperationStore
   readonly historyPolicy?: { readonly kind: 'peer' } | {
     readonly kind: 'coordinated'
-    readonly policy: FinalityProvider
+    readonly policy: LiveInclusionFinalityProvider
     /** Maximum author time beyond the first inclusion closure; defaults to 31,000 ms. */
     readonly futureAdmissionWindowMs?: number
     /** Apply inline membership at a proved closed timestamp boundary. */

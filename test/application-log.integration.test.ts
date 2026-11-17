@@ -216,6 +216,7 @@ async function nativeReplica(profile: 'sql' | 'events') {
     canValidate: context => equalBytes(context.validatorId, identity.publicKeyBytes) && equalBytes(context.validatorCapability, capabilityId),
     threshold: () => 1,
     watermarkPolicy: () => ({ kind: 'threshold', policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }),
+    liveFinalityPolicies: () => [{ kind: 'threshold', policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }],
   }
   const open = async () => {
     const store = new NativeAgentStore(join(directory, 'agent.sqlite'))

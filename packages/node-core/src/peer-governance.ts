@@ -14,7 +14,7 @@ import {
 import { GovernanceActivationIndex } from './governance-activation.js'
 import type { GovernanceControlPlane } from './governance.js'
 import type { DurableOperationStore } from './operations.js'
-import type { EnvelopeCipher, EnvelopeCipherResolver } from './types.js'
+import type { ClosedAdmissionRevision, EnvelopeCipher, EnvelopeCipherResolver } from './types.js'
 import { decodeSignedEnvelope, WIRE_ENCRYPTION_EPOCH_UNAVAILABLE } from './wire.js'
 
 export interface PeerGovernanceControllerOptions {
@@ -46,7 +46,7 @@ export class PeerGovernanceController {
   readonly #activation: GovernanceActivationIndex
   readonly #mutex = new Mutex()
   readonly #abort = new AbortController()
-  readonly #closed = new Map<string, readonly Uint8Array[]>()
+  readonly #closed = new Map<string, ClosedAdmissionRevision>()
   readonly #checkpointKey: string
   #checkpoint: { readonly revision: bigint; readonly digest: Uint8Array; readonly boundary: bigint } | null = null
   #recordTask: Promise<void> | undefined
@@ -70,12 +70,8 @@ export class PeerGovernanceController {
     return this.#initialized ? this.#activation.snapshotFor(context) : null
   }
 
-  isRevisionClosed(revision: Uint8Array): boolean {
-    return this.#initialized && this.#closed.has(bytesToHex(revision))
-  }
-
-  closureAdmissions(revision: Uint8Array): readonly Uint8Array[] {
-    return (this.#closed.get(bytesToHex(revision)) ?? []).map((id) => id.slice())
+  closedAdmissionRevisions(): readonly ClosedAdmissionRevision[] {
+    return this.#initialized ? structuredClone([...this.#closed.values()]) : []
   }
 
   /**
@@ -150,7 +146,11 @@ export class PeerGovernanceController {
         this.#activation.activateFinalized(next, boundary)
         const transactions = new Map<string, Uint8Array>()
         for (const item of scanned) for (const txId of item.transactionIds) transactions.set(bytesToHex(txId), txId)
-        this.#closed.set(bytesToHex(previous.revisionDigest), [...transactions.values()])
+        this.#closed.set(bytesToHex(previous.revisionDigest), {
+          membershipRevision: previous.revisionDigest.slice(), closedThroughMs: boundary,
+          proposalIds: [...transactions.values()],
+          feedPrefixes: closures.map(item => ({ author: item.record.author, throughSequence: item.record.sequence })),
+        })
         // The proof records are already durable. This checkpoint also detects
         // a later incomplete restore instead of silently reopening old grants.
         if (this.#checkpoint === null || next.revision >= this.#checkpoint.revision) {

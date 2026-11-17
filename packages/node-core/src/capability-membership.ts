@@ -193,18 +193,32 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     const snapshot = await this.#snapshot(context)
     const effective = snapshot?.policies.get(bytesToHex(core.validationPolicy))
     if (!snapshot || !effective) return null
+    return this.#watermarkPolicies(snapshot)?.find(item => item.policyId === bytesToHex(effective.id)) ?? null
+  }
+
+  async liveFinalityPolicies(context: {
+    readonly groupId: Uint8Array
+    readonly membershipRevision: Uint8Array
+  }): Promise<readonly WatermarkPolicy[] | null> {
+    const snapshot = await this.#snapshots(context.membershipRevision)
+    if (snapshot === null || !equalBytes(snapshot.groupId, context.groupId) ||
+        !equalBytes(snapshot.revisionDigest, context.membershipRevision)) return null
+    return this.#watermarkPolicies(snapshot)
+  }
+
+  #watermarkPolicies(snapshot: CapabilitySnapshot): readonly WatermarkPolicy[] | null {
     const validators = [...snapshot.capabilities.values()]
       .filter((capability) => this.#activeRole(capability, snapshot, 'validator'))
     if (validators.length > this.#maximumWatermarkValidators) return null
-    const policyId = bytesToHex(effective.id)
-    const threshold = Number(effective.policy.minimumValidators)
-    if (!Number.isSafeInteger(threshold)) return null
-    return {
-      kind: 'threshold',
-      policyId,
-      validatorIds: validators.map((capability) => capability.grant.signingPublicKey),
-      threshold,
+    const validatorIds = validators.map((capability) => capability.grant.signingPublicKey)
+    if (new Set(validatorIds.map(bytesToHex)).size !== validatorIds.length) return null
+    const policies: WatermarkPolicy[] = []
+    for (const effective of snapshot.policies.values()) {
+      const threshold = Number(effective.policy.minimumValidators)
+      if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > validators.length) return null
+      policies.push({ kind: 'threshold', policyId: bytesToHex(effective.id), validatorIds, threshold })
     }
+    return policies
   }
 
   async #snapshot(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): Promise<CapabilitySnapshot | null> {

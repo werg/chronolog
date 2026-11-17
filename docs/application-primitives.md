@@ -149,7 +149,7 @@ A separately provisioned membership host may pin a different finality key and
 schema administrator. An agent on an ordinary enrolled replica can consume final
 events without hosting the finality service.
 
-The public proof producer is **`NativeFinalityService`**. A **`FinalityProvider`**
+The public proof producer is **`NativeFinalityService`**. A **`LiveInclusionFinalityProvider`**
 is the replica-side verifier of proof bytes. `AgentApplicationContext.finality`
 is non-null only where this process hosts the selected signer. Effect modules
 normally need `context.publisher`, `context.signals` and their final-event

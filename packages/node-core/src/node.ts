@@ -44,7 +44,8 @@ import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
 import { decodeLedgerRecord, LedgerRecordError, verifyLedgerPayload, type LedgerRecord } from './ledger-record.js'
 import { orderFinalizedGovernanceRecords } from './governance.js'
-import type { FinalityClosureBoundary, IncludedRecord } from './finality.js'
+import type { FinalityClosureBoundary, IncludedRecord, LiveFinalityFrontier } from './finality.js'
+import { evaluatePeerLiveFinality } from './peer-finality.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import type {
@@ -83,6 +84,7 @@ export class ChronologNode {
     subscribe: (options: EventReadOptions & { readonly signal?: AbortSignal } = {}): AsyncIterable<EventBatch> => this.#subscribeEvents(options),
   }
   readonly #seen = new Set<string>()
+  readonly #indexedFeeds = new Map<string, { through: bigint; pending: Set<bigint> }>()
   readonly #retryRecords = new Map<string, TransportRecord>()
   readonly #maximumRetryRecords: number
   readonly #feedForks: FeedForkRegistry
@@ -119,9 +121,7 @@ export class ChronologNode {
 
   constructor(options: ChronologNodeOptions) {
     this.#options = options
-    const policy = options.historyPolicy?.kind ?? 'peer'
-    this.#control = options.controlStore ?? new ControlStore(null, { orderPolicy: policy })
-    if (this.#control.orderPolicy !== policy) throw new Error('NODE_HISTORY_POLICY_MISMATCH')
+    this.#control = options.controlStore ?? new ControlStore()
     const operationStore = options.operationStore ?? new MemoryOperationStore()
     this.#operations = new DurableOperationJournal(operationStore, `transactions/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
     this.#ingressOperations = new DurableOperationJournal(operationStore, `ingress/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
@@ -533,19 +533,19 @@ export class ChronologNode {
       try {
         const continuity = this.#feedForks.observe(record)
         if (continuity === 'discarded') {
-          this.#seen.add(record.id)
+          this.#markSeen(record)
           return
         }
         if (continuity === 'quarantined') {
           const error = new Error(`FEED_FORK_QUARANTINED:${record.author}`)
-          this.#seen.add(record.id)
+          this.#markSeen(record)
           this.#recordError(error)
           return
         }
         let envelope: ReturnType<typeof decodeEnvelope>
         try { envelope = decodeEnvelope(record.payload) } catch { invalid('NODE_ENVELOPE_INVALID') }
         if (envelope.messageType !== 'candidate' && envelope.messageType !== 'attestation' && envelope.messageType !== 'heartbeat') {
-          this.#seen.add(record.id)
+          this.#markSeen(record)
           return
         }
         coordinatedCandidate = envelope.messageType === 'candidate' && this.historyPolicy === 'coordinated'
@@ -553,18 +553,18 @@ export class ChronologNode {
         if (wire.type === 'candidate') await this.#ingestCandidate(record, wire.payload, wire.signer)
         else if (wire.type === 'attestation') await this.#ingestAttestation(record, wire.payload, wire.signer)
         else await this.#ingestHeartbeat(record, wire.payload, wire.signer)
-        this.#seen.add(record.id)
+        this.#markSeen(record)
         this.#retryRecords.delete(record.id)
         if (this.#retryRecords.size === 0 && !this.#retryOverflow) this.#ingestionError = undefined
       } catch (error) {
         if (coordinatedCandidate && error instanceof Error && error.message === WIRE_ENCRYPTION_EPOCH_UNAVAILABLE) {
           // The certified path owns this candidate's retry and decides whether
           // its epoch was issued. An unordered hint needs no second key wait.
-          this.#seen.add(record.id)
+          this.#markSeen(record)
           this.#retryRecords.delete(record.id)
           if (this.#retryRecords.size === 0 && !this.#retryOverflow) this.#ingestionError = undefined
         } else if (error instanceof TerminalIngestError || error instanceof ControlStoreConflictError) {
-          this.#seen.add(record.id)
+          this.#markSeen(record)
           this.#retryRecords.delete(record.id)
           if (error instanceof ControlStoreConflictError) this.#recordError(error)
           else this.#emit('error', undefined, error)
@@ -596,7 +596,7 @@ export class ChronologNode {
     const outcome = this.#options.materialization.queries.outcome(txId)
     if (outcome !== null) return outcome
     const candidate = this.#control.getCandidate(txId)
-    if (candidate?.state === 'unauthorized' && this.isFinal(txId)) return {
+    if ((candidate?.state === 'unauthorized' || candidate?.state === 'inadmissible') && this.isFinal(txId)) return {
       txId: candidate.txId, orderKey: candidate.orderKey, orderIndex: -1,
       outcome: 'rejected', rejectionCode: candidate.stateReason ?? 'WRITER_UNAUTHORIZED', failingStatementIndex: null,
     }
@@ -604,6 +604,9 @@ export class ChronologNode {
   }
 
   isFinal(txId: Uint8Array): boolean {
+    if (this.#control.getCandidate(txId)?.state === 'inadmissible') {
+      return this.#options.materialization.queries.outcome(txId) === null
+    }
     if (this.historyPolicy === 'coordinated') {
       const position = this.#canonicalPositions.get(this.#idKey(txId))
       const candidate = this.#control.getCandidate(txId)
@@ -826,33 +829,55 @@ export class ChronologNode {
   }
 
   async settlementEvidence(txId: Uint8Array): Promise<SettlementEvidence | null> {
-    const core = this.candidateCore(txId)
-    if (!core) return null
-    const policy = await this.#options.membership.watermarkPolicy?.(core)
-    if (!policy) return null
-    const evidence = this.#control.settlementEvidence(txId, policy, core.membershipRevision)
-    if (evidence !== null && await this.#closedRevisionEvidenceApplied(core.membershipRevision)) {
-      return { ...evidence, belowWatermark: evidence.unresolvedAttestationIds.length === 0,
-        watermark: { ...evidence.watermark, cutoffMs: core.authorTimestampMs, explanation: 'established' } }
-    }
-    return evidence
+    return this.#mutex.run(async () => {
+      const candidate = this.#control.getCandidate(txId), core = this.candidateCore(txId)
+      if (candidate === null || core === null) return null
+      const policy = await this.#options.membership.watermarkPolicy?.(core)
+      if (!policy) return null
+      const frontier = await this.#liveFinalityFrontier()
+      return { txId: candidate.txId, candidateState: candidate.state, orderKey: candidate.orderKey,
+        proofAttestationIds: candidate.proofAttestationIds,
+        watermark: this.#control.watermark(policy, core.membershipRevision), frontier,
+        belowWatermark: frontier.closedThroughMs !== null && core.authorTimestampMs <= frontier.closedThroughMs,
+        unresolvedAttestationIds: frontier.blockers.filter(item => item.authorTimestampMs <= core.authorTimestampMs)
+          .flatMap(item => item.attestationIds),
+      }
+    })
   }
 
-  async #closedRevisionEvidenceApplied(revision: Uint8Array): Promise<boolean> {
-    const governance = this.#options.peerGovernance
-    if (governance?.isRevisionClosed(revision) !== true ||
-        !governance.closureAdmissions(revision).every((id) => this.#candidateCores.has(this.#idKey(id)))) return false
-    // The governance verifier and SQL node subscribe independently. Complete
-    // transport feeds are necessary, but the admission index must also have
-    // consumed every available proof before freezing a SQL prefix.
-    for (const record of await this.#options.transport.history()) {
-      if (this.#seen.has(record.id)) continue
-      try {
-        const envelope = decodeEnvelope(record.payload)
-        if (envelope.messageType === 'attestation' && equalBytes(envelope.groupRoute, this.#groupRoute())) return false
-      } catch { /* unrelated malformed records carry no admission */ }
+  /** Live consensus proof progress; application finality additionally requires replay publication. */
+  async liveFinality(): Promise<LiveFinalityFrontier> {
+    return this.#mutex.run(() => this.#liveFinalityFrontier())
+  }
+
+  async #liveFinalityFrontier(): Promise<LiveFinalityFrontier> {
+    const selected = this.#options.historyPolicy
+    if (selected?.kind === 'coordinated') {
+      const snapshot = selected.policy.snapshot()
+      return { mode: 'live', checkpointId: snapshot.checkpointId,
+        provenThroughMs: snapshot.closedThroughMs < 0n ? null : snapshot.closedThroughMs,
+        closedThroughMs: this.#processedClosedThroughMs < 0n ? null : this.#processedClosedThroughMs,
+        blockers: [], excludedProposalIds: [],
+      }
     }
-    return true
+    if (this.#retryRecords.size > 0 || this.#retryOverflow || this.#feedForks.quarantined()) {
+      return { mode: 'live', provenThroughMs: null, closedThroughMs: null, blockers: [], excludedProposalIds: [] }
+    }
+    const verifiedHeartbeatIds = new Set<string>()
+    for (const heartbeat of this.#control.listHeartbeats()) {
+      const record = await this.#options.transport.get(new TextDecoder().decode(heartbeat.heartbeatId))
+      if (record === undefined || !this.#isPrefixApplied(record.author, record.sequence) || !await this.#isFeedContiguous(record)) continue
+      verifiedHeartbeatIds.add(this.#idKey(heartbeat.heartbeatId))
+      if (!heartbeat.feedContiguous) this.#control.recordHeartbeat({ ...heartbeat, feedContiguous: true })
+    }
+    return evaluatePeerLiveFinality({
+      groupId: this.#options.groupId, initialMembershipRevision: this.#options.membershipRevision,
+      membershipRevision: this.membershipRevision, membership: this.#options.membership,
+      control: this.#control, candidateCores: this.#candidateCores, verifiedHeartbeatIds,
+      closedRevisions: this.#options.peerGovernance?.closedAdmissionRevisions() ?? [],
+      isPrefixApplied: (author, sequence) => this.#isPrefixApplied(author, sequence),
+      isValidAdmissionProof: (candidate, core, proof) => this.#isValidAdmissionProof(candidate, core, proof),
+    })
   }
 
   async watermark(txId?: Uint8Array): Promise<WatermarkEvidence | null> {
@@ -1229,7 +1254,7 @@ export class ChronologNode {
       membershipRevision: heartbeat.membershipRevision,
       validatorFeedSequence: record.sequence,
       acceptanceCutoffMs: heartbeat.acceptanceCutoffMs,
-      feedContiguous: await this.#isFeedContiguous(record),
+      feedContiguous: this.#isPrefixApplied(record.author, record.sequence - 1n) && await this.#isFeedContiguous(record),
     })
     if (recorded !== null) {
       this.#emit('heartbeat')
@@ -1290,20 +1315,18 @@ export class ChronologNode {
     ) {
       throw new Error('MATERIALIZATION_RECONCILIATION_RESULT_MISMATCH')
     }
-    let finalLength = this.finalOrderLength
-    if (this.historyPolicy === 'coordinated') {
-      for (let index = finalLength; index < ordered.length; index += 1) {
-        const candidate = this.#control.getCandidate(ordered[index]!.txId)
-        if (candidate === null || candidate.orderKey.authorTimestampMs > this.#processedClosedThroughMs) break
-        finalLength = index + 1
+    const frontier = await this.#liveFinalityFrontier()
+    let admissionClosed = false
+    for (const id of frontier.excludedProposalIds) {
+      if (this.#control.getCandidate(id)?.state === 'pending_validation') {
+        this.#control.setCandidateState(id, 'inadmissible', { reason: 'ADMISSION_CLOSED' })
+        admissionClosed = true
       }
     }
-    else if (this.#retryRecords.size === 0 && !this.#retryOverflow) {
-      for (let index = finalLength; index < ordered.length; index += 1) {
-        const evidence = await this.settlementEvidence(ordered[index]!.txId)
-        if (evidence === null || !evidence.belowWatermark || evidence.unresolvedAttestationIds.length > 0) break
-        finalLength = index + 1
-      }
+    let finalLength = this.finalOrderLength
+    for (let index = finalLength; index < ordered.length; index += 1) {
+      if (frontier.closedThroughMs === null || ordered[index]!.core.authorTimestampMs > frontier.closedThroughMs) break
+      finalLength = index + 1
     }
     if (this.#options.materialization.coordinator.publishFinal !== undefined) {
       await this.#options.materialization.coordinator.publishFinal(finalLength)
@@ -1332,7 +1355,7 @@ export class ChronologNode {
     const recovered = this.#materializationError !== undefined
     this.#materializationError = undefined
     this.#applicationChanges.notify()
-    if (coordinated !== null || this.finalOrderLength !== previousFinalLength ||
+    if (coordinated !== null || admissionClosed || this.finalOrderLength !== previousFinalLength ||
         this.#coordinatedAppliedThrough !== previousAppliedThrough || recovered) this.#emit('materialized')
   }
 
@@ -1625,6 +1648,24 @@ export class ChronologNode {
     const feed = status.feedStates?.find((candidate) => candidate.feedId === record.author)
     if (feed === undefined || !/^(0|[1-9][0-9]*)$/.test(feed.contiguousThrough)) return false
     return BigInt(feed.contiguousThrough) >= record.sequence
+  }
+  #isPrefixApplied(author: string, sequence: bigint): boolean {
+    return (this.#indexedFeeds.get(author)?.through ?? 0n) >= sequence
+  }
+
+  #markSeen(record: TransportRecord): void {
+    this.#seen.add(record.id)
+    const feed = this.#indexedFeeds.get(record.author) ?? { through: 0n, pending: new Set<bigint>() }
+    this.#indexedFeeds.set(record.author, feed)
+    if (record.sequence > feed.through) feed.pending.add(record.sequence)
+    const previous = feed.through
+    while (feed.pending.delete(feed.through + 1n)) feed.through++
+    if (feed.through > previous && this.historyPolicy === 'peer') {
+      // An earlier admission or an unrelated record can complete a signed
+      // heartbeat/closure prefix. Transport retention alone is not this proof.
+      this.#materializationPending = true
+      this.#scheduleMaterialization()
+    }
   }
   #nextAuthorTimestamp(): bigint {
     const wallClock = BigInt(Math.max(0, Math.trunc(this.#clockNow())))
