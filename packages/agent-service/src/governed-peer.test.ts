@@ -44,7 +44,9 @@ async function connect(left: GovernedPeerService, right: GovernedPeerService, ex
       framePeerStream({ readable: forward.readable, writable: backward.writable })]
   }
   const reliable = lane(), live = withLive ? lane() : undefined
-  const connections = reliable.map((connection, index) => ({ ...connection, ...(live === undefined ? {} : { live: live[index]! }),
+  const connections = reliable.map((connection, index) => ({ ...connection, ...(live === undefined ? {} : {
+    live: live[index]!, signal: AbortSignal.any([connection.signal, live[index]!.signal]),
+  }),
     async close() { await Promise.all([connection.close(), live?.[index]?.close()]) } }))
   return Promise.all([left.connectPeer({ connection: connections[0]!, ...(expected === undefined ? {} : { peerIdentity: expected }) }),
     right.connectPeer({ connection: connections[1]! })])
@@ -106,8 +108,10 @@ describe('owned governed peer composition', () => {
     const revoke = { ...snapshots[1]!.capabilities.get(bytesToHex(bytes(1)))!, revokedAtRevision: 1n }
     snapshots[1] = { ...snapshots[1]!, revision: 1n, capabilities: new Map([...snapshots[1]!.capabilities, [bytesToHex(revoke.id), revoke]]) }
     const rejected = expect(sessions[1].completion).rejects.toThrow('PEER_READ_UNAUTHORIZED')
-    await services[0]!.signals.send('typing', 'after reader revocation')
+    // Dispatch is not a delivery receipt; remote rejection can close it first.
+    const [sending] = await Promise.allSettled([services[0]!.signals.send('typing', 'after reader revocation')])
     await rejected
+    if (sending.status === 'rejected') expect(sending.reason).toMatchObject({ message: expect.stringMatching(/^(SIGNAL_ROUTE_CLOSED|PEER_CONNECTION_CLOSED)$/u) })
     expect(sessions[1].signal.aborted).toBe(true)
   })
 
@@ -165,9 +169,11 @@ describe('owned governed peer composition', () => {
     await waiting
     const current = await connect(services[0]!, services[1]!)
     release()
-    const oldRemote = await counterpart
+    const [oldRemote] = await Promise.allSettled([counterpart])
     expect(await outcome).toMatchObject({ message: 'PEER_CONNECTION_SUPERSEDED' })
-    await oldRemote.close()
+    // Supersession may close the counterpart before its opening promise settles.
+    if (oldRemote.status === 'fulfilled') await oldRemote.value.close()
+    else expect(oldRemote.reason).toMatchObject({ message: 'PEER_CONNECTION_CLOSED' })
     expect(current.every(session => !session.signal.aborted)).toBe(true)
     const iterator = services[1]!.signals.subscribe()[Symbol.asyncIterator](), receiving = iterator.next()
     const sent = await services[0]!.signals.send('typing', 'current route')

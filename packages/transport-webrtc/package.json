@@ -9,7 +9,8 @@
     "./resident": "./src/resident.ts"
   },
   "dependencies": {
-    "@chronolog/agent-service": "workspace:*"
+    "@chronolog/agent-service": "workspace:*",
+    "@chronolog/signals": "workspace:*"
   },
   "optionalDependencies": {
     "werift": "0.27.0"

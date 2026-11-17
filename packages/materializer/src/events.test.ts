@@ -100,16 +100,40 @@ describe('SQL-free durable event execution', () => {
     const early = await admitted(digest, 10, program(emit('chat', 'earlier')), 'same-operation')
     await runtime.coordinator.materialize([late])
     expect(runtime.queries.outcome(late.txId)?.outcome).toBe('accepted')
+    const held = runtime.queries.captureRead!({ view: 'local' })
+    const before = runtime.queries.captureApplication({ view: 'local' })
+    expect(held).toMatchObject(before)
+    expect(runtime.queries.captureApplication()).toEqual({
+      view: 'final', revision: 0n, orderLength: 0, finalRevision: 0n, finalOrderLength: 0, transactions: [],
+    })
     const changed = await runtime.coordinator.materialize([early, late])
     expect(changed?.revision.replayFromIndex).toBe(0)
     expect(changed?.revision.outcomeChanges).toContainEqual({ txId: late.txId, previous: 'accepted', current: 'rejected',
       previousRejectionCode: null, currentRejectionCode: 'operation_conflict' })
+    expect(held).toMatchObject(before)
+    expect(before.transactions).toEqual([{ txId: late.txId, canonicalCandidate: late.canonicalCandidate, outcome: 'accepted' }])
+    const applied = runtime.queries.captureApplication({ view: 'local' })
+    expect(applied).toMatchObject({ revision: 2n, orderLength: 2, finalRevision: 0n, finalOrderLength: 0,
+      transactions: [
+        { txId: early.txId, canonicalCandidate: early.canonicalCandidate, outcome: 'accepted' },
+        { txId: late.txId, canonicalCandidate: late.canonicalCandidate, outcome: 'rejected' },
+      ] })
+    applied.transactions[0]!.txId.fill(0)
+    applied.transactions[0]!.canonicalCandidate.fill(0)
+    expect(runtime.queries.captureApplication({ view: 'local' }).transactions[0])
+      .toEqual({ txId: early.txId, canonicalCandidate: early.canonicalCandidate, outcome: 'accepted' })
     await runtime.coordinator.publishFinal!(2)
+    const final = runtime.queries.captureApplication()
+    expect(final).toMatchObject({ view: 'final', revision: 1n, orderLength: 2, finalRevision: 1n, finalOrderLength: 2 })
+    expect(held).toMatchObject(before)
+    held.release()
     await runtime.close()
     const reopened = await createEventMaterializationRuntime({ store: bytes, namespace: 'replay' })
     expect(reopened.queries.outcome(early.txId)?.outcome).toBe('accepted')
     expect(reopened.queries.outcome(late.txId)?.rejectionCode).toBe('operation_conflict')
     expect(reopened.queries.finalOrderLength).toBe(2)
+    expect(reopened.queries.captureApplication()).toEqual(final)
+    await reopened.close()
   })
 
   it('owns queued inputs and keeps returned outcome identities detached from internal state', async () => {
@@ -129,6 +153,9 @@ describe('SQL-free durable event execution', () => {
     const originalTwoId = two.txId.slice()
     const first = runtime.coordinator.materialize([one])
     await blocked
+    expect(runtime.queries.captureApplication({ view: 'local' })).toEqual({
+      view: 'local', revision: 0n, orderLength: 0, finalRevision: 0n, finalOrderLength: 0, transactions: [],
+    })
     const second = runtime.coordinator.materialize([one, two])
     two.txId.fill(0)
     unblock()

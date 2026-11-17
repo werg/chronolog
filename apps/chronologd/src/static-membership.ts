@@ -106,8 +106,8 @@ export async function loadStaticMembership(
         validator.transportAuthor === context.transportAuthor)
     },
     watermarkPolicy: (core) => matchesPins(core) ? watermarkPolicy() : null,
-    liveFinalityPolicies: (context) => equalBytes(context.groupId, groupId) &&
-      equalBytes(context.membershipRevision, membershipRevision) ? [watermarkPolicy()] : null,
+    admissionScopes: (context) => equalBytes(context.groupId, groupId)
+      ? [{ membershipRevision: membershipRevision.slice(), authorTimeAfterMs: -1n, policies: [watermarkPolicy()] }] : null,
   }
 }
 

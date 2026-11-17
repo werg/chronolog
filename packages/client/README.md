@@ -85,8 +85,9 @@ For standalone use without any Chronolog database, use
 `client.changes({ view, signal })` yields a current `{ view, revision,
 finalRevision }` snapshot and coalesces later invalidations. It defaults to
 `final`. SQL-only writes, a provisional rebase, and finality advancing without
-changed rows can all invalidate the selected view. Capture SQL and events
-together and release the read lease after rendering:
+changed rows can all invalidate the selected view. `readView()` captures SQL,
+effective events and revision metadata from one locally applied application
+prefix. Capture them together and release the read lease after rendering:
 
 ```ts
 for await (const change of client.changes({ view: 'local', signal: pageLifetime.signal })) {
@@ -98,7 +99,10 @@ for await (const change of client.changes({ view: 'local', signal: pageLifetime.
 ```
 
 Invalidations have no replay cursor and may skip intermediate views. A
-reconnection reads current state. Use `client.events.subscribe()` for durable
+reconnection reads current state. The subscription holds no SQL read lease and
+does not poll the Tendriller page host. The captured view stays coherent while
+new proof or replay advances the replica; its identity may already be newer than
+the invalidation that prompted it. Use `client.events.subscribe()` for durable
 processing: it delivers whole final event batches and advances received progress
 only on the next pull. Persist the processed cursor together with derived state.
 
@@ -116,7 +120,6 @@ The Tendriller adapter exposes these same ports. Operation lifecycle
 `queued | provisional | final` is independent of `accepted | rejected` outcome;
 an exact retry of a final rejection returns `status: 'final', outcome:
 'rejected'` immediately.
-
 
 ## Submit SQL and wait for the result you need
 

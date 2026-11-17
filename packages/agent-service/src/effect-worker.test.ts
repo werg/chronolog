@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest'
 
 import { DurableEffectWorker, effectIdentity } from './effect-worker.js'
 import type { EffectHandler, EffectWorkerOptions } from './effect-worker.js'
-import type { EventReadOptions, FinalEventBatch, FinalEventSource } from './event-source.js'
+import type { EventReadOptions, FinalEvent, FinalEventBatch, FinalEventSource } from './event-source.js'
 import { ResidentAgentService } from './service.js'
 
 const origin: ChronologEventOrigin = { kind: 'chronolog', groupId: 'A'.repeat(43), authorId: '11'.repeat(32),
@@ -146,6 +146,40 @@ describe('durable final-intent workers', () => {
     expect(attempted).toBe(1)
     expect(reconciled).toBe(1)
     expect(f.results).toHaveLength(1)
+  })
+
+  it('preserves detached source provenance through recovery despite forged payload fields and consumer mutation', async () => {
+    const f = fixture({ recovery: 'reconcile' })
+    const event: FinalEvent = { id: 'verified-proposal:0', proposalId: 'verified-proposal', eventOrdinal: 0, topic: 'jobs.requested',
+      origin: { ...origin, operationId: 'verified-operation' },
+      payload: { authorId: 'forged-author', operationId: 'forged-operation',
+        origin: { kind: 'forged-provider', authorId: 'forged-origin-author', operationId: 'forged-origin-operation' } } }
+    const original = structuredClone(event), observed: FinalEvent[] = []
+    const batch: FinalEventBatch = { transactions: [{ proposalId: event.proposalId, events: [event] }],
+      scannedThrough: 'c:1', revision: 'r:1', hasMore: false }
+    const configuration: EffectWorkerOptions = { ...f.configuration,
+      source: { ...f.configuration.source, read: async () => batch },
+      handler: { ...f.configuration.handler,
+        dispatch: async ({ event: dispatched }) => {
+          observed.push(structuredClone(dispatched))
+          Object.assign(dispatched.origin, { authorId: 'provider-mutated' })
+          Object.assign(dispatched.payload!, { authorId: 'provider-mutated' })
+          throw new Error('provider outcome unknown')
+        },
+        reconcile: async ({ event: recovered }) => {
+          observed.push(structuredClone(recovered))
+          return { kind: 'completed', result: { receipt: 'verified' } }
+        },
+      } }
+    await expect((await DurableEffectWorker.open(configuration)).processNext()).rejects.toThrow('EFFECT_OUTCOME_UNCERTAIN')
+    Object.assign(event.origin, { authorId: 'source-mutated' })
+    Object.assign(event.payload!, { authorId: 'source-mutated' })
+    const reopened = await DurableEffectWorker.open({ ...configuration, source: { ...configuration.source,
+      read: async () => { throw new Error('recovery must use its checkpoint') } } })
+    await reopened.processNext()
+    expect(observed).toEqual([original, original])
+    expect(f.results).toHaveLength(1)
+    expect(await reopened.status()).toMatchObject({ cursor: 'c:1', remaining: 0, effect: null })
   })
 
   it('retries exact result publication after a lost final response without calling the provider again', async () => {

@@ -82,6 +82,11 @@ the application has applied that state.
 | A final read view exists | A coherent snapshot of this replica's applied final prefix. It may lag another replica. |
 | `signals.send()` returns | Local live dispatch completed; it has no relationship to durable finality. |
 
+The Tendriller application port reports lifecycle separately from outcome. A
+rejection can be provisional; once immutable it is `status: 'final', outcome:
+'rejected'`. An exact retry recovers that final rejection without creating a new
+operation or waiting for another finality decision.
+
 Use final reads by default for shared business state. Use a local view when the
 UI intentionally presents speculative state and can replace it after replay.
 Not every locally submitted proposal is immediately in the local materialized
@@ -123,9 +128,11 @@ recovers the committed operation identities and final boundary.
 
 The UI replaces a complete captured view after a rebase; it must not accumulate
 irreversible side effects from speculative event callbacks. Capture SQL and
-events through the same read view when displaying them together, and release
-the read lease after rendering. Durable projections and effect workers consume
-the final event stream using stable event IDs and processed checkpoints.
+events through one `readView()` when displaying them together. The capture pins
+one locally applied application prefix: its SQL rows, effective events and
+revision metadata agree even if new proof or replay arrives during rendering.
+Release the read lease after rendering. Durable projections and effect workers
+consume the final event stream using stable event IDs and processed checkpoints.
 
 `changes({ view: 'final' | 'local', signal })` yields the current view identity
 and then coalesces invalidations, including SQL-only changes and finality-only
@@ -133,7 +140,8 @@ advances. It defaults to `final`, like `readView()`. Its `{ revision,
 finalRevision }` tokens tell the UI to capture a new view; they are not durable
 event cursors. Reconnecting observes current state. A slow reader may skip
 intermediate invalidations, while durable event readers retain whole-batch
-delivery and explicit processed cursors.
+delivery and explicit processed cursors. The invalidation subscription holds no
+SQL read lease and does not poll the page host; capture a view only when needed.
 
 A backdated proposal first included after its timestamp is closed receives
 `FINALITY_TIMESTAMP_CLOSED`. Re-signing it silently under a new timestamp would

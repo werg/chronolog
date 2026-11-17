@@ -1,8 +1,17 @@
 import type { FramedPeerConnection } from '@chronolog/agent-service/framing'
+import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
+import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
+import { ChangeSignal, type FeedLink } from '@chronolog/records'
 import { describe, expect, it } from 'vitest'
 
 import { openHttpPeerConnection } from '../../test/browser/event-connection.js'
 import { createHttpPeerFixture } from './http-peer-fixture.js'
+
+function emptyLink(identity: string): FeedLink {
+  const changes = new ChangeSignal()
+  return { identity, async read() { return [] }, async readEvidence() { return [] }, async readPayload() { return null },
+    watch: signal => changes.watch(signal) }
+}
 
 describe('paired HTTP qualification transport', () => {
   it('carries live frames independently of a blocked reliable stream and closes both lanes together', async () => {
@@ -50,5 +59,34 @@ describe('paired HTTP qualification transport', () => {
       await expect(openHttpPeerConnection(server.url, 'wrong-token')).rejects.toThrow('PEER_STREAM_OPEN_FAILED: 403')
       expect(accepted).toBe(0)
     } finally { await server.close() }
+  })
+
+  it.each(['authorization', 'live protocol'] as const)('reports %s failure after the authenticated owner has closed both streams', async failure => {
+    const identities = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
+    const groupId = new Uint8Array(32).fill(1), grantId = new Uint8Array(32).fill(2), failures: unknown[] = []
+    let observed!: (error: unknown) => void
+    const reported = new Promise<unknown>(resolve => { observed = resolve })
+    const server = await createHttpPeerFixture({ accept: connection => openAuthenticatedPeerLink({ connection,
+      local: emptyLink('server'), identity: identities[0], groupId, grantId, authorizePeer: () => failure !== 'authorization' }),
+      onError(error) { failures.push(error); observed(error) } })
+    let client: FramedPeerConnection | undefined, session: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined
+    try {
+      client = await openHttpPeerConnection(server.url, server.token)
+      const opening = openAuthenticatedPeerLink({ connection: client, local: emptyLink('client'), identity: identities[1],
+        groupId, grantId, authorizePeer: () => true })
+      if (failure === 'authorization') {
+        // Only the server decides admission here; its close can race client readiness.
+        const [result] = await Promise.allSettled([opening])
+        if (result.status === 'fulfilled') session = result.value
+      }
+      else {
+        session = await opening
+        // Valid framing, invalid live protocol: the authenticated owner must fail.
+        await client.live!.send(encodeCanonicalCbor([1n, 'unexpected'])).catch(() => undefined)
+      }
+      const error = await reported
+      expect(error).toMatchObject({ message: failure === 'authorization' ? 'PEER_READ_UNAUTHORIZED' : 'SIGNAL_FRAME_INVALID' })
+      expect(failures).toEqual([error])
+    } finally { await session?.close(); await client?.close(); await server.close() }
   })
 })

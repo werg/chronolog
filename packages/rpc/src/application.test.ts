@@ -25,6 +25,26 @@ function readHandle(revision: string, release: () => void): RpcReadHandle {
 }
 
 describe('application RPC', () => {
+  it('streams view metadata without opening read leases or accepting event replay cursors', async () => {
+    const readView = vi.fn(), read = vi.fn(), options: unknown[] = []
+    const service = new NodeRpcService({ node: node({ readView,
+      events: { read, subscribe: () => ({ async *[Symbol.asyncIterator]() { throw new Error('must not replay events') } }) },
+      changes: value => ({ async *[Symbol.asyncIterator]() {
+        options.push(value); yield { view: value!.view!, revision: 'current', finalRevision: 'final' }
+      } }),
+    }) })
+    const transport = new InProcessRpcTransport(service)
+    const iterator = transport.stream('view.changes', { ...request, view: 'local' })[Symbol.asyncIterator]()
+    expect((await iterator.next()).value).toEqual({ view: 'local', revision: 'current', finalRevision: 'final' })
+    expect(options).toEqual([expect.objectContaining({ view: 'local', signal: expect.any(AbortSignal) })])
+    expect(readView).not.toHaveBeenCalled(); expect(read).not.toHaveBeenCalled()
+    await iterator.return?.()
+    for (const malformed of [{ groupId: group, view: 'branch' }, { groupId: group, cursor: 'durable-progress' }]) {
+      await expect(transport.stream('view.changes', malformed as never)[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'invalid_argument' })
+    }
+    await transport.close()
+  })
+
   it('preserves authenticated event origin on HTTP reads, subscriptions and captured views', async () => {
     const origin = { kind: 'chronolog' as const, groupId: group, authorId: '11'.repeat(32), operationId: 'signed-operation',
       authorTimestampMs: '9007199254740993', membershipRevision: group, writerCapability: group }

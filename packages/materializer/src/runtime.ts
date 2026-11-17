@@ -79,12 +79,22 @@ export interface MaterializedRevisionSnapshot {
   readonly executionManifestDigest: Uint8Array
 }
 
-/** A bounded lease on one immutable applied SQL revision. */
-export interface MaterializedReadHandle {
+/** Detached application inputs and outcomes from one published revision. */
+export interface MaterializedApplicationSnapshot {
   readonly revision: bigint
   readonly orderLength: number
+  readonly finalRevision: bigint
   readonly finalOrderLength: number
   readonly view: 'local' | 'final'
+  readonly transactions: readonly {
+    readonly txId: Uint8Array
+    readonly canonicalCandidate: Uint8Array
+    readonly outcome: MaterializedTransactionOutcomeKind
+  }[]
+}
+
+/** A bounded SQL lease captured atomically with its published application snapshot. */
+export interface MaterializedReadHandle extends MaterializedApplicationSnapshot {
   query(sql: string, parameters?: readonly MaterializedLocalSqlValue[]): MaterializedLocalSqlResult
   release(): void
 }
@@ -104,6 +114,7 @@ export interface MaterializedQueryService {
     options?: { readonly atRevision?: bigint; readonly view?: 'local' | 'final' },
   ): MaterializedLocalSqlResult
   outcome(txId: Uint8Array): MaterializedTransactionOutcome | null
+  captureApplication(options?: { readonly view?: 'local' | 'final' }): MaterializedApplicationSnapshot
   captureRead?(options?: { readonly view?: 'local' | 'final' }): MaterializedReadHandle
   subscribe(subscriber: (revision: MaterializedRevisionSnapshot) => void): () => void
 }

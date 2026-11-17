@@ -55,6 +55,22 @@ until it is admitted or its remaining eligible voters cannot form a quorum.
 The raw frontier must also be safe for every policy permitted by the history,
 including an easier policy than the latest applied proposal uses.
 
+`MembershipResolver.admissionScopes()` supplies the complete activated
+revision history, including every permitted policy and each revision's
+authenticated exclusive author-time floor. Closed revisions remain in this
+enumeration. Discovering policies only from locally seen proposals or the latest
+revision cannot establish completeness. An adapter unable to establish that
+guarantee must leave the scope enumeration unavailable, keeping application
+finality pending.
+
+Each still-open scope is bounded by the least advanced policy it permits. Its
+authenticated activation floor is safe even before that scope has a usable
+cutoff; advancing beyond the floor requires every permitted policy's cutoff.
+The group takes the minimum across all still-open scopes. Closing one revision
+cannot lift another revision's bound. Only when every scope is verifiably closed
+can the maximum closed boundary represent a history with no remaining admission
+scope.
+
 A cutoff becomes usable only after both transport replication and the current
 admission index have consumed its complete authenticated feed prefix. Filling a
 gap upgrades this local proof monotonically; reopening a durable snapshot still
@@ -109,6 +125,15 @@ latest cutoff would be unsafe: it could erase evidence that a backdated proposal
 arrived after an earlier closure. Missing prefixes block; authentic conflicting
 or regressing promises fail continuity verification. Unauthenticated marker-like
 writer bytes cannot create a closure.
+
+The retained verifier owns an immutable, authenticated prefix. A certificate
+selecting an extension must agree with that exact predecessor before its new
+suffix is checked. Newly added closures are verified once against the retained
+admission floors, first covering closures and control projection; an arbitrary
+caller-supplied snapshot cannot serve as a trusted baseline. The extension stays
+staged until its durable store write succeeds. Reopening and the public
+`evaluateFinalitySnapshot()` still verify the supplied history from genesis.
+All proof bytes remain available for replay and peer transfer.
 
 Closures can advance during an idle period. Future-dated included proposals stay
 pending until the closed frontier covers their author time; only then is their
@@ -185,7 +210,8 @@ of control discovery.
   `packages/node-core/src/live-finality.test.ts`: delayed partial-quorum votes,
   policy-wide frontier bounds, closed-revision exclusions and feed-gap recovery.
 - `packages/node-core/src/finality.test.ts`: closure signatures, full predecessor
-  history, regression, contradictory heads and forged marker input.
+  history, regression, contradictory heads, forged marker input, linear closure
+  verification on retained-prefix extension and retry after failed persistence.
 - `packages/node-core/src/governance-activation.test.ts` and
   `canonical-epoch.integration.test.ts`: causal membership activation, cutoff
   authorization and immutable epoch dependency eligibility.

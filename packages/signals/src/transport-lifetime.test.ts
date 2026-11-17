@@ -1,7 +1,7 @@
 import { assertCanonicalCbor, encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
-import { SignalChannel } from './index.js'
+import { SignalBackpressureError, SignalChannel } from './index.js'
 
 async function fixture() {
   const identity = await generateEd25519KeyPair(), receiverIdentity = await generateEd25519KeyPair()
@@ -16,6 +16,28 @@ async function fixture() {
 }
 
 describe('authorized ephemeral peer signals', () => {
+  it('rejects a saturated publication without retiring routes that refused local dispatch', async () => {
+    const f = await fixture(), { send: _send, ...options } = f.options
+    const channel = new SignalChannel(options)
+    let congested = true, retired = 0
+    const received: Uint8Array[] = []
+    for (let index = 0; index < 2; index++) channel.attachRoute({
+      async send(frame) { if (congested) throw new SignalBackpressureError(); received.push(frame) },
+      close() { retired++ },
+    })
+    try {
+      await expect(channel.send('typing', 'discarded intent')).rejects.toBeInstanceOf(SignalBackpressureError)
+      expect(received).toEqual([])
+      expect(retired).toBe(0)
+      congested = false
+      const sent = await channel.send('typing', 'fresh intent')
+      expect(received).toHaveLength(2)
+      expect(received[0]).toEqual(received[1])
+      expect((await f.receiver.receive(received[0]!))?.payload).toEqual(sent.payload)
+      expect(retired).toBe(0)
+    } finally { channel.close(); f.sender.close(); f.receiver.close() }
+  })
+
   it('does not refresh the TTL of a message waiting behind a backpressured send', async () => {
     const f = await fixture()
     let release!: () => void, entered!: () => void

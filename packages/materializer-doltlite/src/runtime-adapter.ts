@@ -2,6 +2,7 @@ import {
   publicationRequestForRevision,
   type AdmittedTransaction,
   type ChronologMaterializationRuntime,
+  type MaterializedApplicationSnapshot,
   type MaterializationPublicationRequest,
   type MaterializationPublicationResult,
   type MaterializedRevisionSnapshot,
@@ -31,6 +32,7 @@ export interface DoltLiteMaterializerRuntimeBackend {
     options?: LocalSqlOptions,
   ): LocalSqlQueryResult
   outcome(txId: Uint8Array): TransactionOutcome | null
+  captureApplication(options?: { readonly view?: 'local' | 'final' }): MaterializedApplicationSnapshot
   captureRead?(options?: { readonly view?: 'local' | 'final' }): MaterializedReadHandle
   subscribe(subscriber: (revision: MaterializedRevision) => void): () => void
   close(): void
@@ -82,6 +84,7 @@ export function createDoltLiteMaterializationRuntime(
       proposalIdAt(index) { return materializer.proposalIdAt(index) },
       localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
       outcome(txId) { return materializer.outcome(txId) },
+      captureApplication(options) { return materializer.captureApplication(options) },
       captureRead(options) {
         if (materializer.captureRead === undefined) throw new Error('MATERIALIZER_SNAPSHOT_UNAVAILABLE')
         return materializer.captureRead(options)

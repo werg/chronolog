@@ -264,7 +264,8 @@ async function runtime(options: { readonly clockNow?: () => number; readonly wat
     threshold: () => 1,
     ...(options.watermark === true ? {
       watermarkPolicy: () => ({ kind: 'threshold' as const, policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }),
-      liveFinalityPolicies: () => [{ kind: 'threshold' as const, policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }],
+      admissionScopes: () => [{ membershipRevision, authorTimeAfterMs: -1n,
+        policies: [{ kind: 'threshold' as const, policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }] }],
     } : {}),
   }
   const node = new ChronologNode({

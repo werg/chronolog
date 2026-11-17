@@ -15,6 +15,12 @@ export async function createHttpPeerFixture(options: {
   readonly onError: (error: unknown) => void
 }) {
   const token = crypto.randomUUID(), sessions = new Map<string, PairedStream>()
+  const reportFailure = (error: unknown): void => {
+    // Peer failure closes both lanes before its completion rejects. That cleanup
+    // must not hide malformed traffic or failed authorization from qualification.
+    if (error instanceof Error && (error.message === 'PEER_CONNECTION_CLOSED' || error.message === 'PEER_CONNECTION_ENDED')) return
+    options.onError(error)
+  }
   const pair = (id: string): PairedStream => {
     const lanes = new Map<Lane, StreamLane>()
     let closed = false, session: OwnedSession | undefined
@@ -28,13 +34,16 @@ export async function createHttpPeerFixture(options: {
       if (closed || lanes.size !== 2) return
       clearTimeout(timer)
       const reliable = lanes.get('reliable')!.connection, live = lanes.get('live')!.connection
-      const connection: FramedPeerConnection = { send: (frame, options) => reliable.send(frame, options),
+      const signal = AbortSignal.any([reliable.signal, live.signal])
+      signal.addEventListener('abort', () => { void close() }, { once: true })
+      if (signal.aborted) { void close(); return }
+      const connection: FramedPeerConnection = { signal, send: (frame, options) => reliable.send(frame, options),
         frames: signal => reliable.frames(signal), live, close }
       void options.accept(connection).then(value => {
         session = value
-        if (closed) { void value.close(); return }
-        void value.completion.catch((error: unknown) => { if (!closed) options.onError(error) }).finally(close)
-      }, (error: unknown) => { if (!closed) options.onError(error); void close() })
+        void value.completion.catch(reportFailure).finally(close)
+        if (closed) void value.close()
+      }, (error: unknown) => { reportFailure(error); void close() })
     } }
   }
   const server = createServer((request, response) => {

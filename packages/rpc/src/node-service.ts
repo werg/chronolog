@@ -217,6 +217,7 @@ export class NodeRpcService implements ChronologRpcService {
 
   async *streamViewChanges(request: ViewChangesRequest, context: RpcCallContext): AsyncIterable<ViewChangesResponse> {
     this.#assertGroup(request.groupId)
+    if (Object.keys(request).some(key => !['groupId', 'requestId', 'view'].includes(key))) throw invalid('View changes have no replay cursor')
     const signal = context.signal === undefined ? this.#signalLifetime.signal : AbortSignal.any([this.#signalLifetime.signal, context.signal])
     signal.throwIfAborted()
     if (this.#node.changes === undefined) throw failed('View change notifications are not enabled for this node')

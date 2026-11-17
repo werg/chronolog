@@ -133,6 +133,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
   }
   const membership = new CapabilityMembershipResolver({
     snapshotForRevision: (digest) => governance.snapshotForRevision(digest),
+    finalityRevisions: () => peer?.finalityRevisions ?? null,
     authorizationSnapshot: (context) => {
       if (peer !== undefined) return peer.ready
         ? context.authorTimestampMs === undefined ? peer.activeSnapshot : peer.snapshotFor(context)

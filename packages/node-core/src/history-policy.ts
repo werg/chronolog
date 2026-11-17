@@ -5,8 +5,8 @@ import {
 } from '@chronolog/protocol'
 
 import { Mutex } from './async.js'
-import { controlGenesisRoot } from './control-chain.js'
-import { evaluateFinalitySnapshot, type LiveInclusionFinalityProvider, type SignedInclusionSnapshot } from './finality.js'
+import type { LiveInclusionFinalityProvider, SignedInclusionSnapshot } from './finality.js'
+import { VerifiedFinalityPrefix } from './finality-prefix.js'
 import type { DurableOperationStore } from './operations.js'
 
 /** Immutable group/provider binding. Execution always uses chronological order. */
@@ -223,24 +223,26 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
   #certificates = new Map<number, PrefixCertificate>()
   #progress: CoordinatedProgress
   #finality: SignedInclusionSnapshot
+  #prefix: VerifiedFinalityPrefix
 
-  private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, root: string, quotaBytes: number) {
+  private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, prefix: VerifiedFinalityPrefix, quotaBytes: number) {
     this.#configuration = structuredClone(configuration)
     this.#store = store
     this.#key = `history/${bytesToHex(configuration.groupId)}/coordinated`
     this.#quotaBytes = quotaBytes
+    this.#prefix = prefix
+    this.#finality = prefix.snapshot()
+    const root = prefix.checkpointId
     this.#progress = { receivedThrough: 0, verifiedThrough: 0, certifiedThrough: 0, finalThrough: 0, root, missing: [] }
-    this.#finality = { checkpointId: root, receivedThrough: 0, includedThrough: 0,
-      closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [], control: { count: 0, root: '' }, controls: [] }
   }
 
   static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore,
     options: CoordinatedHistoryStorageOptions = {}): Promise<CoordinatedHistoryPolicy> {
+    configuration = structuredClone(configuration)
     encodeHistoryConfiguration(configuration)
     const quotaBytes = options.quotaBytes ?? DEFAULT_EVIDENCE_QUOTA_BYTES
     if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1024 || quotaBytes > MAX_LOCAL_HISTORY_BYTES) throw new Error('HISTORY_STORAGE_QUOTA_INVALID')
-    const policy = new CoordinatedHistoryPolicy(configuration, store, await orderedGenesisRoot(configuration.historyId), quotaBytes)
-    policy.#finality = { ...policy.#finality, control: { count: 0, root: await controlGenesisRoot(configuration) } }
+    const policy = new CoordinatedHistoryPolicy(configuration, store, await VerifiedFinalityPrefix.empty(configuration), quotaBytes)
     const saved = await store.get(policy.#key)
     if (saved !== null) {
       if (saved.length > quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
@@ -256,6 +258,7 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
       policy.#progress = evaluated.progress
       policy.#selectedEntries = evaluated.selectedEntries
       policy.#finality = evaluated.finality
+      policy.#prefix = evaluated.prefix
       discardUncommittedAlternatives(policy.#entries, evaluated.selectedEntries)
     }
     return policy
@@ -321,7 +324,7 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
       // Exact retries still pass hash/signature/configuration validation, but
       // do not rewrite retained history or turn a read into a storage write.
       if (!changed) return this.progress
-      const { progress, selectedEntries, finality } = await this.#evaluate(entries, certificates)
+      const { progress, selectedEntries, finality, prefix } = await this.#evaluate(entries, certificates)
       if (progress.finalThrough < this.#progress.finalThrough) throw new Error('HISTORY_FINAL_PREFIX_REGRESSION')
       discardUncommittedAlternatives(entries, selectedEntries)
       const all: OrderingEvidence[] = [
@@ -339,6 +342,7 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
       this.#selectedEntries = selectedEntries
       this.#progress = progress
       this.#finality = finality
+      this.#prefix = prefix
       return this.progress
     })
   }
@@ -374,6 +378,7 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
     readonly progress: CoordinatedProgress
     readonly selectedEntries: Map<number, OrderedRecordEntry>
     readonly finality: SignedInclusionSnapshot
+    readonly prefix: VerifiedFinalityPrefix
   }> {
     const genesisRoot = await orderedGenesisRoot(this.#configuration.historyId)
     let finalThrough = 0
@@ -414,10 +419,14 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
       if (!entries.has(position)) missing.add(position)
     }
     const gaps = [...missing].filter((position) => position > finalThrough).sort((a, b) => a - b).slice(0, 1_024)
-    const finality = finalThrough === this.#finality.includedThrough && finalRoot === this.#finality.checkpointId
-      ? { ...this.#finality, receivedThrough }
-      : await evaluateFinalitySnapshot(this.#configuration,
-        [...selectedEntries.values()].sort((left, right) => left.position - right.position), receivedThrough)
+    if (finalThrough < this.#prefix.includedThrough) throw new Error('HISTORY_FINAL_PREFIX_REGRESSION')
+    const retainedRoot = this.#prefix.includedThrough === 0 ? genesisRoot : selectedEntries.get(this.#prefix.includedThrough)?.root
+    if (retainedRoot !== this.#prefix.checkpointId) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
+    const suffix = [...selectedEntries.values()].filter(entry => entry.position > this.#prefix.includedThrough)
+      .sort((left, right) => left.position - right.position)
+    const prefix = await this.#prefix.append(suffix)
+    if (prefix.includedThrough !== finalThrough || prefix.checkpointId !== finalRoot) throw new Error('HISTORY_AUTHORITY_EQUIVOCATION')
+    const finality = prefix === this.#prefix ? { ...this.#finality, receivedThrough } : prefix.snapshot(receivedThrough)
     return {
       progress: {
         receivedThrough, verifiedThrough: finalThrough, certifiedThrough,
@@ -425,6 +434,7 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
       },
       selectedEntries,
       finality,
+      prefix,
     }
   }
 }

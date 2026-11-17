@@ -65,6 +65,9 @@ export class PeerGovernanceController {
   get minimumAuthorTimestampMs(): bigint { return this.#activation.activationBoundary + 1n }
   get lastError(): string | undefined { return this.#lastError }
   get ready(): boolean { return this.#initialized }
+  get finalityRevisions(): GovernanceActivationIndex['finalityRevisions'] | null {
+    return this.#initialized ? this.#activation.finalityRevisions : null
+  }
 
   snapshotFor(context: WriterAuthorizationContext): CapabilitySnapshot | null {
     return this.#initialized ? this.#activation.snapshotFor(context) : null

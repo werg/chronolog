@@ -5,7 +5,10 @@ import {
   isEmitStep, transactionDigest, transactionOrderKey, compareTransactionOrder, utf8,
 } from '@chronolog/protocol'
 import type { AdmittedTransaction } from './types.js'
-import { publicationRequestForRevision, type ChronologMaterializationRuntime, type MaterializedTransactionOutcome, type MaterializedRevisionSnapshot, type MaterializationOutcomeChange } from './runtime.js'
+import {
+  publicationRequestForRevision, type ChronologMaterializationRuntime, type MaterializationOutcomeChange,
+  type MaterializedApplicationSnapshot, type MaterializedRevisionSnapshot, type MaterializedTransactionOutcome,
+} from './runtime.js'
 
 export interface EventExecutionStore {
   get(key: string): Promise<Uint8Array | null>
@@ -109,6 +112,18 @@ export async function createEventMaterializationRuntime(options: {
       throw error
     }
   }
+  const captureApplication = (input: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot => {
+    if (closed) throw new Error('EVENT_EXECUTION_CLOSED')
+    const view = input.view ?? 'final'
+    const length = view === 'final' ? finalLength : order.length
+    return {
+      view, revision: view === 'final' ? finalRevision : revision, orderLength: length,
+      finalRevision, finalOrderLength: finalLength,
+      transactions: order.slice(0, length).map((entry, index) => ({
+        txId: entry.txId.slice(), canonicalCandidate: entry.canonicalCandidate.slice(), outcome: outcomes[index]!.outcome,
+      })),
+    }
+  }
   return {
     coordinator: {
       materialize: async (input) => {
@@ -167,11 +182,12 @@ export async function createEventMaterializationRuntime(options: {
       localSql() { throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
       outcome(id) { return structuredClone(outcomes.find((entry) => equalBytes(entry.txId, id)) ?? null) },
       subscribe(subscriber) { subscribers.add(subscriber); return () => { subscribers.delete(subscriber) } },
+      captureApplication,
       captureRead(input = {}) {
-        const view = input.view ?? 'final'
+        const application = captureApplication(input)
         let released = false
-        return { view, revision: view === 'final' ? finalRevision : revision, orderLength: view === 'final' ? finalLength : order.length,
-          finalOrderLength: finalLength, query() { if (released) throw new Error('VIEW_RELEASED'); throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
+        return { ...application,
+          query() { if (released) throw new Error('VIEW_RELEASED'); throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
           release() { released = true } }
       },
     },

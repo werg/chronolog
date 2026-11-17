@@ -29,6 +29,7 @@ function connections() {
   }
   const reliable = lane(), live = lane()
   return reliable.map((connection, index) => ({ ...connection, live: live[index]!,
+    signal: AbortSignal.any([connection.signal, live[index]!.signal]),
     async close() { await Promise.all([connection.close(), live[index]!.close()]) } })) as unknown as
     readonly [typeof reliable[0] & { readonly live: typeof live[0] }, typeof reliable[1] & { readonly live: typeof live[1] }]
 }
@@ -283,8 +284,10 @@ describe('authenticated framed range synchronization', () => {
     const session = await signalSession()
     session.revokeIncoming()
     const failed = expect(session.receiver.completion).rejects.toThrow('PEER_READ_UNAUTHORIZED')
-    await session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'not admitted']))
+    // Local dispatch can race the peer's immediate rejection and physical close.
+    const [sending] = await Promise.allSettled([session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'not admitted']))])
     await failed
+    if (sending.status === 'rejected') expect(sending.reason).toMatchObject({ message: 'PEER_CONNECTION_CLOSED' })
     expect(session.received).toEqual([])
   })
 

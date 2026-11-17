@@ -17,7 +17,7 @@ export interface FinalEventPublisher {
 }
 
 export function validateConsumerId(value: string): void {
-  if (value.length === 0 || value.length > 256 || [...value].some((character) => character.charCodeAt(0) < 32)) throw new Error('CONSUMER_ID_INVALID')
+  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || [...value].some((character) => character.charCodeAt(0) < 32)) throw new Error('CONSUMER_ID_INVALID')
 }
 
 export function canonicalTopics(topics: readonly string[]): readonly string[] {
@@ -27,13 +27,16 @@ export function canonicalTopics(topics: readonly string[]): readonly string[] {
 }
 
 export function cloneFinalEvent(event: FinalEvent): FinalEvent {
-  validateConsumerId(event.id)
-  validateConsumerId(event.proposalId)
-  if (!Number.isSafeInteger(event.eventOrdinal) || event.eventOrdinal < 0 || event.eventOrdinal >= 64) {
+  if (typeof event !== 'object' || event === null) throw new Error('CONSUMER_EVENT_INVALID')
+  const { id, proposalId, eventOrdinal, topic, payload } = event
+  validateConsumerId(id)
+  validateConsumerId(proposalId)
+  if (!Number.isSafeInteger(eventOrdinal) || eventOrdinal < 0 || eventOrdinal >= 64) {
     throw new Error('CONSUMER_EVENT_INVALID')
   }
-  assertEventTopic(event.topic)
-  return { ...event, payload: JSON.parse(canonicalEventPayload(event.payload)) as EventPayload, origin: cloneEventOrigin(event.origin) }
+  assertEventTopic(topic)
+  const origin = cloneEventOrigin(event.origin)
+  return { id, proposalId, eventOrdinal, topic, payload: JSON.parse(canonicalEventPayload(payload)) as EventPayload, origin }
 }
 
 /** A source cannot bypass consumer memory bounds or mix transaction identities. */
