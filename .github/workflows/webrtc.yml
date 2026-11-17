@@ -29,14 +29,14 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: fdeac2da9d9893907c110efac8b0caa9c9c5279a
+          ref: 7ee29dbbaa78808422ccbbd23b086200944b4e17
           path: artifacts/contrib
           persist-credentials: false
       - name: Check out exact hosted participant
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller
-          ref: bfe9daf89305fccc20ed008ce498f9746527e52e
+          ref: 56f758ce9a0b5556e61462b4444995147d1b4533
           path: artifacts/host-source
           persist-credentials: false
       - name: Build clean public session artifacts
