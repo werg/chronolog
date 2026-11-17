@@ -123,9 +123,15 @@ export function createMembershipLedgerClient(options: {
       lifetime.signal.throwIfAborted()
       const body = await interruptible(signMembershipLedgerRequest({ descriptor, identity, request, now: options.now?.() ?? Date.now() }), lifetime.signal)
       const fetching = fetcher(url, { method: 'POST', body: body.slice().buffer,
-        headers: { 'Content-Type': 'application/cbor' }, cache: 'no-store', redirect: 'error', credentials: 'omit', signal: lifetime.signal })
+        // workerd supports manual/follow, but deliberately rejects redirect:error
+        // before any I/O. Never forward a signed control request to another URL.
+        headers: { 'Content-Type': 'application/cbor' }, cache: 'no-store', redirect: 'manual', credentials: 'omit', signal: lifetime.signal })
       void fetching.then(response => { if (lifetime.signal.aborted) void response.body?.cancel().catch(() => undefined) }, () => undefined)
       const response = await interruptible(fetching, lifetime.signal)
+      if (response.redirected || response.type === 'opaqueredirect' || response.status >= 300 && response.status < 400) {
+        void response.body?.cancel().catch(() => undefined)
+        throw new Error('MEMBERSHIP_LEDGER_REDIRECT')
+      }
       if (!response.ok) {
         void response.body?.cancel().catch(() => undefined)
         throw new Error(`MEMBERSHIP_LEDGER_HTTP_${response.status}`)

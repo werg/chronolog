@@ -54,7 +54,7 @@ describe('bounded membership I/O', () => {
     let release!: (response: Response) => void, started!: () => void
     const requested = new Promise<void>(resolve => { started = resolve })
     const fetcher: typeof fetch = async (_url, init) => {
-      expect(init).toMatchObject({ redirect: 'error', credentials: 'omit' })
+      expect(init).toMatchObject({ redirect: 'manual', credentials: 'omit' })
       started(); return new Promise<Response>(resolve => { release = resolve })
     }
     const client = createMembershipLedgerClient({ url: 'https://resident.example/_chronolog/membership', descriptor, identity, fetch: fetcher, timeoutMs: 20 })
@@ -64,6 +64,23 @@ describe('bounded membership I/O', () => {
     const cancel = vi.fn()
     release(new Response(new ReadableStream<Uint8Array>({ cancel })))
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(cancel).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([301, 302, 303, 307, 308])('rejects HTTP %i without forwarding a signed request or reading the redirect body', async status => {
+    const key = await generateEd25519KeyPair()
+    const { descriptor, identity } = await provisionMembership({ store: new MemoryOperationStore(),
+      executionManifestDigest: new Uint8Array(32).fill(1), schemaAdministratorPublicKey: key.publicKeyBytes,
+      nativeAuthority: { historyId: 'h_0123456789abcdef0123456789abcdef', publicKey: key.publicKeyBytes } })
+    const cancel = vi.fn(), fetcher = vi.fn<typeof fetch>(async (url, init) => {
+      expect(url instanceof URL && url.href).toBe('https://resident.example/_chronolog/membership')
+      expect(init).toMatchObject({ method: 'POST', redirect: 'manual', credentials: 'omit' })
+      return new Response(new ReadableStream<Uint8Array>({ cancel }), { status,
+        headers: { Location: 'https://different.example/receive' } })
+    })
+    const client = createMembershipLedgerClient({ url: 'https://resident.example/_chronolog/membership', descriptor, identity, fetch: fetcher })
+    await expect(client.read({ after: 0, limit: 128 })).rejects.toThrow('MEMBERSHIP_LEDGER_REDIRECT')
+    expect(fetcher).toHaveBeenCalledTimes(1)
     expect(cancel).toHaveBeenCalledTimes(1)
   })
 })
