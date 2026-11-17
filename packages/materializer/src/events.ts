@@ -1,9 +1,9 @@
 import type { BytesStore } from '@chronolog/records'
-import { bytesToHex, sha256 } from '@chronolog/canonical'
+import { bytesToHex } from '@chronolog/canonical'
 import {
-  assertValidChangeProgram, createExecutionManifest,
+  assertValidChangeProgram,
   encodeTransactionCore, equalBytes, executionManifestArtifacts,
-  isEmitStep, transactionDigest, transactionOrderKey, utf8,
+  isEmitStep, transactionDigest, transactionOrderKey,
 } from '@chronolog/protocol'
 import type { ReplayProposal } from './types.js'
 import {
@@ -14,14 +14,8 @@ import {
 import { EventHistoryStore, type EventHistoryState } from './event-store.js'
 export type { BytesStore } from '@chronolog/records'
 
-/** A pinned SQL-absent execution profile; importing it never loads an SQL engine. */
-export async function eventExecutionManifest() {
-  return createExecutionManifest({
-    profile: 'chronolog-events-v1', engine: 'none',
-    engineDigest: await sha256(utf8('chronolog/events-only/v1')),
-    platformDigest: await sha256(utf8('chronolog/change-program/v3;literal-events;operation-conflicts/v1;verified-input-order/v1')),
-  })
-}
+export { eventExecutionManifest } from './manifest.js'
+import { eventExecutionManifest } from './manifest.js'
 
 export async function createEventMaterializationRuntime(options: {
   readonly store: BytesStore

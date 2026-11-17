@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./control": "./src/control.ts",
-    "./participant": "./src/participant.ts"
+    "./participant": "./src/participant.ts",
+    "./metadata": "./src/metadata.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",

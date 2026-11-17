@@ -93,6 +93,12 @@
       ],
       "@chronolog/peer-session/websocket": [
         "packages/peer-session/src/websocket.ts"
+      ],
+      "@chronolog/materializer/manifest": [
+        "packages/materializer/src/manifest.ts"
+      ],
+      "@chronolog/peer-generation/metadata": [
+        "packages/peer-generation/src/metadata.ts"
       ]
     }
   }
