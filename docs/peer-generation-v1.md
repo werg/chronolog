@@ -77,6 +77,43 @@ routing/enrollment inputs, never generation or author authority. Applications ca
 grant ordinary participants both recovery and coordinator eligibility explicitly;
 no creator or native process has an implicit permanent role.
 
+The supported shared policy is `participantGrant`: reader, writer, coordinator and
+recovery rights are explicit; shared-data membership defaults to `member`.
+`controlParticipantGrant` gives the host explicit administration and recovery
+rights while leaving reader, writer, coordinator and data membership disabled.
+Account ownership can therefore authorize recovery without possessing a creator's
+device key or becoming an application-data peer.
+
+The reserved `APPLICATION_COLLECTIVE_ID` is the durable shared SQL owner. Its
+members come from signed `dataRole` grants. Inherited commands replay against
+their historical control revision inside the candidate view; the newest control
+is reapplied before publication. Rolling back data cannot restore revoked team
+membership. The separately signed initial schema remains fixed for this profile;
+ordinary commands cannot perform administrative platform operations or DDL.
+
+## Participant roles and transport
+
+A participant's role determines the records it may author, receive, retain and
+serve. A transport supplies delivery, authentication handshakes and resource
+bounds. Routing filters and subscriptions implement the role's declared interests;
+the shared verifier still enforces authority at every receiving boundary. A new
+transport cannot grant rights or replace the history policy.
+
+The hosted adapter is one deployment of the control-participant role. HTTP carries
+bootstrap metadata and rare signed transitions; rendezvous carries bounded
+connection setup. Ordinary peers carry encrypted application history, live signals
+and content. Coarse availability refresh is separately accounted discovery work
+and never a condition for current-generation command completion.
+
+This separation also provides a path for application and page publication. A
+future signed publication manifest can select immutable content roots for code and
+assets, with peers and explicitly configured hosted providers supplying the bytes.
+The initial browser entry point must establish the trusted publication identity.
+Presentation updates can have their own publication revision; changes to command
+definitions, schema or execution semantics require an authenticated activation
+boundary binding those exact identities. That publication protocol is a distinct
+extension, not an implemented guarantee of the current attachment API.
+
 ## Selection and ancestry
 
 A signed transition binds an exact transition identity, expected selected
@@ -149,6 +186,24 @@ Retain complete replayable history initially. Peer recovery requires verified
 original bodies, contiguous order evidence, controls, keys and operation identity;
 metadata or a SQL cache alone is insufficient. A remote database image is never
 accepted merely because a peer signed it. Recovery replays retained evidence.
+
+The initial peer envelope is at most 4,096 retained ordered records and 64 MiB of
+serialized ordered history, including abandoned records. Applications may choose
+lower limits. Recovery transfer uses the same bounds; increasing them requires
+new resource qualification. There is no automatic pruning. Reopen verifies the
+retained records; append stores indexed records and a small publication head.
+The SQL-free event runtime also uses immutable indexed records, with prefix-linked
+heads rather than rewriting all bodies on each append. Its growth test measures
+body writes and head bytes. Native quota accounting scans once on reopen and
+updates incrementally under the exclusive storage owner.
+
+Attachments use independently staged encrypted 64 KiB chunks, with a 128 MiB
+per-object limit and at most eight attached sources. Range reads fetch only needed
+chunks, and verified local chunks survive an interrupted fetch. A reference does
+not grant access: every serving and fetching boundary checks current reader
+rights. Retention receipts describe a verified complete durable copy, not present
+reachability or survival after every peer disappears. Content unavailability
+does not select or invalidate application history.
 
 Replication is prompt and asynchronous. Aim for a second independently stored
 complete prefix when another peer is available. Five minutes is the initial

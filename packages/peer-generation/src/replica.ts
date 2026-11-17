@@ -8,7 +8,8 @@ import {
   boundedText, bytesDigest, bytesToHex, check, isArray, decodePeerValue, encodePeerValue,
   hexToBytes, peerDigest, PeerGenerationError, samePeerValue, Serial, signPeerValue, verifyPeerValue,
 } from './codec.js'
-import { generationStartRoot, type PeerAuthority, validateHistoryPoint, verifyAuthorityBundle, verifyOrderReceipt } from './control.js'
+import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, validateHistoryPoint, verifyAuthorityBundle, verifyOrderReceipt } from './control.js'
+import { PEER_MAX_RECORDS, PEER_MAX_HISTORY_BYTES } from './control-types.js'
 import type {
   AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, OperationState, OrderedCommand,
   PeerReplica, PeerReplicaOptions, PeerRevision, PeerStore, PrefixProof, PrepareCommand,
@@ -17,6 +18,8 @@ import type {
 
 interface Head { readonly sequence: number; readonly root: string; readonly bytes: number }
 interface Retained { readonly command: OrderedCommand; readonly core: TransactionCore }
+interface PendingRecovery { readonly previousGeneration: string; readonly previousCoordinator: string }
+interface ReplicaState { readonly version: 2; readonly authority: AuthorityBundle; readonly pending: PendingRecovery | null }
 const activeOwners = new WeakMap<PeerStore, Set<string>>()
 const operationKey = (author: string, operationId: string): string => `${author}\u0000${operationId}`
 
@@ -29,6 +32,7 @@ class Replica implements PeerReplica {
   #disposed = false
   #ready = false
   #publishedRevision: PeerRevision | null = null
+  #pendingRecovery: PendingRecovery | null = null
   #journalHead = 0
   #retainedBytes = 0
   readonly #heads = new Map<string, Head>()
@@ -52,27 +56,46 @@ class Replica implements PeerReplica {
   }
   get descriptor() { return this.#authority.descriptor }
   get device() { return this.#options.device }
+  get storageId(): string { return this.#options.storageId }
+  get requiredEpochs(): readonly number[] {
+    return [...new Set(this.#authority.selectedSegments().filter(segment => segment.cutoff?.sequence !== 0)
+      .map(segment => this.#authority.controlAt(segment.generation.payload.controlRevision).payload.epoch))].sort((a, b) => a - b)
+  }
   get authority() { return this.#authority.bundle }
   get generation(): SignedGeneration {
     const generation = this.#authority.current; check(generation !== null, 'PEER_NO_SELECTED_GENERATION'); return generation
   }
   get isCoordinator(): boolean { return this.generation.payload.coordinator === this.device.publicKey }
   get revision(): PeerRevision {
-    check(this.#publishedRevision !== null, 'PEER_RECOVERING')
+    check(this.#ready && this.#publishedRevision !== null, 'PEER_RECOVERING')
     return structuredClone(this.#publishedRevision)
   }
   async initialize(): Promise<void> {
     const stored = await this.#options.store.get(`${this.#prefix}/authority`)
     if (stored !== null) {
-      const previous = await verifyAuthorityBundle(decodePeerValue<AuthorityBundle>(stored), this.#authority.bundle.descriptor)
+      const state = decodePeerValue<ReplicaState>(stored)
+      check(state.version === 2 && Object.hasOwn(state, 'pending'), 'PEER_REPLICA_STATE_INVALID')
+      const previous = await verifyAuthorityBundle(state.authority, this.#authority.bundle.descriptor)
+      this.#pendingRecovery = state.pending
       if (previous.bundle.generations.length > this.#authority.bundle.generations.length) {
-        assertExtension(this.#authority, previous); this.#authority = previous
-      } else assertExtension(previous, this.#authority)
+        assertAuthorityExtension(this.#authority, previous); this.#authority = previous
+      } else {
+        assertAuthorityExtension(previous, this.#authority)
+        if (previous.current !== null && previous.current.id !== this.#authority.current?.id) this.#pendingRecovery ??= {
+          previousGeneration: previous.current.id, previousCoordinator: previous.current.payload.coordinator,
+        }
+      }
     }
     check(this.#authority.current !== null, 'PEER_NO_SELECTED_GENERATION')
     check(this.#options.materializer.historyProfile === 'peer-generation-v1', 'PEER_MATERIALIZER_PROFILE_MISMATCH')
     check(bytesToHex(this.#options.materializer.queries.executionManifestDigest) === this.descriptor.executionManifestDigest,
       'PEER_EXECUTION_MANIFEST_MISMATCH')
+    if (this.#pendingRecovery !== null) {
+      const value = this.#pendingRecovery
+      check(typeof value.previousGeneration === 'string' && typeof value.previousCoordinator === 'string' &&
+        this.#authority.generation(value.previousGeneration).payload.coordinator === value.previousCoordinator, 'PEER_RECOVERY_JOURNAL_INVALID')
+    }
+    await this.#persistAuthority()
     const journal = await this.#options.store.get(`${this.#prefix}/journal-head`)
     this.#journalHead = journal === null ? 0 : decodePeerValue<number>(journal)
     check(Number.isSafeInteger(this.#journalHead) && this.#journalHead >= 0 && this.#journalHead <= this.#maxRecords, 'PEER_JOURNAL_INVALID')
@@ -92,9 +115,13 @@ class Replica implements PeerReplica {
     }
     try { await this.#materialize(this.#authority) }
     catch (error) { if (!(error instanceof PeerGenerationError) || error.code !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') throw error }
-    await this.#write(`${this.#prefix}/authority`, encodePeerValue(this.#authority.bundle))
+    if (this.#ready) await this.#finishRecovery()
   }
-  get #maxRecords(): number { return this.#options.maxRecords ?? 100_000 }
+  async #persistAuthority(): Promise<void> {
+    const state: ReplicaState = { version: 2, authority: this.#authority.bundle, pending: this.#pendingRecovery }
+    await this.#write(`${this.#prefix}/authority`, encodePeerValue(state))
+  }
+  get #maxRecords(): number { return this.#options.maxRecords ?? PEER_MAX_RECORDS }
   #assertOpen(): void { check(!this.#closed, 'PEER_REPLICA_CLOSED') }
   #assertReady(): void {
     this.#assertOpen(); check(this.#ready, 'PEER_RECOVERING')
@@ -105,7 +132,7 @@ class Replica implements PeerReplica {
     catch (error) {
       // An atomic write may have committed before its reply was lost. Reopen;
       // never continue from stale signing or sequence state.
-      this.#closed = true; throw error
+      this.#closed = true; this.#ready = false; throw error
     }
   }
   #remember(attempt: SignedAttempt): void {
@@ -160,7 +187,8 @@ class Replica implements PeerReplica {
       check(samePeerValue(previous.command, command), 'PEER_ORDER_IDENTITY_CONFLICT'); return
     }
     check(receipt.payload.sequence === head.sequence + 1 && receipt.payload.previousRoot === head.root, 'PEER_HISTORY_GAP')
-    check(head.sequence < this.#maxRecords && this.#retainedBytes + receipt.payload.bodyBytes <= (this.#options.maxHistoryBytes ?? 128 * 1024 * 1024), 'PEER_STORAGE_QUOTA')
+    const recordBytes = encodePeerValue(command)
+    check(this.#receipts.size < this.#maxRecords && this.#retainedBytes + recordBytes.length + 2 <= (this.#options.maxHistoryBytes ?? PEER_MAX_HISTORY_BYTES), 'PEER_STORAGE_QUOTA')
     const key = operationKey(receipt.payload.author, receipt.payload.operationId), existing = this.#operations.get(key)
     check(existing === undefined || existing === attempt.id, 'PEER_OPERATION_ID_REUSED')
     const knownOrder = this.#receipts.get(attempt.id)
@@ -168,11 +196,11 @@ class Replica implements PeerReplica {
     const next = { sequence: receipt.payload.sequence, root: receipt.root, bytes: head.bytes + receipt.payload.bodyBytes }
     if (persist) {
       // Persist exact original body and signed receipt before publishing the head.
-      await this.#write(`${this.#prefix}/record/${generation.id}/${next.sequence}`, encodePeerValue(command))
+      await this.#write(`${this.#prefix}/record/${generation.id}/${next.sequence}`, recordBytes)
       await this.#write(`${this.#prefix}/head/${generation.id}`, encodePeerValue(next))
     }
     this.#heads.set(generation.id, next); entries.set(next.sequence, { command: structuredClone(command), core })
-    this.#remember(attempt); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += receipt.payload.bodyBytes
+    this.#remember(attempt); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += recordBytes.length + 2
   }
   #selectedHistory(authority: PeerAuthority): Retained[] {
     const result: Retained[] = []
@@ -306,7 +334,12 @@ class Replica implements PeerReplica {
     return this.#serial.run(async () => {
       this.#assertOpen(); check(commands.length <= 4096, 'PEER_REPLICATION_BATCH_LIMIT')
       for (const command of commands) await this.#retain(command, this.#authority, true)
-      try { await this.#materialize(this.#authority) } catch (error) { this.#closed = true; throw error }
+      try { await this.#materialize(this.#authority) }
+      catch (error) {
+        if (!(error instanceof PeerGenerationError) || error.code !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') this.#closed = true
+        throw error
+      }
+      await this.#finishRecovery()
       this.#publish()
     })
   }
@@ -323,47 +356,55 @@ class Replica implements PeerReplica {
         'PEER_REPLICATION_TARGET_INVALID')
       }
       await this.#serial.run(async () => {
-        this.#assertOpen(); assertExtension(this.#authority, next)
+        this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
+        if (this.generation.id !== next.current!.id) {
+          this.#pendingRecovery ??= { previousGeneration: this.generation.id, previousCoordinator: this.generation.payload.coordinator }
+          // Fence restrictive controls before fetching the replacement prefix.
+          this.#ready = false; this.#authority = next; this.#coverage.clear()
+          await this.#persistAuthority()
+          this.#publish()
+        }
         for (const generation of next.bundle.generations) await this.#loadGeneration(generation, next)
       })
       let count = 0
       // Fetch outside the serial section: the other peer may simultaneously
       // need our retained ranges. Each page is copied before asynchronous checks.
       for await (const inputPage of replicationPages(commands)) {
-        check(isArray(inputPage) && inputPage.length > 0 && inputPage.length <= 4096, 'PEER_REPLICATION_BATCH_LIMIT')
+        check(isArray(inputPage) && inputPage.length > 0 && inputPage.length <= PEER_MAX_RECORDS, 'PEER_REPLICATION_BATCH_LIMIT')
         count += inputPage.length; check(count <= this.#maxRecords, 'PEER_REPLICATION_BATCH_LIMIT')
         const page = structuredClone(inputPage)
         await this.#serial.run(async () => {
-          this.#assertOpen(); assertExtension(this.#authority, next)
+          this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
           for (const command of page) await this.#retain(command, next, true)
         })
       }
       return this.#serial.run(async () => {
-        this.#assertOpen(); assertExtension(this.#authority, next)
-        const previous = this.generation
+        this.#assertOpen(); assertAuthorityExtension(this.#authority, next)
         this.#selectedHistory(next)
         if (at !== undefined) check(this.#pointAvailable(at.point, next), 'PEER_REPLICATION_TARGET_INCOMPLETE')
-        // Pin selection before publishing the new materialization. A crash can
-        // replay the retained evidence; readers remain serialized until both agree.
-        await this.#write(`${this.#prefix}/authority`, encodePeerValue(next.bundle))
         try { await this.#materialize(next) } catch (error) { this.#closed = true; throw error }
         this.#authority = next
-        let notice: RecoveryNotice | null = null
-        if (previous.id !== this.generation.id) {
-          const abandoned: OperationState[] = []
-          for (const [id, attempt] of this.#attempts) if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
-          notice = { previousGeneration: previous.id, generation: this.generation.id, adopted: this.generation.payload.adopted,
-            revision: this.revision, abandoned: abandoned.slice(0, 1024),
-            // A known abandoned suffix says nothing about work retained only by
-            // the former coordinator. This protocol does not certify its last head.
-            unknownLoss: true }
-          this.#recoveries.push(structuredClone(notice)); if (this.#recoveries.length > 32) this.#recoveries.shift()
-          await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(this.#recoveries))
-          for (const listener of [...this.#recoveryListeners]) { try { listener(structuredClone(notice)) } catch { /* Observers are isolated. */ } }
-        }
+        const notice = await this.#finishRecovery()
         this.#publish(); return notice
       })
     })()
+  }
+  async #finishRecovery(): Promise<RecoveryNotice | null> {
+    const pending = this.#pendingRecovery
+    if (pending === null) return null
+    const recorded = this.#recoveries.at(-1)
+    if (recorded?.previousGeneration === pending.previousGeneration && recorded.generation === this.generation.id) {
+      this.#pendingRecovery = null; await this.#persistAuthority(); return structuredClone(recorded)
+    }
+    const abandoned: OperationState[] = []
+    for (const [id, attempt] of this.#attempts) if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
+    const notice: RecoveryNotice = { previousGeneration: pending.previousGeneration, generation: this.generation.id, adopted: this.generation.payload.adopted,
+      revision: this.revision, abandoned: abandoned.slice(0, 1024), unknownLoss: pending.previousCoordinator !== this.device.publicKey }
+    this.#recoveries.push(structuredClone(notice)); if (this.#recoveries.length > 32) this.#recoveries.shift()
+    await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(this.#recoveries))
+    this.#pendingRecovery = null; await this.#persistAuthority()
+    for (const listener of [...this.#recoveryListeners]) { try { listener(structuredClone(notice)) } catch { /* Observers are isolated. */ } }
+    return notice
   }
   #state(attempt: SignedAttempt): OperationState {
     const header = attempt.payload.header, previous = this.#lastOutcomes.get(attempt.id)
@@ -373,7 +414,7 @@ class Replica implements PeerReplica {
       operationId: header.operationId, generation: header.generation, selectedGeneration: this.generation.id, previous: structuredClone(previous ?? null) }
   }
   operation(operationId: string, author = this.device.publicKey): Promise<OperationState | null> {
-    return this.#serial.run(async () => { this.#assertOpen(); const id = this.#operations.get(operationKey(author, operationId)); return id === undefined ? null : this.#state(this.#attempts.get(id)!) })
+    return this.#serial.run(async () => { this.#assertReady(); const id = this.#operations.get(operationKey(author, operationId)); return id === undefined ? null : this.#state(this.#attempts.get(id)!) })
   }
   attempt(operationId: string, author = this.device.publicKey): Promise<SignedAttempt | null> {
     return this.#serial.run(async () => { this.#assertOpen(); const id = this.#operations.get(operationKey(author, operationId)); return structuredClone(id === undefined ? null : this.#attempts.get(id)!) })
@@ -477,17 +518,13 @@ class Replica implements PeerReplica {
 async function* replicationPages(commands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>): AsyncGenerator<readonly OrderedCommand[]> {
   if (isArray(commands)) {
     const values = commands as readonly OrderedCommand[]
-    for (let offset = 0; offset < values.length; offset += 4096) yield values.slice(offset, offset + 4096)
+    for (let offset = 0; offset < values.length; offset += PEER_MAX_RECORDS) yield values.slice(offset, offset + PEER_MAX_RECORDS)
   } else yield* commands as AsyncIterable<readonly OrderedCommand[]>
 }
 
-function assertExtension(previous: PeerAuthority, next: PeerAuthority): void {
-  const old = previous.bundle, current = next.bundle
-  check(current.generations.length >= old.generations.length && current.controls.length >= old.controls.length, 'PEER_AUTHORITY_REGRESSION')
-  for (let index = 0; index < old.generations.length; index++) check(samePeerValue(old.generations[index], current.generations[index]), 'PEER_CONTROL_EQUIVOCATION')
-  for (let index = 0; index < old.controls.length; index++) check(samePeerValue(old.controls[index], current.controls[index]), 'PEER_CONTROL_EQUIVOCATION')
-}
 export async function createPeerReplica(options: PeerReplicaOptions): Promise<PeerReplica> {
+  check(options.maxRecords === undefined || Number.isSafeInteger(options.maxRecords) && options.maxRecords >= 1 && options.maxRecords <= PEER_MAX_RECORDS, 'PEER_RECORD_LIMIT_INVALID')
+  check(options.maxHistoryBytes === undefined || Number.isSafeInteger(options.maxHistoryBytes) && options.maxHistoryBytes >= 1024 && options.maxHistoryBytes <= PEER_MAX_HISTORY_BYTES, 'PEER_HISTORY_LIMIT_INVALID')
   const authority = await verifyAuthorityBundle(options.authority)
   boundedText(options.storageId, 256)
   let owners = activeOwners.get(options.store)

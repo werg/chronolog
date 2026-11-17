@@ -16,6 +16,15 @@ export * from './definition.js'
 export * from './schema.js'
 export { createPeerIdentity, exportPeerIdentity, importPeerIdentity, PeerGenerationError, encodePeerValue, decodePeerValue, peerDigest, bytesDigest } from './codec.js'
 
+/** Monotonic learned authority: a signed older state or a divergent chain cannot replace it. */
+export function assertAuthorityExtension(previous: PeerAuthority, next: PeerAuthority): void {
+  const old = previous.bundle, current = next.bundle
+  check(samePeerValue(old.descriptor, current.descriptor), 'PEER_DESCRIPTOR_MISMATCH')
+  check(current.generations.length >= old.generations.length && current.controls.length >= old.controls.length, 'PEER_AUTHORITY_REGRESSION')
+  for (let index = 0; index < old.generations.length; index++) check(samePeerValue(old.generations[index], current.generations[index]), 'PEER_CONTROL_EQUIVOCATION')
+  for (let index = 0; index < old.controls.length; index++) check(samePeerValue(old.controls[index], current.controls[index]), 'PEER_CONTROL_EQUIVOCATION')
+}
+
 function scope(value: { applicationId: string; profile: string; policy?: string }, descriptor: ApplicationDescriptor): void {
   check(value.applicationId === descriptor.applicationId && value.profile === PEER_GENERATION_PROFILE &&
     (value.policy === undefined || value.policy === descriptor.policy), 'PEER_SCOPE_MISMATCH')

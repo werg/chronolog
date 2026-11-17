@@ -100,6 +100,8 @@ export interface CapturedPeerView {
 export interface PeerReplica {
   readonly descriptor: ApplicationDescriptor
   readonly device: PeerIdentity
+  readonly storageId: string
+  readonly requiredEpochs: readonly number[]
   readonly authority: AuthorityBundle
   readonly generation: SignedGeneration
   readonly revision: PeerRevision

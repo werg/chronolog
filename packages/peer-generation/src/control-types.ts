@@ -1,5 +1,8 @@
 export const PEER_GENERATION_PROFILE = 'peer-generation-v1' as const
 export const PEER_GENERATION_POLICY = 'eligible-members-v1' as const
+/** Initial qualified envelope shared by indexed storage, recovery, and transfer. */
+export const PEER_MAX_RECORDS = 4096
+export const PEER_MAX_HISTORY_BYTES = 64 * 1024 * 1024
 export const PEER_GENERATION_CAPABILITIES = Object.freeze({
   ordering: 'generation-sequence', applied: true, shared: true,
   finality: false, automaticExternalEffects: false, recovery: 'selected-prefix',
