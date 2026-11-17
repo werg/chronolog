@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
-import { decodeEnvelope, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
+import { decodeFinalityClosureRecord, isFinalityClosureRecord } from '@chronolog/node-core/finality'
+import { assertCanonicalCbor, decodeEnvelope, utf8, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
 import type { ApplicationOperation } from '@tendriller/core/application'
 
@@ -22,10 +23,13 @@ export async function qualifyApplicationScope(modulePath: string) {
   const recipe = await import(pathToFileURL(modulePath).href) as ScopePrograms
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-scope-qualification-'))
   const executionManifest = createDoltLiteExecutionManifest()
+  let materializer: DeterministicMaterializer | undefined
   const native = await createNativeBrowserFixture({ directory, browsers: [], manifest: executionManifest,
-    materialization: async ({ identity }) => createDoltLiteMaterializationRuntime(await DeterministicMaterializer.open({
-      path: join(directory, 'application.db'), executionManifest, rootAdministrator: identity.signing.publicKeyBytes,
-    })) })
+    materialization: async ({ identity }) => {
+      materializer = await DeterministicMaterializer.open({ path: join(directory, 'application.db'),
+        executionManifest, rootAdministrator: identity.signing.publicKeyBytes })
+      return createDoltLiteMaterializationRuntime(materializer)
+    } })
   try {
     // Pause automatic inclusion/closure, retaining the same fenced service.
     // This lets an original offline edit arrive after the reset's time closes.
@@ -48,15 +52,34 @@ export async function qualifyApplicationScope(modulePath: string) {
     }
     const include = async (pending: Awaited<ReturnType<typeof submit>>): Promise<ApplicationOperation> => {
       await authority.append(pending.record.payload)
+      const started = performance.now()
       const deadline = Date.now() + 10_000
+      let attempts = 0
       while (Date.now() < deadline) {
+        attempts++
         await authority.share({ putEvidence: bytes => native.transport.putEvidence(bytes) })
         await native.node.waitForIdle()
         const value = await backend.operations.get(pending.receipt.operationId)
         if (value?.status === 'final' || value?.status === 'rejected') return value
         await new Promise(resolve => setTimeout(resolve, 10))
       }
-      throw new Error('SCOPE_OPERATION_DID_NOT_SETTLE')
+      const txId = utf8(pending.receipt.proposalId)
+      const [operation, status, range] = await Promise.all([
+        backend.operations.get(pending.receipt.operationId), native.node.status(), authority.read({ limit: 256 }),
+      ])
+      const closure = range.entries.filter(entry => isFinalityClosureRecord(entry.bytes))
+        .map(entry => decodeFinalityClosureRecord(entry.bytes)).at(-1)
+      const applied = assertCanonicalCbor(await native.node.finalTarget())
+      const candidate = native.node.candidate(txId)
+      const diagnostic = { operationId: pending.receipt.operationId, operation, attempts, elapsedMs: Math.round(performance.now() - started),
+        candidate: candidate === null ? null : { state: candidate.state, reason: candidate.stateReason,
+          authorTimestampMs: candidate.orderKey.authorTimestampMs },
+        outcome: native.node.outcome(txId), materializerOutcome: materializer?.outcome(txId), status,
+        finality: { head: range.head, hasMore: range.hasMore, closedThroughMs: closure?.closedThroughMs,
+          closedReceiptThrough: closure?.includedHead.position, appliedThrough: native.node.finalThrough,
+          appliedClosedThroughMs: Array.isArray(applied) && typeof applied[6] === 'bigint' ? applied[6] : null } }
+      throw new Error(`SCOPE_OPERATION_DID_NOT_SETTLE:${JSON.stringify(diagnostic, (_key, value: unknown) =>
+        typeof value === 'bigint' ? value.toString() : value)}`)
     }
     const scope = 'inspection-notes'
     assert.equal((await include(await submit(recipe.initializeScopedState({ scope }), 'scope-initialize'))).status, 'final')

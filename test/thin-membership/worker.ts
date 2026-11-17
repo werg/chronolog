@@ -33,6 +33,8 @@ let connection: Awaited<ReturnType<typeof attachMembershipPeer>> | undefined
 let opening: DataChannelConnection | undefined, connectionGeneration = 0
 let connectionError: string | undefined
 let requestId: string | undefined
+interface SyncProgress { phase: string; startedAt: number; phaseStartedAt: number; completedAt: number | undefined }
+let syncProgress: SyncProgress | undefined
 
 async function disconnect(): Promise<void> {
   connectionGeneration++
@@ -41,15 +43,18 @@ async function disconnect(): Promise<void> {
   await Promise.all([pending?.close(), previous?.close()])
 }
 
-async function status() {
+async function status(phase?: (value: string) => void) {
   if (peer === undefined || identity === undefined || client === undefined) throw new Error('THIN_BROWSER_NOT_OPEN')
   let applicationBlockedOnPayload = false
+  phase?.('materialization')
   try { await peer.node.waitForIdle() }
   catch (error) {
     if (!(error instanceof Error && error.cause instanceof LedgerRecordError && error.cause.code === 'LEDGER_PAYLOAD_UNAVAILABLE')) throw error
     applicationBlockedOnPayload = true
   }
   const membership = peer.governed!.activeSnapshot
+  phase?.('enrollment')
+  const enrollment = requestId === undefined ? null : await client.enrollment.getStatus(requestId)
   return { identity: bytesToBase64Url(identity.signing.publicKeyBytes), connected: connection !== undefined,
     connectionError, rtc: connection?.stats() ?? null, applicationBlockedOnPayload, membershipRevision: String(membership.revision), finalThrough: peer.node.finalThrough,
     availableEpochs: peer.governed!.governance.cipherRing.epochs().map(String),
@@ -58,7 +63,7 @@ async function status() {
       equalBytes(capability.grant.signingPublicKey, identity!.signing.publicKeyBytes)).map(capability => ({
         id: bytesToBase64Url(capability.id), role: capability.grant.role, active: isCapabilityActive(capability, membership.revision),
       })),
-    enrollment: requestId === undefined ? null : await client.enrollment.getStatus(requestId) }
+    enrollment }
 }
 
 endpoint.addEventListener('message', event => {
@@ -126,10 +131,17 @@ endpoint.addEventListener('message', event => {
       case 'disconnect': await disconnect(); return null
       case 'sync': {
         if (connectionError !== undefined) throw new Error(connectionError)
-        await peer!.transport.catchUp()
-        const current = await status()
-        if (connectionError !== undefined) throw new Error(connectionError)
-        return current
+        const progress: SyncProgress = { phase: 'transport', startedAt: performance.now(), phaseStartedAt: performance.now(),
+          completedAt: undefined }
+        syncProgress = progress
+        const phase = (value: string) => { progress.phase = value; progress.phaseStartedAt = performance.now() }
+        try {
+          await peer!.transport.catchUp()
+          const current = await status(phase)
+          if (connectionError !== undefined) throw new Error(connectionError)
+          phase('completed')
+          return current
+        } finally { progress.completedAt = performance.now() }
       }
       case 'publish': {
         const handle = await client!.submit(program(emit('qualification', { text: request.text! })), { operationId: request.operationId! })
@@ -140,7 +152,11 @@ endpoint.addEventListener('message', event => {
       case 'status': return status()
       // Diagnostics observe current state without entering the SQL replay mutex.
       case 'progress': return { opened: peer !== undefined, connected: connection !== undefined, connectionError,
-        rtc: connection?.stats() ?? null, node: await peer?.node.status() }
+        rtc: connection?.stats() ?? null, node: await peer?.node.status(), finalThrough: peer?.node.finalThrough,
+        sync: syncProgress === undefined ? null : { phase: syncProgress.phase,
+          elapsedMs: Math.round((syncProgress.completedAt ?? performance.now()) - syncProgress.startedAt),
+          phaseElapsedMs: Math.round((syncProgress.completedAt ?? performance.now()) - syncProgress.phaseStartedAt),
+          completed: syncProgress.completedAt !== undefined } }
       case 'close': await client?.close(); await peer?.close(); client = undefined; peer = undefined; return null
     }
   }
