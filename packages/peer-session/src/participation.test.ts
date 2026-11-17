@@ -193,7 +193,13 @@ describe('owned application participation', () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const link = await connectApplications(a, b)
     closing.push(() => link.close())
-    await post(a, 'retained'); await link.synchronize()
+    const operation = await post(a, 'retained')
+    // Each direction synchronizes its own captured head. Handover needs the
+    // successor's signed retention of this exact newly applied prefix.
+    const coverage = await operation.shared({ signal: AbortSignal.timeout(5000) })
+    expect(coverage.map(receipt => ({ peer: receipt.payload.peer, point: receipt.payload.point }))).toEqual([
+      { peer: b.deviceId, point: a.revision.point },
+    ])
     f.loseSelection()
     await expect(a.recovery.handover(f.host, { coordinator: b.deviceId, transitionId: 'handover' })).rejects.toThrow('LOST_SELECTION_REPLY')
     const original = (await a.recovery.inspect())[0]!.request
