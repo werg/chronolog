@@ -1,20 +1,29 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
+import { selectDistributionArtifact, type DistributionIdentity } from './lib/distribution-artifact.js'
 
 const directory = resolve(argument('--directory', 'artifacts/distribution'))
 const requested = optional('--artifact')
-const archive = requested === undefined ? join(directory, (await readdir(directory))
-  .filter(name => name.startsWith('chronolog-') && name.endsWith('.tar.gz')).sort().at(-1)
-  ?? missing('No distribution archive found')) : resolve(requested)
+const sourcePin = optional('--expected-source')
+const checkout = await realpath(resolve(import.meta.dirname, '..'))
+const expectedSourceCommit = requested === undefined
+  ? execFileSync('git', ['rev-parse', 'HEAD'], { cwd: checkout, encoding: 'utf8' }).trim() : sourcePin
+if (requested === undefined && sourcePin !== undefined && sourcePin !== expectedSourceCommit) {
+  throw new Error('DISTRIBUTION_DEFAULT_REQUIRES_CURRENT_SOURCE: use --artifact to qualify a historical archive')
+}
+const selected = await selectDistributionArtifact({ directory, ...(requested === undefined ? {} : { artifact: requested }),
+  ...(expectedSourceCommit === undefined ? {} : { expectedSourceCommit }), platform: process.platform, architecture: process.arch })
+const { archive } = selected
 const temporary = await mkdtemp(join(tmpdir(), 'chronolog-native-consumer-'))
 const report = {
   format: 'chronolog-native-consumer-v1', passed: false, archive, archiveSha256: '',
-  sourceCommit: '', checks: [] as string[], error: '',
+  sourceCommit: selected.identity.sourceCommit, expectedSourceCommit: expectedSourceCommit ?? null,
+  platform: selected.identity.platform, architecture: selected.identity.architecture, checks: [] as string[], error: '',
 }
 // Neither a caller's Node module search path nor a checkout tsconfig may supply
 // dependencies to the relocated consumer.
@@ -23,7 +32,6 @@ delete environment.NODE_PATH
 delete environment.NODE_OPTIONS
 delete environment.TSX_TSCONFIG_PATH
 try {
-  const checkout = await realpath(resolve(import.meta.dirname, '..'))
   const relocated = await realpath(temporary)
   assert(relocated !== checkout && !relocated.startsWith(`${checkout}${sep}`), 'Set TMPDIR outside the source checkout for relocation qualification')
   report.archiveSha256 = createHash('sha256').update(await readFile(archive)).digest('hex')
@@ -33,11 +41,13 @@ try {
     'Archive entries must stay inside the distribution directory')
   execFileSync('tar', ['-xzf', archive, '-C', temporary], { stdio: 'inherit' })
   const distribution = join(temporary, name)
-  execFileSync(join(distribution, 'bin', 'chronolog-verify'), [], { cwd: temporary, env: environment, stdio: 'inherit' })
-  const manifest = JSON.parse(await readFile(join(distribution, 'release-manifest.json'), 'utf8')) as {
-    readonly sourceCommit: string; readonly files: readonly { readonly path: string }[]
+  const manifest = JSON.parse(await readFile(join(distribution, 'release-manifest.json'), 'utf8')) as DistributionIdentity & {
+    readonly files: readonly { readonly path: string }[]
   }
-  report.sourceCommit = manifest.sourceCommit
+  assert.deepEqual({ sourceCommit: manifest.sourceCommit, platform: manifest.platform, architecture: manifest.architecture }, selected.identity,
+    'Extracted archive identity changed after selection')
+  report.checks.push('archive manifest identifies the required source, operating system and architecture')
+  execFileSync(join(distribution, 'bin', 'chronolog-verify'), [], { cwd: temporary, env: environment, stdio: 'inherit' })
   report.checks.push('extracted archive passes its file hashes and internal-symlink verifier outside the checkout')
 
   const names = new Set<string>()
@@ -148,4 +158,3 @@ function optional(name: string): string | undefined {
   return value
 }
 function argument(name: string, fallback: string): string { return optional(name) ?? fallback }
-function missing(message: string): never { throw new Error(message) }

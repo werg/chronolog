@@ -11,7 +11,7 @@ import { CoordinatedHistoryPolicy, decodeLedgerRecord, decodeOrderingEvidence, i
   type CoordinatedHistoryConfiguration, type OrderedRecordHead } from '@chronolog/node-core'
 import { base64UrlToBytes } from '@chronolog/protocol'
 
-import { AUTHORITY_CRASH_POINTS, inspectStoppedAuthority, recoveryJson, type RecoveryOperation } from './lib/authority-recovery-fixture.js'
+import { AUTHORITY_CRASH_POINTS, certifiedRecoveryFloor, inspectStoppedAuthority, recoveryJson, type RecoveryOperation } from './lib/authority-recovery-fixture.js'
 import { fileSha256, git } from './lib/common.js'
 
 interface RecoveryState {
@@ -67,7 +67,8 @@ const report = { format: 'chronolog-authority-recovery/v1', passed: false, start
     'The backup is a quiesced whole-directory copy. Application snapshot export alone is not an authority backup.',
     'Authority-task outage and retained-evidence relay use in-process portable peers; public-network outage and deployed service recovery remain separate.',
     'No independent second-durable-copy acknowledgement or automatic failover is promised.',
-  ], error: '' }
+  ], failureContext: null as { readonly point: string; readonly operation: RecoveryOperation; readonly before: RecoveryState;
+    readonly afterCrash: Awaited<ReturnType<typeof inspectStoppedAuthority>> } | null, error: '' }
 const checked = (id: string, details: unknown) => { checks.push({ id, details }); process.stdout.write(`Passed: ${id}\n`) }
 const child = (action: string, directory: string, operation = 'accepted', point = 'none', continuity?: string): ChildResult => {
   const args = ['--import', 'tsx', join(workspace, 'tools/lib/authority-recovery-child.ts'), action, directory, operation, point,
@@ -98,6 +99,9 @@ try {
       assert(crashed.signal === 'SIGKILL' || crashed.status === 137, `${crashed.stdout}\n${crashed.stderr}`)
       assert(crashed.stdout.includes(`"point":"${point}"`))
       const raw = await inspectStoppedAuthority(directory)
+      // Preserve the observed stopped disk if a later invariant fails; private
+      // crash volumes are deliberately excluded from the public CI artifact.
+      report.failureContext = { point, operation, before, afterCrash: raw }
       const committed = !['before_payload_commit', 'after_payload_commit', 'before_record_commit'].includes(point)
       assert.equal(raw.proposalCount, before.proposalCount + (committed ? 1 : 0))
       assert.deepEqual(raw.entries.slice(0, before.head.position).map(entry => entry.recordId), before.receipts.map(entry => entry.recordId))
@@ -109,26 +113,27 @@ try {
         const certified = raw.certificate?.kind === 'prefix-certificate' ? raw.certificate.certificate.position : -1
         assert.equal(certified >= closure.position, ['after_certificate_commit', 'before_acknowledgement'].includes(point))
       }
+      let continuity = before.head
       if (point === 'after_certificate_commit' || point === 'before_acknowledgement') {
-        assert.equal(raw.certificate?.kind, 'prefix-certificate')
-        if (raw.certificate?.kind === 'prefix-certificate') {
-          assert.equal(raw.certificate.certificate.position, raw.head.position)
-          assert.equal(raw.certificate.certificate.root, raw.head.root)
-        }
+        assert(closure !== undefined)
+        continuity = certifiedRecoveryFloor(raw, closure, point)
       }
-      const recovered = state(child('submit', directory, operation))
+      const floor = join(volumes, `${point}-${operation}-continuity.json`)
+      await writeFile(floor, recoveryJson(continuity), { flag: 'wx' })
+      const recovered = state(child('submit', directory, operation, 'none', floor))
       assertTerminal(recovered, operation)
       assert.equal(recovered.proposalCount, before.proposalCount + 1)
       assert.equal(recovered.payloads.length, before.payloads.length + 1)
-      assert.deepEqual(recovered.receipts.slice(0, before.head.position).map(entry => entry.recordId), before.receipts.map(entry => entry.recordId))
-      const retried = state(child('submit', directory, operation))
+      assert.deepEqual(recovered.receipts.slice(0, raw.head.position), raw.entries)
+      const retried = state(child('submit', directory, operation, 'none', floor))
       assert.equal(retried.operations[operation]?.proposalId, recovered.operations[operation]?.proposalId)
       assertSameState(retried, recovered)
       assert.deepEqual(retried.rows, recovered.rows)
       assert.deepEqual(retried.events, recovered.events)
       assert(retried.payloads.every(payload => payload.payloadBytes !== null))
-      checked(`crash/${point}/${operation}`, { before, afterCrash: raw, recovered,
+      checked(`crash/${point}/${operation}`, { before, afterCrash: raw, continuity, recovered,
         exactRetry: { head: retried.head, proposalCount: retried.proposalCount, closedThroughMs: retried.closedThroughMs } })
+      report.failureContext = null
     }
   }
 

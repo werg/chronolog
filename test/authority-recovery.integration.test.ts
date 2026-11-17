@@ -3,15 +3,57 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { emit, program } from '@chronolog/protocol'
 
-import { AUTHORITY_CRASH_POINTS, inspectStoppedAuthority, openAuthorityRecoveryFixture } from '../tools/lib/authority-recovery-fixture.js'
+import { AUTHORITY_CRASH_POINTS, certifiedRecoveryFloor, inspectStoppedAuthority, openAuthorityRecoveryFixture } from '../tools/lib/authority-recovery-fixture.js'
 
 const directories: string[] = []
 afterEach(async () => { await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true }))) })
 
 describe('native authority process crash recovery', () => {
+  it('retains an acknowledged prefix across an interrupted later idle certificate write', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'chronolog-authority-ack-prefix-'))
+    directories.push(parent)
+    const directory = join(parent, 'volume')
+    const fixture = await openAuthorityRecoveryFixture(directory, { create: true })
+    let acknowledged: Awaited<ReturnType<typeof fixture.inspect>>
+    try {
+      await fixture.initialize()
+      await fixture.submit('accepted')
+      await fixture.agent.close()
+      acknowledged = await fixture.inspect()
+      const put = fixture.store.put.bind(fixture.store)
+      const interrupted = vi.spyOn(fixture.store, 'put').mockImplementation(async (key, bytes) => {
+        if (key.endsWith('/certificate')) throw new Error('INTERRUPTED_IDLE_CERTIFICATE_WRITE')
+        await put(key, bytes)
+      })
+      try {
+        await fixture.advanceClock()
+        await expect(fixture.authority.certify()).rejects.toThrow('INTERRUPTED_IDLE_CERTIFICATE_WRITE')
+      } finally { interrupted.mockRestore() }
+    } finally { await fixture.close() }
+    const raw = await inspectStoppedAuthority(directory)
+    expect(raw.head.position).toBe(acknowledged.head.position + 1)
+    expect(raw.entries.at(-1)?.kind).toBe('closure')
+    const target = raw.closures.find(closure => closure.position === acknowledged.head.position)
+    expect(target).toBeDefined()
+    const continuity = certifiedRecoveryFloor(raw, target!, 'before_acknowledgement')
+    expect(continuity).toEqual(acknowledged.head)
+    expect(() => certifiedRecoveryFloor(raw, target!, 'after_certificate_commit')).toThrow()
+    const recovered = await openAuthorityRecoveryFixture(directory, { continuity })
+    try {
+      await recovered.submit('accepted')
+      const state = await recovered.inspect()
+      expect(state.receipts.slice(0, raw.head.position)).toEqual(raw.entries)
+      expect(state.operations.accepted).toEqual(acknowledged.operations.accepted)
+      expect(state.proposalCount).toBe(acknowledged.proposalCount)
+      expect(state.payloads).toEqual(acknowledged.payloads)
+      expect(state.rows).toEqual(acknowledged.rows)
+      expect(state.events).toEqual(acknowledged.events)
+    } finally { await recovered.close() }
+  }, 40_000)
+
   for (const point of AUTHORITY_CRASH_POINTS) {
     for (const operation of ['accepted', 'rejected'] as const) {
       it(`recovers the original ${operation} operation after SIGKILL at ${point}`, async () => {
@@ -39,10 +81,12 @@ describe('native authority process crash recovery', () => {
           const certifiedThrough = raw.certificate?.kind === 'prefix-certificate' ? raw.certificate.certificate.position : -1
           expect(certifiedThrough >= coveringClosure.position).toBe(['after_certificate_commit', 'before_acknowledgement'].includes(point))
         }
+        let continuity = before.head
         if (point === 'after_certificate_commit' || point === 'before_acknowledgement') {
-          expect(raw.certificate).toMatchObject({ kind: 'prefix-certificate', certificate: raw.head })
+          expect(coveringClosure).toBeDefined()
+          continuity = certifiedRecoveryFloor(raw, coveringClosure!, point)
         }
-        const recovered = await openAuthorityRecoveryFixture(directory, { continuity: before.head })
+        const recovered = await openAuthorityRecoveryFixture(directory, { continuity })
         try {
           const original = await recovered.node.operation(`recovery-${operation}`)
           expect(original).not.toBeNull()
@@ -53,7 +97,7 @@ describe('native authority process crash recovery', () => {
           const state = await recovered.inspect()
           expect(state.proposalCount).toBe(before.proposalCount + 1)
           expect(state.payloads).toHaveLength(before.payloads.length + 1)
-          expect(state.receipts.slice(0, before.head.position).map(entry => entry.recordId)).toEqual(before.receipts.map(entry => entry.recordId))
+          expect(state.receipts.slice(0, raw.head.position)).toEqual(raw.entries)
           expect(state.rows).toEqual([[{ kind: 'integer', value: '1' }, { kind: 'integer', value: operation === 'accepted' ? '20' : '10' }]])
           expect(state.events.flatMap(transaction => transaction.events)).toHaveLength(operation === 'accepted' ? 1 : 0)
           await recovered.submit(operation)
