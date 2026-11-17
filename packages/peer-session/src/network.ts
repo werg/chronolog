@@ -288,9 +288,16 @@ class NetworkPeer implements ApplicationPeerLink {
           const pending = this.#pending.get(id)
           requireNetwork(pending !== undefined, 'APPLICATION_NETWORK_RESPONSE_INVALID')
           const payload = validateParticipantResponse(response, pending.request, PEER_PARTICIPANT_POLICY).payload
+          // Keep the waiter registered until the whole reply is valid. Closing
+          // a malformed response must still reject this request with the link.
+          let failure: Error | undefined
+          if (!message.ok) {
+            requireNetwork(typeof payload === 'string' && /^[A-Z0-9_]{1,128}$/u.test(payload), 'APPLICATION_NETWORK_RESPONSE_INVALID')
+            failure = networkError(payload)
+          }
           this.#pending.delete(id); pending.cancel()
-          if (message.ok) pending.resolve(payload)
-          else { requireNetwork(typeof payload === 'string' && /^[A-Z0-9_]{1,128}$/u.test(payload), 'APPLICATION_NETWORK_RESPONSE_INVALID'); pending.reject(networkError(payload)) }
+          if (failure === undefined) pending.resolve(payload)
+          else pending.reject(failure)
         } else if (kind === 'hint') {
           const message = this.#incomingMessage(record(value, ['kind', 'message']).message)
           requireNetwork(message.facet === 'ephemeral' && message.action === 'hint' && message.payload === null, 'APPLICATION_NETWORK_MESSAGE_INVALID')

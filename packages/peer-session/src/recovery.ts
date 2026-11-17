@@ -1,6 +1,6 @@
 import type { BytesStore } from '@chronolog/records'
 import {
-  decodePeerValue, encodePeerValue, signTransitionRequest, verifyAuthorityBundle,
+  decodePeerValue, encodePeerValue, peerDigest, signTransitionRequest, verifyAuthorityBundle,
   type AuthorityBundle, type PeerReplica, type RecoveryNotice,
   type SignedGeneration, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
@@ -118,7 +118,8 @@ export class ApplicationRecovery {
         this.#signal.throwIfAborted()
         await verifyAuthorityBundle(bundle, this.#replica.authority.descriptor)
         this.#signal.throwIfAborted()
-        if (!bundle.generations.some(generation => generation.id === selected.id && generation.payload.transition.payload.transitionId === entry.request.payload.transitionId)) {
+        const observed = bundle.generations.find(generation => generation.id === selected.id)
+        if (observed === undefined || await peerDigest(observed.payload.transition) !== await peerDigest(entry.request)) {
           throw new Error('APPLICATION_TRANSITION_REPLY_MISMATCH')
         }
         // The attached control participant durably observes new authority on

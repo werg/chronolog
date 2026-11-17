@@ -103,6 +103,7 @@ Package the supported composition from clean source:
 node tools/package-peer-session.mjs
 node tools/package-peer-session.mjs --native-rtc --output artifacts/peer-session-rtc
 node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
+node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-session-sql-browser
 node tools/package-peer-generation-control.mjs
 ```
 

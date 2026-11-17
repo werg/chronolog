@@ -60,7 +60,7 @@ async function fixture() {
     cleanup.push(() => session.close())
     return session
   }
-  return { open, registry, publications, exchange, traffic, faults }
+  return { open, registry, publications, exchange, traffic, faults, devices }
 }
 
 describe('session-owned control participant', () => {
@@ -100,6 +100,17 @@ describe('session-owned control participant', () => {
     await expect(host.application()).rejects.toThrow('PEER_AUTHORITY_REGRESSION')
     expect(b.status.role).toBe('coordinator')
     expect(f.traffic.every(request => request.facet === 'control')).toBe(true)
+  })
+
+  it('correlates recovery replies with the entire saved signed request across custom control transports', async () => {
+    const f = await fixture(), b = await f.open(1), before = b.revision
+    const host = { application: () => f.registry.read(), async selectGeneration(request: SignedTransitionRequest) {
+      const other = f.devices[0]!.identity
+      return f.registry.select(await signTransitionRequest({ ...request.payload, requester: other.publicKey }, other))
+    } }
+    await expect(b.recovery.takeover(host, { transitionId: 'same-human-id' })).rejects.toThrow('APPLICATION_TRANSITION_REPLY_MISMATCH')
+    expect(b.revision).toEqual(before)
+    expect(await b.recovery.inspect()).toMatchObject([{ selected: null, request: { payload: { requester: b.deviceId, transitionId: 'same-human-id' } } }])
   })
 
   it('verifies definitions and persists exact code intent and monotonic selected publications across reopen', async () => {

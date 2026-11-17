@@ -1,8 +1,7 @@
 # Replicated SQL Transactions
 
-Status: normative contract for the unreleased prototype. It replaces the
-earlier compiler-based contract (old specifications 10 and 11) and the SQLite
-compatibility ledger. Owner-controlled rows (sections 4, 6 and 7) follow
+Status: normative contract for the prerelease shared materializer.
+Owner-controlled rows (sections 4, 6 and 7) follow
 [the owner-rows design](../design-owner-rows.md).
 
 Chronolog has no deployed protocol or user data. Formats are edited in place;
@@ -123,10 +122,11 @@ local order:
    code and the index of the failing step (null for reconciliation).
 6. Append the log row (section 8) and clear the fixed engine inputs.
 
-The peer policy may replay a tentative suffix when earlier transactions
-arrive. The coordinated policy uses certified log positions. Both preserve
-the already applied final prefix; the materializer does not independently
-choose or sort the history order.
+The application owner supplies one verified selected order. A generation change
+can replace its recoverable suffix, while an explicitly protected prefix cannot
+regress. The materializer does not independently select or sort history, and
+author timestamps remain original provenance and deterministic clock inputs.
+Native and browser engines execute this same pipeline.
 
 `PRAGMA foreign_keys` and `PRAGMA recursive_triggers` are on. With
 `recursive_triggers`, the deletion by `REPLACE` fires delete triggers, so the
@@ -346,7 +346,7 @@ step index. DELETE/rekey closes a policy generation; an ownership-only transfer
 preserves its ID and explicit readers, including when the owner is part of the
 PK. Table rename moves the binding; removing/renaming a sealed column closes its
 generation. The [sealed-data contract](../sealed-data.md) specifies encryption,
-client finality preflight and the limits of revocation after disclosure.
+explicit reader encryption and the limits of revocation after disclosure.
 
 ## 8. Transaction log
 
@@ -390,7 +390,7 @@ supported adapter profile before opening the engine.
 
 A replica only executes transactions whose manifest it runs. An unavailable
 manifest blocks replay without creating a SQL outcome (section 4). The
-execution profile is fixed in the signed group configuration; live engine
-or profile upgrades are outside this initial scope. The materialized
+execution identity is fixed in the signed application descriptor; a new engine
+requires an explicit authenticated activation. The materialized
 database also records its initial schema administrator, and a replica refuses
 to open it with another.

@@ -99,6 +99,7 @@ describe('authenticated peer application connections', () => {
     ['scope', 'APPLICATION_NETWORK_SCOPE_MISMATCH'],
     ['control action', 'PEER_PARTICIPANT_FACET_FORBIDDEN'],
     ['response interest', 'PEER_PARTICIPANT_RESPONSE_MISMATCH'],
+    ['error payload', 'APPLICATION_NETWORK_RESPONSE_INVALID'],
   ])('fences a peer transport with a substituted %s before changing its view', async (fault, code) => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const [left, right] = createFramedPeerConnectionPair()
@@ -106,6 +107,7 @@ describe('authenticated peer application connections', () => {
     const malicious = rewrite(left, value => {
       if (!inject || value.kind !== 'response') return value
       const message = value.message as ParticipantRequest
+      if (fault === 'error payload') return { ...value, ok: false, message: { ...message, payload: null } }
       return { ...value, message: { ...message, ...(fault === 'scope' ? { applicationId: 'fe'.repeat(32) }
         : fault === 'control action' ? { facet: 'control', action: 'configure' } : { facet: 'database', action: 'coverage' }) } }
     })
