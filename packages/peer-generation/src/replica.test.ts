@@ -2,11 +2,12 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createAppliedEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { compareTransactionOrder, decodeTransactionCore, emit, executionManifestArtifacts, program, transactionOrderKey } from '@chronolog/protocol'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, peerDigest,
-  signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  bytesDigest, controlIntentDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, peerDigest,
+  signApplicationDescriptor, signControlRevision, signTransitionRequest, verifyAuthorityBundle,
   type AuthorityBundle, type PeerIdentity, type PeerReplica, type PeerStore, type PrefixProof,
 } from './index.js'
 import { bytesToHex, hexToBytes, signPeerValue } from './codec.js'
+import { verifyAttempt } from './attempt.js'
 
 const opened: PeerReplica[] = []
 afterEach(async () => { for (const peer of opened.splice(0)) await peer.close() })
@@ -20,19 +21,21 @@ async function fixture() {
     definitionDigest: '11'.repeat(32), schemaDigest: null }, host)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: [a, b, c].map(identity => ({ publicKey: identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: identity === a })) }, host)
+    grants: [a, b, c].map(identity => ({ publicKey: identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: identity === a, dataRole: 'member' as const })) }, host)
   const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
   const select = async (who: PeerIdentity, base: PrefixProof | null, id: string) => {
     const authority = await registry.read()
     return registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
       profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: id,
       expectedGeneration: authority.generations.at(-1)?.id ?? null, coordinator: who.publicKey,
-      requester: who.publicKey, controlRevision: 0, reason: base === null ? 'create' : 'takeover', base }, who))
+      requester: who.publicKey, controlRevision: 0, controlIntentDigest: await controlIntentDigest(control.payload), contextDigest: null,
+      reason: base === null ? 'create' : 'takeover', base }, who))
   }
   await select(a, null, 'initial')
-  const open = async (identity: PeerIdentity, store: PeerStore = new MemoryPeerStore(), authority?: AuthorityBundle, storageId = identity.publicKey) => {
+  const open = async (identity: PeerIdentity, store: PeerStore = new MemoryPeerStore(), authority?: AuthorityBundle, storageId = identity.publicKey, now?: () => number) => {
     const materializer = await createAppliedEventMaterializationRuntime({ store, namespace: 'test' })
-    const peer = await createPeerReplica({ authority: authority ?? await registry.read(), device: identity, store, storageId, materializer, epochKeys: keys })
+    const peer = await createPeerReplica({ authority: authority ?? await registry.read(), device: identity, store, storageId, materializer, epochKeys: keys,
+      ...(now === undefined ? {} : { now }) })
     opened.push(peer); return peer
   }
   return { host, a, b, c, key, keys, control, registry, select, open }
@@ -40,6 +43,37 @@ async function fixture() {
 const event = (name: string) => program(emit('message', { name }))
 
 describe('peer-owned encrypted history and tolerant recovery', () => {
+  it('authors after durable own intents and applied observations across same-clock retries, recovery and reopen', async () => {
+    const f = await fixture(), store = new MemoryPeerStore(), now = () => 100
+    const a = await f.open(f.a, store, undefined, undefined, now), b = await f.open(f.b)
+    const timestamp = async (attempt: Awaited<ReturnType<PeerReplica['prepare']>>) =>
+      (await verifyAttempt(attempt, await verifyAuthorityBundle(await f.registry.read()), f.keys)).authorTimestampMs
+    const first = await a.prepare({ operationId: 'first', program: event('first') })
+    const second = await a.prepare({ operationId: 'second', program: event('second') })
+    expect(await timestamp(first)).toBe(100n)
+    expect(await timestamp(second)).toBe(101n)
+    const empty = await a.recoveryPoint()
+    const remote = await b.prepare({ operationId: 'observed', program: event('observed'), authorTimestampMs: 900n })
+    await a.order(remote)
+    const retained = await a.exportCommands()
+    await f.select(f.b, empty, 'recovered-empty')
+    await a.adopt(await f.registry.read())
+    await a.close()
+    const reopened = await f.open(f.a, store, undefined, undefined, now)
+    expect(await reopened.prepare({ operationId: 'first', program: event('first') })).toEqual(first)
+    const afterObserved = await reopened.prepare({ operationId: 'after-observed', program: event('after-observed') })
+    expect(await timestamp(afterObserved)).toBe(901n)
+    await reopened.close()
+    const again = await f.open(f.a, store, undefined, undefined, now)
+    expect(await again.prepare({ operationId: 'after-observed', program: event('after-observed') })).toEqual(afterObserved)
+    expect(await timestamp(await again.prepare({ operationId: 'after-saved', program: event('after-saved') }))).toBe(902n)
+    expect(await timestamp(await again.prepare({ operationId: 'explicit', program: event('explicit'), authorTimestampMs: 7n }))).toBe(7n)
+    // An old remote body retained only as recovery evidence was never observed
+    // as applied by this fresh peer and must not move its author clock.
+    const fresh = await f.open(f.c, undefined, undefined, undefined, now)
+    await fresh.synchronize(await f.registry.read(), retained)
+    expect(await timestamp(await fresh.prepare({ operationId: 'unobserved', program: event('unobserved') }))).toBe(100n)
+  })
   it('replays author-time order independently of receipt sequence and retains exact intent through reopen', async () => {
     const f = await fixture(), store = new MemoryPeerStore(), a = await f.open(f.a, store), b = await f.open(f.b)
     const first = await a.prepare({ operationId: 'first', program: event('first'), authorTimestampMs: 500n })
@@ -47,6 +81,8 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     await a.order(first)
     const held = await a.capture(), initial = await a.operation('first')
     await a.order(second); await b.ingest(await a.exportCommands())
+    expect(await a.exportCommands({ at: held.revision })).toHaveLength(1)
+    await expect(a.exportCommands({ at: held.revision, offset: 2 })).rejects.toThrow('PEER_RANGE_OFFSET_INVALID')
     const av = await a.capture(), bv = await b.capture()
     try {
       expect(av.read.orderLength).toBe(2)
@@ -107,11 +143,13 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const one = await a.prepare({ operationId: 'one', program: event('one') })
     await a.order(one); await b.ingest(await a.exportCommands())
+    const inheritedView = await b.capture(); const inheritedRevision = inheritedView.revision; inheritedView.release()
     const two = await a.prepare({ operationId: 'two', program: event('two') })
     await a.order(two)
     const held = await a.capture(), oldRevision = held.revision
     const base = await b.recoveryPoint(), g2 = await f.select(f.b, base, 'second')
     await b.adopt(await f.registry.read())
+    await expect(b.exportCommands({ at: inheritedRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
     const three = await b.prepare({ operationId: 'three', program: event('three') }); await b.order(three)
     const c = await f.open(f.c)
     await expect(c.capture()).rejects.toThrow('PEER_RECOVERING')

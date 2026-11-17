@@ -12,8 +12,15 @@ export const SYSTEM_LOG_SQL = `
       canonical_manifest BLOB NOT NULL,
       publication_mode TEXT NOT NULL CHECK (publication_mode IN ('applied', 'live')),
       sql_policy TEXT NOT NULL CHECK (sql_policy IN ('authorized', 'data-only')),
+      authorization_policy TEXT NOT NULL CHECK (authorization_policy IN ('transaction-grants', 'external-membership')),
       bootstrap_program BLOB NOT NULL,
       bootstrap_group_id BLOB NOT NULL
+    ) STRICT;
+    CREATE TABLE chronolog_peer_control (
+      singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+      application_id BLOB NOT NULL CHECK (length(application_id) = 32),
+      revision INTEGER NOT NULL,
+      digest BLOB NOT NULL CHECK (length(digest) = 32)
     ) STRICT;
     CREATE TABLE ${TRANSACTION_LOG_TABLE} (
       tx_id BLOB PRIMARY KEY NOT NULL,
@@ -40,19 +47,20 @@ export function initializeSystemLog(database: DatabaseLike): void {
 
 export function insertExecutionManifest(database: DatabaseLike, manifest: StoredExecutionManifest): void {
   database.prepare(`
-    INSERT INTO ${EXECUTION_MANIFEST_TABLE} (singleton_key, manifest_digest, canonical_manifest, publication_mode, sql_policy, bootstrap_program, bootstrap_group_id) VALUES (1, ?, ?, ?, ?, ?, ?)
-  `).run(manifest.manifestDigest, manifest.canonicalManifest, manifest.publicationMode, manifest.sqlPolicy, manifest.bootstrapProgram, manifest.bootstrapGroupId)
+    INSERT INTO ${EXECUTION_MANIFEST_TABLE} (singleton_key, manifest_digest, canonical_manifest, publication_mode, sql_policy, authorization_policy, bootstrap_program, bootstrap_group_id) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+  `).run(manifest.manifestDigest, manifest.canonicalManifest, manifest.publicationMode, manifest.sqlPolicy, manifest.authorizationPolicy, manifest.bootstrapProgram, manifest.bootstrapGroupId)
 }
 
 export function readExecutionManifest(database: DatabaseLike): StoredExecutionManifest {
   const raw = database.prepare(`
-    SELECT manifest_digest, canonical_manifest, publication_mode, sql_policy, bootstrap_program, bootstrap_group_id FROM ${EXECUTION_MANIFEST_TABLE} WHERE singleton_key = 1
+    SELECT manifest_digest, canonical_manifest, publication_mode, sql_policy, authorization_policy, bootstrap_program, bootstrap_group_id FROM ${EXECUTION_MANIFEST_TABLE} WHERE singleton_key = 1
   `).get()
   if (raw === undefined || Array.isArray(raw)) throw new Error('DATABASE_MANIFEST_MISSING')
   if (raw.publication_mode !== 'applied' && raw.publication_mode !== 'live') throw new Error('DATABASE_PUBLICATION_MODE_INVALID')
   if (raw.sql_policy !== 'authorized' && raw.sql_policy !== 'data-only') throw new Error('DATABASE_SQL_POLICY_INVALID')
+  if (raw.authorization_policy !== 'transaction-grants' && raw.authorization_policy !== 'external-membership') throw new Error('DATABASE_AUTHORIZATION_POLICY_INVALID')
   return { manifestDigest: asDigest(raw.manifest_digest), canonicalManifest: asBytes(raw.canonical_manifest),
-    publicationMode: raw.publication_mode, sqlPolicy: raw.sql_policy,
+    publicationMode: raw.publication_mode, sqlPolicy: raw.sql_policy, authorizationPolicy: raw.authorization_policy,
     bootstrapProgram: asBytes(raw.bootstrap_program), bootstrapGroupId: asBytes(raw.bootstrap_group_id) }
 }
 

@@ -1,4 +1,5 @@
 export * from './bytes.js'
+export * from './author-clock.js'
 export * from './cbor.js'
 export * from './errors.js'
 export * from './messages.js'

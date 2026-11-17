@@ -1,6 +1,6 @@
 import type { DataChannelStats } from './channel.js'
 import type { RtcDataChannel } from './types.js'
-import type { PeerLiveLane } from '@chronolog/agent-service/framing'
+import type { PeerLiveLane } from '@chronolog/records'
 
 export const WEBRTC_LIVE_LIMITS = Object.freeze({ frameBytes: 16_384, queueFrames: 64, bufferedBytes: 65_536 })
 

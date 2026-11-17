@@ -39,6 +39,8 @@ export interface PeerGrant {
   readonly coordinator: boolean
   readonly recovery: boolean
   readonly administrator: boolean
+  /** Membership of the durable application data collective, independent of coordination. */
+  readonly dataRole: 'member' | 'admin' | null
 }
 /** A position in authenticated inclusion evidence, not an application replay index. */
 export interface HistoryPoint {
@@ -94,6 +96,10 @@ export interface TransitionRequest {
   readonly coordinator: string
   readonly requester: string
   readonly controlRevision: number
+  /** Domain-separated digest of the exact unsigned referenced control payload. */
+  readonly controlIntentDigest: string
+  /** Caller-verifiable external transition context, such as host enrollment bindings. */
+  readonly contextDigest: string | null
   readonly reason: TransitionReason
   readonly base: PrefixProof | null
 }

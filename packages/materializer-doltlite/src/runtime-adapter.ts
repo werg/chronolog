@@ -2,11 +2,12 @@ import {
   publicationRequestForRevision,
   type ReplayProposal,
   type AppliedApplicationSnapshot,
+  type AppliedMaterializationCoordinator,
   type AppliedMaterializationRuntime,
   type AppliedReadHandle,
   type AppliedSqlResult,
+  type PeerExecutionControls,
   type ChronologMaterializationRuntime,
-  type MaterializationCoordinator,
   type MaterializedApplicationSnapshot,
   type MaterializationPublicationRequest,
   type MaterializationPublicationResult,
@@ -28,7 +29,7 @@ interface ReplayBackend {
   readonly orderLength: number
   readonly executionManifestDigest: Uint8Array
   proposalIdAt(index: number): Uint8Array | null
-  materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null>
+  materialize(orderedTransactions: readonly ReplayProposal[], controls?: PeerExecutionControls): Promise<MaterializedRevision | null>
   outcome(txId: Uint8Array): TransactionOutcome | null
   subscribe(subscriber: (revision: MaterializedRevision) => void): () => void
   close(): void
@@ -79,7 +80,7 @@ export function createDoltLiteMaterializationRuntime(
   return {
     ...runtime,
     coordinator: {
-      ...runtime.coordinator,
+      materialize(input) { return runtime.coordinator.materialize(input) },
       async publishFinal(prefixLength) { await materializer.publishFinal(prefixLength) },
     },
     queries: {
@@ -100,7 +101,7 @@ export function createDoltLiteMaterializationRuntime(
 
 /** DoltLite moves its applied head during replay; publication validates that exact movement. */
 function publicationRuntime(materializer: ReplayBackend): {
-  readonly coordinator: MaterializationCoordinator
+  readonly coordinator: AppliedMaterializationCoordinator
   readonly publications: MaterializationPublicationStore
   close(): void
 } {
@@ -120,8 +121,8 @@ function publicationRuntime(materializer: ReplayBackend): {
   ): MaterializationPublicationResult => ({ status, publicationKey, ...snapshot() })
   return {
     coordinator: {
-      async materialize(orderedTransactions) {
-        const revision = await materializer.materialize(orderedTransactions)
+      async materialize(orderedTransactions, controls) {
+        const revision = await materializer.materialize(orderedTransactions, controls)
         if (revision === null) return null
         const publication = publicationRequestForRevision(revision)
         prepared.set(publication.publicationKey, publication)

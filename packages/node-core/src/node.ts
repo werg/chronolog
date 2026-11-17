@@ -31,6 +31,7 @@ import {
   equalBytes,
   transactionDigest,
   transactionOrderKey,
+  nextAuthorTimestampMs,
   utf8,
   type TransactionCore,
   type ChangeProgram,
@@ -1899,13 +1900,11 @@ export class ChronologNode {
     // follows the same applied snapshot readers can actually observe.
     if (this.orderLength > 0) this.#observeAuthorTime(this.#appliedAuthorTimestamp(this.orderLength - 1))
     const wallClock = BigInt(Math.max(0, Math.trunc(this.#clockNow())))
-    const previous = this.#lastAuthoredTimestampMs > this.#observedAuthorTimestampMs
-      ? this.#lastAuthoredTimestampMs : this.#observedAuthorTimestampMs
-    const next = wallClock > previous ? wallClock : previous + 1n
     const membershipFloor = this.#membershipState().minimumAuthorTimestampMs ?? 0n
     const closedFloor = this.#closedAuthorTime() + 1n
     const floor = membershipFloor > closedFloor ? membershipFloor : closedFloor
-    const timestamp = next < floor ? floor : next
+    const timestamp = nextAuthorTimestampMs(wallClock,
+      [this.#lastAuthoredTimestampMs, this.#observedAuthorTimestampMs], floor)
     if (timestamp > wallClock + this.#maxFutureSkewMs) {
       throw new Error('AUTHOR_CLOCK_AHEAD')
     }

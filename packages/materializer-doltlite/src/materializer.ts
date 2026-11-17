@@ -14,7 +14,7 @@ import {
   type ManifestArtifacts,
   type TransactionOrderKey,
 } from '@chronolog/protocol'
-import type { AppliedApplicationSnapshot, AppliedReadHandle, AppliedSqlResult, MaterializedApplicationSnapshot, MaterializedReadHandle } from '@chronolog/materializer'
+import type { AppliedApplicationSnapshot, AppliedReadHandle, AppliedSqlResult, MaterializedApplicationSnapshot, MaterializedReadHandle, PeerExecutionControls } from '@chronolog/materializer'
 import type { DoltLiteAppliedMaterializerRuntimeBackend } from './runtime-adapter.js'
 
 import {
@@ -35,6 +35,7 @@ import {
   type PublishedRef,
 } from './checkpoints.js'
 import { withAuthorizer } from './sql-profile.js'
+import { applyPeerExecutionControl, assertPeerControlAdvance, hasCurrentPeerControl, peerControlFor, validatePeerExecutionControls } from './peer-controls.js'
 import { executeTransactionProgram, SqlRejection } from './sql-executor.js'
 import { executeLocalSql } from './sql-values.js'
 import {
@@ -66,6 +67,7 @@ import type {
   TransactionLogRow,
   TransactionOutcome,
   SqlMutationPolicy,
+  SqlAuthorizationPolicy,
 } from './types.js'
 
 export class MaterializerInputError extends Error {
@@ -144,13 +146,15 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       throw new MaterializerInputError('MATERIALIZER_ROOT_ADMINISTRATOR_INVALID')
     }
     const sqlPolicy = options.sqlPolicy ?? 'authorized'
-    if (!bytesEqual(options.executionManifest.platformDigest, computePlatformDigest(sqlPolicy))) {
+    const authorizationPolicy = options.authorizationPolicy ?? 'transaction-grants'
+    if (!bytesEqual(options.executionManifest.platformDigest, computePlatformDigest(sqlPolicy, authorizationPolicy))) {
       throw new MaterializerInputError('MATERIALIZER_PLATFORM_DIGEST_MISMATCH')
     }
+    if (live && authorizationPolicy === 'external-membership') throw new MaterializerInputError('MATERIALIZER_EXTERNAL_AUTHORIZATION_REQUIRES_APPLIED_RUNTIME')
     const artifacts = await executionManifestArtifacts(options.executionManifest)
     const bootstrapProgram = bootstrapBytes(options)
     const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator,
-      publicationMode: live ? 'live' : 'applied', sqlPolicy, bootstrapProgram, bootstrapGroupId: options.bootstrapGroupId ?? new Uint8Array() }
+      publicationMode: live ? 'live' : 'applied', sqlPolicy, authorizationPolicy, bootstrapProgram, bootstrapGroupId: options.bootstrapGroupId ?? new Uint8Array() }
     const bootstrapIdentity = await hashDomain(DOMAINS.peerSchema, bootstrapProgram)
     const opened = openDatabase(options)
     let reader: DatabaseLike | null = null
@@ -327,7 +331,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       get orderLength() { return engine.orderLength },
       get executionManifestDigest() { return engine.executionManifestDigest },
       proposalIdAt(index) { return engine.proposalIdAt(index) },
-      materialize(input) { return engine.materialize(input) },
+      materialize(input, controls) { return engine.materialize(input, controls) },
       outcome(txId) { return engine.outcome(txId) },
       subscribe(subscriber) { return engine.subscribe(subscriber) },
       localSql(sql, parameters = [], options = {}): AppliedSqlResult {
@@ -349,7 +353,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     return () => this.#subscribers.delete(subscriber)
   }
 
-  async materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null> {
+  async materialize(orderedTransactions: readonly ReplayProposal[], peerControls?: PeerExecutionControls): Promise<MaterializedRevision | null> {
     this.#assertOpen()
     if (this.#materializing) throw new Error('MATERIALIZER_REENTRANT_CALL')
     this.#materializing = true
@@ -361,6 +365,9 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     let replayBaseRef: string | null = null
     try {
       const transactions = orderedTransactions.map(cloneTransaction)
+      const controls = this.#sourceOptions.authorizationPolicy === 'external-membership' ? validatePeerExecutionControls(peerControls, transactions) : undefined
+      if (controls === undefined && peerControls !== undefined) throw new Error('MATERIALIZER_AUTHORIZATION_POLICY_MISMATCH')
+      if (controls !== undefined) assertPeerControlAdvance(this.#reader, controls)
       // Rows of the published log were fully verified when they were read;
       // byte-identical rows are not re-verified, so an append costs O(1)
       // verification work instead of O(history).
@@ -372,8 +379,9 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       }
       if (this.#final !== null) verifyFinalTransactions(this.#final.log, transactions)
       validateExistingIdentities(this.#log, transactions)
-      const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
-      if (difference === null) return null
+      const changedAt = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
+      if (changedAt === null && (controls === undefined || hasCurrentPeerControl(this.#writer, controls))) return null
+      const difference = changedAt ?? transactions.length
 
       const previousRevision = this.revision
       // #log is replaced, never mutated, so the reference stays a stable copy.
@@ -393,13 +401,18 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
       for (let index = replayFrom; index < transactions.length; index += 1) {
         verifyNextLogIndex(this.#writer, index)
+        if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls, peerControlFor(controls, transactions[index]!))
         this.#applyTransaction(transactions[index]!, index)
       }
 
+      if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls, controls.revisions[controls.currentRevision]!)
       const candidateLog = readSystemLog(this.#writer)
       verifyDesiredLog(candidateLog, transactions)
       verifyDatabaseState(this.#writer, this.#expected)
-      const commitHash = this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
+      // Recovery can land exactly on a retained checkpoint. Publish its existing
+      // immutable content under the new view revision without an empty commit.
+      const commitHash = this.#writer.prepare('SELECT * FROM dolt_status').all().length === 0
+        ? baseRef : this.#writer.doltCommit(`chronolog revision ${nextRevision}`)
       const contentHash = this.#writer.doltHashOf(commitHash)
       if (contentHash !== this.#writer.doltHashOf()) throw new Error('MATERIALIZER_COMMIT_CONTENT_MISMATCH')
       this.#publicationFault('after_candidate_commit')
@@ -591,6 +604,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   get #expected(): ExpectedState {
     return { artifacts: this.#artifacts, rootAdministrator: this.#rootAdministrator,
       publicationMode: this.#final === null ? 'applied' : 'live', sqlPolicy: this.#sourceOptions.sqlPolicy ?? 'authorized',
+      authorizationPolicy: this.#sourceOptions.authorizationPolicy ?? 'transaction-grants',
       bootstrapProgram: bootstrapBytes(this.#sourceOptions), bootstrapGroupId: this.#sourceOptions.bootstrapGroupId ?? new Uint8Array() }
   }
 
@@ -646,6 +660,7 @@ interface ExpectedState {
   readonly rootAdministrator: Uint8Array
   readonly publicationMode: 'applied' | 'live'
   readonly sqlPolicy: SqlMutationPolicy
+  readonly authorizationPolicy: SqlAuthorizationPolicy
   readonly bootstrapProgram: Uint8Array
   readonly bootstrapGroupId: Uint8Array
 }
@@ -664,7 +679,8 @@ function initializeRepository(
     withAuthorizer(database, 'internal_bootstrap', () => {
       initializeSystemLog(database)
       insertExecutionManifest(database, { ...storedManifest(expected.artifacts), publicationMode: expected.publicationMode,
-        sqlPolicy: expected.sqlPolicy, bootstrapProgram: expected.bootstrapProgram, bootstrapGroupId: expected.bootstrapGroupId })
+        sqlPolicy: expected.sqlPolicy, authorizationPolicy: expected.authorizationPolicy,
+        bootstrapProgram: expected.bootstrapProgram, bootstrapGroupId: expected.bootstrapGroupId })
       initializePlatform(database, expected.rootAdministrator, forkSeeding)
     })
     if (options.bootstrapProgram !== undefined) {
@@ -705,6 +721,7 @@ function verifyDatabaseState(
   verifyStoredManifest(stored, expected.artifacts)
   if (stored.publicationMode !== expected.publicationMode) throw new Error('DATABASE_PUBLICATION_MODE_MISMATCH')
   if (stored.sqlPolicy !== expected.sqlPolicy) throw new Error('DATABASE_SQL_POLICY_MISMATCH')
+  if (stored.authorizationPolicy !== expected.authorizationPolicy) throw new Error('DATABASE_AUTHORIZATION_POLICY_MISMATCH')
   if (!bytesEqual(stored.bootstrapProgram, expected.bootstrapProgram) || !bytesEqual(stored.bootstrapGroupId, expected.bootstrapGroupId)) {
     throw new Error('DATABASE_BOOTSTRAP_MISMATCH')
   }

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { DOMAINS } from '@chronolog/protocol'
 import {
-  createGenerationRegistry, createPeerIdentity, generationStartRoot, peerDigest,
+  controlIntentDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, generationStartRoot, participantGrant, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, verifyAuthorityBundle,
-  type AuthorityBundle, type OrderReceipt, type PeerIdentity, type PrefixProof, type SignedGeneration,
+  type AuthorityBundle, type ControlRevision, type OrderReceipt, type PeerIdentity, type PrefixProof, type SignedGeneration,
 } from './control.js'
 import { signPeerValue } from './codec.js'
 import { MemoryPeerStore } from './memory.js'
@@ -17,13 +17,14 @@ async function fixture() {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: digest, recoveryFloor: null,
     grants: [a, b, c, writer].map(key => ({ publicKey: key.publicKey, reader: true, writer: true,
-      coordinator: key !== writer, recovery: key !== writer, administrator: key === a })) }, host)
+      coordinator: key !== writer, recovery: key !== writer, administrator: key === a, dataRole: 'member' as const })) }, host)
   const store = new MemoryPeerStore()
   const registry = await createGenerationRegistry({ store, descriptor, controls: [control], signer: host })
-  const transition = async (who: PeerIdentity, coordinator: PeerIdentity, expected: string | null, base: PrefixProof | null, id: string, reason: 'create' | 'takeover' | 'control-change' = 'takeover', revision = 0) => signTransitionRequest({
+  const transition = async (who: PeerIdentity, coordinator: PeerIdentity, expected: string | null, base: PrefixProof | null, id: string, reason: 'create' | 'takeover' | 'control-change' = 'takeover', revision = 0, selectedControl?: ControlRevision) => signTransitionRequest({
     applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     transitionId: id, expectedGeneration: expected, coordinator: coordinator.publicKey, requester: who.publicKey,
-    controlRevision: revision, reason, base,
+    controlRevision: revision, controlIntentDigest: await controlIntentDigest(selectedControl ?? (await registry.read()).controls[revision]!.payload),
+    contextDigest: null, reason, base,
   }, who)
   const request = await transition(a, a, null, null, 'create', 'create')
   const g1 = await registry.select(request)
@@ -47,6 +48,57 @@ function proof(receipt: OrderReceipt, bridge: readonly OrderReceipt[] = []): Pre
 }
 
 describe('portable peer generation authority', () => {
+  it('binds first-use control intent to the exact grants, roles, keys and recovery floor', async () => {
+    const f = await fixture(), head = (await receipts(f.g1, f.a, 1))[0]!
+    const next = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
+      epoch: 1, keyDigest: '44'.repeat(32), grants: f.control.payload.grants.filter(grant => grant.publicKey !== f.writer.publicKey) }, f.host)
+    const request = await f.transition(f.a, f.b, f.g1.id, proof(head), 'exact-policy', 'control-change', 1, next.payload)
+    const substitutions: ControlRevision[] = [
+      { ...next.payload, keyDigest: '55'.repeat(32) },
+      { ...next.payload, epoch: 2 },
+      { ...next.payload, recoveryFloor: proof(head).point },
+      { ...next.payload, grants: next.payload.grants.map(grant => grant.publicKey === f.c.publicKey ? { ...grant, administrator: true } : grant) },
+      { ...next.payload, grants: next.payload.grants.map(grant => grant.publicKey === f.c.publicKey ? { ...grant, dataRole: 'admin' } : grant) },
+    ]
+    for (const payload of substitutions) {
+      const substituted = await signControlRevision(payload, f.host)
+      await expect(f.registry.select(request, { control: substituted })).rejects.toThrow('PEER_CONTROL_INTENT_MISMATCH')
+      expect((await f.registry.read()).controls).toHaveLength(1)
+    }
+    const selected = await f.registry.select(request, { control: next })
+    expect(await f.registry.select(request, { control: next })).toEqual(selected)
+    expect((await verifyAuthorityBundle(await f.registry.read())).control).toEqual(next)
+  })
+
+  it('authenticates external context and retains its exact identity across transition retries', async () => {
+    const f = await fixture(), head = (await receipts(f.g1, f.a, 1))[0]!
+    const original = await f.transition(f.b, f.b, f.g1.id, proof(head), 'context')
+    const contextDigest = await peerDigest({ kind: 'test/account-bindings/v1', accounts: [{ publicKey: f.b.publicKey, accountId: 'one' }] })
+    const request = await signTransitionRequest({ ...original.payload, contextDigest }, f.b)
+    await expect(f.registry.select({ ...request, payload: { ...request.payload, contextDigest: '66'.repeat(32) } })).rejects.toThrow()
+    const selected = await f.registry.select(request)
+    expect(await f.registry.select(request)).toEqual(selected)
+    const changed = await signTransitionRequest({ ...request.payload, contextDigest: '66'.repeat(32) }, f.b)
+    await expect(f.registry.select(changed)).rejects.toThrow('PEER_TRANSITION_ID_REUSED')
+    expect((await verifyAuthorityBundle(await f.registry.read())).current?.payload.transition.payload.contextDigest).toBe(contextDigest)
+  })
+
+  it('recovers through an explicit control participant without creator or data authority', async () => {
+    const f = await fixture()
+    const roles = { reader: true, writer: true, coordinator: true, recovery: true, administrator: false, dataRole: 'member' as const }
+    const control = await signControlRevision({ ...f.control.payload,
+      grants: [controlParticipantGrant(f.host.publicKey), participantGrant(f.a.publicKey, roles), participantGrant(f.b.publicKey, roles)],
+    }, f.host)
+    const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor: f.descriptor, controls: [control], signer: f.host })
+    const first = await registry.select(await f.transition(f.a, f.a, null, null, 'create', 'create', 0, control.payload))
+    const head = (await receipts(first, f.a, 1))[0]!
+    const next = await registry.select(await f.transition(f.host, f.b, first.id, proof(head), 'owner-recovery', 'takeover', 0, control.payload))
+    expect(next.payload.coordinator).toBe(f.b.publicKey)
+    expect((await verifyAuthorityBundle(await registry.read())).grant(f.host.publicKey)).toMatchObject({
+      reader: false, writer: false, coordinator: false, recovery: true, administrator: true, dataRole: null,
+    })
+    await expect(registry.select(await f.transition(f.host, f.host, next.id, proof(head), 'host-is-not-a-peer', 'takeover', 0, control.payload))).rejects.toThrow('PEER_COORDINATOR_FORBIDDEN')
+  })
   it('recovers lost replies exactly and allows one competing successor', async () => {
     const f = await fixture(), [head] = await receipts(f.g1, f.a, 1)
     const first = await f.transition(f.b, f.b, f.g1.id, proof(head!), 'second')
@@ -97,7 +149,7 @@ describe('portable peer generation authority', () => {
     const next = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control), epoch: 1,
       keyDigest: '44'.repeat(32), recoveryFloor: floor,
       grants: f.control.payload.grants.filter(grant => grant.publicKey !== f.writer.publicKey) }, f.host)
-    const g2 = await f.registry.select(await f.transition(f.a, f.b, f.g1.id, proof(history[1]!), 'revoke', 'control-change', 1), { control: next })
+    const g2 = await f.registry.select(await f.transition(f.a, f.b, f.g1.id, proof(history[1]!), 'revoke', 'control-change', 1, next.payload), { control: next })
     await expect(f.registry.select(await f.transition(f.b, f.b, g2.id, proof(history[0]!, [history[1]!]), 'rollback', 'takeover', 1))).rejects.toThrow('PEER_RECOVERY_FLOOR_UNAVAILABLE')
     const authority = await verifyAuthorityBundle(await f.registry.read())
     expect(authority.grant(f.writer.publicKey)).toBe(null)
@@ -107,7 +159,7 @@ describe('portable peer generation authority', () => {
     const f = await fixture(), history = await receipts(f.g1, f.a, 1)
     const next = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
       grants: f.control.payload.grants.filter(grant => grant.publicKey !== f.writer.publicKey) }, f.host)
-    await expect(f.registry.select(await f.transition(f.a, f.b, f.g1.id, proof(history[0]!), 'revoke', 'control-change', 1), { control: next })).rejects.toThrow('PEER_REVOCATION_REQUIRES_KEY_ROTATION')
+    await expect(f.registry.select(await f.transition(f.a, f.b, f.g1.id, proof(history[0]!), 'revoke', 'control-change', 1, next.payload), { control: next })).rejects.toThrow('PEER_REVOCATION_REQUIRES_KEY_ROTATION')
   })
   it('refuses to recreate lost established control state', async () => {
     const f = await fixture()

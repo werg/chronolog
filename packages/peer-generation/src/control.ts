@@ -12,6 +12,8 @@ import {
 } from './control-types.js'
 
 export * from './control-types.js'
+export * from './definition.js'
+export * from './schema.js'
 export { createPeerIdentity, exportPeerIdentity, importPeerIdentity, PeerGenerationError, encodePeerValue, decodePeerValue, peerDigest, bytesDigest } from './codec.js'
 
 function scope(value: { applicationId: string; profile: string; policy?: string }, descriptor: ApplicationDescriptor): void {
@@ -35,17 +37,23 @@ function validateControl(value: ControlRevision): void {
   check(isArray(value.grants) && value.grants.length > 0 && value.grants.length <= 1024, 'PEER_GRANTS_INVALID')
   const keys = new Set<string>()
   for (const grant of value.grants) {
-    object(grant, ['publicKey', 'reader', 'writer', 'coordinator', 'recovery', 'administrator']); hex(grant.publicKey)
-    for (const key of ['reader', 'writer', 'coordinator', 'recovery', 'administrator'] as const) check(typeof grant[key] === 'boolean', 'PEER_GRANT_INVALID')
+    validateGrant(grant)
     check(!keys.has(grant.publicKey), 'PEER_DUPLICATE_GRANT'); keys.add(grant.publicKey)
-    check(!grant.coordinator || grant.reader, 'PEER_COORDINATOR_MUST_READ')
   }
   check(value.grants.some(grant => grant.administrator), 'PEER_ADMINISTRATOR_REQUIRED')
   if (value.recoveryFloor !== null) validateHistoryPoint(value.recoveryFloor)
 }
+function validateGrant(grant: PeerGrant): void {
+  object(grant, ['publicKey', 'reader', 'writer', 'coordinator', 'recovery', 'administrator', 'dataRole']); hex(grant.publicKey)
+  for (const key of ['reader', 'writer', 'coordinator', 'recovery', 'administrator'] as const) check(typeof grant[key] === 'boolean', 'PEER_GRANT_INVALID')
+  check(!grant.coordinator || grant.reader, 'PEER_COORDINATOR_MUST_READ')
+  check(grant.dataRole === null || grant.dataRole === 'member' || grant.dataRole === 'admin', 'PEER_DATA_ROLE_INVALID')
+}
 function validateRequest(value: TransitionRequest): void {
-  object(value, ['applicationId', 'profile', 'policy', 'transitionId', 'expectedGeneration', 'coordinator', 'requester', 'controlRevision', 'reason', 'base'])
+  object(value, ['applicationId', 'profile', 'policy', 'transitionId', 'expectedGeneration', 'coordinator', 'requester', 'controlRevision', 'controlIntentDigest', 'contextDigest', 'reason', 'base'])
   hex(value.applicationId); boundedText(value.transitionId, 128); hex(value.coordinator); hex(value.requester); uint(value.controlRevision)
+  hex(value.controlIntentDigest)
+  if (value.contextDigest !== null) hex(value.contextDigest)
   if (value.expectedGeneration !== null) hex(value.expectedGeneration)
   check(['create', 'handover', 'takeover', 'control-change'].includes(value.reason), 'PEER_TRANSITION_REASON_INVALID')
   if (value.base !== null) {
@@ -64,8 +72,24 @@ export async function signApplicationDescriptor(payload: ApplicationDescriptor, 
   validateDescriptor(payload); check(payload.controlPublicKey === signer.publicKey, 'PEER_CONTROL_KEY_MISMATCH')
   return signPeerValue(DOMAINS.peerDescriptor, payload, signer)
 }
+/** Constructs a checked grant without inferring any independent power from another. */
+export function participantGrant(publicKey: string, options: Omit<PeerGrant, 'publicKey'>): PeerGrant {
+  const grant = { ...options, publicKey }
+  validateGrant(grant)
+  return grant
+}
+/** Explicit control-only host role, enabling account ownership recovery without a creator device. */
+export function controlParticipantGrant(publicKey: string): PeerGrant {
+  hex(publicKey)
+  return { publicKey, reader: false, writer: false, coordinator: false, recovery: true, administrator: true, dataRole: null }
+}
 export async function signControlRevision(payload: ControlRevision, signer: PeerIdentity): Promise<SignedControlRevision> {
   validateControl(payload); return signPeerValue(DOMAINS.peerControl, payload, signer)
+}
+/** Requesters commit to authority before the host adds its control signature. */
+export async function controlIntentDigest(payload: ControlRevision): Promise<string> {
+  validateControl(payload)
+  return peerDigest(['chronolog/peer-generation/control-intent/v1', payload])
 }
 export async function signTransitionRequest(payload: TransitionRequest, signer: PeerIdentity): Promise<SignedTransitionRequest> {
   validateRequest(payload); check(payload.requester === signer.publicKey, 'PEER_REQUESTER_KEY_MISMATCH')
@@ -159,6 +183,7 @@ export class PeerAuthority {
     const value = request.payload, current = this.current, currentControl = this.control
     check(value.expectedGeneration === (current?.id ?? null), 'PEER_GENERATION_CONFLICT')
     check(value.controlRevision === nextControl.payload.revision, 'PEER_CONTROL_REVISION_MISMATCH')
+    check(value.controlIntentDigest === await controlIntentDigest(nextControl.payload), 'PEER_CONTROL_INTENT_MISMATCH')
     const requester = this.grant(value.requester, currentControl.payload.revision)
     const candidate = nextControl.payload.grants.find(grant => grant.publicKey === value.coordinator)
     check(requester?.recovery === true, 'PEER_RECOVERY_FORBIDDEN')
@@ -172,7 +197,10 @@ export class PeerAuthority {
       if (nextControl.payload.revision !== currentControl.payload.revision) {
         check(value.reason === 'control-change' && requester.administrator, 'PEER_CONTROL_CHANGE_FORBIDDEN')
         await verifyNextControl(this.descriptor, currentControl, nextControl)
-      } else check(value.reason !== 'control-change', 'PEER_CONTROL_CHANGE_REQUIRED')
+      } else {
+        check(samePeerValue(nextControl, currentControl), 'PEER_CONTROL_CHANGED_WITHOUT_REVISION')
+        check(value.reason !== 'control-change', 'PEER_CONTROL_CHANGE_REQUIRED')
+      }
       const previousFloor = currentControl.payload.recoveryFloor
       const floor = nextControl.payload.recoveryFloor
       if (previousFloor !== null) {

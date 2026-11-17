@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
-  createGenerationRegistry, createPeerIdentity, MemoryPeerStore, signApplicationDescriptor,
+  controlIntentDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, signApplicationDescriptor,
   signControlRevision, signTransitionRequest, bytesDigest, type PeerIdentity, type PrefixProof,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
@@ -34,13 +34,14 @@ async function fixture() {
     executionManifestDigest: bytesToHex(artifacts.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: [a, b, c].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true })) }, host)
+    grants: [a, b, c].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true, dataRole: 'member' as const })) }, host)
   const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
   const select = async (identity: PeerIdentity, base: PrefixProof | null, transitionId: string) => {
     const bundle = await registry.read()
     return registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
       policy: descriptor.payload.policy, expectedGeneration: bundle.generations.at(-1)?.id ?? null, coordinator: identity.publicKey,
-      requester: identity.publicKey, controlRevision: 0, base, transitionId, reason: base === null ? 'create' : 'takeover' }, identity))
+      requester: identity.publicKey, controlRevision: 0, controlIntentDigest: await controlIntentDigest(control.payload), contextDigest: null,
+      base, transitionId, reason: base === null ? 'create' : 'takeover' }, identity))
   }
   await select(a.identity, null, 'create')
   const open = async (device: typeof a) => {
@@ -135,7 +136,7 @@ describe('public peer application sessions', () => {
     const held = await a.readView(), previous = a.revision
     await f.select(f.b.identity, await a.recoveryPoint(), 'fresh-recovery')
     const b = await f.open(f.b)
-    expect(b.status.phase).toBe('waiting')
+    expect(b.status.phase).toBe('recovering')
     await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
     expect(a.revision).toEqual(previous)
     const link = await connectApplications(a, b); cleanup.push(() => link.close())
@@ -143,7 +144,7 @@ describe('public peer application sessions', () => {
     expect((await b.query('messages', null)).value.events.map(value => value.operationId)).toEqual(['retained'])
     expect(held.readEvents().events.map(value => value.operationId)).toEqual(['retained']); held.release()
     const c = await f.open(f.c)
-    expect(c.status.phase).toBe('waiting')
+    expect(c.status.phase).toBe('recovering')
     const freshLink = await connectApplications(b, c); cleanup.push(() => freshLink.close())
     expect((await c.query('messages', null)).value.events.map(value => value.operationId)).toEqual(['retained'])
   })
@@ -157,7 +158,7 @@ describe('public peer application sessions', () => {
     await f.select(f.c.identity, await a.recoveryPoint(), 'complete-prefix-required')
     const c = await f.open(f.c)
     await expect(connectApplications(b, c)).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
-    expect(c.status.phase).toBe('waiting')
+    expect(c.status.phase).toBe('recovering')
     expect(b.revision).toEqual(older)
     expect((await b.query('messages', null)).value.events).toHaveLength(1)
     const full = await connectApplications(a, c); cleanup.push(() => full.close())

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { join } from 'node:path'
-import { platformOp, program, sqlStatement } from '@chronolog/protocol'
+import { APPLICATION_COLLECTIVE_ID, encodeTransactionCore, platformOp, program, sqlStatement, transactionDigest } from '@chronolog/protocol'
 
 import { AppliedMaterializer, DeterministicMaterializer } from './native.js'
 import { createDoltLiteExecutionManifest } from './manifest.js'
@@ -15,6 +15,7 @@ async function fixture() {
     path: join(await fixtures.directory(), 'applied.db'),
     executionManifest: createDoltLiteExecutionManifest({ sqlPolicy: 'data-only' }),
     sqlPolicy: 'data-only' as const,
+    authorizationPolicy: 'transaction-grants' as const,
     rootAdministrator: ROOT_KEY,
     bootstrapGroupId: testKey(1),
     bootstrapProgram: program(
@@ -32,6 +33,76 @@ function withdraw(amount: number) {
 }
 
 describe('finality-free SQL replay', () => {
+  it('derives identical historical authority and current rights regardless of control arrival order', async () => {
+    const base = await fixture(), other = await fixture()
+    const manifest = createDoltLiteExecutionManifest({ sqlPolicy: 'data-only', authorizationPolicy: 'external-membership' })
+    const options = { ...base, executionManifest: manifest, authorizationPolicy: 'external-membership' as const }
+    const incremental = createDoltLiteAppliedMaterializationRuntime(await AppliedMaterializer.open(options))
+    const direct = createDoltLiteAppliedMaterializationRuntime(await AppliedMaterializer.open({ ...options, path: other.path }))
+    const controls = [
+      { revision: 0, digest: testKey(61), members: [{ publicKey: ROOT_KEY, role: 'member' as const }] },
+      { revision: 1, digest: testKey(62), members: [{ publicKey: testKey(2), role: 'member' as const }] },
+      { revision: 2, digest: testKey(63), members: [{ publicKey: ROOT_KEY, role: 'admin' as const }, { publicKey: testKey(3), role: 'member' as const }] },
+    ]
+    for (let index = 0; index < controls.length; index++) {
+      await incremental.coordinator.materialize([], { applicationId: base.bootstrapGroupId, currentRevision: index, revisions: controls.slice(0, index + 1) })
+    }
+    const current = { applicationId: base.bootstrapGroupId, currentRevision: 2, revisions: controls }
+    await direct.coordinator.materialize([], current)
+    const original = await replayProposal(10n, 'historical-authority', [
+      sqlStatement("SELECT chronolog_assert(NOT EXISTS(SELECT 1 FROM chronolog_collective_members WHERE collective_id=? AND member_key=?), 'future_member')",
+        [APPLICATION_COLLECTIVE_ID, testKey(2)]),
+      sqlStatement('UPDATE accounts SET balance=balance+1 WHERE id=1'),
+    ], incremental.queries.executionManifestDigest)
+    const core = { ...original.core, membershipRevision: controls[0]!.digest }
+    const canonicalCandidate = encodeTransactionCore(core)
+    const proposal = { ...original, core, canonicalCandidate, candidateDigest: await transactionDigest(canonicalCandidate) }
+    const contentHashes: string[] = []
+    for (const runtime of [incremental, direct]) {
+      contentHashes.push((await runtime.coordinator.materialize([proposal], current))!.revision.contentHash)
+      expect(runtime.queries.outcome(proposal.txId)?.outcome).toBe('accepted')
+    }
+    expect(contentHashes[0]).toBe(contentHashes[1])
+    const parameters = [{ kind: 'blob' as const, value: APPLICATION_COLLECTIVE_ID }]
+    for (const sql of [
+      'SELECT created_tx FROM chronolog_collectives WHERE collective_id=?',
+      'SELECT member_key,role,state,joined_tx,left_tx FROM chronolog_collective_members WHERE collective_id=? ORDER BY member_key',
+    ]) expect(incremental.queries.localSql(sql, parameters).rows).toEqual(direct.queries.localSql(sql, parameters).rows)
+    expect(incremental.queries.localSql('SELECT id,key FROM chronolog_principals ORDER BY id').rows)
+      .toEqual(direct.queries.localSql('SELECT id,key FROM chronolog_principals ORDER BY id').rows)
+    await incremental.close(); await direct.close()
+  })
+
+  it('requires authenticated external membership and never restores older authority with an application rollback', async () => {
+    const options = { ...await fixture(), authorizationPolicy: 'external-membership' as const,
+      executionManifest: createDoltLiteExecutionManifest({ sqlPolicy: 'data-only', authorizationPolicy: 'external-membership' }) }
+    expect(() => createDoltLiteExecutionManifest({ sqlPolicy: 'authorized', authorizationPolicy: 'external-membership' }))
+      .toThrow('MATERIALIZER_EXTERNAL_MEMBERSHIP_REQUIRES_DATA_ONLY')
+    await expect(DeterministicMaterializer.open(options)).rejects.toThrow('MATERIALIZER_EXTERNAL_AUTHORIZATION_REQUIRES_APPLIED_RUNTIME')
+    const runtime = createDoltLiteAppliedMaterializationRuntime(await AppliedMaterializer.open(options))
+    await expect(runtime.coordinator.materialize([])).rejects.toThrow('MATERIALIZER_PEER_CONTROLS_REQUIRED')
+    const first = { revision: 0, digest: testKey(61), members: [{ publicKey: ROOT_KEY, role: 'member' as const }] }
+    const original = { applicationId: options.bootstrapGroupId, currentRevision: 0, revisions: [first] }
+    await runtime.coordinator.materialize([], original)
+    const held = runtime.queries.captureRead()
+    const latest = { applicationId: options.bootstrapGroupId, currentRevision: 1,
+      revisions: [first, { revision: 1, digest: testKey(62), members: [{ publicKey: testKey(2), role: 'member' as const }] }] }
+    await runtime.coordinator.materialize([], latest)
+    expect(runtime.queries.revision).toBe(2n)
+    const sql = 'SELECT state FROM chronolog_collective_members WHERE member_key = ? AND collective_id = ?'
+    const key = [{ kind: 'blob' as const, value: ROOT_KEY }, { kind: 'blob' as const, value: APPLICATION_COLLECTIVE_ID }]
+    expect(held.query(sql, key).rows).toEqual([[{ kind: 'text', value: 'active' }]])
+    expect(runtime.queries.localSql(sql, key).rows).toEqual([[{ kind: 'text', value: 'left' }]])
+    await expect(runtime.coordinator.materialize([], original)).rejects.toThrow('MATERIALIZER_PEER_CONTROL_REGRESSION')
+    held.release()
+    await runtime.close()
+    const reopened = createDoltLiteAppliedMaterializationRuntime(await AppliedMaterializer.open(options))
+    await expect(reopened.coordinator.materialize([], original)).rejects.toThrow('MATERIALIZER_PEER_CONTROL_REGRESSION')
+    await expect(reopened.coordinator.materialize([], latest)).resolves.toBeNull()
+    expect(reopened.queries.localSql(sql, key).rows).toEqual([[{ kind: 'text', value: 'left' }]])
+    await reopened.close()
+  })
+
   it('publishes restored content as a new revision while preserving exact retry identity', async () => {
     const runtime = createDoltLiteAppliedMaterializationRuntime(await AppliedMaterializer.open(await fixture()))
     const late = await replayProposal(20n, 'late', withdraw(80), runtime.queries.executionManifestDigest)

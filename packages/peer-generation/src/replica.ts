@@ -1,8 +1,8 @@
 import {
-  DOMAINS, compareTransactionOrder, encodeChangeProgram, encodeTransactionCore, transactionDigest, transactionOrderKey,
+  DOMAINS, compareTransactionOrder, encodeChangeProgram, encodeTransactionCore, nextAuthorTimestampMs, transactionDigest, transactionOrderKey,
   type TransactionCore,
 } from '@chronolog/protocol'
-import type { ReplayProposal } from '@chronolog/materializer'
+import type { ReplayProposal, PeerExecutionControls } from '@chronolog/materializer'
 import { createSignedAttempt, validatePeerRevision, verifyAttempt } from './attempt.js'
 import {
   boundedText, bytesDigest, bytesToHex, check, isArray, decodePeerValue, encodePeerValue,
@@ -31,6 +31,8 @@ class Replica implements PeerReplica {
   #publishedRevision: PeerRevision | null = null
   #journalHead = 0
   #retainedBytes = 0
+  #authoredTimestampMs: bigint | null = null
+  #observedTimestampMs: bigint | null = null
   readonly #heads = new Map<string, Head>()
   readonly #records = new Map<string, Map<number, Retained>>()
   readonly #attempts = new Map<string, SignedAttempt>()
@@ -82,8 +84,8 @@ class Replica implements PeerReplica {
       const bytes = await this.#options.store.get(`${this.#prefix}/journal/${index}`)
       check(bytes !== null, 'PEER_JOURNAL_INCOMPLETE')
       const attempt = decodePeerValue<SignedAttempt>(bytes)
-      await verifyAttempt(attempt, this.#authority, this.#options.epochKeys)
-      this.#remember(attempt)
+      const core = await verifyAttempt(attempt, this.#authority, this.#options.epochKeys)
+      this.#remember(attempt, core)
     }
     for (const generation of this.#authority.bundle.generations) await this.#loadGeneration(generation, this.#authority)
     const recoveryBytes = await this.#options.store.get(`${this.#prefix}/recoveries`)
@@ -110,11 +112,18 @@ class Replica implements PeerReplica {
       this.#closed = true; throw error
     }
   }
-  #remember(attempt: SignedAttempt): void {
+  #remember(attempt: SignedAttempt, core: TransactionCore): void {
     const key = operationKey(attempt.payload.header.author, attempt.payload.header.operationId)
     const previous = this.#operations.get(key)
     check(previous === undefined || previous === attempt.id, 'PEER_OPERATION_ID_REUSED')
     this.#operations.set(key, attempt.id); this.#attempts.set(attempt.id, structuredClone(attempt))
+    if (attempt.payload.header.author === this.device.publicKey &&
+        (this.#authoredTimestampMs === null || this.#authoredTimestampMs < core.authorTimestampMs)) {
+      this.#authoredTimestampMs = core.authorTimestampMs
+    }
+  }
+  #observeApplied(timestampMs: bigint): void {
+    if (this.#observedTimestampMs === null || this.#observedTimestampMs < timestampMs) this.#observedTimestampMs = timestampMs
   }
   async #loadGeneration(generation: SignedGeneration, authority: PeerAuthority): Promise<void> {
     if (this.#heads.has(generation.id)) return
@@ -140,6 +149,10 @@ class Replica implements PeerReplica {
         check(result.revision.applicationId === this.descriptor.applicationId && result.revision.historyId === this.descriptor.historyId,
           'PEER_RESULT_JOURNAL_INVALID')
         this.#lastOutcomes.set(command.attempt.id, result)
+        // This durable result records a locally applied observation, even when
+        // later recovery abandons that proposal. Merely retained remote bodies
+        // do not advance the author's causal clock.
+        this.#observeApplied(this.#records.get(generation.id)!.get(index)!.core.authorTimestampMs)
       }
     }
     check(samePeerValue(this.#heads.get(generation.id), head), 'PEER_HEAD_ROOT_MISMATCH')
@@ -177,7 +190,7 @@ class Replica implements PeerReplica {
       await this.#write(`${this.#prefix}/head/${generation.id}`, encodePeerValue(next))
     }
     this.#heads.set(generation.id, next); entries.set(next.sequence, { command: structuredClone(command), core })
-    this.#remember(attempt); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += receipt.payload.bodyBytes
+    this.#remember(attempt, core); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += receipt.payload.bodyBytes
   }
   #selectedHistory(authority: PeerAuthority): Retained[] {
     const result: Retained[] = []
@@ -208,7 +221,12 @@ class Replica implements PeerReplica {
       txId: hexToBytes(command.attempt.id), candidateDigest: hexToBytes(command.attempt.payload.header.coreDigest),
       canonicalCandidate: encodeTransactionCore(core), core,
     }))
-    const output = await this.#options.materializer.coordinator.materialize(proposals)
+    const controls: PeerExecutionControls = { applicationId: hexToBytes(authority.descriptor.applicationId),
+      currentRevision: authority.current!.payload.controlRevision,
+      revisions: await Promise.all(authority.bundle.controls.map(async control => ({ revision: control.payload.revision,
+        digest: hexToBytes(await peerDigest(control)), members: control.payload.grants.flatMap(grant => grant.dataRole === null ? [] :
+          [{ publicKey: hexToBytes(grant.publicKey), role: grant.dataRole }]) }))) }
+    const output = await this.#options.materializer.coordinator.materialize(proposals, controls)
     if (output !== null) await this.#options.materializer.publications.publish(output.publication)
     const generation = authority.current!, head = this.#heads.get(generation.id)!
     const revision: PeerRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
@@ -234,6 +252,8 @@ class Replica implements PeerReplica {
     this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
     this.#publishedRevision = revision
     this.#ready = true
+    const latest = executionOrder.at(-1)
+    if (latest !== undefined) this.#observeApplied(latest.core.authorTimestampMs)
   }
   #publish(): void { for (const listener of [...this.#listeners]) { try { listener() } catch { /* Consumer failure cannot undo persistence. */ } } }
   #pointAvailable(point: HistoryPoint, authority = this.#authority): boolean {
@@ -276,7 +296,8 @@ class Replica implements PeerReplica {
       const key = this.#options.epochKeys.get(control.payload.epoch); check(key !== undefined, 'PEER_EPOCH_KEY_UNAVAILABLE')
       const core: TransactionCore = { operationId: captured.operationId, groupId: hexToBytes(this.descriptor.applicationId),
         membershipRevision: hexToBytes(await peerDigest(control)), validationPolicy: hexToBytes(await peerDigest([this.descriptor.profile, this.descriptor.policy])),
-        authorId: hexToBytes(this.device.publicKey), authorTimestampMs: captured.authorTimestampMs ?? BigInt(this.#now()),
+        authorId: hexToBytes(this.device.publicKey), authorTimestampMs: captured.authorTimestampMs ?? nextAuthorTimestampMs(BigInt(this.#now()),
+          [this.#authoredTimestampMs, this.#observedTimestampMs].filter(value => value !== null)),
         nonce: crypto.getRandomValues(new Uint8Array(16)), executionManifestDigest: hexToBytes(this.descriptor.executionManifestDigest), program: captured.program }
       const attempt = await createSignedAttempt({ applicationId: this.descriptor.applicationId, profile: 'peer-generation-v1',
         generation: generation.id, controlRevision: control.payload.revision, epoch: control.payload.epoch, author: this.device.publicKey,
@@ -287,7 +308,7 @@ class Replica implements PeerReplica {
       check(this.#journalHead < this.#maxRecords, 'PEER_STORAGE_QUOTA')
       await this.#write(`${this.#prefix}/journal/${this.#journalHead + 1}`, encodePeerValue(attempt))
       await this.#write(`${this.#prefix}/journal-head`, encodePeerValue(this.#journalHead + 1))
-      this.#journalHead++; this.#remember(attempt); this.#publish(); return structuredClone(attempt)
+      this.#journalHead++; this.#remember(attempt, core); this.#publish(); return structuredClone(attempt)
     })
   }
   order(input: SignedAttempt): Promise<OrderedCommand> {
@@ -374,7 +395,7 @@ class Replica implements PeerReplica {
       this.#assertReady()
       const read = this.#options.materializer.queries.captureRead()
       const outcomes = this.#executionOrder.map(value => this.#options.materializer.queries.outcome(hexToBytes(value.command.attempt.id))!)
-      return { revision: this.revision, read, outcomes: structuredClone(outcomes), release: () => read.release() }
+      return { authority: this.authority, revision: this.revision, read, outcomes: structuredClone(outcomes), release: () => read.release() }
     })
   }
   async #proof(point: HistoryPoint): Promise<PrefixProof> {
@@ -387,9 +408,18 @@ class Replica implements PeerReplica {
   }
   recoveryPoint(): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(this.revision.point) }) }
   prefixProof(point: HistoryPoint): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(point) }) }
-  exportCommands(options: { readonly after?: HistoryPoint; readonly limit?: number } = {}): Promise<readonly OrderedCommand[]> {
+  exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
     return this.#serial.run(async () => {
-      this.#assertReady(); let start = 0
+      this.#assertReady(); let start = 0, end = this.#selected.length
+      if (options.at !== undefined) {
+        this.#checkView(options.at)
+        check(options.at.generation === this.generation.id && options.at.point.generation === this.generation.id, 'PEER_VIEW_RECOVERY_REQUIRED')
+        end -= this.revision.point.sequence - options.at.point.sequence
+      }
+      if (options.offset !== undefined) {
+        check(options.after === undefined && Number.isSafeInteger(options.offset) && options.offset >= 0 && options.offset <= end, 'PEER_RANGE_OFFSET_INVALID')
+        start = options.offset
+      }
       if (options.after !== undefined) {
         check(this.#pointAvailable(options.after), 'PEER_CURSOR_RECOVERY_REQUIRED')
         if (options.after.sequence > 0) {
@@ -402,14 +432,17 @@ class Replica implements PeerReplica {
       }
       const limit = options.limit ?? this.#maxRecords
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= this.#maxRecords, 'PEER_RANGE_LIMIT_INVALID')
-      return this.#selected.slice(start, start + limit).map(value => structuredClone(value.command))
+      return this.#selected.slice(start, Math.min(end, start + limit)).map(value => structuredClone(value.command))
     })
   }
-  retainedCoverage(): Promise<SignedRetainedCoverage> {
+  retainedCoverage(input?: HistoryPoint): Promise<SignedRetainedCoverage> {
+    const requested = input === undefined ? undefined : structuredClone(input)
     return this.#serial.run(async () => {
       this.#assertReady()
+      const point = requested ?? this.revision.point
+      check(this.#pointAvailable(point), 'PEER_RECOVERY_PREFIX_INCOMPLETE')
       return signPeerValue(DOMAINS.peerCoverage, { applicationId: this.descriptor.applicationId, generation: this.generation.id,
-        point: this.revision.point, peer: this.device.publicKey, storageId: this.#options.storageId, retainedAt: this.#now() }, this.device)
+        point, peer: this.device.publicKey, storageId: this.#options.storageId, retainedAt: this.#now() }, this.device)
     })
   }
   observeCoverage(input: SignedRetainedCoverage): Promise<void> {

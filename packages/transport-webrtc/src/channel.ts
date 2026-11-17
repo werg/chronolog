@@ -1,4 +1,4 @@
-import type { FramedPeerConnection } from '@chronolog/agent-service/framing'
+import type { FramedPeerConnection } from '@chronolog/records'
 
 import type { RtcDataChannel } from './types.js'
 import type { WebRtcChannels } from './types.js'

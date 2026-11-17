@@ -197,6 +197,8 @@ export interface DatabaseLike {
 export interface MaterializerOptions {
   /** SQL authority semantics, authenticated by the execution manifest's platform digest. */
   readonly sqlPolicy?: SqlMutationPolicy
+  /** Independently authenticated source of data authority; external membership is an applied capability. */
+  readonly authorizationPolicy?: SqlAuthorizationPolicy
   /** Verified schema-author program, executed once before the genesis checkpoint. */
   readonly bootstrapProgram?: ChangeProgram
   readonly bootstrapGroupId?: Uint8Array
@@ -231,9 +233,11 @@ export interface MaterializerOptions {
 
 /** Independent of replay/finality: data-only proposals cannot alter schema or platform rights. */
 export type SqlMutationPolicy = 'authorized' | 'data-only'
+export type SqlAuthorizationPolicy = 'transaction-grants' | 'external-membership'
 
 export interface AppliedMaterializerOptions extends MaterializerOptions {
   readonly sqlPolicy: SqlMutationPolicy
+  readonly authorizationPolicy: SqlAuthorizationPolicy
 }
 
 export type MaterializerPublicationFaultPoint =
@@ -246,6 +250,7 @@ export type MaterializerPublicationFaultPoint =
 export interface StoredExecutionManifest {
   readonly publicationMode: 'applied' | 'live'
   readonly sqlPolicy: SqlMutationPolicy
+  readonly authorizationPolicy: SqlAuthorizationPolicy
   readonly bootstrapProgram: Uint8Array
   readonly bootstrapGroupId: Uint8Array
   readonly manifestDigest: Uint8Array

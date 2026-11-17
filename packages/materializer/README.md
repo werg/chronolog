@@ -54,6 +54,20 @@ the execution manifest's platform digest. It is not inferred from the inclusion
 protocol or the presence of finality. A verified bootstrap schema has a separate
 authenticated genesis identity and must match its retained bytes on reopen.
 
+Applied SQL additionally selects an `authorizationPolicy`. `transaction-grants`
+uses the existing row-ownership and grant system. `external-membership` requires
+`data-only` commands and a verified `PeerExecutionControls` projection on every
+replay; this choice is independently included in the execution fingerprint.
+The caller verifies the signed authority chain and supplies the exact historical
+control digest bound by each proposal. Replay applies that historical membership
+before executing the proposal, then reapplies the latest control before publishing
+the SQL view. Recovering application history cannot restore revoked current rights,
+and an older control projection is rejected after a newer one has been retained.
+Membership-only changes publish a new coherent applied revision even if the
+proposal set is unchanged. The live factory rejects `external-membership`: final
+view semantics for that composition are not implemented. Live SQL retains its
+existing transaction-grant authorization and actual immutable final prefix.
+
 ## SQL-free event execution
 
 `createAppliedEventMaterializationRuntime` implements the applied port for programs

@@ -10,7 +10,7 @@ import type { ApplicationSession } from './session.js'
 
 /** Exact compiled native engine and platform identity for the peer-generation SQL profile. */
 export function createNativeSqlManifest() {
-  return createDoltLiteExecutionManifest({ profile: 'chronolog-peer-sql-v1', sqlPolicy: 'data-only' })
+  return createDoltLiteExecutionManifest({ profile: 'chronolog-peer-sql-v1', sqlPolicy: 'data-only', authorizationPolicy: 'external-membership' })
 }
 
 /** Verifies a separately authorized schema before constructing the permanent genesis state. */
@@ -24,7 +24,7 @@ export async function openNativeSqlApplication<const D extends ApplicationDefini
     throw new Error('APPLICATION_SCHEMA_DEFINITION_MISMATCH')
   }
   const materializer = await AppliedMaterializer.open({ path: options.databasePath, executionManifest: createNativeSqlManifest(),
-    sqlPolicy: 'data-only', rootAdministrator: hexToBytes(descriptor.schemaAdministrator),
+    sqlPolicy: 'data-only', authorizationPolicy: 'external-membership', rootAdministrator: hexToBytes(descriptor.schemaAdministrator),
     bootstrapGroupId: hexToBytes(descriptor.applicationId), bootstrapProgram })
   try { return await openPeerApplication({ ...options, materializer: createDoltLiteAppliedMaterializationRuntime(materializer) }) }
   catch (error) { materializer.close(); throw error }

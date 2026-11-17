@@ -2,7 +2,7 @@ import { createSha256, utf8 } from '@chronolog/canonical'
 
 import { SQL_PROFILE_VERSION } from '../sql-profile.js'
 import { SYSTEM_LOG_SQL } from '../system-log.js'
-import type { SqlMutationPolicy } from '../types.js'
+import type { SqlAuthorizationPolicy, SqlMutationPolicy } from '../types.js'
 
 import { PLATFORM_TABLES_SQL, PLATFORM_VIEWS_SQL } from './schema.js'
 import { platformTriggers, type TableShape } from './tables.js'
@@ -12,7 +12,7 @@ import { platformTriggers, type TableShape } from './tables.js'
  * any change to what an operation checks or writes: the platform code decides
  * replicated state, so replicas must run the same version.
  */
-export const PLATFORM_CODE_VERSION = 'chronolog-platform-ops-v10-change-program-v3-events-v1-author-time-order-v1-sql-policy-v1'
+export const PLATFORM_CODE_VERSION = 'chronolog-platform-ops-v11-change-program-v3-events-v1-author-time-order-v1-sql-policy-v1-external-membership-v1'
 
 /** A fixed table that exercises the trigger generator (composite key, odd names, a cap column). */
 const REFERENCE_TABLE: TableShape = {
@@ -29,13 +29,19 @@ const REFERENCE_TABLE: TableShape = {
 }
 
 /** SHA-256 over SQL/operation semantics, replicated schemas, and generated views and triggers. */
-export function computePlatformDigest(sqlPolicy: SqlMutationPolicy = 'authorized'): Uint8Array {
+export function computePlatformDigest(
+  sqlPolicy: SqlMutationPolicy = 'authorized',
+  authorizationPolicy: SqlAuthorizationPolicy = 'transaction-grants',
+): Uint8Array {
   if (sqlPolicy !== 'authorized' && sqlPolicy !== 'data-only') throw new Error('MATERIALIZER_SQL_POLICY_UNSUPPORTED')
+  if (authorizationPolicy !== 'transaction-grants' && authorizationPolicy !== 'external-membership') throw new Error('MATERIALIZER_AUTHORIZATION_POLICY_UNSUPPORTED')
+  if (authorizationPolicy === 'external-membership' && sqlPolicy !== 'data-only') throw new Error('MATERIALIZER_EXTERNAL_MEMBERSHIP_REQUIRES_DATA_ONLY')
   const hash = createSha256()
   hash.update('chronolog-platform-digest-v2\n')
   hash.update(`${PLATFORM_CODE_VERSION}\n`)
   hash.update(`${SQL_PROFILE_VERSION}\n`)
   hash.update(`sql-mutation-policy:${sqlPolicy}\n`)
+  hash.update(`sql-authorization-policy:${authorizationPolicy}\n`)
   for (const sql of [SYSTEM_LOG_SQL, ...PLATFORM_TABLES_SQL, ...PLATFORM_VIEWS_SQL, ...platformTriggers(REFERENCE_TABLE).map((trigger) => trigger.sql)]) {
     hash.update(`${utf8(sql).length}\n${sql}\n`)
   }

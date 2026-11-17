@@ -55,10 +55,34 @@ export interface MaterializationCoordinator {
   ): Promise<CoordinatedMaterialization | null>
 }
 
+/** Applied SQL can also project a verified external membership history into its data authority. */
+export interface AppliedMaterializationCoordinator extends MaterializationCoordinator {
+  materialize(
+    orderedTransactions: readonly ReplayProposal[],
+    controls?: PeerExecutionControls,
+  ): Promise<CoordinatedMaterialization | null>
+}
+
 /** Live consensus alone can freeze a proven application prefix. */
 export interface LiveMaterializationCoordinator extends MaterializationCoordinator {
   /** Materialize and pin an actual immutable final prefix, independently of local state. */
   publishFinal(prefixLength: number): Promise<void>
+}
+
+/**
+ * A control projection authenticated by the caller before replay. Its digest is
+ * the exact signed control identity bound by each proposal's membershipRevision.
+ * The materializer validates structure and retained continuity, not signatures.
+ */
+export interface PeerExecutionControl {
+  readonly revision: number
+  readonly digest: Uint8Array
+  readonly members: readonly { readonly publicKey: Uint8Array; readonly role: 'member' | 'admin' }[]
+}
+export interface PeerExecutionControls {
+  readonly applicationId: Uint8Array
+  readonly currentRevision: number
+  readonly revisions: readonly PeerExecutionControl[]
 }
 
 export type MaterializedLocalSqlValue =
@@ -174,7 +198,7 @@ export interface MaterializationPublicationStore {
 /** Deterministic replay and atomic publication, independent of any finality protocol. */
 export interface AppliedMaterializationRuntime {
   readonly kind: 'applied'
-  readonly coordinator: MaterializationCoordinator
+  readonly coordinator: AppliedMaterializationCoordinator
   readonly queries: AppliedQueryService
   readonly publications: MaterializationPublicationStore
   close(): void | Promise<void>

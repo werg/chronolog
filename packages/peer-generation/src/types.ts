@@ -93,6 +93,7 @@ export interface PrepareCommand {
   readonly authorTimestampMs?: bigint
 }
 export interface CapturedPeerView {
+  readonly authority: AuthorityBundle
   readonly revision: PeerRevision
   readonly read: AppliedReadHandle
   readonly outcomes: readonly MaterializedTransactionOutcome[]
@@ -119,9 +120,9 @@ export interface PeerReplica {
   capture(): Promise<CapturedPeerView>
   recoveryPoint(): Promise<PrefixProof>
   prefixProof(point: HistoryPoint): Promise<PrefixProof>
-  exportCommands(options?: { readonly after?: HistoryPoint; readonly limit?: number }): Promise<readonly OrderedCommand[]>
+  exportCommands(options?: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly at?: PeerRevision }): Promise<readonly OrderedCommand[]>
   pendingAttempts(): Promise<readonly SignedAttempt[]>
-  retainedCoverage(): Promise<SignedRetainedCoverage>
+  retainedCoverage(point?: HistoryPoint): Promise<SignedRetainedCoverage>
   observeCoverage(coverage: SignedRetainedCoverage): Promise<void>
   shared(point?: HistoryPoint): readonly SignedRetainedCoverage[]
   subscribe(listener: () => void): () => void
