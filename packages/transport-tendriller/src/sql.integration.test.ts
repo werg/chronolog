@@ -11,7 +11,7 @@ import { ChronologNode, Mutex, membershipDescriptor, provisionMembership } from 
 import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
 import { createLedgerRecord } from '@chronolog/node-core/ledger'
 import {
-  CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog,
+  SignedInclusionFinalityProvider, decodeOrderingEvidence, ReferenceRecordLog,
 } from '@chronolog/node-core/history'
 import { digestExecutionManifest, equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
@@ -113,7 +113,7 @@ describe('Tendriller coordinated SQL connection', () => {
       const transport = adapter ?? local
       const materializer = await DeterministicMaterializer.open({ path: join(directory, `${name}.db`), executionManifest,
         rootAdministrator: aliceKey.publicKeyBytes })
-      const policy = await CoordinatedHistoryPolicy.open(authority.configuration, saved)
+      const policy = await SignedInclusionFinalityProvider.open(authority.configuration, saved)
       const node = new ChronologNode({
         groupId: authority.configuration.groupId, membershipRevision: bytes32(13), validationPolicy: bytes32(14), identity,
         transport, operationStore: saved, historyPolicy: { kind: 'coordinated', policy },

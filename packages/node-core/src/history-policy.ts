@@ -210,7 +210,7 @@ export function decodeOrderingEvidence(bytes: Uint8Array): OrderingEvidence {
  * certificates. Receipt order enumerates inclusion evidence only. Application
  * finality additionally requires the independently signed closure markers.
  */
-export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
+export class SignedInclusionFinalityProvider implements LiveInclusionFinalityProvider {
   readonly #configuration: CoordinatedHistoryConfiguration
   readonly #store: DurableOperationStore
   readonly #key: string
@@ -237,12 +237,12 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
   }
 
   static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore,
-    options: CoordinatedHistoryStorageOptions = {}): Promise<CoordinatedHistoryPolicy> {
+    options: CoordinatedHistoryStorageOptions = {}): Promise<SignedInclusionFinalityProvider> {
     configuration = structuredClone(configuration)
     encodeHistoryConfiguration(configuration)
     const quotaBytes = options.quotaBytes ?? DEFAULT_EVIDENCE_QUOTA_BYTES
     if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1024 || quotaBytes > MAX_LOCAL_HISTORY_BYTES) throw new Error('HISTORY_STORAGE_QUOTA_INVALID')
-    const policy = new CoordinatedHistoryPolicy(configuration, store, await VerifiedFinalityPrefix.empty(configuration), quotaBytes)
+    const policy = new SignedInclusionFinalityProvider(configuration, store, await VerifiedFinalityPrefix.empty(configuration), quotaBytes)
     const saved = await store.get(policy.#key)
     if (saved !== null) {
       if (saved.length > quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
@@ -438,9 +438,6 @@ export class CoordinatedHistoryPolicy implements LiveInclusionFinalityProvider {
     }
   }
 }
-
-/** Preferred name: this provider certifies inclusion and closes author time. */
-export { CoordinatedHistoryPolicy as SignedInclusionFinalityProvider }
 
 function allEntries(entries: ReadonlyMap<number, ReadonlyMap<string, OrderedRecordEntry>>): OrderedRecordEntry[] {
   const result: OrderedRecordEntry[] = []

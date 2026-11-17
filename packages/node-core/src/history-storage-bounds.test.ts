@@ -3,7 +3,7 @@ import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol
 import { describe, expect, it } from 'vitest'
 
 import {
-  CoordinatedHistoryPolicy, ReferenceRecordLog, createPrefixAuthority, encodeHistoryConfiguration,
+  SignedInclusionFinalityProvider, ReferenceRecordLog, createPrefixAuthority, encodeHistoryConfiguration,
   encodeOrderingEvidence, orderedEntryRoot, orderedGenesisRoot, orderedRecordId,
 } from './history-policy.js'
 import type { CoordinatedHistoryConfiguration, OrderedRecordEntry } from './history-policy.js'
@@ -36,10 +36,10 @@ describe('retained history decode bounds', () => {
       1n, encodeHistoryConfiguration(configuration), [...encoded, encodeOrderingEvidence({ kind: 'ordered-entry', entry: next }),
         encodeOrderingEvidence({ kind: 'prefix-certificate', certificate })],
     ]))
-    const policy = await CoordinatedHistoryPolicy.open(configuration, evidenceStore, { quotaBytes: 24 * 1024 * 1024 })
+    const policy = await SignedInclusionFinalityProvider.open(configuration, evidenceStore, { quotaBytes: 24 * 1024 * 1024 })
     expect(policy.progress.finalThrough).toBe(18)
     await policy.ingest({ kind: 'prefix-certificate', certificate })
-    expect((await CoordinatedHistoryPolicy.open(configuration, evidenceStore)).progress.finalThrough).toBe(18)
+    expect((await SignedInclusionFinalityProvider.open(configuration, evidenceStore)).progress.finalThrough).toBe(18)
   })
 
   it('refuses a local evidence quota before committing or advancing progress', async () => {
@@ -49,9 +49,9 @@ describe('retained history decode bounds', () => {
       genesisDigest: new Uint8Array(32).fill(92), executionManifestDigest: new Uint8Array(32).fill(93) }
     const log = await ReferenceRecordLog.open(configuration.historyId, new MemoryOperationStore())
     const entry = await log.append(new Uint8Array(2048))
-    const policy = await CoordinatedHistoryPolicy.open(configuration, store, { quotaBytes: 1024 })
+    const policy = await SignedInclusionFinalityProvider.open(configuration, store, { quotaBytes: 1024 })
     await expect(policy.ingest({ kind: 'ordered-entry', entry })).rejects.toThrow('HISTORY_STORAGE_QUOTA_EXCEEDED')
     expect(policy.progress.receivedThrough).toBe(0)
-    expect((await CoordinatedHistoryPolicy.open(configuration, store, { quotaBytes: 1024 })).progress.receivedThrough).toBe(0)
+    expect((await SignedInclusionFinalityProvider.open(configuration, store, { quotaBytes: 1024 })).progress.receivedThrough).toBe(0)
   })
 })

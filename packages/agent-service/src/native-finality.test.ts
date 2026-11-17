@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 import { signGenesis, type ClockPolicy } from '@chronolog/capabilities'
-import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence, membershipDescriptor,
+import { SignedInclusionFinalityProvider, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence, membershipDescriptor,
   encodeOrderingEvidence, evaluateFinalitySnapshot, verifyPrefixCertificate } from '@chronolog/node-core'
 import type { DurableOperationStore } from '@chronolog/node-core'
 import { encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
@@ -375,14 +375,14 @@ describe('native signed-inclusion finality service', () => {
     const first = await authority.certifiedRead({ limit: 1 })
     for (const entry of first.entries) await sink.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
     await sink.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: first.certificate }))
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     for (const bytes of captured.splice(0)) await peer.ingest(decodeOrderingEvidence(bytes))
     expect(peer.progress.finalThrough).toBe(0)
     await authority.share(sink, { after: first.entries.at(-1)!.position })
     for (const bytes of captured.reverse()) await peer.ingest(decodeOrderingEvidence(bytes))
     expect(peer.progress.finalThrough).toBe(4)
     expect(peer.snapshot().closedThroughMs).toBe(1_000n)
-    const third = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const third = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     for (const evidence of [...peer.evidence()].reverse()) await third.ingest(evidence)
     expect(third.progress).toEqual(peer.progress)
   })
@@ -407,7 +407,7 @@ describe('native signed-inclusion finality service', () => {
       .toEqual(Array.from({ length: 66 }, (_, index) => index + 1))
     expect(evidence.at(-1)).toMatchObject({ kind: 'prefix-certificate', certificate: shared })
     expect((await authority.head()).position).toBe(67)
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     await peer.ingestBatch(evidence)
     expect(peer.progress.finalThrough).toBe(66)
 
@@ -423,7 +423,7 @@ describe('native signed-inclusion finality service', () => {
   it.each(['entry', 'certificate'] as const)('propagates a lost %s sink acknowledgment and retries exact evidence', async (boundary) => {
     const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
     await Promise.all(['one', 'two', 'three'].map(text => authority.append(envelope(text))))
-    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const peer = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     const captured: Uint8Array[] = [], lost = new Error('sink acknowledgment lost')
     let fail = true
     const sink = { putEvidence: async (bytes: Uint8Array) => {
@@ -521,7 +521,7 @@ describe('native signed-inclusion finality service', () => {
     cleanup.push(() => transport.close())
     await transport.publish(envelope('queued-before-service'))
     const stopped = new AbortController(), running = authority.serve(transport, stopped.signal)
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     const frontier = async () => {
       for (const item of await transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
       return policy.snapshot().closedThroughMs

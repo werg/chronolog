@@ -7,7 +7,7 @@ import { parseArgs } from 'node:util'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
 import { createDoltLiteExecutionManifest, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
-import { CoordinatedHistoryPolicy, decodeLedgerRecord, decodeOrderingEvidence, isFinalityClosureRecord, ReferenceRecordLog,
+import { SignedInclusionFinalityProvider, decodeLedgerRecord, decodeOrderingEvidence, isFinalityClosureRecord, ReferenceRecordLog,
   type CoordinatedHistoryConfiguration, type OrderedRecordHead } from '@chronolog/node-core'
 import { base64UrlToBytes } from '@chronolog/protocol'
 
@@ -180,8 +180,8 @@ try {
       genesisDigest: base64UrlToBytes(held.value.configuration.genesisDigest), executionManifestDigest: base64UrlToBytes(held.value.configuration.executionManifestDigest),
       ...(held.value.configuration.providerId === undefined ? {} : { providerId: held.value.configuration.providerId }),
       ...(held.value.configuration.providerParameters === undefined ? {} : { providerParameters: base64UrlToBytes(held.value.configuration.providerParameters) }) }
-    const first = await CoordinatedHistoryPolicy.open(publicConfiguration, one)
-    const second = await CoordinatedHistoryPolicy.open(publicConfiguration, two)
+    const first = await SignedInclusionFinalityProvider.open(publicConfiguration, one)
+    const second = await SignedInclusionFinalityProvider.open(publicConfiguration, two)
     projection = await DeterministicMaterializer.open({ path: projectionPath, executionManifest: createDoltLiteExecutionManifest(),
       rootAdministrator: base64UrlToBytes(held.value.state.authorityIdentity) })
     for (const bytes of [...held.value.evidence].reverse()) await first.ingest(decodeOrderingEvidence(base64UrlToBytes(bytes)))

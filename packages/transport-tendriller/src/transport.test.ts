@@ -11,7 +11,7 @@ import {
   type RecordLogEntry,
 } from '@tendriller/core/records'
 import {
-  CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog, verifyPrefixCertificate,
+  SignedInclusionFinalityProvider, decodeOrderingEvidence, ReferenceRecordLog, verifyPrefixCertificate,
   type OrderedRecordEntry,
 } from '@chronolog/node-core/history'
 import { encodeEnvelope, generateEd25519KeyPair, type EnvelopeMessageType } from '@chronolog/protocol'
@@ -180,7 +180,7 @@ describe('public Tendriller adapter', () => {
     expect(await reader.transport.get(original.id)).toMatchObject({
       id: original.id, author: original.author, sequence: original.sequence, payload: original.payload,
     })
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
     for (const item of await reader.transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(2)
     expect(policy.snapshot().closedThroughMs).toBe(1_000n)
@@ -208,7 +208,7 @@ describe('public Tendriller adapter', () => {
     f.offline()
     await expect(adapter.publish(envelope('candidate', 2))).rejects.toThrow('Hub unavailable')
     expect(await adapter.history()).toHaveLength(2)
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
     for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(2)
     expect((await adapter.status()).lastCatchUpError).toContain('Hub unavailable')
@@ -279,7 +279,7 @@ describe('public Tendriller adapter', () => {
     const adapter = new TendrillerTransport({ local: author.transport, configuration: f.configuration, groupRoute,
       records: { ...f.records, watch: () => () => undefined }, certificate: f.certificate, finalityPollIntervalMs: 5 })
     closers.push(() => adapter.close())
-    const policy = await CoordinatedHistoryPolicy.open(f.configuration, storage())
+    const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
     const frontier = async () => {
       for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
       return policy.snapshot().closedThroughMs
