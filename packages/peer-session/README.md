@@ -256,10 +256,44 @@ Use `tool: "list"` for schemas and `tool: "wait"` with the operation ID for its
 current applied result. The transport creates no second identity, outbox, or
 hosted command proxy.
 
-The portable entry and the browser entry are SQL-free. SQL applications supply
-a qualified materializer with the same authenticated profile; the pinned schema
-is initialized before application history. Irreversible effects require a
-separately declared protected boundary.
+## SQL composition
+
+The portable and ordinary browser entries are SQL-free. SQL applications use
+`openNativeSqlApplication` from `@chronolog/peer-session/sql-native` or
+`openBrowserSqlApplication` from `@chronolog/peer-session/sql-browser`. Both
+construct the same deterministic materializer under the owned device session,
+verify the signed initializer and execution identity before creating a SQL
+database, and close the materializer before releasing device storage.
+
+The native constructor takes `databasePath` and the signed `schema` alongside
+the usual `device`, `definition` and `authority` options.
+`prepareNativeSqlApplication({ applicationId, definition, schemaAdministrator })`
+returns that signed schema and the descriptor binding fields for the exact
+compiled engine. The definition must contain its initializer in `schema`.
+
+The browser constructor runs in the isolated owning Worker and takes `engineUrl`
+instead of a database path. Serve the packaged `browser-engine` directory as
+static assets with JavaScript/WASM content types and the same cross-origin
+isolation policy as the Worker. The directory URL may include or omit its final
+slash. For example:
+
+```ts
+import { openBrowserSqlApplication } from '@chronolog/peer-session/sql-browser'
+
+const session = await openBrowserSqlApplication({
+  device, definition, authority, schema,
+  engineUrl: new URL('/chronolog-engine/', self.location.href),
+})
+```
+
+The session verifies the engine bytes and manifest, opens an OPFS handle pool
+scoped to the durable storage identity and application, and owns its lifetime.
+`createBrowserSqlManifest(buildManifest)` exposes the matching execution
+manifest for bootstrap. Native and browser peers must use that same signed
+identity; an incompatible engine fails before initializing the SQL cache.
+The database is derived from authenticated history. It does not replace the
+original encrypted records, saved operation intent, or epoch keyring.
+Irreversible effects require a separately declared protected boundary.
 
 ## Build a packed preview
 
@@ -270,3 +304,16 @@ browser entries share session classes and ownership state through those chunks.
 Use `--native-rtc` to include the optional native RTC entry. That archive declares
 the exact `werift@0.27.0` peer dependency; the default archive has no runtime
 package dependencies and remains SQL-free.
+
+Use `--sql-native` for the native SQL entry and exact compiled patched addon.
+That archive is bound to the build platform and architecture. Use
+`--sql-browser artifacts/wasm` after `tools/build-wasm-engine.mjs` to include the
+browser SQL entry and its four engine assets. The packaging gate checks the WASM
+digest, source identity, deterministic hooks and runtime versions against the
+native build, then records every asset hash in provenance. Combine both flags
+when qualifying browser/native peers on the same execution profile.
+
+`node tools/test-peer-session-sql.mjs --artifact /path/to/archive.tgz` installs
+the native SQL archive into an empty independent project and exercises shared
+rows, constraint rejection, generation recovery, creator departure and reopen
+without workspace imports or install scripts.
