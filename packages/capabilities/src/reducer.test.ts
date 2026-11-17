@@ -46,7 +46,7 @@ function revisionAfter(
   f: { readonly snapshot: CapabilitySnapshot; readonly root: Ed25519KeyPair },
   overrides: Partial<CapabilityRevision> = {},
 ): CapabilityRevision {
-  return {
+  return { encryptionEpoch: f.snapshot.encryptionEpoch,
     groupId: f.snapshot.groupId, revision: f.snapshot.revision + 1n, previousRevisionDigest: f.snapshot.revisionDigest,
     issuerRootPublicKey: f.root.publicKeyBytes, grants: [], revocations: [], validationPolicies: [], ...overrides,
   }
@@ -118,7 +118,7 @@ describe('capability revision chain', () => {
     const cases: readonly [string, Partial<CapabilityRevision>, string, 'root' | 'stranger'][] = [
       ['foreign group', { groupId: bytes(98) }, 'SCHEMA_INVALID', 'root'],
       ['revision gap', { revision: 2n }, 'SCHEMA_INVALID', 'root'],
-      ['forked predecessor', { previousRevisionDigest: bytes(98) }, 'DIGEST_MISMATCH', 'root'],
+      ['forked predecessor', { encryptionEpoch: 0n, previousRevisionDigest: bytes(98) }, 'DIGEST_MISMATCH', 'root'],
       ['wrong declared issuer', { issuerRootPublicKey: stranger.publicKeyBytes }, 'INVALID_KEY', 'stranger'],
       ['non-root signature', {}, 'INVALID_SIGNATURE', 'stranger'],
     ]
@@ -195,17 +195,17 @@ describe('capability revision chain', () => {
     expect(raised.validatorFloorMs).toBe(2_000n)
   })
 
-  it('stops honoring the old root after succession', async () => {
+  it('advances encryption identity with the signed revision and rejects gaps or reopening', async () => {
     const f = await fixture()
-    const successor = await generateEd25519KeyPair()
     const rotated = await applyCapabilityRevision(f.snapshot, await signCapabilityRevision(
-      revisionAfter(f, { successorRootPublicKey: successor.publicKeyBytes, successorCapabilityLogFeed: bytes(8) }),
-      f.root.privateKey,
-    ))
-    const oldRootAttempt = await signCapabilityRevision(revisionAfter({ snapshot: rotated, root: f.root }), f.root.privateKey)
-    await expect(applyCapabilityRevision(rotated, oldRootAttempt)).rejects.toMatchObject({ code: 'INVALID_KEY' })
-    const newRootRevision = await signCapabilityRevision(revisionAfter({ snapshot: rotated, root: successor }), successor.privateKey)
-    expect((await applyCapabilityRevision(rotated, newRootRevision)).revision).toBe(2n)
+      revisionAfter(f, { encryptionEpoch: 1n }), f.root.privateKey))
+    expect(rotated.encryptionEpoch).toBe(1n)
+    expect(rotated.rootAdminPublicKey).toEqual(f.root.publicKeyBytes)
+    expect(rotated.capabilityLogFeed).toEqual(f.snapshot.capabilityLogFeed)
+    for (const encryptionEpoch of [0n, 3n]) {
+      const invalid = await signCapabilityRevision(revisionAfter({ snapshot: rotated, root: f.root }, { encryptionEpoch }), f.root.privateKey)
+      await expect(applyCapabilityRevision(rotated, invalid)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
+    }
   })
 
   it('orders unsorted input revisions before applying them', async () => {

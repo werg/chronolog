@@ -1,5 +1,5 @@
 import { isCapabilityActive, type CapabilitySnapshot, type EffectiveCapability } from '@chronolog/capabilities'
-import { bytesToHex, equalBytes } from '@chronolog/protocol'
+import { assertCanonicalCbor, bytesToHex, equalBytes } from '@chronolog/protocol'
 
 import type { WriterAuthorizationContext } from './capability-membership.js'
 
@@ -39,6 +39,27 @@ export class GovernanceActivationIndex {
   get activationBoundary(): bigint { return this.#activations[this.#activations.length - 1]!.after }
   get finalityRevisions(): readonly { readonly membershipRevision: Uint8Array; readonly authorTimeAfterMs: bigint }[] {
     return this.#activations.map(({ snapshot, after }) => ({ membershipRevision: snapshot.revisionDigest.slice(), authorTimeAfterMs: after }))
+  }
+
+  /** Envelope authority follows the same timestamp-selected state as writer grants. */
+  encryptionEpochStatusAt(authorTimestampMs: bigint, epochId: Uint8Array | null): 'active' | 'closed' | 'unissued' {
+    const epoch = decodeEpochId(epochId)
+    if (epoch === null || authorTimestampMs < 0n) return 'unissued'
+    const activation = this.#activations.findLast(item => authorTimestampMs > item.after)
+    if (activation === undefined || epoch > activation.snapshot.encryptionEpoch) return 'unissued'
+    return epoch === activation.snapshot.encryptionEpoch ? 'active' : 'closed'
+  }
+
+  /** Does an epoch's authority overlap (afterMs, throughMs]? The caller proves that complete window closed. */
+  encryptionEpochCanAuthorize(afterMs: bigint, throughMs: bigint, epochId: Uint8Array | null): boolean {
+    const epoch = decodeEpochId(epochId)
+    if (epoch === null || throughMs < 0n || afterMs >= throughMs) return false
+    return this.#activations.some((activation, index) => {
+      const next = this.#activations[index + 1]
+      const lower = afterMs > activation.after ? afterMs : activation.after
+      const upper = next !== undefined && next.after < throughMs ? next.after : throughMs
+      return activation.snapshot.encryptionEpoch === epoch && lower < upper
+    })
   }
 
   /** The provider proved inclusion and closed this author-time boundary. */
@@ -91,4 +112,12 @@ function activeValidators(snapshot: CapabilitySnapshot): EffectiveCapability[] {
   return [...snapshot.capabilities.values()]
     .filter((item) => item.grant.role === 'validator' && isCapabilityActive(item, snapshot.revision))
     .sort((left, right) => bytesToHex(left.id).localeCompare(bytesToHex(right.id)))
+}
+
+function decodeEpochId(epochId: Uint8Array | null): bigint | null {
+  if (epochId === null) return null
+  try {
+    const value = assertCanonicalCbor(epochId)
+    return typeof value === 'bigint' && value >= 0n ? value : null
+  } catch { return null }
 }

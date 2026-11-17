@@ -1,9 +1,10 @@
 import { encodeGenesisManifest, reduceCapabilityLog, signGenesis, type CapabilityGrant, type GenesisManifest } from '@chronolog/capabilities'
 import {
-  bytesToHex, decodeValidatorAttestation, encodeEnvelope, encodeValidatorAttestation,
+  bytesToHex, decodeValidatorAttestation, encodeCanonicalCbor, encodeEnvelope, encodeValidatorAttestation,
   equalBytes, generateEd25519KeyPair, type Ed25519KeyPair,
 } from '@chronolog/protocol'
 import { MemoryTransportNetwork, type ChronologTransport } from '@chronolog/transport-ssb'
+import { generateX25519KeyPair } from '@chronolog/crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { encodeSignedGovernanceClosure, signGovernanceClosure } from './peer-governance-proof.js'
@@ -16,6 +17,44 @@ const closeables: Array<{ close(): Promise<void> }> = []
 afterEach(async () => { for (const item of closeables.splice(0).reverse()) await item.close() })
 
 describe('live peer governance activation controller', () => {
+  it('activates epoch rotation with the same peer closure and preserves old encrypted replay after restart', async () => {
+    const f = await fixture()
+    const first = f.controller(0)
+    await first.start()
+    await f.governance[0]!.initializeEpochKey(f.identities[0].privateKey, bytes(70))
+    await waitFor(() => f.governance[1]!.hasEpochKey(0n))
+    const canonical = new TextEncoder().encode('original signed event')
+    const oldEnvelope = await encodeSignedEnvelope(f.route, 'candidate', canonical, f.identities[0],
+      f.governance[0]!.cipherRing.resolve(encodeCanonicalCbor(0n)))
+    await f.governance[0]!.rotateEpoch(f.identities[0].privateKey, bytes(71))
+    await waitFor(() => f.governance[1]!.hasEpochKey(1n))
+    await first.refresh()
+    expect(first.activeSnapshot.encryptionEpoch).toBe(0n)
+    expect(first.encryptionEpochStatusAt(1_001n, encodeCanonicalCbor(0n))).toBe('active')
+    expect(first.encryptionEpochStatusAt(1_001n, encodeCanonicalCbor(1n))).toBe('unissued')
+    const second = f.controller(1)
+    await second.start(); await first.refresh()
+    expect(first.activeSnapshot.encryptionEpoch).toBe(1n)
+    expect(first.encryptionEpochStatusAt(1_000n, encodeCanonicalCbor(0n))).toBe('active')
+    expect(first.encryptionEpochStatusAt(1_001n, encodeCanonicalCbor(0n))).toBe('closed')
+    expect(first.encryptionEpochStatusAt(1_001n, encodeCanonicalCbor(1n))).toBe('active')
+    expect(first.encryptionEpochCanAuthorize(-1n, 999n, encodeCanonicalCbor(1n))).toBe(false)
+    expect(first.encryptionEpochCanAuthorize(-1n, 1_000n, encodeCanonicalCbor(1n))).toBe(false)
+    expect(first.encryptionEpochCanAuthorize(-1n, 1_001n, encodeCanonicalCbor(1n))).toBe(true)
+    expect((await decodeSignedEnvelope(oldEnvelope, f.route, f.governance[1]!.cipherRing)).payload).toEqual(canonical)
+    await first.close()
+    const reopened = f.controller(0)
+    await reopened.start()
+    expect(reopened.encryptionEpochStatusAt(1_000n, encodeCanonicalCbor(0n))).toBe('active')
+    expect(reopened.encryptionEpochStatusAt(1_001n, encodeCanonicalCbor(0n))).toBe('closed')
+    f.governance[1]!.cipherRing.remove(0n)
+    await expect(decodeSignedEnvelope(oldEnvelope, f.route, f.governance[1]!.cipherRing)).rejects.toThrow('WIRE_ENCRYPTION_EPOCH_UNAVAILABLE')
+    await f.governance[0]!.grantHistoricalAccess(f.identities[1].publicKeyBytes, f.identities[0].privateKey)
+    await waitFor(() => f.governance[1]!.cipherRing.resolve(encodeCanonicalCbor(0n)) !== undefined)
+    expect((await decodeSignedEnvelope(oldEnvelope, f.route, f.governance[1]!.cipherRing)).payload).toEqual(canonical)
+    expect(reopened.encryptionEpochStatusAt(1_001n, encodeCanonicalCbor(0n))).toBe('closed')
+  })
+
   it('keeps a received grant pending until every fixed validator durably closes the preceding revision', async () => {
     const f = await fixture()
     const first = f.controller(0)
@@ -96,11 +135,14 @@ describe('live peer governance activation controller', () => {
 async function fixture() {
   const network = new MemoryTransportNetwork()
   const identities = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
+  const recipients = await Promise.all([generateX25519KeyPair(), generateX25519KeyPair()])
   const transports = [network.createNode('admin'), network.createNode('validator')]
   network.connectAll()
   const initialCapabilities: CapabilityGrant[] = identities.flatMap((identity, i) => [
     { subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes, role: 'writer', program: { sql: true, topics: [], signals: [] }, validFromRevision: 0n, transportAuthor: transports[i]!.identity },
     { subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes, role: 'validator', validFromRevision: 0n, transportAuthor: transports[i]!.identity, minimumAuthorTimestampMs: 0n },
+    { subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes, role: 'reader', validFromRevision: 0n,
+      transportAuthor: transports[i]!.identity, hpkePublicKey: recipients[i]!.publicKeyBytes },
   ])
   const manifest: GenesisManifest = {
     groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: identities[0].publicKeyBytes, schemaAdminPublicKey: identities[0].publicKeyBytes,
@@ -117,6 +159,7 @@ async function fixture() {
   const stores = [new MemoryOperationStore(), new MemoryOperationStore()]
   const governance = await Promise.all(transports.map((transport, i) => GovernanceControlPlane.create({
     genesis, groupRoute: route, transport, identity: identities[i]!, operationStore: stores[i]!,
+    recipient: { id: identities[i]!.publicKeyBytes, privateKey: recipients[i]!.privateKey },
   })))
   closeables.push(...governance)
   await Promise.all(governance.map((plane) => plane.start()))

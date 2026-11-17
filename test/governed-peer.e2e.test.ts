@@ -63,8 +63,6 @@ describe('live native governed peer', () => {
     const initialRecords = (await root.transport.history()).length
     await expect(root.runtime.governance.publishCapabilityChange({ revocations: [validatorGrant.id] }, root.identity.privateKey))
       .rejects.toThrow('GOVERNANCE_FIXED_VALIDATORS')
-    await expect(root.runtime.governance.publishCapabilityChange({ successorRootPublicKey: new Uint8Array(32).fill(90) }, root.identity.privateKey))
-      .rejects.toThrow('GOVERNANCE_FIXED_ROOT')
     await expect(root.runtime.governance.publishCapabilityChange({ validationPolicies: [{ version: 2n, minimumValidators: 0n }] }, root.identity.privateKey))
       .rejects.toThrow('GOVERNANCE_FIXED_VALIDATION_POLICY')
     expect((await root.transport.history()).length).toBe(initialRecords)

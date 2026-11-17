@@ -45,9 +45,10 @@ import { readEffectiveEvents, type EventBatch, type EventReadOptions, type Event
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
 import { decodeLedgerRecord, LedgerRecordError, verifyLedgerPayload, type LedgerRecord } from './ledger-record.js'
-import { orderFinalizedGovernanceRecords } from './governance.js'
+import { GovernanceRecordPendingError, orderFinalizedGovernanceRecords } from './governance.js'
 import type { FinalityClosureBoundary, IncludedRecord, LiveFinalityFrontier } from './finality.js'
 import { evaluatePeerLiveFinality } from './peer-finality.js'
+import { GovernanceEvidencePendingError } from './capability-membership.js'
 
 import { Mutex, RevisionBroadcaster } from './async.js'
 import type {
@@ -62,6 +63,8 @@ import { WIRE_ENCRYPTION_EPOCH_UNAVAILABLE, decodeSignedEnvelope, encodeSignedEn
 import { FeedForkRegistry } from './feed-forks.js'
 import { ValidatorRevisionClosures } from './validator-closures.js'
 
+const MAX_AUTHOR_TIMESTAMP_MS = (1n << 63n) - 1n
+
 export class ChronologNode {
   readonly #options: ChronologNodeOptions
   readonly #control: ControlStore
@@ -70,6 +73,8 @@ export class ChronologNode {
   readonly #validatorClosures: ValidatorRevisionClosures
   #evidenceTask: Promise<void> | null = null
   #coordinatedProcessed = 0
+  #coordinatedObserved = 0
+  #provisionalInputsPending = false
   readonly #finalizedControls = new Set<number>()
   readonly #resolvedInclusionRecords = new Set<number>()
   #coordinatedAppliedThrough = 0
@@ -93,6 +98,8 @@ export class ChronologNode {
   readonly #feedForks: FeedForkRegistry
   #retryOverflow = false
   readonly #candidateCores = new Map<string, TransactionCore>()
+  readonly #candidateEpochs = new Map<string, Map<string, Uint8Array | null>>()
+  readonly #maxFutureSkewMs: bigint
   readonly #replayedOutcomes = new Set<string>()
   readonly #abort = new AbortController()
   #revision = 0n
@@ -124,6 +131,9 @@ export class ChronologNode {
 
   constructor(options: ChronologNodeOptions) {
     this.#options = options
+    const maxFutureSkewMs = options.live?.maxFutureSkewMs ?? 30_000
+    if (!Number.isSafeInteger(maxFutureSkewMs) || maxFutureSkewMs < 0) throw new Error('LIVE_MAX_FUTURE_SKEW_INVALID')
+    this.#maxFutureSkewMs = BigInt(maxFutureSkewMs)
     this.#control = options.controlStore ?? new ControlStore()
     const operationStore = options.operationStore ?? new MemoryOperationStore()
     this.#operations = new DurableOperationJournal(operationStore, `transactions/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
@@ -139,7 +149,7 @@ export class ChronologNode {
         throw new Error('NODE_HISTORY_CONFIGURATION_MISMATCH')
       }
       if (options.validator !== undefined) throw new Error('COORDINATED_NODE_CANNOT_ATTEST')
-      if (options.envelopeCipher !== undefined && options.historyPolicy.encryptionEpochStatusAt === undefined) {
+      if (options.envelopeCipher !== undefined && options.encryptionEpochStatusAt === undefined) {
         throw new Error('COORDINATED_ENCRYPTION_POLICY_REQUIRED')
       }
       const futureAdmissionWindowMs = options.historyPolicy.futureAdmissionWindowMs ?? 31_000
@@ -434,6 +444,12 @@ export class ChronologNode {
     return { historyId: applied.view === 'local' ? `${historyId}/local/${revision}` : historyId, revision, items }
   }
 
+  #appliedProposalId(index: number): Uint8Array {
+    const id = this.#options.materialization.queries.proposalIdAt(index)
+    if (id === null) throw new Error('MATERIALIZED_ORDER_MISSING')
+    return id
+  }
+
   /** Permanently stops old-revision admission before publishing its signed promise. */
   async closeGovernanceRevision(previous: Uint8Array, next: Uint8Array): Promise<TransportRecord> {
     if (this.historyPolicy !== 'peer' || this.#options.validator === undefined) throw new Error('NODE_NOT_VALIDATOR')
@@ -452,9 +468,8 @@ export class ChronologNode {
       await this.#mutex.run(async () => {
       for (const candidate of this.#control.listCandidates()) {
         const core = this.#candidateCores.get(this.#idKey(candidate.txId))
-        if (core === undefined || candidate.state !== 'pending_validation' || this.historyPolicy !== 'peer') continue
-        await this.#evaluateAdmission(candidate.txId, core)
-        await this.#maybeAttest(candidate.txId, candidate, core)
+        if (core === undefined || !pendingCandidate(candidate.state)) continue
+        await this.#refreshCandidateSelection(candidate, core)
       }
       this.#materializationPending = true
       await this.#reconcileMaterializer()
@@ -495,7 +510,7 @@ export class ChronologNode {
           nonce: input.nonce?.slice() ?? this.#randomBytes(32),
         }
     const authorTimestampMs = allocated.authorTimestampMs
-    if (authorTimestampMs < 0n || authorTimestampMs > 0x7fff_ffff_ffff_ffffn) {
+    if (authorTimestampMs < 0n || authorTimestampMs > MAX_AUTHOR_TIMESTAMP_MS) {
       throw new Error('AUTHOR_TIMESTAMP_OUT_OF_RANGE')
     }
     if (allocated.nonce.length < 16) throw new Error('TRANSACTION_NONCE_TOO_SHORT')
@@ -662,13 +677,14 @@ export class ChronologNode {
       const position = this.#canonicalPositions.get(this.#idKey(txId))
       const candidate = this.#control.getCandidate(txId)
       if (candidate?.state === 'unauthorized') {
-        return position !== undefined && position <= this.#coordinatedAppliedThrough &&
+        return this.#options.materialization.queries.outcome(txId) === null &&
+          position !== undefined && position <= this.#coordinatedAppliedThrough &&
           (candidate.stateReason === 'FINALITY_TIMESTAMP_FUTURE' ||
             candidate.orderKey.authorTimestampMs <= this.#appliedClosedThroughMs)
       }
     }
-    const index = this.#control.orderedTransactionIds().findIndex((id) => equalBytes(id, txId))
-    return index >= 0 && index < this.finalOrderLength
+    const outcome = this.#options.materialization.queries.outcome(txId)
+    return outcome !== null && outcome.orderIndex >= 0 && outcome.orderIndex < this.finalOrderLength
   }
 
   async finalTarget(): Promise<Uint8Array> {
@@ -679,7 +695,7 @@ export class ChronologNode {
         BigInt(this.#coordinatedAppliedThrough), closure?.includedRoot ?? await orderedGenesisRoot(this.#finalityHistoryId()),
         this.#appliedClosedThroughMs])
     }
-    const ids = this.#control.orderedTransactionIds().slice(0, this.finalOrderLength)
+    const ids = Array.from({ length: this.finalOrderLength }, (_, index) => this.#appliedProposalId(index))
     return encodeCanonicalCbor([2n, this.groupId, this.historyPolicy, BigInt(ids.length), await sha256(encodeCanonicalCbor(ids)),
       null, null,
     ])
@@ -700,7 +716,7 @@ export class ChronologNode {
     if (!Array.isArray(value) || value.length !== 7 || value[0] !== 2n || !(value[1] instanceof Uint8Array) ||
         !equalBytes(value[1], this.groupId) || value[2] !== this.historyPolicy || typeof value[3] !== 'bigint' ||
         value[3] < 0n || value[3] > BigInt(this.finalOrderLength) || !(value[4] instanceof Uint8Array)) return false
-    const ids = this.#control.orderedTransactionIds().slice(0, Number(value[3]))
+    const ids = Array.from({ length: Number(value[3]) }, (_, index) => this.#appliedProposalId(index))
     if (value[5] !== null || value[6] !== null) return false
     return equalBytes(await sha256(encodeCanonicalCbor(ids)), value[4])
   }
@@ -709,7 +725,7 @@ export class ChronologNode {
     return this.ingestFinalityEvidence(encodeOrderingEvidence(evidence))
   }
 
-  /** The injected verifier interprets proof bytes; it cannot supply a sorter. */
+  /** Accept verified evidence; unavailable replay inputs are reported by waitForIdle and status. */
   async ingestFinalityEvidence(bytes: Uint8Array): Promise<void> {
     if (this.#options.historyPolicy?.kind !== 'coordinated') throw new Error('NODE_HISTORY_POLICY_MISMATCH')
     const policy = this.#options.historyPolicy.policy
@@ -722,9 +738,16 @@ export class ChronologNode {
       // applied closed prefix. Pending bodies, keys or publication failures
       // still need reconciliation even when the verified frontier is unchanged.
       if (!this.#materializationPending && snapshot.closedReceiptThrough === this.#coordinatedAppliedThrough &&
-          snapshot.closedThroughMs === this.#appliedClosedThroughMs) return
+          snapshot.closedThroughMs === this.#appliedClosedThroughMs && snapshot.includedThrough === this.#coordinatedObserved) return
       this.#materializationPending = true
-      await this.#reconcileMaterializer()
+      try { await this.#reconcileMaterializer() }
+      catch (error) {
+        if (!(error instanceof MaterializationProgressError)) throw error
+        // The next proof page may contain the missing key or causal control.
+        // Retention succeeded: application availability must not stop ingestion.
+        this.#recordError(error)
+        this.#scheduleMaterializationRetry()
+      }
     })
   }
 
@@ -752,6 +775,7 @@ export class ChronologNode {
     const selected = this.#options.historyPolicy
     if (selected?.kind !== 'coordinated') return
     const snapshot = structuredClone(selected.policy.snapshot())
+    this.#provisionalInputsPending = false
     if (snapshot.closedThroughMs < this.#appliedClosedThroughMs || snapshot.closedReceiptThrough < this.#coordinatedAppliedThrough) {
       throw new Error('FINALITY_PROVIDER_REGRESSION')
     }
@@ -776,7 +800,7 @@ export class ChronologNode {
     const proposals = new Map<string, PreparedCandidate[]>()
     for (const inclusion of snapshot.records) {
       const { entry } = inclusion
-      if (inclusion.closureBoundary === null || this.#resolvedInclusionRecords.has(entry.position)) continue
+      if (this.#resolvedInclusionRecords.has(entry.position)) continue
       let ledger: LedgerRecord
       try { ledger = decodeLedgerRecord(entry.bytes) }
       catch { this.#resolvedInclusionRecords.add(entry.position); continue }
@@ -788,22 +812,37 @@ export class ChronologNode {
         // Unknown body/key/execution inputs block progress. They never become
         // rejection evidence, and an inclusion receipt alone is not finality.
         const detached = await this.#options.transport.getPayload(ledger.payloadHash)
-        if (detached === null) throw new LedgerRecordError('LEDGER_PAYLOAD_UNAVAILABLE', ledger.payloadHash)
+        if (detached === null) {
+          if (inclusion.closureBoundary !== null) throw new LedgerRecordError('LEDGER_PAYLOAD_UNAVAILABLE', ledger.payloadHash)
+          this.#provisionalInputsPending = true
+          continue
+        }
         let payload: Uint8Array
         try { payload = await verifyLedgerPayload(ledger, detached) }
         catch (error) {
           // Metadata is checked only after matching the committed body hash.
           // That contradiction is permanent; a missing or corrupt peer reply
           // remains retryable and cannot make us skip a valid position.
-          if (!(error instanceof LedgerRecordError) || error.code !== 'LEDGER_PAYLOAD_METADATA_MISMATCH') throw error
+          if (!(error instanceof LedgerRecordError) || error.code !== 'LEDGER_PAYLOAD_METADATA_MISMATCH') {
+            if (inclusion.closureBoundary !== null) throw error
+            this.#provisionalInputsPending = true
+            continue
+          }
           this.#resolvedInclusionRecords.add(entry.position)
           continue
         }
-        if (selected.hasEncryptionEpoch?.(ledger.encryptionEpoch, inclusion.closureBoundary.includedThrough) === false) {
-          // A complete finalized control prefix proves this epoch was not
-          // issued. No unverified body may manufacture a proposal identity.
-          this.#resolvedInclusionRecords.add(entry.position)
-          continue
+        if (inclusion.closureBoundary !== null) {
+          const proposedHorizon = inclusion.closureBoundary.closedThroughMs + BigInt(selected.futureAdmissionWindowMs ?? 31_000)
+          const horizon = proposedHorizon > MAX_AUTHOR_TIMESTAMP_MS ? MAX_AUTHOR_TIMESTAMP_MS : proposedHorizon
+          const issued = this.#options.encryptionEpochCanAuthorize?.(inclusion.admissionFloorMs, horizon, ledger.encryptionEpoch)
+          if (issued === null) throw new GovernanceEvidencePendingError()
+          if (issued === false && snapshot.closedThroughMs >= horizon) {
+            // Only closure of the entire permitted author-time window rules
+            // out a future epoch. Receipt order does not determine authority.
+            // Unverified ciphertext cannot manufacture a proposal identity.
+            this.#resolvedInclusionRecords.add(entry.position)
+            continue
+          }
         }
         const record: TransportRecord = {
           id: `included:${entry.historyId}:${entry.position}`, author: '', sequence: 0n,
@@ -817,14 +856,15 @@ export class ChronologNode {
           if (!equalBytes(core.groupId, this.groupId)) invalid('CANDIDATE_WRONG_GROUP')
           if (!equalBytes(core.authorId, wire.signer)) invalid('CANDIDATE_SIGNER_MISMATCH')
           try { assertValidChangeProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
-          const tooFuture = core.authorTimestampMs > inclusion.closureBoundary.closedThroughMs +
+          const tooFuture = inclusion.closureBoundary !== null && core.authorTimestampMs > inclusion.closureBoundary.closedThroughMs +
             BigInt(selected.futureAdmissionWindowMs ?? 31_000)
           const decision = tooFuture ? inclusion.closureBoundary : snapshot.closures.find(closure =>
             entry.position <= closure.includedThrough && core.authorTimestampMs <= closure.closedThroughMs) ?? null
-          if (decision === null && core.authorTimestampMs <= snapshot.closedThroughMs) {
+          if (decision === null && inclusion.closureBoundary !== null && core.authorTimestampMs <= snapshot.closedThroughMs) {
             throw new Error('FINALITY_PROVIDER_CLOSURE_INCOMPLETE')
           }
-          const epochStatus = selected.encryptionEpochStatusAt?.(core.authorTimestampMs, ledger.encryptionEpoch)
+          const epochStatus = this.#options.encryptionEpochStatusAt?.(core.authorTimestampMs, ledger.encryptionEpoch)
+          if (epochStatus === 'pending' && decision !== null) throw new GovernanceEvidencePendingError()
           const rejection = tooFuture ? 'FINALITY_TIMESTAMP_FUTURE'
             : core.authorTimestampMs <= inclusion.admissionFloorMs ? 'FINALITY_TIMESTAMP_CLOSED'
             : epochStatus === 'closed' || epochStatus === 'unissued' ? 'ENCRYPTION_EPOCH_CLOSED' : undefined
@@ -836,6 +876,11 @@ export class ChronologNode {
         } catch (error) {
           // A known invalid record occupies its fixed position without stealing
           // a valid proposal identity. Missing keys/engines/storage still block.
+          if (inclusion.closureBoundary === null && error instanceof Error &&
+              (error.message === WIRE_ENCRYPTION_EPOCH_UNAVAILABLE || error instanceof GovernanceEvidencePendingError)) {
+            this.#provisionalInputsPending = true
+            continue
+          }
           if (!(error instanceof TerminalIngestError)) throw error
         }
       }
@@ -849,9 +894,10 @@ export class ChronologNode {
     for (const [, alternatives] of [...proposals].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
       const decided = alternatives.filter(item => item.decision !== null)
       if (decided.length === 0) {
-        // Membership may still change before this future timestamp closes.
-        const pending = alternatives[0]!
-        await this.#ingestCandidate(pending.record, pending.canonical, pending.signer)
+        // The same original proposal can be available in multiple envelopes.
+        // Every currently authorized wrapping may support the local preview;
+        // none makes admission immutable before author time is closed.
+        for (const pending of alternatives) await this.#ingestCandidate(pending.record, pending.canonical, pending.signer)
         continue
       }
       const firstDecision = decided.reduce((minimum, item) => Math.min(minimum, item.decision!.position), Number.MAX_SAFE_INTEGER)
@@ -865,6 +911,7 @@ export class ChronologNode {
     }
     this.#coordinatedProcessed = snapshot.closedReceiptThrough
     this.#processedClosedThroughMs = snapshot.closedThroughMs
+    this.#coordinatedObserved = snapshot.includedThrough
   }
 
   outcomeChangedByReplay(txId: Uint8Array): boolean {
@@ -960,7 +1007,7 @@ export class ChronologNode {
       closed: this.#closed,
       eventSetRevision: this.#revision,
       candidates: this.#control.listCandidates().length,
-      admitted: this.#control.orderedTransactionIds().length,
+      admitted: this.#control.listCandidates().filter(candidate => candidate.state === 'admissible').length,
       processedTransportRecords: this.#seen.size,
       materializationPending: this.#materializationPending,
       materializedRevision: this.#options.materialization.queries.revision,
@@ -1080,53 +1127,91 @@ export class ChronologNode {
       throw new Error('CANDIDATE_EXECUTION_MANIFEST_UNAVAILABLE')
     }
     try { assertValidChangeProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
-    const writerContext = {
-      groupId: core.groupId,
-      membershipRevision: core.membershipRevision,
-      validationPolicy: core.validationPolicy,
-      writerId: core.authorId,
-      ...(core.writerCapability === undefined ? {} : { writerCapability: core.writerCapability }),
-      authorTimestampMs: core.authorTimestampMs,
-      program: core.program,
-    }
     const candidateDigest = await transactionDigest(canonical)
-    const txId = utf8(`tx_${bytesToHex(candidateDigest)}`)
-    if (canonicalPosition !== undefined && !this.#canonicalPositions.has(this.#idKey(txId))) this.#canonicalPositions.set(this.#idKey(txId), canonicalPosition)
+    const txId = utf8(`tx_${bytesToHex(candidateDigest)}`), key = this.#idKey(txId)
+    if (canonicalPosition !== undefined && !this.#canonicalPositions.has(key)) this.#canonicalPositions.set(key, canonicalPosition)
     const existing = this.#control.getCandidate(txId)
-    this.#candidateCores.set(this.#idKey(txId), core)
-    if (existing !== null && (existing.state !== 'pending_validation' || (this.historyPolicy === 'coordinated' && canonicalPosition === undefined))) return
-    const canWrite = canonicalRejection !== undefined || (this.historyPolicy === 'coordinated' && canonicalPosition === undefined)
-      ? true : await this.#options.membership.canWrite({ ...writerContext,
-        ...(canonicalPosition === undefined ? {} : { finalityClosed: true }) })
-    const rejection = canonicalRejection ?? (canWrite ? foreignProfile ? 'EXECUTION_PROFILE_MISMATCH' : undefined : 'WRITER_UNAUTHORIZED')
-    const authorized = rejection === undefined
-    const state = authorized ? 'pending_validation' as const : 'unauthorized' as const
-    const candidate: StoredCandidate = {
-      txId,
-      groupId: core.groupId,
-      candidateDigest,
-      validationPolicy: core.validationPolicy,
+    this.#candidateCores.set(key, core)
+    const epoch = decodeEnvelope(record.payload).encryptionEpoch
+    const epochs = this.#candidateEpochs.get(key) ?? new Map<string, Uint8Array | null>()
+    epochs.set(epoch === null ? '' : bytesToHex(epoch), epoch?.slice() ?? null)
+    this.#candidateEpochs.set(key, epochs)
+    if (existing !== null && !pendingCandidate(existing.state)) return
+    const candidate: StoredCandidate = existing ?? {
+      txId, groupId: core.groupId, candidateDigest, validationPolicy: core.validationPolicy,
       orderKey: transactionOrderKey(core, { authorFeedSequence: 0n, txId }),
-      canonicalPayload: canonical,
-      state,
-      ...(rejection === undefined ? {} : { stateReason: rejection }),
-      proofAttestationIds: [],
+      canonicalPayload: canonical, state: 'pending_validation', proofAttestationIds: [],
     }
-    const inserted = existing === null ? this.#control.putCandidate(candidate) : { added: false }
-    if (existing !== null && rejection !== undefined) this.#control.setCandidateState(txId, 'unauthorized', { reason: rejection })
-    this.#candidateCores.set(this.#idKey(txId), core)
-    if (inserted.added) this.#emit('candidate', txId)
-    if (authorized && this.historyPolicy === 'coordinated') {
-      if (canonicalPosition !== undefined) {
-        this.#control.setCandidateState(txId, 'admissible')
-        this.#materializationPending = true
-      }
+    if (existing === null) { this.#control.putCandidate(candidate); this.#emit('candidate', txId) }
+    if (canonicalPosition !== undefined) {
+      // Only verified closed inclusion decides admission. A local preview may
+      // have changed since its original signature, so recheck signed-time rights.
+      const rejection = canonicalRejection ?? (foreignProfile ? 'EXECUTION_PROFILE_MISMATCH'
+        : await this.#canWrite(core, true) ? undefined : 'WRITER_UNAUTHORIZED')
+      this.#control.setCandidateState(txId, rejection === undefined ? 'admissible' : 'unauthorized',
+        rejection === undefined ? {} : { reason: rejection })
+    } else {
+      await this.#refreshCandidateSelection(candidate, core)
+    }
+    this.#materializationPending = true
+    this.#scheduleMaterialization()
+  }
+
+  #canWrite(core: TransactionCore, finalityClosed = false): boolean | Promise<boolean> {
+    return this.#options.membership.canWrite({
+      groupId: core.groupId, membershipRevision: core.membershipRevision,
+      validationPolicy: core.validationPolicy, writerId: core.authorId,
+      ...(core.writerCapability === undefined ? {} : { writerCapability: core.writerCapability }),
+      authorTimestampMs: core.authorTimestampMs, program: core.program,
+      ...(finalityClosed ? { finalityClosed: true } : {}),
+    })
+  }
+
+  #hasAuthorizedEnvelope(txId: Uint8Array, core: TransactionCore): boolean {
+    const epochs = this.#candidateEpochs.get(this.#idKey(txId))
+    return epochs !== undefined && [...epochs.values()].some(epoch =>
+      this.#options.encryptionEpochStatusAt === undefined ||
+      this.#options.encryptionEpochStatusAt(core.authorTimestampMs, epoch) === 'active')
+  }
+
+  #closedAuthorTime(): bigint {
+    const last = this.finalOrderLength === 0 ? undefined
+      : this.#candidateCores.get(this.#idKey(this.#appliedProposalId(this.finalOrderLength - 1)))
+    return last !== undefined && last.authorTimestampMs > this.#appliedClosedThroughMs
+      ? last.authorTimestampMs : this.#appliedClosedThroughMs
+  }
+
+  #isAppliedFinal(txId: Uint8Array): boolean {
+    const outcome = this.#options.materialization.queries.outcome(txId)
+    return outcome !== null && outcome.orderIndex >= 0 && outcome.orderIndex < this.finalOrderLength
+  }
+
+  async #refreshCandidateSelection(candidate: StoredCandidate, core: TransactionCore): Promise<void> {
+    if (!pendingCandidate(candidate.state)) return
+    const cutoff = this.historyPolicy === 'coordinated' && this.#processedClosedThroughMs > this.#closedAuthorTime()
+      ? this.#processedClosedThroughMs : this.#closedAuthorTime()
+    if (this.#materializationReady && core.authorTimestampMs <= cutoff && !this.#isAppliedFinal(candidate.txId)) {
+      this.#control.setCandidateState(candidate.txId, 'inadmissible', {
+        reason: this.historyPolicy === 'coordinated' ? 'FINALITY_TIMESTAMP_CLOSED' : 'ADMISSION_CLOSED' })
       return
     }
-    if (authorized) {
-      await this.#evaluateAdmission(txId, core)
-      this.#setConsumerPhase('attesting')
-      await this.#maybeAttest(txId, candidate, core)
+    let reason: string | undefined
+    if (core.authorTimestampMs > BigInt(Math.trunc(this.#clockNow())) + this.#maxFutureSkewMs) reason = 'AUTHOR_TIMESTAMP_FUTURE'
+    else if (!this.#hasAuthorizedEnvelope(candidate.txId, core)) reason = 'ENCRYPTION_EPOCH_PENDING'
+    else {
+      try { if (!await this.#canWrite(core)) reason = 'WRITER_UNAUTHORIZED' }
+      catch (error) {
+        if (!(error instanceof GovernanceEvidencePendingError)) throw error
+        reason = error.code
+      }
+    }
+    this.#control.setCandidateState(candidate.txId, reason === undefined ? 'provisional' : 'pending_validation',
+      reason === undefined ? {} : { reason })
+    if (this.historyPolicy === 'peer' && reason === undefined) {
+      await this.#evaluateAdmission(candidate.txId, core)
+      // A newly eligible preview needs its first local vote. Existing previews
+      // have already attempted it; incoming proofs use the same evaluator.
+      if (candidate.state !== 'provisional') await this.#maybeAttest(candidate.txId, candidate, core)
     }
   }
 
@@ -1141,7 +1226,7 @@ export class ChronologNode {
     // is persisted just before signing. Persisting here for every candidate
     // fsynced once per record during history replay (seconds per restart).
     this.#advanceValidatorCutoff(now)
-    const futureLimit = BigInt(Math.trunc(now)) + BigInt(validator.maxFutureSkewMs ?? 30_000)
+    const futureLimit = BigInt(Math.trunc(now)) + this.#maxFutureSkewMs
     if (core.authorTimestampMs > futureLimit || core.authorTimestampMs <= this.#acceptedAboveMs) return
     const context = {
       groupId: core.groupId,
@@ -1230,7 +1315,11 @@ export class ChronologNode {
 
   async #evaluateAdmission(txId: Uint8Array, core: TransactionCore): Promise<void> {
     const candidate = this.#control.getCandidate(txId)
-    if (!candidate || candidate.state !== 'pending_validation') return
+    if (!candidate || !pendingCandidate(candidate.state)) return
+    if (core.authorTimestampMs <= this.#closedAuthorTime() && !this.#isAppliedFinal(txId) ||
+        !this.#hasAuthorizedEnvelope(txId, core)) return
+    try { if (!await this.#canWrite(core)) return }
+    catch (error) { if (error instanceof GovernanceEvidencePendingError) return; throw error }
     const context = {
       groupId: core.groupId,
       membershipRevision: core.membershipRevision,
@@ -1332,7 +1421,35 @@ export class ChronologNode {
     if (!this.#materializationPending) return
     const previousFinalLength = this.finalOrderLength
     const previousAppliedThrough = this.#coordinatedAppliedThrough
-    await this.#processCoordinatedHistory()
+    let finalityInputsPending: Error | undefined
+    try { await this.#processCoordinatedHistory() }
+    catch (error) {
+      if (!(error instanceof LedgerRecordError) && !(error instanceof GovernanceRecordPendingError) &&
+          !(error instanceof GovernanceEvidencePendingError) &&
+          !(error instanceof Error && error.message === WIRE_ENCRYPTION_EPOCH_UNAVAILABLE)) throw error
+      // Unavailable proof inputs stop final progress. Independent authorized
+      // previews can still replay against the last complete closed frontier.
+      finalityInputsPending = error
+      this.#provisionalInputsPending = true
+    }
+    for (const candidate of this.#control.listCandidates()) {
+      if (!pendingCandidate(candidate.state)) continue
+      const core = this.#candidateCores.get(this.#idKey(candidate.txId))
+      if (core === undefined) {
+        this.#control.setCandidateState(candidate.txId, 'pending_validation', { reason: 'PROPOSAL_INPUTS_PENDING' })
+        continue
+      }
+      await this.#refreshCandidateSelection(candidate, core)
+    }
+    const frontier = await this.#liveFinalityFrontier()
+    let admissionClosed = false
+    for (const id of frontier.excludedProposalIds) {
+      const candidate = this.#control.getCandidate(id)
+      if (candidate !== null && pendingCandidate(candidate.state)) {
+        this.#control.setCandidateState(id, 'inadmissible', { reason: 'ADMISSION_CLOSED' })
+        admissionClosed = true
+      }
+    }
     const ordered: AdmittedTransaction[] = this.#control.orderedCandidates().map((candidate) => {
       const core = this.#candidateCores.get(this.#idKey(candidate.txId))
       if (!core || !candidate.canonicalPayload) throw new Error('ADMITTED_CANDIDATE_PAYLOAD_MISSING')
@@ -1370,17 +1487,9 @@ export class ChronologNode {
     ) {
       throw new Error('MATERIALIZATION_RECONCILIATION_RESULT_MISMATCH')
     }
-    const frontier = await this.#liveFinalityFrontier()
-    let admissionClosed = false
-    for (const id of frontier.excludedProposalIds) {
-      if (this.#control.getCandidate(id)?.state === 'pending_validation') {
-        this.#control.setCandidateState(id, 'inadmissible', { reason: 'ADMISSION_CLOSED' })
-        admissionClosed = true
-      }
-    }
     let finalLength = this.finalOrderLength
     for (let index = finalLength; index < ordered.length; index += 1) {
-      // Selection can include a lower-level provisional preview. Closing its
+      // Selection can include an authorized provisional preview. Closing its
       // timestamp does not turn that preview into an admitted decision.
       if (this.#control.getCandidate(ordered[index]!.txId)?.state !== 'admissible') break
       if (frontier.closedThroughMs === null || ordered[index]!.core.authorTimestampMs > frontier.closedThroughMs) break
@@ -1394,10 +1503,12 @@ export class ChronologNode {
     } else if (finalLength > 0) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
     if (this.historyPolicy === 'coordinated') {
       this.#coordinatedAppliedThrough = this.#coordinatedProcessed
-      this.#appliedClosedThroughMs = this.#processedClosedThroughMs
     }
-    this.#materializationPending = false
-    this.#materializationRetryMs = 100
+    if (frontier.closedThroughMs !== null && frontier.closedThroughMs > this.#appliedClosedThroughMs) {
+      this.#appliedClosedThroughMs = frontier.closedThroughMs
+    }
+    this.#materializationPending = this.#provisionalInputsPending
+    if (!this.#materializationPending) this.#materializationRetryMs = 100
     if (this.#materializationDebounceTimer) {
       clearTimeout(this.#materializationDebounceTimer)
       this.#materializationDebounceTimer = undefined
@@ -1417,6 +1528,8 @@ export class ChronologNode {
     this.#materializationError = undefined
     if (coordinated !== null || admissionClosed || this.finalOrderLength !== previousFinalLength ||
         this.#coordinatedAppliedThrough !== previousAppliedThrough || recovered) this.#emit('materialized')
+    if (this.#materializationPending) this.#scheduleMaterializationRetry()
+    if (finalityInputsPending !== undefined) throw finalityInputsPending
   }
 
   #scheduleMaterialization(): void {
@@ -1851,4 +1964,8 @@ class MaterializationProgressError extends Error {
 
 function invalid(code: string): never {
   throw new TerminalIngestError(code)
+}
+
+function pendingCandidate(state: StoredCandidate['state']): boolean {
+  return state === 'pending_validation' || state === 'provisional'
 }

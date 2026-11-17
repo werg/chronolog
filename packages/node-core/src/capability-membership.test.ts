@@ -67,7 +67,7 @@ function snapshot(
 ): CapabilitySnapshot {
   const all = [...Object.values(capabilities), ...extra]
   const effective: EffectivePolicy = { id: policyId, policy: validationPolicy, installedAtRevision: 1n }
-  return {
+  return { encryptionEpoch: 0n,
     groupId,
     revision: REVISION,
     revisionDigest,

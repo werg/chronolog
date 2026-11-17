@@ -74,8 +74,8 @@ async function fixture(options: { readonly closeBootstrap?: boolean } = {}) {
   const log = await ReferenceRecordLog.open(historyId, new MemoryOperationStore())
   const authority = createPrefixAuthority({ configuration, identity: authorityIdentity, readHead: () => log.head() })
   let now = 1_000, bootstrapped = false
-  const certify = async (peer: { readonly node: ChronologNode }) => {
-    now += 100
+  const certify = async (peer: { readonly node: ChronologNode }, advanceMs = 100) => {
+    now += advanceMs
     await log.append(await createFinalityClosureRecord({ configuration, identity: authorityIdentity,
       includedHead: await log.head(), closedThroughMs: BigInt(now),
       control: await controlCommitmentForClosure(configuration, await log.read(), BigInt(now)) }))
@@ -165,7 +165,13 @@ describe('chronological encryption epoch acceptance fence', () => {
     await peer.node.ingest(await peer.transport.publish(envelope))
     const following = await peer.node.publish({ operationId: 'epoch-after', program: program(emit('chat', 'after')) })
     if (kind === 'future') await peer.governance.rotateEpoch(f.identity.signing.privateKey, key, { operationId: 'later-rotation' })
-    await f.certify(peer)
+    if (kind === 'unknown') {
+      await expect(f.certify(peer)).rejects.toThrow('WIRE_ENCRYPTION_EPOCH_UNAVAILABLE')
+      expect(peer.node.isFinal(following.txId)).toBe(false)
+      // A ciphertext can refer to an epoch that is activated later within its
+      // allowed author-time window. Exclusion needs that entire window closed.
+      await f.certify(peer, 31_001)
+    } else await f.certify(peer)
     if (kind === 'unknown') expect(peer.node.outcome(proposalId)).toBeNull()
     else expect(peer.node.outcome(proposalId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ENCRYPTION_EPOCH_CLOSED' })
     expect(peer.node.outcome(following.txId)?.outcome).toBe('accepted')
@@ -181,25 +187,39 @@ describe('chronological encryption epoch acceptance fence', () => {
     expect((await reopened.node.status()).lastError).toBeUndefined()
   })
 
-  it('does not retroactively issue an excluded descriptor when an epoch appears in a later closure', async () => {
+  it('accepts future author time when its key epoch activates after the original receipt, and rejects the same key for earlier author time', async () => {
     const f = await fixture(), peer = await f.open()
     const first = await peer.node.publish({ operationId: 'before-late-epoch', program: program(emit('chat', 'before')) })
     const key = new Uint8Array(32).fill(191)
-    const core = { ...first.core, operationId: 'epoch-not-in-inclusion-set', nonce: new Uint8Array(32).fill(192),
-      program: program(emit('chat', 'must remain excluded')) }
-    const canonical = encodeTransactionCore(core), proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
-    await peer.transport.publish(await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing,
-      createEpochEnvelopeCipher(key, 1n)))
-    await f.certify(peer)
-    expect(peer.node.outcome(proposalId)).toBeNull()
+    const include = async (operationId: string, authorTimestampMs: bigint) => {
+      const core = { ...first.core, operationId, authorTimestampMs, nonce: new Uint8Array(32).fill(192),
+        program: program(emit('chat', operationId)) }
+      const canonical = encodeTransactionCore(core), proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
+      await peer.transport.publish(await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing,
+        createEpochEnvelopeCipher(key, 1n)))
+      return { proposalId, canonical }
+    }
+    const future = await include('future-epoch-before-control', BigInt(f.now() + 500))
+    const tooEarly = await include('epoch-before-activation', first.core.authorTimestampMs)
+    await expect(f.certify(peer)).rejects.toThrow('WIRE_ENCRYPTION_EPOCH_UNAVAILABLE')
+    expect(peer.node.outcome(future.proposalId)).toBeNull()
     await peer.governance.rotateEpoch(f.identity.signing.privateKey, key, { operationId: 'issue-in-later-closure' })
     await f.certify(peer)
-    expect(peer.node.outcome(proposalId)).toBeNull()
+    expect(peer.node.candidate(future.proposalId)?.state).toBe('provisional')
+    expect(peer.node.outcome(future.proposalId)?.outcome).toBe('accepted')
+    expect(peer.node.isFinal(future.proposalId)).toBe(false)
+    expect(peer.node.outcome(tooEarly.proposalId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ENCRYPTION_EPOCH_CLOSED' })
+    await f.certify(peer, 400)
+    expect(peer.node.isFinal(future.proposalId)).toBe(true)
+    expect(peer.node.candidate(future.proposalId)?.canonicalPayload).toEqual(future.canonical)
     await peer.close()
     const reopened = await f.open()
     await f.certify(reopened)
-    expect(reopened.node.outcome(proposalId)).toBeNull()
-    expect((await reopened.node.events.read()).transactions.map(item => item.proposalId)).toEqual([first.txIdText])
+    expect(reopened.node.outcome(future.proposalId)?.outcome).toBe('accepted')
+    expect(reopened.node.isFinal(future.proposalId)).toBe(true)
+    expect(reopened.node.outcome(tooEarly.proposalId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ENCRYPTION_EPOCH_CLOSED' })
+    expect((await reopened.node.events.read()).transactions.map(item => item.proposalId))
+      .toEqual([first.txIdText, new TextDecoder().decode(future.proposalId)])
   })
 
   it('keeps an issued historical epoch blocked until its missing local key is delivered', async () => {
@@ -215,6 +235,57 @@ describe('chronological encryption epoch acceptance fence', () => {
     await f.certify(peer)
     expect(peer.node.outcome(transaction.txId)?.outcome).toBe('accepted')
     expect(peer.node.isFinal(transaction.txId)).toBe(true)
+    expect((await peer.node.events.read()).transactions.map(item => item.proposalId)).toEqual([transaction.txIdText])
+  })
+
+  it('does not wait for a retired key that cannot authorize any timestamp in a later receipt window', async () => {
+    const f = await fixture(), peer = await f.open()
+    const first = await peer.node.publish({ operationId: 'before-retirement', program: program(emit('chat', 'before')) })
+    await f.certify(peer)
+    const oldCipher = peer.governance.cipherRing.current()
+    await peer.governance.rotateEpoch(f.identity.signing.privateKey, undefined, { operationId: 'retire-first-key' })
+    await f.certify(peer)
+    peer.governance.cipherRing.remove(0n)
+    const canonical = encodeTransactionCore({ ...first.core, operationId: 'old-key-after-retirement',
+      authorTimestampMs: BigInt(f.now()), nonce: new Uint8Array(32).fill(193),
+      program: program(emit('chat', 'must not execute')) })
+    const proposalId = utf8(`tx_${bytesToHex(await transactionDigest(canonical))}`)
+    await peer.transport.publish(await encodeSignedEnvelope(f.groupRoute, 'candidate', canonical, f.identity.signing, oldCipher))
+    const following = await peer.node.publish({ operationId: 'after-retirement', program: program(emit('chat', 'after')) })
+    await expect(f.certify(peer)).rejects.toThrow('WIRE_ENCRYPTION_EPOCH_UNAVAILABLE')
+    await f.certify(peer, 31_001)
+    expect(peer.governance.cipherRing.resolve(encodeCanonicalCbor(0n))).toBeUndefined()
+    expect(peer.node.outcome(proposalId)).toBeNull()
+    expect(peer.node.isFinal(following.txId)).toBe(true)
+    expect((await peer.node.events.read()).transactions.map(item => item.proposalId)).toEqual([first.txIdText, following.txIdText])
+    expect((await peer.node.status()).lastError).toBeUndefined()
+  })
+
+  it('withdraws a future preview on epoch activation and rewraps the same signed intent before author time closes', async () => {
+    const f = await fixture(), peer = await f.open()
+    const input = { operationId: 'preview-across-rotation', authorTimestampMs: BigInt(f.now() + 500),
+      program: program(emit('chat', 'same original intent')) }
+    const transaction = await peer.node.publish(input)
+    await peer.node.waitForIdle()
+    expect(peer.node.candidate(transaction.txId)?.state).toBe('provisional')
+    expect(peer.node.outcome(transaction.txId)?.outcome).toBe('accepted')
+    const original = peer.node.candidate(transaction.txId)!.canonicalPayload
+    await peer.governance.rotateEpoch(f.identity.signing.privateKey, undefined, { operationId: 'rotate-before-author-time' })
+    await f.certify(peer)
+    expect(peer.node.candidate(transaction.txId)?.state).toBe('pending_validation')
+    expect(peer.node.outcome(transaction.txId)).toBeNull()
+    expect(peer.node.isFinal(transaction.txId)).toBe(false)
+    expect(await peer.node.publish(input)).toEqual(transaction)
+    expect(peer.node.candidate(transaction.txId)?.canonicalPayload).toEqual(original)
+
+    await peer.node.ingest(await peer.transport.publish(await encodeSignedEnvelope(f.groupRoute,
+      'candidate', original, f.identity.signing, peer.governance.cipherRing)))
+    await peer.node.waitForIdle()
+    expect(peer.node.candidate(transaction.txId)?.state).toBe('provisional')
+    expect(peer.node.outcome(transaction.txId)?.outcome).toBe('accepted')
+    await f.certify(peer, 600)
+    expect(peer.node.isFinal(transaction.txId)).toBe(true)
+    expect(peer.node.candidate(transaction.txId)?.canonicalPayload).toEqual(original)
     expect((await peer.node.events.read()).transactions.map(item => item.proposalId)).toEqual([transaction.txIdText])
   })
 

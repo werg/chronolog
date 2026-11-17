@@ -16,9 +16,9 @@ it('attests the exact future boundary without rounding when clock plus allowed s
     signer: webFeedSigner(feedIdFromPublicKey(identity.publicKeyBytes), identity.privateKey) })
   const now = 1_002, skew = Number.MAX_SAFE_INTEGER
   const node = new ChronologNode({ identity, groupId, membershipRevision, validationPolicy, operationStore: store,
-    materialization, transport, clock: { now: () => now },
+    materialization, transport, clock: { now: () => now }, live: { maxFutureSkewMs: skew },
     membership: { canWrite: () => true, canValidate: () => true, threshold: () => 1 },
-    validator: { capabilityId: new Uint8Array(32).fill(4), cutoffLagMs: 0, maxFutureSkewMs: skew },
+    validator: { capabilityId: new Uint8Array(32).fill(4), cutoffLagMs: 0 },
   })
   try {
     await node.start()

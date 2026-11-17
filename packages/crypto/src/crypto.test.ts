@@ -77,7 +77,7 @@ describe('RFC 9180 base-mode adapter', () => {
 describe('signed encryption epochs', () => {
   it('signs an epoch with no recipients after the final reader is removed', async () => {
     const signer = await generateEd25519KeyPair(), removed = await generateX25519KeyPair()
-    const created = await createEpochManifest({ groupId: bytes(1), epoch: 5n, previousEpochDigest: bytes(2),
+    const created = await createEpochManifest({ groupId: bytes(1), epoch: 5n, membershipRevision: bytes(2),
       createdAtMs: 100n, recipients: [], signerPublicKey: signer.publicKeyBytes, signerPrivateKey: signer.privateKey })
     const signedManifest = decodeSignedEpochManifest(encodeSignedEpochManifest(created.signedManifest))
     expect(signedManifest.manifest.wraps).toEqual([])
@@ -110,7 +110,7 @@ describe('signed encryption epochs', () => {
     const contentKey = Buffer.from(bytes(9))
     const expected = Uint8Array.from(contentKey)
     const created = await createEpochManifest({
-      groupId: bytes(1), epoch: 1n, previousEpochDigest: null, createdAtMs: 100n,
+      groupId: bytes(1), epoch: 1n, membershipRevision: bytes(2), createdAtMs: 100n,
       recipients: [{ recipientId: bytes(20), publicKey: recipient.publicKeyBytes }],
       signerPublicKey: signer.publicKeyBytes, signerPrivateKey: signer.privateKey, contentKey,
     })
@@ -125,7 +125,7 @@ describe('signed encryption epochs', () => {
     const first = await generateX25519KeyPair()
     const second = await generateX25519KeyPair()
     const created = await createEpochManifest({
-      groupId: bytes(1), epoch: 4n, previousEpochDigest: bytes(2), createdAtMs: 100n,
+      groupId: bytes(1), epoch: 4n, membershipRevision: bytes(2), createdAtMs: 100n,
       recipients: [
         { recipientId: bytes(20), publicKey: first.publicKeyBytes },
         { recipientId: bytes(21), publicKey: second.publicKeyBytes },

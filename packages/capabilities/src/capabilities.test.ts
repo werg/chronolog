@@ -64,23 +64,21 @@ describe('capability chain', () => {
       .rejects.toThrow('Unknown capability role')
   })
 
-  it('reduces grants, prospective revocation and root succession deterministically', async () => {
+  it('reduces grants, prospective revocation and epoch changes deterministically', async () => {
     const f = await fixture()
     expect(decodeSignedGenesis(encodeSignedGenesis(f.signedGenesis))).toEqual(f.signedGenesis)
     const initial = await reduceCapabilityLog(f.signedGenesis, [])
     expect(hasRole(initial, bytes(20), 'writer')).toBe(true)
     const writerId = await capabilityId(f.writer)
-    const nextRoot = await generateEd25519KeyPair()
-    const revision = await signCapabilityRevision({
+    const revision = await signCapabilityRevision({ encryptionEpoch: 0n,
       groupId: bytes(1), revision: 1n, previousRevisionDigest: initial.revisionDigest,
       issuerRootPublicKey: f.root.publicKeyBytes,
       grants: [validator(22, 1n, 1_000n, 'B')], revocations: [writerId], validationPolicies: [],
-      successorRootPublicKey: nextRoot.publicKeyBytes, successorCapabilityLogFeed: bytes(8),
     }, f.root.privateKey)
     const roundTrippedRevision = decodeSignedCapabilityRevision(encodeSignedCapabilityRevision(revision))
     const state = await reduceCapabilityLog(f.signedGenesis, [roundTrippedRevision])
     expect(state.revision).toBe(1n)
-    expect(state.rootAdminPublicKey).toEqual(nextRoot.publicKeyBytes)
+    expect(state.rootAdminPublicKey).toEqual(f.root.publicKeyBytes)
     expect(hasRole(state, bytes(20), 'writer', 0n)).toBe(true)
     expect(hasRole(state, bytes(20), 'writer', 1n)).toBe(false)
   })
@@ -88,7 +86,7 @@ describe('capability chain', () => {
   it('rejects a new validator whose floor reopens timestamp history', async () => {
     const f = await fixture()
     const initial = await reduceCapabilityLog(f.signedGenesis, [])
-    const revision = await signCapabilityRevision({
+    const revision = await signCapabilityRevision({ encryptionEpoch: 0n,
       groupId: bytes(1), revision: 1n, previousRevisionDigest: initial.revisionDigest,
       issuerRootPublicKey: f.root.publicKeyBytes,
       grants: [validator(22, 1n, 999n, 'B')], revocations: [], validationPolicies: [],

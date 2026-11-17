@@ -45,7 +45,7 @@ async function fixture() {
 describe('limited original-signer publishers', () => {
   it('issues only requested publication rights, with no history or reader keys, and preserves approval retries', async () => {
     const f = await fixture()
-    expect(f.governance.knownEpochs).toEqual([])
+    expect(f.governance.hasEpochKey(0n)).toBe(false)
     expect(Object.keys(f.publisherIdentity).sort()).toEqual(['privateKey', 'publicKey', 'publicKeyBytes'])
     expect(f.approval.revision.revision.grants).toHaveLength(1)
     expect(f.approval.revision.revision.grants[0]).toMatchObject({ role: 'writer', program: { sql: false, forwarded: true, topics: ['chat/message'], signals: ['chat/typing'] } })
@@ -60,7 +60,7 @@ describe('limited original-signer publishers', () => {
 
   it('forwards the exact original signature and returns the original proposal after revocation and reopening', async () => {
     const f = await fixture()
-    await f.governance.rotateEpoch(f.identity.signing.privateKey, bytes(3))
+    await f.governance.initializeEpochKey(f.identity.signing.privateKey, bytes(3))
     const membership = new CapabilityMembershipResolver({ snapshotForRevision: (digest) => f.governance.snapshotForRevision(digest), authorizationSnapshot: () => f.governance.snapshot })
     const node = new ChronologNode({ groupId: f.descriptor.history.groupId, groupRoute: f.descriptor.groupRoute, identity: f.identity.signing,
       membershipRevision: f.governance.snapshot.revisionDigest, validationPolicy: f.approval.validationPolicy,

@@ -150,19 +150,21 @@ describe('live chronological finality', () => {
     expect((await f.node.events.read()).transactions.map(item => item.proposalId)).toEqual([new TextDecoder().decode(b.txId)])
   })
 
-  it('never finalizes a selected preview merely because its admission becomes impossible', async () => {
+  it('withdraws an excluded preview before finalizing later admitted work', async () => {
     const f = await fixture(), preview = await f.candidate('preview', 50n), admitted = await f.candidate('admitted', 100n)
-    // An embedding can supply a selected provisional control state even though
-    // this node does not author previews. Its final publication stays fail closed.
-    f.control.setCandidateState(preview.txId, 'provisional')
+    await f.node.waitForIdle()
+    expect(f.node.candidate(preview.txId)?.state).toBe('provisional')
+    expect(f.node.outcome(preview.txId)?.outcome).toBe('accepted')
+    expect(f.node.isFinal(preview.txId)).toBe(false)
     await f.vote(0, admitted); await f.vote(1, admitted)
     await f.heartbeat(0); await f.heartbeat(1); await f.heartbeat(2); await f.node.waitForIdle()
-    expect(await f.node.liveFinality()).toMatchObject({ closedThroughMs: 100n, excludedProposalIds: [preview.txId] })
-    expect(f.node.orderLength).toBe(2)
-    expect(f.node.outcome(preview.txId)?.outcome).toBe('accepted')
-    expect(f.node.finalOrderLength).toBe(0)
-    expect(f.finalPublications).toEqual([])
-    expect((await f.node.events.read()).transactions).toEqual([])
+    expect(await f.node.liveFinality()).toMatchObject({ closedThroughMs: 100n })
+    expect(f.node.orderLength).toBe(1)
+    expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
+    expect(f.node.isFinal(preview.txId)).toBe(true)
+    expect(f.node.finalOrderLength).toBe(1)
+    expect(f.finalPublications.at(-1)).toEqual({ length: 1, excluded: [bytesToHex(preview.txId)] })
+    expect((await f.node.events.read()).transactions.map(item => item.proposalId)).toEqual([new TextDecoder().decode(admitted.txId)])
   })
 
   it('waits for indexed admissions even when the transport already has a contiguous heartbeat prefix', async () => {
@@ -171,7 +173,7 @@ describe('live chronological finality', () => {
     f.retain(delayed)
     await f.vote(0, b); await f.vote(1, b); await f.heartbeat(0); await f.heartbeat(1); await f.node.waitForIdle()
     expect(f.node.finalOrderLength).toBe(0)
-    expect(f.node.candidate(a.txId)?.state).toBe('pending_validation')
+    expect(f.node.candidate(a.txId)?.state).toBe('provisional')
     expect((await f.node.settlementEvidence(b.txId))?.belowWatermark).toBe(false)
     await f.ingest(delayed); await f.node.waitForIdle()
     expect(f.node.finalOrderLength).toBe(0)

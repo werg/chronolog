@@ -15,7 +15,7 @@ describe('public live signal client', () => {
       { id: readerId, grantedAtRevision: 0n, grant: { role: 'reader', subjectId: reader.publicKeyBytes, signingPublicKey: reader.publicKeyBytes,
         validFromRevision: 0n, hpkePublicKey: new Uint8Array(32) } },
     ]
-    const snapshot: CapabilitySnapshot = { groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
+    const snapshot: CapabilitySnapshot = { encryptionEpoch: 0n, groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
       capabilityLogFeed: new Uint8Array(32), capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), validatorFloorMs: 0n }
     const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, send: async () => {} })
     const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, send: async frame => { await receiver.receive(frame) } })

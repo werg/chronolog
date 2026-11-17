@@ -96,8 +96,8 @@ export interface CapabilityRevision {
   readonly grants: readonly CapabilityGrant[]
   readonly revocations: readonly Uint8Array[]
   readonly validationPolicies: readonly ValidationPolicy[]
-  readonly successorRootPublicKey?: Uint8Array
-  readonly successorCapabilityLogFeed?: Uint8Array
+  /** Retain the current epoch or advance it by one in this same authority transition. */
+  readonly encryptionEpoch: bigint
 }
 
 export interface SignedCapabilityRevision {
@@ -126,6 +126,8 @@ export interface CapabilitySnapshot {
   readonly capabilityLogFeed: Uint8Array
   readonly capabilities: ReadonlyMap<string, EffectiveCapability>
   readonly policies: ReadonlyMap<string, EffectivePolicy>
+  /** Genesis authorizes epoch zero; later epochs activate with their containing revision. */
+  readonly encryptionEpoch: bigint
   /**
    * Highest minimum author timestamp ever granted to a validator. It only rises:
    * revoking validators never lowers it, so closed history cannot be

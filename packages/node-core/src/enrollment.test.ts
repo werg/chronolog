@@ -132,8 +132,8 @@ describe('live durable group enrollment', () => {
   })
 
   it('approves a fresh peer live and obtains all historical keys through another peer while the issuer is disconnected', async () => {
-    const fixture = await setup()
-    await fixture.governance.rotateEpoch(fixture.identity.signing.privateKey, bytes(80))
+    const fixture = await setup([0n, 1n])
+    await fixture.governance.initializeEpochKey(fixture.identity.signing.privateKey, bytes(80))
     await fixture.governance.rotateEpoch(fixture.identity.signing.privateKey, bytes(81))
     const relay = fixture.network.createNode('relay')
     fixture.network.connect(fixture.transport, relay)
@@ -153,7 +153,8 @@ describe('live durable group enrollment', () => {
     })
     controllers.push(participant)
     await participant.start()
-    expect(participant.snapshot.revision).toBe(1n)
+    // Epoch rotation is revision 1; the reader/writer approval is revision 2.
+    expect(participant.snapshot.revision).toBe(2n)
     expect(participant.cipherRing.epochs()).toEqual([0n, 1n])
     const base = { descriptor: fixture.descriptor, request, approval,
       activeMembership: participant.snapshot, connected: true,
@@ -166,6 +167,36 @@ describe('live durable group enrollment', () => {
     expect((await enrollmentProgress({ ...base, isFinalTargetApplied: () => true })).state).toBe('ready')
     const granted = approval.approval.capabilityIds.map((id) => participant.snapshot.capabilities.get(Buffer.from(id).toString('hex'))!.grant.role)
     expect(granted).toEqual(['reader', 'writer'])
+  })
+
+  it('requires the active epoch key without extending the original captured enrollment target', async () => {
+    const fixture = await setup([0n]), store = new MemoryOperationStore()
+    const identity = await loadOrCreateEnrollmentIdentity(store, 'rotating-reader')
+    const request = await prepareEnrollmentRequest({ descriptor: fixture.descriptor, store, requestId: 'join',
+      identity: identity.signing, readerPublicKey: identity.reader.publicKeyBytes,
+      transportAuthor: 'rotating-reader', requestedRoles: ['reader'] })
+    const approval = await fixture.issuer.approve(request, {
+      operationId: 'approve', roles: ['reader'], grantFullHistory: true,
+    })
+    const captured = structuredClone(approval.approval.target)
+    const beforeRotation = fixture.governance.snapshot
+    const options = { descriptor: fixture.descriptor, request, approval, activeMembership: beforeRotation,
+      connected: true, availableEpochs: [0n], executionManifestDigest: captured.executionManifestDigest,
+      isFinalTargetApplied: () => true }
+    expect((await enrollmentProgress(options)).state).toBe('ready')
+    expect(await enrollmentProgress({ ...options, availableEpochs: [] }))
+      .toMatchObject({ state: 'awaiting-keys', missingEpochs: [0n] })
+
+    await fixture.governance.rotateEpoch(fixture.identity.signing.privateKey, bytes(82))
+    const activeMembership = fixture.governance.snapshot
+    expect(activeMembership.encryptionEpoch).toBe(1n)
+    expect(await enrollmentProgress({ ...options, activeMembership }))
+      .toMatchObject({ state: 'awaiting-keys', missingEpochs: [1n] })
+    expect((await enrollmentProgress({ ...options, activeMembership, availableEpochs: [0n, 1n] })).state).toBe('ready')
+    // Receiving a future key cannot change the policy of a still-active epoch 0.
+    expect((await enrollmentProgress({ ...options, availableEpochs: [0n, 1n] })).state).toBe('ready')
+    expect(approval.approval.target).toEqual(captured)
+    expect(captured.requiredEpochs).toEqual([0n])
   })
 
   it('resumes interrupted approval without creating another grant and preserves the original decision', async () => {
@@ -247,7 +278,7 @@ describe('live durable group enrollment', () => {
   )
 })
 
-async function setup() {
+async function setup(requiredEpochs: readonly bigint[] = []) {
   const operationStore = new MemoryOperationStore()
   const identity = await loadOrCreateEnrollmentIdentity(operationStore, 'issuer')
   const network = new MemoryTransportNetwork()
@@ -274,7 +305,7 @@ async function setup() {
     identity: identity.signing, operationStore, recipient: { id: identity.signing.publicKeyBytes, privateKey: identity.reader.privateKey } })
   controllers.push(governance)
   await governance.start()
-  const target: EnrollmentFinalTarget = { frontier: bytes(4), requiredEpochs: [], executionManifestDigest: manifest.schemaId }
+  const target: EnrollmentFinalTarget = { frontier: bytes(4), requiredEpochs, executionManifestDigest: manifest.schemaId }
   const issuerOptions = { descriptor, governance, store: operationStore, rootPrivateKey: identity.signing.privateKey, captureFinalTarget: async () => target }
   const issuer = new EnrollmentIssuer(issuerOptions)
   return { descriptor, network, transport, governance, identity, issuer, issuerOptions, target }

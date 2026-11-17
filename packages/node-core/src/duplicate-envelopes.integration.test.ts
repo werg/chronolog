@@ -46,11 +46,12 @@ async function fixture(futureAdmissionWindowMs = 31_000) {
       materialization: await createEventMaterializationRuntime({ store, namespace: 'duplicate-envelopes' }),
       membership: { canWrite: () => true, canValidate: () => false, threshold: () => 1 },
       historyPolicy: { kind: 'coordinated', policy: await SignedInclusionFinalityProvider.open(configuration, store), futureAdmissionWindowMs,
-        // The fixture isolates envelope selection after the two keys have been
-        // issued; governance activation itself is covered by the epoch suite.
-        hasEncryptionEpoch: epoch => epoch !== null && [0n, 1n].some(value => equalBytes(epoch, encodeCanonicalCbor(value))),
-        encryptionEpochStatusAt: (timestamp, epoch) => epoch !== null &&
-          equalBytes(epoch, encodeCanonicalCbor(timestamp > 100n ? 1n : 0n)) ? 'active' : 'closed' },
+      },
+      // The fixture isolates envelope selection after the two keys have been
+      // issued; governance activation itself is covered by the epoch suite.
+      encryptionEpochCanAuthorize: (_afterMs, _throughMs, epoch) => epoch !== null && [0n, 1n].some(value => equalBytes(epoch, encodeCanonicalCbor(value))),
+      encryptionEpochStatusAt: (timestamp, epoch) => epoch !== null &&
+        equalBytes(epoch, encodeCanonicalCbor(timestamp > 100n ? 1n : 0n)) ? 'active' : 'closed',
     })
     cleanup.push(() => node.close())
     await node.start()
@@ -116,7 +117,8 @@ describe('deterministic admission of multiple envelopes for one signed proposal'
     const proposal = await f.proposal(250n)
     await f.include(reversed ? proposal.valid : proposal.stale)
     await f.deliver(live, await f.closeThrough(200n))
-    expect(live.node.outcome(proposal.txId)).toBeNull()
+    if (reversed) expect(live.node.outcome(proposal.txId)?.outcome).toBe('accepted')
+    else expect(live.node.outcome(proposal.txId)).toBeNull()
     expect(live.node.isFinal(proposal.txId)).toBe(false)
     await f.include(reversed ? proposal.stale : proposal.valid)
     const certificate = await f.closeThrough(300n)

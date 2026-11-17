@@ -23,7 +23,7 @@ async function replicas(writer = true) {
   const identities = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
   const grants = [capability(identities[0], 'reader', 1), capability(identities[1], 'reader', 2)]
   if (writer) grants.push(capability(identities[0], 'writer', 3))
-  const original: CapabilitySnapshot = { groupId: bytes(5), revision: 0n, revisionDigest: bytes(6), rootAdminPublicKey: identities[0].publicKeyBytes,
+  const original: CapabilitySnapshot = { encryptionEpoch: 0n, groupId: bytes(5), revision: 0n, revisionDigest: bytes(6), rootAdminPublicKey: identities[0].publicKeyBytes,
     capabilityLogFeed: bytes(7), capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), validatorFloorMs: 0n }
   const snapshots = [original, original]
   const transports: PortableFeedTransport[] = [], services: GovernedPeerService[] = []

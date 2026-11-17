@@ -118,7 +118,6 @@ export interface ValidatorOptions {
   readonly capabilityId: Uint8Array
   readonly policyVersion?: bigint
   readonly cutoffLagMs?: number
-  readonly maxFutureSkewMs?: number
   readonly heartbeatIntervalMs?: number
   readonly initialAcceptedAboveMs?: bigint
 }
@@ -141,6 +140,12 @@ export interface ClosedAdmissionRevision {
 }
 
 export interface ChronologNodeOptions {
+  /** Live preview bounds apply to every replica, including non-validating readers. */
+  readonly live?: { readonly maxFutureSkewMs?: number }
+  /** Envelope authorization at signed author time, independent of its proof mechanism. */
+  readonly encryptionEpochStatusAt?: (authorTimestampMs: bigint, epochId: Uint8Array | null) => 'active' | 'closed' | 'unissued' | 'pending'
+  /** Could this epoch authorize a timestamp in (afterMs, throughMs]? Null awaits governance. */
+  readonly encryptionEpochCanAuthorize?: (afterMs: bigint, throughMs: bigint, epochId: Uint8Array | null) => boolean | null
   readonly peerGovernance?: {
     closedAdmissionRevisions(): readonly ClosedAdmissionRevision[]
     allowsAttestation(revision: Uint8Array, validatorId: Uint8Array, sequence: bigint): Promise<boolean>
@@ -153,10 +158,6 @@ export interface ChronologNodeOptions {
     readonly futureAdmissionWindowMs?: number
     /** Apply inline membership at a proved closed timestamp boundary. */
     readonly applyGovernanceRecord?: (entry: OrderedRecordEntry, cutoffMs: bigint) => Promise<void>
-    /** Issuance is independent of whether this reader has obtained the key. */
-    readonly hasEncryptionEpoch?: (epochId: Uint8Array | null, includedThrough: number) => boolean
-    /** Authorization uses the signed author timestamp, never a provider position. */
-    readonly encryptionEpochStatusAt?: (authorTimestampMs: bigint, epochId: Uint8Array | null) => 'active' | 'closed' | 'unissued'
   }
   readonly groupId: Uint8Array
   readonly groupRoute?: Uint8Array

@@ -1,11 +1,28 @@
 import type { CapabilitySnapshot, EffectiveCapability } from '@chronolog/capabilities'
-import { bytesToHex, generateEd25519KeyPair } from '@chronolog/protocol'
+import { bytesToHex, encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
 import { GovernanceActivationIndex } from './governance-activation.js'
 import { signGovernanceClosure, verifyPeerGovernanceActivation, type VerifiedGovernanceClosureEvidence } from './peer-governance-proof.js'
 
 describe('governance activation', () => {
+  it('bounds epoch eligibility by actual author-time intervals, including collapsed intermediate epochs', async () => {
+    const { genesis, next } = await fixture()
+    const index = new GovernanceActivationIndex(genesis)
+    index.activateFinalized({ ...next, encryptionEpoch: 1n }, 100n)
+    expect(index.encryptionEpochCanAuthorize(-1n, 100n, encodeCanonicalCbor(1n))).toBe(false)
+    expect(index.encryptionEpochCanAuthorize(-1n, 101n, encodeCanonicalCbor(1n))).toBe(true)
+    index.activateFinalized({ ...next, revision: 2n, revisionDigest: bytes(21), encryptionEpoch: 2n }, 100n)
+    expect(index.encryptionEpochCanAuthorize(-1n, 200n, encodeCanonicalCbor(1n))).toBe(false)
+    expect(index.encryptionEpochCanAuthorize(-1n, 100n, encodeCanonicalCbor(0n))).toBe(true)
+    expect(index.encryptionEpochCanAuthorize(-1n, 101n, encodeCanonicalCbor(2n))).toBe(true)
+    expect(index.encryptionEpochCanAuthorize(100n, 200n, encodeCanonicalCbor(0n))).toBe(false)
+    expect(index.encryptionEpochCanAuthorize(99n, 200n, encodeCanonicalCbor(0n))).toBe(true)
+    expect(index.encryptionEpochCanAuthorize(100n, 100n, encodeCanonicalCbor(2n))).toBe(false)
+    expect(index.encryptionEpochStatusAt(100n, encodeCanonicalCbor(0n))).toBe('active')
+    expect(index.encryptionEpochStatusAt(101n, encodeCanonicalCbor(2n))).toBe('active')
+  })
+
   it('selects membership strictly after a finalized author-time boundary', async () => {
     const { genesis, next, context } = await fixture()
     const index = new GovernanceActivationIndex(genesis)
@@ -72,7 +89,7 @@ async function fixture() {
     grant: { role: 'validator', subjectId: key.publicKeyBytes, signingPublicKey: key.publicKeyBytes,
       validFromRevision: 0n, minimumAuthorTimestampMs: 0n, transportAuthor: `validator-${i}` },
   }))
-  const genesis: CapabilitySnapshot = {
+  const genesis: CapabilitySnapshot = { encryptionEpoch: 0n,
     groupId: bytes(1), revision: 0n, revisionDigest: bytes(2), rootAdminPublicKey: bytes(3),
     capabilityLogFeed: bytes(4), capabilities: new Map(effective.map((item) => [bytesToHex(item.id), item])),
     policies: new Map(), validatorFloorMs: 0n,

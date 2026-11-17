@@ -81,6 +81,7 @@ async function genesisSnapshot(genesis: SignedGenesis): Promise<CapabilitySnapsh
     capabilityLogFeed: manifest.capabilityLogFeed,
     capabilities,
     policies,
+    encryptionEpoch: 0n,
     validatorFloorMs: raiseValidatorFloor(0n, manifest.initialCapabilities),
   }
 }
@@ -113,6 +114,11 @@ export async function applyCapabilityRevision(
     protocolInvariant(equalBytes(revision.previousRevisionDigest, snapshot.revisionDigest), 'DIGEST_MISMATCH', 'Capability revision does not extend current chain')
     protocolInvariant(equalBytes(revision.issuerRootPublicKey, snapshot.rootAdminPublicKey), 'INVALID_KEY', 'Capability revision has the wrong root issuer')
     protocolInvariant(await verifyDomain(DOMAINS.capabilityRevision, encodeCapabilityRevision(revision), signed.signature, snapshot.rootAdminPublicKey), 'INVALID_SIGNATURE', 'Capability revision signature is invalid')
+    protocolInvariant(revision.encryptionEpoch === snapshot.encryptionEpoch || revision.encryptionEpoch === snapshot.encryptionEpoch + 1n,
+      'SCHEMA_INVALID', 'Encryption epoch must retain or advance the current epoch by one')
+    protocolInvariant(!revision.revocations.some(id => snapshot.capabilities.get(bytesToHex(id))?.grant.role === 'reader') ||
+      revision.encryptionEpoch === snapshot.encryptionEpoch + 1n,
+    'SCHEMA_INVALID', 'Reader revocation must retire its encryption epoch in the same revision')
 
     const capabilities = new Map(snapshot.capabilities)
     for (const revokedId of revision.revocations) {
@@ -142,8 +148,7 @@ export async function applyCapabilityRevision(
       ...snapshot,
       revision: revision.revision,
       revisionDigest,
-      rootAdminPublicKey: revision.successorRootPublicKey ?? snapshot.rootAdminPublicKey,
-      capabilityLogFeed: revision.successorCapabilityLogFeed ?? snapshot.capabilityLogFeed,
+      encryptionEpoch: revision.encryptionEpoch,
       capabilities,
       policies,
       validatorFloorMs: raiseValidatorFloor(snapshot.validatorFloorMs, revision.grants),
@@ -183,6 +188,7 @@ export async function capabilitySnapshotDigest(snapshot: CapabilitySnapshot): Pr
     [5, entries.map((entry) => (awaitImportHackGrant(entry)))],
     [6, policies.map((entry) => (awaitImportHackPolicy(entry)))],
     [7, snapshot.validatorFloorMs],
+    [8, snapshot.encryptionEpoch],
   ])
   return hashDomain(DOMAINS.capabilitySnapshot, encodeCanonicalCbor(value))
 }

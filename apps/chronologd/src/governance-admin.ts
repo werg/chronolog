@@ -87,7 +87,7 @@ export function createGovernanceRpcAdmin(options: {
 
     async rotateEpoch(request) {
       const signed = await operation(() => options.governance.rotateEpoch(options.rootPrivateKey, undefined, { operationId: request.requestId }))
-      return { epoch: signed.manifest.epoch.toString(10) }
+      return { epoch: signed.revision.encryptionEpoch.toString(10) }
     },
 
     async grantHistoricalAccess(request) {

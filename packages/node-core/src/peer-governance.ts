@@ -69,6 +69,14 @@ export class PeerGovernanceController {
     return this.#initialized ? this.#activation.finalityRevisions : null
   }
 
+  encryptionEpochStatusAt(authorTimestampMs: bigint, epochId: Uint8Array | null): 'active' | 'closed' | 'unissued' | 'pending' {
+    return this.#initialized ? this.#activation.encryptionEpochStatusAt(authorTimestampMs, epochId) : 'pending'
+  }
+
+  encryptionEpochCanAuthorize(afterMs: bigint, throughMs: bigint, epochId: Uint8Array | null): boolean | null {
+    return this.#initialized ? this.#activation.encryptionEpochCanAuthorize(afterMs, throughMs, epochId) : null
+  }
+
   snapshotFor(context: WriterAuthorizationContext): CapabilitySnapshot | null {
     return this.#initialized ? this.#activation.snapshotFor(context) : null
   }

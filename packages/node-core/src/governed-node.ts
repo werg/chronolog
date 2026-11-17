@@ -4,7 +4,7 @@ import {
 } from '@chronolog/capabilities'
 import type { ControlStore } from '@chronolog/control-store/browser'
 import type { ChronologMaterializationRuntime } from '@chronolog/materializer'
-import { DOMAINS, equalBytes, hashDomain, type Ed25519KeyPair } from '@chronolog/protocol'
+import { DOMAINS, encodeCanonicalCbor, equalBytes, hashDomain, type Ed25519KeyPair } from '@chronolog/protocol'
 import type { ChronologTransport } from '@chronolog/records'
 
 import { Mutex } from './async.js'
@@ -116,7 +116,8 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     closeRevision: (previous, next) => node.closeGovernanceRevision(previous, next),
     onActivation: () => { void node.refreshMembership() },
   }) : undefined
-  const activeSnapshot = (): CapabilitySnapshot => peer?.activeSnapshot ?? activation.activeSnapshot
+  const authority = peer ?? activation
+  const activeSnapshot = (): CapabilitySnapshot => authority.activeSnapshot
   const membershipState = (): OperationalMembershipState => {
     const snapshot = activeSnapshot()
     const capabilities = [...snapshot.capabilities.values()].filter((capability) =>
@@ -146,7 +147,16 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     groupId: genesis.manifest.groupId, groupRoute: options.groupRoute,
     membershipRevision: initial.revisionDigest, validationPolicy, identity: options.identity,
     transport: options.transport, materialization: options.materialization, membership, membershipState,
-    operationStore: options.operationStore, envelopeCipher: governance.cipherRing,
+    operationStore: options.operationStore,
+    envelopeCipher: {
+      current: () => {
+        const cipher = governance.cipherRing.resolve(encodeCanonicalCbor(activeSnapshot().encryptionEpoch))
+        if (cipher === undefined) throw new Error('EPOCH_CIPHER_CURRENT_UNAVAILABLE')
+        return cipher
+      },
+      resolve: epochId => governance.cipherRing.resolve(epochId),
+    },
+    live: { maxFutureSkewMs: clock.maxFutureSkewMs },
     ...(options.controlStore === undefined ? {} : { controlStore: options.controlStore }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     ...(options.random === undefined ? {} : { random: options.random }),
@@ -154,14 +164,14 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     ...(peer === undefined ? {} : { peerGovernance: peer }),
     ...(peer === undefined || validatorCapability === undefined ? {} : {
       validator: { ...options.validator, capabilityId: validatorCapability,
-        cutoffLagMs: clock.cutoffLagMs, maxFutureSkewMs: clock.maxFutureSkewMs,
+        cutoffLagMs: clock.cutoffLagMs,
         heartbeatIntervalMs: clock.heartbeatIntervalMs },
     }),
+    encryptionEpochStatusAt: (timestamp, epochId) => authority.encryptionEpochStatusAt(timestamp, epochId),
+    encryptionEpochCanAuthorize: (afterMs, throughMs, epochId) => authority.encryptionEpochCanAuthorize(afterMs, throughMs, epochId),
     historyPolicy: coordinated === undefined ? { kind: 'peer' } : {
       kind: 'coordinated', policy: coordinated, futureAdmissionWindowMs: clock.futureAdmissionWindowMs,
       applyGovernanceRecord: applyControl,
-      hasEncryptionEpoch: (epochId, includedThrough) => governance.hasFinalizedEpoch(epochId, includedThrough),
-      encryptionEpochStatusAt: (timestamp, epochId) => governance.finalizedEpochStatusAt(timestamp, epochId),
     },
   })
   const abort = new AbortController()
@@ -172,7 +182,8 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
       descriptor, governance, store: options.operationStore, rootPrivateKey: options.identity.privateKey,
       captureFinalTarget: async () => {
         await node.waitForIdle()
-        return { frontier: await node.finalTarget(), requiredEpochs: governance.knownEpochs,
+        const activeEpoch = activeSnapshot().encryptionEpoch
+        return { frontier: await node.finalTarget(), requiredEpochs: governance.knownEpochs.filter(epoch => epoch <= activeEpoch),
           executionManifestDigest: node.executionManifestDigest }
       },
     }) : undefined
@@ -191,8 +202,8 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
       if (started) return
       await governance.start()
       await applyBootstrapControls()
-      if (governance.currentEpoch === null && governance.ownsCapabilityFeed) {
-        await governance.rotateEpoch(options.identity.privateKey, options.initialEpochContentKey,
+      if (!governance.hasEpochKey(0n) && governance.ownsCapabilityFeed && governance.currentEpoch === 0n) {
+        await governance.initializeEpochKey(options.identity.privateKey, options.initialEpochContentKey,
           { operationId: 'bootstrap-epoch-0' })
       }
       await peer?.start()

@@ -10,7 +10,7 @@ describe('governance admin RPC adapter', () => {
   it('reports a stable public capability inventory and delegates a bounded grant', async () => {
     const snapshot = capabilitySnapshot()
     const publishCapabilityChange = vi.fn(async (change: CapabilityChange): Promise<SignedCapabilityRevision> => ({
-      revision: {
+      revision: { encryptionEpoch: 0n,
         groupId: snapshot.groupId,
         revision: 4n,
         previousRevisionDigest: snapshot.revisionDigest,
@@ -69,7 +69,7 @@ describe('governance admin RPC adapter', () => {
 
 function capabilitySnapshot(): CapabilitySnapshot {
   const id = bytes(8)
-  return {
+  return { encryptionEpoch: 0n,
     groupId: bytes(1),
     revision: 3n,
     revisionDigest: bytes(2),
