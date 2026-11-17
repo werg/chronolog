@@ -127,6 +127,7 @@ export interface PeerReplica {
   operation(operationId: string, author?: string): Promise<OperationState | null>
   attempt(operationId: string, author?: string): Promise<SignedAttempt | null>
   capture(): Promise<CapturedPeerView>
+  /** Validate the current complete prefix, or a complete selected ancestor while newer inherited bodies are unavailable. Does not publish a recovering view. */
   recoveryPoint(): Promise<PrefixProof>
   prefixProof(point: HistoryPoint): Promise<PrefixProof>
   /** The contiguous retained selected prefix, including evidence available while recovery is pending. */

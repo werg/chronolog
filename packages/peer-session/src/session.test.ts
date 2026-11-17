@@ -10,7 +10,7 @@ import {
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import { defineApplication, defineCommand, defineQuery, applicationDefinitionDigest } from './definition.js'
-import { connectApplications, AbandonedOperationError, RecoveredViewError, type ApplicationReadView, type ApplicationSession } from './session.js'
+import { connectApplications, AbandonedOperationError, RecoveredViewError, type ApplicationEvent, type ApplicationReadView, type ApplicationSession } from './session.js'
 import { openNativeApplication, openNativeDevice } from './native.js'
 import { createApplicationTools, serveApplicationToolLines } from './tools.js'
 import { ApplicationControlConflictError } from './recovery.js'
@@ -206,6 +206,64 @@ describe('public peer application sessions', () => {
     const recovered = await connectApplications(a, reopened)
     cleanup.push(() => recovered.close())
     expect((await a.operations.get('tail'))?.status).toBe('abandoned')
+    expect((await reopened.query('messages', null)).value.events).toHaveLength(1)
+  })
+
+  it('keeps inherited recovery private until selection and retries its exact ancestor base after reopen', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const link = await connectApplications(a, b)
+    await applied(a, 'retained ancestor', 'retained'); await link.synchronize(); await link.close()
+    const ancestor = await b.recoveryPoint(), captured = await b.readView(), notices: unknown[] = []
+    b.onRecovery(notice => { notices.push(notice) })
+    const projectionDefinition = { id: 'message-ids', version: '1', topics: ['message'], initial: [] as string[],
+      reduce: (state: string[], event: ApplicationEvent) => [...state, event.operationId] }
+    const projection = b.project(projectionDefinition), changes = projection.changes()[Symbol.asyncIterator]()
+    expect((await changes.next()).value?.state).toEqual(['retained'])
+    let advanced = false
+    const next = changes.next().then(value => { advanced = true; return value })
+    cleanup.push(() => { captured.release() })
+    await f.select(f.a.identity, ancestor, 'second'); await a.adopt(await f.registry.read())
+    await applied(a, 'unavailable newer data', 'unavailable')
+    const current = await f.select(f.c.identity, await a.recoveryPoint(), 'third')
+    await expect(b.adopt(await f.registry.read())).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
+    expect(await b.recoveryPoint()).toEqual(ancestor)
+    await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
+    await expect(projection.read()).rejects.toThrow('PEER_RECOVERING')
+    expect(captured.readEvents().events.map(event => event.operationId)).toEqual(['retained'])
+    expect(notices).toEqual([]); expect(advanced).toBe(false)
+
+    let entered!: () => void, release!: () => void, lost = true
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const requests: Array<Parameters<typeof f.registry.select>[0]> = []
+    const host = { application: () => f.registry.read(), async selectGeneration(request: Parameters<typeof f.registry.select>[0]) {
+      requests.push(request); entered(); await gate
+      const selected = await f.registry.select(request)
+      if (lost) { lost = false; throw new Error('LOST_ANCESTOR_SELECTION_REPLY') }
+      return selected
+    } }
+    const expected = { generation: current.id, controlRevision: 0, point: ancestor.point }
+    const takeover = b.recovery.takeover(host, { transitionId: 'ancestor-once', expected })
+    const lostReply = expect(takeover).rejects.toThrow('LOST_ANCESTOR_SELECTION_REPLY')
+    await started
+    expect(requests[0]!.payload).toMatchObject({ expectedGeneration: current.id, base: ancestor })
+    expect(advanced).toBe(false); expect(notices).toEqual([])
+    await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
+    release(); await lostReply
+    const original = (await b.recovery.inspect())[0]!.request
+    expect(advanced).toBe(false)
+    expect(captured.readEvents().events.map(event => event.operationId)).toEqual(['retained'])
+    await b.close(); expect((await next).done).toBe(true)
+    const reopened = await f.open(await openNativeDevice({ path: join(f.directory, 'b.sqlite') }))
+    await reopened.recovery.takeover(host, { transitionId: 'ancestor-once', expected })
+    expect(requests).toEqual([original, original])
+    expect((await reopened.recovery.inspect())[0]).toMatchObject({ request: original, selected: reopened.revision.generation })
+    expect((await f.registry.read()).generations).toHaveLength(4)
+    const resumed = await reopened.project(projectionDefinition).read()
+    expect(resumed.state).toEqual(['retained'])
+    expect(resumed.reset).toMatchObject({ reason: 'recovery', previousRevision: captured.revision })
+    const recovered = await connectApplications(a, reopened)
+    cleanup.push(() => recovered.close())
+    expect(await a.operations.get('unavailable')).toMatchObject({ status: 'abandoned' })
     expect((await reopened.query('messages', null)).value.events).toHaveLength(1)
   })
 

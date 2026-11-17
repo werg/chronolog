@@ -17,6 +17,7 @@ export interface ApplicationControlHost {
 
 /** A displayed recovery choice cannot silently cross a changed authority or prefix. */
 export interface ApplicationRecoveryExpectation {
+  /** Current selected generation used by the control CAS; the usable point may belong to an ancestor. */
   readonly generation: string
   readonly controlRevision: number
   readonly point: HistoryPoint
@@ -83,7 +84,7 @@ export class ApplicationRecovery {
       signal.throwIfAborted()
       if (expected !== undefined) {
         validateHistoryPoint(expected.point)
-        if (expected.generation !== expected.point.generation || !Number.isSafeInteger(expected.controlRevision) || expected.controlRevision < 0) throw new Error('APPLICATION_RECOVERY_EXPECTATION_INVALID')
+        if (!/^[0-9a-f]{64}$/u.test(expected.generation) || !Number.isSafeInteger(expected.controlRevision) || expected.controlRevision < 0) throw new Error('APPLICATION_RECOVERY_EXPECTATION_INVALID')
       }
       if (transitionId !== undefined && (transitionId.length < 1 || transitionId.length > 128)) throw new Error('APPLICATION_TRANSITION_ID_INVALID')
       if (!/^[0-9a-f]{64}$/u.test(coordinator)) throw new Error('APPLICATION_COORDINATOR_INVALID')
@@ -104,30 +105,33 @@ export class ApplicationRecovery {
         signal.throwIfAborted()
         await verifyAuthorityBundle(bundle, this.#replica.authority.descriptor)
         signal.throwIfAborted()
-        await this.#replica.adopt(bundle)
+        await this.#replica.receiveHistory(bundle, [])
         signal.throwIfAborted()
-        if (expected !== undefined && (expected.generation !== this.#replica.generation.id || expected.controlRevision !== this.#replica.generation.payload.controlRevision)) {
+        const generation = this.#replica.generation
+        if (expected !== undefined && (expected.generation !== generation.id || expected.controlRevision !== generation.payload.controlRevision)) {
           throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
         }
-        if (reason === 'takeover' && this.#replica.isCoordinator) return null
+        if (reason === 'takeover' && this.#replica.isCoordinator && this.#replica.ready) return null
+        if (reason === 'handover' && !this.#replica.ready) throw new Error('PEER_RECOVERY_PREFIX_INCOMPLETE')
         if (reason === 'handover' && (!this.#replica.isCoordinator || coordinator === this.#replica.device.publicKey)) {
           throw new Error('APPLICATION_HANDOVER_REQUIRES_CURRENT_COORDINATOR')
         }
         const base = await this.#replica.recoveryPoint()
         signal.throwIfAborted()
-        if (expected !== undefined && (expected.point.generation !== base.point.generation || expected.point.sequence !== base.point.sequence || expected.point.root !== base.point.root)) {
+        if (this.#replica.generation.id !== generation.id || expected !== undefined &&
+            (expected.point.generation !== base.point.generation || expected.point.sequence !== base.point.sequence || expected.point.root !== base.point.root)) {
           throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
         }
         if ((reason === 'handover' || coordinator !== this.#replica.device.publicKey) &&
-            !this.#replica.shared(base.point).some(receipt => receipt.payload.peer === coordinator &&
-              receipt.payload.point.generation === base.point.generation && receipt.payload.point.sequence === base.point.sequence && receipt.payload.point.root === base.point.root)) {
+            (!this.#replica.ready || !this.#replica.shared(base.point).some(receipt => receipt.payload.peer === coordinator &&
+              receipt.payload.point.generation === base.point.generation && receipt.payload.point.sequence === base.point.sequence && receipt.payload.point.root === base.point.root))) {
           throw new Error(reason === 'handover' ? 'APPLICATION_HANDOVER_REQUIRES_RETAINED_PREFIX' : 'APPLICATION_TAKEOVER_REQUIRES_RETAINED_PREFIX')
         }
         if (journal.length >= 64) throw new Error('APPLICATION_TRANSITION_JOURNAL_FULL')
         const descriptor = this.#replica.descriptor
         const request = await signTransitionRequest({ applicationId: descriptor.applicationId, profile: descriptor.profile,
-          policy: descriptor.policy, expectedGeneration: this.#replica.generation.id, coordinator, requester: this.#replica.device.publicKey,
-          controlRevision: this.#replica.generation.payload.controlRevision, base, transitionId: transitionId ?? crypto.randomUUID(), reason }, this.#replica.device)
+          policy: descriptor.policy, expectedGeneration: generation.id, coordinator, requester: this.#replica.device.publicKey,
+          controlRevision: generation.payload.controlRevision, base, transitionId: transitionId ?? crypto.randomUUID(), reason }, this.#replica.device)
         signal.throwIfAborted()
         entry = { request, selected: null, superseded: false }
         journal.push(entry)
@@ -136,7 +140,6 @@ export class ApplicationRecovery {
       }
       signal.throwIfAborted()
       const request = entry.request
-      const previousGeneration = this.#replica.generation.id
       try {
         const selected = await this.#hostCall(() => host.selectGeneration(request, { signal }), signal)
         signal.throwIfAborted()
@@ -151,8 +154,9 @@ export class ApplicationRecovery {
         // The attached control participant durably observes new authority on
         // read. It may already have published this recovery while fetching the
         // selected bundle; return that same notice without publishing a reset twice.
+        // Its previous published view can precede several incomplete selections.
         const notice = await this.#replica.adopt(bundle) ?? this.#replica.inspectRecovery().findLast(value =>
-          value.previousGeneration === previousGeneration && value.generation === this.#replica.generation.id) ?? null
+          value.generation === selected.id) ?? null
         signal.throwIfAborted()
         const index = journal.indexOf(entry)
         journal[index] = { request: entry.request, selected: selected.id, superseded: false }
@@ -173,7 +177,7 @@ export class ApplicationRecovery {
           journal[journal.indexOf(entry)] = { ...entry, superseded: true }
           await this.#store.put(this.#key, encodePeerValue(journal))
           signal.throwIfAborted()
-          await this.#replica.adopt(bundle)
+          await this.#replica.receiveHistory(bundle, [])
         }
         throw error
       }

@@ -267,6 +267,38 @@ describe('owned application participation', () => {
     await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
   })
 
+  it.each(['self', 'other'] as const)('approves an inherited complete prefix when the %s selection adopted unavailable newer data', async coordinator => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const link = await connectApplications(a, b)
+    await post(a, 'retained-ancestor'); await link.synchronize(); await link.close()
+    const ancestor = await b.recoveryPoint()
+    const select = async (transitionId: string, coordinator: string) => {
+      const authority = await f.registry.read()
+      return f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+        expectedGeneration: authority.generations.at(-1)!.id, coordinator, requester: f.a.identity.publicKey, controlRevision: 0,
+        base: await a.recoveryPoint(), transitionId, reason: 'takeover' }, f.a.identity))
+    }
+    await select('second', a.deviceId); await a.adopt(await f.registry.read())
+    await post(a, 'unavailable-newer-data')
+    const current = await select('third', coordinator === 'self' ? b.deviceId : f.c.identity.publicKey)
+    await a.close()
+    const participation = f.participate(b)
+    await until(() => participation.status.phase === 'approval-required')
+    const proposal = participation.status.recovery!
+    expect(proposal).toMatchObject({ point: ancestor.point, reason: 'freshness-unknown', coordinator: b.deviceId })
+    expect(f.requests).toHaveLength(0)
+    await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
+    await expect(b.recovery.handover(f.host, { coordinator: f.c.identity.publicKey })).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
+    expect(f.requests).toHaveLength(0)
+    await participation.approveRecovery(proposal.id)
+    await until(() => participation.status.phase === 'coordinating')
+    expect(f.requests).toHaveLength(1)
+    expect(f.requests[0]!.payload).toMatchObject({ expectedGeneration: current.id, base: ancestor })
+    const view = await b.readView()
+    try { expect(view.readEvents().events.map(event => event.operationId)).toEqual(['retained-ancestor']) } finally { view.release() }
+    await expect((await post(b, 'new-work')).get()).resolves.toMatchObject({ status: 'applied' })
+  })
+
   it('authenticates newly enrolled readers through newer signed hello authority without reopening the healthy owner', async () => {
     const f = await fixture({ omitC: true }), a = await f.open(f.a)
     const first = f.participate(a)

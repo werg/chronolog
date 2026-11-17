@@ -6,16 +6,17 @@ import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/brow
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
-  signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  signApplicationDescriptor, signControlRevision, signTransitionRequest, type PrefixProof,
 } from '@chronolog/peer-generation'
-import { program } from '@chronolog/protocol'
-import { defineApplication } from './definition.js'
+import { emit, program } from '@chronolog/protocol'
+import { defineApplication, defineCommand } from './definition.js'
 import { openApplicationDevice } from './device.js'
 import { createNativeSqlEngine } from './sql-native.js'
 import { openSqlApplication, prepareSqlApplication, type SqlEngine } from './sql.js'
 import { openPeerApplication } from './runtime.js'
 import { createApplicationBackend } from './tendriller.js'
 import { connectApplicationWorker, serveApplicationWorker } from './worker-application.js'
+import { connectApplications } from './session.js'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close() })
@@ -109,3 +110,64 @@ it('derives native and Worker-backed SQL adapter capabilities from the actual ma
     finally { await view.release() }
   }
 })
+
+it('keeps captured SQL and events coherent while privately validating an inherited recovery candidate', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'peer-sql-ancestor-'))
+  cleanups.push(() => rm(directory, { recursive: true, force: true }))
+  const devices = await Promise.all([0, 1].map(() => openApplicationDevice({ store: new MemoryBytesStore(), create: true })))
+  const [first, survivor] = devices as [typeof devices[number], typeof devices[number]]
+  const host = await createPeerIdentity(), key = crypto.getRandomValues(new Uint8Array(32)), engine = createNativeSqlEngine()
+  const definition = defineApplication({ id: 'sql-ancestor', version: '1',
+    schema: program('CREATE TABLE items (id INTEGER PRIMARY KEY)'), commands: {
+      add: defineCommand({ description: 'Add an item', input: { type: 'integer', minimum: 1 },
+        prepare: id => program(`INSERT INTO items (id) VALUES (${id})`, emit('item.added', { id })) }),
+    }, queries: {} })
+  const applicationId = 'ce'.repeat(32), prepared = await prepareSqlApplication({ engine, applicationId, definition, schemaAdministrator: first.identity })
+  const descriptor = await signApplicationDescriptor({ applicationId, historyId: 'sql-ancestor', profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+    controlPublicKey: host.publicKey, ...prepared.binding }, host)
+  const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
+    revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
+    grants: devices.map(device => participantGrant(device.identity.publicKey, { administrator: true })),
+  }, host)
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
+  const select = async (base: PrefixProof | null, transitionId: string) => registry.select(await signTransitionRequest({
+    applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId,
+    expectedGeneration: (await registry.read()).generations.at(-1)?.id ?? null, requester: first.identity.publicKey,
+    coordinator: first.identity.publicKey, controlRevision: 0, reason: base === null ? 'create' : 'takeover', base,
+  }, first.identity))
+  await select(null, 'first')
+  const open = async (device: typeof first, name: string) => {
+    const session = await openSqlApplication({ engine, device, definition, authority: await registry.read(), epochKeys: new Map([[0, key]]),
+      databasePath: join(directory, `${name}.db`), schema: prepared.schema })
+    cleanups.push(() => session.close()); return session
+  }
+  const a = await open(first, 'a'), b = await open(survivor, 'b'), link = await connectApplications(a, b)
+  await (await a.command('add', 1, { operationId: 'retained' })).applied(); await link.synchronize()
+  const ancestor = await b.recoveryPoint()
+  await (await a.command('add', 2, { operationId: 'excluded' })).applied(); await link.synchronize(); await link.close()
+  const held = await b.readView(), rows = [[1], [2]]
+  try {
+    expect(held.query('SELECT id FROM items ORDER BY id').rows).toEqual(rows)
+    await select(ancestor, 'second'); await a.adopt(await registry.read())
+    await (await a.command('add', 3, { operationId: 'unavailable' })).applied()
+    const current = await select(await a.recoveryPoint(), 'third')
+    await expect(b.adopt(await registry.read())).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
+    expect(await b.recoveryPoint()).toEqual(ancestor)
+    await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
+    expect(held.query('SELECT id FROM items ORDER BY id').rows).toEqual(rows)
+    expect(held.readEvents().events.map(event => event.operationId)).toEqual(['retained', 'excluded'])
+    await b.recovery.takeover({ application: () => registry.read(), selectGeneration: request => registry.select(request) }, {
+      transitionId: 'fourth', expected: { generation: current.id, controlRevision: 0, point: ancestor.point },
+    })
+    const recovered = await b.readView()
+    try {
+      expect(recovered.query('SELECT id FROM items ORDER BY id').rows).toEqual(rows.slice(0, 1))
+      expect(recovered.readEvents().events.map(event => event.operationId)).toEqual(['retained'])
+      expect(recovered.revision.generation).not.toBe(current.id)
+    } finally { recovered.release() }
+    expect(await b.operations.get('retained', { author: a.deviceId })).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    expect(await b.operations.get('excluded', { author: a.deviceId })).toMatchObject({ status: 'abandoned' })
+    expect(held.query('SELECT id FROM items ORDER BY id').rows).toEqual(rows)
+    expect(held.readEvents().events.map(event => event.operationId)).toEqual(['retained', 'excluded'])
+  } finally { held.release() }
+}, 60_000)

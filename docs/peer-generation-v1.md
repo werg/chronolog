@@ -192,6 +192,16 @@ original bodies, contiguous order evidence, controls, keys and operation identit
 metadata or a SQL cache alone is insufficient. A remote database image is never
 accepted merely because a peer signed it. Recovery replays retained evidence.
 
+A peer missing a newer inherited segment may recover from a complete ancestor
+on the currently selected ancestry. It must retain every original body through
+that ancestor's selected cutoff, prove the cutoff and replay the whole usable
+prefix under current controls. The active epoch key must also match its signed
+commitment so the successor can verify new work after selection. It cannot infer a missing receipt bridge, revive
+excluded branches, cross a protected floor or treat an empty store as a reset
+to genesis. Candidate replay remains private: the current application view stays
+recovering until an authorized successor selects and materializes the prefix.
+Planned handover still requires the complete current selected view.
+
 The initial peer envelope is at most 4,096 retained ordered records and 64 MiB of
 serialized ordered history, including abandoned records. Applications may choose
 lower limits. Recovery transfer uses the same bounds; increasing them requires

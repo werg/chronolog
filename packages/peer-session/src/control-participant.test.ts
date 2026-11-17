@@ -114,12 +114,23 @@ describe('session-owned control participant', () => {
     expect((await (await a.command('say', 'still writing', { operationId: 'after-host' })).applied()).outcome).toBe('accepted')
   })
 
-  it('uses the same signed authority for takeover and durably refuses stale control replies', async () => {
+  it('returns the adopted ancestor notice across incomplete selections and durably refuses stale control replies', async () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
     const old = await f.registry.read(), host = b.connectControlParticipant({ exchange: f.exchange })
     const link = await connectApplications(a, b)
     await (await a.command('say', 'inherited', { operationId: 'inherited' })).applied(); await link.synchronize(); await link.close()
+    const ancestor = await b.recoveryPoint()
     await (await a.command('say', 'tail', { operationId: 'tail' })).applied()
+    const identity = f.devices[0]!.identity
+    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+      expectedGeneration: a.revision.generation, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 0,
+      transitionId: 'second', reason: 'takeover', base: ancestor }, identity))
+    await a.adopt(await f.registry.read())
+    await (await a.command('say', 'unavailable', { operationId: 'unavailable' })).applied()
+    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+      expectedGeneration: a.revision.generation, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 0,
+      transitionId: 'third', reason: 'takeover', base: await a.recoveryPoint() }, identity))
+    await host.application(); await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
     const notice = await b.recovery.takeover(host, { transitionId: 'recover' })
     expect(notice).toMatchObject({ previousGeneration: old.generations[0]!.id, generation: b.revision.generation })
     expect(b.status.role).toBe('coordinator')

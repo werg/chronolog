@@ -183,6 +183,97 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     const before = (await c.exportCommands()).map(value => value.attempt.id)
     expect(before).not.toContain(two.id); expect(before).toContain(reapplied.id)
   })
+  it('validates a complete inherited ancestor while a newer selected prefix is unavailable', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'inherited', program: event('inherited') }))
+    const inherited = await a.recoveryPoint()
+    await a.order(await a.prepare({ operationId: 'excluded-first-tail', program: event('excluded') }))
+    await b.ingest(await a.exportCommands())
+    const held = await b.capture(), recoveries: unknown[] = []
+    b.onRecovery(notice => { recoveries.push(notice) })
+    try {
+      await f.select(f.a, inherited, 'second'); await a.adopt(await f.registry.read())
+      await a.order(await a.prepare({ operationId: 'unavailable-second-tail', program: event('unavailable') }))
+      const selected = await f.select(f.c, await a.recoveryPoint(), 'third')
+      expect(await b.receiveHistory(await f.registry.read(), [])).toEqual({ ready: false, recovery: null })
+      const replay = vi.spyOn(f.materializers.get(b)!.coordinator, 'materialize')
+      const base = await b.recoveryPoint()
+      expect(base).toEqual(inherited)
+      expect(replay).toHaveBeenCalledOnce(); replay.mockRestore()
+      expect(b.generation.id).toBe(selected.id); expect(b.ready).toBe(false)
+      await expect(b.capture()).rejects.toThrow('PEER_RECOVERING')
+      expect(recoveries).toEqual([])
+      expect(held.read.orderLength).toBe(2)
+      expect(decodeTransactionCore(held.read.transactionAt(1)!.canonicalCandidate).operationId).toBe('excluded-first-tail')
+      await f.select(f.b, base, 'fourth'); await b.adopt(await f.registry.read())
+      expect(b.ready).toBe(true); expect(recoveries).toHaveLength(1)
+      expect((await b.exportCommands()).map(command => command.attempt.payload.header.operationId)).toEqual(['inherited'])
+      expect(await b.operation('excluded-first-tail', f.a.publicKey)).toMatchObject({ status: 'abandoned' })
+      expect(held.read.orderLength).toBe(2)
+    } finally { held.release() }
+  })
+  it('does not turn a partial ancestor without its selected-cutoff bridge into a recovery base', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'retained-part', program: event('retained') }))
+    await b.ingest(await a.exportCommands())
+    await a.order(await a.prepare({ operationId: 'missing-cutoff', program: event('missing') }))
+    await f.select(f.c, await a.recoveryPoint(), 'adopt-two')
+    expect((await b.receiveHistory(await f.registry.read(), [])).ready).toBe(false)
+    expect(b.retainedPoint?.sequence).toBe(1)
+    await expect(b.recoveryPoint()).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
+    await expect(b.capture()).rejects.toThrow('PEER_RECOVERING')
+  })
+  it.each(['floor', 'recovery-revoked', 'reader-revoked'] as const)('preserves current %s controls when recovering from an inherited ancestor', async restriction => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'old-prefix', program: event('old') })); await b.ingest(await a.exportCommands())
+    const ancestor = await b.recoveryPoint()
+    await f.select(f.a, ancestor, 'second'); await a.adopt(await f.registry.read())
+    await a.order(await a.prepare({ operationId: 'unavailable-prefix', program: event('unavailable') }))
+    const latest = await a.recoveryPoint(), current = await f.registry.read()
+    const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
+      ...(restriction === 'reader-revoked' ? { epoch: 1, keyDigest: await bytesDigest(crypto.getRandomValues(new Uint8Array(32))) } : {}),
+      recoveryFloor: restriction === 'floor' ? latest.point : null,
+      grants: f.control.payload.grants.map(grant => grant.publicKey !== f.b.publicKey ? grant : restriction === 'recovery-revoked'
+        ? { ...grant, recovery: false } : restriction === 'reader-revoked' ? { ...grant, reader: false, writer: false, coordinator: false, dataRole: null } : grant),
+    }, f.host)
+    const selected = await f.registry.select(await signTransitionRequest({ applicationId: a.descriptor.applicationId,
+      profile: a.descriptor.profile, policy: a.descriptor.policy, transitionId: 'restricted-third', expectedGeneration: current.generations.at(-1)!.id,
+      coordinator: f.a.publicKey, requester: f.a.publicKey, controlRevision: 1, reason: 'control-change', base: latest,
+    }, f.a), { control })
+    expect((await b.receiveHistory(await f.registry.read(), [])).ready).toBe(false)
+    if (restriction === 'floor') await expect(b.recoveryPoint()).rejects.toThrow('PEER_RECOVERY_FLOOR_UNAVAILABLE')
+    else if (restriction === 'reader-revoked') await expect(b.recoveryPoint()).rejects.toThrow('PEER_READER_FORBIDDEN')
+    else expect(await b.recoveryPoint()).toEqual(ancestor)
+    await expect(f.registry.select(await signTransitionRequest({ applicationId: b.descriptor.applicationId,
+      profile: b.descriptor.profile, policy: b.descriptor.policy, transitionId: 'forbidden-fourth', expectedGeneration: selected.id,
+      coordinator: f.b.publicKey, requester: f.b.publicKey, controlRevision: 1, reason: 'takeover', base: ancestor,
+    }, f.b))).rejects.toThrow(restriction === 'floor' ? 'PEER_RECOVERY_FLOOR_UNAVAILABLE'
+      : restriction === 'reader-revoked' ? 'PEER_COORDINATOR_FORBIDDEN' : 'PEER_RECOVERY_FORBIDDEN')
+    expect((await f.registry.read()).generations.at(-1)!.id).toBe(selected.id)
+    await expect(b.capture()).rejects.toThrow('PEER_RECOVERING')
+  })
+  it('requires the active epoch key before offering a usable ancestor as a successor base', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'old-epoch-prefix', program: event('old') })); await b.ingest(await a.exportCommands())
+    const ancestor = await b.recoveryPoint()
+    await f.select(f.a, ancestor, 'second'); await a.adopt(await f.registry.read())
+    await a.order(await a.prepare({ operationId: 'unavailable-tail', program: event('tail') }))
+    const key = crypto.getRandomValues(new Uint8Array(32))
+    const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control), epoch: 1,
+      keyDigest: await bytesDigest(key),
+    }, f.host)
+    await f.registry.select(await signTransitionRequest({ applicationId: a.descriptor.applicationId,
+      profile: a.descriptor.profile, policy: a.descriptor.policy, transitionId: 'rotate-third', expectedGeneration: a.generation.id,
+      coordinator: f.a.publicKey, requester: f.a.publicKey, controlRevision: 1, reason: 'control-change', base: await a.recoveryPoint(),
+    }, f.a), { control })
+    expect((await b.receiveHistory(await f.registry.read(), [])).ready).toBe(false)
+    await expect(b.recoveryPoint()).rejects.toThrow('PEER_EPOCH_KEY_UNAVAILABLE')
+    f.keys.set(1, crypto.getRandomValues(new Uint8Array(32)))
+    await expect(b.recoveryPoint()).rejects.toThrow('PEER_EPOCH_KEY_MISMATCH')
+    f.keys.set(1, key)
+    expect(await b.recoveryPoint()).toEqual(ancestor)
+    expect(b.ready).toBe(false)
+  })
   it('reopens a locally committed receipt after its acknowledgment is lost', async () => {
     const f = await fixture(), retained = new MemoryBytesStore()
     let fail = false

@@ -293,6 +293,21 @@ class Replica implements PeerReplica {
         const retained = records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); selected.push(retained)
       }
     } else selected = this.#selectedHistory(authority)
+    const previousLength = this.#selected.length
+    await this.#replay(selected, authority, continuing)
+    // Control may already have advanced while ready=false. Publish all view
+    // metadata together before allowing readers to observe the complete prefix.
+    this.#authority = authority
+    this.#selected = selected
+    if (continuing) for (let index = previousLength; index < selected.length; index++) this.#selectedIds.add(selected[index]!.command.attempt.id)
+    else this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
+    this.#publishedRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
+      generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
+      controlRevision: generation.payload.controlRevision, materializationRevision: String(this.#options.materializer.queries.revision) }
+    this.#ready = true
+  }
+  /** Replay also validates a recovery candidate without publishing it as the selected application view. */
+  async #replay(selected: readonly Retained[], authority: PeerAuthority, continuing = false): Promise<void> {
     const admitted = selected.map(value => value.proposal)
     const controls: PeerExecutionControls = { applicationId: hexToBytes(authority.descriptor.applicationId),
       currentRevision: authority.current!.payload.controlRevision,
@@ -316,16 +331,6 @@ class Replica implements PeerReplica {
       if (previous === undefined) await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
       this.#lastOutcomes.set(attempt.id, result)
     }
-    // Control may already have advanced while ready=false. Publish all view
-    // metadata together before allowing readers to observe the complete prefix.
-    this.#authority = authority
-    this.#selected = selected
-    if (continuing) for (let index = previousLength; index < selected.length; index++) this.#selectedIds.add(selected[index]!.command.attempt.id)
-    else this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
-    this.#publishedRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
-      generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
-      controlRevision: generation.payload.controlRevision, materializationRevision: String(this.#options.materializer.queries.revision) }
-    this.#ready = true
   }
   async #finishRecovery(notify: boolean): Promise<RecoveryNotice | null> {
     const pending = this.#pendingRecovery
@@ -527,11 +532,48 @@ class Replica implements PeerReplica {
     validateHistoryPoint(point); check(this.#pointAvailable(point), 'PEER_RECOVERY_PREFIX_INCOMPLETE')
     const records = this.#records.get(point.generation)!, segment = this.#authority.selectedSegments().find(value => value.generation.id === point.generation)!
     const receipt = point.sequence === 0 ? null : records.get(point.sequence)!.command.receipt
-    const bridge = segment.cutoff === null ? [] : Array.from({ length: segment.cutoff.sequence - point.sequence }, (_, index) => records.get(point.sequence + index + 1)!.command.receipt)
-    check(bridge.length <= 4096, 'PEER_PREFIX_PROOF_TOO_LARGE')
+    const length = segment.cutoff === null ? 0 : segment.cutoff.sequence - point.sequence
+    check(length <= 4096, 'PEER_PREFIX_PROOF_TOO_LARGE')
+    const bridge = Array.from({ length }, (_, index) => {
+      const retained = records.get(point.sequence + index + 1)
+      check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); return retained.command.receipt
+    })
     return structuredClone({ point, receipt, bridge })
   }
-  recoveryPoint(): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(this.revision.point) }) }
+  recoveryPoint(): Promise<PrefixProof> {
+    return this.#serial.run(async () => {
+      this.#assertOpen()
+      check(this.#authority.grant(this.device.publicKey)?.reader === true, 'PEER_READER_FORBIDDEN')
+      const control = this.#authority.control, key = this.#options.epochKeys.get(control.payload.epoch)
+      check(key !== undefined, 'PEER_EPOCH_KEY_UNAVAILABLE')
+      check(key.length === 32 && await bytesDigest(key) === control.payload.keyDigest, 'PEER_EPOCH_KEY_MISMATCH')
+      if (this.#ready) return this.#proof(this.revision.point)
+      const selected: Retained[] = [], segments = this.#authority.selectedSegments()
+      let point: HistoryPoint | null = null
+      for (const [index, range] of this.#selectedRanges(this.#authority, false).entries()) {
+        const segment = segments[index]!
+        // An incomplete inherited segment lacks both application bodies and
+        // the receipt bridge to its selected cutoff. Keep the last complete
+        // ancestor instead; later stored branches cannot repair this gap.
+        if (segment.cutoff !== null && range.length < segment.cutoff.sequence) break
+        for (let sequence = 1; sequence <= range.length; sequence++) {
+          const retained = range.records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); selected.push(retained)
+        }
+        const head = this.#heads.get(range.generation)!
+        point = segment.cutoff ?? { generation: range.generation, sequence: head.sequence, root: head.root }
+      }
+      // A new empty peer is not evidence for an implicit reset to genesis.
+      check(point !== null && selected.length > 0, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
+      const proof = await this.#proof(point)
+      await this.#authority.verifyPrefix(proof)
+      const floor = this.#authority.control.payload.recoveryFloor
+      check(floor === null || this.#authority.atOrAfter(point, floor), 'PEER_RECOVERY_FLOOR_UNAVAILABLE')
+      await this.#replay(selected, this.#authority)
+      // Selection, readiness, captured views and recovery observers remain
+      // unchanged until an authorized successor actually adopts this prefix.
+      return proof
+    })
+  }
   prefixProof(point: HistoryPoint): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(point) }) }
   exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly maxBytes?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
     return this.#serial.run(async () => {

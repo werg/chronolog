@@ -106,8 +106,14 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   }
   async approveRecovery(proposalId: string): Promise<void> {
     this.signal.throwIfAborted()
-    if (this.#proposal === null || this.#proposal.id !== proposalId || !this.#owner.replica.ready ||
-        !samePoint(this.#proposal.point, this.#owner.replica.revision.point)) throw new Error('APPLICATION_RECOVERY_APPROVAL_STALE')
+    const proposal = this.#proposal, replica = this.#owner.replica
+    if (proposal === null || proposal.id !== proposalId) throw new Error('APPLICATION_RECOVERY_APPROVAL_STALE')
+    const base = await replica.recoveryPoint().catch(error => { throw new Error('APPLICATION_RECOVERY_APPROVAL_STALE', { cause: error }) })
+    const generation = replica.generation
+    const id = await peerDigest({ generation: generation.id, control: generation.payload.controlRevision, coordinator: proposal.coordinator, point: base.point })
+    this.signal.throwIfAborted()
+    if (this.#proposal?.id !== proposalId || !samePoint(proposal.point, base.point) || id !== proposalId ||
+        replica.generation.id !== generation.id) throw new Error('APPLICATION_RECOVERY_APPROVAL_STALE')
     this.#approved = proposalId; this.#nextScan = 0; this.#wake()
   }
 
@@ -142,10 +148,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     while (!this.signal.aborted) {
       this.#watchLinks()
       const replica = this.#owner.replica, now = Date.now()
-      if (this.#generation !== replica.generation.id) {
-        this.#generation = replica.generation.id; this.#proposal = null; this.#approved = null
-        this.#nextScan = 0; this.#nextAdvertisement = 0
-      }
+      this.#observeGeneration()
       if (this.#healthy()) { this.#missingSince = null; this.#proposal = null; this.#approved = null; this.#retry = 0 }
       else this.#missingSince ??= now
       if (now >= this.#nextAdvertisement) {
@@ -197,6 +200,9 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     }
     const available = new Set(links.filter((link, index) => synchronized[index]?.status === 'fulfilled' && !link.signal.aborted).map(link => link.peerId))
     this.signal.throwIfAborted()
+    // Authority can advance during this scan. Retire an older choice before
+    // creating its replacement, rather than clearing the new proposal next turn.
+    this.#observeGeneration()
     const pending = [...await this.#call('journal', () => this.#owner.recovery.inspect())].reverse().find(entry => entry.selected === null && !entry.superseded)
     if (pending !== undefined) {
       if (pending.request.payload.reason !== 'takeover' && pending.request.payload.reason !== 'handover') throw new Error('APPLICATION_TRANSITION_JOURNAL_INVALID')
@@ -209,13 +215,11 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       return
     }
     if (authorityError !== undefined) throw authorityError
-    if (!replica.ready) throw new Error('PEER_RECOVERY_PREFIX_INCOMPLETE')
     if (replica.grant(replica.device.publicKey)?.recovery !== true) throw new Error('PEER_RECOVERY_FORBIDDEN')
     const base = await replica.recoveryPoint()
     this.signal.throwIfAborted()
     const expected: ApplicationRecoveryExpectation = { generation: replica.generation.id, controlRevision: replica.generation.payload.controlRevision, point: base.point }
-    if (base.point.generation !== expected.generation) throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
-    const retained = replica.shared(base.point)
+    const retained = replica.ready ? replica.shared(base.point) : []
     const candidates = new Set<string>()
     if (replica.grant(replica.device.publicKey)?.coordinator === true) candidates.add(replica.device.publicKey)
     for (const link of this.#links()) {
@@ -327,7 +331,16 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   }
 
   #links(): readonly ApplicationPeerLink[] { return this.#owner.links().filter(link => !link.signal.aborted) }
-  #healthy(): boolean { return this.#owner.replica.isCoordinator || this.#links().some(link => link.peerId === this.#owner.replica.generation.payload.coordinator) }
+  #observeGeneration(): void {
+    const generation = this.#owner.replica.generation.id
+    if (this.#generation === generation) return
+    this.#generation = generation; this.#proposal = null; this.#approved = null
+    this.#nextScan = 0; this.#nextAdvertisement = 0
+  }
+  #healthy(): boolean {
+    const replica = this.#owner.replica
+    return replica.ready && (replica.isCoordinator || this.#links().some(link => link.peerId === replica.generation.payload.coordinator))
+  }
   #watchLinks(): void {
     for (const link of this.#links()) {
       if (this.#watchedLinks.has(link)) continue

@@ -242,8 +242,12 @@ and retried; old retention alone does not establish current reachability.
 Candidate selection uses the complete best
 prefix actually verified locally on the selected ancestry. A remote successor
 must hold a signed retention acknowledgment for that exact prefix; a self
-candidate must be locally ready. Current coordinator and recovery grants are
-checked independently. Directory hints, advertised eligibility and remote
+candidate must validate and replay its complete prefix. If newer inherited
+segments are unavailable, a survivor can propose the last fully retained ancestor
+whose selected cutoff is provable. An empty survivor or partial segment without
+its receipt bridge cannot supply that evidence. Current coordinator and recovery grants are
+checked independently, and the candidate must hold the key committed by the active
+control epoch. Directory hints, advertised eligibility and remote
 retention timestamps supply no authority or freshness evidence.
 
 Automatic selection additionally requires recent local evidence from an
@@ -257,7 +261,9 @@ than the budget. Such cases expose `phase: 'approval-required'` with the exact
 complete prefix, candidate, observation age and reason. Only approving that
 proposal ID permits the broader recovery; changed authority or prefix invalidates
 the choice, including changes during the final host refresh before signing.
-An incomplete selected prefix cannot be approved into completeness.
+While that ancestor is proposed or approved, current reads remain recovering and
+projections do not reset. Only selecting and materializing the successor publishes
+the adopted prefix. Protected recovery floors still apply.
 
 The controller uses the existing durable transition journal. Lost takeover and
 handover replies retry the same signed request, and competing valid selections
@@ -391,9 +397,12 @@ queue.
 The lower-level `session.recovery.takeover(host, { transitionId })` validates this device's
 complete recovery point, saves one signed transition request, selects it through
 the host, and adopts the verified result. Retry the same transition ID after a
-lost hosted reply, including after device reopen. A planned
+lost hosted reply, including after device reopen. For an inherited recovery base,
+`expected.generation` names the current selected generation for the control CAS,
+while `expected.point.generation` names the ancestor containing the displayed
+complete prefix. Both remain bound to the saved request. A planned
 `session.recovery.handover(host, { coordinator, transitionId })` additionally
-requires the successor's signed retention of the exact current prefix. These
+requires a complete current view and the successor's signed retention of that exact prefix. These
 methods never reinterpret an excluded branch as an eligible recovery base.
 
 `ApplicationControlHost` recognizes the typed error code
