@@ -20,20 +20,21 @@ export interface ApplicationTool {
 /** Local agent tools execute against the same owned session, identity and journal as the UI. */
 export function createApplicationTools(session: ApplicationSession, options: { readonly host?: ApplicationControlHost } = {}) {
   const description = session.describe(), operationId = { type: 'string', minLength: 1, maxLength: 256 }
+  const author = { type: 'string', minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$' }
   const object = (properties: Record<string, unknown>, required: readonly string[] = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false })
   const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>, optional: Record<string, unknown> = {}) => ({ type: 'object', oneOf: description[kind].map(entry => object({
     name: { type: 'string', const: entry.name, description: entry.description }, input: entry.input, ...fields, ...optional,
   }, ['name', 'input', ...Object.keys(fields)])) })
   const tools: readonly ApplicationTool[] = [
     { name: 'describe', description: 'Inspect authenticated application definitions, current role and supported guarantees.', inputSchema: object({}) },
-    { name: 'query', description: 'Execute a declared query against one coherent captured application revision.', inputSchema: entries('queries', {}) },
-    { name: 'command', description: 'Save one signed command under a caller-owned operation ID. Returns saved or currently applied state.', inputSchema: entries('commands', { operationId }, { basedOn: revisionSchema }) },
-    { name: 'operation', description: 'Inspect saved attempt bytes, current outcome and explicit reapplication linkage.', inputSchema: object({ operationId }) },
+    ...(description.queries.length === 0 ? [] : [{ name: 'query', description: 'Execute a declared query against one coherent captured application revision.', inputSchema: entries('queries', {}) }]),
+    ...(description.commands.length === 0 ? [] : [{ name: 'command', description: 'Save one signed command under a caller-owned operation ID. Returns saved or currently applied state.', inputSchema: entries('commands', { operationId }, { basedOn: revisionSchema }) }]),
+    { name: 'operation', description: 'Inspect saved attempt bytes, current outcome and explicit reapplication linkage. Author defaults to this device; provide the original signer to inspect another participant\'s retained attempt.', inputSchema: object({ operationId, author }, ['operationId']) },
     { name: 'retry', description: 'Retry the exact saved command. Never recreates an abandoned operation.', inputSchema: object({ operationId }) },
     { name: 'wait', description: 'Wait for the current applied result. Cancellation only cancels this wait.', inputSchema: object({ operationId }) },
     { name: 'recoveries', description: 'Inspect generation recovery notices and preserved abandoned operations.', inputSchema: object({}) },
     { name: 'changes', description: 'Wait for a coherent revision different from after, or return the current view when omitted. Recovery requires rereading; changes may coalesce.', inputSchema: object({ after: revisionSchema }, []) },
-    { name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment.', inputSchema: entries('commands', { operationId, originalOperationId: operationId }, { basedOn: revisionSchema }) },
+    ...(description.commands.length === 0 ? [] : [{ name: 'reapply', description: 'Deliberately create a newly signed, linked command from current input after abandonment. Original author defaults to this device; reapplication always uses this device\'s current identity and permissions.', inputSchema: entries('commands', { operationId, originalOperationId: operationId }, { basedOn: revisionSchema, originalAuthor: author }) }]),
     ...(options.host === undefined ? [] : [{ name: 'takeover', description: 'Select this eligible device\'s complete recovery point through the hosted authority; may abandon a recent suffix.', inputSchema: object({ transitionId: { type: 'string', minLength: 1, maxLength: 128 } }) }]),
   ]
   return {
@@ -43,6 +44,11 @@ export function createApplicationTools(session: ApplicationSession, options: { r
       if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new Error('APPLICATION_TOOL_INPUT_INVALID')
       const value = input as Record<string, unknown>
       const text = (key: string): string => { if (typeof value[key] !== 'string') throw new Error('APPLICATION_TOOL_INPUT_INVALID'); return value[key] }
+      const publicKey = (key: string): string => {
+        const result = text(key)
+        if (!/^[0-9a-f]{64}$/u.test(result)) throw new Error('APPLICATION_TOOL_INPUT_INVALID')
+        return result
+      }
       const fields = (...keys: string[]): void => { if (Object.keys(value).some(key => !keys.includes(key))) throw new Error('APPLICATION_TOOL_INPUT_INVALID') }
       const revision = (input: unknown): PeerRevision => {
         const result = parseApplicationInput(revisionSchema, input) as unknown as PeerRevision
@@ -58,7 +64,8 @@ export function createApplicationTools(session: ApplicationSession, options: { r
             ...(value.basedOn === undefined ? {} : { basedOn: revision(value.basedOn) }) })
           return operation.get()
         }
-        case 'operation': fields('operationId'); return session.operations.inspect(text('operationId'))
+        case 'operation': fields('operationId', 'author'); return session.operations.inspect(text('operationId'),
+          value.author === undefined ? {} : { author: publicKey('author') })
         case 'retry': fields('operationId'); await session.retry(text('operationId')); return session.operations.get(text('operationId'))
         case 'wait': fields('operationId'); return session.operations.wait(text('operationId'), callOptions)
         case 'recoveries': fields(); return session.inspectRecovery()
@@ -75,9 +82,10 @@ export function createApplicationTools(session: ApplicationSession, options: { r
           callOptions.signal?.throwIfAborted(); session.signal.throwIfAborted(); throw new Error('APPLICATION_CHANGES_ENDED')
         }
         case 'reapply': {
-          fields('name', 'input', 'operationId', 'originalOperationId', 'basedOn')
+          fields('name', 'input', 'operationId', 'originalOperationId', 'basedOn', 'originalAuthor')
           const operation = await session.reapply(text('originalOperationId'), text('name'), value.input as never, { operationId: text('operationId'),
-            ...(value.basedOn === undefined ? {} : { basedOn: revision(value.basedOn) }) })
+            ...(value.basedOn === undefined ? {} : { basedOn: revision(value.basedOn) }),
+            ...(value.originalAuthor === undefined ? {} : { originalAuthor: publicKey('originalAuthor') }) })
           return operation.get()
         }
         case 'takeover':
