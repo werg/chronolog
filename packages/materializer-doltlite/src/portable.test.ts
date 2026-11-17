@@ -1,6 +1,6 @@
 import {
   MaterializerContractError,
-  digestAdmittedOrder,
+  digestReplayOrder,
   type ChronologMaterializationOutcome,
   type ResolvedMaterializationInvocation,
 } from '@chronolog/materializer'
@@ -12,7 +12,7 @@ import {
   type DoltLitePortableMaterializerLike,
   type DoltLitePortableProjectionContext,
 } from './portable.js'
-import type { AdmittedTransaction, MaterializedRevision, TransactionLogRow } from './types.js'
+import type { ReplayProposal, MaterializedRevision, TransactionLogRow } from './types.js'
 
 const bytes = (fill: number, length = 32): Uint8Array => new Uint8Array(length).fill(fill)
 
@@ -33,43 +33,41 @@ function core(index: number): TransactionCore {
   }
 }
 
-function transaction(index: number): AdmittedTransaction {
+function transaction(index: number): ReplayProposal {
   const value = core(index)
   return {
     txId: bytes(0x10 + index),
-    authorFeedSequence: BigInt(index + 1),
     candidateDigest: bytes(0x20 + index),
     canonicalCandidate: encodeTransactionCore(value),
     core: value,
   }
 }
 
-function logRow(item: AdmittedTransaction, orderIndex: number): TransactionLogRow {
+function logRow(item: ReplayProposal, orderIndex: number): TransactionLogRow {
   return {
     operationId: item.core.operationId,
     txId: item.txId,
-    orderKey: { authorTimestampMs: item.core.authorTimestampMs, authorId: item.core.authorId, authorFeedSequence: item.authorFeedSequence, txId: item.txId },
+    orderKey: { authorTimestampMs: item.core.authorTimestampMs, authorId: item.core.authorId, txId: item.txId },
     orderIndex,
     outcome: 'accepted',
     rejectionCode: null,
     failingStatementIndex: null,
     authorId: item.core.authorId,
     authorTimestampMs: item.core.authorTimestampMs,
-    authorFeedSequence: item.authorFeedSequence,
     candidateDigest: item.candidateDigest,
     canonicalCandidate: item.canonicalCandidate,
   }
 }
 
 interface FakeMaterializer extends DoltLitePortableMaterializerLike {
-  readonly calls: AdmittedTransaction[][]
+  readonly calls: ReplayProposal[][]
   orderLength: number
   log: TransactionLogRow[]
   /** Optional corruption of the log after materialize, to model a misbehaving engine. */
   afterMaterialize?: (log: TransactionLogRow[]) => TransactionLogRow[]
 }
 
-function fakeMaterializer(prior: readonly AdmittedTransaction[]): FakeMaterializer {
+function fakeMaterializer(prior: readonly ReplayProposal[]): FakeMaterializer {
   const fake: FakeMaterializer = {
     revision: BigInt(prior.length),
     orderLength: prior.length,
@@ -90,9 +88,9 @@ function fakeMaterializer(prior: readonly AdmittedTransaction[]): FakeMaterializ
 }
 
 async function invocation(
-  prior: readonly AdmittedTransaction[],
+  prior: readonly ReplayProposal[],
   replayFromIndex: number,
-  suffix: readonly AdmittedTransaction[],
+  suffix: readonly ReplayProposal[],
   overrides: Record<string, unknown> = {},
   inputOverrides: Partial<ResolvedMaterializationInvocation> = {},
 ): Promise<ResolvedMaterializationInvocation> {
@@ -102,14 +100,14 @@ async function invocation(
       continuation: null,
       expectedEngineDigest: engineDigest,
       expectedExecutionManifestDigest: manifestDigest,
-      expectedPreviousOrderDigest: await digestAdmittedOrder(prior.map((item) => item.txId)),
+      expectedPreviousOrderDigest: await digestReplayOrder(prior.map((item) => item.txId)),
       replayFromIndex,
       targetOrderLength: target.length,
-      targetOrderDigest: await digestAdmittedOrder(target.map((item) => item.txId)),
+      targetOrderDigest: await digestReplayOrder(target.map((item) => item.txId)),
       ...overrides,
     },
     continuation: null,
-    admittedSuffix: { transactions: suffix },
+    replaySuffix: { transactions: suffix },
     exactReadSet: [],
     executionManifest: {},
     ...inputOverrides,
@@ -136,7 +134,7 @@ async function contractCode(promise: Promise<unknown>): Promise<string> {
 const prior = [transaction(0), transaction(1), transaction(2)]
 
 describe('DoltLite portable kernel', () => {
-  it('replays the retained prefix plus the admitted suffix and projects the result', async () => {
+  it('replays the retained prefix plus the replay suffix and projects the result', async () => {
     const materializer = fakeMaterializer(prior)
     const { kernel, projections } = kernelFor(materializer)
     const suffix = [transaction(5), transaction(6)]
@@ -221,10 +219,10 @@ describe('DoltLite portable kernel', () => {
     const { kernel } = kernelFor(materializer)
     const committed = await invocation(prior, 3, [transaction(5), transaction(6)])
     // Same length, swapped order.
-    const swapped = { ...committed, admittedSuffix: { ...committed.admittedSuffix, transactions: [transaction(6), transaction(5)] } }
+    const swapped = { ...committed, replaySuffix: { ...committed.replaySuffix, transactions: [transaction(6), transaction(5)] } }
     expect(await contractCode(kernel.materialize(swapped))).toBe('MATERIALIZER_TARGET_ORDER_DIGEST_MISMATCH')
     // Same length, substituted transaction.
-    const substituted = { ...committed, admittedSuffix: { ...committed.admittedSuffix, transactions: [transaction(5), transaction(7)] } }
+    const substituted = { ...committed, replaySuffix: { ...committed.replaySuffix, transactions: [transaction(5), transaction(7)] } }
     expect(await contractCode(kernel.materialize(substituted))).toBe('MATERIALIZER_TARGET_ORDER_DIGEST_MISMATCH')
     expect(materializer.calls).toEqual([])
   })

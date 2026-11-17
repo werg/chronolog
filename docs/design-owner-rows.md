@@ -507,8 +507,9 @@ the CLI takes readable JSON (`{"platform": "grant", …}`).
   - `ExecutionManifest` is now version 2:
     `{version, profile, engine, engineDigest, programVersion: 3, platformDigest, recursiveTriggers: true, limits}`.
   - `platformDigest` is SHA-256 over `PLATFORM_CODE_VERSION` (bumped with any
-    change to what an operation checks or writes), the platform schema and
-    views, and the triggers generated for a fixed reference table.
+    change to what an operation checks or writes), the protected transaction-log
+    schema, the platform schema and views, and the triggers generated for a fixed
+    reference table.
   - A replica already rejects a candidate whose manifest it does not run
     (`manifest_mismatch`).
 - **Tooling.** The client SDK and CLI get typed builders.

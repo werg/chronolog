@@ -10,8 +10,8 @@ import type { MaterializedApplicationSnapshot } from '@chronolog/materializer'
 
 import { DeterministicMaterializer } from './native.js'
 import { createDoltLiteMaterializationRuntime } from './runtime-adapter.js'
-import { MaterializerFixture, ROOT_KEY, admitted, rows } from './test-fixtures.js'
-import type { AdmittedTransaction } from './types.js'
+import { MaterializerFixture, ROOT_KEY, replayProposal, rows } from './test-fixtures.js'
+import type { ReplayProposal } from './types.js'
 
 const fixtures = new MaterializerFixture()
 afterEach(async () => fixtures.cleanup())
@@ -321,6 +321,6 @@ async function transaction(
   id: string,
   steps: readonly ProgramStep[],
   executionManifestDigest: Uint8Array,
-): Promise<AdmittedTransaction> {
-  return admitted(timestamp, id, steps, executionManifestDigest)
+): Promise<ReplayProposal> {
+  return replayProposal(timestamp, id, steps, executionManifestDigest)
 }

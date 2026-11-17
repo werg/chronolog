@@ -29,7 +29,7 @@ import {
 } from '@chronolog/protocol'
 
 import type {
-  ChronologAdmittedSuffix,
+  ChronologReplaySuffix,
   ChronologArtifactKind,
   ChronologMaterializationContinuation,
   ChronologMaterializationInvocation,
@@ -61,7 +61,7 @@ const HASH_ALGORITHMS: readonly ContentHashAlgorithm[] = [
   'dolt-blake3-160',
 ]
 const ARTIFACT_KINDS: readonly ChronologArtifactKind[] = [
-  'admitted-suffix',
+  'replay-suffix',
   'execution-manifest',
   'continuation',
   'materialization-manifest',
@@ -265,7 +265,7 @@ export function encodeMaterializationInvocation(value: ChronologMaterializationI
   canonicalInvariant(value.context.groupId.length === 32, 'SCHEMA_INVALID', 'Invocation group ID must contain 32 bytes')
   canonicalInvariant(value.context.logicalTimeMs === null, 'SCHEMA_INVALID', 'Pure materialization v1 forbids logical time')
   canonicalInvariant(value.context.entropySeed === null, 'SCHEMA_INVALID', 'Pure materialization v1 forbids caller entropy')
-  canonicalInvariant(value.admittedSuffix.kind === 'admitted-suffix', 'SCHEMA_INVALID', 'Invocation admitted suffix has the wrong kind')
+  canonicalInvariant(value.replaySuffix.kind === 'replay-suffix', 'SCHEMA_INVALID', 'Invocation replay suffix has the wrong kind')
   canonicalInvariant(value.executionManifest.kind === 'execution-manifest', 'SCHEMA_INVALID', 'Invocation execution manifest has the wrong kind')
   canonicalInvariant(value.continuation === null || value.continuation.kind === 'continuation', 'SCHEMA_INVALID', 'Invocation continuation has the wrong kind')
   requireIndex(value.replayFromIndex, 'replayFromIndex')
@@ -277,7 +277,7 @@ export function encodeMaterializationInvocation(value: ChronologMaterializationI
     [2, integerMap([[0, value.context.groupId], [1, value.context.logicalTimeMs], [2, value.context.entropySeed]])],
     [3, value.previous === null ? null : inputToCbor(value.previous)],
     [4, inputToCbor(value.replayBase)],
-    [5, exactArtifactRefToCbor(value.admittedSuffix)],
+    [5, exactArtifactRefToCbor(value.replaySuffix)],
     [6, exactArtifactRefToCbor(value.executionManifest)],
     [7, value.continuation === null ? null : exactArtifactRefToCbor(value.continuation)],
     [8, requireDigest(value.expectedEngineDigest, 'expectedEngineDigest')],
@@ -305,10 +305,10 @@ export function decodeMaterializationInvocation(
   canonicalInvariant(entropySeed === null, 'SCHEMA_INVALID', 'Pure materialization v1 forbids caller entropy')
   const previousValue = required(map, 3, 'materialization_invocation.previous')
   const continuationValue = required(map, 7, 'materialization_invocation.continuation')
-  const admittedSuffix = exactArtifactRefFromCbor(required(map, 5, 'materialization_invocation.admitted_suffix'), 'materialization_invocation.admitted_suffix')
+  const replaySuffix = exactArtifactRefFromCbor(required(map, 5, 'materialization_invocation.replay_suffix'), 'materialization_invocation.replay_suffix')
   const executionManifest = exactArtifactRefFromCbor(required(map, 6, 'materialization_invocation.execution_manifest'), 'materialization_invocation.execution_manifest')
   const continuation = continuationValue === null ? null : exactArtifactRefFromCbor(continuationValue, 'materialization_invocation.continuation')
-  canonicalInvariant(admittedSuffix.kind === 'admitted-suffix', 'SCHEMA_INVALID', 'Invocation admitted suffix has the wrong kind')
+  canonicalInvariant(replaySuffix.kind === 'replay-suffix', 'SCHEMA_INVALID', 'Invocation replay suffix has the wrong kind')
   canonicalInvariant(executionManifest.kind === 'execution-manifest', 'SCHEMA_INVALID', 'Invocation execution manifest has the wrong kind')
   canonicalInvariant(continuation === null || continuation.kind === 'continuation', 'SCHEMA_INVALID', 'Invocation continuation has the wrong kind')
   const replayFromIndex = expectUint(required(map, 11, 'materialization_invocation.replay_from_index'), 'materialization_invocation.replay_from_index')
@@ -324,7 +324,7 @@ export function decodeMaterializationInvocation(
     },
     previous: previousValue === null ? null : inputFromCbor(previousValue, 'materialization_invocation.previous'),
     replayBase: inputFromCbor(required(map, 4, 'materialization_invocation.replay_base'), 'materialization_invocation.replay_base'),
-    admittedSuffix,
+    replaySuffix,
     executionManifest,
     continuation,
     expectedEngineDigest: expectBytes(required(map, 8, 'materialization_invocation.expected_engine_digest'), 'materialization_invocation.expected_engine_digest', 32),
@@ -336,9 +336,8 @@ export function decodeMaterializationInvocation(
   }
 }
 
-function admittedTransactionToCbor(value: ChronologAdmittedSuffix['transactions'][number]): CborValue {
+function replayProposalToCbor(value: ChronologReplaySuffix['transactions'][number]): CborValue {
   canonicalInvariant(value.txId.length > 0, 'SCHEMA_INVALID', 'Transaction ID cannot be empty')
-  canonicalInvariant(value.authorFeedSequence >= 0n, 'INTEGER_OUT_OF_RANGE', 'Author feed sequence cannot be negative')
   canonicalInvariant(value.candidateDigest.length === 32, 'SCHEMA_INVALID', 'Candidate digest must contain 32 bytes')
   canonicalInvariant(value.canonicalCandidate.length > 0, 'SCHEMA_INVALID', 'Canonical candidate cannot be empty')
   canonicalInvariant(
@@ -348,63 +347,61 @@ function admittedTransactionToCbor(value: ChronologAdmittedSuffix['transactions'
     'SCHEMA_INVALID',
     'Candidate bytes are not canonical',
   )
-  return [value.txId, value.authorFeedSequence, value.candidateDigest, value.canonicalCandidate]
+  return [value.txId, value.candidateDigest, value.canonicalCandidate]
 }
 
-export function encodeAdmittedSuffix(value: ChronologAdmittedSuffix): Uint8Array {
-  canonicalInvariant(value.version === 1, 'SCHEMA_INVALID', 'Unsupported admitted suffix version')
-  canonicalInvariant(value.groupId.length === 32, 'SCHEMA_INVALID', 'Admitted suffix group ID must contain 32 bytes')
+export function encodeReplaySuffix(value: ChronologReplaySuffix): Uint8Array {
+  canonicalInvariant(value.version === 1, 'SCHEMA_INVALID', 'Unsupported replay suffix version')
+  canonicalInvariant(value.groupId.length === 32, 'SCHEMA_INVALID', 'Replay suffix group ID must contain 32 bytes')
   requireIndex(value.replayFromIndex, 'replayFromIndex')
   requireIndex(value.targetOrderLength, 'targetOrderLength')
-  canonicalInvariant(value.replayFromIndex + value.transactions.length === value.targetOrderLength, 'SCHEMA_INVALID', 'Admitted suffix length does not reach target order length')
+  canonicalInvariant(value.replayFromIndex + value.transactions.length === value.targetOrderLength, 'SCHEMA_INVALID', 'Replay suffix length does not reach target order length')
   return encodeCanonicalCbor(integerMap([
     [0, 1n],
     [1, value.groupId],
     [2, BigInt(value.replayFromIndex)],
     [3, BigInt(value.targetOrderLength)],
     [4, requireDigest(value.targetOrderDigest, 'targetOrderDigest')],
-    [5, value.transactions.map(admittedTransactionToCbor)],
+    [5, value.transactions.map(replayProposalToCbor)],
   ]))
 }
 
-export function decodeAdmittedSuffix(
+export function decodeReplaySuffix(
   bytes: Uint8Array,
   limits: DecodeLimits = MATERIALIZER_DECODE_LIMITS,
-): ChronologAdmittedSuffix {
-  const map = root(bytes, 'admitted_suffix', limits)
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5], 'admitted_suffix')
-  canonicalInvariant(expectBigint(required(map, 0, 'admitted_suffix.version'), 'admitted_suffix.version') === 1n, 'SCHEMA_INVALID', 'Unsupported admitted suffix version')
-  const transactions = expectArray(required(map, 5, 'admitted_suffix.transactions'), 'admitted_suffix.transactions').map((value, index) => {
-    const tuple = expectArray(value, `admitted_suffix.transactions[${index}]`)
-    canonicalInvariant(tuple.length === 4, 'SCHEMA_INVALID', `admitted_suffix.transactions[${index}] has invalid arity`)
-    const canonicalCandidate = expectBytes(tuple[3] ?? null, `admitted_suffix.transactions[${index}].canonical_candidate`)
+): ChronologReplaySuffix {
+  const map = root(bytes, 'replay_suffix', limits)
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5], 'replay_suffix')
+  canonicalInvariant(expectBigint(required(map, 0, 'replay_suffix.version'), 'replay_suffix.version') === 1n, 'SCHEMA_INVALID', 'Unsupported replay suffix version')
+  const transactions = expectArray(required(map, 5, 'replay_suffix.transactions'), 'replay_suffix.transactions').map((value, index) => {
+    const tuple = expectArray(value, `replay_suffix.transactions[${index}]`)
+    canonicalInvariant(tuple.length === 3, 'SCHEMA_INVALID', `replay_suffix.transactions[${index}] has invalid arity`)
+    const canonicalCandidate = expectBytes(tuple[2] ?? null, `replay_suffix.transactions[${index}].canonical_candidate`)
     const core = decodeTransactionCore(canonicalCandidate)
     canonicalInvariant(
       encodeTransactionCore(core).every((byte, offset) => byte === canonicalCandidate[offset]),
       'SCHEMA_INVALID',
-      `admitted_suffix.transactions[${index}] is not canonical`,
+      `replay_suffix.transactions[${index}] is not canonical`,
     )
     return {
-      txId: expectBytes(tuple[0] ?? null, `admitted_suffix.transactions[${index}].tx_id`),
-      authorFeedSequence: expectBigint(tuple[1] ?? null, `admitted_suffix.transactions[${index}].author_feed_sequence`),
-      candidateDigest: expectBytes(tuple[2] ?? null, `admitted_suffix.transactions[${index}].candidate_digest`, 32),
+      txId: expectBytes(tuple[0] ?? null, `replay_suffix.transactions[${index}].tx_id`),
+      candidateDigest: expectBytes(tuple[1] ?? null, `replay_suffix.transactions[${index}].candidate_digest`, 32),
       canonicalCandidate,
       core,
     }
   })
   for (const [index, transaction] of transactions.entries()) {
-    canonicalInvariant(transaction.txId.length > 0, 'SCHEMA_INVALID', `admitted_suffix.transactions[${index}].tx_id cannot be empty`)
-    canonicalInvariant(transaction.authorFeedSequence >= 0n, 'INTEGER_OUT_OF_RANGE', `admitted_suffix.transactions[${index}].author_feed_sequence cannot be negative`)
+    canonicalInvariant(transaction.txId.length > 0, 'SCHEMA_INVALID', `replay_suffix.transactions[${index}].tx_id cannot be empty`)
   }
-  const replayFromIndex = expectUint(required(map, 2, 'admitted_suffix.replay_from_index'), 'admitted_suffix.replay_from_index')
-  const targetOrderLength = expectUint(required(map, 3, 'admitted_suffix.target_order_length'), 'admitted_suffix.target_order_length')
-  canonicalInvariant(replayFromIndex + transactions.length === targetOrderLength, 'SCHEMA_INVALID', 'Admitted suffix length does not reach target order length')
+  const replayFromIndex = expectUint(required(map, 2, 'replay_suffix.replay_from_index'), 'replay_suffix.replay_from_index')
+  const targetOrderLength = expectUint(required(map, 3, 'replay_suffix.target_order_length'), 'replay_suffix.target_order_length')
+  canonicalInvariant(replayFromIndex + transactions.length === targetOrderLength, 'SCHEMA_INVALID', 'Replay suffix length does not reach target order length')
   return {
     version: 1,
-    groupId: expectBytes(required(map, 1, 'admitted_suffix.group_id'), 'admitted_suffix.group_id', 32),
+    groupId: expectBytes(required(map, 1, 'replay_suffix.group_id'), 'replay_suffix.group_id', 32),
     replayFromIndex,
     targetOrderLength,
-    targetOrderDigest: expectBytes(required(map, 4, 'admitted_suffix.target_order_digest'), 'admitted_suffix.target_order_digest', 32),
+    targetOrderDigest: expectBytes(required(map, 4, 'replay_suffix.target_order_digest'), 'replay_suffix.target_order_digest', 32),
     transactions,
   }
 }
@@ -587,14 +584,14 @@ export async function digestMaterializationInvocation(value: ChronologMaterializ
   return digestFramed('chronolog/materialization-invocation/v1', encodeMaterializationInvocation(value))
 }
 
-export async function digestAdmittedOrder(transactionIds: readonly Uint8Array[]): Promise<Uint8Array> {
+export async function digestReplayOrder(transactionIds: readonly Uint8Array[]): Promise<Uint8Array> {
   const framed = transactionIds.map((transactionId) => {
     canonicalInvariant(transactionId.length > 0, 'SCHEMA_INVALID', 'Transaction ID cannot be empty')
     const length = new Uint8Array(4)
     new DataView(length.buffer).setUint32(0, transactionId.length, false)
     return concatBytes(length, transactionId)
   })
-  return digestFramed('chronolog/admitted-order/v1', concatBytes(...framed))
+  return digestFramed('chronolog/replay-order/v1', concatBytes(...framed))
 }
 
 export async function digestFramed(domain: string, payload: Uint8Array): Promise<Uint8Array> {

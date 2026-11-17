@@ -43,8 +43,8 @@ export interface ValidatorAttestation {
   readonly acceptedAboveMs: bigint; readonly candidateDigest: Uint8Array; readonly decision: 'admit'; readonly policyVersion: bigint
 }
 export interface ValidatorHeartbeat { readonly groupId: Uint8Array; readonly membershipRevision: Uint8Array; readonly validatorCapability: Uint8Array; readonly validatorId: Uint8Array; readonly acceptanceCutoffMs: bigint }
-export interface TransactionOrderKey { readonly authorTimestampMs: bigint; readonly authorId: Uint8Array; readonly authorFeedSequence: bigint; readonly txId: Uint8Array }
-export interface CandidateTransportIdentity { readonly authorFeedSequence: bigint; readonly txId: Uint8Array }
+/** Application order is independent of transport feeds and receipt positions. */
+export interface TransactionOrderKey { readonly authorTimestampMs: bigint; readonly authorId: Uint8Array; readonly txId: Uint8Array }
 
 function metadataToCbor(metadata: ReadonlyMap<string, Uint8Array> | undefined): CborValue | undefined {
   if (metadata === undefined) return undefined
@@ -142,6 +142,6 @@ export function decodeValidatorHeartbeat(bytes: Uint8Array): ValidatorHeartbeat 
   return { groupId: expectBytes(required(map, 1, 'heartbeat.group_id'), 'heartbeat.group_id'), membershipRevision: expectBytes(required(map, 2, 'heartbeat.membership_revision'), 'heartbeat.membership_revision'), validatorCapability: expectBytes(required(map, 3, 'heartbeat.validator_capability'), 'heartbeat.validator_capability'), validatorId: expectBytes(required(map, 4, 'heartbeat.validator_id'), 'heartbeat.validator_id'), acceptanceCutoffMs: expectUint64(required(map, 5, 'heartbeat.acceptance_cutoff_ms'), 'heartbeat.acceptance_cutoff_ms') }
 }
 
-export function transactionOrderKey(core: Pick<TransactionCore, 'authorTimestampMs' | 'authorId'>, transport: CandidateTransportIdentity): TransactionOrderKey { protocolInvariant(transport.authorFeedSequence >= 0n, 'INTEGER_OUT_OF_RANGE', 'Author feed sequence cannot be negative'); return { authorTimestampMs: core.authorTimestampMs, authorId: core.authorId, ...transport } }
-export function compareTransactionOrder(left: TransactionOrderKey, right: TransactionOrderKey): number { if (left.authorTimestampMs !== right.authorTimestampMs) return left.authorTimestampMs < right.authorTimestampMs ? -1 : 1; const authorOrder = compareBytes(left.authorId, right.authorId); if (authorOrder !== 0) return authorOrder; if (left.authorFeedSequence !== right.authorFeedSequence) return left.authorFeedSequence < right.authorFeedSequence ? -1 : 1; return compareBytes(left.txId, right.txId) }
+export function transactionOrderKey(core: Pick<TransactionCore, 'authorTimestampMs' | 'authorId'>, txId: Uint8Array): TransactionOrderKey { return { authorTimestampMs: core.authorTimestampMs, authorId: core.authorId, txId } }
+export function compareTransactionOrder(left: TransactionOrderKey, right: TransactionOrderKey): number { if (left.authorTimestampMs !== right.authorTimestampMs) return left.authorTimestampMs < right.authorTimestampMs ? -1 : 1; const authorOrder = compareBytes(left.authorId, right.authorId); if (authorOrder !== 0) return authorOrder; return compareBytes(left.txId, right.txId) }
 export function assertUniqueOrderKeys(keys: readonly TransactionOrderKey[]): void { const sorted = [...keys].sort(compareTransactionOrder); for (let index = 1; index < sorted.length; index += 1) if (compareTransactionOrder(sorted[index - 1]!, sorted[index]!) === 0) throw new ProtocolError('DUPLICATE_TRANSACTION', 'Duplicate transaction order key') }

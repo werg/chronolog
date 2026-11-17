@@ -9,8 +9,8 @@
  * phase (wall time on a loaded machine is mostly fsync noise).
  */
 
-import type { AdmittedTransaction } from '@chronolog/materializer-doltlite'
-import { MaterializerFixture, admitted, testKey } from '@chronolog/materializer-doltlite/testing'
+import type { ReplayProposal } from '@chronolog/materializer-doltlite'
+import { MaterializerFixture, replayProposal, testKey } from '@chronolog/materializer-doltlite/testing'
 
 const TXS = Number(process.env.TXS ?? 300)
 const ROWS = Number(process.env.ROWS ?? 20)
@@ -19,10 +19,10 @@ const WRITER = testKey(0x10)
 
 const fixtures = new MaterializerFixture()
 const { materializer } = await fixtures.open({ rootAdministrator: ROOT })
-const transactions: AdmittedTransaction[] = []
+const transactions: ReplayProposal[] = []
 let clock = 1n
-async function add(author: Uint8Array, ...steps: Parameters<typeof admitted>[2]): Promise<void> {
-  transactions.push(await admitted(clock, `tx-${clock}`, steps, materializer.executionManifestDigest, author))
+async function add(author: Uint8Array, ...steps: Parameters<typeof replayProposal>[2]): Promise<void> {
+  transactions.push(await replayProposal(clock, `tx-${clock}`, steps, materializer.executionManifestDigest, author))
   clock += 1n
 }
 

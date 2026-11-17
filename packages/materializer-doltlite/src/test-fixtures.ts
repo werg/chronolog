@@ -15,7 +15,7 @@ import {
 
 import { createDoltLiteExecutionManifest } from './manifest.js'
 import { DeterministicMaterializer } from './native.js'
-import type { AdmittedTransaction, LocalSqlValue, MaterializerOptions } from './types.js'
+import type { ReplayProposal, LocalSqlValue, MaterializerOptions } from './types.js'
 
 /** Test-only helpers for driving a real materializer with signed-looking transactions. */
 
@@ -59,16 +59,16 @@ export class MaterializerFixture {
 }
 
 /**
- * An admitted transaction with id `id`, authored by `author` at `timestamp`.
+ * A replay proposal with id `id`, authored by `author` at `timestamp`.
  * String steps are SQL without parameters.
  */
-export async function admitted(
+export async function replayProposal(
   timestamp: bigint,
   id: string,
   steps: readonly (ProgramStep | string)[],
   executionManifestDigest: Uint8Array,
   author: Uint8Array = ROOT_KEY,
-): Promise<AdmittedTransaction> {
+): Promise<ReplayProposal> {
   const core: TransactionCore = {
     operationId: id,
     groupId: testKey(1), membershipRevision: testKey(2), validationPolicy: testKey(3), authorId: author,
@@ -78,7 +78,6 @@ export async function admitted(
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(id),
-    authorFeedSequence: timestamp,
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

@@ -4,9 +4,9 @@ Chronolog has one application ordering rule:
 
 `(signed author timestamp, signing public key, stable proposal ID)`.
 
-The outer feed sequence is fixed to zero in this comparator. Given the same
-proposals, every replica derives the same relative application order.
-Relay choice, network arrival and receipt-log position are not sorting keys.
+Given the same proposals, every replica derives the same relative application
+order. Transport feed sequence, relay choice, network arrival and receipt-log
+position are not part of the application order key.
 The provider can change the included set, but cannot choose an ordering rule
 for that set. SQL and effective event cursors follow the same chronological
 application prefix.

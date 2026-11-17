@@ -43,7 +43,7 @@ import { materializedLogDigest } from './snapshot-evidence.js'
 import { PLATFORM_DIGEST } from './platform/digest.js'
 import { initializePlatform, readRootAdministrator } from './platform/schema.js'
 import type {
-  AdmittedTransaction,
+  ReplayProposal,
   DatabaseLike,
   LocalSqlOptions,
   LocalSqlQueryResult,
@@ -304,7 +304,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     return () => this.#subscribers.delete(subscriber)
   }
 
-  async materialize(orderedTransactions: readonly AdmittedTransaction[]): Promise<MaterializedRevision | null> {
+  async materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null> {
     this.#assertOpen()
     if (this.#materializing) throw new Error('MATERIALIZER_REENTRANT_CALL')
     this.#materializing = true
@@ -464,7 +464,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         for (let index = checkpoint.prefixLength; index < prefixLength; index += 1) {
           const row = prefix[index]!
           this.#applyTransaction({
-            txId: row.txId, authorFeedSequence: row.authorFeedSequence,
+            txId: row.txId,
             candidateDigest: row.candidateDigest, canonicalCandidate: row.canonicalCandidate,
             core: decodeTransactionCore(row.canonicalCandidate),
           }, index)
@@ -507,7 +507,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#writer.close()
   }
 
-  #applyTransaction(transaction: AdmittedTransaction, orderIndex: number): void {
+  #applyTransaction(transaction: ReplayProposal, orderIndex: number): void {
     this.#writer.exec('BEGIN IMMEDIATE')
     this.#writer.exec('SAVEPOINT chronolog_program')
     let rejection: { readonly code: string; readonly statementIndex: number | null } | null = null
@@ -660,20 +660,17 @@ function validateCheckpointRefs(
 }
 
 async function validateTransactionSet(
-  transactions: readonly AdmittedTransaction[],
+  transactions: readonly ReplayProposal[],
   verified: readonly TransactionLogRow[],
 ): Promise<void> {
   const seen = new Set<string>()
   const proposals = new Set<string>()
   for (const [index, transaction] of transactions.entries()) {
     if (transaction.txId.length === 0) throw new MaterializerInputError('MATERIALIZER_TRANSACTION_ID_INVALID')
-    if (transaction.authorFeedSequence < 0n || transaction.authorFeedSequence > (1n << 63n) - 1n) {
-      throw new MaterializerInputError('MATERIALIZER_AUTHOR_FEED_SEQUENCE_INVALID')
-    }
     if (!bytesEqual(encodeTransactionCore(transaction.core), transaction.canonicalCandidate)) {
       throw new MaterializerInputError('MATERIALIZER_CANONICAL_CANDIDATE_MISMATCH')
     }
-    // A logged row's digest was checked when it was admitted. It is a pure function of the canonical bytes, which the check above
+    // A logged row's digest was checked when it was applied. It is a pure function of the canonical bytes, which the check above
     // binds to this core, so a byte-identical candidate needs no recheck.
     const known = verified[index]
     const alreadyVerified = known !== undefined &&
@@ -702,7 +699,7 @@ function openDatabase(options: MaterializerOptions): ReturnType<NonNullable<Mate
   return options.openDatabase(options)
 }
 
-function verifyFinalTransactions(final: readonly TransactionLogRow[], transactions: readonly AdmittedTransaction[]): void {
+function verifyFinalTransactions(final: readonly TransactionLogRow[], transactions: readonly ReplayProposal[]): void {
   if (transactions.length < final.length) throw new Error('MATERIALIZER_FINAL_PREFIX_CHANGED')
   for (let index = 0; index < final.length; index += 1) {
     if (!sameIdentity(final[index]!, transactions[index]!)) throw new Error('MATERIALIZER_FINAL_PREFIX_CHANGED')
@@ -722,7 +719,7 @@ function verifyFinalPrefix(final: readonly TransactionLogRow[], current: readonl
 
 function validateExistingIdentities(
   existing: readonly TransactionLogRow[],
-  transactions: readonly AdmittedTransaction[],
+  transactions: readonly ReplayProposal[],
 ): void {
   const transactionsById = new Map(transactions.map((transaction) => [idKey(transaction.txId), transaction]))
   for (const row of existing) {
@@ -735,7 +732,7 @@ function validateExistingIdentities(
 
 function verifyReplayBase(
   baseLog: readonly TransactionLogRow[],
-  transactions: readonly AdmittedTransaction[],
+  transactions: readonly ReplayProposal[],
   prefixLength: number,
 ): void {
   if (baseLog.length !== prefixLength) throw new Error('MATERIALIZER_CHECKPOINT_PREFIX_LENGTH_MISMATCH')
@@ -757,7 +754,7 @@ function verifyNextLogIndex(database: DatabaseLike, expectedIndex: number): void
   }
 }
 
-function verifyDesiredLog(log: readonly TransactionLogRow[], transactions: readonly AdmittedTransaction[]): void {
+function verifyDesiredLog(log: readonly TransactionLogRow[], transactions: readonly ReplayProposal[]): void {
   if (log.length !== transactions.length) throw new Error('MATERIALIZER_LOG_LENGTH_MISMATCH')
   for (let index = 0; index < log.length; index += 1) {
     if (log[index]!.orderIndex !== index || !sameIdentity(log[index]!, transactions[index]!)) {
@@ -766,13 +763,12 @@ function verifyDesiredLog(log: readonly TransactionLogRow[], transactions: reado
   }
 }
 
-function sameIdentity(row: TransactionLogRow, transaction: AdmittedTransaction): boolean {
+function sameIdentity(row: TransactionLogRow, transaction: ReplayProposal): boolean {
   return bytesEqual(row.txId, transaction.txId) &&
     bytesEqual(row.candidateDigest, transaction.candidateDigest) &&
     bytesEqual(row.canonicalCandidate, transaction.canonicalCandidate) &&
     bytesEqual(row.authorId, transaction.core.authorId) &&
     row.authorTimestampMs === transaction.core.authorTimestampMs &&
-    row.authorFeedSequence === transaction.authorFeedSequence &&
     compareTransactionOrder(row.orderKey, orderKeyOf(transaction)) === 0
 }
 
@@ -815,7 +811,7 @@ function earliestDifference(previous: readonly Uint8Array[], next: readonly Uint
 }
 
 function logRow(
-  transaction: AdmittedTransaction,
+  transaction: ReplayProposal,
   orderIndex: number,
   rejection: { readonly code: string; readonly statementIndex: number | null } | null,
 ): Omit<TransactionLogRow, 'orderKey'> {
@@ -825,7 +821,6 @@ function logRow(
     operationId: transaction.core.operationId,
     authorId: transaction.core.authorId,
     authorTimestampMs: transaction.core.authorTimestampMs,
-    authorFeedSequence: transaction.authorFeedSequence,
     candidateDigest: transaction.candidateDigest,
     canonicalCandidate: transaction.canonicalCandidate,
     outcome: rejection === null ? 'accepted' : 'rejected',
@@ -849,10 +844,10 @@ function verifyStoredManifest(stored: StoredExecutionManifest, artifacts: Manife
 }
 
 function rollbackIfActive(database: DatabaseLike): void { if (database.inTransaction) database.exec('ROLLBACK') }
-function orderKeyOf(transaction: AdmittedTransaction): TransactionOrderKey {
-  return { authorTimestampMs: transaction.core.authorTimestampMs, authorId: copyBytes(transaction.core.authorId), authorFeedSequence: transaction.authorFeedSequence, txId: copyBytes(transaction.txId) }
+function orderKeyOf(transaction: ReplayProposal): TransactionOrderKey {
+  return { authorTimestampMs: transaction.core.authorTimestampMs, authorId: copyBytes(transaction.core.authorId), txId: copyBytes(transaction.txId) }
 }
-function cloneTransaction(transaction: AdmittedTransaction): AdmittedTransaction { return structuredClone(transaction) }
+function cloneTransaction(transaction: ReplayProposal): ReplayProposal { return structuredClone(transaction) }
 function cloneLogRow(row: TransactionLogRow): TransactionLogRow { return structuredClone(row) }
 function idKey(bytes: Uint8Array): string { return bytesToBase64Url(bytes) }
 function copyBytes(value: Uint8Array): Uint8Array { return Uint8Array.from(value) }

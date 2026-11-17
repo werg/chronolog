@@ -1,6 +1,6 @@
 import {
   publicationRequestForRevision,
-  type AdmittedTransaction,
+  type ReplayProposal,
   type ChronologMaterializationRuntime,
   type MaterializedApplicationSnapshot,
   type MaterializationPublicationRequest,
@@ -24,7 +24,7 @@ export interface DoltLiteMaterializerRuntimeBackend {
   readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
   proposalIdAt(index: number): Uint8Array | null
-  materialize(orderedTransactions: readonly AdmittedTransaction[]): Promise<MaterializedRevision | null>
+  materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null>
   publishFinal?(prefixLength: number): Promise<void>
   localSql(
     sql: string,

@@ -10,8 +10,8 @@ import {
 import { afterEach, describe, expect, it } from 'vitest'
 
 import type { DeterministicMaterializer } from './materializer.js'
-import { MaterializerFixture, ROOT_KEY, admitted, rows, testKey } from './test-fixtures.js'
-import type { AdmittedTransaction } from './types.js'
+import { MaterializerFixture, ROOT_KEY, replayProposal, rows, testKey } from './test-fixtures.js'
+import type { ReplayProposal } from './types.js'
 
 const fixtures = new MaterializerFixture()
 afterEach(async () => fixtures.cleanup())
@@ -22,16 +22,16 @@ const CAROL = testKey(0x30)
 
 /** Appends transactions in order and reports each outcome as `accepted` or its rejection code. */
 class Ledger {
-  readonly #transactions: AdmittedTransaction[] = []
+  readonly #transactions: ReplayProposal[] = []
   #clock = 1n
 
   constructor(readonly materializer: DeterministicMaterializer) {}
 
-  get transactions(): readonly AdmittedTransaction[] { return [...this.#transactions] }
+  get transactions(): readonly ReplayProposal[] { return [...this.#transactions] }
 
   async submit(author: Uint8Array, ...steps: readonly (ProgramStep | string)[]): Promise<{ readonly outcome: string; readonly txId: Uint8Array; readonly step: number | null }> {
     const id = `tx-${this.#clock}`
-    const transaction = await admitted(this.#clock, id, steps, this.materializer.executionManifestDigest, author)
+    const transaction = await replayProposal(this.#clock, id, steps, this.materializer.executionManifestDigest, author)
     this.#clock += 1n
     this.#transactions.push(transaction)
     await this.materializer.materialize(this.#transactions)

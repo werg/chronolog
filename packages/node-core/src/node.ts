@@ -10,7 +10,7 @@ import {
   type WatermarkEvidence,
 } from '@chronolog/control-store/browser'
 import type {
-  AdmittedTransaction,
+  ReplayProposal,
   MaterializedLocalSqlResult,
   MaterializedLocalSqlValue,
   MaterializedTransactionOutcome,
@@ -1187,7 +1187,7 @@ export class ChronologNode {
     if (existing !== null && !pendingCandidate(existing.state)) return
     const candidate: StoredCandidate = existing ?? {
       txId, groupId: core.groupId, candidateDigest, validationPolicy: core.validationPolicy,
-      orderKey: transactionOrderKey(core, { authorFeedSequence: 0n, txId }),
+      orderKey: transactionOrderKey(core, txId),
       canonicalPayload: canonical, state: 'pending_validation', proofAttestationIds: [],
     }
     if (existing === null) { this.#control.putCandidate(candidate); this.#emit('candidate', txId) }
@@ -1501,12 +1501,11 @@ export class ChronologNode {
     }
     // Exclusion can remove a selected preview. Replay that removal before
     // exposing a final denial or advancing the immutable application prefix.
-    const ordered: AdmittedTransaction[] = this.#control.orderedCandidates().map((candidate) => {
+    const ordered: ReplayProposal[] = this.#control.orderedCandidates().map((candidate) => {
       const core = this.#candidateCores.get(this.#idKey(candidate.txId))
-      if (!core || !candidate.canonicalPayload) throw new Error('ADMITTED_CANDIDATE_PAYLOAD_MISSING')
+      if (!core || !candidate.canonicalPayload) throw new Error('REPLAY_PROPOSAL_PAYLOAD_MISSING')
       return {
         txId: candidate.txId,
-        authorFeedSequence: candidate.orderKey.authorFeedSequence,
         candidateDigest: candidate.candidateDigest,
         canonicalCandidate: candidate.canonicalPayload,
         core,

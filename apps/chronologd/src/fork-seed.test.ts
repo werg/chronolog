@@ -1,6 +1,6 @@
 import { DatabaseSync } from '@dolthub/doltlite'
 import { openReadOnlyDatabase, type DeterministicMaterializer } from '@chronolog/materializer-doltlite'
-import { MaterializerFixture, admitted, rows, testKey } from '@chronolog/materializer-doltlite/testing'
+import { MaterializerFixture, replayProposal, rows, testKey } from '@chronolog/materializer-doltlite/testing'
 import { platformObjectId, platformOp, sqlStatement, type ProgramStep } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -25,11 +25,11 @@ afterEach(async () => fixtures.cleanup())
 
 class Writer {
   #clock = 1n
-  readonly transactions: Awaited<ReturnType<typeof admitted>>[] = []
+  readonly transactions: Awaited<ReturnType<typeof replayProposal>>[] = []
   constructor(readonly materializer: DeterministicMaterializer) {}
 
   async submit(author: Uint8Array, ...steps: readonly (ProgramStep | string)[]): Promise<{ readonly outcome: string; readonly txId: Uint8Array }> {
-    const transaction = await admitted(this.#clock, `tx-${this.#clock}`, steps, this.materializer.executionManifestDigest, author)
+    const transaction = await replayProposal(this.#clock, `tx-${this.#clock}`, steps, this.materializer.executionManifestDigest, author)
     this.#clock += 1n
     this.transactions.push(transaction)
     await this.materializer.materialize(this.transactions)

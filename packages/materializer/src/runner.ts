@@ -5,7 +5,7 @@ import { transactionDigest } from '@chronolog/protocol'
 
 import {
   compareObjectRefs,
-  decodeAdmittedSuffix,
+  decodeReplaySuffix,
   decodeExecutionManifestArtifact,
   decodeMaterializationContinuation,
   decodeMaterializationInvocation,
@@ -49,7 +49,7 @@ export async function resolveDecodedMaterializationInvocation(
   const requested = [
     invocation.previous?.manifest,
     invocation.replayBase.manifest,
-    invocation.admittedSuffix,
+    invocation.replaySuffix,
     invocation.executionManifest,
     invocation.continuation,
   ].filter((ref): ref is ExactArtifactRef => ref !== undefined && ref !== null)
@@ -65,7 +65,7 @@ export async function resolveDecodedMaterializationInvocation(
     return bytes
   }
   const executionManifest = decodeExecutionManifestArtifact(bytesFor(invocation.executionManifest))
-  const admittedSuffix = decodeAdmittedSuffix(bytesFor(invocation.admittedSuffix))
+  const replaySuffix = decodeReplaySuffix(bytesFor(invocation.replaySuffix))
   const continuation = invocation.continuation === null
     ? null
     : decodeMaterializationContinuation(bytesFor(invocation.continuation))
@@ -79,17 +79,17 @@ export async function resolveDecodedMaterializationInvocation(
   if (!sameBytes(executionManifest.engineDigest, invocation.expectedEngineDigest)) {
     throw new MaterializerContractError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
   }
-  if (!sameBytes(admittedSuffix.groupId, invocation.context.groupId)) {
+  if (!sameBytes(replaySuffix.groupId, invocation.context.groupId)) {
     throw new MaterializerContractError('MATERIALIZER_GROUP_MISMATCH')
   }
   if (
-    admittedSuffix.replayFromIndex !== invocation.replayFromIndex ||
-    admittedSuffix.targetOrderLength !== invocation.targetOrderLength ||
-    !sameBytes(admittedSuffix.targetOrderDigest, invocation.targetOrderDigest)
+    replaySuffix.replayFromIndex !== invocation.replayFromIndex ||
+    replaySuffix.targetOrderLength !== invocation.targetOrderLength ||
+    !sameBytes(replaySuffix.targetOrderDigest, invocation.targetOrderDigest)
   ) {
     throw new MaterializerContractError('MATERIALIZER_SUFFIX_IDENTITY_MISMATCH')
   }
-  for (const transaction of admittedSuffix.transactions) {
+  for (const transaction of replaySuffix.transactions) {
     if (!sameBytes(transaction.core.groupId, invocation.context.groupId)) {
       throw new MaterializerContractError('MATERIALIZER_TRANSACTION_GROUP_MISMATCH')
     }
@@ -112,7 +112,7 @@ export async function resolveDecodedMaterializationInvocation(
   return {
     invocation,
     executionManifest,
-    admittedSuffix,
+    replaySuffix,
     continuation,
     exactReadSet: unique.map((artifact) => artifact.object).sort(compareObjectRefs),
   }

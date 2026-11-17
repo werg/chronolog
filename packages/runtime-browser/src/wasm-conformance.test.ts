@@ -9,7 +9,7 @@ import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/brow
 import { emit, encodeRowKey, encodeSealedEnvelope, platformObjectId, sealedOp, sqlStatement, sqlValue, utf8 } from '@chronolog/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { admitted, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
+import { replayProposal, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
 import { generateX25519KeyPair, sealSealedValue } from '../../crypto/src/index.js'
 import { openDatabase as openNativeDatabase } from '../../materializer-doltlite/src/driver.js'
 import { CONSENSUS_DENIED_FUNCTIONS } from '../../materializer-doltlite/src/sql-profile.js'
@@ -50,17 +50,17 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
     let browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', openDatabase: factory })
     try {
       const digest = native.executionManifestDigest
-      const setup = await admitted(1n, 'setup', [
+      const setup = await replayProposal(1n, 'setup', [
         'CREATE TABLE balances (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)',
         'INSERT INTO balances (id, balance) VALUES (1, 10)',
         'CREATE TABLE probes (id INTEGER PRIMARY KEY, now TEXT, local TEXT, random INTEGER, blob BLOB, real REAL, integer INTEGER, empty BLOB, last_rowid INTEGER, changed INTEGER, vector_distance REAL, transaction_id BLOB)',
       ], digest)
-      const late = await admitted(3n, 'late', ['UPDATE balances SET balance = balance + 100 WHERE id = 1'], digest)
-      const spend = await admitted(5n, 'spend', [
+      const late = await replayProposal(3n, 'late', ['UPDATE balances SET balance = balance + 100 WHERE id = 1'], digest)
+      const spend = await replayProposal(5n, 'spend', [
         "SELECT chronolog_assert((SELECT balance FROM balances WHERE id=1)>=50, 'balance')",
         'UPDATE balances SET balance=balance-50 WHERE id=1',
       ], digest)
-      const probe = await admitted(1_700_000_000_000n, 'probe', [sqlStatement(
+      const probe = await replayProposal(1_700_000_000_000n, 'probe', [sqlStatement(
         "INSERT INTO probes (id,now,local,random,blob,real,integer,empty,last_rowid,changed,vector_distance,transaction_id) VALUES (1,datetime('now'),datetime('now','localtime'),random(),randomblob(12),?,?,?,last_insert_rowid(),changes(),vec_distance_L2('[1.2,3.4]','[5.6,7.8]'),chronolog_transaction_id())",
         [sqlValue.real(1), 9_223_372_036_854_775_807n, new Uint8Array()],
       )], digest)
@@ -93,23 +93,23 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       const digest = native.executionManifestDigest
       const other = new Uint8Array(32).fill(9)
       const programs = [
-        await admitted(1n, 'setup', [
+        await replayProposal(1n, 'setup', [
           'CREATE TABLE notes (id INTEGER PRIMARY KEY, value TEXT NOT NULL)',
           "INSERT INTO notes (id,value) VALUES(1,'root')",
           "SELECT vec_distance_L2('[1,2]','[1,4]')",
         ], digest),
-        await admitted(2n, 'owner', ["UPDATE notes SET value='other' WHERE id=1"], digest, other),
-        await admitted(3n, 'assert', ["SELECT chronolog_assert(0,'expected')"], digest),
-        await admitted(4n, 'attach', ["ATTACH DATABASE ':memory:' AS other"], digest),
-        await admitted(5n, 'multiple', ['SELECT 1; SELECT 2'], digest),
-        await admitted(6n, 'ignore', ['CREATE TRIGGER bad AFTER UPDATE ON notes BEGIN SELECT RAISE(IGNORE); END'], digest),
-        await admitted(7n, 'constraint', ['INSERT INTO notes(id) VALUES(2)'], digest),
-        await admitted(8n, 'budget', ['WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) SELECT count(*) FROM n'], digest),
+        await replayProposal(2n, 'owner', ["UPDATE notes SET value='other' WHERE id=1"], digest, other),
+        await replayProposal(3n, 'assert', ["SELECT chronolog_assert(0,'expected')"], digest),
+        await replayProposal(4n, 'attach', ["ATTACH DATABASE ':memory:' AS other"], digest),
+        await replayProposal(5n, 'multiple', ['SELECT 1; SELECT 2'], digest),
+        await replayProposal(6n, 'ignore', ['CREATE TRIGGER bad AFTER UPDATE ON notes BEGIN SELECT RAISE(IGNORE); END'], digest),
+        await replayProposal(7n, 'constraint', ['INSERT INTO notes(id) VALUES(2)'], digest),
+        await replayProposal(8n, 'budget', ['WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) SELECT count(*) FROM n'], digest),
         ...await Promise.all([
           "SELECT sqlite_compileoption_used('OMIT_UTF16')", 'SELECT sqlite_compileoption_get(0)', 'SELECT sqlite_source_id()',
           'SELECT * FROM pragma_compile_options', 'SELECT * FROM pragma_function_list', 'SELECT * FROM pragma_module_list',
           'SELECT * FROM pragma_pragma_list', 'SELECT * FROM pragma_collation_list', "SELECT load_extension('x')", 'SELECT load_extension(1,2,3)',
-        ].map((sql, index) => admitted(BigInt(index + 9), `host-probe-${index}`, [sql], digest))),
+        ].map((sql, index) => replayProposal(BigInt(index + 9), `host-probe-${index}`, [sql], digest))),
       ]
       await native.materialize(programs)
       await browser.materialize(programs)
@@ -208,11 +208,11 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       const digest = native.executionManifestDigest
       const reader = await generateX25519KeyPair()
       const rowKey = Uint8Array.of(0, 255, 1)
-      const setup = await admitted(1n, 'sealed-schema', [
+      const setup = await replayProposal(1n, 'sealed-schema', [
         'CREATE TABLE sealed_docs (id BLOB NOT NULL PRIMARY KEY, body BLOB) STRICT',
         sqlStatement('INSERT INTO sealed_docs (id) VALUES (?)', [rowKey]), sealedOp.registerReaderKey(reader.publicKeyBytes),
       ], digest)
-      const policy = await admitted(2n, 'sealed-policy', [sealedOp.readerPolicy({
+      const policy = await replayProposal(2n, 'sealed-policy', [sealedOp.readerPolicy({
         table: 'sealed_docs', rowKey: [rowKey], expectedVersion: 0n, readers: [ROOT_KEY],
       })], digest)
       const policyId = await platformObjectId(policy.txId, 0)
@@ -220,14 +220,14 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         context: { groupId: setup.core.groupId, policyId, policyVersion: 1n, slot: 'body', dataVersion },
         plaintext: utf8('sealed body'), recipients: [{ readerId: ROOT_KEY, publicKey: reader.publicKeyBytes }],
       })))
-      const write = await admitted(3n, 'sealed-write', [sealedOp.put({ policyId, expectedPolicyVersion: 1n,
+      const write = await replayProposal(3n, 'sealed-write', [sealedOp.put({ policyId, expectedPolicyVersion: 1n,
         expectedDataVersion: 0n, slot: 'body', envelope: envelopes[0]!,
       })], digest)
-      const overwrite = await admitted(4n, 'sealed-overwrite', ["UPDATE sealed_docs SET body = x'00'"], digest)
-      const recreate = await admitted(5n, 'sealed-recreate', [
+      const overwrite = await replayProposal(4n, 'sealed-overwrite', ["UPDATE sealed_docs SET body = x'00'"], digest)
+      const recreate = await replayProposal(5n, 'sealed-recreate', [
         'DELETE FROM sealed_docs', sqlStatement('INSERT INTO sealed_docs (id) VALUES (?)', [rowKey]),
       ], digest)
-      const stale = await admitted(6n, 'sealed-closed', [sealedOp.put({ policyId, expectedPolicyVersion: 1n,
+      const stale = await replayProposal(6n, 'sealed-closed', [sealedOp.put({ policyId, expectedPolicyVersion: 1n,
         expectedDataVersion: 1n, slot: 'body', envelope: envelopes[1]!,
       })], digest)
       const history: typeof setup[] = []
@@ -261,18 +261,18 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
     const browser = await DeterministicMaterializer.open({ ...options, path: '/events.db', openDatabase: factory })
     try {
       const digest = native.executionManifestDigest
-      const setup = await admitted(1n, 'events-schema', [
+      const setup = await replayProposal(1n, 'events-schema', [
         'CREATE TABLE tasks(id INTEGER PRIMARY KEY, value TEXT NOT NULL)',
         "INSERT INTO tasks(id,value) VALUES(1,'initial')",
       ], digest)
-      const accepted = await admitted(2n, 'events-mixed', [
+      const accepted = await replayProposal(2n, 'events-mixed', [
         "UPDATE tasks SET value='accepted' WHERE id=1", emit('tasks.changed', { id: 1, value: 'accepted' }),
       ], digest)
-      const rejected = await admitted(3n, 'events-rollback', [
+      const rejected = await replayProposal(3n, 'events-rollback', [
         "UPDATE tasks SET value='rollback' WHERE id=1", emit('tasks.changed', { id: 1, value: 'rollback' }),
         "SELECT chronolog_assert(0,'rollback_sql_and_event')",
       ], digest)
-      const successor = await admitted(4n, 'events-successor', [
+      const successor = await replayProposal(4n, 'events-successor', [
         "UPDATE tasks SET value='successor' WHERE id=1", emit('tasks.changed', { id: 1, value: 'successor' }),
       ], digest)
       for (const engine of [native, browser]) {

@@ -1,7 +1,7 @@
 import {
   DeterministicMaterializer,
   createDoltLiteExecutionManifest,
-  type AdmittedTransaction,
+  type ReplayProposal,
   type MaterializerPublicationFaultPoint,
 } from '@chronolog/materializer-doltlite'
 import {
@@ -40,9 +40,8 @@ const core: TransactionCore = {
   },
 }
 const canonicalCandidate = encodeTransactionCore(core)
-const transaction: AdmittedTransaction = {
+const transaction: ReplayProposal = {
   txId: utf8('crash-probe'),
-  authorFeedSequence: 1n,
   candidateDigest: await transactionDigest(canonicalCandidate),
   canonicalCandidate,
   core,

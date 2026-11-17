@@ -191,13 +191,13 @@ loses authorization. An admitted candidate cannot be removed or replaced, but
 its application outcome can still change when the provisional suffix replays.
 Admission establishes inclusion, not successful SQL execution.
 
-Admitted transactions are ordered by the immutable key
+Selected proposals are ordered by the immutable key
 
 `(author_timestamp_ms, signing_public_key, proposal_id)`.
 
-The node fixes the transport-sequence component of the underlying order key
-to zero. Outer feed sequence is replication and fork evidence; it cannot move
-a proposal when the same signed content travels over another connection.
+Transport feed sequence belongs only to replication and fork evidence. The
+application order key has no transport component, so relaying the same signed
+content over another connection cannot move a proposal.
 
 Validators never choose the position; more attestations never move it. A
 transaction that becomes visible late sorts into its fixed position in the

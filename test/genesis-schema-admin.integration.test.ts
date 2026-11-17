@@ -10,7 +10,7 @@ import { generateEd25519KeyPair } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { resolveRootAdministrator } from '../apps/chronologd/src/root-administrator.js'
-import { MaterializerFixture, admitted, rows } from '../packages/materializer-doltlite/src/test-fixtures.js'
+import { MaterializerFixture, replayProposal, rows } from '../packages/materializer-doltlite/src/test-fixtures.js'
 
 const fixtures = new MaterializerFixture()
 const directories: string[] = []
@@ -35,9 +35,9 @@ describe('signed genesis SQL authority separation', () => {
       await writeFile(join(directory, 'governance.json'), JSON.stringify({ signedGenesis: Buffer.from(encodeSignedGenesis(genesis)).toString('base64') }))
       expect(await resolveRootAdministrator(directory)).toEqual(schemaIdentity.publicKeyBytes)
 
-      const rosterAttempt = await admitted(1n, 'roster-ddl', ['CREATE TABLE roster_owned (id INTEGER PRIMARY KEY)'],
+      const rosterAttempt = await replayProposal(1n, 'roster-ddl', ['CREATE TABLE roster_owned (id INTEGER PRIMARY KEY)'],
         materializer.executionManifestDigest, genesis.manifest.rootAdminPublicKey)
-      const schemaChange = await admitted(2n, 'schema-ddl', ['CREATE TABLE application_owned (id INTEGER PRIMARY KEY)'],
+      const schemaChange = await replayProposal(2n, 'schema-ddl', ['CREATE TABLE application_owned (id INTEGER PRIMARY KEY)'],
         materializer.executionManifestDigest, genesis.manifest.schemaAdminPublicKey)
       await materializer.materialize([rosterAttempt, schemaChange])
       expect(materializer.outcome(rosterAttempt.txId)).toMatchObject({ outcome: 'rejected' })

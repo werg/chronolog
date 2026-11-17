@@ -46,7 +46,7 @@ describe('NodeRpcService policy views and enrollment', () => {
     const node: ChronologRpcNodeService = {
       ...readerNode(),
       get revision() { return revision },
-      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, authorFeedSequence: 1n, txId: groupId } }),
+      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, txId: groupId } }),
       outcome: () => ({ outcome: 'accepted', rejectionCode: null, failingStatementIndex: null }),
       isFinal: () => finalized,
       outcomeChangedByReplay: () => false,
@@ -73,7 +73,7 @@ describe('NodeRpcService policy views and enrollment', () => {
     const node = readerNode()
     const service = new NodeRpcService({ node: {
       ...node,
-      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, authorFeedSequence: 1n, txId: groupId } }),
+      candidate: () => ({ state: 'admissible', orderKey: { authorTimestampMs: 1n, authorId: groupId, txId: groupId } }),
       outcome: () => ({ outcome: finalized ? 'rejected' : 'accepted', rejectionCode: finalized ? 'constraint' : null, failingStatementIndex: finalized ? 0 : null }),
       isFinal: () => finalized,
       outcomeChangedByReplay: () => finalized,

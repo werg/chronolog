@@ -4,9 +4,9 @@ import {
   DeterministicMaterializer,
   openReadOnlyDatabase,
   readMaterializedRootAdministrator,
-  type AdmittedTransaction,
+  type ReplayProposal,
 } from '@chronolog/materializer-doltlite'
-import { MaterializerFixture, admitted, rows, testKey } from '@chronolog/materializer-doltlite/testing'
+import { MaterializerFixture, replayProposal, rows, testKey } from '@chronolog/materializer-doltlite/testing'
 import { commitStagedSnapshot, exportSnapshotArchive, signSnapshotManifest, stageSnapshotArchive, type TrustedSnapshotManifest } from '@chronolog/node-core'
 import { generateEd25519KeyPair, platformObjectId, platformOp, type ExecutionManifest } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -37,10 +37,10 @@ async function validate(path: string, manifest: ExecutionManifest, rootAdministr
 describe('snapshot export and import of owner-controlled rows', () => {
   it('carries owners, platform tables and platform triggers, and refuses another group\'s root', async () => {
     const { materializer, path, manifest } = await fixtures.open({ rootAdministrator: ROOT })
-    const transactions: AdmittedTransaction[] = []
+    const transactions: ReplayProposal[] = []
     let clock = 1n
-    const submit = async (author: Uint8Array, ...steps: Parameters<typeof admitted>[2]): Promise<Uint8Array> => {
-      const transaction = await admitted(clock, `tx-${clock}`, steps, materializer.executionManifestDigest, author)
+    const submit = async (author: Uint8Array, ...steps: Parameters<typeof replayProposal>[2]): Promise<Uint8Array> => {
+      const transaction = await replayProposal(clock, `tx-${clock}`, steps, materializer.executionManifestDigest, author)
       clock += 1n
       transactions.push(transaction)
       await materializer.materialize(transactions)
@@ -98,7 +98,7 @@ describe('snapshot export and import of owner-controlled rows', () => {
       expect(rows(imported, "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name LIKE 'chronolog_k_notes_%' ORDER BY name"))
         .toEqual([['chronolog_k_notes_del'], ['chronolog_k_notes_ins'], ['chronolog_k_notes_upd']])
       // Ownership keeps being enforced on the imported database.
-      await imported.materialize([...transactions, await admitted(clock, 'after-import', ["UPDATE notes SET body = 'x' WHERE id = 2"], imported.executionManifestDigest, ALICE)])
+      await imported.materialize([...transactions, await replayProposal(clock, 'after-import', ["UPDATE notes SET body = 'x' WHERE id = 2"], imported.executionManifestDigest, ALICE)])
       expect(imported.outcome(new TextEncoder().encode('after-import'))?.rejectionCode).toBe('policy:notes:update')
     } finally { imported.close() }
   })

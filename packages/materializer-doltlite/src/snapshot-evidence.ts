@@ -9,12 +9,11 @@ export function materializedLogDigest(rows: readonly TransactionLogRow[]): Promi
     [1n, BigInt(row.orderIndex)],
     [2n, row.authorId],
     [3n, row.authorTimestampMs],
-    [4n, row.authorFeedSequence],
-    [5n, row.candidateDigest],
-    [6n, row.canonicalCandidate],
-    [7n, row.outcome],
-    [8n, row.rejectionCode],
-    [9n, row.failingStatementIndex === null ? null : BigInt(row.failingStatementIndex)],
+    [4n, row.candidateDigest],
+    [5n, row.canonicalCandidate],
+    [6n, row.outcome],
+    [7n, row.rejectionCode],
+    [8n, row.failingStatementIndex === null ? null : BigInt(row.failingStatementIndex)],
   ])))
   return hashDomain(DOMAINS.materializedLog, encoded)
 }

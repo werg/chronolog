@@ -7,7 +7,7 @@ filesystem, transport, clock, or random-source dependency.
 It owns:
 
 - exact object, artifact, and immutable database reference shapes;
-- canonical CBOR codecs for invocation, admitted suffix, continuation, outcome,
+- canonical CBOR codecs for invocation, replay suffix, continuation, outcome,
   differential observation, and self-contained differential fixture values;
 - resolution through an exact-reference-only object reader;
 - an explicit pure context in which logical time and caller entropy are null in
@@ -23,6 +23,14 @@ because only a CAS/export host can assign generic immutable output refs.
 
 The package does not define mutable publication. Reduction returns immutable
 candidates; a coordinator publishes those candidates separately.
+
+`ReplayProposal` is the shared input for event and SQL replay. It carries the
+original canonical proposal, its digest and its stable ID. It asserts neither
+admission nor finality; the caller selects which verified proposals to replay.
+`ChronologReplaySuffix` carries a chronological suffix of these inputs through
+the portable kernel. Application ordering uses only signed author timestamp,
+signing public key and stable proposal ID. Transport sequences never enter
+replay inputs or the protected SQL transaction log.
 
 ## SQL-free event execution
 
@@ -49,5 +57,5 @@ lost. The runtime closes its mutation and publication ports immediately. Reopen
 from the authoritative stored value before continuing; retrying from the old
 in-memory prefix could overwrite a newer durable finality promise. Existing read
 snapshots retain their last acknowledged coherent view. The regression suite
-covers failures before a write and lost replies after both admission and finality
+covers failures before a write and lost replies after both replay and finality
 commits.

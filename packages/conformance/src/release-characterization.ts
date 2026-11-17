@@ -8,7 +8,7 @@ import { performance } from 'node:perf_hooks'
 import {
   DeterministicMaterializer,
   createDoltLiteExecutionManifest,
-  type AdmittedTransaction,
+  type ReplayProposal,
 } from '@chronolog/materializer-doltlite'
 import {
   encodeTransactionCore,
@@ -68,7 +68,7 @@ export async function characterizeNativeRecovery(
     rootAdministrator: AUTHOR,
     checkpointEvery: Math.max(1, options.reopenEvery),
   })
-  const ordered: AdmittedTransaction[] = []
+  const ordered: ReplayProposal[] = []
   let replayedTransactions = 0
   let reopenCount = 0
   let lateTransactions = 0
@@ -146,7 +146,7 @@ export async function characterizeNativeRecovery(
 
 async function requireRevision(
   materializer: DeterministicMaterializer,
-  ordered: readonly AdmittedTransaction[],
+  ordered: readonly ReplayProposal[],
 ) {
   const revision = await materializer.materialize(ordered)
   if (revision === null) throw new Error('CHARACTERIZATION_REVISION_MISSING')
@@ -171,7 +171,7 @@ async function transaction(
   id: number,
   program: ChangeProgram,
   executionManifestDigest: Uint8Array,
-): Promise<AdmittedTransaction> {
+): Promise<ReplayProposal> {
   const core: TransactionCore = {
     operationId: String(id),
     groupId: bytes32(1),
@@ -186,7 +186,6 @@ async function transaction(
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(`characterization-${id.toString().padStart(8, '0')}`),
-    authorFeedSequence: BigInt(id),
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

@@ -9,7 +9,7 @@ import {
   createDoltLiteMaterializationRuntime,
   DeterministicMaterializer,
   createDoltLiteExecutionManifest,
-  type AdmittedTransaction,
+  type ReplayProposal,
 } from '@chronolog/materializer-doltlite'
 import {
   encodeTransactionCore,
@@ -204,7 +204,7 @@ async function runReplayFixture(
 async function applyConformanceOrder(
   materializer: DeterministicMaterializer,
   runtime: ReturnType<typeof createDoltLiteMaterializationRuntime> | null,
-  transactions: readonly AdmittedTransaction[],
+  transactions: readonly ReplayProposal[],
 ): Promise<void> {
   if (runtime === null) {
     await materializer.materialize(transactions)
@@ -230,7 +230,7 @@ async function transaction(
   id: string,
   steps: readonly ProgramStep[],
   executionManifestDigest: Uint8Array,
-): Promise<AdmittedTransaction> {
+): Promise<ReplayProposal> {
   const core: TransactionCore = {
     operationId: id,
     groupId: bytes32(1),
@@ -245,7 +245,6 @@ async function transaction(
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(id),
-    authorFeedSequence: timestamp,
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

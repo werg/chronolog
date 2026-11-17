@@ -1,8 +1,8 @@
 import {
   MaterializerContractError,
-  digestAdmittedOrder,
+  digestReplayOrder,
   sameBytes,
-  type AdmittedTransaction as PortableAdmittedTransaction,
+  type ReplayProposal,
   type ChronologMaterializationInvocation,
   type ChronologMaterializationOutcome,
   type ChronologMaterializerKernel,
@@ -12,7 +12,6 @@ import {
 import { decodeTransactionCore } from '@chronolog/protocol'
 
 import type {
-  AdmittedTransaction,
   MaterializedRevision,
   MaterializerBackendInfo,
   TransactionLogRow,
@@ -24,7 +23,7 @@ export interface DoltLitePortableMaterializerLike {
   readonly executionManifestDigest: Uint8Array
   readonly backend: MaterializerBackendInfo
   transactionLog(): readonly TransactionLogRow[]
-  materialize(orderedTransactions: readonly AdmittedTransaction[]): Promise<MaterializedRevision | null>
+  materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null>
 }
 
 export interface DoltLitePortableProjectionContext {
@@ -65,7 +64,7 @@ export function createDoltLitePortableKernel(
         throw new MaterializerContractError('MATERIALIZER_ORACLE_LOG_LENGTH_MISMATCH')
       }
       if (!sameBytes(
-        await digestAdmittedOrder(priorLog.map((row) => row.txId)),
+        await digestReplayOrder(priorLog.map((row) => row.txId)),
         input.invocation.expectedPreviousOrderDigest,
       )) {
         throw new MaterializerContractError('MATERIALIZER_PREVIOUS_ORDER_DIGEST_MISMATCH')
@@ -77,12 +76,12 @@ export function createDoltLitePortableKernel(
       const prefix = priorLog
         .slice(0, input.invocation.replayFromIndex)
         .map(transactionFromLogRow)
-      const ordered = [...prefix, ...input.admittedSuffix.transactions.map(clonePortableTransaction)]
+      const ordered = [...prefix, ...input.replaySuffix.transactions.map((proposal) => structuredClone(proposal))]
       if (ordered.length !== input.invocation.targetOrderLength) {
         throw new MaterializerContractError('MATERIALIZER_TARGET_ORDER_LENGTH_MISMATCH')
       }
       if (!sameBytes(
-        await digestAdmittedOrder(ordered.map((transaction) => transaction.txId)),
+        await digestReplayOrder(ordered.map((transaction) => transaction.txId)),
         input.invocation.targetOrderDigest,
       )) {
         throw new MaterializerContractError('MATERIALIZER_TARGET_ORDER_DIGEST_MISMATCH')
@@ -94,7 +93,7 @@ export function createDoltLitePortableKernel(
         throw new MaterializerContractError('MATERIALIZER_ORACLE_FINAL_LOG_LENGTH_MISMATCH')
       }
       if (!sameBytes(
-        await digestAdmittedOrder(transactionLog.map((row) => row.txId)),
+        await digestReplayOrder(transactionLog.map((row) => row.txId)),
         input.invocation.targetOrderDigest,
       )) {
         throw new MaterializerContractError('MATERIALIZER_ORACLE_FINAL_ORDER_MISMATCH')
@@ -124,22 +123,11 @@ function verifyEngineAndManifests(
   }
 }
 
-function transactionFromLogRow(row: TransactionLogRow): AdmittedTransaction {
+function transactionFromLogRow(row: TransactionLogRow): ReplayProposal {
   return {
     txId: row.txId.slice(),
-    authorFeedSequence: row.authorFeedSequence,
     candidateDigest: row.candidateDigest.slice(),
     canonicalCandidate: row.canonicalCandidate.slice(),
     core: decodeTransactionCore(row.canonicalCandidate),
-  }
-}
-
-function clonePortableTransaction(transaction: PortableAdmittedTransaction): AdmittedTransaction {
-  return {
-    txId: transaction.txId.slice(),
-    authorFeedSequence: transaction.authorFeedSequence,
-    candidateDigest: transaction.candidateDigest.slice(),
-    canonicalCandidate: transaction.canonicalCandidate.slice(),
-    core: structuredClone(transaction.core),
   }
 }

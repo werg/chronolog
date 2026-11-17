@@ -19,7 +19,6 @@ function candidate(id: number, timestamp: bigint, author = id): PutCandidateInpu
     orderKey: {
       authorTimestampMs: timestamp,
       authorId: bytes(author),
-      authorFeedSequence: BigInt(id),
       txId: bytes(id),
     },
     canonicalPayload: bytes(200, id),

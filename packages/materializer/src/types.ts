@@ -39,7 +39,7 @@ export interface ExactDatabaseRef {
 }
 
 export type ChronologArtifactKind =
-  | 'admitted-suffix'
+  | 'replay-suffix'
   | 'execution-manifest'
   | 'continuation'
   | 'materialization-manifest'
@@ -77,7 +77,7 @@ export interface ChronologMaterializationInvocation {
   readonly context: ChronologMaterializationContext
   readonly previous: MaterializationInput | null
   readonly replayBase: MaterializationInput
-  readonly admittedSuffix: ExactArtifactRef
+  readonly replaySuffix: ExactArtifactRef
   readonly executionManifest: ExactArtifactRef
   readonly continuation: ExactArtifactRef | null
   readonly expectedEngineDigest: Uint8Array
@@ -88,21 +88,25 @@ export interface ChronologMaterializationInvocation {
   readonly targetOrderDigest: Uint8Array
 }
 
-export interface AdmittedTransaction {
+/**
+ * A verified original proposal selected for deterministic replay. Selection
+ * does not imply admission or finality: a live runtime can replay its currently
+ * authorized local previews through the same input as admitted proposals.
+ */
+export interface ReplayProposal {
   readonly txId: Uint8Array
-  readonly authorFeedSequence: bigint
   readonly candidateDigest: Uint8Array
   readonly canonicalCandidate: Uint8Array
   readonly core: TransactionCore
 }
 
-export interface ChronologAdmittedSuffix {
+export interface ChronologReplaySuffix {
   readonly version: 1
   readonly groupId: Uint8Array
   readonly replayFromIndex: number
   readonly targetOrderLength: number
   readonly targetOrderDigest: Uint8Array
-  readonly transactions: readonly AdmittedTransaction[]
+  readonly transactions: readonly ReplayProposal[]
 }
 
 export interface ChronologMaterializationContinuation {
@@ -157,7 +161,7 @@ export type ChronologMaterializationOutcome =
 export interface ResolvedMaterializationInvocation {
   readonly invocation: ChronologMaterializationInvocation
   readonly executionManifest: ExecutionManifest
-  readonly admittedSuffix: ChronologAdmittedSuffix
+  readonly replaySuffix: ChronologReplaySuffix
   readonly continuation: ChronologMaterializationContinuation | null
   /** Exact objects read while resolving the invocation, sorted by canonical identity. */
   readonly exactReadSet: readonly ExactObjectRef[]

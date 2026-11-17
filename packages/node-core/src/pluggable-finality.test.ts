@@ -101,8 +101,8 @@ describe('pluggable inclusion finality with one chronological execution order', 
     for (const value of [...proposals].reverse()) await right.include(value)
     await left.closeThrough(50n); await right.closeThrough(50n)
     const expected = [...proposals].sort((a, b) => compareTransactionOrder(
-      transactionOrderKey(a.core, { authorFeedSequence: 0n, txId: a.txId }),
-      transactionOrderKey(b.core, { authorFeedSequence: 0n, txId: b.txId }),
+      transactionOrderKey(a.core, a.txId),
+      transactionOrderKey(b.core, b.txId),
     )).map(value => value.core.operationId)
     expect(await eventNames(left.current.node)).toEqual(expected)
     expect(await eventNames(right.current.node)).toEqual(expected)

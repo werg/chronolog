@@ -1,6 +1,6 @@
 import type { TransactionOrderKey } from '@chronolog/protocol'
 
-import type { AdmittedTransaction } from './types.js'
+import type { ReplayProposal } from './types.js'
 
 export type MaterializedTransactionOutcomeKind = 'accepted' | 'rejected'
 
@@ -51,7 +51,7 @@ export interface CoordinatedMaterialization {
 /** Calculates or follows one immutable materialization candidate. */
 export interface MaterializationCoordinator {
   materialize(
-    orderedTransactions: readonly AdmittedTransaction[],
+    orderedTransactions: readonly ReplayProposal[],
   ): Promise<CoordinatedMaterialization | null>
   /** Materialize and pin an actual immutable final prefix, independently of local state. */
   publishFinal?(prefixLength: number): Promise<void>

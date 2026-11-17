@@ -49,7 +49,6 @@ export interface RpcNodeCandidate {
   readonly orderKey: {
     readonly authorTimestampMs: bigint
     readonly authorId: Uint8Array
-    readonly authorFeedSequence: bigint
     readonly txId: Uint8Array
   }
 }

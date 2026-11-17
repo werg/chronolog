@@ -677,8 +677,8 @@ function parseRevision(value: string): bigint {
   if (!/^(0|[1-9][0-9]*)$/u.test(value)) throw invalid('SQL revision must be a nonnegative decimal integer')
   return BigInt(value)
 }
-function orderKeyText(key: { readonly authorTimestampMs: bigint; readonly authorId: Uint8Array; readonly authorFeedSequence: bigint; readonly txId: Uint8Array }): string {
-  return `${key.authorTimestampMs}:${toBase64Url(key.authorId)}:${key.authorFeedSequence}:${toBase64Url(key.txId)}`
+function orderKeyText(key: { readonly authorTimestampMs: bigint; readonly authorId: Uint8Array; readonly txId: Uint8Array }): string {
+  return `${key.authorTimestampMs}:${toBase64Url(key.authorId)}:${toBase64Url(key.txId)}`
 }
 
 function stableFingerprint(value: unknown): string {
