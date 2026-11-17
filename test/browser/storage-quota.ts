@@ -3,7 +3,7 @@ import { sha256 } from '@chronolog/canonical'
 import { DurableOperationJournal } from '@chronolog/node-core/browser'
 import { bytesToHex, equalBytes, utf8 } from '@chronolog/protocol'
 
-import { OpfsBytesStore } from '../../packages/runtime-browser/src/opfs.js'
+import { OpfsBytesStore } from '@chronolog/records/browser'
 
 interface QuotaBucket {
   getDirectory(): Promise<FileSystemDirectoryHandle>

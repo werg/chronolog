@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { OpfsBytesStore, type OpfsDirectory } from './opfs.js'
+import { OpfsBytesStore, type OpfsDirectory } from './browser.js'
 
 function directory() {
   const values = new Map<string, Uint8Array>()

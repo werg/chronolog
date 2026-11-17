@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { NativeAgentStore } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+
 import { ChronologClient, DurableProjection, ProjectionConflictError, type ProjectionCheckpoint, type ProjectionStore } from '@chronolog/client'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
@@ -355,7 +356,7 @@ async function nativeReplica(profile: 'sql' | 'events') {
       policies: [{ kind: 'threshold', policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }] }],
   }
   const open = async () => {
-    const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
+    const store = new NativeBytesStore(join(directory, 'agent.sqlite'))
     const control = new NodeStateDatabase(join(directory, 'control.sqlite'))
     const feed = new PortableFeedTransport({ store: new FeedStore(join(directory, 'feed.sqlite')), crypto: nativeFeedCrypto,
       signer: { identity: feedIdFromPublicKey(identity.publicKeyBytes),

@@ -1,5 +1,4 @@
 export * from './finality-service.js'
-export * from './native-store.js'
 export * from './workers.js'
 export * from './framing.js'
 export * from './peer-link.js'

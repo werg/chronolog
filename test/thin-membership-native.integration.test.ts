@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
-import { NativeAgentStore } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
 import { ChronologClient, type TransactionHandle } from '@chronolog/client'
@@ -58,7 +59,7 @@ describe('thin membership qualification native boundary', () => {
     const native = await createThinMembershipNative({ directory: join(directory, 'native'), clock })
     failureDiagnostic = () => native.diagnostics()
     cleanup.push(() => native.close())
-    let store = new NativeAgentStore(join(directory, 'administrator.sqlite'))
+    let store = new NativeBytesStore(join(directory, 'administrator.sqlite'))
     cleanup.push(() => store.close())
     const provision = () => provisionMembership({ store, executionManifestDigest: native.executionManifestDigest,
       schemaAdministratorPublicKey: native.identity.signing.publicKeyBytes,
@@ -99,7 +100,7 @@ describe('thin membership qualification native boundary', () => {
     expect(administrator.read({ after: 0 }).entries.every(control => decodeLedgerRecord(control.entry.bytes).kind !== 'candidate')).toBe(true)
     expect(beforeJoinSnapshot.schemaRoles).toEqual({ nativeSchemaAdministrators: 1, membershipRootGroupMembers: 0 })
 
-    const deviceStore = new NativeAgentStore(join(directory, 'device.sqlite'))
+    const deviceStore = new NativeBytesStore(join(directory, 'device.sqlite'))
     cleanup.push(() => deviceStore.close())
     const device = await loadOrCreateEnrollmentIdentity(deviceStore, 'peer')
     const request = await prepareEnrollmentRequest({ descriptor: provisioned.descriptor, store: deviceStore,
@@ -112,7 +113,7 @@ describe('thin membership qualification native boundary', () => {
     native.loseNextAppendReply()
     await expect(administrator.approve(request, decision)).rejects.toThrow()
     await administrator.close(); store.close()
-    store = new NativeAgentStore(join(directory, 'administrator.sqlite'))
+    store = new NativeBytesStore(join(directory, 'administrator.sqlite'))
     provisioned = await provision()
     expect(bytesToBase64Url(encodeSignedGenesis(provisioned.descriptor.genesis))).toBe(originalGenesis)
     administrator = await open()

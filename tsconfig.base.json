@@ -129,6 +129,12 @@
       ],
       "@chronolog/peer-generation/control": [
         "packages/peer-generation/src/control.ts"
+      ],
+      "@chronolog/records/native": [
+        "packages/records/src/native.ts"
+      ],
+      "@chronolog/records/browser": [
+        "packages/records/src/browser.ts"
       ]
     }
   }

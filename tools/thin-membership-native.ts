@@ -6,7 +6,8 @@ import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import { join } from 'node:path'
 
-import { NativeAgentStore, waitForAbortableDelay, type NativeFinalityService } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+import { waitForAbortableDelay, type NativeFinalityService } from '@chronolog/agent-service'
 import { createMembershipLedgerHandler } from '@chronolog/agent-service/membership-http'
 import { decodeSignedGenesis, encodeSignedGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
@@ -71,7 +72,7 @@ export async function createThinMembershipNative(options: {
   readonly clock?: { now(): number; advanceTo(timestampMs: number): void }
 }) {
   await mkdir(options.directory, { recursive: true })
-  const store = new NativeAgentStore(join(options.directory, 'native.sqlite'))
+  const store = new NativeBytesStore(join(options.directory, 'native.sqlite'))
   const identity = await loadOrCreateEnrollmentIdentity(store, 'native')
   let savedHistory = await store.get('qualification/native-history')
   if (savedHistory === null) {

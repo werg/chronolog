@@ -2,7 +2,7 @@ import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, type Enrollment
 import { encodeCanonicalCbor, equalBytes } from '@chronolog/protocol'
 import { DurableFeedStore, webFeedCrypto, type AtomicBytesStore } from '@chronolog/records'
 
-import { acquireBrowserStorage } from './opfs.js'
+import { acquireBrowserStorage } from '@chronolog/records/browser'
 
 /** Existing keys always require their feed. First setup persists an empty feed before keys. */
 export async function openBrowserDeviceRecords(bytes: AtomicBytesStore, createIdentity?: true) {

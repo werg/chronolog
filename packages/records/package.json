@@ -3,6 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
-  "dependencies": { "@chronolog/canonical": "workspace:*" }
+  "exports": {
+    ".": "./src/index.ts",
+    "./native": "./src/native.ts",
+    "./browser": "./src/browser.ts"
+  },
+  "dependencies": {
+    "@chronolog/canonical": "workspace:*"
+  }
 }

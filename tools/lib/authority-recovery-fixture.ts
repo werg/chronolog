@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { NativeAgentStore } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+
 import { decodeSignedGenesis, encodeGenesisManifest, verifySignedGenesis } from '@chronolog/capabilities'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
@@ -44,7 +45,7 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
 } = {}) {
   if (options.create === true) await mkdir(directory, { recursive: false, mode: 0o700 })
   else await stat(join(directory, 'agent.sqlite')) // A lost volume must never become a new history implicitly.
-  const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
+  const store = new NativeBytesStore(join(directory, 'agent.sqlite'))
   const control = new NodeStateDatabase(join(directory, 'control.sqlite'))
   let armed = false
   let targetPayloadKey: string | undefined
@@ -272,7 +273,7 @@ export async function inspectStoppedAuthority(directory: string) {
     executionManifestDigest: policy.executionManifestDigest,
     ...(policy.providerId === undefined ? {} : { providerId: policy.providerId }),
     ...(policy.providerParameters === undefined ? {} : { providerParameters: policy.providerParameters }) }
-  const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
+  const store = new NativeBytesStore(join(directory, 'agent.sqlite'))
   try {
     const log = await ReferenceRecordLog.open(historyId, store, { requireExisting: true })
     const entries = await log.read(), saved = await store.get(`agent/authority/${historyId}/certificate`)

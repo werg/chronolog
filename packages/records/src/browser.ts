@@ -1,5 +1,5 @@
 import { assertCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, equalBytes, sha256, utf8 } from '@chronolog/canonical'
-import type { AtomicBytesStore } from '@chronolog/records'
+import type { AtomicBytesStore } from './store.js'
 
 export interface OpfsWriter {
   write(bytes: ArrayBuffer): Promise<void>

@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
-import { NativeAgentStore } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { createGovernedNode, encodeSignedEnrollmentRequest, loadOrCreateEnrollmentIdentity, prepareEnrollmentRequest } from '@chronolog/node-core'
 import { LedgerRecordError } from '@chronolog/node-core/ledger'
@@ -33,7 +34,7 @@ it('bootstraps the public retained-log bridge before fetching SQL bodies from it
   const native = await createBrowserBridgeFixture({ rootDirectory: join(directory, 'native') })
   cleanup.push(() => native.close())
   observe('open joining replica')
-  const store = new NativeAgentStore(join(directory, 'joining.sqlite'))
+  const store = new NativeBytesStore(join(directory, 'joining.sqlite'))
   cleanup.push(() => store.close())
   const identity = await loadOrCreateEnrollmentIdentity(store, 'joining')
   const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,

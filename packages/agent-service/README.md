@@ -131,7 +131,7 @@ the continuity check. Failed opens preserve the surviving state. A log may be
 ahead of its last certificate after an interrupted append, and exact retries
 keep their original positions.
 
-`NativeAgentStore` supplies the same atomic bytes port for embedded native hosts.
+`NativeBytesStore` from `@chronolog/records/native` supplies the same atomic bytes port for embedded native hosts.
 It holds SQLite's exclusive owner fence for the lifetime of the connection and
 can back `DurableFeedStore`, authoring state, the finality service, and checkpoints.
 The existing daemon instead shares its already fenced node-state database.
