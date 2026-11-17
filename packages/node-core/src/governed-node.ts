@@ -73,7 +73,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
   })
   const initial = governance.snapshot
   const validationPolicy = await validationPolicyId(genesis.manifest.validationPolicies[0]!)
-  const activation = new GovernanceActivationIndex(initial, configured.kind)
+  const activation = new GovernanceActivationIndex(initial)
   let coordinated: FinalityProvider | undefined
   if (descriptor.history.kind === 'coordinated') {
     const providerId = descriptor.history.providerId ?? 'signed-inclusion-v2'

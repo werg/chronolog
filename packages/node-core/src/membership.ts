@@ -170,7 +170,7 @@ export class MembershipAdministrator {
     ledger: MembershipLedger; local: PortableFeedTransport; governance: GovernanceControlPlane; policy: ControlHistory }) {
     this.#descriptor = options.descriptor; this.#identity = options.identity; this.#store = options.store; this.#ledger = options.ledger
     this.#local = options.local; this.#governance = options.governance; this.#policy = options.policy
-    this.#activation = new GovernanceActivationIndex(options.governance.revisionSnapshots[0]!, 'coordinated')
+    this.#activation = new GovernanceActivationIndex(options.governance.revisionSnapshots[0]!)
     this.#signal = this.#abort.signal
     this.#revocations = new DurableOperationJournal(options.store, 'membership/revocations')
     this.#issuer = new EnrollmentIssuer({ descriptor: options.descriptor, governance: options.governance, store: options.store,

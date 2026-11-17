@@ -6,7 +6,7 @@ import {
 import { MemoryTransportNetwork, type ChronologTransport } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { encodeSignedGovernanceClosure, signGovernanceClosure } from './governance-activation.js'
+import { encodeSignedGovernanceClosure, signGovernanceClosure } from './peer-governance-proof.js'
 import { GovernanceControlPlane } from './governance.js'
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { PeerGovernanceController } from './peer-governance.js'

@@ -4,7 +4,7 @@ import {
 } from '@chronolog/protocol'
 import type { ChronologTransport, TransportRecord } from '@chronolog/records'
 
-import { encodeSignedGovernanceClosure, signGovernanceClosure } from './governance-activation.js'
+import { encodeSignedGovernanceClosure, signGovernanceClosure } from './peer-governance-proof.js'
 import { DurableOperationJournal, type DurableOperationStore } from './operations.js'
 import type { EnvelopeCipher, EnvelopeCipherResolver } from './types.js'
 import { decodeSignedEnvelope, WIRE_ENCRYPTION_EPOCH_UNAVAILABLE } from './wire.js'

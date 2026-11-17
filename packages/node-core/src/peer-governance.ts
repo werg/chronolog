@@ -8,9 +8,10 @@ import type { ChronologTransport, TransportRecord } from '@chronolog/records'
 import { Mutex } from './async.js'
 import type { WriterAuthorizationContext } from './capability-membership.js'
 import {
-  GovernanceActivationIndex, decodeSignedGovernanceClosure, verifyGovernanceClosure,
+  decodeSignedGovernanceClosure, verifyGovernanceClosure, verifyPeerGovernanceActivation,
   type SignedGovernanceClosure, type VerifiedGovernanceClosureEvidence,
-} from './governance-activation.js'
+} from './peer-governance-proof.js'
+import { GovernanceActivationIndex } from './governance-activation.js'
 import type { GovernanceControlPlane } from './governance.js'
 import type { DurableOperationStore } from './operations.js'
 import type { EnvelopeCipher, EnvelopeCipherResolver } from './types.js'
@@ -56,7 +57,7 @@ export class PeerGovernanceController {
 
   constructor(options: PeerGovernanceControllerOptions) {
     this.#options = options
-    this.#activation = new GovernanceActivationIndex(options.genesis, 'peer')
+    this.#activation = new GovernanceActivationIndex(options.genesis)
     this.#checkpointKey = `peer-governance/${bytesToHex(options.genesis.groupId)}/active`
   }
 
@@ -144,7 +145,9 @@ export class PeerGovernanceController {
           scanned.push(result)
         }
         if (incomplete) break
-        const boundary = await this.#activation.activatePeer(next, scanned.map((item) => item.evidence))
+        const boundary = await verifyPeerGovernanceActivation({ previous, next,
+          evidence: scanned.map((item) => item.evidence), minimumBoundary: this.#activation.activationBoundary })
+        this.#activation.activateFinalized(next, boundary)
         const transactions = new Map<string, Uint8Array>()
         for (const item of scanned) for (const txId of item.transactionIds) transactions.set(bytesToHex(txId), txId)
         this.#closed.set(bytesToHex(previous.revisionDigest), [...transactions.values()])

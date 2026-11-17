@@ -2,7 +2,7 @@ import { decodeEnvelope, encodeValidatorAttestation, generateEd25519KeyPair } fr
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { describe, expect, it } from 'vitest'
 
-import { decodeSignedGovernanceClosure, verifyGovernanceClosure } from './governance-activation.js'
+import { decodeSignedGovernanceClosure, verifyGovernanceClosure } from './peer-governance-proof.js'
 import { MemoryOperationStore } from './operations.js'
 import { ValidatorRevisionClosures } from './validator-closures.js'
 import { encodeSignedEnvelope } from './wire.js'

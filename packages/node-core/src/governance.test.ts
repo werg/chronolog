@@ -33,7 +33,7 @@ describe('replicated governance control plane', () => {
       const canonical = await GovernanceControlPlane.create({ genesis: f.genesis, groupRoute: f.groupRoute,
         transport: f.network.createNode('canonical-fixed-reader'), identity: await generateEd25519KeyPair() })
       controllers.push(received, canonical)
-      const initial = received.snapshot, activation = new GovernanceActivationIndex(canonical.snapshot, 'coordinated')
+      const initial = received.snapshot, activation = new GovernanceActivationIndex(canonical.snapshot)
       const validator = [...initial.capabilities.values()].find(capability => capability.grant.role === 'validator')!
       const changes: Record<typeof change, Partial<CapabilityRevision>> = {
         root: { successorRootPublicKey: bytes32(101), successorCapabilityLogFeed: initial.capabilityLogFeed },
@@ -119,7 +119,7 @@ describe('replicated governance control plane', () => {
       const participant = await GovernanceControlPlane.create({ genesis: f.genesis, groupRoute: f.groupRoute,
         transport: f.network.createNode(`causal-${reversed}`), identity: await generateEd25519KeyPair() })
       controllers.push(participant)
-      const activation = new GovernanceActivationIndex(participant.snapshot, 'coordinated')
+      const activation = new GovernanceActivationIndex(participant.snapshot)
       const log = await ReferenceRecordLog.open('h_0123456789abcdef0123456789abcdef', new MemoryOperationStore())
       const records = []
       for (const record of reversed ? [...authored].reverse() : authored) {
