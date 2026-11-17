@@ -218,7 +218,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   readonly operations = {
     get: (id: string, options: { readonly author?: string } = {}): Promise<OperationState | null> => this.#call('operation.get', [id, options]),
     inspect: (id: string, options: { readonly author?: string } = {}): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null> => this.#call('operation.inspect', [id, options]),
-    wait: (id: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => this.#call('operation.wait', [id], options.signal),
+    wait: (id: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => this.#call('operation.wait', [id], options.signal, true),
   }
   readonly recovery = {
     inspect: (): Promise<readonly ApplicationTransition[]> => this.#call('recovery.inspect', []),
@@ -375,7 +375,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   #operation(id: string): WorkerApplicationOperation {
     return Object.freeze({ operationId: id, get: () => this.operations.get(id),
       applied: (options: { readonly signal?: AbortSignal } = {}) => this.operations.wait(id, options),
-      retry: () => this.retry(id), shared: (options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> => this.#call('operation.shared', [id], options.signal) })
+      retry: () => this.retry(id), shared: (options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> => this.#call('operation.shared', [id], options.signal, true) })
   }
   #upload(id: string): ContentUpload {
     return { id, write: (index, bytes) => this.#call('content.write', [id, index, bytes]),
@@ -497,8 +497,16 @@ function bounded(value: unknown): void {
     if (typeof item === 'string') bytes += new TextEncoder().encode(item).length
     else if (typeof item === 'bigint') bytes += item.toString().length
     else if (item === null || item === undefined || typeof item === 'number' || typeof item === 'boolean') bytes += 8
-    else if (item instanceof Uint8Array) bytes += item.byteLength
-    else if (typeof item === 'object') {
+    else if (item instanceof Uint8Array) {
+      if (!(item.buffer instanceof ArrayBuffer)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
+      bytes += item.byteLength
+    } else if (typeof item === 'object') {
+      if (Array.isArray(item)) {
+        if (item.length > 65_536) throw new Error('APPLICATION_WORKER_MESSAGE_LIMIT')
+        bytes += item.length * 8
+      } else if (Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) {
+        throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
+      }
       if (seen.has(item)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
       seen.add(item)
       for (const [key, child] of Object.entries(item)) { bytes += new TextEncoder().encode(key).length; visit(child, depth + 1) }

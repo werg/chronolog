@@ -215,6 +215,11 @@ observe updates, while `inspectRecovery()` loads retained recovery notices.
 `readView()` holds one coherent SQL/event view until `release()` resolves.
 Only the Worker holds signing keys and the durable command journal. Cancelling
 a page waiter ends that observation and leaves the saved command inspectable.
+`applied()` and `shared()` can wait through an offline period until their signal
+is aborted; they are not limited by the ordinary RPC request deadline. Query
+results cross the bridge as plain records, arrays, scalar values, SQL bigints
+and `Uint8Array` bytes. Class instances, key objects and shared memory are
+rejected, and message budgets apply before posting.
 
 The optional `host` stays in the Worker for `recovery.takeover()` and
 `recovery.handover()`; ordinary commands do not call it. The bridge serves one

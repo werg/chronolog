@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, type RecoveryNotice,
@@ -48,12 +48,12 @@ async function fixture(options: { readonly closeA?: () => Promise<void> } = {}) 
   return { a: sessions[0]!, b: sessions[1]!, registry }
 }
 
-async function facade(session: ApplicationSession, host?: ApplicationControlHost) {
+async function facade(session: ApplicationSession, host?: ApplicationControlHost, timeoutMs = 5000) {
   const endpoint = new MessageChannel()
   cleanup.push(() => { endpoint.port1.close(); endpoint.port2.close() })
   const server = serveApplicationWorker(session, endpoint.port1, host === undefined ? {} : { host })
   cleanup.push(() => server.close())
-  const client = await connectApplicationWorker<typeof definition>(endpoint.port2, { timeoutMs: 5000 })
+  const client = await connectApplicationWorker<typeof definition>(endpoint.port2, { timeoutMs })
   cleanup.push(() => client.close())
   return { client, endpoint }
 }
@@ -167,6 +167,35 @@ describe('owned browser application facade', () => {
     expect((await b.content.retained(reference)).payload.peer).toBe(b.deviceId)
     expect((await a.content.retention(reference)).some(value => value.payload.peer === b.deviceId)).toBe(true)
     expect((await a.query('messages', null)).value.events).toHaveLength(0)
+  })
+
+  it('keeps durable operation observation pending beyond the ordinary RPC deadline', async () => {
+    const f = await fixture(), { client } = await facade(f.b, undefined, 500)
+    const operation = await client.command('say', 'offline', { operationId: 'long-wait' })
+    const abort = new AbortController(), outcomes: unknown[] = []
+    const applied = operation.applied({ signal: abort.signal }).then(value => { outcomes.push(value) }, error => { outcomes.push(error) })
+    const shared = operation.shared({ signal: abort.signal }).then(value => { outcomes.push(value) }, error => { outcomes.push(error) })
+    await new Promise(resolve => setTimeout(resolve, 650))
+    expect(outcomes).toEqual([])
+    abort.abort(new Error('observation finished'))
+    await Promise.all([applied, shared])
+    expect(outcomes).toHaveLength(2)
+    expect(outcomes.every(value => value instanceof Error && value.message === 'observation finished')).toBe(true)
+    expect((await operation.get())?.status).toBe('saved')
+  })
+
+  it('rejects unbudgeted structured-clone objects and keeps subsequent domain queries usable', async () => {
+    const f = await fixture(), { client } = await facade(f.a)
+    const query = vi.spyOn(f.a, 'query')
+    for (const value of [new Map([['large', new Uint8Array(2_000_000)]]), new ArrayBuffer(2_000_000),
+      await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt']), new Date()]) {
+      query.mockResolvedValueOnce({ revision: f.a.revision, value })
+      await expect(client.query('messages', null)).rejects.toThrow('APPLICATION_WORKER_MESSAGE_INVALID')
+    }
+    query.mockResolvedValueOnce({ revision: f.a.revision, value: new Array<unknown>(100_000) })
+    await expect(client.query('messages', null)).rejects.toThrow('APPLICATION_WORKER_MESSAGE_LIMIT')
+    query.mockRestore()
+    expect((await client.query('messages', null)).value.events).toHaveLength(0)
   })
 
   it('bounds pending waits and page streams while leaving a cancelled command inspectable', async () => {
