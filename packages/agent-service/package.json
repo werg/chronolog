@@ -6,7 +6,6 @@
   "exports": {
     ".": "./src/index.ts",
     "./workers": "./src/workers.ts",
-    "./framing": "./src/framing.ts",
     "./peer-link": "./src/peer-link.ts",
     "./governed-peer": "./src/governed-peer.ts",
     "./membership-http": "./src/membership-http.ts"

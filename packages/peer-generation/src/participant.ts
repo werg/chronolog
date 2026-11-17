@@ -53,14 +53,24 @@ function requireParticipant(condition: unknown, code: string): asserts condition
 function applicationId(value: unknown): asserts value is string {
   requireParticipant(typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value), 'PEER_PARTICIPANT_SCOPE_INVALID')
 }
+function dataProperties(value: object, code: string): Array<[string, PropertyDescriptor]> {
+  const properties = Object.entries(Object.getOwnPropertyDescriptors(value))
+  requireParticipant(properties.every(([, descriptor]) => Object.hasOwn(descriptor, 'value')), code)
+  return properties
+}
 function jsonValue(value: unknown, depth = 0): void {
   requireParticipant(depth <= PARTICIPANT_LIMITS.depth, 'PEER_PARTICIPANT_DEPTH_LIMIT')
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return
   if (typeof value === 'number') { requireParticipant(Number.isFinite(value), 'PEER_PARTICIPANT_PAYLOAD_INVALID'); return }
-  if (Array.isArray(value)) { for (const item of value) jsonValue(item, depth + 1); return }
-  requireParticipant(value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype,
+  const array = Array.isArray(value)
+  requireParticipant(value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === (array ? Array.prototype : Object.prototype),
     'PEER_PARTICIPANT_PAYLOAD_INVALID')
-  for (const item of Object.values(value)) jsonValue(item, depth + 1)
+  const properties = dataProperties(value, 'PEER_PARTICIPANT_PAYLOAD_INVALID')
+  if (array) requireParticipant(properties.filter(([key]) => /^(?:0|[1-9][0-9]*)$/u.test(key) && Number(key) < value.length).length === value.length,
+    'PEER_PARTICIPANT_PAYLOAD_INVALID')
+  for (const [key, descriptor] of properties) {
+    if (!array || key !== 'length') jsonValue(descriptor.value, depth + 1)
+  }
 }
 export function participantAccepts(policy: ParticipantPolicy, interest: ParticipantInterest): boolean {
   return policy.interests.some(value => value.facet === interest.facet && value.action === interest.action)
@@ -72,7 +82,9 @@ export function validateParticipantRequest(value: unknown, selected: Participant
     'PEER_PARTICIPANT_ENVELOPE_INVALID')
   const request = value as ParticipantRequest
   const fields = ['protocol', 'applicationId', 'requestId', 'facet', 'action', 'payload']
-  requireParticipant(Object.keys(request).length === fields.length && fields.every(key => Object.hasOwn(request, key)),
+  const properties = dataProperties(request, 'PEER_PARTICIPANT_ENVELOPE_INVALID')
+  requireParticipant(properties.length === fields.length && Object.keys(request).length === fields.length &&
+    Object.getOwnPropertySymbols(request).length === 0 && fields.every(key => Object.hasOwn(request, key)),
     'PEER_PARTICIPANT_ENVELOPE_INVALID')
   requireParticipant(request.protocol === PARTICIPANT_PROTOCOL, 'PEER_PARTICIPANT_PROTOCOL_UNSUPPORTED')
   applicationId(request.applicationId)
@@ -116,15 +128,26 @@ export function createParticipantTransport(options: {
   let pending = 0
   const exchange = async (input: ParticipantRequest, inputOptions: ParticipantExchangeOptions = {}): Promise<ParticipantResponse> => {
     const request = validateParticipantRequest(input, selected)
+    const signal = inputOptions.signal
     requireParticipant(request.applicationId === scope, 'PEER_PARTICIPANT_SCOPE_MISMATCH')
-    inputOptions.signal?.throwIfAborted()
+    signal?.throwIfAborted()
     requireParticipant(pending < PARTICIPANT_LIMITS.pending, 'PEER_PARTICIPANT_BUSY')
     pending++
-    try {
-      const response = await dispatch(request, inputOptions)
-      inputOptions.signal?.throwIfAborted()
-      return validateParticipantResponse(response, request, selected)
-    } finally { pending-- }
+    // Cancelling the caller does not release an adapter's unfinished physical work.
+    const completion = (async () => {
+      try { return await dispatch(request, signal === undefined ? {} : { signal }) }
+      finally { pending-- }
+    })()
+    const response = await (signal === undefined ? completion : new Promise<unknown>((resolve, reject) => {
+      const cleanup = () => signal.removeEventListener('abort', onAbort)
+      function onAbort() { cleanup(); reject(signal!.reason) }
+      signal.addEventListener('abort', onAbort, { once: true })
+      // Both handlers stay attached after cancellation, consuming late failures.
+      void completion.then(value => { cleanup(); resolve(value) }, error => { cleanup(); reject(error) })
+      if (signal.aborted) onAbort()
+    }))
+    signal?.throwIfAborted()
+    return validateParticipantResponse(response, request, selected)
   }
   return Object.freeze({ applicationId: scope, policy: policy(selected.role,
     Object.fromEntries([...new Set(selected.interests.map(value => value.facet))].map(facet =>

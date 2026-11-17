@@ -5,10 +5,8 @@ import {
 } from '@chronolog/protocol'
 import type { CborValue, Ed25519KeyPair } from '@chronolog/protocol'
 import { assertFeedPosition, ChangeSignal } from '@chronolog/records'
-import type { FeedLink } from '@chronolog/records'
+import type { FeedLink, FramedPeerConnection } from '@chronolog/records'
 import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN } from '@chronolog/signals'
-
-import type { FramedPeerConnection } from './framing.js'
 
 const PEER_DOMAIN = 'chronolog/peer/v1'
 const MAX_RANGE = 64

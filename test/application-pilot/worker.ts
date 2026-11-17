@@ -1,4 +1,5 @@
 import { decodeSignedGenesis } from '@chronolog/capabilities'
+import { SignedInclusionFinalityProvider } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { prepareBrowserIdentity, openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
@@ -15,6 +16,20 @@ let connection: { close(): Promise<void>; stats(): PilotRouteStats } | undefined
 let opening: PeerDataChannelConnection | undefined, connectionGeneration = 0
 let bootstrap: PilotPeerBootstrap | undefined
 const connectionHistory: PilotRouteStats[] = []
+
+// Observe calls the peer already makes. These diagnostics never scan retained
+// evidence, take the node mutex, or initiate verification/materialization.
+const providerIngest = { calls: 0, completed: 0, failed: 0, active: 0 }
+const nodeIngest = { calls: 0, completed: 0, failed: 0, active: 0 }
+let proofProgress: { receivedThrough: number; verifiedThrough: number; certifiedThrough: number } | undefined
+let finalitySnapshot = { includedThrough: 0, closedReceiptThrough: 0, closedThroughMs: '-1' }
+
+async function observeEvidence<T>(metric: typeof providerIngest, run: () => Promise<T>): Promise<T> {
+  metric.calls++; metric.active++
+  try { const result = await run(); metric.completed++; return result }
+  catch (error) { metric.failed++; throw error }
+  finally { metric.active-- }
+}
 
 /** The Window transfers an untouched channel; keys and application frames stay here. */
 async function connect(channels: WebRtcChannels, connectionId: number): Promise<void> {
@@ -71,9 +86,32 @@ endpoint.addEventListener('message', (event) => {
         const genesis = decodeSignedGenesis(base64UrlToBytes(bootstrap.genesis))
         peer = await openBrowserPeer({ name: request.name!, engineUrl: new URL('./engine/', globalThis.location.href), configure() {
           return { materializer: { executionManifest: decodeExecutionManifest(base64UrlToBytes(bootstrap!.executionManifest)), rootAdministrator: genesis.manifest.schemaAdminPublicKey },
-            governed: { genesis, groupRoute: base64UrlToBytes(bootstrap!.groupRoute), initialEpochContentKey: base64UrlToBytes(bootstrap!.epochContentKey) },
+            governed: { genesis, groupRoute: base64UrlToBytes(bootstrap!.groupRoute), initialEpochContentKey: base64UrlToBytes(bootstrap!.epochContentKey),
+              liveInclusionProviders: { 'signed-inclusion-v2': async (configuration, store) => {
+                const provider = await SignedInclusionFinalityProvider.open(configuration, store)
+                const captureProgress = (progress: typeof provider.progress): void => {
+                  proofProgress = { receivedThrough: progress.receivedThrough, verifiedThrough: progress.verifiedThrough,
+                    certifiedThrough: progress.certifiedThrough }
+                }
+                captureProgress(provider.progress)
+                return { configuration: provider.configuration, evidenceBytes: () => provider.evidenceBytes(),
+                  ingestEvidence: bytes => observeEvidence(providerIngest, async () => {
+                    const progress = await provider.ingestEvidence(bytes)
+                    captureProgress(progress)
+                    return progress
+                  }),
+                  snapshot() {
+                    const snapshot = provider.snapshot()
+                    finalitySnapshot = { includedThrough: snapshot.includedThrough, closedReceiptThrough: snapshot.closedReceiptThrough,
+                      closedThroughMs: String(snapshot.closedThroughMs) }
+                    return snapshot
+                  },
+                }
+              } } },
             close: disconnect }
         } })
+        const ingestEvidence = peer.node.ingestFinalityEvidence.bind(peer.node)
+        peer.node.ingestFinalityEvidence = bytes => observeEvidence(nodeIngest, () => ingestEvidence(bytes))
         serveBrowserPeer(endpoint, peer)
         return { groupId: bytesToBase64Url(genesis.manifest.groupId), identity: bytesToBase64Url(peer.node.identity) }
       }
@@ -87,6 +125,8 @@ endpoint.addEventListener('message', (event) => {
         return { connected: connection !== undefined, records: status.transport.records,
           processedRecords: status.processedTransportRecords, finalOrderLength: status.finalOrderLength ?? 0,
           materializationPending: status.materializationPending,
+          ...(proofProgress === undefined ? {} : { finality: { ...proofProgress, ...finalitySnapshot,
+            appliedThrough: peer!.node.finalThrough, providerIngest: { ...providerIngest }, nodeIngest: { ...nodeIngest } } }),
           ...(status.lastError === undefined ? {} : { error: status.lastError }),
           ...(status.transport.lastCatchUpError === undefined ? {} : { transportError: status.transport.lastCatchUpError }),
           ...(status.ingest === undefined ? {} : { ingest: status.ingest }) } satisfies PilotProgress

@@ -100,9 +100,6 @@
       "@chronolog/agent-service/governed-peer": [
         "packages/agent-service/src/governed-peer.ts"
       ],
-      "@chronolog/agent-service/framing": [
-        "packages/agent-service/src/framing.ts"
-      ],
       "@chronolog/agent-service/peer-link": [
         "packages/agent-service/src/peer-link.ts"
       ],

@@ -461,7 +461,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     if (!Number.isSafeInteger(prefixLength) || prefixLength < this.finalOrderLength || prefixLength > this.orderLength) {
       throw new MaterializerInputError('MATERIALIZER_FINAL_PREFIX_INVALID')
     }
-    if (prefixLength === this.finalOrderLength) return
     if (this.#materializing) throw new Error('MATERIALIZER_REENTRANT_CALL')
     this.#materializing = true
     let replayBranch: string | null = null
@@ -473,6 +472,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         canonicalCandidate: row.canonicalCandidate, core: decodeTransactionCore(row.canonicalCandidate) }))
       const controls = peerControls === undefined ? undefined : validatePeerExecutionControls(peerControls, transactions)
       if (controls !== undefined && !hasCurrentPeerControl(this.#writer, controls)) throw new Error('MATERIALIZER_CONTROL_PROJECTION_UNPUBLISHED')
+      // The same settled data prefix can still need a newly restrictive control projection.
+      if (prefixLength === this.finalOrderLength && (controls === undefined || hasCurrentPeerControl(this.#finalReader, controls))) return
       let commitHash: string
       if (prefixLength === this.#log.length) {
         commitHash = this.#published.doltCommitHash
@@ -489,7 +490,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         }
         if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, controls.revisions[controls.currentRevision]!)
         verifyFinalPrefix(prefix, readSystemLog(this.#writer))
-        commitHash = this.#writer.doltCommit(`chronolog final prefix ${prefixLength}`)
+        commitHash = this.#writer.prepare('SELECT * FROM dolt_status').all().length === 0
+          ? checkpoint.doltCommitHash : this.#writer.doltCommit(`chronolog final prefix ${prefixLength}`)
       }
       // Read and validate the exact SQL commit before publishing its final ref.
       const temporary = replayBranch ?? this.#published.branchRef
@@ -499,6 +501,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       const log = readSystemLog(reader)
       if (log.length !== prefixLength) throw new Error('MATERIALIZER_FINAL_LOG_LENGTH_MISMATCH')
       verifyFinalPrefix(prefix, log)
+      if (controls !== undefined && !hasCurrentPeerControl(reader, controls)) throw new Error('MATERIALIZER_FINAL_CONTROL_MISMATCH')
       const published = publishFinalRef(this.#writer, this.finalRevision + 1n, log, commitHash)
       reader.doltCheckout(published.branchRef)
       const oldReader = this.#finalReader

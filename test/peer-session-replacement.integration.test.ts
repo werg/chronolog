@@ -2,10 +2,10 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { framePeerStream, openAuthenticatedPeerLink } from '@chronolog/agent-service'
+import { openAuthenticatedPeerLink } from '@chronolog/agent-service'
 import { MemoryOperationStore, loadOrCreateEnrollmentIdentity } from '@chronolog/node-core'
 import { bytesToBase64Url, equalBytes } from '@chronolog/protocol'
-import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
+import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, framePeerStream, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { describe, expect, it } from 'vitest'
 
 import { createNativeBrowserFixture, type NativeBrowserFixture } from '../tools/browser-event-fixture.js'

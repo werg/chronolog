@@ -1,6 +1,5 @@
 export * from './finality-service.js'
 export * from './workers.js'
-export * from './framing.js'
 export * from './peer-link.js'
 export * from './governed-peer.js'
 export * from './membership-http.js'

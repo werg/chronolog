@@ -105,6 +105,14 @@ export interface PublicationRegistry {
   read(): Promise<readonly SignedPublication[]>
   publish(publication: SignedPublication): Promise<SignedPublication>
 }
+interface PublicationState {
+  readonly authority: AuthorityBundle
+  readonly publications: readonly SignedPublication[]
+}
+interface VerifiedPublicationState {
+  readonly authority: PeerAuthority
+  readonly publications: readonly SignedPublication[]
+}
 const locks = new WeakMap<BytesStore, Map<string, Serial>>()
 function publicationLock(store: BytesStore, key: string): Serial {
   let keys = locks.get(store)
@@ -123,33 +131,57 @@ export async function createPublicationRegistry(options: {
   const store = options.store, readAuthority = options.authority
   const initial = await verifyAuthorityBundle(await readAuthority()), descriptor = initial.bundle.descriptor
   const key = `peer-generation/publications/${descriptor.payload.applicationId}`, lock = publicationLock(store, key)
-  const authority = async (): Promise<PeerAuthority> => verifyAuthorityBundle(await readAuthority(), descriptor)
-  const read = async (verified: PeerAuthority): Promise<SignedPublication[]> => {
-    const bytes = await store.get(key); check(bytes !== null, 'PEER_PUBLICATION_STATE_MISSING')
-    check(bytes.length <= PUBLICATION_LIMITS.historyBytes, 'PEER_PUBLICATION_HISTORY_LIMIT')
-    const values = decodePeerValue<SignedPublication[]>(bytes)
+  let learned = initial
+  const encode = (state: VerifiedPublicationState): Uint8Array => {
+    check(encodePeerValue(state.publications).length <= PUBLICATION_LIMITS.historyBytes, 'PEER_PUBLICATION_HISTORY_LIMIT')
+    return encodePeerValue({ authority: state.authority.bundle, publications: state.publications })
+  }
+  const decode = async (bytes: Uint8Array): Promise<VerifiedPublicationState> => {
+    const state = decodePeerValue<PublicationState>(bytes)
+    object(state, ['authority', 'publications'])
+    const verified = await verifyAuthorityBundle(state.authority, descriptor), values = state.publications
     check(isArray(values) && values.length <= PUBLICATION_LIMITS.revisions, 'PEER_PUBLICATION_HISTORY_LIMIT')
+    check(encodePeerValue(values).length <= PUBLICATION_LIMITS.historyBytes, 'PEER_PUBLICATION_HISTORY_LIMIT')
     const operations = new Set<string>()
     for (const [index, publication] of values.entries()) {
       await verifyPublicationManifest(publication, verified)
       check(publication.payload.revision === index && publication.payload.previous === (values[index - 1]?.id ?? null), 'PEER_PUBLICATION_CHAIN_INVALID')
       check(!operations.has(publication.payload.operationId), 'PEER_PUBLICATION_OPERATION_REUSED'); operations.add(publication.payload.operationId)
     }
-    return values
+    return { authority: verified, publications: values }
+  }
+  const read = async (): Promise<VerifiedPublicationState> => {
+    const bytes = await store.get(key); check(bytes !== null, 'PEER_PUBLICATION_STATE_MISSING')
+    return decode(bytes)
+  }
+  const observe = async (state: VerifiedPublicationState, candidate?: PeerAuthority): Promise<VerifiedPublicationState> => {
+    const verified = candidate ?? await verifyAuthorityBundle(await readAuthority(), descriptor)
+    assertAuthorityExtension(state.authority, verified)
+    assertAuthorityExtension(learned, verified)
+    // Keep the owner fenced even if persisting this learned restriction loses its acknowledgment.
+    learned = verified
+    if (samePeerValue(state.authority.bundle, verified.bundle)) return state
+    const next = { authority: verified, publications: state.publications }
+    // The durable floor advances independently of whether a proposed release is authorized.
+    await store.put(key, encode(next))
+    return next
   }
   await lock.run(async () => {
-    if (await store.get(key) === null) {
+    const bytes = await store.get(key)
+    let state: VerifiedPublicationState
+    if (bytes === null) {
       check(options.requireExisting !== true, 'PEER_PUBLICATION_STATE_MISSING')
-      await store.put(key, encodePeerValue([]))
-    }
-    await read(await authority())
+      state = { authority: initial, publications: [] }
+      await store.put(key, encode(state))
+    } else state = await observe(await decode(bytes), initial)
+    await observe(state)
   })
   return {
-    read: () => lock.run(async () => structuredClone(await read(await authority()))),
+    read: () => lock.run(async () => structuredClone((await observe(await read())).publications)),
     async publish(input) {
       const publication = structuredClone(input)
       return lock.run(async () => {
-        const verified = await authority(), values = await read(verified)
+        const state = await observe(await read()), verified = state.authority, values = state.publications
         await verifyPublicationManifest(publication, verified)
         const retry = values.find(value => value.payload.operationId === publication.payload.operationId)
         if (retry !== undefined) {
@@ -158,12 +190,12 @@ export async function createPublicationRegistry(options: {
         }
         await authorizePublication(publication, verified, values.at(-1) ?? null)
         check(values.length < PUBLICATION_LIMITS.revisions, 'PEER_PUBLICATION_HISTORY_LIMIT')
-        const bytes = encodePeerValue([...values, publication])
-        check(bytes.length <= PUBLICATION_LIMITS.historyBytes, 'PEER_PUBLICATION_HISTORY_LIMIT')
+        const publications = [...values, publication]
+        check(encodePeerValue(publications).length <= PUBLICATION_LIMITS.historyBytes, 'PEER_PUBLICATION_HISTORY_LIMIT')
         // A newly learned restrictive control cannot be bypassed by slow preparation.
-        const latest = await authority(); assertAuthorityExtension(verified, latest)
-        await authorizePublication(publication, latest, values.at(-1) ?? null)
-        await store.put(key, bytes)
+        const latest = await observe(state)
+        await authorizePublication(publication, latest.authority, values.at(-1) ?? null)
+        await store.put(key, encode({ authority: latest.authority, publications }))
         return structuredClone(publication)
       })
     },

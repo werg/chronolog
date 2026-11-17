@@ -37,6 +37,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
   readonly #publicationKey: string
   readonly #publicationAttempts: string
   #tail: Promise<unknown> = Promise.resolve()
+  #closing: Promise<void> | undefined
 
   constructor(replica: PeerReplica, store: BytesStore, signal: AbortSignal, options: ControlParticipantOptions) {
     const timeoutMs = options.timeoutMs ?? 30_000
@@ -181,12 +182,19 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
   }
 
   close(): Promise<void> {
+    if (this.#closing !== undefined) return this.#closing
+    this.#closing = this.#tail.then(() => undefined)
     this.#lifetime.abort(new Error('APPLICATION_CONTROL_CLOSED'))
-    return this.#tail.then(() => undefined)
+    return this.#closing
   }
 
   #serial<T>(call: () => Promise<T>): Promise<T> {
-    const result = this.#tail.then(() => { this.#signal.throwIfAborted(); return call() })
+    const result = this.#tail.then(async () => {
+      this.#signal.throwIfAborted()
+      const value = await call()
+      this.#signal.throwIfAborted()
+      return value
+    })
     this.#tail = result.catch(() => undefined)
     return result
   }

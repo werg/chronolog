@@ -473,22 +473,32 @@ try {
   report.error = error instanceof Error ? error.stack ?? error.message : String(error)
   report.status = `failed during ${report.status}`
   const observations = await Promise.allSettled(observedPages.map(async (page, index) => {
-    const observation = await bounded(page.evaluate(async () => {
-      const target = globalThis as unknown as PilotWindow
-      const ui = Object.fromEntries(['status', 'revision', 'jobs', 'operations', 'typing'].map(id => [id, document.getElementById(id)?.textContent]))
-      const operationIds = Array.from(document.querySelectorAll('#operations > li')).map(row => row.getAttribute('data-operation')).filter((id): id is string => id !== null)
-      const outcomes = await Promise.allSettled(operationIds.map(id => target.applicationPilot.operation(id)))
-      const events = await target.applicationPilot.events()
-      return { url: location.href, ui, failure: document.getElementById('status')?.getAttribute('data-failure'), outcomes, events,
-        connectionErrors: target.applicationPilot.connectionErrors }
-    }), 5_000)
+    const [presentation, events, progress, outcomes] = await Promise.all([
+      bounded(page.evaluate(() => {
+        const target = globalThis as unknown as Partial<PilotWindow>
+        const ui = Object.fromEntries(['status', 'revision', 'jobs', 'operations', 'typing'].map(id => [id, document.getElementById(id)?.textContent]))
+        return { url: location.href, ui, failure: document.getElementById('status')?.getAttribute('data-failure'),
+          startup: target.applicationPilot?.startup ?? null, connectionErrors: target.applicationPilot?.connectionErrors ?? [] }
+      }), 5_000).catch((error: unknown) => ({ presentationError: String(error) })),
+      bounded(page.evaluate(() => (globalThis as unknown as Partial<PilotWindow>).applicationPilot?.events()), 5_000)
+        .then(events => ({ events })).catch((error: unknown) => ({ eventsError: String(error) })),
+      bounded(page.evaluate(() => (globalThis as unknown as Partial<PilotWindow>).applicationPilot?.progress()), 5_000)
+        .then(progress => ({ progress })).catch((error: unknown) => ({ progressError: String(error) })),
+      bounded(page.evaluate(async () => {
+        const pilot = (globalThis as unknown as Partial<PilotWindow>).applicationPilot
+        if (pilot === undefined) return { diagnosticsAvailable: false }
+        const operationIds = Array.from(document.querySelectorAll('#operations > li')).map(row => row.getAttribute('data-operation')).filter((id): id is string => id !== null)
+        return { diagnosticsAvailable: true, outcomes: await Promise.allSettled(operationIds.map(id => pilot.operation(id))) }
+      }), 5_000).catch((error: unknown) => ({ outcomesError: String(error) })),
+    ])
     await page.screenshot({ path: join(output, `failure-${index}.png`), fullPage: true }).catch(() => undefined)
-    return observation
+    return { ...presentation, ...events, ...progress, ...outcomes }
   }))
   report.diagnostics.pages = observations.map(value => value.status === 'fulfilled' ? value.value : String(value.reason))
   if (native !== undefined) {
     report.diagnostics.nativeAgent = native.agent.status
     report.diagnostics.nativeRevision = native.node.revision.toString()
+    report.diagnostics.nativeStatus = await bounded(native.node.status(), 5_000).catch((error: unknown) => String(error))
     report.diagnostics.nativeFinalEvents = await bounded(native.client.events.read(), 5_000).catch((error: unknown) => String(error))
   }
   if (routes !== undefined) { report.diagnostics.routes ??= routes.snapshot(); await routes.saveTrace(join(output, 'route-trace.ndjson')) }
@@ -522,7 +532,12 @@ async function accepted(handle: TransactionHandle) {
   finally { handle.dispose() }
 }
 async function ready(page: Page) {
-  await page.waitForFunction(() => 'applicationPilot' in globalThis)
+  await page.waitForFunction(() => {
+    const startup = (globalThis as unknown as Partial<PilotWindow>).applicationPilot?.startup
+    return startup !== undefined && (startup.phase === 'ready' || startup.error !== null)
+  })
+  const startup = await page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.startup)
+  assert.equal(startup.error, null, `Browser bootstrap failed: ${JSON.stringify(startup)}`)
   await expect(page.locator('#message')).toBeEnabled()
   await expect(page.locator('#status')).toHaveAttribute('data-failure', 'false')
 }

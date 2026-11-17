@@ -6,11 +6,11 @@ import {
   type ProgramStep,
 } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { MaterializedApplicationSnapshot } from '@chronolog/materializer'
+import type { MaterializedApplicationSnapshot, PeerExecutionControls } from '@chronolog/materializer'
 
 import { DeterministicMaterializer } from './native.js'
 import { createDoltLiteMaterializationRuntime } from './runtime-adapter.js'
-import { MaterializerFixture, ROOT_KEY, replayProposal, rows } from './test-fixtures.js'
+import { MaterializerFixture, ROOT_KEY, replayProposal, rows, testKey } from './test-fixtures.js'
 import type { ReplayProposal } from './types.js'
 
 const fixtures = new MaterializerFixture()
@@ -343,7 +343,85 @@ describe('replicated SQL materialization', () => {
     expect(materializer.localSql('SELECT count(*) FROM views', [], { view: 'final' }).rows).toEqual([[{ kind: 'integer', value: '2' }]])
     materializer.close()
   })
+  it.each([0, 1])('publishes restrictive controls at unchanged settled prefix %i and preserves them on reopen', async (prefixLength) => {
+    const { path, manifest } = await fixture()
+    let materializer = await open(path, manifest, 1)
+    const { initial, restricted, member } = peerControls()
+    const membership = "SELECT count(*) FROM chronolog_collective_members WHERE member_key = ? AND state = 'active'"
+    const controlRow = [[{ kind: 'integer', value: '1' }, { kind: 'blob', value: restricted.revisions[1]!.digest }]]
+    try {
+      const history = [
+        await transaction(1n, 'settled', [sqlStatement('SELECT 1')], materializer.executionManifestDigest),
+        await transaction(2n, 'tentative', [sqlStatement('SELECT 2')], materializer.executionManifestDigest),
+      ]
+      await materializer.materialize(history.slice(0, prefixLength), initial)
+      await materializer.publishFinal(prefixLength, initial)
+      expect(materializer.localSql(membership, [{ kind: 'blob', value: member }], { view: 'final' }).rows)
+        .toEqual([[{ kind: 'integer', value: '1' }]])
+      const held = createDoltLiteMaterializationRuntime(materializer).queries.captureRead!({ view: 'final' })
+      try {
+        await materializer.materialize(history, initial)
+        await materializer.materialize(history, restricted)
+        expect(rows(materializer, membership, [{ kind: 'blob', value: member }])).toEqual([['0']])
+        await expect(materializer.publishFinal(prefixLength)).rejects.toThrow('MATERIALIZER_CONTROLS_REQUIRED')
+        await expect(materializer.publishFinal(prefixLength, initial)).rejects.toThrow('MATERIALIZER_CONTROL_PROJECTION_UNPUBLISHED')
+        const previous = materializer.finalRevision
+        await materializer.publishFinal(prefixLength, restricted)
+        expect(materializer.finalRevision).toBe(previous + 1n)
+        expect(materializer.finalOrderLength).toBe(prefixLength)
+        expect(materializer.localSql(membership, [{ kind: 'blob', value: member }], { view: 'final' }).rows)
+          .toEqual([[{ kind: 'integer', value: '0' }]])
+        expect(materializer.localSql('SELECT revision, digest FROM chronolog_peer_control', [], { view: 'final' }).rows)
+          .toEqual(controlRow)
+        expect(held.query(membership, [{ kind: 'blob', value: member }]).rows)
+          .toEqual([[{ kind: 'integer', value: '1' }]])
+        await materializer.publishFinal(prefixLength, restricted)
+        expect(materializer.finalRevision).toBe(previous + 1n)
+      } finally { held.release() }
+      const final = snapshotData(materializer.captureApplication({ view: 'final' }))
+      materializer.close(); materializer = await open(path, manifest, 1)
+      expect(snapshotData(materializer.captureApplication({ view: 'final' }))).toEqual(final)
+      expect(materializer.localSql(membership, [{ kind: 'blob', value: member }], { view: 'final' }).rows)
+        .toEqual([[{ kind: 'integer', value: '0' }]])
+      expect(materializer.localSql('SELECT revision, digest FROM chronolog_peer_control', [], { view: 'final' }).rows)
+        .toEqual(controlRow)
+      await materializer.publishFinal(prefixLength, restricted)
+      expect(materializer.finalRevision).toBe(final.revision)
+    } finally { materializer.close() }
+  })
+
+  it('settles an exact retained checkpoint without requiring an empty SQL commit', async () => {
+    const { path, manifest } = await fixture()
+    let materializer = await open(path, manifest, 1)
+    try {
+      const first = await transaction(1n, 'first-checkpoint', [sqlStatement('SELECT 1')], materializer.executionManifestDigest)
+      const second = await transaction(2n, 'later-checkpoint', [sqlStatement('SELECT 2')], materializer.executionManifestDigest)
+      await materializer.materialize([first])
+      await materializer.materialize([first, second])
+      expect(materializer.checkpoints().some(checkpoint => checkpoint.prefixLength === 1)).toBe(true)
+      await materializer.publishFinal(1)
+      const final = snapshotData(materializer.captureApplication({ view: 'final' }))
+      expect(final.transactions).toEqual([{ txId: first.txId, canonicalCandidate: first.canonicalCandidate, outcome: 'accepted' }])
+      expect(materializer.orderLength).toBe(2)
+      materializer.close(); materializer = await open(path, manifest, 1)
+      expect(snapshotData(materializer.captureApplication({ view: 'final' }))).toEqual(final)
+      await materializer.publishFinal(1)
+      expect(materializer.finalRevision).toBe(final.revision)
+    } finally { materializer.close() }
+  })
 })
+
+function peerControls(): { initial: PeerExecutionControls; restricted: PeerExecutionControls; member: Uint8Array } {
+  const member = testKey(0x60)
+  const initial: PeerExecutionControls = { applicationId: testKey(1), currentRevision: 0,
+    revisions: [{ revision: 0, digest: testKey(2), members: [
+      { publicKey: ROOT_KEY, role: 'admin' }, { publicKey: member, role: 'member' },
+    ] }] }
+  const restricted: PeerExecutionControls = { ...initial, currentRevision: 1, revisions: [...initial.revisions,
+    { revision: 1, digest: testKey(4), members: [{ publicKey: ROOT_KEY, role: 'admin' }] },
+  ] }
+  return { initial, restricted, member }
+}
 
 async function fixture(limits: Partial<ExecutionLimits> = {}) {
   const directory = await fixtures.directory()

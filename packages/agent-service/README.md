@@ -387,7 +387,7 @@ A reachable resident accepts one direct HTTPS offer/answer; optional Tendriller
 rendezvous requires both endpoints to join the same attempt. Neither introduction
 path carries application frames or supplies an automatic hosted data fallback.
 
-`framePeerStream` adapts a reliable `ReadableStream`/`WritableStream` pair to
+`framePeerStream` from `@chronolog/records` adapts a reliable `ReadableStream`/`WritableStream` pair to
 bounded length-prefixed frames, backpressure, cancellation, and truncated-frame
 errors when a deployment explicitly selects a generic stream transport. Supply
 appropriate transport security, such as WSS/QUIC; length framing does not provide
@@ -501,7 +501,7 @@ never retries sends or reconnects subscriptions behind the application's back.
 
 The independent `PeerLiveLane.trySend(frame, { signal })` returns `true` after
 local dispatch or `false` when busy before accepting any bytes. Actual failures
-throw. Use `frameLivePeerStream` for a dedicated byte stream: it permits one
+throw. Use `frameLivePeerStream` from `@chronolog/records` for a dedicated byte stream: it permits one
 write in flight and refuses further sends while that write remains outstanding.
 It does not share the reliable history stream or its queue. The WebRTC adapter
 implements the same contract on its independent datagram channel.

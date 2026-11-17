@@ -31,17 +31,26 @@ async function fixture() {
     revision: previous === null ? 0 : previous.payload.revision + 1, previous: previous?.id ?? null,
     definitionDigest: descriptor.payload.definitionDigest, executionManifestDigest: descriptor.payload.executionManifestDigest,
     entry: 'index.html', files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }], ...changes }, signer)
-  const revoke = async () => {
+  const revise = async (registry: typeof generations, transitionId: string, grants: typeof control.payload.grants) => {
     const next = await signControlRevision({ ...control.payload, revision: 1, previous: await peerDigest(control),
-      grants: control.payload.grants.map(grant => grant.publicKey === admin.publicKey ? { ...grant, administrator: false } : grant) }, host)
+      grants }, host)
     const transition = await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
-      policy: descriptor.payload.policy, transitionId: 'revoke-admin', expectedGeneration: first.id, requester: host.publicKey,
+      policy: descriptor.payload.policy, transitionId, expectedGeneration: first.id, requester: host.publicKey,
       coordinator: admin.publicKey, controlRevision: 1, reason: 'control-change', base: {
         point: { generation: first.id, sequence: 0, root: await generationStartRoot(first) }, receipt: null, bridge: [],
       } }, host)
-    await generations.select(transition, { control: next })
+    await registry.select(transition, { control: next })
   }
-  return { host, admin, writer, descriptor, authority, store, publications, bytes, manifest, revoke }
+  const revoke = () => revise(generations, 'revoke-admin', control.payload.grants.map(grant =>
+    grant.publicKey === admin.publicKey ? { ...grant, administrator: false } : grant))
+  const fork = async () => {
+    const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
+    await registry.select(first.payload.transition)
+    await revise(registry, 'competing-control', control.payload.grants.map(grant =>
+      grant.publicKey === writer.publicKey ? { ...grant, administrator: true } : grant))
+    return registry.read()
+  }
+  return { host, admin, writer, descriptor, authority, store, publications, bytes, manifest, revoke, fork }
 }
 
 describe('signed code publication independent of lossy database history', () => {
@@ -114,5 +123,81 @@ describe('signed code publication independent of lossy database history', () => 
     } })
     await expect(registry.publish(publication)).rejects.toThrow('PEER_PUBLICATION_CONTROL_CHANGED')
     expect(await registry.read()).toEqual([])
+  })
+  it('persists a restriction before rejecting a release, fencing stale shared owners and reopen', async () => {
+    const f = await fixture(), first = await f.publications.publish(await f.manifest('first'))
+    const stale = await f.authority(), rejected = await f.manifest('revoked-release', first)
+    const other = await createPublicationRegistry({ store: f.store, authority: async () => stale, requireExisting: true })
+    await f.revoke()
+    await expect(f.publications.publish(rejected)).rejects.toThrow('PEER_PUBLICATION_CONTROL_CHANGED')
+    await expect(other.read()).rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    await expect(other.publish(rejected)).rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    await expect(createPublicationRegistry({ store: f.store, authority: async () => stale, requireExisting: true }))
+      .rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    const reopened = await createPublicationRegistry({ store: f.store, authority: f.authority, requireExisting: true })
+    expect(await reopened.read()).toEqual([first])
+    expect(await reopened.publish(first)).toEqual(first)
+  })
+  it('durably learns authority from reads and refuses a regressed initialization observation', async () => {
+    const f = await fixture(), stale = await f.authority(), store = new MemoryBytesStore()
+    let selected = stale
+    const registry = await createPublicationRegistry({ store, authority: async () => selected })
+    await f.revoke(); selected = await f.authority()
+    expect(await registry.read()).toEqual([])
+    selected = stale
+    await expect(registry.read()).rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    await expect(createPublicationRegistry({ store, authority: async () => stale, requireExisting: true }))
+      .rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+
+    const current = await f.authority(), initialStore = new MemoryBytesStore()
+    let calls = 0
+    await expect(createPublicationRegistry({ store: initialStore, authority: async () => ++calls === 1 ? current : stale }))
+      .rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    await expect(createPublicationRegistry({ store: initialStore, authority: async () => stale, requireExisting: true }))
+      .rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+  })
+  it('rejects a different valid control branch on initialization, read, and publish', async () => {
+    const f = await fixture(), first = await f.publications.publish(await f.manifest('first'))
+    const fork = await f.fork()
+    await verifyAuthorityBundle(fork)
+    let selected = await f.authority()
+    const other = await createPublicationRegistry({ store: f.store, authority: async () => selected, requireExisting: true })
+    await f.revoke()
+    expect(await f.publications.read()).toEqual([first])
+    selected = fork
+    await expect(other.read()).rejects.toThrow('PEER_CONTROL_EQUIVOCATION')
+    await expect(other.publish(await f.manifest('forked-release', first, f.admin, { controlRevision: 1 })))
+      .rejects.toThrow('PEER_CONTROL_EQUIVOCATION')
+    await expect(createPublicationRegistry({ store: f.store, authority: async () => fork, requireExisting: true }))
+      .rejects.toThrow('PEER_CONTROL_EQUIVOCATION')
+    expect(await f.publications.publish(first)).toEqual(first)
+    expect(await f.publications.read()).toEqual([first])
+  })
+  it('keeps learned restrictions after a failed persistence attempt and recovers a lost acknowledgment', async () => {
+    const f = await fixture(), stale = await f.authority(), backing = new MemoryBytesStore()
+    let selected = stale, failure: 'before' | 'after' | null = null
+    const store = { get: backing.get.bind(backing), async put(key: string, value: Uint8Array) {
+      const mode = failure; failure = null
+      if (mode === 'before') throw new Error('write refused')
+      await backing.put(key, value)
+      if (mode === 'after') throw new Error('reply lost')
+    } }
+    const registry = await createPublicationRegistry({ store, authority: async () => selected })
+    const rejected = await f.manifest('revoked-release')
+    await f.revoke(); const current = await f.authority(); selected = current
+    failure = 'before'
+    await expect(registry.publish(rejected)).rejects.toThrow('write refused')
+    selected = stale
+    await expect(registry.publish(rejected)).rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+
+    selected = current; failure = 'after'
+    await expect(registry.publish(rejected)).rejects.toThrow('reply lost')
+    selected = stale
+    await expect(createPublicationRegistry({ store, authority: async () => selected, requireExisting: true }))
+      .rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    selected = current
+    const reopened = await createPublicationRegistry({ store, authority: async () => selected, requireExisting: true })
+    await expect(reopened.publish(rejected)).rejects.toThrow('PEER_PUBLICATION_CONTROL_CHANGED')
+    expect(await reopened.read()).toEqual([])
   })
 })

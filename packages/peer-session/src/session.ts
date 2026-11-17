@@ -242,11 +242,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   connectControlParticipant(options: ControlParticipantOptions): ApplicationControlParticipant {
     this.#assertOpen()
-    if (this.#control !== undefined && !this.#control.signal.aborted) throw new Error('APPLICATION_CONTROL_ALREADY_ATTACHED')
+    if (this.#control !== undefined) throw new Error('APPLICATION_CONTROL_ALREADY_ATTACHED')
     const participant = new ApplicationControlParticipant(this.#replica, this.#store, this.#lifetime.signal, options)
     this.#control = participant
     this.#links.add(participant)
-    participant.signal.addEventListener('abort', () => { this.#links.delete(participant) }, { once: true })
+    participant.signal.addEventListener('abort', () => {
+      // Abort fences callers immediately; durable writes still belong to this
+      // participant until close drains them, including during session shutdown.
+      void participant.close().then(() => {
+        if (this.#control === participant) this.#control = undefined
+        this.#links.delete(participant)
+      })
+    }, { once: true })
     return participant
   }
 

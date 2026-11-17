@@ -1,5 +1,40 @@
 # Chronolog DB
 
+Chronolog owns application data and execution on the participating devices.
+New peer applications use the public
+[`@chronolog/peer-session`](packages/peer-session/README.md) composition: one
+durable device identity, signed command attempts, coherent queries, encrypted
+content, recovery and live signals. Browser Workers and native processes exchange
+the same authenticated protocol over WebRTC. Tendriller serves the initial page,
+administers participants and selects generations; healthy application exchange
+needs no host request or application-data fallback.
+
+## Application profiles
+
+| Profile | Ordering and completion | Recovery contract |
+| --- | --- | --- |
+| `peer-generation-v1` | One eligible peer sequences commands; `applied()` reports execution and `shared()` reports retained coverage. | A signed successor can adopt an older available prefix. Excluded attempts remain inspectable and require explicit reapplication. |
+| `chronolog-finality-v1` | Deterministic author-time ordering with authenticated inclusion and closure; `final()` reports an irreversible outcome. | A closed prefix cannot be reopened. New final decisions require the configured finality policy. |
+
+These guarantees are explicit in the application and authenticated history-owner contracts.
+Both profiles use one materialization pipeline for verified input order. The
+history owner supplies ordering evidence and invokes settlement only when its
+policy establishes an irreversible prefix.
+Generation-scoped application does not acquire irreversible finality by retaining
+another copy, and a chronological backend cannot accept a generation read view.
+Choose the peer-session profile for collaboration that can recover with a recent
+suffix loss. Choose the stronger chronological profile when the application needs
+irreversible decisions and can accept its availability requirements.
+
+Start with the [peer-session API](packages/peer-session/README.md),
+[architecture](docs/peer-application-architecture.md), and
+[generation and recovery contract](docs/peer-generation-v1.md).
+SQL and event-only applications share the owned session; SQL loads the pinned
+native engine explicitly. A resident is an optional reachable peer and worker,
+not an implicit requirement for every application command.
+
+## Chronological execution and finality
+
 Chronolog DB is a TypeScript prototype of a decentralized, permissioned
 application log. One signed change program combines **ordinary SQLite
 transactions**, platform operations, and bounded durable events. Native and

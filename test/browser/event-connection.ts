@@ -1,4 +1,4 @@
-import { frameLivePeerStream, framePeerStream, type FramedPeerConnection, type PeerLiveLane, type PeerStreamOptions } from '@chronolog/agent-service/framing'
+import { frameLivePeerStream, framePeerStream, type FramedPeerConnection, type PeerLiveLane, type PeerStreamOptions } from '@chronolog/records'
 import type { GovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import { base64UrlToBytes } from '@chronolog/protocol'
 import { MAX_SIGNAL_BYTES } from '@chronolog/signals'

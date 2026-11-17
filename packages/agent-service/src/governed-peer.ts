@@ -1,9 +1,8 @@
 import { createCapabilitySignals, isCapabilityActive, type CapabilitySnapshot } from '@chronolog/capabilities'
 import { bytesToHex, equalBytes, type Ed25519KeyPair } from '@chronolog/protocol'
-import type { FeedLink } from '@chronolog/records'
+import type { FeedLink, FramedPeerConnection } from '@chronolog/records'
 import type { SignalLimits, SignalRoute, Signals } from '@chronolog/signals'
 
-import type { FramedPeerConnection } from './framing.js'
 import { openAuthenticatedPeerLink, type PeerAuthorization } from './peer-link.js'
 
 export interface GovernedPeerSession {

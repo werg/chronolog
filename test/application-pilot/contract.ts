@@ -32,9 +32,33 @@ export interface PilotProgress {
   readonly error?: string
   readonly transportError?: string
   readonly ingest?: { readonly phase: string; readonly phaseAgeMs: number; readonly subscriptionRestarts: number; readonly retryRecords: number }
+  /** Ordered evidence positions, distinct from signed feed record counts. */
+  readonly finality?: {
+    readonly receivedThrough: number
+    readonly verifiedThrough: number
+    readonly certifiedThrough: number
+    readonly includedThrough: number
+    readonly closedReceiptThrough: number
+    readonly appliedThrough: number
+    readonly closedThroughMs: string
+    readonly providerIngest: PilotEvidenceWork
+    readonly nodeIngest: PilotEvidenceWork
+  }
+}
+export interface PilotEvidenceWork {
+  readonly calls: number
+  readonly completed: number
+  readonly failed: number
+  readonly active: number
+}
+export interface PilotStartup {
+  readonly phase: 'connecting' | 'synchronizing' | 'accepting-invitation' | 'installing-backend' | 'ready'
+  readonly invitationProposalId: string | null
+  readonly error: string | null
 }
 export interface PilotDiagnostics {
   readonly identity: string
+  readonly startup: PilotStartup
   readonly connectionErrors: readonly string[]
   holdNextSubmission(): void
   heldSubmission(): { readonly operationId: string; readonly proposalId: string } | null

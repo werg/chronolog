@@ -1,7 +1,6 @@
-import { frameLivePeerStream, type FramedPeerConnection } from '@chronolog/agent-service/framing'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
-import { ChangeSignal, type FeedLink } from '@chronolog/records'
+import { ChangeSignal, frameLivePeerStream, type FeedLink, type FramedPeerConnection } from '@chronolog/records'
 import { describe, expect, it } from 'vitest'
 
 import { openHttpPeerConnection } from '../../test/browser/event-connection.js'

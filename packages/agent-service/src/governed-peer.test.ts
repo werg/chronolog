@@ -1,12 +1,11 @@
 import type { CapabilitySnapshot, EffectiveCapability } from '@chronolog/capabilities'
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { assertCanonicalCbor, bytesToHex, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
-import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
+import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, frameLivePeerStream, framePeerStream, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import type { SignalLimits } from '@chronolog/signals'
 import { frameRtcPeerChannels, WEBRTC_LIVE_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { frameLivePeerStream, framePeerStream } from './framing.js'
 import { createGovernedPeerService, type GovernedPeerService } from './governed-peer.js'
 import { openAuthenticatedPeerLink } from './peer-link.js'
 

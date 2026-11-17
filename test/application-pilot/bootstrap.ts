@@ -6,7 +6,7 @@ import { createChronologApplicationBackend } from '@chronolog/transport-tendrill
 import { supervisePeerSession, type WebRtcSession } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
-import type { PeerIntroductionModule, PilotBootstrap, PilotWindow, PublicKernel } from './contract.js'
+import type { PeerIntroductionModule, PilotBootstrap, PilotStartup, PilotWindow, PublicKernel } from './contract.js'
 
 const target = globalThis as unknown as PilotWindow
 const device = new URL(globalThis.location.href).searchParams.get('device')
@@ -132,26 +132,35 @@ const client = new ChronologClient({ transport, groupId: opened.groupId })
 // Live clients are installed before synchronization or membership finality.
 // The page can start their subscriptions while durable readiness is pending.
 target.tendril.signals.install(client.signals)
+let startup: PilotStartup = { phase: 'connecting', invitationProposalId: null, error: null }
 export const applicationReady = (async () => {
   await connect()
+  startup = { ...startup, phase: 'synchronizing' }
   // The invitation and schema-dependent application calls need the initial state.
   // Reconnect only attaches; qualification observes its replay separately.
   await command('sync', {}, 120_000)
+  startup = { ...startup, phase: 'accepting-invitation' }
   const membership = await client.ownership.acceptInvitation(base64UrlToBytes(bootstrap.teamId), { operationId: 'accept-pilot-team' })
+  startup = { ...startup, invitationProposalId: membership.handle.transactionId }
   try {
     const outcome = await membership.handle.final({ signal: AbortSignal.timeout(30_000) })
     if (outcome.outcome.type !== 'accepted') throw new Error(`PILOT_MEMBERSHIP_REJECTED: ${JSON.stringify(outcome.outcome)}`)
   } finally { membership.handle.dispose() }
+  startup = { ...startup, phase: 'installing-backend' }
   const backend = createChronologApplicationBackend({ id: bootstrap.applicationId, replica: client, sql: true })
   target.tendril.application.install(backend)
+  startup = { ...startup, phase: 'ready' }
   return backend
 })()
 // The page owns the visible readiness error; no top-level await blocks signals.
-void applicationReady.catch(() => undefined)
+void applicationReady.catch((error: unknown) => {
+  startup = { ...startup, error: error instanceof Error ? error.message : String(error) }
+})
 
 let closed = false
 const diagnostics: PilotWindow['applicationPilot'] = {
   identity: opened.identity, connectionErrors,
+  get startup() { return { ...startup } },
   holdNextSubmission() {
     if (hold !== null) throw new Error('PILOT_REPLY_ALREADY_HELD')
     let release!: () => void
@@ -175,5 +184,6 @@ const diagnostics: PilotWindow['applicationPilot'] = {
     await navigator.locks.request(`chronolog:${name}`, { mode: 'exclusive' }, () => undefined)
   },
 }
-void applicationReady.then(() => { target.applicationPilot = diagnostics }).catch(() => undefined)
+// Diagnostics must exist during startup so a failed or blocked bootstrap can be inspected.
+target.applicationPilot = diagnostics
 addEventListener('pagehide', () => { lifetime.abort(new Error('PILOT_OWNER_CLOSED')); worker.terminate(); void supervisor?.close() })

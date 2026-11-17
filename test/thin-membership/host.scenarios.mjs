@@ -148,7 +148,10 @@ it('administers an independently ordered native/browser group through the actual
   const approval = await decision(owner, 'approve', approvalDecision);
   expect(approval.signedApproval).toBe(retained.signedApproval);
   expect(approval.capabilityIds).toEqual(retained.capabilityIds);
-  await expect(owner.approve({ ...approvalDecision, roles: ['reader'] })).rejects.toMatchObject({ status: 409 });
+  // A conflicting retry must first be a valid decision: reader-only grants have no writer program.
+  await expect(owner.approve({ operationId: approvalDecision.operationId, requestId: approvalDecision.requestId,
+    roles: ['reader'], grantFullHistory: approvalDecision.grantFullHistory }))
+    .rejects.toMatchObject({ status: 409, code: 'operation_conflict' });
   await passed('host authentication binds device ownership and exact approval survives a lost reply plus real Durable Object eviction');
 
   await phase('first fresh Worker authenticated history replay');

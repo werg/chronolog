@@ -1,12 +1,14 @@
 # Peer generations: selected history with tolerant recovery
 
-Status: implemented peer-generation preview; wider qualification is in progress.
-The authenticated record format is `peer-generation-v1`, with the bounded
-`eligible-members-v1` authority policy. An operation exposes `applied()` for its
-accepted or rejected result in the selected history and `shared()` for retained
-peer coverage. A valid recovery can abandon a recent suffix. All applications use
-one session and materialization path. The record format is not a runtime selector;
-there are no profile-specific application APIs or implicit stronger guarantees.
+Status: implemented peer-generation preview; qualification is source-specific.
+The authenticated history profile is `peer-generation-v1`, with the bounded
+`eligible-members-v1` authority policy. Sessions expose `applied()` for execution
+in the selected history and `shared()` for independently retained prefix coverage.
+Recovery can abandon a recent applied suffix. `final()` belongs only to profiles
+that provide irreversible outcomes; it is neither an alias nor a planned rename
+for generation-scoped application. All applications built with this package use
+one owned session and the common materialization pipeline; transport roles do not
+select execution semantics or establish stronger guarantees.
 
 ## Implementation boundary
 
@@ -24,9 +26,11 @@ prerelease qualification.
 
 Tendriller implements the hosted control registry and lifecycle API using the
 same verifier. That service selects authenticated generations; it does not
-execute application commands. Superseded hosted and resident application paths
-are removed along with their adapters. Downstream consumers use the same public
-session contract. There is no migration or compatibility layer.
+execute application commands. New peer applications use the public session
+contract. The chronological primitives retain their explicit irreversible-prefix
+contract and use the same materialization pipeline. Their final-intent consumers
+cannot be attached to generation recovery without a recovery-aware contract.
+There is no migration or compatibility layer for the replaced prerelease protocols.
 
 The preserved [independent native/events development run](https://github.com/werg/tendriller-contrib/blob/5dc62b8d1fd6bb323bf6ca272cb21064f33ab318/cookbooks/run-a-peer-application/notes/peer-generation-qualification.md)
 uses a packed public session, separate durable stores and the in-process link.
@@ -108,15 +112,30 @@ declared interests before delivery. A session attaches the host with
 `connectControlParticipant({ exchange })`; attaching performs no request and does
 not register the host as a reader or an application-data peer.
 
-Signed publication manifests select immutable code and page assets. The control
-participant verifies the current administrator, exact operation identity, bounded
-asset hashes and predecessor before atomically projecting a selected version into
-Tendriller's serving store. The session journals signed publication intent before
-dispatch, verifies skipped predecessors and durably rejects a regressed head.
-An exact retry returns the original receipt, even after another publication.
-Publication binds the existing definition and execution manifest; changing their
-meaning requires a separately authenticated activation. Health reports cannot
-silently choose unsigned rollback code.
+Signed publication manifests select immutable content hashes for code and assets.
+The portable publication registry verifies the administrator, control revision,
+application scope, exact preceding release and signed asset commitments.
+`verifyPublicationAsset` separately checks delivered bytes against their declared
+length and hash. The registry retains learned controls with publication history,
+so a later stale authority callback cannot forget a revocation. Transport and asset
+storage remain separate from those checks; an attachment provider does not confer
+publication authority.
+
+The initial browser entry point must establish the trusted publication identity.
+Presentation updates have their own publication revision. Their manifests preserve
+the descriptor's application-description and execution-manifest digests and cannot
+rewrite selected history. The description digest binds declared schemas, names
+and semantic versions; it does not hash command preparation or query JavaScript.
+Signed asset hashes identify the actual published code, but do not prove that a
+code update preserves business behavior. Changing the descriptor's declared
+definition or execution contract requires a separately authenticated activation
+boundary.
+
+The session journals signed publication intent before dispatch, verifies skipped
+predecessors and durably rejects a regressed head. An exact retry preserves the
+original release identity even after a newer publication. Hosted asset retention
+is separate: an expired old serving version must be reported as unavailable,
+never silently remapped to newer code.
 
 ## Selection and ancestry
 
@@ -145,8 +164,11 @@ linked to the old intent, under current controls and freshly selected domain gua
 An operation can be saved, applied (accepted or rejected), shared, abandoned, or
 need reapplication. `applied` includes its generation and position. It remains
 stable while that history is selected; it is not irreversible across recovery.
-The public wait is `applied()`. An irreversible external action
-requires a separately declared protected boundary and its own retained evidence.
+The wait is named `applied()` because the result belongs to the selected history.
+The immutable-history `FinalEventSource` adapter cannot consume generation resets;
+generation applications need a recovery-aware consumer contract. An irreversible
+external action requires a separately declared protected boundary and its own
+retained evidence.
 Wait cancellation does not cancel or reject the saved command. An exact retry
 retains the original bytes, identity, guards, and result.
 

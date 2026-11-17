@@ -34,6 +34,30 @@ describe('role-filtered participant transport', () => {
     await expect(transport.exchange(request)).rejects.toThrow('PEER_PARTICIPANT_FACET_FORBIDDEN')
     await expect(transport.exchange({ ...request, applicationId: '22'.repeat(32) })).rejects.toThrow('PEER_PARTICIPANT_SCOPE_MISMATCH')
   })
+  it('rejects envelope and payload accessors without evaluating or dispatching them', async () => {
+    let calls = 0, reads = 0
+    const transport = createParticipantTransport({ applicationId: scope, exchange: async request => {
+      calls++; return createParticipantResponse(request, null)
+    } })
+    const changing = { ...read(), get facet(): 'control' | 'database' { return ++reads <= 3 ? 'control' : 'database' } }
+    await expect(transport.exchange(changing)).rejects.toThrow('PEER_PARTICIPANT_ENVELOPE_INVALID')
+    await expect(transport.request('control', 'select', { nested: { get transition() { reads++; return 'changed' } } }))
+      .rejects.toThrow('PEER_PARTICIPANT_PAYLOAD_INVALID')
+    expect(reads).toBe(0)
+    expect(calls).toBe(0)
+  })
+  it('rejects payload serialization callbacks before they can change the routed interest', async () => {
+    let calls = 0, serialized = false
+    const transport = createParticipantTransport({ applicationId: scope, exchange: async request => {
+      calls++; return createParticipantResponse(request, null)
+    } })
+    const request = { ...read(), payload: Object.assign([], { toJSON: () => {
+      serialized = true; request.facet = 'database'; return []
+    } }) }
+    await expect(transport.exchange(request)).rejects.toThrow('PEER_PARTICIPANT_PAYLOAD_INVALID')
+    expect(serialized).toBe(false)
+    expect(calls).toBe(0)
+  })
   it('bounds payloads and accepts finite schema constraints without broadening control canonicalization', () => {
     expect(createParticipantRequest({ applicationId: scope, facet: 'publication', action: 'definition',
       payload: { minimum: 0.25, maximum: 1.5 } }).payload).toEqual({ minimum: 0.25, maximum: 1.5 })
@@ -64,5 +88,35 @@ describe('role-filtered participant transport', () => {
     expect(observed).toEqual(Array.from({ length: PARTICIPANT_LIMITS.pending }, () => ({ transition: 'original' })))
     const next = transport.request('control', 'read', null)
     gates.at(-1)!(); await expect(next).resolves.toBeNull()
+  })
+  it('settles cancelled callers before uncooperative dispatches release their bounded slots', async () => {
+    const gates: Array<{ completion: Promise<unknown>; resolve: (value: unknown) => void; reject: (error: unknown) => void;
+      response: ReturnType<typeof createParticipantResponse> }> = []
+    const transport = createParticipantTransport({ applicationId: scope, exchange: request => {
+      let resolve!: (value: unknown) => void, reject!: (error: unknown) => void
+      const completion = new Promise<unknown>((accept, fail) => { resolve = accept; reject = fail })
+      gates.push({ completion, resolve, reject, response: createParticipantResponse(request, 'delivered') })
+      return completion
+    } })
+    const controller = new AbortController(), reason = new Error('caller left')
+    const callers = Array.from({ length: PARTICIPANT_LIMITS.pending }, () =>
+      transport.request('control', 'read', null, { signal: controller.signal }))
+    const results = Promise.allSettled(callers)
+    controller.abort(reason)
+    // No physical exchange has settled: abort must not wait for these gates.
+    expect(await results).toEqual(callers.map(() => ({ status: 'rejected', reason })))
+    await expect(transport.request('control', 'read', null)).rejects.toThrow('PEER_PARTICIPANT_BUSY')
+    expect(gates).toHaveLength(PARTICIPANT_LIMITS.pending)
+
+    const physical = Promise.allSettled(gates.map(gate => gate.completion))
+    gates.forEach((gate, index) => {
+      if (index % 2 === 0) gate.resolve(gate.response)
+      else gate.reject(new Error('late adapter failure'))
+    })
+    await physical
+    const next = transport.request('control', 'read', null)
+    expect(gates).toHaveLength(PARTICIPANT_LIMITS.pending + 1)
+    gates.at(-1)!.resolve(gates.at(-1)!.response)
+    await expect(next).resolves.toBe('delivered')
   })
 })

@@ -1,7 +1,7 @@
 import { once } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 
-import { frameLivePeerStream, framePeerStream, type FramedPeerConnection, type PeerLiveLane, type PeerStreamOptions } from '@chronolog/agent-service/framing'
+import { frameLivePeerStream, framePeerStream, type FramedPeerConnection, type PeerLiveLane, type PeerStreamOptions } from '@chronolog/records'
 import { MAX_SIGNAL_BYTES } from '@chronolog/signals'
 
 type Lane = 'reliable' | 'live'

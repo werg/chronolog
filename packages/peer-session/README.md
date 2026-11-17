@@ -57,8 +57,10 @@ from the configured control service. Enrolled decryption keys persist in the
 owned device store; a new reader acquires missing keys from an authorized peer.
 `applicationDefinitionDigest(definition)` binds the published
 schemas and semantic version. Obtain the event execution manifest with
-`eventExecutionManifest()`. Materializers consume verified order through one
-execution pipeline; transport roles do not change execution semantics.
+`eventExecutionManifest()`. It pins execution of the verified input order; the
+signed history profile and its owner establish ordering, recovery and settlement
+guarantees. Both history profiles use the same materialization pipeline;
+transport roles do not change execution semantics.
 
 Only first device setup passes `{ create: true }`. Ordinary reopening omits it.
 The session owns one signed attempt journal in the device store. A disconnected

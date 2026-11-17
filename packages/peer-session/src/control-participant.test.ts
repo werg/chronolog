@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { BytesStore } from '@chronolog/records'
 import {
   bytesDigest, createGenerationRegistry, createParticipantResponse, createPeerIdentity, createPublicationRegistry,
-  MemoryBytesStore, participantGrant, signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  decodePeerValue, MemoryBytesStore, participantGrant, signApplicationDescriptor, signControlRevision, signTransitionRequest,
   type AuthorityBundle, type ParticipantRequest, type SignedPublication, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
@@ -15,11 +16,40 @@ const definition = defineApplication({ id: 'participant', version: '1', commands
   say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
 }, queries: {} })
 const cleanup: Array<() => void | Promise<void>> = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close() })
 
-async function fixture() {
-  const signer = await createPeerIdentity(), stores = [new MemoryBytesStore(), new MemoryBytesStore()]
-  const devices = await Promise.all(stores.map(store => openApplicationDevice({ store, create: true })))
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
+
+class PausedWriteStore extends MemoryBytesStore {
+  #next: { prefix: string; entered: (value: { key: string; bytes: Uint8Array }) => void; resumed: Promise<void>; finished: () => void } | undefined
+  pause(prefix: string) {
+    const entered = deferred<{ key: string; bytes: Uint8Array }>(), resumed = deferred<void>()
+    let persisted = false
+    this.#next = { prefix, entered: entered.resolve, resumed: resumed.promise, finished: () => { persisted = true } }
+    return { entered: entered.promise, resume: () => resumed.resolve(), get persisted() { return persisted } }
+  }
+  override async put(key: string, bytes: Uint8Array): Promise<void> {
+    const paused = this.#next
+    if (paused !== undefined && key.startsWith(paused.prefix)) {
+      this.#next = undefined
+      paused.entered({ key, bytes: bytes.slice() })
+      await paused.resumed
+      await super.put(key, bytes)
+      paused.finished()
+      return
+    }
+    await super.put(key, bytes)
+  }
+}
+
+async function fixture(options: { store?: BytesStore; close?: () => void | Promise<void> } = {}) {
+  const signer = await createPeerIdentity(), stores = [options.store ?? new MemoryBytesStore(), new MemoryBytesStore()]
+  const devices = await Promise.all(stores.map((store, index) => openApplicationDevice({ store, create: true,
+    ...(index === 0 && options.close !== undefined ? { close: options.close } : {}) })))
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
   const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: 'ab'.repeat(32), historyId: 'participant-test',
@@ -147,5 +177,72 @@ describe('session-owned control participant', () => {
     await started; await a.close(); await checked
     expect(host.signal.aborted).toBe(true)
     await expect(host.application()).rejects.toThrow('APPLICATION_SESSION_CLOSED')
+  })
+
+  it('retains the closing participant until its exact publication intent is durable', async () => {
+    const store = new PausedWriteStore(), f = await fixture({ store }), a = await f.open(0)
+    const host = a.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('export const version = 1;'), hash = await bytesDigest(bytes)
+    const input = { operationId: 'paused-release', entry: 'page.mjs', files: [{ path: 'page.mjs', hash, size: bytes.length, type: 'text/javascript' }] }
+    const paused = store.pause('peer-session/publication-attempt/')
+    const pending = host.preparePublication(input), checked = expect(pending).rejects.toThrow('APPLICATION_CONTROL_CLOSED')
+    const saved = await paused.entered, original = decodePeerValue<SignedPublication>(saved.bytes)
+    try {
+      const closing = host.close()
+      expect(() => a.connectControlParticipant({ exchange: f.exchange })).toThrow('APPLICATION_CONTROL_ALREADY_ATTACHED')
+      paused.resume()
+      await closing; await checked
+      expect(paused.persisted).toBe(true)
+      const replacement = a.connectControlParticipant({ exchange: f.exchange })
+      expect(await replacement.preparePublication(input)).toEqual(original)
+      expect(await store.get(saved.key)).toEqual(saved.bytes)
+      await expect(replacement.preparePublication({ ...input, entry: 'other.mjs' })).rejects.toThrow('PEER_PUBLICATION_OPERATION_REUSED')
+    } finally { paused.resume() }
+  })
+
+  it('joins a retired participant before releasing the application store', async () => {
+    const store = new PausedWriteStore()
+    let deviceClosed = false
+    const f = await fixture({ store, close() { expect(paused.persisted).toBe(true); deviceClosed = true } }), a = await f.open(0)
+    const host = a.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('<main>page</main>'), hash = await bytesDigest(bytes)
+    const files = [{ path: 'index.html', hash, size: bytes.length, type: 'text/html' }]
+    const first = await host.preparePublication({ operationId: 'one', entry: 'index.html', files }); await host.publish(first, [])
+    const second = await host.preparePublication({ operationId: 'two', entry: 'index.html', files })
+    const paused = store.pause('peer-session/publication/')
+    const pending = host.publish(second, []), checked = expect(pending).rejects.toThrow('APPLICATION_CONTROL_CLOSED')
+    await paused.entered
+    try {
+      const retiring = host.close(), closing = a.close().then(() => undefined, (error: unknown) => error)
+      expect(host.signal.aborted).toBe(true)
+      await new Promise<void>(resolve => { setImmediate(resolve) })
+      expect(deviceClosed).toBe(false)
+      paused.resume()
+      await retiring; await checked
+      expect(await closing).toBeUndefined()
+      expect(deviceClosed).toBe(true)
+      const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+      expect((await resumed.publication())?.publication).toEqual(second)
+      f.faults.stalePublication = first
+      await expect(resumed.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REGRESSION')
+    } finally { paused.resume() }
+  })
+
+  it('does not return a saved publication after close interrupts its verification', async () => {
+    const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('export const version = 1;'), hash = await bytesDigest(bytes)
+    const input = { operationId: 'saved-release', entry: 'page.mjs', files: [{ path: 'page.mjs', hash, size: bytes.length, type: 'text/javascript' }] }
+    await host.preparePublication(input)
+    const entered = deferred<void>(), resumed = deferred<void>(), verify = crypto.subtle.verify.bind(crypto.subtle)
+    vi.spyOn(crypto.subtle, 'verify').mockImplementationOnce(async (...args) => {
+      entered.resolve(); await resumed.promise; return verify(...args)
+    })
+    const pending = host.preparePublication(input), checked = expect(pending).rejects.toThrow('APPLICATION_CONTROL_CLOSED')
+    await entered.promise
+    try {
+      const closing = host.close()
+      resumed.resolve()
+      await checked; await closing
+    } finally { resumed.resolve() }
   })
 })

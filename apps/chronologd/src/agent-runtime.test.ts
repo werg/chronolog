@@ -4,14 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { NativeBytesStore } from '@chronolog/records/native'
-import { frameLivePeerStream, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
+import { waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
 import { signGenesis } from '@chronolog/capabilities'
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { createGovernedNode, decodeLedgerRecord, isFinalityClosureRecord, membershipDescriptor, MemoryOperationStore } from '@chronolog/node-core'
 import { bytesToHex, decodeEnvelope, executionManifestArtifacts, generateEd25519KeyPair } from '@chronolog/protocol'
 import {
-  DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner,
+  DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, frameLivePeerStream, framePeerStream, webFeedCrypto, webFeedSigner,
 } from '@chronolog/records'
 import { afterEach, describe, expect, it } from 'vitest'
 

@@ -7,12 +7,11 @@ import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { MAX_LEDGER_PAYLOAD_BYTES } from '@chronolog/node-core/ledger'
 import { assertCanonicalCbor, encodeCanonicalCbor, equalBytes, generateEd25519KeyPair, utf8, type CborValue } from '@chronolog/protocol'
-import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type FeedLink } from '@chronolog/records'
+import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, frameLivePeerStream, framePeerStream, webFeedCrypto, webFeedSigner, type FeedLink } from '@chronolog/records'
 import { FeedTransport } from '@chronolog/transport-ssb'
 import { SignalChannel, SIGNAL_DOMAIN } from '@chronolog/signals'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { frameLivePeerStream, framePeerStream } from './framing.js'
 import { openAuthenticatedPeerLink, type AuthenticatedPeerLinkOptions } from './peer-link.js'
 
 const cleanup: Array<() => Promise<void>> = []

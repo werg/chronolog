@@ -1,10 +1,17 @@
 # Peer application architecture
 
-Chronolog owns application data, peer authentication, live messages and finality.
-Tendriller supplies the initial page and participant administration. A resident
-Chronolog process supplies an independently reachable peer; its finality role is
-optional and selected by the signed group descriptor. Ordinary application
-traffic does not pass through a Cloudflare application API.
+Chronolog owns application data, peer authentication, execution, recovery and live
+messages. Tendriller supplies the initial page and participant administration.
+The public `@chronolog/peer-session` composition uses the `peer-generation-v1`
+profile: one eligible peer sequences commands, and signed controls select a
+successor when needed. Ordinary application traffic does not pass through a
+Cloudflare application API. A native resident supplies an independently reachable
+peer when the application needs one; its location grants no extra authority.
+
+The chronological composition supplies a separate `chronolog-finality-v1`
+application contract when irreversible outcomes are required. Its finality service
+and availability requirements belong to that selected profile. An applied
+generation result and a retained copy are never presented as irreversible finality.
 
 ```mermaid
 flowchart TD
@@ -36,7 +43,60 @@ signals. The application chooses its reachable peers and ICE configuration.
 The optional retained-log adapter remains an explicit deployment choice. The
 peer composition does not silently fall back to it when WebRTC is unavailable.
 
-## Three distinct application primitives
+## Owned peer-generation sessions
+
+An application opens one device and one session. The session owns its identity,
+epoch keyring, immutable signed attempt journal, local materializer, peer links,
+encrypted content and live routes. The browser owner is a Worker with an exclusive
+Web Lock and OPFS; the native owner holds an exclusive durable SQLite store.
+The page uses the public application facade without another retry journal or an
+application-specific message forwarding protocol.
+
+`command()` saves the original signed intent before acknowledging it. A healthy
+selected coordinator orders that attempt, and each receiving peer verifies and
+executes the same order. `applied()` identifies that generation and sequence;
+`shared()` separately observes complete retained-prefix acknowledgments from
+distinct current reader identities. Neither wait performs a hosted data request.
+Queries and change notifications use coherent local views of SQL, events and
+operation outcomes.
+
+The same authenticated framed connection carries native, browser and in-process
+exchange. A fresh signed challenge binds both peers, the application descriptor
+and the history profile. Reliable history requests capture one head and stream
+bounded verified pages; concurrent writes cannot keep moving that target.
+Encrypted content uses independent bounded requests. Lossy signals have their own
+queue and expire instead of entering history or replaying after reconnect.
+
+Controls and decryption keys are separate. A granted reader can open before it has
+keys, learn a newer signed control from a peer, and request the committed epoch
+keys through a fresh signed HPKE exchange. Current reader authorization and the
+selected generation are checked again before installation. Reopening loads the
+owned keyring instead of requiring application bootstrap secrets again. The
+creator explicitly provisions the first key.
+
+Recovery adopts one authenticated available prefix. The replica durably records
+the new authority and pending recovery before exposing the transition, then
+publishes SQL, events and operation outcomes together. Current restrictive
+controls remain active while older application data replays. Excluded attempts
+remain inspectable; reapplication creates a new signed identity under current
+permissions and domain guards. There is no automatic branch merge or resubmission.
+
+The host retains compact controls, selections and published application definitions. It has
+explicit control-only rights, with no reader key, command authorship or SQL data
+role. Membership changes and generation selection can need the host; ordinary
+current-generation work continues while host endpoints are unavailable. If both
+the coordinator and control service are unavailable, commands remain saved until
+a valid coordinator or successor becomes reachable.
+
+See the [public session contract](../packages/peer-session/README.md) for ownership,
+transport limits and browser composition, and the
+[generation policy](peer-generation-v1.md) for trust and suffix-loss semantics.
+
+## Chronological primitives and final effects
+
+The following sections describe the stronger chronological composition. Its
+immutable final prefix supports final-intent consumers; it is not the completion
+contract of a generation session.
 
 **Durable operations** append original signed proposals. Their operation IDs
 survive retries and device restart. SQL and durable events are produced by the
