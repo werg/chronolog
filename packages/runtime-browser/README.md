@@ -143,6 +143,14 @@ The SQL/events profile also requires WebAssembly and SharedArrayBuffer. Each pro
 
 OPFS stores immutable feed objects before publishing the atomic manifest that references them. Private operation and key records use atomic file replacement. SQL uses SQLite's OPFS synchronous-access-handle pool in a separate private directory. That VFS supports the shared materializer's multiple reader/candidate connections inside one storage owner; normal close pauses the pool and releases all handles without deleting data. The independent SQL control database commits cutoff updates synchronously with FULL durability before signing decisions. The application database uses the shared DoltLite publication/recovery protocol. Private stores and keys never enter feed replication.
 
+An evidence page writes its immutable objects and then publishes one manifest;
+consumers cannot observe a partial page, even if an unrelated feed notification
+arrives during those writes. Startup and catch-up verify bounded retained
+batches and reconcile the application once per batch, rather than reopening SQL
+readers for every historical closure. The [retention and publication
+contract](../../docs/pluggable-finality.md#retained-evidence-and-application-publication)
+separates raw evidence storage, trusted verifier progress and coherent views.
+
 The SQL-free profile instead appends checksum-protected private control records
 to a synchronous OPFS journal and flushes each append before acknowledging it.
 Recovery removes only an incomplete unacknowledged tail; a corrupt complete

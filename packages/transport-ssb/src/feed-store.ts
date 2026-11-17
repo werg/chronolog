@@ -11,7 +11,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite'
 import {
   DEFAULT_MAX_RECORD_BYTES, FeedRecordError, decodeSignedFeedRecord, encodeSignedFeedRecord,
   feedIdFromPublicKey, publicKeyFromFeedId, feedRecordId, feedSigningBytes, classifyFeedAppend,
-  type FeedRecord, type FeedCrypto,
+  captureEvidenceBatch, type EvidenceAppendResult, type FeedRecord, type FeedCrypto,
 } from '@chronolog/records'
 import type { ImmutableEvidence, TransportRecord } from './types.js'
 
@@ -88,6 +88,9 @@ interface RecordRow {
 
 export class FeedStore {
   readonly #database: DatabaseSync
+  #closed = false
+  #writeFailed = false
+  #writeFailure: unknown
   readonly #statements: {
     readonly head: StatementSync
     readonly insert: StatementSync
@@ -193,12 +196,14 @@ export class FeedStore {
   }
 
   head(author: string): { readonly sequence: bigint; readonly id: string | null } {
+    this.#assertUsable()
     const row = this.#statements.head.get(author) as { sequence: bigint; id: string } | undefined
     return row === undefined ? { sequence: 0n, id: null } : { sequence: row.sequence, id: row.id }
   }
 
   /** Append the author's next record. Durable when this returns. */
   append(record: FeedRecord, receivedAtMs = Date.now()): AppendResult {
+    this.#assertUsable()
     const existing = this.#statements.bySequence.get(record.author, record.sequence) as { id: string } | undefined
     const head = this.head(record.author)
     const disposition = classifyFeedAppend(record, head, existing?.id)
@@ -218,11 +223,13 @@ export class FeedStore {
   }
 
   get(id: string): TransportRecord | undefined {
+    this.#assertUsable()
     const row = this.#statements.byId.get(id) as RecordRow | undefined
     return row === undefined ? undefined : rowRecord(row)
   }
 
   getPayload(hash: string): Uint8Array | null {
+    this.#assertUsable()
     if (!/^[0-9a-f]{64}$/u.test(hash)) throw new Error('PAYLOAD_HASH_INVALID')
     const row = (this.#statements.payloadByHash.get(hash) ?? this.#statements.detachedPayloadByHash.get(hash)) as
       { bytes: Uint8Array } | undefined
@@ -232,6 +239,7 @@ export class FeedStore {
   }
 
   putPayload(input: Uint8Array): string {
+    this.#assertUsable()
     if (input.length > DEFAULT_MAX_RECORD_BYTES) throw new Error('FEED_RECORD_TOO_LARGE')
     const bytes = input.slice(), hash = createHash('sha256').update(bytes).digest('hex')
     if (this.#statements.payloadByHash.get(hash) === undefined) this.#statements.putPayload.run(hash, bytes)
@@ -240,12 +248,14 @@ export class FeedStore {
 
   /** Records in local arrival order after `localIndex`, with their indexes. */
   after(localIndex: bigint, limit: number): { readonly index: bigint; readonly record: TransportRecord }[] {
+    this.#assertUsable()
     return (this.#statements.after.all(localIndex, limit) as unknown as RecordRow[])
       .map((row) => ({ index: BigInt(row.local_index), record: rowRecord(row) }))
   }
 
   /** Retained fork evidence is part of local replay, including after restart. */
   forksAfter(index: bigint, limit: number): { readonly index: bigint; readonly record: TransportRecord }[] {
+    this.#assertUsable()
     if (index < 0n || index > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isSafeInteger(limit) || limit < 1 || limit > 4096) {
       throw new Error('FEED_RANGE_INVALID')
     }
@@ -261,49 +271,92 @@ export class FeedStore {
 
   /** Signed bytes of one feed after `sequence`, in order. */
   feedAfter(author: string, sequence: bigint, limit: number): { readonly sequence: bigint; readonly raw: Uint8Array }[] {
+    this.#assertUsable()
     return (this.#statements.feedAfter.all(author, sequence, limit) as unknown as { sequence: bigint; raw: Uint8Array }[])
       .map((row) => ({ sequence: row.sequence, raw: Uint8Array.from(row.raw) }))
   }
 
   heads(): ReadonlyMap<string, bigint> {
+    this.#assertUsable()
     const rows = this.#statements.heads.all() as unknown as { author: string; sequence: bigint }[]
     return new Map(rows.map((row) => [row.author, row.sequence]))
   }
 
   count(): number {
+    this.#assertUsable()
     return Number((this.#statements.count.get() as { count: bigint }).count)
   }
 
   maxLocalIndex(): bigint {
+    this.#assertUsable()
     return BigInt((this.#statements.maxIndex.get() as { local_index: bigint }).local_index)
   }
 
   forkedAuthors(): readonly string[] {
+    this.#assertUsable()
     return (this.#statements.forks.all() as unknown as { author: string }[]).map((row) => row.author)
   }
 
-  putEvidence(input: Uint8Array): { readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence } {
-    if (input.length > DEFAULT_MAX_RECORD_BYTES) throw new FeedRecordError('FEED_RECORD_TOO_LARGE')
-    const bytes = input.slice()
-    const id = recordId(bytes)
-    const existing = this.#statements.evidenceById.get(id) as { local_index: bigint } | undefined
-    if (existing !== undefined) return { kind: 'duplicate', index: existing.local_index, evidence: { id, bytes } }
-    const row = this.#statements.evidenceInsert.get(id, bytes) as { local_index: bigint }
-    return { kind: 'appended', index: row.local_index, evidence: { id, bytes } }
+  putEvidence(input: Uint8Array): EvidenceAppendResult { return this.putEvidenceBatch([input])[0]! }
+
+  putEvidenceBatch(input: readonly Uint8Array[]): readonly EvidenceAppendResult[] {
+    this.#assertUsable()
+    const captured = captureEvidenceBatch(input), result: EvidenceAppendResult[] = []
+    let committing = false
+    try {
+      this.#database.exec('BEGIN IMMEDIATE')
+      for (const bytes of captured) {
+        const id = recordId(bytes)
+        const existing = this.#statements.evidenceById.get(id) as { local_index: bigint } | undefined
+        if (existing !== undefined) result.push({ kind: 'duplicate', index: existing.local_index, evidence: { id, bytes } })
+        else {
+          const row = this.#statements.evidenceInsert.get(id, bytes) as { local_index: bigint }
+          result.push({ kind: 'appended', index: row.local_index, evidence: { id, bytes } })
+        }
+      }
+      committing = true
+      this.#database.exec('COMMIT')
+      return result
+    } catch (error) {
+      if (this.#database.isTransaction) {
+        try {
+          this.#database.exec('ROLLBACK')
+          if (this.#database.isTransaction) throw new Error('FEED_STORE_ROLLBACK_INCOMPLETE', { cause: error })
+        } catch (rollbackError) {
+          // Uncertain rollback can leave private uncommitted rows visible on
+          // this connection. Fence every read/write until the store is reopened.
+          this.#writeFailed = true; this.#writeFailure = rollbackError
+        }
+      } else if (committing) {
+        // COMMIT may have succeeded before its acknowledgement failed. Only
+        // reopening can decide which complete durable prefix became visible.
+        this.#writeFailed = true; this.#writeFailure = error
+      }
+      throw error
+    }
   }
 
   evidenceHead(): bigint {
+    this.#assertUsable()
     return (this.#statements.evidenceHead.get() as { position: bigint }).position
   }
 
   evidenceAfter(after: bigint, limit: number): readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[] {
+    this.#assertUsable()
     if (after < 0n || !Number.isSafeInteger(limit) || limit < 1 || limit > 4096) throw new Error('FEED_RANGE_INVALID')
     const rows = this.#statements.evidenceAfter.all(after, limit) as unknown as { local_index: bigint; id: string; raw: Uint8Array }[]
     return rows.map((row) => ({ index: row.local_index, evidence: { id: row.id, bytes: Uint8Array.from(row.raw) } }))
   }
 
   close(): void {
+    if (this.#closed) return
     this.#database.close()
+    this.#closed = true
+  }
+
+  #assertUsable(): void {
+    if (this.#closed) throw new Error('FEED_STORE_CLOSED')
+    if (this.#writeFailed) throw new Error('FEED_STORE_REOPEN_REQUIRED', { cause: this.#writeFailure })
   }
 }
 

@@ -193,6 +193,13 @@ does not promise that every application input is available or that a final
 target has been applied; materialization and finality are separate checks.
 Availability heads carry no extra authority.
 
+Historical evidence is processed in bounded batches. A transport commits a
+received evidence page before making it available; the node verifies each proof
+and publishes the resulting coherent application prefix once per batch. A fresh
+replica therefore does not have to publish every intermediate database revision
+from the original session. Batching changes neither transaction boundaries nor
+finality rules. A directly ingested single proof still reconciles immediately.
+
 ### Rollback, redo, and user undo
 
 The current node executes admitted proposals. Its `provisional()` result means

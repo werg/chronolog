@@ -92,7 +92,9 @@ describe('browser qualification native fixture', () => {
     expect(events.transactions.map((transaction) => transaction.events[0]?.payload)).toEqual([{ text: 'replica' }, { text: 'native' }])
     expect((await native.node.events.read()).transactions).toEqual(events.transactions)
     expect(replica.node.finalThrough).toBe(native.node.finalThrough)
-    expect((await transport.evidenceHistory()).length).toBeGreaterThan(0)
+    let evidenceCount = 0
+    for await (const batch of transport.evidenceHistory()) evidenceCount += batch.length
+    expect(evidenceCount).toBeGreaterThan(0)
     expect((await native.transport.history()).some((record) => record.author === transport.identity)).toBe(true)
     native.assertHealthy()
   })

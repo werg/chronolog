@@ -2,7 +2,8 @@ import { createFeedRecord, DEFAULT_MAX_RECORD_BYTES, type FeedCrypto, type FeedS
 import { ChangeSignal, type FeedLink, pullFeedLink } from './replication.js'
 import type { FeedStorePort } from './store.js'
 import { validatePayloadHash, verifyPayloadHash } from './payload.js'
-import { cloneRecord, type ChronologTransport, type ImmutableEvidence, type PublishOptions, type TransportRecord, type TransportStatus } from './types.js'
+import { readEvidenceBatches, readEvidencePage } from './evidence.js'
+import { cloneRecord, type ChronologTransport, type EvidenceBatch, type ImmutableEvidence, type PublishOptions, type TransportRecord, type TransportStatus } from './types.js'
 
 interface Connection {
   readonly link: FeedLink
@@ -19,6 +20,7 @@ export class PortableFeedTransport implements ChronologTransport {
   readonly #crypto: FeedCrypto
   readonly #maxRecordBytes: number
   readonly #changes = new ChangeSignal()
+  readonly #lifetime = new AbortController()
   readonly #wanted = new Set<string>()
   readonly #connections = new Map<string, Connection>()
   readonly #syncTasks = new Set<Promise<void>>()
@@ -158,37 +160,46 @@ export class PortableFeedTransport implements ChronologTransport {
         if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
         return (await this.#store.feedAfter(feed, after, limit)).map(({ raw }) => raw.slice())
       },
-      readEvidence: async (after, limit) => (await this.#store.evidenceAfter(after, limit)).map(({ evidence }) => evidence.bytes.slice()),
+      readEvidence: async (after, limit) => {
+        if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+        return (await readEvidencePage(this.#store, after, limit, this.#lifetime.signal)).map(({ evidence }) => evidence.bytes)
+      },
       readPayload: async (hash) => this.#store.getPayload(hash),
       watch: (signal) => this.#changes.watch(signal),
     }
   }
 
   async putEvidence(bytes: Uint8Array): Promise<ImmutableEvidence> {
-    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
-    const result = await this.#store.putEvidence(bytes)
-    if (result.kind === 'appended') this.#changes.notify()
-    return result.evidence
+    return (await this.putEvidenceBatch([bytes]))[0]!
   }
 
-  async evidenceHistory(): Promise<readonly ImmutableEvidence[]> {
-    const result: ImmutableEvidence[] = []
-    let after = 0n
-    for (;;) {
-      const batch = await this.#store.evidenceAfter(after, 256)
-      if (batch.length === 0) return result
-      result.push(...batch.map((item) => item.evidence))
-      after = batch.at(-1)!.index
+  async putEvidenceBatch(bytes: readonly Uint8Array[]): Promise<EvidenceBatch> {
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const result = await this.#store.putEvidenceBatch(bytes)
+    if (result.some(item => item.kind === 'appended')) this.#changes.notify()
+    return result.map(item => item.evidence)
+  }
+
+  async *evidenceHistory(signal?: AbortSignal): AsyncIterable<EvidenceBatch> {
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const lifetime = signal === undefined ? this.#lifetime.signal : AbortSignal.any([signal, this.#lifetime.signal])
+    for await (const batch of readEvidenceBatches(this.#store, { signal: lifetime })) {
+      if (lifetime.aborted) return
+      yield batch
     }
   }
 
-  async *subscribeEvidence(signal?: AbortSignal): AsyncIterable<ImmutableEvidence> {
+  async *subscribeEvidenceBatches(signal?: AbortSignal): AsyncIterable<EvidenceBatch> {
+    const lifetime = signal === undefined ? this.#lifetime.signal : AbortSignal.any([signal, this.#lifetime.signal])
     let after = 0n
-    while (!this.#closed && !signal?.aborted) {
+    while (!lifetime.aborted) {
       const version = this.#changes.version
-      const batch = await this.#store.evidenceAfter(after, 256)
-      for (const item of batch) { after = item.index; yield item.evidence }
-      if (batch.length < 256) await this.#changes.wait(version, signal)
+      for await (const batch of readEvidenceBatches(this.#store, { after, signal: lifetime })) {
+        if (lifetime.aborted) return
+        after += BigInt(batch.length)
+        yield batch
+      }
+      await this.#changes.wait(version, lifetime)
     }
   }
 
@@ -206,6 +217,7 @@ export class PortableFeedTransport implements ChronologTransport {
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true
+    this.#lifetime.abort()
     for (const connection of this.#connections.values()) connection.controller.abort()
     await this.#publish
     await Promise.all(this.#syncTasks)

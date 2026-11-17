@@ -543,7 +543,9 @@ describe('native signed-inclusion finality service', () => {
     const stopped = new AbortController(), running = authority.serve(transport, stopped.signal)
     const policy = await SignedInclusionFinalityProvider.open(f.configuration, new MemoryOperationStore())
     const frontier = async () => {
-      for (const item of await transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
+      for await (const batch of transport.evidenceHistory()) {
+        for (const item of batch) await policy.ingest(decodeOrderingEvidence(item.bytes))
+      }
       return policy.snapshot().closedThroughMs
     }
     try {

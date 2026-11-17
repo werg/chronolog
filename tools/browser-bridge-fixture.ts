@@ -15,7 +15,7 @@ import {
   type EnrollmentRole, type GovernedNode,
 } from '@chronolog/node-core'
 import {
-  decodeOrderingEvidence, ReferenceRecordLog,
+  ReferenceRecordLog,
   type CoordinatedHistoryConfiguration, type OrderedRecordEntry,
 } from '@chronolog/node-core/history'
 import {
@@ -247,7 +247,6 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       for (;;) {
         peerHttp.assertHealthy()
         await adapter.catchUp()
-        for (const evidence of await local.evidenceHistory()) await root.node.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
         await root.node.waitForIdle()
         const status = await root.node.status()
         if (status.lastError !== undefined) throw new Error(`BRIDGE_NATIVE_SYNC_FAILED: ${status.lastError}`)
@@ -330,9 +329,11 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       restoreHub() { online = true },
       hubRequests() { return { ...requests } },
       async exportPeer() {
+        const evidence: string[] = []
+        for await (const batch of local.evidenceHistory()) evidence.push(...batch.map((item) => bytesToBase64Url(item.bytes)))
         return { identity: local.identity,
           records: (await local.asLink().read(local.identity, 0n, 4_096)).map(bytesToBase64Url),
-          evidence: (await local.evidenceHistory()).map((item) => bytesToBase64Url(item.bytes)) }
+          evidence }
       },
       close,
     }

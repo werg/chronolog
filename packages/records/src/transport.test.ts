@@ -4,11 +4,18 @@ import { feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from './feed-codec.
 import { DurableFeedStore, type AtomicBytesStore } from './store.js'
 import { connectInProcess, PortableFeedTransport } from './transport.js'
 import { payloadHash } from './payload.js'
+import type { ImmutableEvidence } from './types.js'
+
+async function retainedEvidence(transport: PortableFeedTransport): Promise<ImmutableEvidence[]> {
+  const result: ImmutableEvidence[] = []
+  for await (const batch of transport.evidenceHistory()) result.push(...batch)
+  return result
+}
 
 const peers: PortableFeedTransport[] = []
 afterEach(async () => { await Promise.all(peers.splice(0).map((peer) => peer.close())) })
 
-async function peer(observeStore?: (store: DurableFeedStore) => void) {
+async function peer(observeStore?: (store: DurableFeedStore, bytes: AtomicBytesStore) => void) {
   const values = new Map<string, Uint8Array>()
   const bytes: AtomicBytesStore = {
     get: async (key) => values.get(key)?.slice() ?? null,
@@ -17,13 +24,71 @@ async function peer(observeStore?: (store: DurableFeedStore) => void) {
   const keys = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])
   const id = feedIdFromPublicKey(new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey)))
   const store = await DurableFeedStore.open(bytes, webFeedCrypto)
-  observeStore?.(store)
+  observeStore?.(store, bytes)
   const transport = new PortableFeedTransport({ store, signer: webFeedSigner(id, keys.privateKey), crypto: webFeedCrypto })
   peers.push(transport)
   return transport
 }
 
 describe('portable peer replication', () => {
+  it('never exposes part of a durable page even when an unrelated feed notification wakes its consumer', async () => {
+    let store!: DurableFeedStore, bytes!: AtomicBytesStore
+    const reader = await peer((value, backing) => { store = value; bytes = backing })
+    let feedStored!: () => void, deliverFeed!: () => void, pageBlocked!: () => void, finishPage!: () => void
+    const stored = new Promise<void>(resolve => { feedStored = resolve }), feedGate = new Promise<void>(resolve => { deliverFeed = resolve })
+    const blocked = new Promise<void>(resolve => { pageBlocked = resolve }), pageGate = new Promise<void>(resolve => { finishPage = resolve })
+    const append = store.append.bind(store)
+    vi.spyOn(store, 'append').mockImplementation(async (record, receivedAtMs) => {
+      const result = await append(record, receivedAtMs); feedStored(); await feedGate; return result
+    })
+    const oldFeed = reader.publish(Uint8Array.of(8))
+    await stored
+    const put = bytes.put.bind(bytes)
+    vi.spyOn(bytes, 'put').mockImplementation(async (key, value) => {
+      if (key.startsWith('feed/object/') && value[0] === 22) { pageBlocked(); await pageGate }
+      await put(key, value)
+    })
+    const lifetime = new AbortController(), iterator = reader.subscribeEvidenceBatches(lifetime.signal)[Symbol.asyncIterator]()
+    let delivered = false
+    const next = iterator.next().then(value => { delivered = true; return value })
+    const page = reader.putEvidenceBatch([Uint8Array.of(11), Uint8Array.of(22)])
+    await blocked
+    deliverFeed(); await oldFeed
+    await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+    try {
+      expect(delivered).toBe(false)
+      expect(await retainedEvidence(reader)).toEqual([])
+      expect(store.evidenceHead()).toBe(0n)
+    } finally { finishPage() }
+    const committed = await page
+    expect((await next).value).toEqual(committed)
+    const single = iterator.next(), proof = await reader.putEvidence(Uint8Array.of(33))
+    expect((await single).value).toEqual([proof])
+    lifetime.abort(); expect((await iterator.next()).done).toBe(true)
+  })
+
+  it('captures one finite evidence head and terminates paused readers on close before accessing storage again', async () => {
+    let store!: DurableFeedStore
+    const transport = await peer(value => { store = value })
+    await transport.putEvidenceBatch(Array.from({ length: 64 }, (_, i) => Uint8Array.of(i)))
+    await transport.putEvidence(Uint8Array.of(64))
+    const history = transport.evidenceHistory()[Symbol.asyncIterator]()
+    expect((await history.next()).value).toHaveLength(64)
+    await transport.putEvidence(Uint8Array.of(65))
+    const tail = await history.next()
+    if (tail.done) throw new Error('Missing captured evidence tail')
+    expect(tail.value.map(item => item.bytes[0])).toEqual([64])
+    expect((await history.next()).done).toBe(true)
+    const finite = transport.evidenceHistory()[Symbol.asyncIterator](), live = transport.subscribeEvidenceBatches()[Symbol.asyncIterator]()
+    expect((await finite.next()).value).toHaveLength(64)
+    expect((await live.next()).value).toHaveLength(64)
+    await transport.close()
+    const read = vi.spyOn(store, 'evidenceAfter').mockImplementation(() => { throw new Error('read after close') })
+    expect((await finite.next()).done).toBe(true)
+    expect((await live.next()).done).toBe(true)
+    expect(read).not.toHaveBeenCalled()
+  })
+
   it('keeps replacement connections when an older in-process route detaches', async () => {
     const [author, reader] = await Promise.all([peer(), peer()])
     const oldRoute = connectInProcess(author, reader)
@@ -100,10 +165,10 @@ describe('portable peer replication', () => {
     relay.disconnect(author.identity)
     connectInProcess(relay, reader)
     await reader.catchUp()
-    expect(await reader.evidenceHistory()).toEqual([proof])
+    expect(await retainedEvidence(reader)).toEqual([proof])
     expect(await reader.history()).toEqual([])
     expect(await reader.putEvidence(proof.bytes)).toEqual(proof)
-    expect(await reader.evidenceHistory()).toHaveLength(1)
+    expect(await retainedEvidence(reader)).toHaveLength(1)
   })
 
   it('serializes concurrent local signing so no feed sequence forks', async () => {
@@ -135,8 +200,8 @@ describe('portable peer replication', () => {
     await author.putEvidence(Uint8Array.of(7, 1))
     let entered!: () => void, release!: () => void
     const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
-    const putEvidence = store.putEvidence.bind(store)
-    vi.spyOn(store, 'putEvidence').mockImplementation(async bytes => { entered(); await gate; return putEvidence(bytes) })
+    const putEvidenceBatch = store.putEvidenceBatch.bind(store)
+    vi.spyOn(store, 'putEvidenceBatch').mockImplementation(async bytes => { entered(); await gate; return putEvidenceBatch(bytes) })
     const closeStore = vi.spyOn(store, 'close')
     const detach = reader.connect({ ...author.asLink(), async *watch() {} })
     await started

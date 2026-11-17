@@ -62,17 +62,17 @@ async function fixture(mode: FixtureMode) {
   policy.ingestEvidence = async value => { counts.proofs++; return ingest(value) }
   const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
     signer: webFeedSigner(feedIdFromPublicKey(identity.publicKeyBytes), identity.privateKey) })
-  const retain = transport.putEvidence.bind(transport)
-  transport.putEvidence = async value => {
-    if (unavailable && mode === 'failed-retention' && decodeOrderingEvidence(value).kind === 'prefix-certificate') {
+  const retain = transport.putEvidenceBatch.bind(transport)
+  transport.putEvidenceBatch = async values => {
+    if (unavailable && mode === 'failed-retention' && values.some(value => decodeOrderingEvidence(value).kind === 'prefix-certificate')) {
       throw new Error('RETENTION_FAILED')
     }
-    return retain(value)
+    return retain(values)
   }
   transport.getPayload = async hash => bodies.get(hash)?.slice() ?? null
   // Drive proof delivery explicitly so background subscription echoes cannot
   // obscure the waitForIdle barrier. Retention and its history remain real.
-  transport.subscribeEvidence = async function* () {}
+  transport.subscribeEvidenceBatches = async function* () {}
   const ring = new EpochCipherRing(), writerRing = new EpochCipherRing()
   writerRing.install(bytes(91), 0n, true)
   const node = new ChronologNode({ identity, groupId, membershipRevision, validationPolicy, operationStore: store, transport,
@@ -138,7 +138,7 @@ describe('application reconciliation after finality evidence', () => {
     const f = await fixture('available')
     await f.node.ingestFinalityEvidence(f.proof)
     await f.node.waitForIdle()
-    const before = await f.state(), evidence = (await f.transport.evidenceHistory()).length
+    const before = await f.state(), evidence = (await retainedEvidence(f.transport)).length
     expect(before).toMatchObject({ finalOrderLength: 1, pending: false })
     f.reset()
     for (let count = 0; count < 3; count++) await f.node.waitForIdle()
@@ -161,19 +161,40 @@ describe('application reconciliation after finality evidence', () => {
     expect(f.node.outcome(f.txId)?.outcome).toBe('accepted')
   })
 
-  it('applies a verified frontier after interrupted transport retention even when no materialization was pending', async () => {
+  it('keeps a fully verified shared batch retryable after a derived-view reconciliation failure', async () => {
+    const f = await fixture('failed-reconcile')
+    await f.transport.putEvidenceBatch([f.proof])
+    await expect(f.node.waitForIdle()).rejects.toThrow('RECONCILIATION_FAILED')
+    expect((await f.node.status()).lastError).toBe('RECONCILIATION_FAILED')
+    expect(f.policy.snapshot().closedReceiptThrough).toBe(1)
+    f.restore()
+    await f.node.waitForIdle()
+    expect(f.node.isFinal(f.txId)).toBe(true)
+    expect(f.node.outcome(f.txId)?.outcome).toBe('accepted')
+    expect((await f.node.status()).lastError).toBeUndefined()
+  })
+
+  it('does not advance a verified frontier before transport retention succeeds', async () => {
     const f = await fixture('failed-retention')
-    await expect(f.node.ingestFinalityEvidence(f.proof)).rejects.toThrow('RETENTION_FAILED')
     const before = await f.state()
-    expect(before).toMatchObject({ pending: false, finalOrderLength: 0, appliedThrough: 0, closedReceiptThrough: 1 })
+    await expect(f.node.ingestFinalityEvidence(f.proof)).rejects.toThrow('RETENTION_FAILED')
+    expect(await f.state()).toEqual(before)
+    expect(before).toMatchObject({ pending: false, finalOrderLength: 0, appliedThrough: 0, closedReceiptThrough: 0 })
     f.restore(); f.reset()
     await f.node.ingestFinalityEvidence(f.proof)
     await f.node.waitForIdle()
     expect(f.counts).toMatchObject({ materialize: 1, reconcile: 1, publishFinal: 1 })
-    expect(await f.state()).toMatchObject({ checkpoint: before.checkpoint, pending: false, finalOrderLength: 1, appliedThrough: 1 })
+    expect(await f.state()).toMatchObject({ pending: false, finalOrderLength: 1, appliedThrough: 1, closedReceiptThrough: 1 })
+    expect((await f.state()).checkpoint).not.toBe(before.checkpoint)
     expect(f.node.isFinal(f.txId)).toBe(true)
     expect(f.node.outcome(f.txId)?.outcome).toBe('accepted')
-    expect((await f.transport.evidenceHistory()).some(item => item.bytes.every((value, index) => f.proof[index] === value) &&
+    expect((await retainedEvidence(f.transport)).some(item => item.bytes.every((value, index) => f.proof[index] === value) &&
       item.bytes.length === f.proof.length)).toBe(true)
   })
 })
+
+async function retainedEvidence(transport: PortableFeedTransport) {
+  const evidence = []
+  for await (const batch of transport.evidenceHistory()) evidence.push(...batch)
+  return evidence
+}

@@ -1,5 +1,6 @@
 import { DEFAULT_MAX_RECORD_BYTES, type FeedCrypto, type FeedRecord, verifyFeedRecord } from './feed-codec.js'
 import type { FeedAppendResult, FeedStorePort } from './store.js'
+import { MAX_EVIDENCE_BATCH_SIZE } from './types.js'
 
 /** A connection carries exact signed records. Its current peer never becomes their author. */
 export interface FeedLink {
@@ -8,7 +9,7 @@ export interface FeedLink {
   head(feed: string): Promise<bigint>
   evidenceHead(): Promise<bigint>
   read(feed: string, after: bigint, limit: number): Promise<readonly Uint8Array[]>
-  /** Dense, append-only positions belonging to this connection's evidence log. */
+  /** Dense positions; a nonempty byte-limited page may contain fewer than limit. */
   readEvidence(after: bigint, limit: number): Promise<readonly Uint8Array[]>
   /** Payload delivery is independent of ledger/header synchronization. */
   readPayload(hash: string): Promise<Uint8Array | null>
@@ -80,20 +81,18 @@ export async function pullFeedLink(
   }
   for (const { feed, through } of targets) await pullFeed(link, feed, through, options, signal)
   while (cursor.evidenceAfter < evidenceThrough) {
-    const remaining = evidenceThrough - cursor.evidenceAfter, limit = Number(remaining < 64n ? remaining : 64n)
+    const maximum = BigInt(MAX_EVIDENCE_BATCH_SIZE)
+    const remaining = evidenceThrough - cursor.evidenceAfter, limit = Number(remaining < maximum ? remaining : maximum)
     const batch = await remoteRead(() => link.readEvidence(cursor.evidenceAfter, limit), signal)
     if (batch.length > limit) throw new Error('FEED_RANGE_TOO_LARGE')
     if (batch.length === 0) throw new Error('FEED_RANGE_TARGET_UNAVAILABLE')
-    for (const bytes of batch) {
-      signal?.throwIfAborted()
-      // Never race a durable write against cancellation and close its store
-      // while its commit is still in flight.
-      const result = await options.store.putEvidence(bytes)
-      cursor.evidenceAfter += 1n
-      if (result.kind === 'appended') options.onEvidenceStored?.()
-      signal?.throwIfAborted()
-    }
-    if (cursor.evidenceAfter < evidenceThrough && batch.length < limit) throw new Error('FEED_RANGE_TARGET_UNAVAILABLE')
+    signal?.throwIfAborted()
+    // The complete page becomes visible at one durable publication boundary.
+    // Never abandon that commit on cancellation and close its backing store.
+    const result = await options.store.putEvidenceBatch(batch)
+    cursor.evidenceAfter += BigInt(batch.length)
+    if (result.some(item => item.kind === 'appended')) options.onEvidenceStored?.()
+    signal?.throwIfAborted()
   }
   signal?.throwIfAborted()
 }

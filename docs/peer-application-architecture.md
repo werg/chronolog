@@ -36,7 +36,7 @@ signals. The application chooses its reachable peers and ICE configuration.
 The optional retained-log adapter remains an explicit deployment choice. The
 peer composition does not silently fall back to it when WebRTC is unavailable.
 
-## Three distinct application primitives
+## Application primitives
 
 **Durable operations** append original signed proposals. Their operation IDs
 survive retries and device restart. SQL and durable events are produced by the
@@ -58,7 +58,20 @@ old signals, and an interrupted subscription is visible to its consumer.
 Expired messages are not useful history. Applications requiring durable delivery
 must publish a durable event instead.
 
-**Final effects** consume final durable intents. A resident can run effect and
+**Final events** are the accepted durable emissions of change programs. An event
+subscription has whole transaction batches and a processed cursor, so a pure
+projection can rebuild or resume from history. An event's verified origin carries
+its author and capability; application payload claims do not establish authority.
+
+**Application views** pair `changes({ view })` with `readView({ view })`. Change
+notifications coalesce; a read captures one coherent revision of SQL, outcomes
+and events. A provisional local view can be replaced after replay, while the
+published final prefix is immutable. Notifications are reasons to read a view,
+not a transaction log.
+
+## Effects build on final events
+
+Effect workers consume final durable intents. A resident can run effect and
 timer tasks independently of the device that authored an intent. An effect
 worker records dispatch and reconciliation state and uses a stable provider
 idempotency key where supported. A signal, a provisional event, and a signed

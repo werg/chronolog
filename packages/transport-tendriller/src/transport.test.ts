@@ -17,11 +17,17 @@ import {
 import { encodeEnvelope, generateEd25519KeyPair, type EnvelopeMessageType } from '@chronolog/protocol'
 import {
   connectInProcess, DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner,
-  type AtomicBytesStore,
+  type AtomicBytesStore, type EvidenceBatch, type ImmutableEvidence,
 } from '@chronolog/records'
 
 import { authorizeThroughRecordLog, createCertificateFetcher, withTendrillerFinality, type FinalityHttp } from './finality-service.js'
 import { TendrillerTransport } from './transport.js'
+
+async function retainedEvidence(transport: { evidenceHistory(): AsyncIterable<EvidenceBatch> }): Promise<ImmutableEvidence[]> {
+  const result: ImmutableEvidence[] = []
+  for await (const batch of transport.evidenceHistory()) result.push(...batch)
+  return result
+}
 
 const historyId = 'h_00112233445566778899aabbccddeeff'
 const groupRoute = new Uint8Array(32).fill(7)
@@ -165,7 +171,7 @@ describe('public Tendriller adapter', () => {
     expect(await resumed.history()).toHaveLength(1)
     expect((await f.log.head()).position).toBe(1)
     await resumed.catchUp()
-    expect((await resumed.evidenceHistory()).map((item) => decodeOrderingEvidence(item.bytes).kind).sort()).toEqual(['ordered-entry', 'ordered-entry', 'prefix-certificate'])
+    expect((await retainedEvidence(resumed)).map((item) => decodeOrderingEvidence(item.bytes).kind).sort()).toEqual(['ordered-entry', 'ordered-entry', 'prefix-certificate'])
   })
 
   it('retains closure markers, keeps prefix certificates separate and relays complete proofs through another peer offline', async () => {
@@ -182,7 +188,7 @@ describe('public Tendriller adapter', () => {
       id: original.id, author: original.author, sequence: original.sequence, payload: original.payload,
     })
     const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
-    for (const item of await reader.transport.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
+    for (const item of await retainedEvidence(reader.transport)) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(2)
     expect(policy.snapshot().closedThroughMs).toBe(1_000n)
     expect(policy.entries()[0]!.bytes).toEqual((await createLedgerRecord(original.payload)).recordBytes)
@@ -210,12 +216,12 @@ describe('public Tendriller adapter', () => {
     await expect(adapter.publish(envelope('candidate', 2))).rejects.toThrow('Hub unavailable')
     expect(await adapter.history()).toHaveLength(2)
     const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
-    for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
+    for (const item of await retainedEvidence(adapter)) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(2)
     expect((await adapter.status()).lastCatchUpError).toContain('Hub unavailable')
     expect(await adapter.status()).toMatchObject({ connected: false, peers: [] })
     f.online(); await adapter.catchUp()
-    for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
+    for (const item of await retainedEvidence(adapter)) await policy.ingest(decodeOrderingEvidence(item.bytes))
     expect(policy.progress.finalThrough).toBe(4)
     expect((await f.log.head()).position).toBe(4)
     expect(await adapter.status()).toMatchObject({ connected: true, peers: [] })
@@ -241,8 +247,8 @@ describe('public Tendriller adapter', () => {
     closers.push(() => adapter.close())
     const stopped = new AbortController()
     const observed = (async () => {
-      for await (const item of adapter.subscribeEvidence(stopped.signal)) {
-        if (decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate') return
+      for await (const batch of adapter.subscribeEvidenceBatches(stopped.signal)) {
+        if (batch.some(item => decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate')) return
       }
       throw new Error('CERTIFICATE_NOT_RETAINED')
     })()
@@ -253,7 +259,7 @@ describe('public Tendriller adapter', () => {
     await firstFailure
     await vi.advanceTimersByTimeAsync(0)
     expect((await adapter.status()).lastCatchUpError).toBe('CERTIFICATE_REPLY_LOST')
-    expect((await adapter.evidenceHistory()).some(item => decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate')).toBe(false)
+    expect((await retainedEvidence(adapter)).some(item => decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate')).toBe(false)
     await vi.advanceTimersByTimeAsync(999)
     expect(attempts).toBe(1)
     await vi.advanceTimersByTimeAsync(1)
@@ -282,7 +288,7 @@ describe('public Tendriller adapter', () => {
     closers.push(() => adapter.close())
     const policy = await SignedInclusionFinalityProvider.open(f.configuration, storage())
     const frontier = async () => {
-      for (const item of await adapter.evidenceHistory()) await policy.ingest(decodeOrderingEvidence(item.bytes))
+      for (const item of await retainedEvidence(adapter)) await policy.ingest(decodeOrderingEvidence(item.bytes))
       return policy.snapshot().closedThroughMs
     }
     await expect.poll(frontier).toBe(1_000n)
@@ -351,7 +357,7 @@ describe('public Tendriller adapter', () => {
     closers.push(() => adapter.close())
     await expect(adapter.catchUp()).rejects.toThrow('TENDRILLER_HISTORY_CONFLICT')
     expect(reads).toBe(1)
-    expect(await adapter.evidenceHistory()).toHaveLength(0)
+    expect(await retainedEvidence(adapter)).toHaveLength(0)
   })
 
   it('fails closed before reading/signing and composes ordinary engine requests and scheduling', async () => {

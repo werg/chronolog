@@ -79,6 +79,14 @@ Head notifications are hints; they never advance applied cursors themselves.
 Rollback, conflicting history, and nonprogressing retained reads stop recovery
 with a visible error.
 
+Transport evidence pages commit atomically before delivery. A finite retained
+replay and the live consumer both use bounded batches, with one application
+reconciliation after each batch's proofs are verified. A joining replica need
+not recreate every intermediate revision that an earlier peer published.
+See [retained evidence and application publication](pluggable-finality.md#retained-evidence-and-application-publication)
+for the storage boundary and failure rules; batching does not change proof
+authority or application transaction boundaries.
+
 ## Local and final SQL are different readers
 
 ```ts

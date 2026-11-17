@@ -10,7 +10,7 @@ import {
 import { ChronologNode, Mutex, membershipDescriptor, provisionMembership } from '@chronolog/node-core'
 import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
 import {
-  SignedInclusionFinalityProvider, decodeOrderingEvidence, ReferenceRecordLog,
+  SignedInclusionFinalityProvider, ReferenceRecordLog,
 } from '@chronolog/node-core/history'
 import { digestExecutionManifest, equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
@@ -138,8 +138,8 @@ describe('Tendriller coordinated SQL connection', () => {
       authority.clock.now += 100
       for (const peer of participants) {
         await peer.adapter!.catchUp()
-        for (const item of await peer.transport.evidenceHistory()) {
-          await peer.node.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes))
+        for await (const batch of peer.transport.evidenceHistory()) {
+          await peer.node.ingestFinalityEvidenceBatch(batch.map(item => item.bytes))
         }
       }
     }
@@ -147,8 +147,8 @@ describe('Tendriller coordinated SQL connection', () => {
     // The proposal is two milliseconds ahead of the first closure. It stays
     // pending until time advances, without another application submission.
     await alice.adapter!.catchUp()
-    for (const item of await alice.transport.evidenceHistory()) {
-      await alice.node.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes))
+    for await (const batch of alice.transport.evidenceHistory()) {
+      await alice.node.ingestFinalityEvidenceBatch(batch.map(item => item.bytes))
     }
     expect((await alice.client.getTransactionOutcome(created.transactionId)).outcome.type).toBe('pending')
     await sync(); expect((await created.accepted()).final).toBe(true)
@@ -201,7 +201,7 @@ describe('Tendriller coordinated SQL connection', () => {
     const reader = await open('reader', readerKey, false)
     connectInProcess(alice.local, reader.local)
     await reader.local.catchUp()
-    for (const item of await reader.local.evidenceHistory()) await reader.node.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes))
+    for await (const batch of reader.local.evidenceHistory()) await reader.node.ingestFinalityEvidenceBatch(batch.map(item => item.bytes))
     expect(finalRows(reader.node).rows).toEqual(expectedRows)
     expect(reader.node.finalThrough).toBe(afterRetry.closedReceiptThrough)
     expect(reader.node.finalOrderLength).toBe(6)

@@ -13,6 +13,26 @@ export interface ImmutableEvidence {
   readonly bytes: Uint8Array
 }
 
+/** A bounded local publication unit; it makes no claim about proof validity. */
+export type EvidenceBatch = readonly ImmutableEvidence[]
+export const MAX_EVIDENCE_BATCH_SIZE = 64
+export const MAX_EVIDENCE_BATCH_BYTES = 64 * 1024 * 1024
+
+/** Validate the whole bound before copying caller-owned bytes. */
+export function captureEvidenceBatch(input: readonly Uint8Array[]): readonly Uint8Array[] {
+  if (!Array.isArray(input) || input.length === 0 || input.length > MAX_EVIDENCE_BATCH_SIZE) {
+    throw new Error('FEED_EVIDENCE_BATCH_INVALID')
+  }
+  const values: readonly Uint8Array[] = input
+  let bytes = 0
+  for (const item of values) {
+    if (!(item instanceof Uint8Array)) throw new Error('FEED_EVIDENCE_BATCH_INVALID')
+    bytes += item.length
+    if (bytes > MAX_EVIDENCE_BATCH_BYTES) throw new Error('FEED_EVIDENCE_BATCH_TOO_LARGE')
+  }
+  return values.map(item => item.slice())
+}
+
 export interface PublishOptions {
   readonly timestampMs?: number
 }
@@ -67,9 +87,14 @@ export interface ChronologTransport {
   feedContiguousThrough?(feedId: string): Promise<bigint>
   /** Replicate `feedId` from connected peers (membership tells the node which feeds matter). */
   requestFeed?(feedId: string): void
+  /** Retain an entire bounded page before notifying any evidence consumer. */
+  putEvidenceBatch?(bytes: readonly Uint8Array[]): Promise<EvidenceBatch>
+  /** Immediate singleton publication through the same durable batch boundary. */
   putEvidence?(bytes: Uint8Array): Promise<ImmutableEvidence>
-  evidenceHistory?(): Promise<readonly ImmutableEvidence[]>
-  subscribeEvidence?(signal?: AbortSignal): AsyncIterable<ImmutableEvidence>
+  /** A finite retained head, captured when iteration begins, in bounded batches. */
+  evidenceHistory?(signal?: AbortSignal): AsyncIterable<EvidenceBatch>
+  /** Only committed batches are visible; cancellation ends iteration normally. */
+  subscribeEvidenceBatches?(signal?: AbortSignal): AsyncIterable<EvidenceBatch>
   close(): Promise<void>
 }
 

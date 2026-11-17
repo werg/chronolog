@@ -195,7 +195,9 @@ describe('portable thin membership administrator', () => {
       expect(peer.governed.activeSnapshot.revision).toBe(1n)
       expect(peer.governed.governance.cipherRing.epochs()).toEqual([0n])
       expect((await peer.transport.status()).records).toBe(0)
-      expect(await peer.transport.evidenceHistory()).toEqual([])
+      let evidenceCount = 0
+      for await (const batch of peer.transport.evidenceHistory()) evidenceCount += batch.length
+      expect(evidenceCount).toBe(0)
       expect(peer.governed.node.finalThrough).toBe(0)
       expect(await peer.governed.node.isFinalTargetApplied(approval.approval.target.frontier)).toBe(false)
       await peer.governed.close()

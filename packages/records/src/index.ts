@@ -1,4 +1,5 @@
 export * from './types.js'
+export * from './evidence.js'
 export * from './feed-codec.js'
 export * from './store.js'
 export * from './replication.js'

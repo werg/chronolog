@@ -1,7 +1,7 @@
 import { assertCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, type CborValue } from '@chronolog/canonical'
 
 import { feedRecordId, type FeedCrypto, type FeedRecord, verifyFeedRecord } from './feed-codec.js'
-import type { ImmutableEvidence, TransportRecord } from './types.js'
+import { captureEvidenceBatch, type ImmutableEvidence, type TransportRecord } from './types.js'
 import { payloadHash, validatePayloadHash, verifyPayloadHash } from './payload.js'
 
 export type Awaitable<T> = T | Promise<T>
@@ -19,6 +19,11 @@ export type FeedAppendResult =
   | { readonly kind: 'out_of_order'; readonly head: bigint }
 
 export interface FeedHead { readonly sequence: bigint; readonly id: string | null }
+export interface EvidenceAppendResult {
+  readonly kind: 'appended' | 'duplicate'
+  readonly index: bigint
+  readonly evidence: ImmutableEvidence
+}
 export interface FeedStorePort {
   head(author: string): Awaitable<FeedHead>
   append(record: FeedRecord, receivedAtMs?: number): Awaitable<FeedAppendResult>
@@ -31,7 +36,8 @@ export interface FeedStorePort {
   feedAfter(author: string, sequence: bigint, limit: number): Awaitable<readonly { readonly sequence: bigint; readonly raw: Uint8Array }[]>
   heads(): Awaitable<ReadonlyMap<string, bigint>>
   count(): Awaitable<number>
-  putEvidence(bytes: Uint8Array): Awaitable<{ readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence }>
+  putEvidence(bytes: Uint8Array): Awaitable<EvidenceAppendResult>
+  putEvidenceBatch(bytes: readonly Uint8Array[]): Awaitable<readonly EvidenceAppendResult[]>
   evidenceHead(): Awaitable<bigint>
   evidenceAfter(index: bigint, limit: number): Awaitable<readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[]>
   close(): Awaitable<void>
@@ -152,22 +158,34 @@ export class DurableFeedStore implements FeedStorePort {
     return task
   }
 
-  putEvidence(input: Uint8Array): Promise<{ readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence }> {
-    const bytes = input.slice()
+  async putEvidence(input: Uint8Array): Promise<EvidenceAppendResult> {
+    return (await this.putEvidenceBatch([input]))[0]!
+  }
+
+  putEvidenceBatch(input: readonly Uint8Array[]): Promise<readonly EvidenceAppendResult[]> {
+    const captured = captureEvidenceBatch(input)
     const task = this.#pending.then(async () => {
       this.#assertWritable()
-      if (bytes.length > 64 * 1024 * 1024) throw new Error('FEED_RECORD_TOO_LARGE')
-      const id = feedRecordId(await this.#crypto.sha256(bytes))
-      const existing = this.#evidenceIndex.get(id)
-      if (existing !== undefined) return { kind: 'duplicate' as const, index: BigInt(existing + 1), evidence: { id, bytes: bytes.slice() } }
-      const evidence = { id, bytes }
-      await this.#put(objectKey(id), bytes)
+      const added: ImmutableEvidence[] = [], staged = new Map<string, number>(), result: EvidenceAppendResult[] = []
+      for (const bytes of captured) {
+        const id = feedRecordId(await this.#crypto.sha256(bytes))
+        const existing = this.#evidenceIndex.get(id) ?? staged.get(id)
+        const index = existing ?? this.#evidence.length + added.length
+        if (existing === undefined) { staged.set(id, index); added.push({ id, bytes }) }
+        result.push({ kind: existing === undefined ? 'appended' : 'duplicate', index: BigInt(index + 1), evidence: { id, bytes: bytes.slice() } })
+      }
+      if (added.length === 0) return result
+      // Object writes may leave unreachable objects after interruption. Only
+      // this single manifest replacement publishes the complete evidence page.
+      for (const evidence of added) await this.#put(objectKey(evidence.id), evidence.bytes)
       await this.#put('feed/manifest', encodeCanonicalCbor([
-        1n, manifestRows(this.#records), manifestRows(this.#forks), [...this.#evidence.map((item) => item.id), id],
+        1n, manifestRows(this.#records), manifestRows(this.#forks), [...this.#evidence, ...added].map(item => item.id),
       ]))
-      this.#evidenceIndex.set(id, this.#evidence.length)
-      this.#evidence.push(evidence)
-      return { kind: 'appended' as const, index: BigInt(this.#evidence.length), evidence: { id, bytes: bytes.slice() } }
+      for (const evidence of added) {
+        this.#evidenceIndex.set(evidence.id, this.#evidence.length)
+        this.#evidence.push(evidence)
+      }
+      return result
     })
     this.#pending = task.catch(() => undefined)
     return task

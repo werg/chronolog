@@ -2,8 +2,9 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { createFeedRecord, decodeFeedRecord, FeedStore, type FeedKeys } from './feed-store.js'
 import { FeedTransport } from './feed-transport.js'
@@ -15,6 +16,7 @@ const ssbKeys = require('ssb-keys') as { generate(): FeedKeys }
 const directories: string[] = []
 const transports: FeedTransport[] = []
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(transports.splice(0).map((transport) => transport.close()))
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
@@ -48,6 +50,18 @@ async function eventually(check: () => Promise<boolean>, timeoutMs = 10_000): Pr
   }
 }
 
+function rejectEvidenceByte(path: string): void {
+  const database = new DatabaseSync(path)
+  try {
+    database.exec("CREATE TRIGGER reject_evidence BEFORE INSERT ON evidence WHEN NEW.raw = X'ff' BEGIN SELECT RAISE(ABORT, 'EVIDENCE_WRITE_FAILED'); END")
+  } finally { database.close() }
+}
+
+function allowEvidenceByte(path: string): void {
+  const database = new DatabaseSync(path)
+  try { database.exec('DROP TRIGGER reject_evidence') } finally { database.close() }
+}
+
 describe('signed feed records', () => {
   it('retains exact immutable evidence across reopen without requiring an author feed', async () => {
     const path = join(await directory(), 'evidence.sqlite')
@@ -62,6 +76,101 @@ describe('signed feed records', () => {
       expect(store.evidenceHead()).toBe(2n)
       expect(store.evidenceAfter(0n, 1)).toEqual([{ index: 1n, evidence: first.evidence }])
       expect(store.count()).toBe(0)
+    } finally { store.close() }
+  })
+
+  it('deduplicates within a native evidence page and rolls back every insert when a later one fails', async () => {
+    const path = join(await directory(), 'evidence.sqlite')
+    let store = new FeedStore(path)
+    const first = Uint8Array.of(1), second = Uint8Array.of(2)
+    const initial = store.putEvidenceBatch([first, first, second])
+    expect(initial.map(item => [item.kind, item.index])).toEqual([['appended', 1n], ['duplicate', 1n], ['appended', 2n]])
+    expect(initial[0]!.evidence).toEqual(initial[1]!.evidence)
+    expect(store.evidenceHead()).toBe(2n)
+    store.close()
+    rejectEvidenceByte(path)
+    store = new FeedStore(path)
+    const failedPage = [Uint8Array.of(3), Uint8Array.of(255)]
+    try {
+      expect(() => store.putEvidenceBatch(failedPage)).toThrow('EVIDENCE_WRITE_FAILED')
+      expect(store.evidenceHead()).toBe(2n)
+      expect(store.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([first, second])
+    } finally { store.close() }
+    allowEvidenceByte(path)
+    store = new FeedStore(path)
+    try {
+      expect(store.putEvidenceBatch(failedPage).map(item => [item.kind, item.index]))
+        .toEqual([['appended', 3n], ['appended', 4n]])
+      expect(store.putEvidenceBatch(failedPage).map(item => item.kind)).toEqual(['duplicate', 'duplicate'])
+      expect(store.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([first, second, ...failedPage])
+      expect(store.count()).toBe(0)
+    } finally { store.close() }
+  })
+
+  it('fences native reads and writes after an uncertain evidence rollback until reopen', async () => {
+    const path = join(await directory(), 'evidence.sqlite')
+    let store = new FeedStore(path)
+    const original = Uint8Array.of(1)
+    store.putEvidence(original)
+    store.close()
+    rejectEvidenceByte(path)
+    store = new FeedStore(path)
+    // Preserve the original method and call it with the intercepted database.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const exec = DatabaseSync.prototype.exec
+    const rollback = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql) {
+      if (sql === 'ROLLBACK') throw new Error('ROLLBACK_REPLY_LOST')
+      return exec.call(this, sql)
+    })
+    const failedPage = [Uint8Array.of(2), Uint8Array.of(255)]
+    try {
+      expect(() => store.putEvidenceBatch(failedPage)).toThrow('EVIDENCE_WRITE_FAILED')
+      expect(rollback).toHaveBeenCalledWith('ROLLBACK')
+      const keys = ssbKeys.generate(), record = createFeedRecord(keys, 1n, null, 1n, Uint8Array.of(4))
+      const access: Record<string, () => unknown> = {
+        head: () => store.head(keys.id), append: () => store.append(record), get: () => store.get(record.id),
+        getPayload: () => store.getPayload('0'.repeat(64)), putPayload: () => store.putPayload(Uint8Array.of(4)),
+        after: () => store.after(0n, 1), forksAfter: () => store.forksAfter(0n, 1),
+        feedAfter: () => store.feedAfter(keys.id, 0n, 1), heads: () => store.heads(), count: () => store.count(),
+        maxLocalIndex: () => store.maxLocalIndex(), forkedAuthors: () => store.forkedAuthors(),
+        evidenceHead: () => store.evidenceHead(), evidenceAfter: () => store.evidenceAfter(0n, 1),
+        putEvidence: () => store.putEvidence(Uint8Array.of(4)), putEvidenceBatch: () => store.putEvidenceBatch([Uint8Array.of(4)]),
+      }
+      for (const [name, operation] of Object.entries(access)) expect(operation, name).toThrow('FEED_STORE_REOPEN_REQUIRED')
+    } finally { rollback.mockRestore(); store.close() }
+    allowEvidenceByte(path)
+    store = new FeedStore(path)
+    try {
+      expect(store.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([original])
+      expect(store.putEvidenceBatch(failedPage).map(item => item.index)).toEqual([2n, 3n])
+      expect(store.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([original, ...failedPage])
+    } finally { store.close() }
+  })
+
+  it('fences a lost commit acknowledgment and recovers the complete native evidence page on reopen', async () => {
+    const path = join(await directory(), 'evidence.sqlite')
+    let store = new FeedStore(path)
+    const original = Uint8Array.of(1), page = [Uint8Array.of(2), Uint8Array.of(3)]
+    store.putEvidence(original)
+    // Preserve the original method and call it with the intercepted database.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const exec = DatabaseSync.prototype.exec
+    const committed = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql) {
+      exec.call(this, sql)
+      if (sql === 'COMMIT') throw new Error('COMMIT_REPLY_LOST')
+    })
+    try {
+      expect(() => store.putEvidenceBatch(page)).toThrow('COMMIT_REPLY_LOST')
+      expect(() => store.evidenceHead()).toThrow('FEED_STORE_REOPEN_REQUIRED')
+      expect(() => store.evidenceAfter(0n, 64)).toThrow('FEED_STORE_REOPEN_REQUIRED')
+      expect(() => store.putEvidenceBatch(page)).toThrow('FEED_STORE_REOPEN_REQUIRED')
+    } finally { committed.mockRestore(); store.close() }
+    store = new FeedStore(path)
+    try {
+      expect(store.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([original, ...page])
+      expect(store.putEvidenceBatch(page).map(item => [item.kind, item.index]))
+        .toEqual([['duplicate', 2n], ['duplicate', 3n]])
+      expect(store.evidenceHead()).toBe(3n)
     } finally { store.close() }
   })
 
@@ -98,6 +207,54 @@ describe('signed feed records', () => {
 })
 
 describe('FeedTransport', () => {
+  it('replicates exact evidence as bounded muxrpc array pages without authoring feed records', async () => {
+    const sender = await open(await directory(), { network: { listen: { port: 0 }, reconnect: false } })
+    const proofs = Array.from({ length: 70 }, (_, index) => Uint8Array.of(index, 255 - index))
+    await sender.putEvidenceBatch(proofs.slice(0, 64))
+    await sender.putEvidenceBatch(proofs.slice(64))
+    const received: Uint8Array[][] = []
+    // Each incoming call must execute on its actual transport instance.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const retain = FeedTransport.prototype.putEvidenceBatch
+    const delivery = vi.spyOn(FeedTransport.prototype, 'putEvidenceBatch').mockImplementation(async function (this: FeedTransport, batch) {
+      const result = await retain.call(this, batch)
+      if (this !== sender) received.push(batch.map(bytes => bytes.slice()))
+      return result
+    })
+    try {
+      const receiver = await open(await directory(), {
+        network: { peers: [{ address: sender.address()!, feedId: sender.identity }], reconnect: false },
+      })
+      await eventually(async () => received.flat().length === proofs.length)
+      expect(received.map(batch => batch.length)).toEqual([64, 6])
+      expect(received.flat()).toEqual(proofs)
+      const retained: Uint8Array[] = []
+      for await (const batch of receiver.evidenceHistory()) retained.push(...batch.map(item => item.bytes))
+      expect(retained).toEqual(proofs)
+      expect((await receiver.status()).records).toBe(0)
+      expect((await receiver.status()).lastCatchUpError).toBeUndefined()
+    } finally { delivery.mockRestore() }
+  }, 20_000)
+
+  it('ends paused finite and live evidence iterators when the transport closes', async () => {
+    const transport = await open(await directory(), { network: { reconnect: false } })
+    const proofs = Array.from({ length: 70 }, (_, index) => Uint8Array.of(index))
+    await transport.putEvidenceBatch(proofs.slice(0, 64))
+    await transport.putEvidenceBatch(proofs.slice(64))
+    const finite = transport.evidenceHistory()[Symbol.asyncIterator]()
+    const paused = transport.subscribeEvidenceBatches()[Symbol.asyncIterator]()
+    const waiting = transport.subscribeEvidenceBatches()[Symbol.asyncIterator]()
+    expect((await finite.next()).value).toHaveLength(64)
+    expect((await paused.next()).value).toHaveLength(64)
+    expect((await waiting.next()).value).toHaveLength(64)
+    expect((await waiting.next()).value).toHaveLength(6)
+    const pending = waiting.next()
+    await transport.close()
+    await expect(finite.next()).resolves.toEqual({ done: true, value: undefined })
+    await expect(paused.next()).resolves.toEqual({ done: true, value: undefined })
+    await expect(pending).resolves.toEqual({ done: true, value: undefined })
+  })
+
   it('replays durable conflicts through history and new subscriptions after restart', async () => {
     const path = await directory(), keys = ssbKeys.generate()
     let transport = await open(path, { keys: { ...keys }, network: { reconnect: false } })

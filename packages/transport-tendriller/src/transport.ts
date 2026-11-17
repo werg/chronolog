@@ -8,12 +8,12 @@ import {
 } from '@chronolog/node-core/history'
 import { decodeEnvelope, equalBytes } from '@chronolog/protocol'
 import { createLedgerRecord } from '@chronolog/node-core/ledger'
-import type {
-  ChronologTransport, ImmutableEvidence, PublishOptions, TransportRecord, TransportStatus,
+import {
+  MAX_EVIDENCE_BATCH_SIZE, type ChronologTransport, type EvidenceBatch, type ImmutableEvidence, type PublishOptions, type TransportRecord, type TransportStatus,
 } from '@chronolog/records'
 
 type EvidenceTransport = ChronologTransport & Required<Pick<ChronologTransport,
-  'putEvidence' | 'evidenceHistory' | 'subscribeEvidence'>>
+  'putEvidence' | 'putEvidenceBatch' | 'evidenceHistory' | 'subscribeEvidenceBatches'>>
 
 export interface TendrillerTransportOptions {
   readonly local: ChronologTransport
@@ -59,7 +59,7 @@ export class TendrillerTransport implements ChronologTransport {
 
   constructor(options: TendrillerTransportOptions) {
     const local = options.local
-    if (local.putEvidence === undefined || local.evidenceHistory === undefined || local.subscribeEvidence === undefined) {
+    if (local.putEvidence === undefined || local.putEvidenceBatch === undefined || local.evidenceHistory === undefined || local.subscribeEvidenceBatches === undefined) {
       throw new Error('TENDRILLER_REQUIRES_DURABLE_EVIDENCE_TRANSPORT')
     }
     if (options.groupRoute.length !== 32) throw new Error('TENDRILLER_GROUP_ROUTE_INVALID')
@@ -129,8 +129,9 @@ export class TendrillerTransport implements ChronologTransport {
   history(): Promise<readonly TransportRecord[]> { return this.#local.history() }
   subscribe(signal?: AbortSignal): AsyncIterable<TransportRecord> { return this.#local.subscribe(signal) }
   putEvidence(bytes: Uint8Array): Promise<ImmutableEvidence> { return this.#local.putEvidence(bytes) }
-  evidenceHistory(): Promise<readonly ImmutableEvidence[]> { return this.#local.evidenceHistory() }
-  subscribeEvidence(signal?: AbortSignal): AsyncIterable<ImmutableEvidence> { return this.#local.subscribeEvidence(signal) }
+  putEvidenceBatch(bytes: readonly Uint8Array[]): Promise<EvidenceBatch> { return this.#local.putEvidenceBatch(bytes) }
+  evidenceHistory(signal?: AbortSignal): AsyncIterable<EvidenceBatch> { return this.#local.evidenceHistory(signal) }
+  subscribeEvidenceBatches(signal?: AbortSignal): AsyncIterable<EvidenceBatch> { return this.#local.subscribeEvidenceBatches(signal) }
   feedContiguousThrough(feedId: string): Promise<bigint> {
     if (this.#local.feedContiguousThrough === undefined) return Promise.resolve(0n)
     return this.#local.feedContiguousThrough(feedId)
@@ -211,22 +212,29 @@ export class TendrillerTransport implements ChronologTransport {
     const historyId = this.#configuration.historyId
     const { head } = await this.#records.info({ historyId, signal: this.#controller.signal })
     if (head.position < requiredThrough) throw new Error('TENDRILLER_HEAD_BEHIND_CERTIFICATE')
-    this.#previous ??= { historyId, position: 0, root: await recordGenesisRoot(historyId), bytes: 0 }
-    if (head.position < this.#previous.position || head.position === this.#previous.position && head.root !== this.#previous.root) {
+    let previous: RecordLogHead = this.#previous ?? { historyId, position: 0, root: await recordGenesisRoot(historyId), bytes: 0 }
+    this.#previous = previous
+    if (head.position < previous.position || head.position === previous.position && head.root !== previous.root) {
       throw new Error('TENDRILLER_HISTORY_CONFLICT')
     }
     const target = Math.max(requiredThrough, head.position)
-    while (this.#previous.position < target) {
-      const page = await this.#records.read({ historyId, after: this.#previous.position, previous: this.#previous, signal: this.#controller.signal })
-      if (page.head.position < target || page.entries.length === 0) throw new Error('TENDRILLER_HISTORY_CONFLICT')
+    while (previous.position < target) {
+      const limit = Math.min(MAX_EVIDENCE_BATCH_SIZE, target - previous.position)
+      const page = await this.#records.read({ historyId, after: previous.position, limit, previous, signal: this.#controller.signal })
+      if (page.head.position < target || page.entries.length === 0 || page.entries.length > limit) throw new Error('TENDRILLER_HISTORY_CONFLICT')
+      const batch: Uint8Array[] = []
+      let next: RecordLogHead = previous
       for (const record of page.entries) {
         const entry = adaptRecordEntry(record)
         if (entry.position === head.position && entry.root !== head.root) throw new Error('TENDRILLER_HISTORY_CONFLICT')
-        await this.#local.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
-        // This is only a delivery optimization. The durable evidence store owns
-        // recovery; reopening revalidates retained bytes from genesis.
-        this.#previous = { historyId, position: entry.position, root: entry.root, bytes: this.#previous.bytes + entry.bytes.length }
+        batch.push(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
+        next = { historyId, position: entry.position, root: entry.root, bytes: next.bytes + entry.bytes.length }
       }
+      await this.#local.putEvidenceBatch(batch)
+      // Advance delivery only after the complete retained page commits. A lost
+      // acknowledgement replays the same immutable page without partial exposure.
+      this.#previous = next
+      previous = next
     }
     this.#relayConnected = true
   }

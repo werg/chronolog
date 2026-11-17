@@ -5,6 +5,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+import type { ImmutableEvidence } from '@chronolog/records'
 import { chromium } from '@playwright/test'
 import { build } from 'esbuild'
 
@@ -96,7 +97,8 @@ try {
   await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sql('owner')), /SQL_DISABLED_FOR_EVENT_PROFILE/u)
   passed('real OPFS Worker opens without cross-origin isolation or a SQL engine; exclusive ownership and SQL refusal hold')
 
-  const signalHistory = await native.transport.history(), signalEvidence = await native.transport.evidenceHistory()
+  const signalHistory = await native.transport.history(), signalEvidence: ImmutableEvidence[] = []
+  for await (const batch of native.transport.evidenceHistory()) signalEvidence.push(...batch)
   const signalEvents = await native.client.events.read()
   const live = new AbortController()
   const nativeSignals = native.agent.context.signals.subscribe({ topics: ['typing'], signal: AbortSignal.any([live.signal, AbortSignal.timeout(20_000)]) })[Symbol.asyncIterator]()
@@ -128,7 +130,9 @@ try {
     await page.waitForFunction(async () =>
       (await (globalThis as unknown as TestWindow).chronologEventTest.signalState('owner')).activeSubscriptions === 0)
     assert.deepEqual(await native.transport.history(), signalHistory)
-    assert.deepEqual(await native.transport.evidenceHistory(), signalEvidence)
+    const retainedEvidence: ImmutableEvidence[] = []
+    for await (const batch of native.transport.evidenceHistory()) retainedEvidence.push(...batch)
+    assert.deepEqual(retainedEvidence, signalEvidence)
     assert.deepEqual(await native.client.events.read(), signalEvents)
     deviceEvidence.signals = { connection: 'public browser peer.connectPeer', rpc: 'ChronologClient and WorkerRpcTransport',
       nativeReceived: browserSent, browserReceived: observed.values, policyRefusal: denied,

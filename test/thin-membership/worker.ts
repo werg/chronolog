@@ -4,7 +4,7 @@ import { SignedInclusionFinalityProvider, type EnrollmentIdentity } from '@chron
 import { LedgerRecordError } from '@chronolog/node-core/ledger'
 import { decodeMembershipLedgerResponse } from '@chronolog/node-core/membership'
 import { base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest, emit, equalBytes, program } from '@chronolog/protocol'
-import { feedIdFromPublicKey } from '@chronolog/records'
+import { feedIdFromPublicKey, type EvidenceBatch } from '@chronolog/records'
 import { openBrowserPeer, prepareBrowserIdentity, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
 import { frameRtcPeerChannels, type PeerDataChannelConnection, type WebRtcChannels } from '@chronolog/transport-webrtc'
 
@@ -39,7 +39,7 @@ let requestId: string | undefined
 // not issue extra reads, drain queues, or change the evidence being verified.
 const workNames = ['transportCatchUp', 'evidenceHistory', 'nodeIdle', 'finalityIngest',
   'finalitySnapshot', 'finalityStoreRead', 'finalityStoreWrite', 'enrollmentStatus',
-  'transportEvidenceWrite', 'nodeEvidence', 'privateRead', 'privateObjectWrite',
+  'transportEvidenceWrite', 'evidenceBatchConsumption', 'privateRead', 'privateObjectWrite',
   'privateManifestWrite', 'privatePayloadWrite', 'privateOtherWrite'] as const
 type WorkName = typeof workNames[number]
 const work = Object.fromEntries(workNames.map(name => [name, {
@@ -68,6 +68,21 @@ async function measured<T>(name: WorkName, run: () => Promise<T>, bytes = 0): Pr
   const finish = beginWork(name, bytes)
   try { const result = await run(); finish(false, result instanceof Uint8Array ? result.length : 0); return result }
   catch (error) { finish(true); throw error }
+}
+
+async function* observeEvidenceBatches(source: AsyncIterable<EvidenceBatch>, retained: boolean): AsyncIterable<EvidenceBatch> {
+  const iterator = source[Symbol.asyncIterator]()
+  try {
+    for (;;) {
+      const next = retained ? await measured('evidenceHistory', () => iterator.next()) : await iterator.next()
+      if (next.done) return
+      if (retained) scannedEvidenceEntries += next.value.length
+      const finish = beginWork('evidenceBatchConsumption', next.value.reduce((bytes, item) => bytes + item.bytes.length, 0))
+      // A consumer requests its next batch after the previous one completes.
+      // This measures that whole interval, including mutex and publication work.
+      try { yield next.value } finally { finish() }
+    }
+  } finally { await iterator.return?.() }
 }
 
 function syncPhase(name: string): void {
@@ -153,14 +168,13 @@ endpoint.addEventListener('message', event => {
             links.push(observation); if (links.length > 8) links.shift()
             return connect(observation.link)
           }
-          const putEvidence = context.transport.putEvidence.bind(context.transport)
-          context.transport.putEvidence = bytes => measured('transportEvidenceWrite', () => putEvidence(bytes), bytes.length)
+          const putEvidenceBatch = context.transport.putEvidenceBatch.bind(context.transport)
+          context.transport.putEvidenceBatch = bytes => measured('transportEvidenceWrite', () => putEvidenceBatch(bytes),
+            bytes.reduce((length, item) => length + item.length, 0))
           const evidenceHistory = context.transport.evidenceHistory.bind(context.transport)
-          context.transport.evidenceHistory = () => measured('evidenceHistory', async () => {
-            const history = await evidenceHistory()
-            scannedEvidenceEntries += history.length
-            return history
-          })
+          context.transport.evidenceHistory = signal => observeEvidenceBatches(evidenceHistory(signal), true)
+          const subscribeEvidenceBatches = context.transport.subscribeEvidenceBatches.bind(context.transport)
+          context.transport.subscribeEvidenceBatches = signal => observeEvidenceBatches(subscribeEvidenceBatches(signal), false)
           return { materializer: { executionManifest: decodeExecutionManifest(base64UrlToBytes(bootstrap!.executionManifest)),
             rootAdministrator: genesis.manifest.schemaAdminPublicKey },
             governed: { genesis, groupRoute: base64UrlToBytes(bootstrap!.groupRoute), liveInclusionProviders: {
@@ -188,8 +202,6 @@ endpoint.addEventListener('message', event => {
               },
             } }, close: disconnect }
         } })
-        const ingestEvidence = peer.node.ingestFinalityEvidence.bind(peer.node)
-        peer.node.ingestFinalityEvidence = bytes => measured('nodeEvidence', () => ingestEvidence(bytes), bytes.length)
         client = new ChronologClient({ groupId: bytesToBase64Url(genesis.manifest.groupId), transport: peer.rpc, unaryRetryAttempts: 1 })
         return status()
       }

@@ -39,7 +39,7 @@ import {
   type EventPayload,
   type ApplicationChange, type ApplicationChangeOptions,
 } from '@chronolog/protocol'
-import { ChangeSignal, type TransportRecord } from '@chronolog/records'
+import { captureEvidenceBatch, ChangeSignal, type EvidenceBatch, type TransportRecord } from '@chronolog/records'
 import { readEffectiveEvents, type EventBatch, type EventReadOptions, type EventHistorySnapshot, type EventHistoryItem } from './events.js'
 import { DurableOperationJournal, MemoryOperationStore } from './operations.js'
 import { encodeOrderingEvidence, orderedGenesisRoot, type OrderingEvidence } from './history-policy.js'
@@ -120,6 +120,8 @@ export class ChronologNode {
   #backlogAtWindowStart = 0
   #lastResyncAt: number | undefined
   #lastError: Error | undefined
+  /** An unfinished shared proof batch requires replay from durable storage on reopen. */
+  #evidenceError: Error | undefined
   #materializationError: Error | undefined
   #ingestionError: Error | undefined
   #acceptedAboveMs: bigint
@@ -139,6 +141,8 @@ export class ChronologNode {
 
   constructor(options: ChronologNodeOptions) {
     this.#options = options
+    if (options.historyPolicy?.kind === 'coordinated' && options.transport.putEvidence !== undefined &&
+        options.transport.putEvidenceBatch === undefined) throw new Error('NODE_EVIDENCE_TRANSPORT_INCOMPLETE')
     this.#authorFutureSkewMs = options.authorClockPolicy?.maxFutureSkewMs
     if (this.#authorFutureSkewMs !== undefined && (!Number.isSafeInteger(this.#authorFutureSkewMs) || this.#authorFutureSkewMs < 0)) {
       throw new Error('AUTHOR_CLOCK_POLICY_INVALID')
@@ -234,6 +238,7 @@ export class ChronologNode {
 
   async start(): Promise<void> {
     if (this.#closed) throw new Error('NODE_CLOSED')
+    this.#assertEvidenceReady()
     if (this.#started) return
     await this.#validatorClosures.recover()
     const history = await this.#options.transport.history()
@@ -246,8 +251,8 @@ export class ChronologNode {
     await this.#operations.recover(async (bytes) => { await this.#applyPreparedTransaction(bytes) })
     await this.#ingressOperations.recover(async (bytes) => { await this.#applyPreparedTransaction(bytes) })
     if (this.#options.historyPolicy?.kind === 'coordinated') {
-      for (const evidence of await this.#options.transport.evidenceHistory?.() ?? []) {
-        await this.#ingestSharedEvidence(evidence.bytes)
+      for await (const batch of this.#options.transport.evidenceHistory?.(this.#abort.signal) ?? []) {
+        await this.#ingestSharedEvidenceBatch(batch)
       }
       this.#evidenceTask = this.#consumeEvidence()
     }
@@ -785,41 +790,82 @@ export class ChronologNode {
 
   /** The injected verifier interprets proof bytes; it cannot supply a sorter. */
   async ingestFinalityEvidence(bytes: Uint8Array): Promise<void> {
+    return this.ingestFinalityEvidenceBatch([bytes])
+  }
+
+  /** Retain through the configured evidence port, verify, then publish one bounded batch's application prefix. */
+  async ingestFinalityEvidenceBatch(evidence: readonly Uint8Array[]): Promise<void> {
     if (this.#options.historyPolicy?.kind !== 'coordinated') throw new Error('NODE_HISTORY_POLICY_MISMATCH')
-    const policy = this.#options.historyPolicy.policy
-    const exact = bytes.slice()
-    await this.#mutex.run(async () => {
-      await policy.ingestEvidence(exact)
-      await this.#options.transport.putEvidence?.(exact)
-      const snapshot = policy.snapshot()
-      // Exact proof replays and open receipt growth cannot change an already
-      // applied closed prefix. Pending bodies, keys or publication failures
-      // still need reconciliation even when the verified frontier is unchanged.
-      if (!this.#materializationPending && snapshot.closedReceiptThrough === this.#coordinatedAppliedThrough &&
-          snapshot.closedThroughMs === this.#appliedClosedThroughMs) return
-      this.#materializationPending = true
-      await this.#reconcileMaterializer()
-    })
+    const exact = captureEvidenceBatch(evidence)
+    await this.#mutex.run(() => this.#applyEvidenceBatch(exact, false))
   }
 
   async #consumeEvidence(): Promise<void> {
-    const subscribe = this.#options.transport.subscribeEvidence?.bind(this.#options.transport)
+    const subscribe = this.#options.transport.subscribeEvidenceBatches?.bind(this.#options.transport)
     if (subscribe === undefined) return
-    for await (const item of subscribe(this.#abort.signal)) {
-      if (this.#closed) return
-      await this.#ingestSharedEvidence(item.bytes)
+    try {
+      for await (const batch of subscribe(this.#abort.signal)) {
+        if (this.#closed) return
+        await this.#ingestSharedEvidenceBatch(batch)
+      }
+    } catch (error) {
+      // Do not request the next batch after an incomplete one. The full raw
+      // batch is retained, and reopening replays it without skipping its tail.
+      if (!this.#closed) this.#failEvidence(error)
     }
   }
 
-  async #ingestSharedEvidence(bytes: Uint8Array): Promise<void> {
-    try { await this.ingestFinalityEvidence(bytes) }
-    catch (error) {
-      // Immutable peer storage may contain unrelated or forged evidence. Only
-      // validated proofs enter the policy store; invalid bytes cannot poison restart.
-      if (error instanceof Error && /^(ORDERING_EVIDENCE_INVALID|HISTORY_(ID_MISMATCH|ID_INVALID|HASH_INVALID|POSITION_INVALID|POSITION_CONFLICT|CERTIFICATE_CONFIGURATION_MISMATCH|CERTIFICATE_SIGNATURE_INVALID)|ORDERED_RECORD_(BYTES_INVALID|TOO_LARGE|DIGEST_MISMATCH|ROOT_MISMATCH))$/u.test(error.message)) return
-      this.#recordError(error)
-      this.#scheduleMaterializationRetry()
+  async #ingestSharedEvidenceBatch(batch: EvidenceBatch): Promise<void> {
+    try {
+      const exact = captureEvidenceBatch(batch.map(item => item.bytes))
+      await this.#mutex.run(async () => {
+        try { await this.#applyEvidenceBatch(exact, true) }
+        catch (error) {
+          // Fence before releasing the mutex: a queued feed reconciliation
+          // must not publish the partially verified prefix of this batch.
+          if (!(error instanceof MaterializationProgressError)) this.#failEvidence(error)
+          throw error
+        }
+      })
     }
+    catch (error) {
+      if (error instanceof MaterializationProgressError) {
+        // Every proof finished before reconciliation began. This batch can be
+        // acknowledged while the existing derived-view retry repairs progress.
+        this.#recordError(error)
+        this.#scheduleMaterializationRetry()
+        return
+      }
+      this.#failEvidence(error)
+      throw error
+    }
+  }
+
+  async #applyEvidenceBatch(exact: readonly Uint8Array[], retained: boolean): Promise<void> {
+    this.#assertEvidenceReady()
+    const selected = this.#options.historyPolicy
+    if (selected?.kind !== 'coordinated') throw new Error('NODE_HISTORY_POLICY_MISMATCH')
+    // Raw immutable retention conveys no trust. Finish it before advancing the
+    // verified provider, so a failed append cannot expose an unretained frontier.
+    // Shared batches already crossed this durable boundary in the transport.
+    if (!retained) await this.#options.transport.putEvidenceBatch?.(exact)
+    for (const bytes of exact) {
+      try { await selected.policy.ingestEvidence(bytes) }
+      catch (error) {
+        // Unrelated or forged shared bytes cannot poison later valid proofs in
+        // the same committed page. Persistence/equivocation failures still stop
+        // the batch and never acknowledge an unfinished application publication.
+        if (retained && error instanceof Error && /^(ORDERING_EVIDENCE_INVALID|HISTORY_(ID_MISMATCH|ID_INVALID|HASH_INVALID|POSITION_INVALID|POSITION_CONFLICT|CERTIFICATE_CONFIGURATION_MISMATCH|CERTIFICATE_SIGNATURE_INVALID)|ORDERED_RECORD_(BYTES_INVALID|TOO_LARGE|DIGEST_MISMATCH|ROOT_MISMATCH))$/u.test(error.message)) continue
+        throw error
+      }
+    }
+    const snapshot = selected.policy.snapshot()
+    // Exact replays and open receipt growth do not change an applied closed
+    // prefix. Pending bodies, keys or publication failures still need repair.
+    if (!this.#materializationPending && snapshot.closedReceiptThrough === this.#coordinatedAppliedThrough &&
+        snapshot.closedThroughMs === this.#appliedClosedThroughMs) return
+    this.#materializationPending = true
+    await this.#reconcileMaterializer()
   }
 
   async #processCoordinatedHistory(): Promise<void> {
@@ -1035,7 +1081,7 @@ export class ChronologNode {
   }
 
   async status(): Promise<NodeStatus> {
-    const error = this.#lastError ?? this.#materializationError ?? this.#ingestionError
+    const error = this.#evidenceError ?? this.#lastError ?? this.#materializationError ?? this.#ingestionError
     const candidates = this.#control.listCandidates()
     const status: NodeStatus = {
       historyPolicy: this.historyPolicy, finalOrderLength: this.finalOrderLength, finalRevision: this.finalRevision,
@@ -1076,9 +1122,10 @@ export class ChronologNode {
   }
 
   async waitForIdle(): Promise<void> {
+    this.#assertEvidenceReady()
     if (this.historyPolicy === 'coordinated') {
-      for (const evidence of await this.#options.transport.evidenceHistory?.() ?? []) {
-        await this.#ingestSharedEvidence(evidence.bytes)
+      for await (const batch of this.#options.transport.evidenceHistory?.(this.#abort.signal) ?? []) {
+        await this.#ingestSharedEvidenceBatch(batch)
       }
     }
     await this.#mutex.run(async () => {
@@ -1098,7 +1145,7 @@ export class ChronologNode {
     await this.#consumeTask?.catch(() => {})
     await this.#evidenceTask?.catch(() => {})
     await this.#mutex.run(async () => {
-      if (!this.#materializationPending) return
+      if (!this.#materializationPending || this.#evidenceError !== undefined) return
       try { await this.#reconcileMaterializer() } catch (error) { this.#recordError(error) }
     })
     this.#control.flush()
@@ -1427,6 +1474,7 @@ export class ChronologNode {
   }
 
   async #reconcileMaterializer(): Promise<void> {
+    this.#assertEvidenceReady()
     if (!this.#materializationReady) return
     const beforeLocal = this.materializedRevision, beforeFinal = this.finalRevision
     try {
@@ -1548,12 +1596,12 @@ export class ChronologNode {
   }
 
   #scheduleMaterialization(): void {
-    if (this.#closed || !this.#materializationReady || !this.#materializationPending) return
+    if (this.#closed || this.#evidenceError !== undefined || !this.#materializationReady || !this.#materializationPending) return
     if (this.#materializationDebounceTimer) clearTimeout(this.#materializationDebounceTimer)
     this.#materializationDebounceTimer = setTimeout(() => {
       this.#materializationDebounceTimer = undefined
       void this.#mutex.run(async () => {
-        if (this.#closed || !this.#materializationPending) return
+        if (this.#closed || this.#evidenceError !== undefined || !this.#materializationPending) return
         try {
           await this.#reconcileMaterializer()
         } catch (error) {
@@ -1566,13 +1614,13 @@ export class ChronologNode {
   }
 
   #scheduleMaterializationRetry(): void {
-    if (this.#closed || !this.#materializationPending || this.#materializationRetryTimer) return
+    if (this.#closed || this.#evidenceError !== undefined || !this.#materializationPending || this.#materializationRetryTimer) return
     const delay = this.#materializationRetryMs
     this.#materializationRetryMs = Math.min(this.#materializationRetryMs * 2, 5_000)
     this.#materializationRetryTimer = setTimeout(() => {
       this.#materializationRetryTimer = undefined
       void this.#mutex.run(async () => {
-        if (this.#closed || !this.#materializationPending) return
+        if (this.#closed || this.#evidenceError !== undefined || !this.#materializationPending) return
         try {
           await this.#reconcileMaterializer()
         } catch (error) {
@@ -1636,6 +1684,17 @@ export class ChronologNode {
     if (error instanceof MaterializationProgressError) this.#materializationError = error
     else this.#lastError = error
     this.#emit('error', undefined, error)
+  }
+
+  #failEvidence(value: unknown): void {
+    if (this.#evidenceError !== undefined) return
+    const cause = value instanceof Error ? value : new Error(String(value))
+    this.#evidenceError = new Error(`NODE_EVIDENCE_REOPEN_REQUIRED: ${cause.message}`, { cause })
+    this.#recordError(this.#evidenceError)
+  }
+
+  #assertEvidenceReady(): void {
+    if (this.#evidenceError !== undefined) throw this.#evidenceError
   }
 
   #recordIngestionError(value: unknown): void {
@@ -1973,6 +2032,7 @@ export class ChronologNode {
   #assertReady(): void {
     if (!this.#started) throw new Error('NODE_NOT_STARTED')
     if (this.#closed) throw new Error('NODE_CLOSED')
+    this.#assertEvidenceReady()
     if (this.#feedForks.quarantined()) throw new Error('NODE_FEED_FORK_QUARANTINED')
   }
 }

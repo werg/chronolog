@@ -2,11 +2,12 @@ import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { createFeedRecord, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from './feed-codec.js'
 import { DurableFeedStore, type AtomicBytesStore } from './store.js'
 import { payloadHash } from './payload.js'
+import { captureEvidenceBatch, MAX_EVIDENCE_BATCH_BYTES, MAX_EVIDENCE_BATCH_SIZE } from './types.js'
 
 const directories: string[] = []
 afterEach(async () => { await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -36,6 +37,56 @@ async function fixture() {
 }
 
 describe('durable portable feed store', () => {
+  it('publishes one manifest for a page and deduplicates repeated objects within it', async () => {
+    const { bytes } = await fixture(), store = await DurableFeedStore.open(bytes, webFeedCrypto)
+    const write = vi.spyOn(bytes, 'put')
+    const first = Uint8Array.of(1), second = Uint8Array.of(2)
+    const result = await store.putEvidenceBatch([first, first, second])
+    expect(result.map(item => [item.kind, item.index])).toEqual([['appended', 1n], ['duplicate', 1n], ['appended', 2n]])
+    expect(write.mock.calls.filter(([key]) => key === 'feed/manifest')).toHaveLength(1)
+    write.mockClear()
+    expect((await store.putEvidenceBatch([second, first])).every(item => item.kind === 'duplicate')).toBe(true)
+    expect(write).not.toHaveBeenCalled()
+    await store.close()
+    const reopened = await DurableFeedStore.open(bytes, webFeedCrypto)
+    expect(reopened.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([first, second])
+    await reopened.close()
+  })
+
+  it.each(['object', 'manifest', 'acknowledgement'] as const)('keeps a failed %s batch invisible until durable reopen and exact repair', async failure => {
+    const { bytes } = await fixture(), store = await DurableFeedStore.open(bytes, webFeedCrypto)
+    await store.putEvidence(Uint8Array.of(0))
+    const put = bytes.put.bind(bytes)
+    const write = vi.spyOn(bytes, 'put').mockImplementation(async (key, value) => {
+      if (failure === 'object' && key.startsWith('feed/object/') && value[0] === 2 || failure === 'manifest' && key === 'feed/manifest') {
+        throw new Error('batch publication interrupted')
+      }
+      await put(key, value)
+      if (failure === 'acknowledgement' && key === 'feed/manifest') throw new Error('batch publication interrupted')
+    })
+    const page = [Uint8Array.of(1), Uint8Array.of(2)]
+    await expect(store.putEvidenceBatch(page)).rejects.toThrow('batch publication interrupted')
+    expect(store.evidenceHead()).toBe(1n)
+    expect(store.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([Uint8Array.of(0)])
+    await expect(store.putEvidence(Uint8Array.of(3))).rejects.toThrow('FEED_STORE_REOPEN_REQUIRED')
+    await store.close(); write.mockRestore()
+    const reopened = await DurableFeedStore.open(bytes, webFeedCrypto)
+    expect(reopened.evidenceHead()).toBe(failure === 'acknowledgement' ? 3n : 1n)
+    const repaired = await reopened.putEvidenceBatch(page)
+    expect(repaired.map(item => item.index)).toEqual([2n, 3n])
+    expect(repaired.every(item => item.kind === (failure === 'acknowledgement' ? 'duplicate' : 'appended'))).toBe(true)
+    expect(reopened.evidenceAfter(0n, 64).map(item => item.evidence.bytes)).toEqual([Uint8Array.of(0), ...page])
+    await reopened.close()
+  })
+
+  it('rejects count and aggregate-byte overflow before copying or persisting any proof', () => {
+    const object = new Uint8Array(Math.floor(MAX_EVIDENCE_BATCH_BYTES / MAX_EVIDENCE_BATCH_SIZE) + 1)
+    const copy = vi.spyOn(object, 'slice')
+    expect(() => captureEvidenceBatch(Array.from({ length: MAX_EVIDENCE_BATCH_SIZE }, () => object))).toThrow('FEED_EVIDENCE_BATCH_TOO_LARGE')
+    expect(() => captureEvidenceBatch(Array.from({ length: MAX_EVIDENCE_BATCH_SIZE + 1 }, () => Uint8Array.of(1)))).toThrow('FEED_EVIDENCE_BATCH_INVALID')
+    expect(copy).not.toHaveBeenCalled()
+  })
+
   it('retains detached payloads by hash without adding a feed or ledger entry', async () => {
     const { bytes, signer } = await fixture()
     let store = await DurableFeedStore.open(bytes, webFeedCrypto)

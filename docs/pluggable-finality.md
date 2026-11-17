@@ -123,6 +123,54 @@ The provider is pinned for a continuing group. Automatic provider replacement,
 validator-set reconfiguration and authority failover are not introduced here.
 This is a pre-release format change; there is no old-prefix-only finality fallback.
 
+## Retained evidence and application publication
+
+Evidence storage is an untrusted, content-addressed input log. It can contain
+unrelated or malformed peer bytes; only the selected verifier can advance trusted
+inclusion and closure state. When an evidence transport is configured, direct
+node ingestion first durably retains the raw input, then asks the provider to
+verify and retain its trusted state. Failed raw retention therefore cannot
+advance the provider's frontier. A manually driven node without an evidence
+transport relies on the provider's own durable store. A provider whose durable
+write has an uncertain outcome must fence further progress until reopen.
+
+The transport exposes two bounded streams:
+
+- `evidenceHistory(signal?)` captures the retained head and yields
+  `EvidenceBatch` values through that finite position.
+- `subscribeEvidenceBatches(signal?)` yields retained evidence and then waits for
+  later commits. It does not wait to fill a batch before delivering live evidence.
+
+These streams partition a captured retained prefix into bounded batches; they
+need not preserve the original network page or write-call boundaries.
+
+`putEvidenceBatch(bytes)` publishes its local storage changes atomically, after
+all immutable objects and the manifest or database transaction are durable. A
+batch contains at most 64 inputs and 64 MiB of input bytes. The singleton
+`putEvidence(bytes)` uses the same path. A received network page advances its
+delivery cursor only after the batch commit; an interrupted attempt can retry
+the same exact bytes. An unrelated feed notification cannot expose part of an
+in-flight batch.
+
+The node verifies each retained proof, ignores individually invalid shared
+inputs, and reconciles the application once per batch. Unexpected verification
+or storage failure in a shared batch stops the consumer and fences further
+application progress with `NODE_EVIDENCE_REOPEN_REQUIRED`. The last coherent
+view remains readable; reopen replays the retained batch without skipping its
+unfinished tail. A fully verified batch whose materialization is blocked by
+missing proposal bodies or keys uses the existing derived-view retry path.
+Startup, explicit idle barriers and the live consumer use this same bounded path,
+so a new replica
+can replay many historical closures without reopening and publishing the SQL
+readers after each one. Direct `ingestFinalityEvidence(bytes)` delegates to a
+single-element `ingestFinalityEvidenceBatch(bytes)` and retains its immediate
+reconciliation behavior.
+
+These are local storage and publication boundaries. They do not combine
+application programs into a transaction, make invalid proof valid, change
+ordering, or confer authority on the transmitting peer. A published view remains
+one coherent application prefix under the original proof rules.
+
 ## Fixed-validator closure and partial admission
 
 A validator's signed heartbeat promises that its subsequent feed will contain

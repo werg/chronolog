@@ -206,6 +206,14 @@ Each author has an append-only, hash-chained **feed** of signed records
 record store also retains content-addressed immutable evidence. Certificates
 do not need a mutable author feed or consume its sequence numbers.
 
+Evidence pages become visible only after one durable batch commit. Retained
+replay captures a finite head and delivers bounded batches; the node verifies
+their proofs before reconciling the application once per batch. This avoids
+publishing every historical SQL revision during catch-up without changing
+transaction atomicity or finality. The [retention and publication
+contract](pluggable-finality.md#retained-evidence-and-application-publication)
+defines bounds, cancellation and failure behavior.
+
 The native adapter uses SQLite; the browser runtime supplies durable OPFS
 stores. A signed feed record is appended only if it is the next one of its
 feed, so feeds have no gaps; a second record at an existing

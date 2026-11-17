@@ -202,7 +202,9 @@ describe('owned governed peer composition', () => {
     await expect(sender!.signals.send('durable-chat', true)).rejects.toThrow('signal_unauthorized')
     for (const transport of transports) {
       expect(await transport.history()).toEqual([])
-      expect(await transport.evidenceHistory()).toEqual([])
+      let evidenceCount = 0
+      for await (const batch of transport.evidenceHistory()) evidenceCount += batch.length
+      expect(evidenceCount).toBe(0)
     }
     await iterator.return?.()
   })

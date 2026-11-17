@@ -18,7 +18,8 @@ import {
   FeedStore,
   type FeedKeys,
 } from './feed-store.js'
-import { consumeFeed, decodeBase64, pullFeedLink, validatePayloadHash, verifyPayloadHash, type FeedLink } from '@chronolog/records'
+import { captureEvidenceBatch, consumeFeed, decodeBase64, MAX_EVIDENCE_BATCH_BYTES, MAX_EVIDENCE_BATCH_SIZE, pullFeedLink,
+  readEvidenceBatches, readEvidencePage, validatePayloadHash, verifyPayloadHash, type EvidenceBatch, type FeedLink } from '@chronolog/records'
 import type { ChronologTransport, ImmutableEvidence, PublishOptions, TransportRecord, TransportStatus } from './types.js'
 
 const require = createRequire(import.meta.url)
@@ -56,7 +57,7 @@ type PullSource<T> = (end: PullEnd, callback: (end: PullEnd, value?: T) => void)
 
 interface Rpc {
   readonly id?: string
-  readonly chronologFeeds?: { history(options: HistoryRequest): PullSource<string>; objects?(options: { after: string }): PullSource<string> }
+  readonly chronologFeeds?: { history(options: HistoryRequest): PullSource<string>; objects?(options: { after: string }): PullSource<readonly string[]> }
   on?(event: string, callback: () => void): void
   close?(error?: Error | boolean, callback?: () => void): void
 }
@@ -128,6 +129,7 @@ export class FeedTransport implements ChronologTransport {
   /** Incremented on every stored change; lets readers wait without losing a wakeup. */
   #version = 0
   #closed = false
+  readonly #lifetime = new AbortController()
 
   private constructor(server: Server, store: FeedStore, keys: FeedKeys, maxRecordBytes: number) {
     this.#server = server
@@ -161,7 +163,7 @@ export class FeedTransport implements ChronologTransport {
             if (ready.transport === undefined) return (_end, callback) => callback(new Error('FEED_TRANSPORT_STARTING'))
             return ready.transport.#historySource(request)
           },
-          objects: (request: { after: string }): PullSource<string> => {
+          objects: (request: { after: string }): PullSource<readonly string[]> => {
             if (ready.transport === undefined) return (_end, callback) => callback(new Error('FEED_TRANSPORT_STARTING'))
             return ready.transport.#evidenceSource(request)
           },
@@ -358,7 +360,7 @@ export class FeedTransport implements ChronologTransport {
       },
       readEvidence: async (after, limit) => {
         range(after, limit)
-        return this.#store.evidenceAfter(after, limit).map(({ evidence }) => evidence.bytes.slice())
+        return (await readEvidencePage(this.#store, after, limit, this.#lifetime.signal)).map(({ evidence }) => evidence.bytes)
       },
       readPayload: async (hash) => this.#store.getPayload(hash),
       async *watch(signal) {
@@ -398,30 +400,37 @@ export class FeedTransport implements ChronologTransport {
   }
 
   async putEvidence(bytes: Uint8Array): Promise<ImmutableEvidence> {
-    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
-    const result = this.#store.putEvidence(bytes)
-    if (result.kind === 'appended') this.#notify()
-    return result.evidence
+    return (await this.putEvidenceBatch([bytes]))[0]!
   }
 
-  async evidenceHistory(): Promise<readonly ImmutableEvidence[]> {
-    const result: ImmutableEvidence[] = []
-    let after = 0n
-    for (;;) {
-      const batch = this.#store.evidenceAfter(after, 256)
-      if (batch.length === 0) return result
-      result.push(...batch.map((entry) => entry.evidence))
-      after = batch.at(-1)!.index
+  async putEvidenceBatch(bytes: readonly Uint8Array[]): Promise<EvidenceBatch> {
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const result = this.#store.putEvidenceBatch(bytes)
+    if (result.some(item => item.kind === 'appended')) this.#notify()
+    return result.map(item => item.evidence)
+  }
+
+  async *evidenceHistory(signal?: AbortSignal): AsyncIterable<EvidenceBatch> {
+    if (this.#closed) throw new Error('FEED_TRANSPORT_CLOSED')
+    const lifetime = signal === undefined ? this.#lifetime.signal : AbortSignal.any([signal, this.#lifetime.signal])
+    for await (const batch of readEvidenceBatches(this.#store, { signal: lifetime })) {
+      if (lifetime.aborted) return
+      yield batch
     }
   }
 
-  async *subscribeEvidence(signal?: AbortSignal): AsyncIterable<ImmutableEvidence> {
-    let after = 0n
-    while (!this.#closed && !signal?.aborted) {
+  subscribeEvidenceBatches(signal?: AbortSignal): AsyncIterable<EvidenceBatch> { return this.#evidenceBatches(0n, signal) }
+
+  async *#evidenceBatches(after: bigint, signal?: AbortSignal): AsyncIterable<EvidenceBatch> {
+    const lifetime = signal === undefined ? this.#lifetime.signal : AbortSignal.any([signal, this.#lifetime.signal])
+    while (!lifetime.aborted) {
       const version = this.#version
-      const batch = this.#store.evidenceAfter(after, 256)
-      for (const entry of batch) { after = entry.index; yield entry.evidence }
-      if (batch.length < 256) await this.#waitForChange(version, signal)
+      for await (const batch of readEvidenceBatches(this.#store, { after, signal: lifetime })) {
+        if (lifetime.aborted) return
+        after += BigInt(batch.length)
+        yield batch
+      }
+      await this.#waitForChange(version, lifetime)
     }
   }
 
@@ -461,6 +470,7 @@ export class FeedTransport implements ChronologTransport {
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true
+    this.#lifetime.abort()
     if (this.#reconnectTimer !== undefined) clearInterval(this.#reconnectTimer)
     for (const streams of this.#streams.values()) for (const stop of streams.values()) stop()
     this.#streams.clear()
@@ -561,16 +571,16 @@ export class FeedTransport implements ChronologTransport {
     if (this.#closed || streams === undefined || streams.has(key) || rpc.chronologFeeds?.objects === undefined) return
     const controller = new AbortController()
     let stopped = false
-    let source: PullSource<string>
+    let source: PullSource<readonly string[]>
     try { source = rpc.chronologFeeds.objects({ after: after.toString(10) }) } catch (error) {
       this.#setStreamError(rpc, key, error)
       return
     }
     streams.set(key, () => { stopped = true; controller.abort(); streams.delete(key) })
     void (async () => {
-      for await (const raw of pullRecords(source, controller.signal)) {
-        await this.putEvidence(raw)
-        after += 1n
+      for await (const batch of pullEvidenceBatches(source, controller.signal)) {
+        await this.putEvidenceBatch(batch)
+        after += BigInt(batch.length)
         this.#clearStreamError(rpc, key)
       }
     })().catch((error: unknown) => { if (!stopped) this.#setStreamError(rpc, key, error) }).finally(() => {
@@ -619,13 +629,24 @@ export class FeedTransport implements ChronologTransport {
     return this.#rangeSource(cursor, (after) => this.#store.feedAfter(request.feed, after, HISTORY_BATCH))
   }
 
-  #evidenceSource(request: { after: string }): PullSource<string> {
+  #evidenceSource(request: { after: string }): PullSource<readonly string[]> {
     let cursor: bigint
     try { cursor = BigInt(request.after); if (cursor < 0n) throw new Error('invalid') } catch {
       return (_end, callback) => callback(new Error('FEED_HISTORY_REQUEST_INVALID'))
     }
-    return this.#rangeSource(cursor, (after) => this.#store.evidenceAfter(after, HISTORY_BATCH)
-      .map((entry) => ({ sequence: entry.index, raw: entry.evidence.bytes })))
+    const controller = new AbortController(), iterator = this.#evidenceBatches(cursor, controller.signal)[Symbol.asyncIterator]()
+    let ended = false
+    return (end, callback) => {
+      if (end) {
+        ended = true; controller.abort()
+        void iterator.return?.().catch(() => undefined)
+        callback(end); return
+      }
+      void iterator.next().then(next => {
+        if (ended || next.done) callback(true)
+        else callback(null, next.value.map(item => Buffer.from(item.bytes).toString('base64')))
+      }, (error: unknown) => { callback(error instanceof Error ? error : new Error(String(error))) })
+    }
   }
 
   #rangeSource(cursor: bigint, read: (after: bigint) => readonly { readonly sequence: bigint; readonly raw: Uint8Array }[]): PullSource<string> {
@@ -769,9 +790,30 @@ function errorMessage(error: unknown): string {
 
 /** Adapt SSB pull callbacks to the portable authenticated record consumer. */
 async function* pullRecords(source: PullSource<string>, signal: AbortSignal): AsyncIterable<Uint8Array> {
+  for await (const value of pullValues(source, signal)) {
+    if (typeof value !== 'string') throw new FeedRecordError('FEED_RECORD_MALFORMED')
+    yield decodeBase64(value)
+  }
+}
+
+async function* pullEvidenceBatches(source: PullSource<readonly string[]>, signal: AbortSignal): AsyncIterable<readonly Uint8Array[]> {
+  for await (const value of pullValues(source, signal)) {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_EVIDENCE_BATCH_SIZE) throw new Error('FEED_EVIDENCE_BATCH_INVALID')
+    const encoded: readonly string[] = value
+    let encodedBytes = 0
+    for (const item of encoded) {
+      if (typeof item !== 'string') throw new Error('FEED_EVIDENCE_BATCH_INVALID')
+      encodedBytes += item.length
+      if (encodedBytes > 4 * Math.ceil(MAX_EVIDENCE_BATCH_BYTES / 3) + 4 * MAX_EVIDENCE_BATCH_SIZE) throw new Error('FEED_EVIDENCE_BATCH_TOO_LARGE')
+    }
+    yield captureEvidenceBatch(encoded.map(item => decodeBase64(item)))
+  }
+}
+
+async function* pullValues<T>(source: PullSource<T>, signal: AbortSignal): AsyncIterable<T> {
   try {
     while (!signal.aborted) {
-      const next = await new Promise<{ readonly ended: true } | { readonly ended: false; readonly value: string }>((resolve, reject) => {
+      const next = await new Promise<{ readonly ended: true } | { readonly ended: false; readonly value: T }>((resolve, reject) => {
         let settled = false
         const abort = (): void => {
           if (settled) return
@@ -786,13 +828,13 @@ async function* pullRecords(source: PullSource<string>, signal: AbortSignal): As
           signal.removeEventListener('abort', abort)
           if (end instanceof Error) reject(end)
           else if (end === true) resolve({ ended: true })
-          else if (typeof value !== 'string') reject(new FeedRecordError('FEED_RECORD_MALFORMED'))
+          else if (value === undefined) reject(new FeedRecordError('FEED_RECORD_MALFORMED'))
           else resolve({ ended: false, value })
         })
         if (signal.aborted) abort()
       })
       if (next.ended) return
-      yield decodeBase64(next.value)
+      yield next.value
     }
   } finally { source(true, () => {}) }
 }

@@ -321,7 +321,9 @@ describe('authenticated framed range synchronization', () => {
     await Promise.all([native.catchUpLinks(), browser.transport.catchUp()])
     expect((await native.get(browserRecord.id))?.payload).toEqual(browserRecord.payload)
     expect((await browser.transport.get(nativeRecord.id))?.payload).toEqual(nativeRecord.payload)
-    expect((await browser.transport.evidenceHistory()).map((evidence) => evidence.bytes)).toContainEqual(utf8('portable certificate bytes'))
+    const retainedProofs: Uint8Array[] = []
+    for await (const batch of browser.transport.evidenceHistory()) retainedProofs.push(...batch.map(evidence => evidence.bytes))
+    expect(retainedProofs).toContainEqual(utf8('portable certificate bytes'))
     expect((await native.status()).peers).toContain(browser.transport.identity)
     let entered!: () => void, release!: (through: bigint) => void
     const waiting = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<bigint>(resolve => { release = resolve })

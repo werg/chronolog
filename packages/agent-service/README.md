@@ -470,6 +470,14 @@ advertises a prefix but cannot supply it fails that pass. If its connection is
 closed or replaced, that pass reports cancellation even when a replacement is
 healthy. Application materialization and final-target checks remain separate.
 
+Evidence pages commit atomically to local storage and are consumed in bounded
+batches: at most 64 proofs and 64 MiB per batch. `evidenceHistory(signal?)` is a
+finite async iterable of batches; `subscribeEvidenceBatches(signal?)` also follows
+later commits. The node verifies every proof and reconciles once per batch, so
+historical catch-up need not publish every intermediate SQL revision. The node's
+`waitForIdle()` drains a captured retained prefix through this same path. A batch
+does not change program atomicity, proof validity, or the selected finality rules.
+
 `readPayload(hash)` requests one detached application envelope by its SHA-256
 address. Header/evidence synchronization does not request these bodies. The
 provider and receiver both check the address and the 1 MiB envelope bound, and
