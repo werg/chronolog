@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { DOMAINS } from '@chronolog/protocol'
 import {
-  createGenerationRegistry, createPeerIdentity, generationStartRoot, peerDigest,
+  controlParticipantGrant, createGenerationRegistry, createPeerIdentity, generationStartRoot, participantGrant, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, verifyAuthorityBundle,
   type AuthorityBundle, type OrderReceipt, type PeerIdentity, type PrefixProof, type SignedGeneration,
 } from './control.js'
@@ -17,7 +17,7 @@ async function fixture() {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: digest, recoveryFloor: null,
     grants: [a, b, c, writer].map(key => ({ publicKey: key.publicKey, reader: true, writer: true,
-      coordinator: key !== writer, recovery: key !== writer, administrator: key === a })) }, host)
+      coordinator: key !== writer, recovery: key !== writer, administrator: key === a, dataRole: 'member' as const })) }, host)
   const store = new MemoryPeerStore()
   const registry = await createGenerationRegistry({ store, descriptor, controls: [control], signer: host })
   const transition = async (who: PeerIdentity, coordinator: PeerIdentity, expected: string | null, base: PrefixProof | null, id: string, reason: 'create' | 'takeover' | 'control-change' = 'takeover', revision = 0) => signTransitionRequest({
@@ -47,6 +47,21 @@ function proof(receipt: OrderReceipt, bridge: readonly OrderReceipt[] = []): Pre
 }
 
 describe('portable peer generation authority', () => {
+  it('recovers through an explicit control participant without creator or data authority', async () => {
+    const f = await fixture()
+    const control = await signControlRevision({ ...f.control.payload,
+      grants: [controlParticipantGrant(f.host.publicKey), participantGrant(f.a.publicKey), participantGrant(f.b.publicKey)],
+    }, f.host)
+    const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor: f.descriptor, controls: [control], signer: f.host })
+    const first = await registry.select(f.request)
+    const head = (await receipts(first, f.a, 1))[0]!
+    const next = await registry.select(await f.transition(f.host, f.b, first.id, proof(head), 'owner-recovery'))
+    expect(next.payload.coordinator).toBe(f.b.publicKey)
+    expect((await verifyAuthorityBundle(await registry.read())).grant(f.host.publicKey)).toMatchObject({
+      reader: false, writer: false, coordinator: false, recovery: true, administrator: true, dataRole: null,
+    })
+    await expect(registry.select(await f.transition(f.host, f.host, next.id, proof(head), 'host-is-not-a-peer'))).rejects.toThrow('PEER_COORDINATOR_FORBIDDEN')
+  })
   it('recovers lost replies exactly and allows one competing successor', async () => {
     const f = await fixture(), [head] = await receipts(f.g1, f.a, 1)
     const first = await f.transition(f.b, f.b, f.g1.id, proof(head!), 'second')

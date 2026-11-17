@@ -33,7 +33,7 @@ async function fixture() {
     executionManifestDigest: bytesToHex(artifacts.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: [a, b].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true })) }, host)
+    grants: [a, b].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true, dataRole: 'member' as const })) }, host)
   const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
   const select = async (identity: PeerIdentity, base: PrefixProof | null, transitionId: string) => {
     const bundle = await registry.read()

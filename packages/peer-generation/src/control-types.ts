@@ -37,6 +37,8 @@ export interface PeerGrant {
   readonly coordinator: boolean
   readonly recovery: boolean
   readonly administrator: boolean
+  /** Membership of the durable application data collective, independent of coordination. */
+  readonly dataRole: 'member' | 'admin' | null
 }
 export interface HistoryPoint {
   readonly generation: string
