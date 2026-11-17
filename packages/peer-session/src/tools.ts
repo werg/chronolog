@@ -51,7 +51,7 @@ export function createApplicationTools(session: ApplicationSession, options: { r
       }
       const fields = (...keys: string[]): void => { if (Object.keys(value).some(key => !keys.includes(key))) throw new Error('APPLICATION_TOOL_INPUT_INVALID') }
       const revision = (input: unknown): PeerRevision => {
-        const result = parseApplicationInput(revisionSchema, input) as unknown as PeerRevision
+        const result = parseApplicationInput(revisionSchema, input)
         if (result.applicationId !== session.applicationId || result.historyId !== session.historyId || result.point.generation !== result.generation) throw new Error('APPLICATION_TOOL_REVISION_INVALID')
         return result
       }
