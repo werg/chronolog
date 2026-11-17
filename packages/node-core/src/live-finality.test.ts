@@ -140,14 +140,19 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
 }
 
 describe('live chronological finality', () => {
-  it.each(['reconciliation', 'finality'] as const)('retains a coherent local view and author clock while %s retries', async stage => {
+  it.each(['publication', 'reconciliation', 'finality'] as const)('retains a coherent local view and author clock while %s retries', async stage => {
     const f = await fixture({ now: () => 10, maxFutureSkewMs: 1_000 })
     const local = f.node.changes({ view: 'local' })[Symbol.asyncIterator]()
     const initial = (await local.next()).value!
+    const publish = f.materialization.publications.publish.bind(f.materialization.publications)
     const reconcile = f.materialization.publications.reconcile.bind(f.materialization.publications)
     const publishFinal = f.materialization.coordinator.publishFinal!.bind(f.materialization.coordinator)
     const unavailable = () => Promise.reject(new Error('PUBLICATION_RETRY_REQUIRED'))
-    if (stage === 'reconciliation') f.materialization.publications.reconcile = unavailable
+    if (stage === 'publication') {
+      f.materialization.publications.publish = async input => { await publish(input); return unavailable() }
+      // Keep a later retry from repairing the clock before it is inspected.
+      f.materialization.publications.reconcile = unavailable
+    } else if (stage === 'reconciliation') f.materialization.publications.reconcile = unavailable
     else f.materialization.coordinator.publishFinal = unavailable
     try {
       const proposal = await f.candidate('published-local', 50n)
@@ -166,11 +171,50 @@ describe('live chronological finality', () => {
       const dependent = await f.node.publish({ operationId: 'dependent-during-retry', program: program(emit('changes', 'dependent')) })
       expect(dependent.core.authorTimestampMs).toBe(51n)
     } finally {
+      f.materialization.publications.publish = publish
       f.materialization.publications.reconcile = reconcile
       f.materialization.coordinator.publishFinal = publishFinal
       await local.return?.()
       await f.node.waitForIdle()
     }
+  })
+
+  it('allocates after the applied tail while its publication acknowledgement is still pending', async () => {
+    const f = await fixture({ now: () => 10, maxFutureSkewMs: 1_000 })
+    const publish = f.materialization.publications.publish.bind(f.materialization.publications)
+    let entered!: () => void, release!: () => void, prepared!: () => void
+    const blocked = new Promise<void>(resolve => { entered = resolve })
+    const resumed = new Promise<void>(resolve => { release = resolve })
+    const retained = new Promise<void>(resolve => { prepared = resolve })
+    f.materialization.publications.publish = async input => {
+      const result = await publish(input)
+      entered()
+      await resumed
+      return result
+    }
+    const transport = f.transports[4]!, append = transport.publish.bind(transport)
+    transport.publish = async (payload, options) => {
+      const record = await append(payload, options)
+      prepared()
+      return record
+    }
+    const proposal = await f.candidate('visible-before-ack', 50n)
+    const progress = f.node.waitForIdle()
+    let dependent: ReturnType<ChronologNode['publish']> | undefined
+    try {
+      await blocked
+      expect(f.node.outcome(proposal.txId)).toMatchObject({ outcome: 'accepted', orderKey: { authorTimestampMs: 50n } })
+      dependent = f.node.publish({ operationId: 'dependent-before-ack', program: program(emit('changes', 'dependent')) })
+      // The exact signed reservation is retained before allowing the older
+      // publication to acknowledge or ingestion to acquire the node mutex.
+      await retained
+    } finally {
+      release()
+      await progress
+      f.materialization.publications.publish = publish
+      transport.publish = append
+    }
+    expect((await dependent).core.authorTimestampMs).toBe(51n)
   })
 
   it('removes an excluded preview before publishing final rejection or finalizing a later proposal', async () => {

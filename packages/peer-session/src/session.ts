@@ -78,7 +78,7 @@ export class ApplicationOperation {
 type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
 type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
 type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
-interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void> }
+interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void>; readonly link: { close(): void | Promise<void> } }
 
 
 /** The application-facing owner: one peer journal, coherent views and explicit recovery. */
@@ -254,8 +254,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#assertOpen()
     if (!currentReader(this.#replica, peerId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
     if (this.#peers.size >= 8 && !this.#peers.has(peerId)) throw new Error('APPLICATION_PEER_LIMIT')
-    const endpoint = { submit }
+    const previous = this.#peers.get(peerId), endpoint = { submit, link }
     this.#peers.set(peerId, endpoint); this.#links.add(link)
+    if (previous !== undefined && previous.link !== link) {
+      try { void Promise.resolve(previous.link.close()).catch(() => undefined) } catch { /* The previous endpoint is already replaced. */ }
+    }
     return () => { if (this.#peers.get(peerId) === endpoint) this.#peers.delete(peerId); this.#links.delete(link) }
   }
 
@@ -317,7 +320,7 @@ export async function connectApplications(left: ApplicationSession, right: Appli
         assertOpen()
         await coordinator.observeCoverage(followerCoverage)
         assertOpen()
-        const coordinatorCoverage = await coordinator.retainedCoverage()
+        const coordinatorCoverage = await coordinator.retainedCoverage(followerCoverage.payload.point)
         assertOpen()
         await follower.observeCoverage(coordinatorCoverage)
       }
@@ -352,6 +355,8 @@ export async function connectApplications(left: ApplicationSession, right: Appli
       if (current !== priorB) { priorB = current; void synchronize().catch(() => { link.close() }) }
     })
     await synchronize()
+    detachA = left.attachPeer(right.deviceId, submit(a.replica, b.replica), link)
+    detachB = right.attachPeer(left.deviceId, submit(b.replica, a.replica), link)
     contentA = a.content.attachSource(right.deviceId, {
       manifest: async reference => { assertOpen(); const value = await b.content.serveManifest(left.deviceId, reference); assertOpen(); return value },
       chunk: async (reference, index) => { assertOpen(); const value = await b.content.serveChunk(left.deviceId, reference, index); assertOpen(); return value },
@@ -364,8 +369,6 @@ export async function connectApplications(left: ApplicationSession, right: Appli
       retained: async reference => { assertOpen(); const value = await a.content.retained(reference); assertOpen(); return value },
       observeRetention: async receipt => { assertOpen(); await a.content.observeRetention(receipt); assertOpen() },
     })
-    detachA = left.attachPeer(right.deviceId, submit(a.replica, b.replica), link)
-    detachB = right.attachPeer(left.deviceId, submit(b.replica, a.replica), link)
     await Promise.all([left.resume(), right.resume()])
     return link
   } catch (error) { link.close(); throw error }

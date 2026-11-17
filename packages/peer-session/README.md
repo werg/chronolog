@@ -68,6 +68,8 @@ Cancelling `applied({ signal })` cancels that waiter only.
 attempt, preserving real signer provenance. `operation.retry()` reuses those
 bytes. `onRecovery()` and `changes()` report coherent generation transitions.
 A stale event cursor throws `RecoveredViewError`; reread the new view explicitly.
+Recovery notices keep `unknownLoss: true` even when they list known abandoned
+work: the selected prefix does not certify the former coordinator's last head.
 
 After inspecting abandoned work, call
 `reapply(oldId, name, currentArguments, { operationId: newId, basedOn })`. This
@@ -78,6 +80,9 @@ work from another signer. Current permissions and domain guards still apply.
 `operation.shared()` observes independently retained complete coverage. It is
 separate from `applied()` and does not block ordinary commands. A retained copy
 is not a claim that its peer is currently reachable.
+Coverage retains one strongest claim per current reader identity, so changing
+storage IDs cannot count one signer as several independent peers. Recovery
+clears those claims; the new generation needs fresh retention acknowledgments.
 
 `connectApplications(a, b)` is a built-in in-process transport for embedded peers
 and independent-store qualification. It carries commands, verified history,
@@ -99,6 +104,26 @@ signed challenge handshake, bounded requests, captured history ranges and
 retention acknowledgments over a framed reliable connection. Its optional live
 lane carries disposable signed signals independently. Each side must call this
 function; close or cancellation fences pending responses.
+
+`connection.synchronize()` finishes one captured prefix. Later change hints
+coalesce into a separate pass, so a continuously writing coordinator cannot
+extend an earlier wait indefinitely. Ranges contain at most 32 commands and
+fit the 1 MiB frame limit; verified pages are retained before requesting the
+next page. The replica's configured record and history-byte quotas bound the
+complete history. There is no smaller whole-history network buffer limit.
+The selected view is published only after the captured root is available, and
+the retention acknowledgment names that captured prefix. If recovery excludes
+the captured generation during transfer, the pass fails explicitly; reconnect
+or synchronize against the newly selected history. The lower-level replica
+accepts command arrays or an async iterable of bounded command pages through
+`synchronize(authority, commands, { at: capturedRevision })`.
+
+A congested live lane refuses the current send without queuing it or closing
+the reliable connection. Ending that lane retires its live route. A dispatched
+write that ignores cancellation retires the physical connection, preventing
+late work from surviving into its replacement. Connecting the same authenticated
+peer again closes its previous connection. Signal sends always use routes
+available when that attempt began; reconnecting never replays missed signals.
 
 The `/webrtc` entry provides `connectApplicationWebRtc(session, options)` for a
 runtime with a usable RTC factory. The optional `/webrtc-native` entry supplies

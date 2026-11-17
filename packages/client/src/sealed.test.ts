@@ -8,7 +8,7 @@ import { encodeSealedEnvelope, utf8, type SealedEnvelope, type SealedPlatformOp 
 import type { TransactionOutcome } from '@chronolog/rpc'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { LocalSqlQueryResponse, TransactionHandle, TransactionStepInput } from './client.js'
+import type { LocalSqlQueryResponse, QueryOptions, TransactionHandle, TransactionStepInput } from './client.js'
 import type { DecodedLocalSqlValue } from './local-sql.js'
 import { SealedDataActions, SealedPolicyNotFinalError, SealedVersionConflictError } from './sealed.js'
 
@@ -141,6 +141,31 @@ describe('sealed client helpers', () => {
     const change = await actions.put(bytes(2), 'body', utf8('final coordinated policy'))
     expect(change.context.policyVersion).toBe(1n)
     expect(client.transaction).toHaveBeenCalledOnce()
+  })
+
+  it('rejects a pending local audience change instead of encrypting to the older final audience', async () => {
+    const reader = await generateX25519KeyPair()
+    const { actions, state, client } = fixture(reader.publicKeyBytes)
+    state.policyVersion = 2n
+    state.final = false
+    const query = client.query.getMockImplementation()!
+    client.query.mockImplementation(async (sql, parameters, options) => {
+      if (sql.includes('FROM chronolog_reader_policies') && (options as QueryOptions | undefined)?.view !== 'local') {
+        return result([[bytes(2), 'notes', 'rk1:opaque', 1n, utf8('older-final-policy'), null, bytes(4), reader.publicKeyBytes]])
+      }
+      return query(sql, parameters, options)
+    })
+    const outcome = client.getTransactionOutcome.getMockImplementation()!
+    client.getTransactionOutcome.mockImplementation(async (transactionId) => {
+      const observed = await outcome(transactionId)
+      return { ...observed, final: transactionId === 'older-final-policy' }
+    })
+    const seal = vi.spyOn(sealedCrypto, 'sealSealedValue')
+    await expect(actions.put(bytes(2), 'body', utf8('do not disclose to the older audience')))
+      .rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL', transactionId: 'policy-tx-id' })
+    expect(client.query.mock.calls.every((call) => (call[2] as QueryOptions).view === 'local')).toBe(true)
+    expect(seal).not.toHaveBeenCalled()
+    expect(client.transaction).not.toHaveBeenCalled()
   })
 
   it('encrypts only the explicit reader snapshot, with an explicit provisional override for development', async () => {

@@ -394,14 +394,20 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       // Live transports must honor cancellation before dispatch. Bound a stuck
       // implementation too; data already handed to the network is not recallable.
       const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
+      let settled = false
       try {
-        const result = await interruptible(live.trySend(outgoing, { signal }), signal)
+        const dispatch = (async () => live.trySend(outgoing, { signal }))().finally(() => { settled = true })
+        const result = await interruptible(dispatch, signal)
         if (typeof result !== 'boolean') throw new Error('PEER_SIGNAL_DISPATCH_RESULT_INVALID')
         return result
       }
       catch (error) {
         if (controller.signal.aborted) throw failure ?? controller.signal.reason
-        if (!signal.aborted) fail(error)
+        // Keep the physical owner accountable when caller cancellation races a
+        // transport that has not settled. Cooperative cancellation gets one turn.
+        if (signal.aborted && !settled) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+        if (controller.signal.aborted) throw failure ?? controller.signal.reason
+        if (!signal.aborted || !settled) fail(error)
         throw error
       }
       finally { clearTimeout(timer) }

@@ -75,9 +75,9 @@ const created = await alice.sealed.setReaders({
 })
 await requireFinalAcceptance(created.handle)
 
-// The helper above waits for the applied final policy. put() reads that final
-// view and checks its final accepted outcome before encrypting for its readers.
-// A concurrent audience change still requires reviewing the intended audience.
+// The helper above waits for the applied final policy. put() rechecks the
+// current local policy and requires its final acceptance before encrypting.
+// A pending audience change must be reviewed instead of using an older audience.
 try {
   const change = await alice.sealed.put(
     created.id, 'body', new TextEncoder().encode('A private note'),
@@ -139,7 +139,7 @@ const changed = await alice.sealed.setReaders({
   expectedVersion: current.version,
 })
 await requireFinalAcceptance(changed.handle)
-// put() reads and checks the selected final policy before disclosing the next value.
+// put() rechecks the current local policy's final acceptance before disclosure.
 ```
 
 Every `put` generates a fresh random AES-256-GCM content key. It wraps that key
@@ -172,12 +172,15 @@ the ciphertext and reader wraps. A recipient can attempt decryption even when
 the transaction later fails a row-write check, a trigger or compare-and-swap.
 SQL rollback and deterministic replay cannot withdraw those bytes.
 
-For that reason `put()` reads the final policy snapshot and checks the policy
-update's applied final acceptance before encrypting. The same rule works with
-validator and signed-inclusion finality; no provider-specific watermark is
-required. An absent final policy is unavailable. An unfinalized or rejected
-policy result throws `SealedPolicyNotFinalError` without encrypting or submitting
-the value. Tests or development tools can explicitly pass
+For that reason `put()` deliberately reads the current local policy, including
+pending audience changes, and the value at that same materialized revision.
+Before encrypting, it requires that policy update's applied final outcome to be
+accepted. It does not fall back to an older final audience while an observed
+policy change is pending. The same rule works with validator and signed-inclusion
+finality; no provider-specific watermark is required. An absent or closed local
+policy is unavailable. An unfinalized or rejected policy result throws
+`SealedPolicyNotFinalError` without encrypting or submitting the value.
+Tests or development tools can explicitly pass
 `allowProvisionalPolicy: true`; that permits irreversible disclosure under a
 policy that may later change during replay.
 

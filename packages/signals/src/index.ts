@@ -171,6 +171,7 @@ export class SignalChannel implements Signals {
       if (typeof options !== 'object' || options === null) throw new SignalError('SIGNAL_OPTIONS_INVALID')
       this.#assertOpen(); options.signal?.throwIfAborted()
       if (this.#routes.size === 0) throw new SignalError('SIGNAL_ROUTE_UNAVAILABLE')
+      const routes = [...this.#routes]
       if (this.#pendingSends >= this.#maxSends) throw new SignalError('SIGNAL_BACKPRESSURE')
       assertSignalTopic(topic)
       const encodedPayload = canonicalSignalPayload(payload)
@@ -204,7 +205,7 @@ export class SignalChannel implements Signals {
           await this.#authorize(authorization, signal)
           this.#assertFresh(value)
           if (!this.#remember(value)) throw new SignalError('SIGNAL_BACKPRESSURE')
-          if (!await this.#dispatch({ value, authorization, frame }, undefined, signal, true)) {
+          if (!await this.#dispatch({ value, authorization, frame }, routes, signal, true)) {
             // Every route explicitly refused before dispatch. No future loop can
             // replay this intent; retain its sequence but release replay budget.
             this.#forget(value)
@@ -229,6 +230,7 @@ export class SignalChannel implements Signals {
       if (route?.lifetime.signal.aborted === true) throw new SignalError('SIGNAL_ROUTE_CLOSED')
       if (this.#pendingReceives >= this.#maxReceives) return Promise.resolve(null)
       const frame = input.slice()
+      const routes = [...this.#routes].filter(attached => attached !== route)
       this.#pendingReceives += 1
       const expiry = new AbortController()
       const timer = setTimeout(() => expiry.abort(new SignalError('SIGNAL_RECEIVE_TIMEOUT')), this.#ttl)
@@ -238,7 +240,7 @@ export class SignalChannel implements Signals {
         const verified = await this.#verify(frame, signal)
         if (verified === null || !this.#remember(verified.value)) return null
         this.#deliver(verified.value, frame.length)
-        if (this.#options.relay === true) await this.#dispatch(verified, route, signal, false)
+        if (this.#options.relay === true) await this.#dispatch(verified, routes, signal, false)
         return structuredClone(verified.value)
       })().finally(() => { clearTimeout(timer); this.#pendingReceives -= 1 })
       return interrupted(operation, signal)
@@ -284,8 +286,9 @@ export class SignalChannel implements Signals {
     if (!await this.#allowed(input, signal)) throw new SignalError('SIGNAL_UNAUTHORIZED')
   }
 
-  async #dispatch(verified: VerifiedSignal, source: Route | undefined, signal: AbortSignal, required: boolean): Promise<boolean> {
-    const attached = [...this.#routes].filter(route => route !== source)
+  async #dispatch(verified: VerifiedSignal, eligible: readonly Route[], signal: AbortSignal, required: boolean): Promise<boolean> {
+    // A replacement connection is eligible only for a later admitted attempt.
+    const attached = eligible.filter(route => !route.lifetime.signal.aborted)
     if (required && attached.length === 0) throw new SignalError('SIGNAL_ROUTE_UNAVAILABLE')
     const routes = attached.filter(route => !route.busy)
     if (routes.length === 0) return false

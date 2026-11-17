@@ -82,11 +82,14 @@ HTTP gateway's allowed origins; the library does not install permissive CORS.
 ## Queries and immutable results
 
 `query.localSql` and `query.liveSql` accept `view: 'local' | 'final'`; the default
-is `final`; speculative readers explicitly select `local`.
+is `final`, matching `view.open`, `view.changes` and durable event reads.
+Select `view: 'local'` explicitly when a caller wants a provisional preview.
+Final reads return the currently applied prefix; they do not wait for pending
+writes to finish.
 
 | View | Reader | Meaning |
 | --- | --- | --- |
-| `local` | Current locally materialized SQL revision | Includes admitted speculative work; synchronization can replay it. |
+| `local` | Current locally materialized SQL revision | Includes the selected provisional suffix; synchronization can replay or remove it. |
 | `final` | Separate SQL reader pinned to the locally applied immutable prefix | Contains only policy-final transactions that this replica has applied. |
 
 Both views return revision metadata:
@@ -141,7 +144,7 @@ group and view, forwards cancellation, and ends its subscriptions on close.
 It delegates directly to the node's applied-view port; opening the stream does
 not acquire a read lease, execute SQL or poll the page host.
 
-The first value describes the current successfully reconciled application
+The first value describes the current successfully published materializer
 snapshot. Later values are bounded, coalesced invalidations. Final-only streams
 do not report speculative work. Local streams also report final-prefix changes
 even when only `finalRevision` changes. Admission, receipt and transport status

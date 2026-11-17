@@ -7,6 +7,9 @@ is [`examples/shared-notes.ts`](../examples/shared-notes.ts)
 (`pnpm demo:ownership`).
 That walkthrough uses a live finality policy and checks each `final()` outcome
 before authoring work that depends on its success.
+Application queries and React query hooks default to the currently applied final
+view; they do not wait for pending writes. Use `view: 'local'` explicitly when a
+preview can be replaced after replay.
 
 ## The model in four sentences
 
@@ -122,7 +125,7 @@ Then `handle.createdId(stepIndex)` gives the created id.
 
 ## Listing ownership state
 
-`ownershipQueries` returns local-read queries with typed decoders:
+`ownershipQueries` returns SQL query descriptions with typed decoders:
 
 - `teams(me)` and `invitations(me)`;
 - `members(teamId)`;

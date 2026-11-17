@@ -3,7 +3,7 @@ import {
   bytesToHex, emit, encodeTransactionCore, generateEd25519KeyPair, program, transactionDigest, utf8,
 } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { EpochCipherRing } from './cipher.js'
 import { createFinalityClosureRecord, controlCommitmentForClosure } from './finality.js'
@@ -16,7 +16,10 @@ import { MemoryOperationStore } from './operations.js'
 import { encodeSignedEnvelope } from './wire.js'
 
 const cleanup: Array<() => Promise<void>> = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+afterEach(async () => {
+  try { for (const close of cleanup.splice(0).reverse()) await close() }
+  finally { vi.useRealTimers() }
+})
 const bytes = (value: number) => new Uint8Array(32).fill(value)
 const groupId = bytes(71), membershipRevision = bytes(72), validationPolicy = bytes(73)
 const emptyCounts = () => ({ materialize: 0, changed: 0, publish: 0, reconcile: 0, publishFinal: 0, proofs: 0, writes: 0 })
@@ -185,6 +188,9 @@ describe('application reconciliation after finality evidence', () => {
   })
 
   it.each(['missing-body', 'missing-key', 'failed-reconcile'] as const)('retries %s from identical retained evidence', async mode => {
+    // Drive this exact retry through retained evidence. A scheduled retry must
+    // not enter materialize while status is read and straddle the counter reset.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const f = await fixture(mode)
     const message = { 'missing-body': 'LEDGER_PAYLOAD_UNAVAILABLE', 'missing-key': 'WIRE_ENCRYPTION_EPOCH_UNAVAILABLE',
       'failed-reconcile': 'RECONCILIATION_FAILED' }[mode]

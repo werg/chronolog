@@ -31,6 +31,12 @@ processed cursor with its own state. `readView` pins queries and events to one
 coherent revision. The default is final state; an explicitly selected local view
 may rebase as earlier eligible history arrives.
 
+This adapter exposes Chronolog's chronological history through `local` and
+`final` views. It rejects `applied` and other view names before observing or
+capturing the replica. The common `basedOn` ordering barrier is unsupported:
+`submit` and `events.publish` reject it before authoring any proposal. Use
+Chronolog program preconditions for state-dependent writes.
+
 `submit` and `events.publish` return the current operation snapshot. Its `status`
 is `queued`, `provisional`, or `final`; executed results separately identify an
 `accepted` or `rejected` `outcome`. A final rejection is terminal. An exact retry

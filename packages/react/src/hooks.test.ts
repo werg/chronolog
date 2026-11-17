@@ -1,8 +1,8 @@
 import { StrictMode, createElement } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { describe, expect, it } from 'vitest'
-import { StreamResource, type ChronologClient, type NodeStatus, type StreamSnapshot } from '@chronolog/client'
-import { useChronologStatus, useStreamResource } from './hooks.js'
+import { StreamResource, type ChronologClient, type LiveQueryValue, type LocalSqlInput, type NodeStatus, type QueryOptions, type SqlView, type StreamSnapshot } from '@chronolog/client'
+import { useChronologQuery, useChronologStatus, useStreamResource } from './hooks.js'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -88,6 +88,53 @@ describe('useStreamResource', () => {
     await act(async () => { renderer?.update(createElement(StrictMode, null, createElement(Probe, { enabled: true }))) })
     expect(resources.filter((resource) => resource.getSnapshot().status !== 'closed')).toHaveLength(1)
     await act(async () => { renderer?.unmount() })
+    expect(resources.every((resource) => resource.getSnapshot().status === 'closed')).toBe(true)
+  })
+
+  it('uses final for omitted query views and shares its resource identity with explicit final', async () => {
+    const resources: StreamResource<LiveQueryValue>[] = []
+    const openedViews: Array<SqlView | undefined> = []
+    const keyViews: Array<SqlView | undefined> = []
+    const client = {
+      queryResourceKey(sql: string, _parameters: readonly LocalSqlInput[], view?: SqlView) {
+        keyViews.push(view)
+        return `${view}:${sql}`
+      },
+      liveQuery(_sql: string, _parameters: readonly LocalSqlInput[], options: QueryOptions) {
+        openedViews.push(options.view)
+        const resource = new StreamResource<LiveQueryValue>({
+          open: async function* (_cursor, signal) {
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) resolve()
+              else signal.addEventListener('abort', () => resolve(), { once: true })
+            })
+          },
+          cursor: () => undefined,
+        })
+        resources.push(resource)
+        return resource
+      },
+    } as unknown as ChronologClient
+    function Probe({ view }: { readonly view?: SqlView }) {
+      useChronologQuery('SELECT value', [], { client, ...(view === undefined ? {} : { view }) })
+      return null
+    }
+
+    let renderer: ReactTestRenderer | undefined
+    try {
+      await act(async () => { renderer = create(createElement(Probe)) })
+      expect(openedViews).toEqual(['final'])
+      expect(keyViews.every((view) => view === 'final')).toBe(true)
+      await act(async () => { renderer?.update(createElement(Probe, { view: 'final' })) })
+      expect(openedViews).toEqual(['final'])
+      expect(resources[0]?.getSnapshot().status).not.toBe('closed')
+      await act(async () => { renderer?.update(createElement(Probe, { view: 'local' })) })
+      expect(openedViews).toEqual(['final', 'local'])
+      expect(resources[0]?.getSnapshot().status).toBe('closed')
+      await act(async () => { renderer?.update(createElement(Probe)) })
+      expect(openedViews).toEqual(['final', 'local', 'final'])
+      expect(resources[1]?.getSnapshot().status).toBe('closed')
+    } finally { await act(async () => { renderer?.unmount() }) }
     expect(resources.every((resource) => resource.getSnapshot().status === 'closed')).toBe(true)
   })
 })

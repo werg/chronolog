@@ -103,6 +103,29 @@ describe('NodeRpcService policy views and enrollment', () => {
     await transport.close()
   })
 
+  it('defaults direct live SQL requests to final and separates local cursor identities', async () => {
+    const transport = new InProcessRpcTransport(new NodeRpcService({ node: {
+      ...readerNode(),
+      revisions() { return { async *[Symbol.asyncIterator]() {} } },
+    } }))
+    const request = { groupId: group, requestId: 'live-query', sql: 'SELECT value FROM t', parameters: [] }
+    const final = transport.stream('query.liveSql', request)[Symbol.asyncIterator]()
+    const local = transport.stream('query.liveSql', { ...request, view: 'local' })[Symbol.asyncIterator]()
+    try {
+      const finalSnapshot = (await final.next()).value
+      const localSnapshot = (await local.next()).value
+      expect(finalSnapshot).toMatchObject({ type: 'snapshot', revision: { view: 'final', materializedRevision: '2' },
+        result: { rows: [[{ kind: 'integer', value: '10' }]] } })
+      expect(localSnapshot).toMatchObject({ type: 'snapshot', revision: { view: 'local', materializedRevision: '6' },
+        result: { rows: [[{ kind: 'integer', value: '30' }]] } })
+      expect(finalSnapshot?.queryDigest).not.toBe(localSnapshot?.queryDigest)
+    } finally {
+      await final.return?.()
+      await local.return?.()
+      await transport.close()
+    }
+  })
+
   it('dispatches signed enrollment requests and receipts through the shared transport', async () => {
     const enrollment = {
       createRequest: vi.fn(async () => ({ signedRequest: 'signed-request' })),

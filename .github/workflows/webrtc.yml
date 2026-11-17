@@ -15,9 +15,11 @@ concurrency:
 jobs:
   qualify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -30,9 +32,27 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: fb1ff7d4219dac4981d512fc0a8a187f3d575910
+          ref: 5dc1e63365c4d073f03c6491ec5e84ed14c26f73
           path: artifacts/tendriller-contrib
           persist-credentials: false
+      - name: Build the clean public peer-session RTC package
+        run: node tools/package-peer-session.mjs --native-rtc --output artifacts/peer-session-rtc
+      - name: Qualify selected-history recovery through the packed native RTC API
+        shell: bash
+        run: |
+          archives=(artifacts/peer-session-rtc/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --transport native-rtc --output artifacts/peer-session-rtc-consumer
+      - name: Qualify actual hosted control and rendezvous with packed RTC peers
+        shell: bash
+        run: |
+          mkdir -p artifacts/tendriller-public-90cfb794
+          cp test/artifacts/tendriller-sdk-90cfb794.tgz artifacts/tendriller-public-90cfb794/tendriller-sdk-0.3.0-rc.9.tgz
+          cp test/artifacts/tendriller-engine-90cfb794.tgz artifacts/tendriller-public-90cfb794/tendriller-engine-0.3.0-rc.9.tgz
+          cp test/artifacts/tendriller-public-90cfb794.provenance.json artifacts/tendriller-public-90cfb794/provenance.json
+          archives=(artifacts/peer-session-rtc/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/tendriller-public-90cfb794 --output artifacts/peer-session-host-consumer
       - name: Qualify the native HTTPS resident task and current reader authorization
         run: node --import tsx tools/test-resident-webrtc.ts --contrib artifacts/tendriller-contrib --output artifacts/resident-webrtc
       - name: Install actual Chromium
@@ -45,6 +65,14 @@ jobs:
         with:
           name: webrtc-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            artifacts/peer-session-rtc/*.tgz
+            artifacts/peer-session-rtc/package/provenance.json
+            artifacts/peer-session-rtc-consumer/report.json
+            artifacts/peer-session-rtc-consumer/summary.json
+            artifacts/peer-session-host-consumer/host-artifacts.json
+            artifacts/peer-session-host-consumer/host/package-lock.json
+            artifacts/peer-session-host-consumer/peers/report.json
+            artifacts/peer-session-host-consumer/peers/summary.json
             artifacts/browser-webrtc/report.json
             artifacts/browser-webrtc/bundle.json
             artifacts/resident-webrtc/report.json

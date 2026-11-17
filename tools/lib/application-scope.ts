@@ -8,7 +8,7 @@ import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, 
 import { decodeFinalityClosureRecord, isFinalityClosureRecord } from '@chronolog/node-core/finality'
 import { assertCanonicalCbor, decodeEnvelope, utf8, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
-import type { ApplicationOperation } from '@tendriller/core/application'
+import type { FinalityApplicationOperation } from '@tendriller/core/application'
 
 import { createNativeBrowserFixture } from '../browser-event-fixture.js'
 import { createFinalityEvidencePublisher } from './finality-evidence.js'
@@ -52,7 +52,7 @@ export async function qualifyApplicationScope(modulePath: string) {
       assert.equal(appended.length, 1, 'One durable authored record per new operation')
       return { receipt, record: appended[0]! }
     }
-    const include = async (pending: Awaited<ReturnType<typeof submit>>): Promise<ApplicationOperation> => {
+    const include = async (pending: Awaited<ReturnType<typeof submit>>): Promise<FinalityApplicationOperation> => {
       await authority.append(pending.record.payload)
       const started = performance.now()
       const deadline = Date.now() + 10_000

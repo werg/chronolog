@@ -1,5 +1,5 @@
 import {
-  verifyAuthorityBundle, type AuthorityBundle, type OrderedCommand, type PeerReplica,
+  validateHistoryPoint, verifyAuthorityBundle, type AuthorityBundle, type OrderedCommand, type PeerReplica,
   type PeerRevision, type SignedAttempt, type SignedRetainedCoverage,
 } from '@chronolog/peer-generation'
 import { bytesToHex, encodeCanonicalCbor, hexToBytes, importEd25519PublicKey } from '@chronolog/protocol'
@@ -9,11 +9,12 @@ import type { ApplicationSession } from './session.js'
 import { sessionInternals } from './internals.js'
 import type { ContentManifest, ContentReference, ContentRetention } from './content.js'
 
-const MAX_MESSAGE_BYTES = 1_048_576, MAX_REQUESTS = 16, MAX_SYNC_RECORDS = 4096, MAX_SYNC_BYTES = 64 * 1024 * 1024
+const MAX_MESSAGE_BYTES = 1_048_576, MAX_REQUESTS = 16, MAX_RANGE_RECORDS = 32
 const HANDSHAKE_DOMAIN = 'chronolog/peer-generation/connection/v1'
 interface Hello { readonly type: 'hello'; readonly applicationId: string; readonly historyId: string; readonly peer: string; readonly nonce: string }
 interface RemoteState { readonly authority: AuthorityBundle; readonly revision: PeerRevision | null; readonly count: number }
 interface Pending { readonly resolve: (value: unknown) => void; readonly reject: (error: unknown) => void; readonly timer: ReturnType<typeof setTimeout> }
+interface Synchronization { readonly promise: Promise<void>; readonly resolve: () => void; readonly reject: (error: unknown) => void; background: boolean }
 export interface ApplicationPeerConnection {
   readonly peerId: string
   readonly signal: AbortSignal
@@ -45,7 +46,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
   const requests = new Map<number, Pending>()
   let remote: Hello | undefined, authenticated = false, sequence = 0, serving = 0, closed = false
   let sentBytes = 0, receivedBytes = 0, sentRequests = 0, receivedRequests = 0
-  let detach = () => {}, unsubscribe = () => {}, signalRoute: ReturnType<typeof owned.signals.attachRoute> | undefined
+  let detach = () => {}, unsubscribe = () => {}, disposeLive = () => {}, signalRoute: ReturnType<typeof owned.signals.attachRoute> | undefined
   let detachContent = () => {}
   let resolveReady!: () => void, rejectReady!: (error: unknown) => void
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
@@ -55,7 +56,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
     if (closing !== undefined) return closing
     closing = Promise.resolve().then(() => connection.close())
     closed = true; lifetime.abort(reason); clearTimeout(handshakeTimer); inputSignal.removeEventListener('abort', abort)
-    rejectReady(reason); detach(); unsubscribe(); signalRoute?.close(); detachContent()
+    rejectReady(reason); detach(); unsubscribe(); disposeLive(); signalRoute?.close(); detachContent()
     for (const pending of requests.values()) { clearTimeout(pending.timer); pending.reject(reason) }
     requests.clear()
     void closing.catch(() => undefined)
@@ -88,71 +89,82 @@ export async function connectApplicationTransport(session: ApplicationSession, o
     })
   }
 
-  let requested = false, synchronizing: Promise<void> | undefined
-  const synchronize = (): Promise<void> => {
-    authorized(); requested = true
-    if (synchronizing !== undefined) return synchronizing
-    const task = (async () => {
-      let retries = 0
-      while (requested) {
-        requested = false; authorized()
-        const remoteState = await request<RemoteState>('state')
+  const pull = async (): Promise<void> => {
+    authorized()
+    const remoteState = await request<RemoteState>('state')
+    authorized()
+    if (!Number.isSafeInteger(remoteState.count) || remoteState.count < 0) throw new Error('APPLICATION_PEER_STATE_INVALID')
+    const authority = await verifyAuthorityBundle(remoteState.authority, replica.authority.descriptor)
+    authorized()
+    const remoteGeneration = authority.current
+    if (remoteGeneration === null) throw new Error('APPLICATION_PEER_GENERATION_MISSING')
+    if (remoteState.revision === null) {
+      if (remoteState.count !== 0) throw new Error('APPLICATION_PEER_STATE_INVALID')
+      return
+    }
+    if (remoteGeneration.payload.number < replica.generation.payload.number) return
+    const target = remoteState.revision
+    validateHistoryPoint(target.point)
+    const count = authority.selectedSegments().reduce((total, segment) => total + (segment.cutoff?.sequence ?? target.point.sequence), 0)
+    if (target.generation !== remoteGeneration.id || target.point.generation !== remoteGeneration.id ||
+        target.controlRevision !== remoteGeneration.payload.controlRevision || target.applicationId !== replica.descriptor.applicationId ||
+        target.historyId !== replica.descriptor.historyId || !Number.isSafeInteger(count) || count !== remoteState.count) {
+      throw new Error('APPLICATION_PEER_STATE_INVALID')
+    }
+    let offset = 0
+    try {
+      const view = await replica.capture()
+      try { if (view.revision.generation === target.generation) offset = Math.min(view.read.orderLength, count) }
+      finally { view.release() }
+    } catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERING') throw error }
+    async function* pages(): AsyncGenerator<readonly OrderedCommand[]> {
+      while (offset < count) {
         authorized()
-        if (!Number.isSafeInteger(remoteState.count) || remoteState.count < 0 || remoteState.count > MAX_SYNC_RECORDS) throw new Error('APPLICATION_PEER_HISTORY_LIMIT')
-        const authority = await verifyAuthorityBundle(remoteState.authority, replica.authority.descriptor)
+        const limit = Math.min(MAX_RANGE_RECORDS, count - offset)
+        const page = await request<readonly OrderedCommand[]>('range', { at: target, offset, limit })
         authorized()
-        const remoteGeneration = authority.current
-        if (remoteGeneration === null) throw new Error('APPLICATION_PEER_GENERATION_MISSING')
-        if (remoteState.revision === null || remoteGeneration.payload.number < replica.generation.payload.number) continue
-        if (remoteState.revision.generation !== remoteGeneration.id || remoteState.revision.applicationId !== replica.descriptor.applicationId ||
-            remoteState.revision.historyId !== replica.descriptor.historyId) throw new Error('APPLICATION_PEER_STATE_INVALID')
-        let offset = 0, retained = false
-        try {
-          const view = await replica.capture()
-          try {
-            if (view.revision.generation === remoteState.revision.generation) {
-              if (view.read.orderLength >= remoteState.count) {
-                if (view.read.orderLength === remoteState.count && view.revision.point.root !== remoteState.revision.point.root) {
-                  throw new Error('APPLICATION_PEER_ORDER_CONFLICT')
-                }
-                retained = true
-              }
-              offset = view.read.orderLength
-            }
-          } finally { view.release() }
-        } catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERING') throw error }
-        if (retained) {
-          authorized(); await replica.synchronize(remoteState.authority, [])
-          authorized(); const coverage = await replica.retainedCoverage()
-          authorized(); await request('retain', coverage)
-          continue
-        }
-        const commands: OrderedCommand[] = []
-        let bytes = 0
-        try {
-          while (offset < remoteState.count) {
-            const page = await request<readonly OrderedCommand[]>('range', { at: remoteState.revision, offset, limit: 1 })
-            authorized()
-            if (!Array.isArray(page) || page.length !== 1) throw new Error('APPLICATION_PEER_HISTORY_INCOMPLETE')
-            bytes += encode(page).length
-            if (bytes > MAX_SYNC_BYTES) throw new Error('APPLICATION_PEER_HISTORY_LIMIT')
-            commands.push(...page as readonly OrderedCommand[]); offset++
-          }
-          authorized()
-          await replica.synchronize(remoteState.authority, commands)
-          authorized()
-          const coverage = await replica.retainedCoverage(); authorized()
-          await request('retain', coverage)
-        } catch (error) {
-          if (error instanceof Error && error.message === 'PEER_VIEW_RECOVERY_REQUIRED' && retries++ < 2) { requested = true; continue }
-          throw error
-        }
+        if (!Array.isArray(page) || page.length < 1 || page.length > limit) throw new Error('APPLICATION_PEER_HISTORY_INCOMPLETE')
+        offset += page.length
+        yield page
       }
-    })()
-    synchronizing = task
-    void task.then(() => { if (synchronizing === task) synchronizing = undefined }, () => { if (synchronizing === task) synchronizing = undefined })
-    return task
+      authorized()
+    }
+    // The replica retains one bounded page at a time, then checks the captured
+    // root before publication. New source writes cannot extend this pass.
+    await replica.synchronize(remoteState.authority, pages(), { at: target })
+    authorized()
+    const coverage = await replica.retainedCoverage(target.point)
+    authorized()
+    if (coverage.payload.generation !== target.generation) throw new Error('PEER_VIEW_RECOVERY_REQUIRED')
+    await request('retain', coverage)
   }
+  let running: Synchronization | undefined, queued: Synchronization | undefined
+  const start = (job: Synchronization): void => {
+    running = job
+    const finish = (): void => {
+      running = undefined
+      if (queued !== undefined) { const next = queued; queued = undefined; start(next) }
+    }
+    void pull().then(() => { job.resolve(); finish() }, error => {
+      job.reject(error)
+      if (job.background) void close(error)
+      finish()
+    })
+  }
+  const schedule = (background: boolean): Promise<void> => {
+    authorized()
+    if (queued !== undefined) { queued.background ||= background; return queued.promise }
+    let resolve!: () => void, reject!: (error: unknown) => void
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no })
+    void promise.catch(() => undefined)
+    const job = { promise, resolve, reject, background }
+    // One active captured pass and one coalesced follow-up keep hint floods
+    // bounded. A caller awaits only its own pass, never future source growth.
+    if (running === undefined) start(job)
+    else queued = job
+    return promise
+  }
+  const synchronize = (): Promise<void> => schedule(false)
   const notify = (): void => { void send({ type: 'changed' }).catch(error => { void close(error) }) }
   const serve = async (id: number, method: string, value: unknown): Promise<void> => {
     try {
@@ -169,8 +181,16 @@ export async function connectApplicationTransport(session: ApplicationSession, o
         }
         case 'range': {
           const input = record(value)
-          if (!Number.isSafeInteger(input.offset) || Number(input.offset) < 0 || input.limit !== 1) throw new Error('APPLICATION_PEER_RANGE_INVALID')
-          result = await replica.exportCommands({ at: input.at as PeerRevision, offset: Number(input.offset), limit: 1 })
+          if (!Number.isSafeInteger(input.offset) || Number(input.offset) < 0 || !Number.isSafeInteger(input.limit) ||
+              Number(input.limit) < 1 || Number(input.limit) > MAX_RANGE_RECORDS) throw new Error('APPLICATION_PEER_RANGE_INVALID')
+          const commands = await replica.exportCommands({ at: input.at as PeerRevision, offset: Number(input.offset), limit: Number(input.limit) })
+          const page: OrderedCommand[] = []
+          for (const command of commands) {
+            page.push(command)
+            if (encode({ type: 'response', id, result: page }).length > MAX_MESSAGE_BYTES) { page.pop(); break }
+          }
+          if (commands.length > 0 && page.length === 0) throw new Error('APPLICATION_PEER_FRAME_TOO_LARGE')
+          result = page
           break
         }
         case 'submit': result = await replica.order(value as SignedAttempt); break
@@ -236,7 +256,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
           if (!Number.isSafeInteger(value.id) || Number(value.id) < 1 || typeof value.method !== 'string' || serving >= MAX_REQUESTS) throw new Error('APPLICATION_PEER_REQUEST_INVALID')
           serving++; receivedRequests++
           void serve(Number(value.id), value.method, value.value).catch(error => { void close(error) })
-        } else if (value.type === 'changed') void synchronize().catch(error => { void close(error) })
+        } else if (value.type === 'changed') void schedule(true)
         else throw new Error('APPLICATION_PEER_MESSAGE_INVALID')
       }
       if (!closed) await close(new Error('APPLICATION_PEER_STREAM_ENDED'))
@@ -258,14 +278,34 @@ export async function connectApplicationTransport(session: ApplicationSession, o
       if (current !== previous) { previous = current; notify() }
     })
     if (connection.live !== undefined) {
-      signalRoute = owned.signals.attachRoute({ trySend: async (frame, sendOptions) => { authorized(); return connection.live!.trySend(frame, sendOptions) } })
+      const lane = connection.live
+      signalRoute = owned.signals.attachRoute({
+        trySend: async (frame, sendOptions) => { authorized(); return lane.trySend(frame, sendOptions) },
+        // A dispatched callback that cannot stop must retire its physical owner.
+        close: () => close(new Error('APPLICATION_PEER_LIVE_WRITE_FAILED')),
+      })
       const route = signalRoute
+      let liveClosed = false
+      disposeLive = () => {
+        if (liveClosed) return
+        liveClosed = true; route.close(); lane.signal.removeEventListener('abort', disposeLive)
+        void lane.close().catch(() => undefined)
+      }
+      lane.signal.addEventListener('abort', disposeLive, { once: true })
+      if (lane.signal.aborted) disposeLive()
       void (async () => {
-        try { for await (const frame of connection.live!.frames(lifetime.signal)) { authorized(); await route.receive(frame) } }
-        catch (error) { if (!closed) await close(error) }
+        try { for await (const frame of lane.frames(lifetime.signal)) { authorized(); await route.receive(frame) } }
+        catch (error) { if (!closed && !lane.signal.aborted) await close(error) }
+        finally { disposeLive() }
       })().catch(() => undefined)
     }
     await synchronize(); authorized()
+    detach = session.attachPeer(peerId, async attempt => {
+      authorized()
+      await request<OrderedCommand>('submit', attempt)
+      authorized()
+      await synchronize()
+    }, { close: () => close() })
     detachContent = owned.content.attachSource(peerId, {
       manifest: async reference => request<ContentManifest | null>('contentManifest', reference),
       chunk: async (reference, index) => {
@@ -278,12 +318,6 @@ export async function connectApplicationTransport(session: ApplicationSession, o
       retained: async reference => request<ContentRetention>('contentRetained', reference),
       observeRetention: async receipt => { await request('contentObserveRetention', receipt) },
     })
-    detach = session.attachPeer(peerId, async attempt => {
-      authorized()
-      await request<OrderedCommand>('submit', attempt)
-      authorized()
-      await synchronize()
-    }, { close: () => close() })
     await session.resume(); authorized()
     return result
   } catch (error) { await close(error); throw error }

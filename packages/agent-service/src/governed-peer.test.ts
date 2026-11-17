@@ -95,6 +95,26 @@ function rtcConnections() {
 }
 
 describe('owned governed peer composition', () => {
+  it('retires a physical peer when cancelled live transport work does not settle', async () => {
+    const { services } = await replicas()
+    let entered!: () => void, writes = 0
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const sessions = await connect(services[0]!, services[1]!, undefined, true, async () => {
+      writes++; entered(); return new Promise<never>(() => {})
+    })
+    const controller = new AbortController()
+    const sending = services[0]!.signals.send('typing', 'cancelled preview', { signal: controller.signal })
+    const cancelled = expect(sending).rejects.toThrow('cancel blocked live dispatch')
+    await started
+    controller.abort(new Error('cancel blocked live dispatch')); await cancelled
+    await expect.poll(() => sessions[0].signal.aborted).toBe(true)
+    // Either owner can retire first: the signal channel closes its route, or
+    // the peer watchdog reports the cancelled write. Both end this session.
+    await sessions[0].completion.catch(() => undefined)
+    await expect(services[0]!.signals.send('typing', 'later preview')).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+    expect(writes).toBe(1)
+  })
+
   it('keeps durable replication available through live congestion and sends only fresh observations on recovery', async () => {
     const { services, transports } = await replicas()
     let busy = true

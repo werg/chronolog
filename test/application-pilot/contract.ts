@@ -1,7 +1,6 @@
 import type { RuntimeApi, RuntimeConfiguration } from '@tendriller/core/contract'
-import type { ApplicationBackend } from '@tendriller/core/application'
+import type { ApplicationBackend, FinalityApplicationOperation } from '@tendriller/core/application'
 import type { EventBatch } from '@chronolog/protocol'
-import type { ApplicationOperation } from '@tendriller/core/application'
 import type { WebRtcChannels, WebRtcSession } from '@chronolog/transport-webrtc'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from '../browser/event-contract.js'
 
@@ -48,7 +47,7 @@ export interface PilotDiagnostics {
   routeState(): Promise<{ readonly records: number; readonly recordDigest: string; readonly capabilityDigest: string; readonly finalOrderLength: number }>
   sync(): Promise<void>
   events(): Promise<EventBatch>
-  operation(operationId: string): Promise<ApplicationOperation | null>
+  operation(operationId: string): Promise<FinalityApplicationOperation | null>
   close(): Promise<void>
 }
 export interface PilotWindow {

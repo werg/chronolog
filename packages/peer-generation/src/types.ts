@@ -108,7 +108,8 @@ export interface PeerReplica {
   order(attempt: SignedAttempt): Promise<OrderedCommand>
   ingest(commands: readonly OrderedCommand[]): Promise<void>
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null>
-  synchronize(authority: AuthorityBundle, commands: readonly OrderedCommand[]): Promise<RecoveryNotice | null>
+  /** Retains bounded pages before publishing one complete captured prefix. Network reads run outside the replica lock. */
+  synchronize(authority: AuthorityBundle, commands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>, options?: { readonly at?: PeerRevision }): Promise<RecoveryNotice | null>
   operation(operationId: string, author?: string): Promise<OperationState | null>
   attempt(operationId: string, author?: string): Promise<SignedAttempt | null>
   capture(): Promise<CapturedPeerView>
@@ -116,7 +117,7 @@ export interface PeerReplica {
   prefixProof(point: HistoryPoint): Promise<PrefixProof>
   exportCommands(options?: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly at?: PeerRevision }): Promise<readonly OrderedCommand[]>
   pendingAttempts(): Promise<readonly SignedAttempt[]>
-  retainedCoverage(): Promise<SignedRetainedCoverage>
+  retainedCoverage(point?: HistoryPoint): Promise<SignedRetainedCoverage>
   observeCoverage(coverage: SignedRetainedCoverage): Promise<void>
   shared(point?: HistoryPoint): readonly SignedRetainedCoverage[]
   subscribe(listener: () => void): () => void

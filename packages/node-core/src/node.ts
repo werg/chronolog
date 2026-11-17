@@ -1464,8 +1464,14 @@ export class ChronologNode {
       throw new MaterializationProgressError(error)
     } finally {
       // Local publication can succeed before a later finality/storage step
-      // fails. Readers still need the newly published coherent local view.
-      if (this.materializedRevision !== beforeLocal || this.finalRevision !== beforeFinal) this.#applicationChanges.notify()
+      // fails. The materializer still owns a coherent published local view.
+      if (this.materializedRevision !== beforeLocal || this.finalRevision !== beforeFinal) {
+        // Even a lost publication acknowledgment must not let newly authored
+        // intent sort before history the application can already read. Read
+        // the applied tail identity, never a pending control-store selection.
+        if (this.orderLength > 0) this.#observeAuthorTime(this.#appliedAuthorTimestamp(this.orderLength - 1))
+        this.#applicationChanges.notify()
+      }
     }
   }
 

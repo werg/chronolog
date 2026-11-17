@@ -23,6 +23,83 @@ function gate() {
 }
 
 describe('standalone live signals', () => {
+  it('counts unsettled route policy work across route replacements until it actually settles', async () => {
+    const blocked = gate()
+    let heldChecks = 0
+    const frames: Uint8Array[] = [], sender = await channel({ maxRoutes: 1, maxPendingSends: 1,
+      authorize: async ({ topic }) => {
+        if (topic === 'held' && ++heldChecks === 3) { blocked.enter(); await blocked.wait }
+        return true
+      },
+    })
+    const route = sender.attachRoute({ async trySend(frame) { frames.push(frame); return true } })
+    const controller = new AbortController(), pending = sender.send('held', 'old observation', { signal: controller.signal })
+    const cancelled = expect(pending).rejects.toThrow('cancel held policy')
+    try {
+      await blocked.entered
+      controller.abort(new Error('cancel held policy')); await cancelled
+      await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+      route.close()
+      // Closing a route cannot release a noncooperative authorization's slot.
+      expect(() => sender.attachRoute({ async trySend(frame) { frames.push(frame); return true } }))
+        .toThrow('SIGNAL_ROUTE_QUOTA_EXCEEDED')
+      expect(frames).toEqual([])
+      blocked.release()
+      await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+      sender.attachRoute({ async trySend(frame) { frames.push(frame); return true } })
+      await sender.send('fresh', 'current observation')
+      expect(frames).toHaveLength(1)
+      expect((await (await channel()).receive(frames[0]!))?.payload).toBe('current observation')
+    } finally { blocked.release() }
+  })
+
+  it('does not move a pending send onto a replacement connection', async () => {
+    const blocked = gate()
+    let first = true
+    const sender = await channel({ authorize: async () => {
+      if (first) { first = false; blocked.enter(); await blocked.wait }
+      return true
+    } })
+    const oldFrames: Uint8Array[] = [], newFrames: Uint8Array[] = []
+    const original = sender.attachRoute({ async trySend(frame) { oldFrames.push(frame); return true } })
+    const pending = sender.send('preview', 'old observation')
+    const disconnected = expect(pending).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+    try {
+      await blocked.entered
+      original.close()
+      sender.attachRoute({ async trySend(frame) { newFrames.push(frame); return true } })
+      blocked.release(); await disconnected
+      expect(oldFrames).toEqual([]); expect(newFrames).toEqual([])
+      await sender.send('preview', 'current observation')
+      expect(newFrames).toHaveLength(1)
+      expect((await (await channel()).receive(newFrames[0]!))?.payload).toBe('current observation')
+    } finally { blocked.release() }
+  })
+
+  it('does not relay an admitted frame to a route attached during verification', async () => {
+    const blocked = gate()
+    let first = true
+    const { sender, receiver, frames } = await fixture({ relay: true, authorize: async () => {
+      if (first) { first = false; blocked.enter(); await blocked.wait }
+      return true
+    } })
+    const oldFrames: Uint8Array[] = [], newFrames: Uint8Array[] = []
+    const original = receiver.attachRoute({ async trySend(frame) { oldFrames.push(frame); return true } })
+    await sender.send('preview', 'old observation')
+    const pending = receiver.receive(frames[0]!)
+    try {
+      await blocked.entered
+      original.close()
+      receiver.attachRoute({ async trySend(frame) { newFrames.push(frame); return true } })
+      blocked.release()
+      expect((await pending)?.payload).toBe('old observation')
+      expect(oldFrames).toEqual([]); expect(newFrames).toEqual([])
+      await sender.send('preview', 'current observation')
+      await receiver.receive(frames[1]!)
+      expect(newFrames).toEqual([frames[1]])
+    } finally { blocked.release() }
+  })
+
   it.each([1, 2])('uses boolean dispatch refusal across %i routes and releases replay capacity', async count => {
     let busy = true, closed = 0
     const frames: Uint8Array[] = [], sender = await channel({ maxSequencesPerSession: 1 })

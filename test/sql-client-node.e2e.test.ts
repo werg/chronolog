@@ -81,7 +81,7 @@ describe('SQL client → RPC → node → reducer', () => {
     const next = await client.transaction(['INSERT INTO final_values (value) VALUES (2)'])
     expect(await terminal(client, next.transactionId)).toMatchObject({ final: false, outcome: { type: 'accepted' } })
     expect((await queryLocal(client, 'SELECT value FROM final_values ORDER BY value')).result.rows).toEqual([[1n], [2n]])
-    expect((await queryLocal(client, 'SELECT value FROM final_values ORDER BY value', [], { view: 'final' })).result.rows).toEqual([[1n]])
+    expect((await client.query('SELECT value FROM final_values ORDER BY value')).result.rows).toEqual([[1n]])
     expect(live.getSnapshot().value?.result?.rows).toEqual([[1n]])
     const nextFinal = next.final({ signal: AbortSignal.timeout(5_000) })
     now += 1_000

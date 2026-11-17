@@ -1,0 +1,26 @@
+{
+  "repository": "werg/tendriller",
+  "source": "90cfb7943206872cda9192c095fd83d68db60f98",
+  "sourceTree": "83198f689ebd61aac7f3f802797f2ec8638e1ac3",
+  "dirty": false,
+  "artifacts": [
+    {
+      "name": "@tendriller/core",
+      "version": "0.3.0-rc.9",
+      "file": "tendriller-sdk-0.3.0-rc.9.tgz",
+      "sha256": "fabee9f51c819cf525a9f90dc937b88e80c5e9dc51b8ac8b3d2a58f008084641"
+    },
+    {
+      "name": "@tendriller/runtime",
+      "version": "0.3.0-rc.9",
+      "file": "tendriller-runtime-0.3.0-rc.9.tgz",
+      "sha256": "bc7e0a497c28c7125bce7fe45d82c638a67869a169cb4edaee659c5a3a790810"
+    },
+    {
+      "name": "@tendriller/engine",
+      "version": "0.3.0-rc.9",
+      "file": "tendriller-engine-0.3.0-rc.9.tgz",
+      "sha256": "c1369f150f35e985e416cee5bd2979ec7bb8db4f4155beb43ebf5e119b8ad2f4"
+    }
+  ]
+}

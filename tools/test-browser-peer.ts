@@ -104,8 +104,8 @@ try {
     "INSERT INTO notes(id,value,clock,noise) VALUES(1,'initial',datetime('now'),randomblob(12))",
   ]
   const transactionId = await page.evaluate(({ schema }) => (globalThis as unknown as TestWindow).chronologBrowserTest.submit('owner', schema, 'schema'), { schema })
-  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('owner', 'SELECT value FROM notes')), [['initial']])
-  await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('owner', "UPDATE notes SET value='bad'")), /SQL|denied|write|profile|authoriz/iu)
+  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('owner', 'SELECT value FROM notes', { view: 'local' })), [['initial']])
+  await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('owner', "UPDATE notes SET value='bad'", { view: 'local' })), /SQL|denied|write|profile|authoriz/iu)
   passed('shared ChronologClient submits signed encrypted records and reads local WASM SQL; local writes denied')
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.advanceFinal('owner'))
   assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('owner', 'SELECT value FROM notes', { view: 'final' })), [['initial']])
@@ -150,7 +150,7 @@ try {
   const recovered = await snapshot('recovered')
   assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.privateCutoff('recovered')), ['987654321'])
   assert.equal(recovered.transactions.filter((row) => row.canonical === prepared.canonical).length, 1)
-  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('recovered', 'SELECT count(*) FROM notes WHERE id=2')), [[1n]])
+  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('recovered', 'SELECT count(*) FROM notes WHERE id=2', { view: 'local' })), [[1n]])
   await compare(recovered)
   passed('termination after durable preparation recovers the original exact canonical transaction once')
   passed('private validator cutoff survives Worker termination without any reconstructing feed record')
@@ -159,7 +159,7 @@ try {
   await page.evaluate(({ steps }) => (globalThis as unknown as TestWindow).chronologBrowserTest.crash('recovered', steps, 'crash-application', 'application'), { steps: applicationSteps })
   await page.evaluate(({ name }) => (globalThis as unknown as TestWindow).chronologBrowserTest.open('final', name), { name })
   await page.evaluate(({ steps }) => (globalThis as unknown as TestWindow).chronologBrowserTest.submit('final', steps, 'crash-application'), { steps: applicationSteps })
-  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('final', 'SELECT count(*) FROM notes WHERE id=3')), [[1n]])
+  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.query('final', 'SELECT count(*) FROM notes WHERE id=3', { view: 'local' })), [[1n]])
   await compare(await snapshot('final'))
   passed('termination after candidate SQL commit safely replays unpublished application state')
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserTest.stop('final'))

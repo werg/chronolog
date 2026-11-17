@@ -1,14 +1,18 @@
-# Application primitives, finality and authority
+# Chronological application primitives, finality and authority
 
-Start with the guarantee the application needs. Chronolog offers a live message
-path and a durable application log. Signals can be used on their own. The current
-durable peer API supports live collaboration: signed timestamp ordering,
-deterministic replay, and a provisional suffix above an immutable final prefix.
-SQL is an optional execution profile of that log. A future asynchronous
-branch/merge profile could reuse signed operations and replay, but would define
-its own inclusion and merge rules without provisional/final APIs. That profile
-is not implemented. A Tendriller page selects its backend explicitly; omitting
-the selection uses hosted Cloudflare application storage.
+This page describes the existing chronological client and its immutable final
+prefix. For the adopted selected-history architecture and new peer application
+API, start with [peer generations](peer-generation-v1.md) and the
+[public session package](../packages/peer-session/README.md). Their explicit
+recovery contract can abandon previously applied work; the chronological
+guarantees below must not be inferred from a completion method's name.
+
+Start with the guarantee the application needs. Signals can be used on their
+own and are independent of either durable history implementation. The
+chronological profile supports signed timestamp ordering, deterministic replay,
+and a provisional suffix above an immutable final prefix. SQL is an optional
+execution profile of that log. A Tendriller page selects its backend explicitly;
+omitting the selection uses hosted Cloudflare application storage.
 
 ## Choose the primitive
 
@@ -88,9 +92,11 @@ rejection can be provisional; once immutable it is `status: 'final', outcome:
 'rejected'`. An exact retry recovers that final rejection without creating a new
 operation or waiting for another finality decision.
 
-`query`, `liveQuery`, `readView` and `changes` default to the final applied
-prefix. Select `view: 'local'` explicitly when the
-UI intentionally presents speculative state and can replace it after replay.
+Application reads default to `final`: `query`, `queryCompiled`, `liveQuery`,
+React query hooks, `readView`, `changes` and durable event reads all select the
+locally applied immutable prefix. Choose `view: 'local'` when the UI intentionally
+presents speculative state and can replace it after replay. A final query reads
+the currently applied prefix; it does not wait for pending work to finish.
 Local execution does not wait for a receipt or validator quorum. It can still
 wait for authorization, acceptable clock bounds or required inputs. Wait
 cancellation stops the caller's wait and leaves a prepared durable operation
@@ -100,10 +106,10 @@ Author dependent work after observing its prerequisite's final accepted result,
 and keep the required business guards in the new program. Automatic timestamps
 advance past the replica's successfully applied history and verified closed-time
 frontier, even when its wall clock trails another writer. Reopening reconstructs
-that floor from retained proofs and application history. Merely receiving an
-unadmitted proposal does not advance it, and it creates no dependency on unseen
-work. Applications should preserve an original observation time as domain data
-instead of calculating ordering timestamps.
+that floor from retained proofs and application history. Receiving proposal bytes
+alone does not advance it; applying an authorized local preview does. The clock
+creates no dependency on unseen work. Applications should preserve an original
+observation time as domain data instead of calculating ordering timestamps.
 
 Governed authoring uses the maximum future skew in signed genesis. If advancing
 the automatic clock would exceed that bound, new authoring fails with
@@ -188,7 +194,7 @@ using the same opaque tokens as `readView()` and its event reader. Tokens identi
 this replica's applied snapshots; they are not global sequence numbers, finality
 proofs or values to parse or order.
 
-The stream emits after successful application reconciliation. SQL-only changes
+The stream reports successfully published application snapshots. SQL-only changes
 and changed outcomes during replay invalidate the local view even when they
 emit no event. Admission, transport and heartbeat bookkeeping alone do not.
 Final subscriptions remain quiet while only speculative state changes. A local
@@ -203,6 +209,8 @@ and does not poll the page host.
 Capture a read view when ready to render, and release it afterward. The captured
 view may be newer than the notification, so its own tokens describe the data
 being displayed. SQL and `readEvents()` on that handle remain pinned together.
+Capturing a view does not eagerly decode its event history; event pages are read
+from the same materializer-owned capture when requested.
 
 Identities come directly from successfully published materializer snapshots. A
 completed, coherent local publication can remain readable while final-prefix

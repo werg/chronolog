@@ -210,4 +210,35 @@ describe('applied application view changes', () => {
     expect((await aborted.next()).done).toBe(true)
     expect((await closed.next()).done).toBe(true)
   })
+
+  it('releases an initial subscription while materialization holds the node mutex', async () => {
+    const f = await fixture(), { node, materialization } = f.current
+    const materialize = materialization.coordinator.materialize.bind(materialization.coordinator)
+    let entered!: () => void, release!: () => void
+    const blocked = new Promise<void>(resolve => { entered = resolve })
+    const resumed = new Promise<void>(resolve => { release = resolve })
+    materialization.coordinator.materialize = async input => {
+      entered()
+      await resumed
+      return materialize(input)
+    }
+    const progress = node.refreshMembership()
+    await blocked
+    const iterator = node.changes()[Symbol.asyncIterator]()
+    const pending = iterator.next()
+    let stopped = false
+    const stopping = iterator.return!().then(() => { stopped = true })
+    try {
+      // No application work is released before checking consumer cancellation.
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(stopped).toBe(true)
+    } finally {
+      release()
+      await progress
+      await stopping
+      await pending
+      materialization.coordinator.materialize = materialize
+    }
+    expect((await iterator.next()).done).toBe(true)
+  })
 })

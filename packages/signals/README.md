@@ -144,8 +144,10 @@ not alter the group's durable protocol or permission grants. The
 maximum configurable TTL is 60 seconds. Queueing does not restart a message's
 TTL, and a local clock rollback cannot revive an expired frame.
 
-A send is one attempt on the currently attached routes. Resolution means at
-least one route accepted local dispatch; it does not acknowledge remote receipt
+A send captures its eligible routes when called; receiving a frame captures its
+eligible relay routes before verification. Closing a route removes it from that
+attempt, and a replacement connection can receive only later attempts. Resolution
+means at least one route accepted local dispatch; it does not acknowledge remote receipt
 or application processing. A healthy route can complete a send while another
 route remains busy. Each route permits at most one unsettled dispatch and has
 its own deadline. Policy and credential work that ignores cancellation stays

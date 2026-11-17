@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -31,15 +33,35 @@ jobs:
         run: |
           pnpm package:signals
           pnpm test:signals-package
-      - name: Check out the exact standalone signal recipe
+      - name: Check out the exact independent application recipes
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: fb1ff7d4219dac4981d512fc0a8a187f3d575910
-          path: artifacts/signal-recipe
+          ref: 5dc1e63365c4d073f03c6491ec5e84ed14c26f73
+          path: artifacts/contrib-recipes
           persist-credentials: false
       - name: Qualify previews through the standalone public package
-        run: node artifacts/signal-recipe/cookbooks/share-live-signals/checks/run.mjs --signals-module artifacts/signals/index.mjs > artifacts/signals/contrib.consumer.json
+        run: node artifacts/contrib-recipes/cookbooks/share-live-signals/checks/run.mjs --signals-module artifacts/signals/index.mjs > artifacts/signals/contrib.consumer.json
+      - name: Build the clean public peer-session package
+        run: node tools/package-peer-session.mjs --output artifacts/peer-session
+      - name: Qualify an independent application through the packed peer session
+        shell: bash
+        run: |
+          archives=(artifacts/peer-session/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/contrib-recipes/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --output artifacts/peer-session-consumer
+      - name: Preserve public peer-session qualification
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: peer-session-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/peer-session/*.tgz
+            artifacts/peer-session/package/provenance.json
+            artifacts/peer-session-consumer/report.json
+            artifacts/peer-session-consumer/summary.json
+          if-no-files-found: warn
+          retention-days: 30
       - name: Preserve the standalone live-signal package
         if: always()
         uses: actions/upload-artifact@v6

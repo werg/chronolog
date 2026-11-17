@@ -219,6 +219,7 @@ class Replica implements PeerReplica {
     const generation = authority.current!, head = this.#heads.get(generation.id)!
     // No await between these assignments: even synchronous status observers see
     // either the old complete publication or the new complete publication.
+    if (this.#authority.current?.id !== generation.id) this.#coverage.clear()
     this.#authority = authority
     this.#selected = selected; this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
     this.#publishedRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
@@ -310,34 +311,59 @@ class Replica implements PeerReplica {
     })
   }
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> { return this.synchronize(authority, []) }
-  synchronize(input: AuthorityBundle, inputCommands: readonly OrderedCommand[]): Promise<RecoveryNotice | null> {
-    const bundle = structuredClone(input), commands = structuredClone(inputCommands)
-    return this.#serial.run(async () => {
-      this.#assertOpen(); check(commands.length <= this.#maxRecords, 'PEER_REPLICATION_BATCH_LIMIT')
+  synchronize(input: AuthorityBundle, inputCommands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>, options: { readonly at?: PeerRevision } = {}): Promise<RecoveryNotice | null> {
+    const bundle = structuredClone(input), at = structuredClone(options.at)
+    const commands = isArray(inputCommands) ? structuredClone(inputCommands as readonly OrderedCommand[]) : inputCommands
+    return (async () => {
       const next = await verifyAuthorityBundle(bundle, this.#authority.bundle.descriptor)
-      assertExtension(this.#authority, next)
-      for (const generation of next.bundle.generations) await this.#loadGeneration(generation, next)
-      for (const command of commands) await this.#retain(command, next, true)
-      const previous = this.generation, previousIds = new Set(this.#selectedIds)
-      this.#selectedHistory(next)
-      // Pin selection before publishing the new materialization. A crash can
-      // replay the retained evidence; readers remain serialized until both agree.
-      await this.#write(`${this.#prefix}/authority`, encodePeerValue(next.bundle))
-      try { await this.#materialize(next) } catch (error) { this.#closed = true; throw error }
-      this.#authority = next
-      let notice: RecoveryNotice | null = null
-      if (previous.id !== this.generation.id) {
-        const abandoned: OperationState[] = []
-        for (const [id, attempt] of this.#attempts) if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
-        notice = { previousGeneration: previous.id, generation: this.generation.id, adopted: this.generation.payload.adopted,
-          revision: this.revision, abandoned: abandoned.slice(0, 1024),
-          unknownLoss: ![...previousIds].some(id => !this.#selectedIds.has(id)) }
-        this.#recoveries.push(structuredClone(notice)); if (this.#recoveries.length > 32) this.#recoveries.shift()
-        await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(this.#recoveries))
-        for (const listener of [...this.#recoveryListeners]) { try { listener(structuredClone(notice)) } catch { /* Observers are isolated. */ } }
+      if (at !== undefined) {
+        validatePeerRevision(at)
+        check(at.applicationId === this.descriptor.applicationId && at.historyId === this.descriptor.historyId &&
+          at.generation === next.current?.id && at.point.generation === at.generation && at.controlRevision === next.current.payload.controlRevision,
+        'PEER_REPLICATION_TARGET_INVALID')
       }
-      this.#publish(); return notice
-    })
+      await this.#serial.run(async () => {
+        this.#assertOpen(); assertExtension(this.#authority, next)
+        for (const generation of next.bundle.generations) await this.#loadGeneration(generation, next)
+      })
+      let count = 0
+      // Fetch outside the serial section: the other peer may simultaneously
+      // need our retained ranges. Each page is copied before asynchronous checks.
+      for await (const inputPage of replicationPages(commands)) {
+        check(isArray(inputPage) && inputPage.length > 0 && inputPage.length <= 4096, 'PEER_REPLICATION_BATCH_LIMIT')
+        count += inputPage.length; check(count <= this.#maxRecords, 'PEER_REPLICATION_BATCH_LIMIT')
+        const page = structuredClone(inputPage)
+        await this.#serial.run(async () => {
+          this.#assertOpen(); assertExtension(this.#authority, next)
+          for (const command of page) await this.#retain(command, next, true)
+        })
+      }
+      return this.#serial.run(async () => {
+        this.#assertOpen(); assertExtension(this.#authority, next)
+        const previous = this.generation
+        this.#selectedHistory(next)
+        if (at !== undefined) check(this.#pointAvailable(at.point, next), 'PEER_REPLICATION_TARGET_INCOMPLETE')
+        // Pin selection before publishing the new materialization. A crash can
+        // replay the retained evidence; readers remain serialized until both agree.
+        await this.#write(`${this.#prefix}/authority`, encodePeerValue(next.bundle))
+        try { await this.#materialize(next) } catch (error) { this.#closed = true; throw error }
+        this.#authority = next
+        let notice: RecoveryNotice | null = null
+        if (previous.id !== this.generation.id) {
+          const abandoned: OperationState[] = []
+          for (const [id, attempt] of this.#attempts) if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
+          notice = { previousGeneration: previous.id, generation: this.generation.id, adopted: this.generation.payload.adopted,
+            revision: this.revision, abandoned: abandoned.slice(0, 1024),
+            // A known abandoned suffix says nothing about work retained only by
+            // the former coordinator. This protocol does not certify its last head.
+            unknownLoss: true }
+          this.#recoveries.push(structuredClone(notice)); if (this.#recoveries.length > 32) this.#recoveries.shift()
+          await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(this.#recoveries))
+          for (const listener of [...this.#recoveryListeners]) { try { listener(structuredClone(notice)) } catch { /* Observers are isolated. */ } }
+        }
+        this.#publish(); return notice
+      })
+    })()
   }
   #state(attempt: SignedAttempt): OperationState {
     const header = attempt.payload.header, previous = this.#lastOutcomes.get(attempt.id)
@@ -400,11 +426,14 @@ class Replica implements PeerReplica {
       return this.#selected.slice(start, Math.min(end, start + limit)).map(value => structuredClone(value.command))
     })
   }
-  retainedCoverage(): Promise<SignedRetainedCoverage> {
+  retainedCoverage(input?: HistoryPoint): Promise<SignedRetainedCoverage> {
+    const captured = structuredClone(input)
     return this.#serial.run(async () => {
       this.#assertReady()
+      const point = captured ?? this.revision.point
+      check(this.#pointAvailable(point), 'PEER_RECOVERY_PREFIX_INCOMPLETE')
       return signPeerValue(DOMAINS.peerCoverage, { applicationId: this.descriptor.applicationId, generation: this.generation.id,
-        point: this.revision.point, peer: this.device.publicKey, storageId: this.#options.storageId, retainedAt: this.#now() }, this.device)
+        point, peer: this.device.publicKey, storageId: this.#options.storageId, retainedAt: this.#now() }, this.device)
     })
   }
   observeCoverage(input: SignedRetainedCoverage): Promise<void> {
@@ -416,13 +445,18 @@ class Replica implements PeerReplica {
       check(value.applicationId === this.descriptor.applicationId && value.generation === this.generation.id &&
         this.#authority.grant(value.peer)?.reader === true && this.#pointAvailable(value.point) && Number.isSafeInteger(value.retainedAt) && value.retainedAt >= 0,
       'PEER_COVERAGE_INVALID')
-      this.#coverage.set(`${value.peer}/${value.storageId}`, coverage); this.#publish()
+      // One signing identity is one peer, regardless of how many storage IDs
+      // it advertises. The current signed grant roster bounds this map.
+      const previous = this.#coverage.get(value.peer)
+      if (previous !== undefined && !this.#authority.atOrAfter(value.point, previous.payload.point)) return
+      this.#coverage.set(value.peer, coverage); this.#publish()
     })
   }
   shared(point = this.revision.point): readonly SignedRetainedCoverage[] {
     this.#assertReady()
     return [...this.#coverage.values()].filter(value => value.payload.storageId !== this.#options.storageId &&
       value.payload.peer !== this.device.publicKey && value.payload.generation === this.generation.id &&
+      this.#authority.grant(value.payload.peer)?.reader === true &&
       this.#pointAvailable(value.payload.point) && this.#authority.atOrAfter(value.payload.point, point)).map(value => structuredClone(value))
   }
   #now(): number { const now = (this.#options.now ?? Date.now)(); check(Number.isSafeInteger(now) && now >= 0, 'PEER_CLOCK_INVALID'); return now }
@@ -438,6 +472,13 @@ class Replica implements PeerReplica {
       finally { activeOwners.get(this.#options.store)?.delete(this.descriptor.applicationId) }
     })
   }
+}
+
+async function* replicationPages(commands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>): AsyncGenerator<readonly OrderedCommand[]> {
+  if (isArray(commands)) {
+    const values = commands as readonly OrderedCommand[]
+    for (let offset = 0; offset < values.length; offset += 4096) yield values.slice(offset, offset + 4096)
+  } else yield* commands as AsyncIterable<readonly OrderedCommand[]>
 }
 
 function assertExtension(previous: PeerAuthority, next: PeerAuthority): void {

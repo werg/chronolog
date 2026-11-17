@@ -13,6 +13,7 @@ import { defineApplication, defineCommand, defineQuery, applicationDefinitionDig
 import { connectApplications, AbandonedOperationError, RecoveredViewError, type ApplicationReadView, type ApplicationSession } from './session.js'
 import { openNativeApplication, openNativeDevice } from './native.js'
 import { createApplicationTools, serveApplicationToolLines } from './tools.js'
+import { sessionInternals } from './internals.js'
 
 const definition = defineApplication({ id: 'messages', version: '1', commands: {
   say: defineCommand({ description: 'Post a message', input: { type: 'string', minLength: 1 }, prepare: text => program(emit('message', { text })) }),
@@ -97,6 +98,26 @@ describe('public peer application sessions', () => {
     expect((await b.operations.inspect('lost'))?.attempt).toEqual(original?.attempt)
     expect((await a.query('messages', null)).value.events).toHaveLength(1)
     await changes.return?.()
+  })
+
+  it('acknowledges the transferred prefix when the coordinator advances before the retention reply', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await applied(a, 'captured', 'captured')
+    const replica = sessionInternals.get(b)!.replica
+    const retainedCoverage = replica.retainedCoverage.bind(replica)
+    let advanced = false
+    replica.retainedCoverage = async point => {
+      const coverage = await retainedCoverage(point)
+      if (!advanced) { advanced = true; await applied(a, 'newer than captured', 'later') }
+      return coverage
+    }
+    const link = await connectApplications(a, b)
+    cleanup.push(() => link.close())
+    await link.synchronize()
+    expect(advanced).toBe(true)
+    expect(a.status.connectedPeers).toBe(1)
+    expect(b.status.connectedPeers).toBe(1)
+    expect((await b.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['captured', 'later'])
   })
 
   it('atomically resets recovery views, preserves abandoned evidence and links a deliberate reapplication', async () => {

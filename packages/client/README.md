@@ -165,7 +165,7 @@ Automatic retries of that call preserve the operation ID; a fresh call creates a
 new operation. `transaction(steps)` is a convenience compiler for the same
 canonical `submit(program, { operationId })` path used by durable events.
 
-## Read local or final SQL explicitly
+## Read final SQL or preview local state
 
 ```ts
 const final = await client.query('SELECT id, balance FROM accounts ORDER BY id')
@@ -180,18 +180,25 @@ console.log(final.revision.finalOrderLength) // decimal string
 ```
 
 The default `final` reader is a separate SQL snapshot of the locally applied
-immutable prefix. Opt into `view: 'local'` for the applied final prefix plus its
-selected provisional suffix. An unadmitted preview can leave that suffix; an
-admitted proposal stays included while its application outcome can still change
-through replay.
+immutable prefix. It reads the current final state immediately; it does not
+wait for pending writes. Await a write's `final()` result and check that
+`outcome.type` is `accepted` before depending on its immutable effects.
+
+Choose `view: 'local'` for a preview that includes the applied final prefix and
+a selected provisional suffix. A locally authorized proposal can appear before consensus
+admission and disappear if excluded. Admission makes its inclusion immutable,
+but its provisional application outcome can still change through replay.
 Both carry view, selected revision, order length, final-prefix metadata and
 execution-manifest identity. A final replica can still be behind other peers.
 
+`queryCompiled`, `liveQuery` and React's `useChronologQuery` also default to
+`final`, matching `readView`, `changes` and durable event reads.
 `liveQuery(sql, parameters, { view })` follows the chosen reader and returns a
 lazy `StreamResource`. Subscribe for snapshot updates or iterate it; dispose
 the resource when no longer needed. Final live queries advance only when that
 replica applies a larger final prefix. React's `useChronologQuery` accepts the
-same `view` option and includes it in the resource identity.
+same explicit `view: 'local'` option for previews and includes the resolved view
+in the resource identity.
 
 ## Observe and capture an application view
 
@@ -221,6 +228,10 @@ and match the captured-read API; compare them for equality, without parsing
 them or treating them as global progress. A read captured after notification
 may already be newer, so render using that handle's own tokens. A captured view
 does not change while it is held, including across a local rebase.
+The materializer owns that capture; effective event pages are decoded only when
+read, so opening a SQL view does not scan the complete event history. A coherent
+published local view remains readable while a later final-prefix publication
+or reconciliation step retries.
 
 Only successful publication of an applied view changes these identities. SQL-only
 transactions and replayed outcomes can invalidate a local view without emitting

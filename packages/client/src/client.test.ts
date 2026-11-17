@@ -1,5 +1,5 @@
 import { decodeChangeProgram, type SqlStatement } from '@chronolog/protocol'
-import type { RpcTransport, SubmitChangeRequest, SubmitTransactionResponse } from '@chronolog/rpc'
+import type { LocalSqlRequest, LocalSqlResponse, RpcCallOptions, RpcTransport, SubmitChangeRequest, SubmitTransactionResponse } from '@chronolog/rpc'
 import { describe, expect, it } from 'vitest'
 
 import { ChronologClient } from './client.js'
@@ -101,6 +101,7 @@ describe('ChronologClient policy views and enrollment', () => {
     } as unknown as RpcTransport
     const client = new ChronologClient({ transport, groupId: 'group', requestId: () => 'query-id' })
     expect((await client.query('SELECT 42')).result.rows).toEqual([[42n]])
+    expect(client.queryResourceKey('SELECT 42')).toBe(client.queryResourceKey('SELECT 42', [], 'final'))
     expect(client.queryResourceKey('SELECT 42', [], 'local')).not.toBe(client.queryResourceKey('SELECT 42', [], 'final'))
     expect(await client.enrollment.createRequest({ requestId: 'device-join', roles: ['reader'] })).toEqual({ signedRequest: 'signed-request' })
     expect(await client.enrollment.approveRequest({ operationId: 'approve-join', signedRequest: 'signed-request', roles: ['reader'], grantFullHistory: true }))
@@ -113,5 +114,59 @@ describe('ChronologClient policy views and enrollment', () => {
       { method: 'enrollment.getStatus', request: { groupId: 'group', requestId: 'device-join', signedApproval: 'signed-approval' } },
     ])
     await client.close()
+  })
+
+  it('defaults queries and live queries to final while keeping local previews explicit', async () => {
+    const calls: Array<{ readonly method: string; readonly view: LocalSqlRequest['view'] }> = []
+    const response = (request: LocalSqlRequest): LocalSqlResponse => {
+      // Deliberately use local if the client forgets to transmit its default.
+      const view = request.view ?? 'local'
+      return {
+        revision: { groupId: 'group', view, eventSetRevision: '4', materializedRevision: view === 'final' ? '2' : '6',
+          publishedOrderLength: view === 'final' ? '1' : '3', finalRevision: '2', finalOrderLength: '1', executionManifestDigest: 'manifest', replaying: false },
+        result: { columns: [{ name: 'value' }], rows: [[{ kind: 'integer', value: view === 'final' ? '10' : '30' }]], truncated: false, consensusSafe: false },
+      }
+    }
+    const transport = {
+      async unary(method: string, request: LocalSqlRequest) {
+        calls.push({ method, view: request.view })
+        return response(request)
+      },
+      stream(method: string, request: LocalSqlRequest, options: RpcCallOptions) {
+        calls.push({ method, view: request.view })
+        return { async *[Symbol.asyncIterator]() {
+          yield { type: 'snapshot', queryDigest: request.view, ...response(request) }
+          await new Promise<void>((resolve) => {
+            if (options.signal?.aborted) resolve()
+            else options.signal?.addEventListener('abort', () => resolve(), { once: true })
+          })
+        } }
+      },
+    } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group' })
+    try {
+      expect((await client.query('SELECT value')).result.rows).toEqual([[10n]])
+      expect((await client.queryCompiled({ sql: 'SELECT value' })).revision.view).toBe('final')
+      expect((await client.query('SELECT value', [], { view: 'local' })).result.rows).toEqual([[30n]])
+      for (const view of [undefined, 'local'] as const) {
+        const resource = client.liveQuery('SELECT value', [], view === undefined ? {} : { view })
+        const iterator = resource[Symbol.asyncIterator]()
+        try {
+          const snapshot = (await iterator.next()).value
+          expect(snapshot?.revision.view).toBe(view ?? 'final')
+          expect(snapshot?.result?.rows).toEqual([[view === 'local' ? 30n : 10n]])
+        } finally {
+          resource.dispose()
+          await iterator.return?.()
+        }
+      }
+      expect(calls).toEqual([
+        { method: 'query.localSql', view: 'final' },
+        { method: 'query.localSql', view: 'final' },
+        { method: 'query.localSql', view: 'local' },
+        { method: 'query.liveSql', view: 'final' },
+        { method: 'query.liveSql', view: 'local' },
+      ])
+    } finally { await client.close() }
   })
 })

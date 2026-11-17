@@ -81,7 +81,7 @@ export interface QueryOptions {
   readonly signal?: AbortSignal
   readonly maxRows?: number
   readonly atRevision?: string
-  /** Defaults to final. Select local explicitly for a speculative, replayable view. */
+  /** Defaults to final, the applied immutable SQL prefix; local includes speculative state. */
   readonly view?: SqlView
 }
 

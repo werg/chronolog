@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { program, emit } from '@chronolog/protocol'
 import { RevisionBroadcaster, type NodeRevisionEvent } from '@chronolog/node-core'
+import type { ApplicationChangeOptions } from '@tendriller/core/application'
 import { createChronologApplicationBackend, type ClientApplicationSource, type NodeApplicationSource } from './application.js'
 
 function fixture() {
   type RawStatus = NonNullable<Awaited<ReturnType<NodeApplicationSource['operation']>>>
   let current: RawStatus | null = null, revision = 0n, reads = 0, watchers = 0, released = 0, changesReleased = 0
-  const calls: unknown[] = [], parameters: unknown[] = [], changeCalls: unknown[] = [], revisions = new RevisionBroadcaster<NodeRevisionEvent>()
+  const calls: unknown[] = [], parameters: unknown[] = [], changeCalls: unknown[] = [], viewCalls: unknown[] = [], revisions = new RevisionBroadcaster<NodeRevisionEvent>()
   const batch = { revision: 'pinned', transactions: [], scannedThrough: 'cursor', hasMore: false }
   const changes = { async *[Symbol.asyncIterator]() {
     try { yield { view: 'final' as const, revision: batch.revision, finalRevision: batch.revision } }
@@ -23,13 +24,21 @@ function fixture() {
     },
     events: { read: async () => batch, async *subscribe() { yield batch } },
     changes(options: unknown) { changeCalls.push(options); return changes },
-    async readView(options: { view?: 'local' | 'final' } = {}) { return { view: options.view ?? 'final', revision: batch.revision,
+    async readView(options: { view?: 'local' | 'final' } = {}) { viewCalls.push(options); return { view: options.view ?? 'final', revision: batch.revision,
       finalRevision: options.view === 'local' ? 'pinned-final' : batch.revision,
       query(_sql: string, values: unknown[]) { parameters.push(values); return { columns: [{ name: 'count' }], rows: [[{ kind: 'integer', value: '7' }]] } },
       readEvents: () => batch, release() { released++ },
     } },
   } as unknown as NodeApplicationSource
-  return { source, calls, parameters, changes, changeCalls, get changesReleased() { return changesReleased },
+  const client = {
+    changes: source.changes, readView: source.readView, events: source.events,
+    async submit(change: unknown, options: { operationId: string }) {
+      calls.push({ program: change, operationId: options.operationId })
+      return { proposalId: 'original-proposal', dispose() {} }
+    },
+    operations: { get: source.operation, async *subscribe() {} },
+  } as unknown as ClientApplicationSource
+  return { source, client, calls, parameters, changes, changeCalls, viewCalls, get changesReleased() { return changesReleased },
     get reads() { return reads }, get watchers() { return watchers }, get released() { return released },
     set(outcome: 'accepted' | 'rejected' | null, final: boolean) {
       current = { operationId: 'stable', proposalId: 'original-proposal', final,
@@ -50,6 +59,42 @@ describe('selected Chronolog application adapter', () => {
     expect(f.calls).toHaveLength(2)
     expect(() => backend.events.publish('conversation', { text: undefined }, { operationId: 'invalid' })).toThrow()
     expect(f.calls).toHaveLength(2)
+  })
+
+  it.each(['node', 'client'] as const)('rejects ordering barriers before either %s submission path writes', async kind => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: kind === 'node' ? f.source : f.client, sql: false })
+    const change = program(emit('conversation', { text: 'reviewed' }))
+    for (const basedOn of ['captured-revision', '']) {
+      await expect(backend.submit(change, { operationId: 'stable', basedOn })).rejects.toMatchObject({ code: 'unsupported_barrier' })
+      await expect(backend.events.publish('conversation', { text: 'reviewed' }, { operationId: 'stable', basedOn })).rejects.toMatchObject({ code: 'unsupported_barrier' })
+    }
+    expect(f.calls).toEqual([])
+    expect(f.reads).toBe(0)
+    await expect(backend.submit(change, { operationId: 'stable' })).resolves.toEqual({ operationId: 'stable', proposalId: 'original-proposal', status: 'queued' })
+    await expect(backend.events.publish('conversation', { text: 'reviewed' }, { operationId: 'stable' })).resolves.toMatchObject({ proposalId: 'original-proposal', status: 'queued' })
+    expect(f.calls).toEqual([{ program: change, operationId: 'stable' }, { program: change, operationId: 'stable' }])
+  })
+
+  it.each(['node', 'client'] as const)('rejects unsupported %s views before observing or capturing a replica', async kind => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: kind === 'node' ? f.source : f.client, sql: false })
+    for (const view of ['applied', 'eventual', '', null, 1, {}]) {
+      const options = { view } as unknown as ApplicationChangeOptions
+      expect(() => backend.changes(options)).toThrowError(expect.objectContaining({ code: 'invalid_view' }))
+      await expect(backend.readView(options)).rejects.toMatchObject({ code: 'invalid_view' })
+    }
+    expect(f.changeCalls).toEqual([])
+    expect(f.viewCalls).toEqual([])
+    for (const view of ['local', 'final'] as const) {
+      expect(backend.changes({ view })).toBe(f.changes)
+      const captured = await backend.readView({ view })
+      expect(captured).toMatchObject({ view, revision: 'pinned', finalRevision: view === 'local' ? 'pinned-final' : 'pinned' })
+      await captured.release()
+    }
+    const captured = await backend.readView()
+    expect(captured).toMatchObject({ view: 'final', finalRevision: 'pinned' })
+    await captured.release()
+    expect(f.changeCalls).toEqual([{ view: 'local' }, { view: 'final' }])
+    expect(f.viewCalls).toEqual([{ view: 'local' }, { view: 'final' }, { view: 'final' }])
   })
 
   it('keeps speculative rejection provisional and observes finality even when its outcome does not change', async () => {

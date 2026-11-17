@@ -11,8 +11,8 @@ export interface OpenPeerApplicationOptions<D extends ApplicationDefinition = Ap
   readonly definition: D
   readonly authority: AuthorityBundle
   readonly epochKeys: ReadonlyMap<number, Uint8Array>
-  /** The events path needs no SQL/WASM. SQL runtimes supply the verified engine here. */
-  readonly materializer?: ChronologMaterializationRuntime
+  /** Called after claiming the device; the session owns the returned runtime. Events need no factory. */
+  readonly createMaterializer?: () => ChronologMaterializationRuntime | Promise<ChronologMaterializationRuntime>
   readonly maxRecords?: number
   readonly maxHistoryBytes?: number
 }
@@ -22,9 +22,9 @@ export async function openPeerApplication<const D extends ApplicationDefinition>
   let materializer: ChronologMaterializationRuntime | undefined
   try {
     if (await applicationDefinitionDigest(options.definition) !== options.authority.descriptor.payload.definitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
-    materializer = options.materializer ?? await createEventMaterializationRuntime({ store: options.device.store,
+    materializer = options.createMaterializer === undefined ? await createEventMaterializationRuntime({ store: options.device.store,
       namespace: options.authority.descriptor.payload.historyId, historyProfile: 'peer-generation-v1',
-      ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) })
+      ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) }) : await options.createMaterializer()
     const input: PeerReplicaOptions = { authority: options.authority, device: options.device.identity,
       store: options.device.store, storageId: options.device.storageId, epochKeys: options.epochKeys, materializer,
       ...(options.maxRecords === undefined ? {} : { maxRecords: options.maxRecords }),

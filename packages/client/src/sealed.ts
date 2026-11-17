@@ -164,8 +164,10 @@ export class SealedDataActions {
   }
 
   async #putCopied(requestedPolicyId: Uint8Array, slot: string, plaintext: Uint8Array, options: SealedPutOptions): Promise<SealedPutChange> {
-    const queryOptions: QueryOptions = { view: options.allowProvisionalPolicy === true ? 'local' : 'final',
-      ...(options.signal === undefined ? {} : { signal: options.signal }) }
+    // Observe pending audience changes before encrypting, even though ordinary
+    // application reads default to final. The outcome check below must reject
+    // an unfinalized local policy instead of silently using its older audience.
+    const queryOptions: QueryOptions = { view: 'local', ...(options.signal === undefined ? {} : { signal: options.signal }) }
     const policy = await this.policy(requestedPolicyId, queryOptions)
     if (policy === null || policy.closed) throw new Error('SEALED_POLICY_UNAVAILABLE')
     if (options.expectedPolicyVersion !== undefined && options.expectedPolicyVersion !== policy.version) {

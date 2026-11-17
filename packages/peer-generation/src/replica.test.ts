@@ -79,6 +79,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect((await c.operation('one', f.a.publicKey))?.status).toBe('applied')
     const notice = await a.synchronize(await f.registry.read(), await b.exportCommands())
     expect(notice?.abandoned).toContainEqual(expect.objectContaining({ operationId: 'two', status: 'abandoned' }))
+    expect(notice?.unknownLoss, 'known abandoned work does not prove that no unseen suffix exists').toBe(true)
     expect((await a.operation('two'))?.status).toBe('abandoned')
     expect(held.read.orderLength).toBe(2); held.release()
     await expect(a.prepare({ operationId: 'stale-view', program: event('stale'), basedOn: oldRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
@@ -130,9 +131,94 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     const another = await a.prepare({ operationId: 'two', program: event('two') })
     await expect(a.order(another)).rejects.toThrow('PEER_COORDINATOR_FENCED')
   })
+  it('retains bounded pages outside the serial lock and publishes only the complete captured target', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'one', program: event('one') }))
+    const first = a.revision
+    await a.order(await a.prepare({ operationId: 'two', program: event('two') }))
+    const commands = await a.exportCommands(), target = a.revision, before = b.revision
+    let observed = 0
+    async function* pages() {
+      for (const command of commands) {
+        // A network source may need this replica's ranges before returning its
+        // next page. Holding the serial lock across next() would deadlock here.
+        const view = await b.capture()
+        try { expect(view.revision).toEqual(before); expect(view.read.orderLength).toBe(0); observed++ }
+        finally { view.release() }
+        yield [command]
+      }
+    }
+    await b.synchronize(a.authority, pages(), { at: target })
+    expect(observed).toBe(2)
+    expect(b.revision.point).toEqual(target.point)
+    const coverage = await b.retainedCoverage(first.point)
+    expect(coverage.payload.point).toEqual(first.point)
+    await a.observeCoverage(coverage)
+    expect(a.shared(first.point)).toHaveLength(1)
+    expect(a.shared(target.point)).toHaveLength(0)
+  })
+  it('rejects an incomplete captured tail and retries exactly from retained pages', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'one', program: event('one') }))
+    await a.order(await a.prepare({ operationId: 'two', program: event('two') }))
+    const commands = await a.exportCommands(), target = a.revision, before = b.revision
+    async function* incomplete() { yield commands.slice(0, 1) }
+    await expect(b.synchronize(a.authority, incomplete(), { at: target })).rejects.toThrow('PEER_REPLICATION_TARGET_INCOMPLETE')
+    expect(b.revision).toEqual(before)
+    async function* complete() { for (const command of commands) yield [command] }
+    await b.synchronize(a.authority, complete(), { at: target })
+    expect(await b.exportCommands()).toEqual(commands)
+    expect(b.revision.point).toEqual(target.point)
+  })
+  it('does not publish an older captured generation after authority changes between pages', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const base = await b.recoveryPoint()
+    await a.order(await a.prepare({ operationId: 'one', program: event('one') }))
+    await a.order(await a.prepare({ operationId: 'two', program: event('two') }))
+    const commands = await a.exportCommands(), target = a.revision
+    let generation = ''
+    async function* pages() {
+      yield commands.slice(0, 1)
+      generation = (await f.select(f.b, base, 'during-transfer')).id
+      await b.adopt(await f.registry.read())
+      yield commands.slice(1)
+    }
+    await expect(b.synchronize(a.authority, pages(), { at: target })).rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    expect(b.revision.generation).toBe(generation)
+    expect(b.revision.point.sequence).toBe(0)
+    expect(await b.exportCommands()).toEqual([])
+  })
   it('does not count a second tab on the same storage owner as a separate copy', async () => {
     const f = await fixture(), a = await f.open(f.a, undefined, undefined, 'same-device'), b = await f.open(f.b, undefined, undefined, 'same-device')
     await a.observeCoverage(await b.retainedCoverage())
     expect(a.shared()).toHaveLength(0)
+  })
+  it('bounds retention evidence by current peer identity and refuses stale or revoked claims', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const old = await b.retainedCoverage()
+    await a.order(await a.prepare({ operationId: 'retained', program: event('retained') }))
+    await b.ingest(await a.exportCommands())
+    const latest = await b.retainedCoverage()
+    for (let index = 0; index < 32; index++) {
+      await a.observeCoverage(await signPeerValue('chronolog/peer-generation/coverage/v1',
+        { ...latest.payload, storageId: `claimed-store-${index}` }, f.b))
+    }
+    expect(a.shared()).toHaveLength(1)
+    await a.observeCoverage(old)
+    expect(a.shared()).toHaveLength(1)
+    expect(a.shared()[0]?.payload.point).toEqual(latest.payload.point)
+
+    const key = crypto.getRandomValues(new Uint8Array(32)); f.keys.set(1, key)
+    const next = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
+      epoch: 1, keyDigest: await bytesDigest(key), grants: f.control.payload.grants.filter(grant => grant.publicKey !== f.b.publicKey) }, f.host)
+    await f.registry.select(await signTransitionRequest({ applicationId: a.descriptor.applicationId, profile: a.descriptor.profile,
+      policy: a.descriptor.policy, expectedGeneration: a.generation.id, coordinator: f.a.publicKey, requester: f.a.publicKey,
+      controlRevision: 1, base: await a.recoveryPoint(), transitionId: 'revoke-reader', reason: 'control-change' }, f.a), { control: next })
+    await a.adopt(await f.registry.read())
+    expect(a.shared()).toEqual([])
+    await expect(a.observeCoverage(latest)).rejects.toThrow('PEER_COVERAGE_INVALID')
+    const revoked = await signPeerValue('chronolog/peer-generation/coverage/v1',
+      { ...latest.payload, generation: a.generation.id, point: a.revision.point }, f.b)
+    await expect(a.observeCoverage(revoked)).rejects.toThrow('PEER_COVERAGE_INVALID')
   })
 })
