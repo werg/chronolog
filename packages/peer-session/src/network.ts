@@ -485,8 +485,8 @@ class NetworkPeer implements ApplicationPeerLink {
           { generation: command.receipt.payload.generation, sequence: command.receipt.payload.sequence, root: command.receipt.root }))
       } else if (method === 'submit') {
         const attempt = input as SignedAttempt
-        requireNetwork(attempt?.payload?.header?.author === this.peerId && grant(replica, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
-        await replica.order(attempt); this.#reader(); requireNetwork(grant(replica, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+        requireNetwork(attempt?.payload?.header?.author === this.peerId && grant(participant, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+        await replica.order(attempt); this.#reader(); requireNetwork(grant(participant, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
       } else if (method === 'coverage') {
         const request = record(input, ['generation', 'point'])
         validateHistoryPoint(request.point as HistoryPoint)
