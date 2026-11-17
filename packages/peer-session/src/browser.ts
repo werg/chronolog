@@ -3,6 +3,7 @@ import { acquireBrowserStorage } from '@chronolog/records/browser'
 import { openApplicationDevice, type ApplicationDevice } from './device.js'
 export { openPeerApplication as openBrowserApplication } from './runtime.js'
 export type { OpenPeerApplicationOptions } from './runtime.js'
+export { serveApplicationWorker, connectApplicationWorker, WorkerApplicationSession, type WorkerApplicationReadView } from './worker-application.js'
 
 /** Open in the owning Worker. Missing storage capabilities and second-tab ownership fail explicitly. */
 export async function openBrowserDevice(options: { readonly name: string; readonly create?: true }): Promise<ApplicationDevice> {
