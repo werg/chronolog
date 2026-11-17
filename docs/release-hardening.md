@@ -87,6 +87,12 @@ hosted and WebRTC adapters are absent. The adjacent `.consumer.json` records the
 archive hash, source commit and checks; it does not depend on source aliases or
 development modules.
 
+By default, the consumer requires exactly one archive whose manifest matches
+the current commit, operating system and architecture. Older archives cannot
+silently qualify a new build. To inspect an explicitly selected historical
+archive, pass `--artifact /path/to/archive.tar.gz`; add
+`--expected-source <full-commit-sha>` when that source must be pinned.
+
 The upgrade drill verifies the package, starts it on a fresh persistent data
 directory, checks health and CLI status, stops cleanly, verifies the replacement
 package, and reopens the same identity, SSB feed, execution manifest,

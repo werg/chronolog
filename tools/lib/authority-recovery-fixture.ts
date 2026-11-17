@@ -3,17 +3,17 @@ import { mkdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
-import { decodeSignedGenesis } from '@chronolog/capabilities'
+import { decodeSignedGenesis, encodeGenesisManifest, verifySignedGenesis } from '@chronolog/capabilities'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import {
   createGovernedNode, decodeFinalityClosureRecord, decodeLedgerRecord, decodeOrderingEvidence,
   isFinalityClosureRecord, loadOrCreateEnrollmentIdentity,
-  ReferenceRecordLog, verifyPrefixCertificate,
-  type DurableOperationStore, type OrderedRecordHead,
+  evaluateFinalitySnapshot, orderedGenesisRoot, ReferenceRecordLog, verifyPrefixCertificate,
+  type CoordinatedHistoryConfiguration, type DurableOperationStore, type OrderedRecordHead,
 } from '@chronolog/node-core'
 import {
-  assertCanonicalCbor, bytesToBase64Url, bytesToHex, decodeEnvelope, emit, encodeCanonicalCbor, executionManifestArtifacts, program, sqlStatement,
+  assertCanonicalCbor, bytesToBase64Url, bytesToHex, decodeEnvelope, DOMAINS, emit, encodeCanonicalCbor, executionManifestArtifacts, hashDomain, program, sqlStatement,
 } from '@chronolog/protocol'
 import { DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 
@@ -222,7 +222,7 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
         assert.equal((await terminal('recovery-schema')).proposalId, receipt.txIdText)
         await settle()
       },
-      submit, terminal, inspect, settle,
+      submit, terminal, inspect, settle, advanceClock,
       async close() {
         await agent!.close()
         try { await governed!.close() } finally { control.close(); store.close() }
@@ -241,20 +241,62 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
 export async function inspectStoppedAuthority(directory: string) {
   const document = JSON.parse(await readFile(join(directory, 'governance.json'), 'utf8')) as { signedGenesis: string }
   const genesis = decodeSignedGenesis(Uint8Array.from(Buffer.from(document.signedGenesis, 'base64')))
-  const historyId = genesis.manifest.historyPolicy?.historyId
-  assert(historyId !== undefined)
+  assert(await verifySignedGenesis(genesis), 'RECOVERY_GENESIS_INVALID')
+  const policy = genesis.manifest.historyPolicy
+  assert(policy?.kind === 'coordinated' && policy.historyId !== undefined && policy.authorityPublicKey !== undefined)
+  assert.deepEqual(policy.executionManifestDigest, genesis.manifest.schemaId)
+  const historyId = policy.historyId
+  const configuration: CoordinatedHistoryConfiguration = { kind: 'coordinated', historyId, authorityPublicKey: policy.authorityPublicKey,
+    groupId: genesis.manifest.groupId, genesisDigest: await hashDomain(DOMAINS.genesis, encodeGenesisManifest(genesis.manifest)),
+    executionManifestDigest: policy.executionManifestDigest,
+    ...(policy.providerId === undefined ? {} : { providerId: policy.providerId }),
+    ...(policy.providerParameters === undefined ? {} : { providerParameters: policy.providerParameters }) }
   const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
   try {
     const log = await ReferenceRecordLog.open(historyId, store, { requireExisting: true })
-    const entries = await log.read(), certificate = await store.get(`agent/authority/${historyId}/certificate`)
+    const entries = await log.read(), saved = await store.get(`agent/authority/${historyId}/certificate`)
+    // Authenticate every retained closure, including a suffix committed after
+    // the last certificate. An interrupted certificate write must not turn that
+    // suffix into trusted finality or allow its signed prefix to be rewritten.
+    await evaluateFinalitySnapshot(configuration, entries)
+    const certificate = saved === null ? null : decodeOrderingEvidence(saved)
+    if (certificate !== null) {
+      assert.equal(certificate.kind, 'prefix-certificate')
+      if (certificate.kind === 'prefix-certificate') {
+        await verifyPrefixCertificate(certificate.certificate, configuration)
+        const prefix = certificate.certificate
+        assert(prefix.position <= entries.length, 'RECOVERY_CERTIFICATE_AHEAD_OF_RETAINED_LOG')
+        assert.equal(prefix.root, prefix.position === 0 ? await orderedGenesisRoot(historyId) : entries[prefix.position - 1]?.root,
+          'RECOVERY_CERTIFICATE_PREFIX_MISMATCH')
+      }
+    }
     return { head: await log.head(), entries: entries.map(entry => ({ position: entry.position, root: entry.root, recordId: entry.recordId,
       kind: isFinalityClosureRecord(entry.bytes) ? 'closure' as const : decodeLedgerRecord(entry.bytes).kind })),
       closures: entries.filter(entry => isFinalityClosureRecord(entry.bytes)).map(entry => ({
         position: entry.position, ...decodeFinalityClosureRecord(entry.bytes),
       })),
       proposalCount: entries.filter(entry => !isFinalityClosureRecord(entry.bytes) && decodeLedgerRecord(entry.bytes).kind === 'candidate').length,
-      certificate: certificate === null ? null : decodeOrderingEvidence(certificate) }
+      certificate }
   } finally { store.close() }
+}
+
+/** The inspector has authenticated this certificate and all retained records. */
+export function certifiedRecoveryFloor(raw: Awaited<ReturnType<typeof inspectStoppedAuthority>>, targetClosure: { readonly position: number },
+  point: 'after_certificate_commit' | 'before_acknowledgement'): OrderedRecordHead {
+  assert(raw.certificate?.kind === 'prefix-certificate', 'RECOVERY_CERTIFICATE_MISSING')
+  const certificate = raw.certificate.certificate
+  assert(certificate.position >= targetClosure.position, 'RECOVERY_TARGET_CLOSURE_NOT_CERTIFIED')
+  assert.equal(certificate.historyId, raw.head.historyId)
+  assert.equal(certificate.root, raw.entries[certificate.position - 1]?.root, 'RECOVERY_CERTIFICATE_PREFIX_MISMATCH')
+  const floor = { historyId: certificate.historyId, position: certificate.position, root: certificate.root }
+  if (point === 'after_certificate_commit') assert.deepEqual(floor, raw.head)
+  else {
+    // Caller acknowledgement is outside the finality mutex. A later idle
+    // closure can be durable while its certificate write is still pending.
+    // This isolated fixture has no other application/control publisher.
+    assert(raw.entries.slice(certificate.position).every(entry => entry.kind === 'closure'), 'RECOVERY_UNEXPECTED_UNCERTIFIED_SUFFIX')
+  }
+  return floor
 }
 
 export async function eventually(check: () => boolean | Promise<boolean>, label: string, timeoutMs = 15_000) {

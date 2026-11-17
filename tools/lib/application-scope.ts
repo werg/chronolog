@@ -11,6 +11,7 @@ import { createChronologApplicationBackend } from '@chronolog/transport-tendrill
 import type { ApplicationOperation } from '@tendriller/core/application'
 
 import { createNativeBrowserFixture } from '../browser-event-fixture.js'
+import { createFinalityEvidencePublisher } from './finality-evidence.js'
 
 interface ScopePrograms {
   initializeScopedState(input: { scope: string; value?: EventPayload }): ChangeProgram
@@ -36,12 +37,13 @@ export async function qualifyApplicationScope(modulePath: string) {
     await native.agent.close()
     const authority = native.agent.finality
     assert(authority !== null)
+    const publishEvidence = createFinalityEvidencePublisher(authority, { putEvidence: bytes => native.transport.putEvidence(bytes) })
     // Finalize the retained genesis key controls before submitting application work.
     for (const record of await native.transport.history()) {
       const kind = decodeEnvelope(record.payload).messageType
       if (kind === 'capability' || kind === 'epoch-manifest') await authority.append(record.payload)
     }
-    await authority.share({ putEvidence: bytes => native.transport.putEvidence(bytes) })
+    await publishEvidence()
     const backend = createChronologApplicationBackend({ id: 'scope-qualification', replica: native.client, sql: true })
     const submit = async (change: ChangeProgram, operationId: string) => {
       const before = (await native.transport.history()).length
@@ -57,7 +59,7 @@ export async function qualifyApplicationScope(modulePath: string) {
       let attempts = 0
       while (Date.now() < deadline) {
         attempts++
-        await authority.share({ putEvidence: bytes => native.transport.putEvidence(bytes) })
+        await publishEvidence()
         await native.node.waitForIdle()
         const value = await backend.operations.get(pending.receipt.operationId)
         if (value?.status === 'final' || value?.status === 'rejected') return value
