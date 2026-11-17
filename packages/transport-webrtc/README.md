@@ -110,22 +110,18 @@ connection performs a fresh Chronolog handshake.
 
 ## Connection lifecycle and retry
 
-`supervisePeerSession` owns a connector's attempt and established-session
-lifetime with an explicit bounded retry policy. The connector receives a fresh
-cancellation signal and returns an object with `signal` and `close()`. It must
-close partially acquired resources on failure. The supervisor closes late
-results from cancelled attempts and permits one owned attempt/session at a time.
+`session.participate()` in `@chronolog/peer-session` owns discovery, connection
+attempts, reconnect grace, bounded backoff and verified recovery policy. Inject
+this package's `openWebRtcConnection` as the raw opener. The common session
+authenticates each result and verifies history before considering it a recovery
+candidate. A transport supplies delivery and cancellation; it has no second
+retry controller or authority policy.
 
-A healthy connection has no supervisor timer, heartbeat or discovery request.
-Failures schedule exponential retry with bounded attempts and jitter. The
-attempt budget resets only after the configured healthy duration. `ready`
-resolves on the first successful connection; `waitForSession()` obtains the
-current one. Cancelling a waiter does not cancel the shared connection.
-`completion` rejects on exhaustion and `close()` cancels a pending dial or retry.
-
-Readiness is explicit: `transport` covers negotiation; `authenticated` requires
-the connector to await `session.connectPeer()` before returning. Application
-history synchronization and materialization remain separate observed progress.
+In a browser, use the session package's `openWorkerWebRtcConnection` with the
+page's `serveWorkerWebRtcConnections` bridge. Discovery, signaling, authentication
+and recovery remain with the owning Worker. The page supplies RTC mechanics.
+See [owned participation](../peer-session/README.md#owned-participation-and-recovery)
+for the common native and browser lifecycle contract.
 
 ## Bounded reliable and live lanes
 
