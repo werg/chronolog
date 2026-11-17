@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, decodePeerValue, encodePeerValue,
   MemoryPeerStore, participantGrant, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest,
-  type OrderedCommand,
+  type OrderedCommand, type ParticipantRequest,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -95,6 +95,30 @@ describe('authenticated peer application connections', () => {
     expect(left.signal.aborted).toBe(true)
   })
 
+  it.each([
+    ['scope', 'APPLICATION_NETWORK_SCOPE_MISMATCH'],
+    ['control action', 'PEER_PARTICIPANT_FACET_FORBIDDEN'],
+    ['response interest', 'PEER_PARTICIPANT_RESPONSE_MISMATCH'],
+  ])('fences a peer transport with a substituted %s before changing its view', async (fault, code) => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    let inject = false
+    const malicious = rewrite(left, value => {
+      if (!inject || value.kind !== 'response') return value
+      const message = value.message as ParticipantRequest
+      return { ...value, message: { ...message, ...(fault === 'scope' ? { applicationId: 'fe'.repeat(32) }
+        : fault === 'control action' ? { facet: 'control', action: 'configure' } : { facet: 'database', action: 'coverage' }) } }
+    })
+    const links = await Promise.all([a.connectPeer({ connection: malicious }), b.connectPeer({ connection: right })])
+    await Promise.all(links.map(link => link.synchronize()))
+    const before = b.revision
+    inject = true
+    await expect(links[1].synchronize()).rejects.toThrow(code)
+    expect(b.revision).toEqual(before)
+    expect(links[1].signal.aborted).toBe(true)
+    await Promise.all(links.map(link => link.close()))
+  })
+
   it('bounds authentication even when the first transport write never completes', async () => {
     const f = await fixture(), a = await f.open(f.a), lifetime = new AbortController()
     const connection: FramedPeerConnection = { signal: lifetime.signal,
@@ -144,16 +168,17 @@ describe('authenticated peer application connections', () => {
     const [left, right] = createFramedPeerConnectionPair()
     const malicious = rewrite(left, value => {
       if (value.kind !== 'response') return value
-      if (fault === 'root mismatch' && value.ok === false && value.value === 'PEER_VIEW_RECOVERY_REQUIRED') {
-        return { ...value, ok: true, value: commands.slice(0, 1) }
+      const message = value.message as ParticipantRequest
+      if (fault === 'root mismatch' && value.ok === false && message.payload === 'PEER_VIEW_RECOVERY_REQUIRED') {
+        return { ...value, ok: true, message: { ...message, payload: commands.slice(0, 1) } }
       }
       if (value.ok !== true) return value
-      const body = value.value
+      const body = message.payload
       if (body !== null && typeof body === 'object' && 'authority' in body && 'revision' in body) {
         const point = fault === 'overrun' ? one : { ...one, root: 'ff'.repeat(32) }
-        return { ...value, value: { ...body, point, revision: { ...body.revision as object, point } } }
+        return { ...value, message: { ...message, payload: { ...body, point, revision: { ...body.revision as object, point } } } }
       }
-      if (Array.isArray(body)) return { ...value, value: fault === 'overrun' ? commands : commands.slice(0, 1) }
+      if (Array.isArray(body)) return { ...value, message: { ...message, payload: fault === 'overrun' ? commands : commands.slice(0, 1) } }
       return value
     })
     const links = await Promise.all([a.connectPeer({ connection: malicious }), b.connectPeer({ connection: right })])
@@ -187,14 +212,16 @@ describe('authenticated peer application connections', () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b, new Map())
     const [left, right] = createFramedPeerConnectionPair()
     const request = rewrite(right, value => {
-      if (field !== 'recipient' || value.kind !== 'request' || value.method !== 'keyShare') return value
-      const envelope = value.value as { readonly payload: object }
-      return { ...value, value: { ...envelope, payload: { ...envelope.payload, recipient: a.deviceId } } }
+      const message = value.message as ParticipantRequest | undefined
+      if (field !== 'recipient' || value.kind !== 'request' || message?.action !== 'keyShare') return value
+      const envelope = message.payload as { readonly payload: object }
+      return { ...value, message: { ...message, payload: { ...envelope, payload: { ...envelope.payload, recipient: a.deviceId } } } }
     })
     const response = rewrite(left, value => {
-      const envelope = value.value as { readonly payload?: { readonly requestDigest?: string } } | null
+      const message = value.message as ParticipantRequest | undefined
+      const envelope = message?.payload as { readonly payload?: { readonly requestDigest?: string } } | null
       if (field !== 'issuer' || value.kind !== 'response' || envelope?.payload?.requestDigest === undefined) return value
-      return { ...value, value: { ...envelope, payload: { ...envelope.payload, issuer: f.host.publicKey } } }
+      return { ...value, message: { ...message, payload: { ...envelope, payload: { ...envelope.payload, issuer: f.host.publicKey } } } }
     })
     const links = await Promise.all([a.connectPeer({ connection: response }), b.connectPeer({ connection: request })])
     await expect(links[1].synchronize()).rejects.toThrow(field === 'recipient' ? 'APPLICATION_KEY_REQUEST_INVALID' : 'APPLICATION_KEY_SHARE_INVALID')

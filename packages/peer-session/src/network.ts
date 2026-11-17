@@ -1,7 +1,8 @@
 import {
   encodePeerValue, peerDigest, verifyAuthorityBundle, validateHistoryPoint,
+  createParticipantRequest, createParticipantResponse, validateParticipantRequest, validateParticipantResponse, PEER_PARTICIPANT_POLICY,
   type AuthorityBundle, type HistoryPoint, type OrderedCommand, type PeerAuthority, type PeerReplica,
-  type PeerRevision, type SignedAttempt, type SignedRetainedCoverage,
+  type PeerRevision, type SignedAttempt, type SignedRetainedCoverage, type ParticipantRequest, type ParticipantInterest,
 } from '@chronolog/peer-generation'
 import { bytesToHex, hexToBytes, signDomain, verifyDomain, DOMAINS } from '@chronolog/protocol'
 import { MAX_SIGNAL_BYTES, type SignalChannel, type SignalRoute } from '@chronolog/signals'
@@ -45,7 +46,13 @@ interface Hello { readonly application: string; readonly profile: 'peer-generati
 interface RemoteState { readonly authority: AuthorityBundle; readonly point: HistoryPoint | null; readonly revision: PeerRevision | null }
 type Method = 'state' | 'range' | 'submit' | 'coverage' | 'keyShare' | 'contentManifest' | 'contentChunk' | 'contentRetained' | 'contentObserveRetention'
 const methods: readonly Method[] = ['state', 'range', 'submit', 'coverage', 'keyShare', 'contentManifest', 'contentChunk', 'contentRetained', 'contentObserveRetention']
-interface Pending { resolve(value: unknown): void; reject(error: unknown): void; cancel(): void }
+const interests: Readonly<Record<Method, ParticipantInterest>> = {
+  state: { facet: 'control', action: 'state' }, keyShare: { facet: 'control', action: 'keyShare' },
+  range: { facet: 'database', action: 'range' }, submit: { facet: 'database', action: 'submit' }, coverage: { facet: 'database', action: 'coverage' },
+  contentManifest: { facet: 'content', action: 'manifest' }, contentChunk: { facet: 'content', action: 'chunk' },
+  contentRetained: { facet: 'content', action: 'retained' }, contentObserveRetention: { facet: 'content', action: 'observeRetention' },
+}
+interface Pending { readonly request: ParticipantRequest; resolve(value: unknown): void; reject(error: unknown): void; cancel(): void }
 interface Owner { next: number; readonly openings: Map<NetworkPeer, number>; readonly accepted: Map<string, number>; readonly peers: Map<string, NetworkPeer> }
 const owners = new WeakMap<ApplicationPeerPort, Owner>()
 const hexadecimal = (value: unknown, length = 64): value is string => typeof value === 'string' && value.length === length && /^[0-9a-f]+$/u.test(value)
@@ -266,25 +273,38 @@ class NetworkPeer implements ApplicationPeerLink {
       } else {
         requireNetwork(this.#authenticated, 'APPLICATION_PEER_AUTHENTICATION_REQUIRED'); this.#reader()
         if (kind === 'request') {
-          const message = record(value, ['kind', 'id', 'method', 'value'])
-          requireNetwork(Number.isSafeInteger(message.id) && (message.id as number) > this.#lastRemoteRequest &&
-            methods.includes(message.method as Method) && this.#incoming < LIMITS.incomingRequests,
+          const message = record(value, ['kind', 'message'])
+          const request = this.#incomingMessage(message.message), id = Number(request.requestId)
+          const method = methods.find(method => interests[method].facet === request.facet && interests[method].action === request.action)
+          requireNetwork(Number.isSafeInteger(id) && String(id) === request.requestId && id > this.#lastRemoteRequest &&
+            method !== undefined && this.#incoming < LIMITS.incomingRequests,
           'APPLICATION_NETWORK_REQUEST_INVALID')
-          this.#lastRemoteRequest = message.id as number; this.#incoming++; this.#receivedRequests++
-          void this.#respond(message.id as number, message.method as Method, message.value).catch(error => this.#fail(error)).finally(() => { this.#incoming-- })
+          this.#lastRemoteRequest = id; this.#incoming++; this.#receivedRequests++
+          void this.#respond(request, method).catch(error => this.#fail(error)).finally(() => { this.#incoming-- })
         } else if (kind === 'response') {
-          const message = record(value, ['kind', 'id', 'ok', 'value'])
-          requireNetwork(Number.isSafeInteger(message.id) && typeof message.ok === 'boolean', 'APPLICATION_NETWORK_RESPONSE_INVALID')
-          const pending = this.#pending.get(message.id as number)
+          const message = record(value, ['kind', 'ok', 'message']), response = this.#incomingMessage(message.message)
+          const id = Number(response.requestId)
+          requireNetwork(Number.isSafeInteger(id) && String(id) === response.requestId && typeof message.ok === 'boolean', 'APPLICATION_NETWORK_RESPONSE_INVALID')
+          const pending = this.#pending.get(id)
           requireNetwork(pending !== undefined, 'APPLICATION_NETWORK_RESPONSE_INVALID')
-          this.#pending.delete(message.id as number); pending.cancel()
-          if (message.ok) pending.resolve(message.value)
-          else { requireNetwork(typeof message.value === 'string' && /^[A-Z0-9_]{1,128}$/u.test(message.value), 'APPLICATION_NETWORK_RESPONSE_INVALID'); pending.reject(networkError(message.value)) }
-        } else if (kind === 'hint') { record(value, ['kind']); this.#kick() }
+          const payload = validateParticipantResponse(response, pending.request, PEER_PARTICIPANT_POLICY).payload
+          this.#pending.delete(id); pending.cancel()
+          if (message.ok) pending.resolve(payload)
+          else { requireNetwork(typeof payload === 'string' && /^[A-Z0-9_]{1,128}$/u.test(payload), 'APPLICATION_NETWORK_RESPONSE_INVALID'); pending.reject(networkError(payload)) }
+        } else if (kind === 'hint') {
+          const message = this.#incomingMessage(record(value, ['kind', 'message']).message)
+          requireNetwork(message.facet === 'ephemeral' && message.action === 'hint' && message.payload === null, 'APPLICATION_NETWORK_MESSAGE_INVALID')
+          this.#kick()
+        }
         else throw networkError('APPLICATION_NETWORK_MESSAGE_INVALID')
       }
     }
     throw networkError('APPLICATION_NETWORK_ENDED')
+  }
+  #incomingMessage(value: unknown): ParticipantRequest {
+    const message = validateParticipantRequest(value, PEER_PARTICIPANT_POLICY)
+    requireNetwork(message.applicationId === this.#port.replica.descriptor.applicationId, 'APPLICATION_NETWORK_SCOPE_MISMATCH')
+    return message
   }
   async #readLive(lane: PeerLiveLane, route: SignalRoute): Promise<void> {
     try {
@@ -298,10 +318,12 @@ class NetworkPeer implements ApplicationPeerLink {
     this.#reader()
     requireNetwork(this.#pending.size < LIMITS.pendingRequests && this.#nextRequest < Number.MAX_SAFE_INTEGER, 'APPLICATION_NETWORK_BACKPRESSURE')
     const id = ++this.#nextRequest
+    const request = createParticipantRequest({ applicationId: this.#port.replica.descriptor.applicationId,
+      requestId: String(id), ...interests[method], payload: value }, PEER_PARTICIPANT_POLICY)
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.#fail(networkError('APPLICATION_NETWORK_REQUEST_TIMEOUT')), this.#requestMs)
-      this.#pending.set(id, { resolve, reject, cancel: () => clearTimeout(timer) })
-      void Promise.resolve().then(() => this.#wire.send({ kind: 'request', id, method, value }, () => {
+      this.#pending.set(id, { request, resolve, reject, cancel: () => clearTimeout(timer) })
+      void Promise.resolve().then(() => this.#wire.send({ kind: 'request', message: request }, () => {
         if (method === 'submit') requireNetwork(grant(this.#port.replica, this.#port.replica.device.publicKey, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
         if (method === 'keyShare') requireNetwork((value as ApplicationKeyRequest).payload.recipient === this.#port.replica.device.publicKey,
           'APPLICATION_KEY_REQUEST_INVALID')
@@ -312,9 +334,10 @@ class NetworkPeer implements ApplicationPeerLink {
       })
     })
   }
-  async #respond(id: number, method: Method, input: unknown): Promise<void> {
+  async #respond(request: ParticipantRequest, method: Method): Promise<void> {
     try {
       this.#reader(); const replica = this.#port.replica
+      const input = request.payload
       let value: unknown = null
       if (method === 'state') {
         requireNetwork(input === null, 'APPLICATION_NETWORK_MESSAGE_INVALID')
@@ -364,11 +387,11 @@ class NetworkPeer implements ApplicationPeerLink {
         requireNetwork(receipt?.payload?.peer === this.peerId, 'CONTENT_RETENTION_INVALID')
         await this.#port.content.observeRetention(receipt)
       }
-      this.#reader(); await this.#wire.send({ kind: 'response', id, ok: true, value })
+      this.#reader(); await this.#wire.send({ kind: 'response', ok: true, message: createParticipantResponse(request, value, PEER_PARTICIPANT_POLICY) })
     } catch (error) {
       this.#reader()
       const code = error instanceof Error && /^[A-Z0-9_]{1,128}$/u.test(error.message) ? error.message : 'APPLICATION_NETWORK_REQUEST_REJECTED'
-      await this.#wire.send({ kind: 'response', id, ok: false, value: code })
+      await this.#wire.send({ kind: 'response', ok: false, message: createParticipantResponse(request, code, PEER_PARTICIPANT_POLICY) })
     }
   }
   synchronize(): Promise<void> {
@@ -479,7 +502,9 @@ class NetworkPeer implements ApplicationPeerLink {
     if (this.#hintPending || this.signal.aborted) return
     this.#hintPending = true
     const advertised = this.#lastHint
-    void Promise.resolve().then(() => this.#wire.send({ kind: 'hint' })).catch(error => this.#fail(error)).finally(() => {
+    const message = createParticipantRequest({ applicationId: this.#port.replica.descriptor.applicationId,
+      requestId: 'hint', facet: 'ephemeral', action: 'hint', payload: null }, PEER_PARTICIPANT_POLICY)
+    void Promise.resolve().then(() => this.#wire.send({ kind: 'hint', message })).catch(error => this.#fail(error)).finally(() => {
       this.#hintPending = false
       // A response may have captured an older head while this write completed.
       if (this.#lastHint !== advertised) this.#sendHint()

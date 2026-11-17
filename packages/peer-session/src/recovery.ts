@@ -109,6 +109,7 @@ export class ApplicationRecovery {
       }
       this.#signal.throwIfAborted()
       const request = entry.request
+      const previousGeneration = this.#replica.generation.id
       try {
         const selected = await this.#hostCall(() => host.selectGeneration(request))
         this.#signal.throwIfAborted()
@@ -119,7 +120,11 @@ export class ApplicationRecovery {
         if (!bundle.generations.some(generation => generation.id === selected.id && generation.payload.transition.payload.transitionId === entry.request.payload.transitionId)) {
           throw new Error('APPLICATION_TRANSITION_REPLY_MISMATCH')
         }
-        const notice = await this.#replica.adopt(bundle)
+        // The attached control participant durably observes new authority on
+        // read. It may already have published this recovery while fetching the
+        // selected bundle; return that same notice without publishing a reset twice.
+        const notice = await this.#replica.adopt(bundle) ?? this.#replica.inspectRecovery().findLast(value =>
+          value.previousGeneration === previousGeneration && value.generation === this.#replica.generation.id) ?? null
         this.#signal.throwIfAborted()
         const index = journal.indexOf(entry)
         journal[index] = { request: entry.request, selected: selected.id, superseded: false }

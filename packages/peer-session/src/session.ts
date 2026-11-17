@@ -14,6 +14,7 @@ import { applicationDefinitionDigest, describeApplication, type ApplicationComma
 import { ApplicationRecovery } from './recovery.js'
 import type { ApplicationContent } from './content.js'
 import type { ApplicationKeyring } from './keys.js'
+import { ApplicationControlParticipant, type ControlParticipantOptions } from './control-participant.js'
 import {
   connectApplicationPeer, connectApplicationPeerPair,
   type ApplicationPeerConnectOptions, type ApplicationPeerLink, type ApplicationPeerPort,
@@ -99,6 +100,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     wait(operationId: string, options?: { readonly signal?: AbortSignal }): Promise<AppliedResult>
   }
   readonly #replica: PeerReplica
+  readonly #store: PeerStore
   readonly #definition: D
   readonly #peers = new Map<string, PeerEndpoint>()
   readonly #lifetime = new AbortController()
@@ -112,9 +114,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #lastStatus = ''
   #closed = false
   #closeTask: Promise<void> | undefined
+  #control: ApplicationControlParticipant | undefined
 
   constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: PeerStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void> }) {
-    this.#replica = options.replica; this.#definition = options.definition; this.#closing = options.close
+    this.#replica = options.replica; this.#store = options.store; this.#definition = options.definition; this.#closing = options.close
     const replica = this.#replica
     const signals = new SignalChannel({ scope: replica.descriptor.applicationId,
       identity: { publicKeyBytes: hexToBytes(replica.device.publicKey), privateKey: replica.device.privateKey },
@@ -235,6 +238,16 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   connectPeer(options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
     this.#assertOpen()
     return connectApplicationPeer(internals.get(this)!.port, options)
+  }
+
+  connectControlParticipant(options: ControlParticipantOptions): ApplicationControlParticipant {
+    this.#assertOpen()
+    if (this.#control !== undefined && !this.#control.signal.aborted) throw new Error('APPLICATION_CONTROL_ALREADY_ATTACHED')
+    const participant = new ApplicationControlParticipant(this.#replica, this.#store, this.#lifetime.signal, options)
+    this.#control = participant
+    this.#links.add(participant)
+    participant.signal.addEventListener('abort', () => { this.#links.delete(participant) }, { once: true })
+    return participant
   }
 
   async retry(operationId: string): Promise<void> {

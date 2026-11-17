@@ -1,13 +1,12 @@
 # Peer generations: selected history with tolerant recovery
 
 Status: implemented peer-generation preview; wider qualification is in progress.
-The authenticated history profile is `peer-generation-v1`, with the bounded
-`eligible-members-v1` authority policy. The selected-history target uses
-`local()` for applied-here results and `final()` for committed/applied results,
-with an explicit recovery exception that can abandon a recent suffix. The
-current public preview still exposes `applied()`; it exports no local/final
-aliases. Historical chronological immutability comes from that older
-implementation, not from the name of a wait method.
+The authenticated record format is `peer-generation-v1`, with the bounded
+`eligible-members-v1` authority policy. An operation exposes `applied()` for its
+accepted or rejected result in the selected history and `shared()` for retained
+peer coverage. A valid recovery can abandon a recent suffix. All applications use
+one session and materialization path. The record format is not a runtime selector;
+there are no profile-specific application APIs or implicit stronger guarantees.
 
 ## Implementation boundary
 
@@ -25,11 +24,9 @@ prerelease qualification.
 
 Tendriller implements the hosted control registry and lifecycle API using the
 same verifier. That service selects authenticated generations; it does not
-execute application commands. The new session does not reinterpret existing
-`chronologd` or chronological browser histories. The [older chronological
-application primitives](application-primitives.md) retain their existing APIs,
-immutable final-prefix guarantee and original evidence. They are historical
-implementation semantics, not a second architecture mandate for new applications.
+execute application commands. Superseded hosted and resident application paths
+are removed along with their adapters. Downstream consumers use the same public
+session contract. There is no migration or compatibility layer.
 
 The preserved [independent native/events development run](https://github.com/werg/tendriller-contrib/blob/5dc62b8d1fd6bb323bf6ca272cb21064f33ab318/cookbooks/run-a-peer-application/notes/peer-generation-qualification.md)
 uses a packed public session, separate durable stores and the in-process link.
@@ -105,14 +102,21 @@ connection setup. Ordinary peers carry encrypted application history, live signa
 and content. Coarse availability refresh is separately accounted discovery work
 and never a condition for current-generation command completion.
 
-This separation also provides a path for application and page publication. A
-future signed publication manifest can select immutable content roots for code and
-assets, with peers and explicitly configured hosted providers supplying the bytes.
-The initial browser entry point must establish the trusted publication identity.
-Presentation updates can have their own publication revision; changes to command
-definitions, schema or execution semantics require an authenticated activation
-boundary binding those exact identities. That publication protocol is a distinct
-extension, not an implemented guarantee of the current attachment API.
+The same scoped participant envelope carries control, publication, discovery,
+database, content and ephemeral messages. Each transport enforces its role's
+declared interests before delivery. A session attaches the host with
+`connectControlParticipant({ exchange })`; attaching performs no request and does
+not register the host as a reader or an application-data peer.
+
+Signed publication manifests select immutable code and page assets. The control
+participant verifies the current administrator, exact operation identity, bounded
+asset hashes and predecessor before atomically projecting a selected version into
+Tendriller's serving store. The session journals signed publication intent before
+dispatch, verifies skipped predecessors and durably rejects a regressed head.
+An exact retry returns the original receipt, even after another publication.
+Publication binds the existing definition and execution manifest; changing their
+meaning requires a separately authenticated activation. Health reports cannot
+silently choose unsigned rollback code.
 
 ## Selection and ancestry
 
@@ -141,10 +145,8 @@ linked to the old intent, under current controls and freshly selected domain gua
 An operation can be saved, applied (accepted or rejected), shared, abandoned, or
 need reapplication. `applied` includes its generation and position. It remains
 stable while that history is selected; it is not irreversible across recovery.
-The current preview spells its wait `applied()`, not `final()`. The unified target's
-selected-history final result still has the explicit recovery exception above.
-Neither spelling makes the existing immutable-history `FinalEventSource` adapter
-safe for generation resets without a recovery-aware consumer contract.
+The public wait is `applied()`. An irreversible external action
+requires a separately declared protected boundary and its own retained evidence.
 Wait cancellation does not cancel or reject the saved command. An exact retry
 retains the original bytes, identity, guards, and result.
 

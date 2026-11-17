@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { frameLivePeerStream, framePeerStream } from '@chronolog/agent-service/framing'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant,
-  decodePeerValue, encodePeerValue, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest, type HistoryPoint, type PeerIdentity, type PrefixProof } from '@chronolog/peer-generation'
+  decodePeerValue, encodePeerValue, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest, type HistoryPoint, type PeerIdentity, type PrefixProof, type ParticipantRequest } from '@chronolog/peer-generation'
 import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program } from '@chronolog/protocol'
 import type { FramedPeerConnection } from '@chronolog/records'
 import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
@@ -74,7 +74,7 @@ function deferred() {
   const promise = new Promise<void>(yes => { resolve = yes })
   return { promise, resolve }
 }
-type Packet = { readonly kind: string; readonly method?: string; readonly value?: unknown }
+type Packet = { readonly kind: string; readonly message?: ParticipantRequest }
 /** Observe complete logical messages while exercising the real fragment codec. */
 function intercept(connection: FramedPeerConnection, inspect: (packet: Packet, bytes: number) => Packet | void | Promise<Packet | void>): FramedPeerConnection {
   let assembled: Uint8Array | undefined
@@ -231,7 +231,8 @@ describe('authenticated application transport', () => {
     let enabled = false, states = 0
     const nextState = deferred(), release = deferred()
     const left = intercept(channels[0], async value => {
-      if (enabled && value.kind === 'response' && value.value !== null && typeof value.value === 'object' && 'authority' in value.value) {
+      const payload = value.message?.payload
+      if (enabled && value.kind === 'response' && payload !== null && typeof payload === 'object' && 'authority' in payload) {
         states++
         if (states === 1) await (await a.command('say', 'later', { operationId: 'later' })).applied()
         else if (states === 2) { nextState.resolve(); await release.promise }
@@ -270,7 +271,7 @@ describe('authenticated application transport', () => {
     await (await a.command('say', 'first', { operationId: 'first' })).applied()
     let advance = false, captured: HistoryPoint | undefined
     const right = intercept(channels[1], async value => {
-      const receipt = value.value as { readonly payload?: { readonly peer?: string; readonly point?: HistoryPoint } } | null
+      const receipt = value.message?.payload as { readonly payload?: { readonly peer?: string; readonly point?: HistoryPoint } } | null
       if (advance && value.kind === 'response' && receipt?.payload?.peer === b.deviceId && receipt.payload.point?.sequence === 1) {
         advance = false; captured = receipt.payload.point
         await (await a.command('say', 'second', { operationId: 'second' })).applied()
@@ -342,7 +343,7 @@ describe('authenticated application transport', () => {
     await seed(a, 65)
     const channels = pair(), pageSizes: number[] = [], responseBytes: number[] = []
     const left = intercept(channels[0], (value, bytes) => {
-      if (value.kind === 'response' && Array.isArray(value.value)) { pageSizes.push(value.value.length); responseBytes.push(bytes) }
+      if (value.kind === 'response' && Array.isArray(value.message?.payload)) { pageSizes.push(value.message.payload.length); responseBytes.push(bytes) }
     })
     await connect(a, b, [left, channels[1]])
     expect(b.revision.point).toEqual(a.revision.point)
@@ -358,18 +359,19 @@ describe('authenticated application transport', () => {
     const requested = deferred(), release = deferred(), controller = new AbortController()
     let target: number | undefined, requestBytes = 0
     const left = intercept(channels[0], value => {
-      if (value.kind === 'response' && value.value !== null && typeof value.value === 'object' && 'authority' in value.value && 'revision' in value.value) {
-        const state = value.value, revision = a.revision
+      const state = value.message?.payload
+      if (value.kind === 'response' && value.message !== undefined && state !== null && typeof state === 'object' && 'authority' in state && 'revision' in state) {
+        const revision = a.revision
         expect(state.revision).toEqual(revision)
         // The authenticated head is a transfer target, not retained evidence.
         // Stop before a page arrives; the real 65-command case checks completion.
         const point = { ...revision.point, sequence: 4097 }
-        return { ...value, value: { ...state, point, revision: { ...revision, point } } }
+        return { ...value, message: { ...value.message, payload: { ...state, point, revision: { ...revision, point } } } }
       }
     })
     const right = intercept(channels[1], async (value, bytes) => {
-      if (value.kind === 'request' && value.method === 'range') {
-        target = (value.value as { readonly through: { readonly sequence: number } }).through.sequence
+      if (value.kind === 'request' && value.message?.action === 'range') {
+        target = (value.message.payload as { readonly through: { readonly sequence: number } }).through.sequence
         requestBytes = bytes; requested.resolve(); await release.promise
       }
     })

@@ -1,6 +1,9 @@
 # Peer application sessions
 
-`@chronolog/peer-session` exposes the `peer-generation-v1` application profile.
+`@chronolog/peer-session` owns the application runtime. All participants use the
+same signed records, operation journal, replication, materialization and query
+contracts. `peer-generation-v1` identifies the signed record format; it is not
+an application mode or a selector for a second implementation.
 One eligible peer sequences commands. Ordinary commands, queries, history and
 live signals need no hosted request while that generation is healthy. A signed
 control service selects a successor during takeover. Recovery can abandon a
@@ -53,14 +56,36 @@ try {
 from the configured control service. Enrolled decryption keys persist in the
 owned device store; a new reader acquires missing keys from an authorized peer.
 `applicationDefinitionDigest(definition)` binds the published
-schemas and semantic version. The event execution manifest is obtained with
-`eventExecutionManifest('peer-generation-v1')`; a chronological manifest is a
-different execution contract and is rejected.
+schemas and semantic version. Obtain the event execution manifest with
+`eventExecutionManifest()`. Materializers consume verified order through one
+execution pipeline; transport roles do not change execution semantics.
 
 Only first device setup passes `{ create: true }`. Ordinary reopening omits it.
 The session owns one signed attempt journal in the device store. A disconnected
 command remains `saved`; connecting resumes its exact original attempt.
 Cancelling `applied({ signal })` cancels that waiter only.
+
+## The host as a control participant
+
+```ts
+const control = session.connectControlParticipant({
+  exchange: (request, { signal }) => client.peers.exchange(request, { signal }),
+})
+const definition = await control.definition()
+const notice = await session.recovery.takeover(control, { transitionId: crypto.randomUUID() })
+```
+
+The attachment shares the session's identity and lifetime. It performs no request
+until an explicit lifecycle action, and its closed role policy excludes database
+bodies, content chunks and ordinary live signals. Peer and hosted transports use
+the same scoped participant request and response contract. A transport supplies
+delivery; the common signed verifier supplies authority.
+
+`control.preparePublication({ operationId, entry, files })` saves the exact signed
+code or page manifest. `control.publish(manifest, assets)` submits it with bounded,
+hash-verified assets, and `control.publication()` verifies the selected chain.
+Retries preserve the original signed intent and receipt. The selected publication
+head persists outside recoverable application history and cannot move backward.
 
 ## Enrollment and epoch keys
 
@@ -303,7 +328,7 @@ page facade, bounds pending requests and pulled streams, and releases held views
 on close. `session.close()` resolves after the Worker has released the owned
 device store, so the page can safely reopen it immediately afterward.
 
-The `/tendriller` entry exports `createPeerGenerationApplicationBackend()` for
+The `/tendriller` entry exports `createApplicationBackend()` for
 binding either an owned native session or this page facade to Tendriller's
 application interface. It forwards declared commands and coherent views to the
 same session instead of introducing another identity or queue.
@@ -336,7 +361,7 @@ current applied result. The transport creates no second identity, outbox, or
 hosted command proxy.
 
 The portable entry and the browser entry are SQL-free. SQL applications supply
-a qualified materializer with the same authenticated profile; the pinned schema
+a qualified materializer through the same execution contract; the pinned schema
 is initialized before application history. Irreversible effects require a
 separately declared protected boundary.
 

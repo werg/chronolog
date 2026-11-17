@@ -4,21 +4,21 @@ import type { WorkerApplicationSession } from './worker-application.js'
 
 export interface PeerApplicationProgram { readonly name: string; readonly input: unknown }
 interface SubmitOptions { readonly operationId: string; readonly basedOn?: string }
-interface ViewOptions { readonly view?: 'applied' | 'local' | 'final' }
+interface ViewOptions { readonly view?: 'applied' }
 interface EventOptions extends ApplicationEventOptions { readonly signal?: AbortSignal }
 
 /**
  * Tendriller's applied backend shape, using the owned public session directly.
  * Domain event publication is opt-in through an ordinary declared command.
  */
-export function createPeerGenerationApplicationBackend(options: {
+export function createApplicationBackend(options: {
   readonly id: string
   readonly session: ApplicationSession | WorkerApplicationSession
   readonly sql?: boolean
   readonly eventCommand?: string
 }) {
   const session = options.session
-  if (!/^[A-Za-z0-9_.:-]{1,200}$/u.test(options.id)) throw new Error('APPLICATION_BACKEND_ID_INVALID')
+  if (!/^[0-9a-f]{64}$/u.test(options.id)) throw new Error('APPLICATION_BACKEND_ID_INVALID')
   if (options.id !== session.applicationId) throw new Error('APPLICATION_BACKEND_SCOPE_MISMATCH')
   if (options.eventCommand !== undefined && !session.describe().commands.some(command => command.name === options.eventCommand)) {
     throw new Error('APPLICATION_EVENT_COMMAND_UNKNOWN')
@@ -38,8 +38,8 @@ export function createPeerGenerationApplicationBackend(options: {
     finally { await view.release() }
   }
   return Object.freeze({
-    id: options.id, profile: 'peer-generation-v1' as const,
-    capabilities: Object.freeze(['events', 'revision-views', 'operation-status', 'peer-generation-v1',
+    id: options.id,
+    capabilities: Object.freeze(['events', 'revision-views', 'operation-status', 'recovery',
       ...(options.sql === true ? ['sql'] : []), ...(options.eventCommand === undefined ? [] : ['event-publication'])]),
     get status() { return session.status },
     onStatus: session.onStatus.bind(session),
@@ -57,7 +57,7 @@ export function createPeerGenerationApplicationBackend(options: {
       const view = await session.readView()
       return Object.freeze({ view: 'applied' as const, revision: JSON.stringify(view.revision), generation: view.revision.generation,
         async query(sql: string, parameters: readonly QueryParameter[] = []) {
-          if (options.sql !== true) throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE')
+          if (options.sql !== true) throw new Error('SQL_NOT_AVAILABLE')
           return await view.query(sql, parameters)
         },
         async readEvents(input: EventOptions = {}) { input.signal?.throwIfAborted(); return eventBatch(await view.readEvents(input)) },

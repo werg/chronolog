@@ -1,0 +1,151 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import {
+  bytesDigest, createGenerationRegistry, createParticipantResponse, createPeerIdentity, createPublicationRegistry,
+  MemoryPeerStore, participantGrant, signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  type AuthorityBundle, type ParticipantRequest, type SignedPublication, type SignedTransitionRequest,
+} from '@chronolog/peer-generation'
+import { eventExecutionManifest } from '@chronolog/materializer'
+import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
+import { applicationDefinitionDigest, defineApplication, defineCommand, describeApplication } from './definition.js'
+import { openApplicationDevice } from './device.js'
+import { openPeerApplication } from './runtime.js'
+import { connectApplications } from './session.js'
+
+const definition = defineApplication({ id: 'participant', version: '1', commands: {
+  say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
+}, queries: {} })
+const cleanup: Array<() => void | Promise<void>> = []
+afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+
+async function fixture() {
+  const signer = await createPeerIdentity(), stores = [new MemoryPeerStore(), new MemoryPeerStore()]
+  const devices = await Promise.all(stores.map(store => openApplicationDevice({ store, create: true })))
+  const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
+  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
+  const descriptor = await signApplicationDescriptor({ applicationId: 'ab'.repeat(32), historyId: 'participant-test',
+    profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: signer.publicKey,
+    schemaAdministrator: devices[0]!.identity.publicKey, definitionDigest: await applicationDefinitionDigest(definition),
+    executionManifestDigest: bytesToHex(manifest.executionManifestDigest), schemaDigest: null }, signer)
+  const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
+    policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
+    grants: devices.map(device => participantGrant(device.identity.publicKey, { administrator: true })) }, signer)
+  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer })
+  await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
+    policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null, coordinator: devices[0]!.identity.publicKey,
+    requester: devices[0]!.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, devices[0]!.identity))
+  const publications = await createPublicationRegistry({ store: new MemoryPeerStore(), authority: () => registry.read() })
+  const traffic: ParticipantRequest[] = []
+  const faults: { offline?: boolean; losePublication?: boolean; stalePublication?: SignedPublication; staleAuthority?: AuthorityBundle } = {}
+  const exchange = async (request: ParticipantRequest) => {
+    traffic.push(structuredClone(request))
+    if (faults.offline === true) throw new Error('HOST_UNAVAILABLE')
+    let result: unknown
+    if (request.facet === 'control' && request.action === 'read') result = faults.staleAuthority ?? await registry.read()
+    else if (request.facet === 'control' && request.action === 'select') result = await registry.select((request.payload as { request: SignedTransitionRequest }).request)
+    else if (request.facet === 'publication' && request.action === 'definition') result = { descriptor, definition: describeApplication(definition), schema: null }
+    else if (request.facet === 'publication' && request.action === 'read') {
+      const records = await publications.read(), id = (request.payload as { id?: string }).id
+      const publication = id === undefined ? faults.stalePublication ?? records.at(-1) : records.find(value => value.id === id)
+      result = publication === undefined ? null : { publication, version: publication.payload.revision + 1 }
+    } else if (request.facet === 'publication' && request.action === 'publish') {
+      const publication = await publications.publish((request.payload as { publication: SignedPublication }).publication)
+      if (faults.losePublication === true) { faults.losePublication = false; throw new Error('LOST_PUBLICATION_REPLY') }
+      result = { publication, version: publication.payload.revision + 1 }
+    } else throw new Error('UNEXPECTED_HOST_INTEREST')
+    return createParticipantResponse(request, result)
+  }
+  const open = async (index: number, resume = false) => {
+    const device = resume ? await openApplicationDevice({ store: stores[index]! }) : devices[index]!
+    const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
+    cleanup.push(() => session.close())
+    return session
+  }
+  return { open, registry, publications, exchange, traffic, faults }
+}
+
+describe('session-owned control participant', () => {
+  it('attaches without I/O and keeps commands, data, and live signals off the host', async () => {
+    const f = await fixture(), a = await f.open(0), b = await f.open(1)
+    const host = a.connectControlParticipant({ exchange: f.exchange })
+    expect(host.role).toBe('control'); expect(host.policy.role).toBe('control')
+    expect(f.traffic).toEqual([]); expect(a.status.connectedPeers).toBe(0)
+    expect(() => a.connectControlParticipant({ exchange: f.exchange })).toThrow('APPLICATION_CONTROL_ALREADY_ATTACHED')
+    const links = await connectApplications(a, b)
+    cleanup.push(() => links.close())
+    f.faults.offline = true
+    const operation = await b.command('say', 'ordinary work', { operationId: 'peer-only' })
+    expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
+    await links.synchronize()
+    const iterator = a.signals.subscribe({ topics: ['typing'] })[Symbol.asyncIterator](), received = iterator.next()
+    await b.signals.send('typing', { active: true }); expect((await received).value?.topic).toBe('typing'); await iterator.return?.()
+    expect(f.traffic).toEqual([])
+    await expect(host.application()).rejects.toThrow('HOST_UNAVAILABLE')
+    await host.close()
+    expect(a.status.phase).toBe('ready')
+    expect((await (await a.command('say', 'still writing', { operationId: 'after-host' })).applied()).outcome).toBe('accepted')
+  })
+
+  it('uses the same signed authority for takeover and durably refuses stale control replies', async () => {
+    const f = await fixture(), a = await f.open(0), b = await f.open(1)
+    const old = await f.registry.read(), host = b.connectControlParticipant({ exchange: f.exchange })
+    const link = await connectApplications(a, b)
+    await (await a.command('say', 'inherited', { operationId: 'inherited' })).applied(); await link.synchronize(); await link.close()
+    await (await a.command('say', 'tail', { operationId: 'tail' })).applied()
+    const notice = await b.recovery.takeover(host, { transitionId: 'recover' })
+    expect(notice).toMatchObject({ previousGeneration: old.generations[0]!.id, generation: b.revision.generation })
+    expect(b.status.role).toBe('coordinator')
+    const rejoin = await connectApplications(a, b); cleanup.push(() => rejoin.close())
+    expect((await a.operations.get('tail'))?.status).toBe('abandoned')
+    f.faults.staleAuthority = old
+    await expect(host.application()).rejects.toThrow('PEER_AUTHORITY_REGRESSION')
+    expect(b.status.role).toBe('coordinator')
+    expect(f.traffic.every(request => request.facet === 'control')).toBe(true)
+  })
+
+  it('verifies definitions and persists exact code intent and monotonic selected publications across reopen', async () => {
+    const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
+    expect((await host.definition()).definition).toEqual(describeApplication(definition))
+    const bytes = new TextEncoder().encode('export const version = 1;'), hash = await bytesDigest(bytes)
+    const input = { operationId: 'release-one', entry: 'page.mjs', files: [{ path: 'page.mjs', hash, size: bytes.length, type: 'text/javascript' }] }
+    const first = await host.preparePublication(input)
+    f.faults.losePublication = true
+    await expect(host.publish(first, [])).rejects.toThrow('LOST_PUBLICATION_REPLY')
+    expect(await host.preparePublication(input)).toEqual(first)
+    await host.publish(first, [])
+    const second = await host.preparePublication({ ...input, operationId: 'release-two' })
+    await host.publish(second, [])
+    expect((await host.publish(first, [])).publication).toEqual(first)
+    expect((await host.publication())?.publication).toEqual(second)
+    await expect(host.preparePublication({ ...input, entry: 'different.mjs' })).rejects.toThrow('PEER_PUBLICATION_OPERATION_REUSED')
+    await a.close()
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    expect(await resumed.preparePublication(input)).toEqual(first)
+    f.faults.stalePublication = first
+    await expect(resumed.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REGRESSION')
+    expect(reopened.revision.point.sequence).toBe(0)
+  })
+
+  it('verifies every skipped publication before remembering the new selected head', async () => {
+    const f = await fixture(), a = await f.open(0), b = await f.open(1)
+    const publisher = a.connectControlParticipant({ exchange: f.exchange }), reader = b.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('<main>page</main>'), hash = await bytesDigest(bytes)
+    const files = [{ path: 'index.html', hash, size: bytes.length, type: 'text/html' }]
+    const first = await publisher.preparePublication({ operationId: 'one', entry: 'index.html', files }); await publisher.publish(first, [])
+    await reader.publication()
+    for (const operationId of ['two', 'three']) await publisher.publish(await publisher.preparePublication({ operationId, entry: 'index.html', files }), [])
+    f.traffic.length = 0
+    expect((await reader.publication())?.publication.payload.revision).toBe(2)
+    expect(f.traffic.filter(request => request.facet === 'publication' && request.action === 'read')).toHaveLength(3)
+  })
+
+  it('fences unanswered control work when the owning session closes', async () => {
+    const f = await fixture(), a = await f.open(0)
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const host = a.connectControlParticipant({ exchange() { entered(); return new Promise(() => {}) } })
+    const pending = host.application(), checked = expect(pending).rejects.toThrow('APPLICATION_SESSION_CLOSED')
+    await started; await a.close(); await checked
+    expect(host.signal.aborted).toBe(true)
+    await expect(host.application()).rejects.toThrow('APPLICATION_SESSION_CLOSED')
+  })
+})

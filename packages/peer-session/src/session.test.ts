@@ -14,7 +14,7 @@ import { connectApplications, AbandonedOperationError, RecoveredViewError, type 
 import { openNativeApplication, openNativeDevice } from './native.js'
 import { createApplicationTools, serveApplicationToolLines } from './tools.js'
 import { ApplicationControlConflictError } from './recovery.js'
-import { createPeerGenerationApplicationBackend } from './tendriller.js'
+import { createApplicationBackend } from './tendriller.js'
 
 const definition = defineApplication({ id: 'messages', version: '1', commands: {
   say: defineCommand({ description: 'Post a message', input: { type: 'string', minLength: 1 }, prepare: text => program(emit('message', { text })) }),
@@ -328,7 +328,7 @@ describe('public peer application sessions', () => {
   })
   it('binds Tendriller to applied views and authenticated operations without hosted command calls', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
-    const backend = createPeerGenerationApplicationBackend({ id: b.applicationId, session: b })
+    const backend = createApplicationBackend({ id: b.applicationId, session: b })
     const phases: string[] = [], unsubscribe = backend.onStatus(status => { phases.push(status.phase) })
     expect(phases).toEqual(['waiting'])
     const link = await connectApplications(a, b)
@@ -343,6 +343,7 @@ describe('public peer application sessions', () => {
     expect(events.transactions[0]?.proposalId).toBe(result.attemptId)
     expect(events.transactions[0]?.events[0]?.origin).toMatchObject({ kind: 'peer-generation', authorId: b.deviceId, operationId: 'adapter-once' })
     await view.release()
+    // @ts-expect-error Unsupported views must also fail at the runtime boundary.
     await expect(backend.readView({ view: 'final' })).rejects.toThrow('APPLICATION_VIEW_UNSUPPORTED')
     await expect(backend.events.publish('anything', {}, { operationId: 'undeclared' })).rejects.toThrow('APPLICATION_EVENT_PUBLICATION_NOT_CONFIGURED')
     await link.close()
