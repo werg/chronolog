@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: webrtc-${{ github.ref }}
+  # Keep each reviewed source snapshot qualifying while concurrent PR work advances.
+  group: webrtc-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

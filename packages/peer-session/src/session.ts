@@ -45,6 +45,7 @@ export interface ApplicationReadView {
   release(): void
 }
 export interface CommandOptions { readonly operationId: string; readonly basedOn?: PeerRevision }
+export interface OperationSubscribeOptions { readonly operationId: string; readonly author?: string; readonly signal?: AbortSignal }
 export interface ApplicationChange { readonly kind: 'applied' | 'recovery'; readonly revision: PeerRevision; readonly recovery: RecoveryNotice | null }
 export interface SessionStatus {
   readonly phase: 'ready' | 'waiting' | 'recovering' | 'awaiting-keys' | 'closed'
@@ -102,6 +103,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     get(operationId: string, options?: { readonly author?: string }): Promise<OperationState | null>
     inspect(operationId: string, options?: { readonly author?: string }): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null>
     wait(operationId: string, options?: { readonly signal?: AbortSignal }): Promise<AppliedResult>
+    subscribe(options: OperationSubscribeOptions): AsyncIterable<OperationState>
   }
   readonly #replica: PeerReplica
   readonly #definition: D
@@ -115,6 +117,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #stopStatus: () => void
   readonly #stopKeys: () => void
   #lastStatus = ''
+  #operationSubscriptions = 0
   #closedTask: Promise<void> | undefined
   #closed = false
 
@@ -137,7 +140,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const state = await replica.operation(operationId, options.author), attempt = await replica.attempt(operationId, options.author)
         return state === null || attempt === null ? null : { state, attempt }
       },
-      wait: (operationId: string, waitOptions: { readonly signal?: AbortSignal } = {}) => this.waitFor(operationId, waitOptions) })
+      wait: (operationId: string, waitOptions: { readonly signal?: AbortSignal } = {}) => this.waitFor(operationId, waitOptions),
+      subscribe: (input: OperationSubscribeOptions) => this.#subscribeOperations(input) })
   }
 
   get signal(): AbortSignal { return this.#lifetime.signal }
@@ -244,6 +248,20 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {
     return coalescedChanges(this.#replica, this.#lifetime.signal, options.signal)
+  }
+
+  #subscribeOperations(options: OperationSubscribeOptions): AsyncIterable<OperationState> {
+    const captured: OperationSubscribeOptions = { operationId: options.operationId,
+      ...(options.author === undefined ? {} : { author: options.author }), ...(options.signal === undefined ? {} : { signal: options.signal }) }
+    const session = this
+    return { [Symbol.asyncIterator]() {
+      session.#assertOpen()
+      if (session.#operationSubscriptions >= 16) throw new Error('APPLICATION_OPERATION_SUBSCRIPTION_LIMIT')
+      session.#operationSubscriptions++
+      const release = (): void => { session.#operationSubscriptions-- }
+      try { return coalescedOperations(session.#replica, session.#lifetime.signal, captured, release) }
+      catch (error) { release(); throw error }
+    } }
   }
 
   async retry(operationId: string): Promise<void> {
@@ -538,6 +556,7 @@ function coalescedChanges(replica: PeerReplica, lifetime: AbortSignal, signal?: 
     const abort = signal === undefined ? lifetime : AbortSignal.any([lifetime, signal])
     let closed = false, pending: ApplicationChange | undefined, waiting: ((value: IteratorResult<ApplicationChange>) => void) | undefined
     let latestRecovery: RecoveryNotice | null = null
+    let publishedRevision: string | undefined
     const close = (): IteratorResult<ApplicationChange> => {
       if (!closed) { closed = true; unsubscribe(); recovery(); abort.removeEventListener('abort', close); waiting?.({ done: true, value: undefined }); waiting = undefined; pending = undefined }
       return { done: true, value: undefined }
@@ -547,6 +566,9 @@ function coalescedChanges(replica: PeerReplica, lifetime: AbortSignal, signal?: 
       let revision: PeerRevision
       try { revision = replica.revision }
       catch (error) { if (error instanceof Error && error.message === 'PEER_RECOVERING') return; throw error }
+      const key = revisionKey(revision)
+      if (latestRecovery === null && key === publishedRevision) return
+      publishedRevision = key
       const value: ApplicationChange = { kind: latestRecovery === null ? 'applied' : 'recovery', revision, recovery: latestRecovery }
       latestRecovery = null
       if (waiting !== undefined) { const resolve = waiting; waiting = undefined; resolve({ done: false, value }) }
@@ -565,6 +587,63 @@ function coalescedChanges(replica: PeerReplica, lifetime: AbortSignal, signal?: 
       async return() { return close() },
     }
   } }
+}
+
+function coalescedOperations(replica: PeerReplica, lifetime: AbortSignal, options: OperationSubscribeOptions, release: () => void): AsyncIterator<OperationState> {
+  const abort = options.signal === undefined ? lifetime : AbortSignal.any([lifetime, options.signal])
+  let closed = false, reading = false, dirty = false, previous: string | undefined, pending: OperationState | undefined
+  let failure: { readonly reason: unknown } | undefined
+  let waiting: { resolve(value: IteratorResult<OperationState>): void; reject(reason: unknown): void } | undefined
+  let unsubscribe = () => {}
+  const done = (): IteratorResult<OperationState> => ({ done: true, value: undefined })
+  const close = (error?: { readonly reason: unknown }): IteratorResult<OperationState> => {
+    if (closed) return done()
+    closed = true; failure = error; pending = undefined
+    unsubscribe(); abort.removeEventListener('abort', stop)
+    if (error === undefined) waiting?.resolve(done()); else waiting?.reject(error.reason)
+    waiting = undefined
+    // A cancelled reader remains charged until its already-started lookup ends.
+    if (!reading) release()
+    return done()
+  }
+  const stop = (): void => { close() }
+  const inspect = (): void => {
+    if (closed) return
+    dirty = true
+    if (reading) return
+    reading = true
+    void (async () => {
+      try {
+        do {
+          dirty = false
+          let state: OperationState | null
+          try { state = await replica.operation(options.operationId, options.author) }
+          catch (error) { if (error instanceof Error && error.message === 'PEER_RECOVERING') continue; throw error }
+          if (closed) return
+          if (state === null) continue
+          const encoded = JSON.stringify(state)
+          if (encoded === previous) continue
+          previous = encoded
+          if (waiting === undefined) pending = state
+          else { const current = waiting; waiting = undefined; current.resolve({ done: false, value: state }) }
+        } while (dirty && !closed)
+      } catch (error) { if (!closed) close({ reason: error }) }
+      finally { reading = false; if (closed) release() }
+    })()
+  }
+  abort.addEventListener('abort', stop, { once: true })
+  if (abort.aborted) stop()
+  else { unsubscribe = replica.subscribe(inspect); inspect() }
+  return {
+    next(): Promise<IteratorResult<OperationState>> {
+      if (failure !== undefined) return Promise.reject(failure.reason)
+      if (closed) return Promise.resolve(done())
+      if (pending !== undefined) { const value = pending; pending = undefined; return Promise.resolve({ done: false, value }) }
+      if (waiting !== undefined) return Promise.reject(new Error('APPLICATION_OPERATION_SUBSCRIPTION_BUSY'))
+      return new Promise((resolve, reject) => { waiting = { resolve, reject } })
+    },
+    async return() { return close() },
+  }
 }
 
 function revisionKeySafe(replica: PeerReplica): string {

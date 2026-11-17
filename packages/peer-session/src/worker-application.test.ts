@@ -12,6 +12,7 @@ import { openPeerApplication } from './runtime.js'
 import { AbandonedOperationError, connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
 import { connectApplicationWorker, serveApplicationWorker } from './worker-application.js'
 import type { ApplicationControlHost } from './recovery.js'
+import { createPeerGenerationApplicationBackend } from './tendriller.js'
 
 const definition = defineApplication({ id: 'worker-messages', version: '1', commands: {
   say: defineCommand({ description: 'Write a message', input: { type: 'string', minLength: 1, maxLength: 128 },
@@ -59,6 +60,33 @@ async function facade(session: ApplicationSession, host?: ApplicationControlHost
 }
 
 describe('owned browser application facade', () => {
+  it('streams saved operations through the facade and backend while applied views stay unchanged', async () => {
+    const f = await fixture(), { client } = await facade(f.b)
+    const backend = createPeerGenerationApplicationBackend({ id: client.applicationId, session: client })
+    const changes = client.changes()[Symbol.asyncIterator]()
+    const states = client.operations.subscribe({ operationId: 'offline' })[Symbol.asyncIterator]()
+    const adapted = backend.operations.subscribe({ operationId: 'offline' })[Symbol.asyncIterator]()
+    await changes.next()
+    let viewChanged = false
+    const view = changes.next().then(value => { viewChanged = true; return value })
+    void view.catch(() => undefined)
+    try {
+      const next = states.next(), adaptedNext = adapted.next()
+      expect(await client.operations.get('offline')).toBeNull()
+      await client.command('say', 'saved without a coordinator', { operationId: 'offline' })
+      expect((await next).value).toMatchObject({ status: 'saved', operationId: 'offline' })
+      expect((await adaptedNext).value).toMatchObject({ status: 'saved', operationId: 'offline' })
+      expect(viewChanged).toBe(false)
+      const applied = states.next()
+      const link = await connectApplications(f.a, f.b); cleanup.push(() => link.close())
+      expect((await applied).value).toMatchObject({ status: 'applied', author: client.deviceId })
+      expect((await view).value?.revision.point.sequence).toBe(1)
+    } finally {
+      await Promise.all([changes.return?.(), states.return?.(), adapted.return?.()])
+      await Promise.allSettled([view])
+    }
+  })
+
   it('keeps keys in the owner and preserves saved intent when a page cancels its waiter', async () => {
     const f = await fixture(), { client } = await facade(f.b)
     expect(client.deviceId).toBe(f.b.deviceId)
@@ -197,6 +225,18 @@ describe('owned browser application facade', () => {
     query.mockResolvedValueOnce({ revision: f.a.revision, value: new Array<unknown>(100_000) })
     await expect(client.query('messages', null)).rejects.toThrow('APPLICATION_WORKER_MESSAGE_LIMIT')
     query.mockRestore()
+    expect((await client.query('messages', null)).value.events).toHaveLength(0)
+  })
+
+  it('releases pre-aborted stream slots without requiring a first pull or explicit return', async () => {
+    const f = await fixture(), { client } = await facade(f.b)
+    const signal = AbortSignal.abort(new Error('already stopped'))
+    const cancelled = Array.from({ length: 64 }, () => client.operations.subscribe({ operationId: 'future', signal })[Symbol.asyncIterator]())
+    const streams = Array.from({ length: 14 }, () => client.operations.subscribe({ operationId: 'future' })[Symbol.asyncIterator]())
+    try {
+      expect(() => client.operations.subscribe({ operationId: 'future' })[Symbol.asyncIterator]()).toThrow('APPLICATION_WORKER_STREAM_LIMIT')
+      expect(await cancelled[0]!.next()).toEqual({ done: true, value: undefined })
+    } finally { await Promise.all(streams.map(async stream => { await stream.return?.() })) }
     expect((await client.query('messages', null)).value.events).toHaveLength(0)
   })
 

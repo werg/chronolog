@@ -7,7 +7,7 @@ import type { ApplicationControlHost, ApplicationTransition } from './recovery.j
 import {
   AbandonedOperationError, RecoveredViewError, type ApplicationChange, type ApplicationEventBatch, type ApplicationPeerAvailability,
   type ApplicationEventOptions, type ApplicationReadView, type ApplicationSession, type CommandOptions,
-  type QueryParameter, type QueryRows, type SessionStatus,
+  type OperationSubscribeOptions, type QueryParameter, type QueryRows, type SessionStatus,
 } from './session.js'
 import { installApplicationWorkerTransport, type ApplicationWorkerEndpoint } from './worker-transport.js'
 
@@ -131,6 +131,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
   const openStream = (name: unknown, args: readonly unknown[], signal: AbortSignal): AsyncIterator<unknown> => {
     switch (name) {
       case 'changes': return session.changes({ signal })[Symbol.asyncIterator]()
+      case 'operations': return session.operations.subscribe({ ...args[0] as OperationSubscribeOptions, signal })[Symbol.asyncIterator]()
       case 'signals': return session.signals.subscribe({ ...args[0] as SignalSubscribeOptions, signal })[Symbol.asyncIterator]()
       case 'status': return observe<SessionStatus>(listener => session.onStatus(listener), signal)
       case 'recovery': return observe<RecoveryNotice>(listener => session.onRecovery(listener), signal)
@@ -221,6 +222,8 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
     get: (id: string, options: { readonly author?: string } = {}): Promise<OperationState | null> => this.#call('operation.get', [id, options]),
     inspect: (id: string, options: { readonly author?: string } = {}): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null> => this.#call('operation.inspect', [id, options]),
     wait: (id: string, options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => this.#call('operation.wait', [id], options.signal, true),
+    subscribe: (options: OperationSubscribeOptions): AsyncIterable<OperationState> => this.#stream('operations', [{ operationId: options.operationId,
+      ...(options.author === undefined ? {} : { author: options.author }) }], options.signal),
   }
   readonly recovery = {
     inspect: (): Promise<readonly ApplicationTransition[]> => this.#call('recovery.inspect', []),
@@ -352,11 +355,13 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       let opened: Promise<number> | undefined, id: number | undefined, done = false, pulling = false
       const finish = (): void => {
         if (done) return
-        done = true; controller.abort(new Error('APPLICATION_WORKER_STREAM_CLOSED')); client.#streams.delete(controller)
+        done = true; lifetime.removeEventListener('abort', finish)
+        controller.abort(new Error('APPLICATION_WORKER_STREAM_CLOSED')); client.#streams.delete(controller)
         if (id !== undefined) client.#cancel(id)
         else void opened?.then(value => client.#cancel(value), () => undefined)
       }
       lifetime.addEventListener('abort', finish, { once: true })
+      if (lifetime.aborted) finish()
       return {
         async next(): Promise<IteratorResult<T>> {
           if (done) return { done: true, value: undefined }
@@ -371,7 +376,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
           } catch (error) { finish(); throw error }
           finally { pulling = false }
         },
-        async return(): Promise<IteratorResult<T>> { finish(); lifetime.removeEventListener('abort', finish); return { done: true, value: undefined } },
+        async return(): Promise<IteratorResult<T>> { finish(); return { done: true, value: undefined } },
       }
     } }
   }

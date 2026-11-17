@@ -2,16 +2,17 @@ import { access, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
+import type { PeerApplicationConfiguration } from '@tendriller/core/peers'
 import { DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import {
   applicationDescriptionDigest, bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant, peerDigest,
-  signApplicationDescriptor, signApplicationSchema, signControlRevision, signTransitionRequest,
+  signApplicationDescriptor, signApplicationSchema, signControlRevision, signTransitionRequest, verifyApplicationSchema,
   type GenerationRegistry,
 } from '@chronolog/peer-generation'
-import { bytesToHex, encodeChangeProgram, executionManifestArtifacts, program } from '@chronolog/protocol'
-import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
+import { program } from '@chronolog/protocol'
+import { defineApplication, defineCommand, defineQuery, describeApplication } from './definition.js'
 import { openApplicationDevice } from './device.js'
-import { createNativeSqlManifest, openNativeSqlApplication, openNativeSqlSession } from './sql-native.js'
+import { openNativeSqlApplication, openNativeSqlSession, prepareNativeSqlApplication } from './sql-native.js'
 import type { ApplicationReadView, ApplicationSession } from './session.js'
 import type { ApplicationBootstrapHost, ApplicationPublication } from './bootstrap.js'
 import { openNativeDevice } from './native.js'
@@ -24,13 +25,17 @@ it('rejects mismatched engines and duplicate owners before creating or disturbin
     const host = await createPeerIdentity(), key = crypto.getRandomValues(new Uint8Array(32))
     const definition = defineApplication({ id: 'sql-owner', version: '1',
       schema: program('CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL)'), commands: {}, queries: {} })
-    const { executionManifestDigest } = await executionManifestArtifacts(createNativeSqlManifest())
-    const applicationId = 'cd'.repeat(32), definitionDigest = await applicationDefinitionDigest(definition)
-    const schema = await signApplicationSchema({ applicationId, definitionDigest, executionManifestDigest: bytesToHex(executionManifestDigest),
-      program: bytesToHex(encodeChangeProgram(definition.schema!)) }, device.identity)
+    const applicationId = 'cd'.repeat(32)
+    const prepared = await prepareNativeSqlApplication({ applicationId, definition, schemaAdministrator: device.identity })
+    const configuration = { ...prepared, historyId: 'sql-owner', epoch: 0, keyDigest: await bytesDigest(key),
+      members: [{ publicKey: device.identity.publicKey }] } satisfies PeerApplicationConfiguration
+    expect(Object.keys(prepared).sort()).toEqual(['definition', 'executionManifestDigest', 'schema', 'schemaAdministrator'])
+    expect(configuration.definition).toEqual(describeApplication(definition))
+    const { schema } = prepared
     const descriptor = await signApplicationDescriptor({ applicationId, historyId: 'sql-owner', profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-      controlPublicKey: host.publicKey, schemaAdministrator: device.identity.publicKey, executionManifestDigest: bytesToHex(executionManifestDigest),
-      definitionDigest, schemaDigest: await peerDigest(schema) }, host)
+      controlPublicKey: host.publicKey, schemaAdministrator: prepared.schemaAdministrator, executionManifestDigest: prepared.executionManifestDigest,
+      definitionDigest: await applicationDescriptionDigest(prepared.definition), schemaDigest: await peerDigest(schema) }, host)
+    expect(await verifyApplicationSchema(schema, descriptor.payload)).toEqual(definition.schema)
     const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
       grants: [participantGrant(device.identity.publicKey, { administrator: true })] }, host)
@@ -80,6 +85,10 @@ it('creates a signed SQL application through the canonical session opener and re
     queries: { items: defineQuery({ description: 'Read items', input: { type: 'null' }, read: (view: ApplicationReadView) => view.query('SELECT id,value FROM items ORDER BY id') }) } })
   const host: ApplicationBootstrapHost = {
     async configureApplication(configuration) {
+      const hostedConfiguration: PeerApplicationConfiguration = configuration
+      expect(Object.keys(hostedConfiguration).sort()).toEqual([
+        'definition', 'epoch', 'executionManifestDigest', 'historyId', 'keyDigest', 'members', 'schema', 'schemaAdministrator',
+      ])
       const descriptor = await signApplicationDescriptor({ applicationId, historyId: configuration.historyId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
         controlPublicKey: signer.publicKey, schemaAdministrator: configuration.schemaAdministrator, executionManifestDigest: configuration.executionManifestDigest,
         definitionDigest: await applicationDescriptionDigest(configuration.definition), schemaDigest: await peerDigest(configuration.schema) }, signer)

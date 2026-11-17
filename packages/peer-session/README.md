@@ -120,12 +120,121 @@ reading retained history and content. Advanced transports can use
 `session.keys.request()`, `offer()` and `attachSource()` directly; ordinary
 applications use the maintained connection helpers.
 
+## Native SQL application
+
+The optional `/sql-native` entry uses the pinned native DoltLite materializer.
+Define the literal initializer in `definition.schema`, then use the canonical
+session opener for creation, joining and offline reopening:
+
+```ts
+import { openNativeSqlSession } from '@chronolog/peer-session/sql-native'
+
+const session = await openNativeSqlSession({
+  device, definition, applicationId, host: client.peers, create: {},
+  databasePath: './application.sqlite',
+})
+```
+
+The creating device signs the initializer, and the opener owns publication,
+initial key enrollment and exact generation-selection retries. Joining or
+reopening omits `create`; reopening also omits `host` when the device has its
+cached verified binding. Applications do not implement a bootstrap journal.
+
+For explicit lower-level publication, prepare the public configuration fields
+from that same executable definition:
+
+```ts
+import { prepareNativeSqlApplication, openNativeSqlApplication } from '@chronolog/peer-session/sql-native'
+
+const prepared = await prepareNativeSqlApplication({
+  applicationId, definition, schemaAdministrator: device.identity,
+})
+await host.peers.configureApplication({
+  ...prepared, historyId, epoch: 0, keyDigest,
+  members: [{ publicKey: device.identity.publicKey }],
+})
+```
+
+The result contains `definition`, signed `schema`, `executionManifestDigest` and
+`schemaAdministrator`. Spread these fields directly into hosted configuration;
+the host derives and verifies the descriptor digests. The application identity
+must match the peer page being configured. The schema administrator is separate
+from the host's control signer and from a device's shared-data role.
+
+For the initial creator, open the SQL session with the verified authority,
+executable definition and explicit epoch keys. Normal reopening loads the
+persisted keyring and omits `epochKeys`:
+
+```ts
+const session = await openNativeSqlApplication({
+  device, definition, authority, epochKeys,
+  databasePath: './application.sqlite', schema: prepared.schema,
+})
+```
+
+Opening verifies the signed schema and execution identity against the descriptor
+before creating a SQL database, then initializes it before replaying application
+commands. The session claims exclusive device ownership before opening the
+materializer and closes it before releasing device storage. Ordinary commands
+cannot change the schema or protected platform tables. `dataRole` controls
+membership in the shared application collective; a null role still permits
+authorized personal rows owned by the actual command author.
+Shared rows can use `APPLICATION_COLLECTIVE_ID` when the domain allows current
+members to edit them. Creator departure does not freeze those rows, and signed
+data-role revocation remains effective through history rollback.
+
+## Browser SQL composition
+
+The portable and ordinary browser entries remain SQL-free. The optional
+`/sql-browser` entry constructs the same deterministic materializer in an
+isolated owning Worker and takes `engineUrl` instead of a database path. Serve
+the packaged `browser-engine` directory as static assets with JavaScript/WASM
+content types and the same cross-origin isolation policy as the Worker. The
+directory URL may include or omit its final slash. For example:
+
+```ts
+import { openBrowserSqlSession } from '@chronolog/peer-session/sql-browser'
+
+const session = await openBrowserSqlSession({
+  device, definition, applicationId, host, create: {},
+  engineUrl: new URL('/chronolog-engine/', self.location.href),
+})
+```
+
+As in native SQL, omit `create` when joining or reopening and omit `host` for
+cached offline reopening. The explicit `openBrowserSqlApplication` constructor
+accepts already verified `authority` and `schema` for custom composition.
+`prepareBrowserSqlApplication({ applicationId, definition, schemaAdministrator,
+engine })` returns the same flat public configuration fields as the native
+preparation helper, using the supplied WASM build manifest.
+
+The session verifies the signed initializer, engine bytes and manifest before
+creating the database. It opens an OPFS handle pool scoped to the durable storage
+identity and application, and releases it when the materializer closes.
+`createBrowserSqlManifest(buildManifest)` exposes the matching execution
+manifest for bootstrap. Native and browser peers must use that same signed
+identity; an incompatible engine fails before initializing the SQL cache.
+
+This composition uses the same page facade and Tendriller adapter described
+below. Both SQL databases are derived from authenticated history; they do not
+replace original encrypted records, saved operation intent, or the epoch keyring.
+Irreversible effects require a separately declared protected boundary.
+
 ## Recovery and inspection
 
 `operations.get(id)` returns saved, applied, abandoned or needsReapply.
+`operations.subscribe({ operationId, author?, signal? })` observes one signer's
+intent state, including `saved` work before a coordinator is reachable. It
+yields the current state when present and coalesces later state changes. The
+session permits 16 operation subscriptions, each with one pending value and
+one active lookup; cancellation releases a slot after any started lookup ends.
 `operations.inspect(id, { author })` includes the retained original signed
 attempt, preserving real signer provenance. `operation.retry()` reuses those
 bytes. `onRecovery()` and `changes()` report coherent generation transitions.
+`changes()` yields the current view first and then coalesces changed views;
+retention bookkeeping alone does not emit another applied-view notification.
+Explicit recovery notices remain visible, and retention still wakes
+`operation.shared()` waiters.
 A stale event cursor throws `RecoveredViewError`; reread the new view explicitly.
 Recovery notices keep `unknownLoss: true` even when they list known abandoned
 work: the selected prefix does not certify the former coordinator's last head.
@@ -168,8 +277,10 @@ function; close or cancellation fences pending responses.
 coalesce into a separate pass, so a continuously writing coordinator cannot
 extend an earlier wait indefinitely. Ranges contain at most 32 commands and
 fit the 1 MiB frame limit; verified pages are retained before requesting the
-next page. The replica's configured record and history-byte quotas bound the
-complete history. There is no smaller whole-history network buffer limit.
+next page. The shared storage envelope is at most 4,096 records and 64 MiB of
+retained history; replica options may lower either quota. There is no smaller
+whole-history network buffer limit. An advertised head is not proof that its
+history fits those quotas or has been retained.
 The selected view is published only after the captured root is available, and
 the retention acknowledgment names that captured prefix. If recovery excludes
 the captured generation during transfer, the pass fails explicitly; reconnect
@@ -312,6 +423,8 @@ The `/tendriller` entry exports `createPeerGenerationApplicationBackend()` for
 binding either an owned native session or this page facade to Tendriller's
 application interface. It forwards declared commands and coherent views to the
 same session instead of introducing another identity or queue.
+The adapter's `sql: true` option exposes SQL reads only when the owned native or
+browser session has a qualified SQL materializer; it does not create one.
 
 ## Content and local agent tools
 
@@ -365,29 +478,7 @@ revision guards, recovery journal and command journal. Cancelling an applied or
 change observation leaves previously saved work available for inspection and
 exact retry.
 
-## SQL applications
-
-The portable and `/browser` entries remain SQL-free. A native SQL application
-uses `openNativeSqlSession({ device, definition, applicationId, host, create: {},
-databasePath })` from `/sql-native`. Its literal `definition.schema` is signed
-by the creating device and pinned in the application descriptor; the helper
-prepares that envelope, publishes it and initializes the protected genesis.
-Ordinary lossy commands cannot perform schema or permission changes. Joining or
-reopening omits `create` and uses the published or cached schema. Reopening also
-omits `host` when the device has a cached verified binding.
-
-Browser SQL uses `openBrowserSqlSession({ device, definition, applicationId,
-host, create: {}, engineUrl })` from the optional `/sql-browser` entry inside the
-isolated owning Worker. As in native SQL, omit `create` for joining or reopening.
-Serve the packaged `browser-engine` directory as static assets with
-JavaScript/WASM content types and the same cross-origin isolation policy as the
-Worker. The engine directory URL may include or omit its final slash. The
-session verifies the engine bytes and execution identity before opening its
-OPFS pool, scopes the database to the device and application, and waits for the
-pool to release its handles before closing device storage. Both SQL paths
-authenticate the same peer-generation engine profile. `prepareApplicationSession` and the explicit
-SQL openers remain available for custom engine/provider composition; callers do
-not implement control signing or bootstrap retry journals.
+## Shared SQL commands and effects
 
 Shared SQL rows can use `APPLICATION_COLLECTIVE_ID` ownership when the domain
 permits every currently authorized application member to edit them. Signed
@@ -480,7 +571,6 @@ initializer's schema authority and the host's administration rights. Later
 enrollment is a signed control change through the host's
 public membership API, followed by peer-to-peer key delivery.
 
-
 ## Build a packed preview
 
 Run `node tools/package-peer-session.mjs`. The tarball includes shared ESM chunks,
@@ -503,6 +593,7 @@ the native build, then records every asset hash in provenance. Combine it with
 `--sql-native` when qualifying browser/native peers on the same execution profile.
 
 `node tools/test-peer-session-sql.mjs --artifact /path/to/archive.tgz` installs
-the native SQL archive into an empty independent project and exercises shared
-rows, constraint rejection, generation recovery, creator departure and reopen
-without workspace imports or install scripts.
+the native SQL archive into an empty independent project, verifies its recorded
+file hashes, and exercises canonical configuration, shared rows, constraint
+rejection, generation recovery, creator departure and reopen without workspace
+imports or install scripts.

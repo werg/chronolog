@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   createGenerationRegistry, createPeerIdentity, MemoryPeerStore, signApplicationDescriptor,
-  signControlRevision, signTransitionRequest, bytesDigest, participantGrant, peerDigest, type PeerIdentity, type PrefixProof,
+  signControlRevision, signTransitionRequest, bytesDigest, participantGrant, peerDigest, type OperationState, type PeerIdentity, type PrefixProof,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -91,6 +91,87 @@ describe('public peer application sessions', () => {
     expect(await applied(c, 'newly enrolled', 'after-grant')).toMatchObject({ outcome: 'accepted', author: c.deviceId })
     await link.synchronize()
     expect((await a.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['before-grant', 'after-grant'])
+  })
+
+  it('observes offline intent independently of applied views and filters operations by signer', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const backend = createPeerGenerationApplicationBackend({ id: b.applicationId, session: b })
+    const changes = b.changes()[Symbol.asyncIterator]()
+    const states = b.operations.subscribe({ operationId: 'offline' })[Symbol.asyncIterator]()
+    const adapted = backend.operations.subscribe({ operationId: 'offline' })[Symbol.asyncIterator]()
+    const other = b.operations.subscribe({ operationId: 'offline', author: a.deviceId })[Symbol.asyncIterator]()
+    try {
+      await changes.next()
+      let viewChanged = false, otherChanged = false
+      const view = changes.next().then(value => { viewChanged = true; return value })
+      const first = states.next(), adaptedFirst = adapted.next()
+      const otherFirst = other.next().then(value => { otherChanged = true; return value })
+      expect(await b.operations.get('offline')).toBeNull()
+      await b.command('say', 'saved offline', { operationId: 'offline' })
+      expect((await first).value).toMatchObject({ status: 'saved', operationId: 'offline' })
+      expect((await adaptedFirst).value).toMatchObject({ status: 'saved', operationId: 'offline' })
+      expect(viewChanged).toBe(false)
+      expect(otherChanged).toBe(false)
+
+      const next = states.next(), adaptedNext = adapted.next()
+      const link = await connectApplications(a, b); cleanup.push(() => link.close())
+      expect((await next).value).toMatchObject({ status: 'applied', author: b.deviceId })
+      expect((await adaptedNext).value).toMatchObject({ status: 'applied', author: b.deviceId })
+      expect((await view).value?.revision.point.sequence).toBe(1)
+      expect(otherChanged).toBe(false)
+      await applied(a, 'the same ID from another signer', 'offline'); await link.synchronize()
+      expect((await otherFirst).value).toMatchObject({ status: 'applied', author: a.deviceId, operationId: 'offline' })
+    } finally { await Promise.all([changes.return?.(), states.return?.(), adapted.return?.(), other.return?.()]) }
+  })
+
+  it('bounds cancelled operation lookups until they settle and wakes idle subscribers', async () => {
+    const f = await fixture(), a = await f.open(f.a), replica = sessionInternals.get(a)!.replica
+    const original = replica.operation.bind(replica), abort = new AbortController()
+    let release!: (state: OperationState | null) => void
+    const blocked = new Promise<OperationState | null>(resolve => { release = resolve })
+    replica.operation = () => blocked
+    const streams = Array.from({ length: 16 }, () => a.operations.subscribe({ operationId: 'future', signal: abort.signal })[Symbol.asyncIterator]())
+    try {
+      const pending = streams[0]!.next()
+      await expect(streams[0]!.next()).rejects.toThrow('APPLICATION_OPERATION_SUBSCRIPTION_BUSY')
+      abort.abort()
+      expect(await pending).toEqual({ done: true, value: undefined })
+      await Promise.all(streams.map(async stream => { await stream.return?.() }))
+      expect(() => a.operations.subscribe({ operationId: 'future' })[Symbol.asyncIterator]()).toThrow('APPLICATION_OPERATION_SUBSCRIPTION_LIMIT')
+      release(null); await blocked
+      replica.operation = original
+      const available = a.operations.subscribe({ operationId: 'future' })[Symbol.asyncIterator]()
+      const idle = available.next()
+      await available.return?.()
+      expect(await idle).toEqual({ done: true, value: undefined })
+    } finally { release(null); replica.operation = original; await Promise.all(streams.map(async stream => { await stream.return?.() })) }
+  })
+
+  it('emits only changed views while retention notifications still resolve sharing waits', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const coordinator = sessionInternals.get(a)!.replica, follower = sessionInternals.get(b)!.replica
+    const changes = a.changes()[Symbol.asyncIterator]()
+    try {
+      expect((await changes.next()).value).toMatchObject({ kind: 'applied', revision: a.revision })
+      let changed = false
+      const next = changes.next().then(value => { changed = true; return value })
+      await coordinator.observeCoverage(await follower.retainedCoverage())
+      expect(changed).toBe(false)
+
+      const operation = await a.command('say', 'a changed view', { operationId: 'changed' })
+      await operation.applied({ signal: AbortSignal.timeout(5000) })
+      expect((await next).value).toMatchObject({ kind: 'applied', revision: a.revision })
+
+      changed = false
+      const idle = changes.next().then(value => { changed = true; return value })
+      const shared = operation.shared({ signal: AbortSignal.timeout(5000) })
+      await follower.synchronize(coordinator.authority, await coordinator.exportCommands())
+      await coordinator.observeCoverage(await follower.retainedCoverage())
+      expect(await shared).toHaveLength(1)
+      expect(changed).toBe(false)
+      await changes.return?.()
+      expect(await idle).toEqual({ done: true, value: undefined })
+    } finally { await changes.return?.() }
   })
 
   it('owns a single saved attempt, exposes authenticated current results and isolates cancelled waiters', async () => {

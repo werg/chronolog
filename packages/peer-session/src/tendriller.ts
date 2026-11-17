@@ -68,15 +68,7 @@ export function createPeerGenerationApplicationBackend(options: {
     inspectRecovery: async () => (await session.inspectRecovery()).map(recoveryNotice),
     operations: Object.freeze({
       get: (id: string) => session.operations.get(id),
-      subscribe(input: { readonly operationId: string; readonly signal?: AbortSignal }) {
-        return subscription(input.signal, async function* (signal) {
-          let previous: string | undefined
-          for await (const _change of session.changes({ signal })) {
-            const state = await session.operations.get(input.operationId), encoded = JSON.stringify(state)
-            if (state !== null && encoded !== previous) { previous = encoded; yield state }
-          }
-        })
-      },
+      subscribe: (input: { readonly operationId: string; readonly signal?: AbortSignal }) => session.operations.subscribe(input),
     }),
     events: Object.freeze({
       async publish(topic: string, payload: unknown, input: SubmitOptions) {

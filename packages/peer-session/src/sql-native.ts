@@ -1,10 +1,10 @@
 import {
   DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime,
 } from '@chronolog/materializer-doltlite'
-import { peerDigest, signApplicationSchema, verifyApplicationSchema, type PeerIdentity, type SignedApplicationSchema } from '@chronolog/peer-generation'
+import { applicationDescriptionDigest, signApplicationSchema, verifyApplicationSchema, type PeerIdentity, type SignedApplicationSchema } from '@chronolog/peer-generation'
 import { bytesToHex, encodeChangeProgram, executionManifestArtifacts, hexToBytes } from '@chronolog/protocol'
 
-import { applicationDefinitionDigest, type ApplicationDefinition } from './definition.js'
+import { describeApplication, type ApplicationDefinition } from './definition.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
 import type { ApplicationSession } from './session.js'
 import { prepareApplicationSession, type ApplicationCreation, type ApplicationSessionBootstrapOptions } from './bootstrap.js'
@@ -14,18 +14,19 @@ export function createNativeSqlManifest() {
   return createDoltLiteExecutionManifest({ profile: 'chronolog-peer-sql-v1' })
 }
 
-/** Prepare the signed schema and binding fields for initial hosted publication. */
+/** Public definition and signed schema fields ready for hosted application configuration. */
 export async function prepareNativeSqlApplication(options: {
   readonly applicationId: string
   readonly definition: ApplicationDefinition
   readonly schemaAdministrator: PeerIdentity
 }) {
-  if (options.definition.schema === undefined) throw new Error('APPLICATION_SCHEMA_REQUIRED')
-  const definitionDigest = await applicationDefinitionDigest(options.definition)
+  const definition = describeApplication(options.definition)
+  if (definition.schema === null) throw new Error('APPLICATION_SCHEMA_REQUIRED')
+  const definitionDigest = await applicationDescriptionDigest(definition)
   const executionManifestDigest = bytesToHex((await executionManifestArtifacts(createNativeSqlManifest())).executionManifestDigest)
   const schema = await signApplicationSchema({ applicationId: options.applicationId, definitionDigest, executionManifestDigest,
-    program: bytesToHex(encodeChangeProgram(options.definition.schema)) }, options.schemaAdministrator)
-  return { schema, binding: { definitionDigest, executionManifestDigest, schemaDigest: await peerDigest(schema), schemaAdministrator: options.schemaAdministrator.publicKey } }
+    program: definition.schema }, options.schemaAdministrator)
+  return { definition, schema, executionManifestDigest, schemaAdministrator: options.schemaAdministrator.publicKey }
 }
 
 /** Verifies a separately authorized schema before constructing the permanent genesis state. */
@@ -62,8 +63,8 @@ export async function openNativeSqlSession<const D extends ApplicationDefinition
   })
   const prepared = await prepareApplicationSession({ device: options.device, definition: options.definition, applicationId: options.applicationId,
     ...(options.host === undefined ? {} : { host: options.host }), ...(options.signal === undefined ? {} : { signal: options.signal }),
-    ...(creation === undefined ? {} : { create: { ...options.create, executionManifestDigest: creation.binding.executionManifestDigest,
-      schemaAdministrator: creation.binding.schemaAdministrator, schema: creation.schema } }) })
+    ...(creation === undefined ? {} : { create: { ...options.create, executionManifestDigest: creation.executionManifestDigest,
+      schemaAdministrator: creation.schemaAdministrator, schema: creation.schema } }) })
   if (prepared.schema === null) { await options.device.close(); throw new Error('APPLICATION_SCHEMA_REQUIRED') }
   return openNativeSqlApplication({ device: options.device, definition: options.definition, authority: prepared.authority, schema: prepared.schema,
     databasePath: options.databasePath,

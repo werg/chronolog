@@ -19,7 +19,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: chaos-${{ github.workflow }}-${{ github.ref }}
+  # Keep each reviewed source snapshot qualifying while concurrent PR work advances.
+  group: chaos-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -30,6 +31,8 @@ jobs:
       CHAOS_SCENARIO: ${{ github.event_name == 'schedule' && 'stress' || inputs.scenario || 'smoke' }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:

@@ -376,7 +376,7 @@ describe('authenticated application transport', () => {
     expect(await b.operations.get('bulk-64', { author: a.deviceId })).toMatchObject({ status: 'applied', outcome: 'accepted' })
   })
 
-  it('admits an authenticated 4097-command target to bounded page fetching and cancels before retention', async () => {
+  it('bounds fetching from an authenticated over-quota history advertisement and cancels before retention', async () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
     const requested = deferred(), release = deferred(), controller = new AbortController()
     let limit: number | undefined
@@ -384,8 +384,9 @@ describe('authenticated application transport', () => {
       const value = packet(frame)
       if (value.type === 'response' && value.result !== undefined && value.result !== null && 'authority' in value.result) {
         const state = value.result as { readonly revision: PeerRevision }
-        // The authenticated head is a transfer target, not retained evidence.
-        // Stop before a page arrives; the real 65-command case checks completion.
+        // An authenticated advertisement is not retained evidence or permission
+        // to exceed the 4096-record storage ceiling. Stop before a page arrives;
+        // the real 65-command case checks completed transfer within that quota.
         const result = { ...value.result, count: 4097, revision: { ...state.revision,
           point: { ...state.revision.point, sequence: 4097 } } }
         frame = new TextEncoder().encode(JSON.stringify({ ...value, result }))

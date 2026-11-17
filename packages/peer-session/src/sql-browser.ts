@@ -2,10 +2,10 @@ import {
   DeterministicMaterializer, createDoltLiteMaterializationRuntime, PLATFORM_DIGEST,
 } from '@chronolog/materializer-doltlite/browser'
 import { loadBrowserEngine, createWasmEngineFactory, wasmEngineDigest, type WasmBuildManifest } from '@chronolog/materializer-doltlite/wasm'
-import { bytesDigest, peerDigest, signApplicationSchema, verifyApplicationSchema, type PeerIdentity, type SignedApplicationSchema } from '@chronolog/peer-generation'
+import { applicationDescriptionDigest, bytesDigest, signApplicationSchema, verifyApplicationSchema, type PeerIdentity, type SignedApplicationSchema } from '@chronolog/peer-generation'
 import { bytesToHex, createExecutionManifest, encodeChangeProgram, executionManifestArtifacts, hexToBytes, utf8 } from '@chronolog/protocol'
 
-import { applicationDefinitionDigest, type ApplicationDefinition } from './definition.js'
+import { describeApplication, type ApplicationDefinition } from './definition.js'
 import { prepareApplicationSession, type ApplicationCreation, type ApplicationSessionBootstrapOptions } from './bootstrap.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
 import type { ApplicationSession } from './session.js'
@@ -15,19 +15,20 @@ export function createBrowserSqlManifest(build: WasmBuildManifest) {
   return createExecutionManifest({ profile: 'chronolog-peer-sql-v1', engineDigest: wasmEngineDigest(build), platformDigest: PLATFORM_DIGEST })
 }
 
-/** Prepare publication from the exact browser engine and separately authorized schema. */
+/** Public configuration fields from the exact browser engine and separately authorized schema. */
 export async function prepareBrowserSqlApplication(options: {
   readonly applicationId: string
   readonly definition: ApplicationDefinition
   readonly schemaAdministrator: PeerIdentity
   readonly engine: WasmBuildManifest
 }) {
-  if (options.definition.schema === undefined) throw new Error('APPLICATION_SCHEMA_REQUIRED')
-  const definitionDigest = await applicationDefinitionDigest(options.definition)
+  const definition = describeApplication(options.definition)
+  if (definition.schema === null) throw new Error('APPLICATION_SCHEMA_REQUIRED')
+  const definitionDigest = await applicationDescriptionDigest(definition)
   const executionManifestDigest = bytesToHex((await executionManifestArtifacts(createBrowserSqlManifest(options.engine))).executionManifestDigest)
   const schema = await signApplicationSchema({ applicationId: options.applicationId, definitionDigest, executionManifestDigest,
-    program: bytesToHex(encodeChangeProgram(options.definition.schema)) }, options.schemaAdministrator)
-  return { schema, binding: { definitionDigest, executionManifestDigest, schemaDigest: await peerDigest(schema), schemaAdministrator: options.schemaAdministrator.publicKey } }
+    program: definition.schema }, options.schemaAdministrator)
+  return { definition, schema, executionManifestDigest, schemaAdministrator: options.schemaAdministrator.publicKey }
 }
 
 type BrowserSqlOptions<D extends ApplicationDefinition> = Omit<OpenPeerApplicationOptions<D>, 'createMaterializer'> & {
@@ -92,8 +93,8 @@ export async function openBrowserSqlSession<const D extends ApplicationDefinitio
   })
   const prepared = await prepareApplicationSession({ device: options.device, definition: options.definition, applicationId: options.applicationId,
     ...(options.host === undefined ? {} : { host: options.host }), ...(options.signal === undefined ? {} : { signal: options.signal }),
-    ...(creation === undefined ? {} : { create: { ...options.create, executionManifestDigest: creation.binding.executionManifestDigest,
-      schemaAdministrator: creation.binding.schemaAdministrator, schema: creation.schema } }) })
+    ...(creation === undefined ? {} : { create: { ...options.create, executionManifestDigest: creation.executionManifestDigest,
+      schemaAdministrator: creation.schemaAdministrator, schema: creation.schema } }) })
   if (prepared.schema === null) { await options.device.close(); throw new Error('APPLICATION_SCHEMA_REQUIRED') }
   return openBrowserSqlOwner({ device: options.device, definition: options.definition, authority: prepared.authority, schema: prepared.schema,
     engineUrl: options.engineUrl,
