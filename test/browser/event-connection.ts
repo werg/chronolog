@@ -3,6 +3,7 @@ import type { GovernedPeerService } from '@chronolog/agent-service/governed-peer
 import { base64UrlToBytes } from '@chronolog/protocol'
 import { MAX_SIGNAL_BYTES } from '@chronolog/signals'
 
+import { liveFrameLane } from '../fixtures/live-frame-lane.js'
 import type { BrowserEventBootstrap } from './event-contract.js'
 
 /** Independent loopback streams for qualification; no feed or evidence bypass. */
@@ -42,7 +43,7 @@ export async function openHttpPeerConnection(base: string, token: string): Promi
     const signal = AbortSignal.any([reliable.signal, live.signal, controller.signal])
     signal.addEventListener('abort', () => { void close() }, { once: true })
     if (signal.aborted) { await close(); signal.throwIfAborted() }
-    return { signal, send: (bytes, options) => reliable.send(bytes, options), frames: signal => reliable.frames(signal), live, close }
+    return { signal, send: (bytes, options) => reliable.send(bytes, options), frames: signal => reliable.frames(signal), live: liveFrameLane(live), close }
   } catch (error) { await close(); throw error }
 }
 

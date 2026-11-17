@@ -1,19 +1,18 @@
-import type { SignalDispatchResult } from '@chronolog/signals'
-
 /** A bounded connection-owned lane. Sending is local dispatch, not delivery. */
-export interface PeerFrameLane<DispatchResult = void> {
-  send(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<DispatchResult>
+export interface PeerFrameLane {
+  send(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
   frames(signal?: AbortSignal): AsyncIterable<Uint8Array>
   close(): Promise<void>
 }
-/** A live lane may refuse dispatch without queueing bytes or ending its owner. */
-export type PeerLiveLane = PeerFrameLane<SignalDispatchResult>
 
 export interface FramedPeerConnection extends PeerFrameLane {
   /** Ends before frame readers finish; preserves the physical failure or close reason. */
   readonly signal: AbortSignal
-  /** Independent disposable traffic; never multiplex it into reliable history. */
-  readonly live?: PeerLiveLane
+  /**
+   * Independent disposable traffic; never multiplex it into reliable history.
+   * Refuse congestion with SignalBackpressureError before queueing or dispatching.
+   */
+  readonly live?: PeerFrameLane
 }
 
 /**

@@ -52,7 +52,7 @@ describe('limited publisher HTTP ingress', () => {
       const protectedPaths = [
         '/rpc/unary/events.read', '/rpc/stream/events.subscribe', '/rpc/unary/query.localSql', '/rpc/unary/view.open',
         '/rpc/unary/enrollment.createRequest', '/rpc/unary/enrollment.approveRequest', '/rpc/unary/governance.grantCapability',
-        '/rpc/unary/change.submit', '/rpc/unary/transaction.submit', '/rpc/unary/operation.get', '/rpc/unary/transaction.getOutcome',
+        '/rpc/unary/change.submit', '/rpc/unary/operation.get', '/rpc/unary/transaction.getOutcome',
         '/rpc/unary/ingress.submit?extra=1', '/rpc/unary/ingress%2esubmit', '/rpc/stream/ingress.submit',
       ]
       for (const path of protectedPaths) {

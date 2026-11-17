@@ -1,13 +1,14 @@
 # Application primitives, finality and authority
 
 Start with the guarantee the application needs. Chronolog offers a live message
-path and a durable application log. Signals can be used on their own. The default
-Tendriller application mode is live collaboration: signed timestamp ordering,
+path and a durable application log. Signals can be used on their own. The current
+durable peer API supports live collaboration: signed timestamp ordering,
 deterministic replay, and a provisional suffix above an immutable final prefix.
 SQL is an optional execution profile of that log. A future asynchronous
-branch/merge mode can share signed operations, timestamp ordering and replay;
-it has no finality concept, API or provisional/final states. It would define its
-own inclusion and merge rules and is not implemented by the live API.
+branch/merge profile could reuse signed operations and replay, but would define
+its own inclusion and merge rules without provisional/final APIs. That profile
+is not implemented. A Tendriller page selects its backend explicitly; omitting
+the selection uses hosted Cloudflare application storage.
 
 ## Choose the primitive
 
@@ -77,8 +78,8 @@ the application has applied that state.
 | Observation | Meaning |
 | --- | --- |
 | `submit` / `events.publish` returns | The original proposal has been durably published locally. |
-| `handle.settled()` returns | A current accepted or rejected result; it may still change through replay. |
-| `handle.accepted()` returns | Immutable locally applied acceptance. A final rejection throws `TransactionRejectedError`. |
+| `handle.provisional()` returns | A current accepted or rejected result; it may still change through replay. |
+| `handle.accepted()` returns | Immutable locally applied acceptance. A final rejection throws `TransactionRejectedError`; provisional rejections keep waiting. |
 | `handle.final()` returns | An immutable locally applied accepted **or rejected** result. Inspect `outcome.type`. |
 | A final read view exists | A coherent snapshot of this replica's applied final prefix. It may lag another replica. |
 | `signals.send()` returns | Local live dispatch completed; it has no relationship to durable finality. |
@@ -88,7 +89,8 @@ rejection can be provisional; once immutable it is `status: 'final', outcome:
 'rejected'`. An exact retry recovers that final rejection without creating a new
 operation or waiting for another finality decision.
 
-Use final reads by default for shared business state. Use a local view when the
+`query`, `liveQuery`, `readView` and `changes` default to the final applied
+prefix. Select `view: 'local'` explicitly when the
 UI intentionally presents speculative state and can replace it after replay.
 Not every locally submitted proposal is immediately in the local materialized
 view: admission and required inputs can still be pending. Wait cancellation
@@ -145,23 +147,25 @@ can remain provisional.
 A late proposal may change a provisional SQL outcome from accepted to rejected,
 or rejected to accepted. The materializer returns to a checkpoint before the
 affected suffix, re-executes pure programs and atomically publishes the new
-view. Events from rejected programs are suppressed. An established final prefix
-cannot change. The SQL-free event materializer preserves original proposal
-bytes and that final-prefix boundary while allowing unadmitted previews to leave
-the selected suffix.
+view. Events from rejected programs are suppressed. Selection for a local
+preview is reversible before admission: withdrawing that selection replays away
+its speculative effects. Verified admission preserves the proposal's place in
+the admitted set, while its executed outcome may still change before finality.
+Only admitted proposals can enter the applied final prefix. If a preview is
+permanently excluded, its terminal rejection becomes visible after replay has
+removed any previously applied outcome. An established final prefix cannot
+change. The SQL-free event materializer enforces the same chronological order,
+original proposal identities and immutable final prefix.
 
 An uncertain storage acknowledgment requires reopening the event runtime before
 more replay or finality publication. A write may already have committed; it is
 unsafe to overwrite that stored prefix from older in-memory state. Reopening
 recovers the committed operation identities and final boundary.
 
-The UI replaces a complete captured view after a rebase; it must not accumulate
-irreversible side effects from speculative event callbacks. Capture SQL and
-events through one `readView()` when displaying them together. The capture pins
-one locally applied application prefix: its SQL rows, effective events and
-revision metadata agree even if new proof or replay arrives during rendering.
-Release the read lease after rendering. Durable projections and effect workers
-consume the final event stream using stable event IDs and processed checkpoints.
+The UI replaces a complete captured view after a rebase; reducers must not
+accumulate irreversible side effects from speculative event callbacks. Durable
+projections and effect workers consume the final event stream using
+whole-transaction batches, stable event IDs and processed checkpoints.
 
 A backdated proposal first included after its timestamp is closed receives
 `FINALITY_TIMESTAMP_CLOSED`. Re-signing it silently under a new timestamp would
@@ -195,10 +199,11 @@ Capture a read view when ready to render, and release it afterward. The captured
 view may be newer than the notification, so its own tokens describe the data
 being displayed. SQL and `readEvents()` on that handle remain pinned together.
 
-During incomplete or ambiguous publication, a view whose underlying counters
-have advanced without successful reconciliation is unavailable. A genuinely
-unchanged final view remains readable. Change streams wait for a usable applied
-snapshot; they never relabel partially published state with an older token.
+Identities come directly from successfully published materializer snapshots. A
+completed, coherent local publication can remain readable while final-prefix
+publication or later reconciliation retries. Ambiguous storage publication must
+not expose partially published state under an older token; an uncertain runtime
+requires reopening to establish its committed state before further publication.
 Returning or throwing from the iterator, aborting its signal, or closing its
 owner releases idle and paused subscriptions.
 
@@ -240,15 +245,32 @@ is non-null only where this process hosts the selected signer. Effect modules
 normally need `context.publisher`, `context.signals` and their final-event
 handlers, not direct access to the service.
 
-Effective durable events carry `event.origin` from their verified signed
-proposal: the group and signing key, original operation ID, membership revision,
-writer capability (or `null` for static membership), and exact signed author
-timestamp. The same provenance accompanies event reads, subscriptions and
-captured read views. Keep it attached when projecting an event or presenting it
-to an agent. Payload fields named `author`, `role`, `origin` or `instruction`
-remain application data; they cannot replace authenticated provenance or grant
-tool permissions. Historical authorization is not a claim that a grant remains
-active now, and authentication alone does not authorize every requested effect.
+### Carry the authenticated author into agent policy
+
+Every effective event includes `origin`, derived from the verified signed
+transaction rather than its JSON payload. Chronolog supplies `kind:'chronolog'`,
+the group, author, original `operationId`, membership revision, writer capability,
+and signed `authorTimestampMs`. The author is a lowercase hex signing public
+key, matching `Signals.authorId`; group, membership and grant IDs are canonical
+base64url strings. The timestamp is exact decimal text. The writer capability
+is `null` only for explicitly configured static membership, not an inferred
+broad grant. Relay peers, page hosts and finality signers do not replace the
+application author.
+
+Use this origin when attributing a conversation or deciding which handler may
+act. A field such as `{role:'owner'}` inside the payload cannot authorize a tool.
+The origin records the publication rights at the operation's signed context;
+it does not itself prove current permission, user approval for an unrelated
+action, or possession of provider credentials. The application chooses that
+policy and validates the domain payload before acting.
+
+RPC, captured views and the Tendriller adapter preserve this provenance. The
+effect worker stores the full bounded origin alongside the intent in its
+durable checkpoint. Recovery gives the handler the same origin and original
+operation, even if it resumes without rereading the source. Sources omitting
+origin are refused before provider dispatch. An external event
+adapter is responsible for authenticating its own provenance; adding the field
+to untrusted input is not authentication.
 
 Participant administration receives compact finalized controls and a signed
 completeness checkpoint, without application descriptors or bodies. The same
@@ -294,23 +316,11 @@ existing final reads and live signals can continue over connected peers.
 
 ## External effects are a separate boundary
 
-Every effective event carries `origin` derived from its verified signed
-proposal, separate from `payload`. Chronolog supplies `kind: 'chronolog'`, the
-group, author, operation ID, signed author timestamp, membership revision and
-exact writer capability. The author is a lowercase hex signing public key,
-matching `Signals.authorId`; group, membership and grant IDs are canonical
-base64url strings. The timestamp is an exact decimal string. A null grant means
-explicit static membership, not an inferred broad grant. RPC, captured views,
-the Tendriller adapter and effect checkpoints preserve these facts on restart.
-
-Publication rights establish who could author an event. A final event does not
-by itself authorize every action an agent can perform. Before dispatch, the
-handler applies its own policy to `event.origin`, topic and bounded intent; a
-payload's `role`, `authorId` or `origin` field is ordinary untrusted data. The
-worker's signing identity, provider credentials and tool permissions remain
-separate. Revocation cannot rewrite a prior final outcome. A handler may deny
-future execution under current application policy, but it must still reconcile
-an uncertain provider call that was already dispatched.
+Before dispatch, the handler applies its policy to `event.origin`, topic and
+validated intent. Its signing identity, provider credentials and tool permissions
+remain separate. Revocation cannot rewrite a prior final outcome. A handler may
+deny future execution under current policy, but it must still reconcile an
+uncertain provider call that was already dispatched.
 
 The database can make an intent final and persist a worker's state. It cannot
 atomically commit another provider's action. Use one designated worker per

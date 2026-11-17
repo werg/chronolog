@@ -1,7 +1,8 @@
 import { createCapabilitySignals, isCapabilityActive, type CapabilitySnapshot } from '@chronolog/capabilities'
 import { bytesToHex, equalBytes, type Ed25519KeyPair } from '@chronolog/protocol'
 import type { FeedLink } from '@chronolog/records'
-import type { SignalRoute, Signals } from '@chronolog/signals'
+import type { SignalLimits, SignalRoute, Signals } from '@chronolog/signals'
+import { SignalBackpressureError } from '@chronolog/signals'
 
 import type { FramedPeerConnection } from './framing.js'
 import { openAuthenticatedPeerLink, type PeerAuthorization } from './peer-link.js'
@@ -29,6 +30,7 @@ export async function createGovernedPeerService(options: {
   readonly activeMembership: () => CapabilitySnapshot
   readonly local: FeedLink
   readonly attach: (link: FeedLink) => () => void
+  readonly signalLimits?: SignalLimits
 }): Promise<GovernedPeerService> {
   if (!(options.groupId instanceof Uint8Array) || options.groupId.length !== 32) throw new Error('PEER_GROUP_INVALID')
   const groupId = options.groupId.slice(), identity = { ...options.identity, publicKeyBytes: options.identity.publicKeyBytes.slice() }
@@ -45,7 +47,7 @@ export async function createGovernedPeerService(options: {
     if (!equalBytes(snapshot.groupId, groupId)) throw new Error('PEER_GROUP_MISMATCH')
     return snapshot
   }
-  const signals = createCapabilitySignals({ groupId, identity, current, relay: true })
+  const signals = createCapabilitySignals({ ...options.signalLimits, groupId, identity, current, relay: true })
   return {
     signals,
     async connectPeer(input) {
@@ -98,7 +100,7 @@ export async function createGovernedPeerService(options: {
             if (localReader === undefined || !isCapabilityActive(localReader, active.revision)) throw new Error('PEER_LOCAL_READER_GRANT_REQUIRED')
             return await authenticated.sendSignal(frame, { signal })
           } catch (error) {
-            if (!signal.aborted) void close().catch(() => undefined)
+            if (!signal.aborted && !SignalBackpressureError.is(error)) void close().catch(() => undefined)
             throw error
           }
         } })

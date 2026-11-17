@@ -1,7 +1,7 @@
 import { assertCanonicalCbor, bytesToHex, encodeCanonicalCbor, generateEd25519KeyPair, type CborValue } from '@chronolog/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { SignalChannel, type SignalChannelOptions, type SignalRoute } from './index.js'
+import { SignalBackpressureError, SignalChannel, type SignalAuthorization, type SignalChannelOptions, type SignalPolicyContext, type SignalRoute } from './index.js'
 
 const channels: SignalChannel[] = []
 afterEach(() => { for (const channel of channels.splice(0)) channel.close() })
@@ -23,6 +23,101 @@ function gate() {
 }
 
 describe('standalone live signals', () => {
+  it.each([1, 2])('recognizes independently constructed refusals across %i routes and releases replay capacity', async count => {
+    const refusal = Object.assign(new Error('independent adapter queue full'), { code: 'SIGNAL_BACKPRESSURE', dispatched: false })
+    expect(refusal).not.toBeInstanceOf(SignalBackpressureError)
+    expect(SignalBackpressureError.is(refusal)).toBe(true)
+    let busy = true, closed = 0
+    const frames: Uint8Array[] = [], sender = await channel({ maxSequencesPerSession: 1 })
+    for (let index = 0; index < count; index++) sender.attachRoute({
+      async send(frame) { if (busy) throw refusal; frames.push(frame) },
+      close() { closed++ },
+    })
+    await expect(sender.send('preview', 'discarded')).rejects.toMatchObject({ code: 'SIGNAL_BACKPRESSURE', dispatched: false })
+    expect(frames).toEqual([]); expect(closed).toBe(0)
+    busy = false
+    const fresh = await sender.send('preview', 'fresh')
+    expect(frames).toHaveLength(count); expect(closed).toBe(0)
+    expect(await (await channel()).receive(frames[0]!)).toEqual(fresh)
+  })
+
+  it.each([undefined, true])('retires a failed route without an explicit pre-dispatch refusal marker: %s', async dispatched => {
+    const failure = Object.assign(new Error('transport failed'), { code: 'SIGNAL_BACKPRESSURE', dispatched })
+    expect(SignalBackpressureError.is(failure)).toBe(false)
+    let closed = 0
+    const sender = await channel()
+    sender.attachRoute({ async send() { throw failure }, close() { closed++ } })
+    await expect(sender.send('preview', 'failed')).rejects.toBe(failure)
+    expect(closed).toBe(1)
+    await expect(sender.send('preview', 'fresh')).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+  })
+
+  it('refuses congestion without retiring any route or replaying the dropped intent', async () => {
+    let busy = true, closed = 0
+    const frames: Uint8Array[] = []
+    const sender = await channel({ maxSequencesPerSession: 1 })
+    sender.attachRoute({ async send(frame) {
+      if (busy) throw new SignalBackpressureError()
+      frames.push(frame)
+    }, close() { closed++ } })
+    sender.attachRoute({ async send() { throw new SignalBackpressureError() }, close() { closed++ } })
+    await expect(sender.send('preview', 'discarded')).rejects.toBeInstanceOf(SignalBackpressureError)
+    expect(frames).toEqual([]); expect(closed).toBe(0)
+    busy = false
+    const sent = await sender.send('preview', 'fresh')
+    expect(frames).toHaveLength(1); expect(closed).toBe(0)
+    const receiver = await channel()
+    expect(await receiver.receive(frames[0]!)).toEqual(sent)
+    expect(sent.payload).toBe('fresh')
+  })
+
+  it('keeps a busy relay route for later fresh messages without buffering missed values', async () => {
+    let busy = true, closed = 0
+    const relayed: Uint8Array[] = []
+    const { sender, receiver, frames } = await fixture({ relay: true })
+    receiver.attachRoute({ async send(frame) {
+      if (busy) throw new SignalBackpressureError()
+      relayed.push(frame)
+    }, close() { closed++ } })
+    await sender.send('progress', 1)
+    expect((await receiver.receive(frames[0]!))?.payload).toBe(1)
+    busy = false
+    await sender.send('progress', 2)
+    expect((await receiver.receive(frames[1]!))?.payload).toBe(2)
+    expect(relayed).toEqual([frames[1]])
+    expect(closed).toBe(0)
+  })
+
+  it.each(['authorize', 'credential'] as const)('cancels cooperative %s work and releases its pending-send budget', async stage => {
+    const blocked = gate()
+    let first = true, policySignal: AbortSignal | undefined
+    const policy = async (signal: AbortSignal): Promise<void> => {
+      if (!first) return
+      first = false; policySignal = signal; blocked.enter()
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    }
+    const { sender, frames } = await fixture({}, { maxPendingSends: 1,
+      ...(stage === 'authorize' ? {
+        authorize: async (_input: SignalAuthorization, { signal }: SignalPolicyContext) => { await policy(signal); return true },
+      } : {
+        credential: async (_topic: string, { signal }: SignalPolicyContext) => { await policy(signal); return undefined },
+      }),
+    })
+    const controller = new AbortController()
+    const sending = sender.send('progress', 'expired observation', { signal: controller.signal })
+    const cancelled = expect(sending).rejects.toThrow('stop policy')
+    await blocked.entered
+    controller.abort(new Error('stop policy')); await cancelled
+    // Public cancellation may win its race before the cooperative callback's
+    // finally chain returns the shared work slot. It must settle this turn.
+    await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+    expect(policySignal?.aborted).toBe(true)
+    await sender.send('progress', 'fresh observation')
+    expect(frames).toHaveLength(1)
+  })
+
   it('authenticates scoped JSON without a group, grant, database or finality provider', async () => {
     const identity = await generateEd25519KeyPair()
     const { sender, receiver, frames } = await fixture({}, { identity })
@@ -83,7 +178,7 @@ describe('standalone live signals', () => {
     const { sender, receiver, frames } = await fixture({ now: () => now, maxSequencesPerSession: 2 }, { now: () => now })
     for (let n = 0; n < 3; n += 1) await sender.send('sample', n, { ttlMs: 5000 })
     await receiver.receive(frames[0]!); await receiver.receive(frames[1]!)
-    await expect(receiver.receive(frames[2]!)).rejects.toThrow('SIGNAL_REPLAY_QUOTA_EXCEEDED')
+    await expect(receiver.receive(frames[2]!)).rejects.toBeInstanceOf(SignalBackpressureError)
     expect(await receiver.receive(frames[0]!)).toBeNull()
     now += 5001
     await expect(receiver.receive(frames[0]!)).resolves.toBeNull()
@@ -189,7 +284,7 @@ describe('standalone live signals', () => {
     const first = await channel({ send }), second = await channel({ send }), receiver = await channel({ maxSessions: 1 })
     await first.send('sample', 1); await second.send('sample', 2)
     await receiver.receive(frames[0]!)
-    await expect(receiver.receive(frames[1]!)).rejects.toThrow('SIGNAL_SESSION_QUOTA_EXCEEDED')
+    await expect(receiver.receive(frames[1]!)).rejects.toBeInstanceOf(SignalBackpressureError)
     expect(await receiver.receive(frames[0]!)).toBeNull()
   })
 

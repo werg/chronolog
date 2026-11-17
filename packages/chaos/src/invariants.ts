@@ -104,13 +104,13 @@ async function snapshotNode(
   const [status, replication, state, schema, log, platform, registered] = await Promise.all([
     client.getStatus(),
     client.getReplicationStatus(),
-    client.query(stateQuery().sql),
-    client.query(schemaQuery().sql),
-    client.query(transactionLogQuery().sql),
-    client.query(platformObjectsQuery().sql),
-    client.query(registeredTablesQuery().sql),
+    client.query(stateQuery().sql, [], { view: 'local' }),
+    client.query(schemaQuery().sql, [], { view: 'local' }),
+    client.query(transactionLogQuery().sql, [], { view: 'local' }),
+    client.query(platformObjectsQuery().sql, [], { view: 'local' }),
+    client.query(registeredTablesQuery().sql, [], { view: 'local' }),
   ])
-  const owners = await client.query(ownersQuery(registered.result.rows.map((row) => String(row[0]))).sql)
+  const owners = await client.query(ownersQuery(registered.result.rows.map((row) => String(row[0]))).sql, [], { view: 'local' })
   if (!status.revision) throw new Error(`CHAOS_NODE_NOT_READY:${node}`)
   return {
     node,

@@ -41,22 +41,22 @@ class TestPeer {
     })
   }
   async submit(steps: string[], operationId: string): Promise<string> {
-    const handle = await this.client.transaction(steps, { idempotencyKey: operationId })
+    const handle = await this.client.transaction(steps, { operationId })
+    // The replay fixture closes time explicitly; authoring observes the provisional view.
     try {
-      // These crash/replay fixtures inspect local SQL before closing finality.
-      const result = await handle.settled()
-      if (result.outcome.type !== 'accepted') throw new Error(`BROWSER_FIXTURE_SQL_REJECTED: ${JSON.stringify(result.outcome)}`)
+      const outcome = await handle.provisional()
+      if (outcome.outcome.type === 'rejected') throw new Error(outcome.outcome.rejection.code)
       return handle.transactionId
     } finally { handle.dispose() }
   }
-  async query(sql: string, options: QueryOptions = {}) { return this.client.query(sql, [], options) }
+  async query(sql: string, options: QueryOptions = {}) { return this.client.query(sql, [], { view: 'local', ...options }) }
   async change(value: string, operationId: string, reject = false) {
     const handle = await this.client.submit(program(
       sqlStatement('UPDATE notes SET value=? WHERE id=1', [value]),
       emit('notes.changed', { id: 1, value }),
       ...(reject ? [sqlStatement("SELECT chronolog_assert(0,'mixed_event_rollback')")] : []),
     ), { operationId })
-    try { return { proposalId: handle.proposalId, outcome: await handle.settled() } }
+    try { return { proposalId: handle.proposalId, outcome: await handle.provisional() } }
     finally { handle.dispose() }
   }
   async stop() { try { await this.rpc.close() } finally { this.worker.terminate() } }

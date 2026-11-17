@@ -173,7 +173,7 @@ describe('Tendriller coordinated SQL connection', () => {
     expect((await alice.client.getTransactionOutcome(aliceClaim.transactionId)).outcome.type).toBe('pending')
     expect((await bob.client.getTransactionOutcome(bobClaim.transactionId)).outcome.type).toBe('pending')
     await sync()
-    const outcomes = await Promise.all([aliceClaim.settled(), bobClaim.settled()])
+    const outcomes = await Promise.all([aliceClaim.provisional(), bobClaim.provisional()])
     expect(outcomes.map((outcome) => outcome.outcome.type)).toEqual(['rejected', 'accepted'])
     const losing = outcomes.find((outcome) => outcome.outcome.type === 'rejected')!
     expect(losing.outcome).toMatchObject({ type: 'rejected', rejection: { code: 'assert:already_claimed' } })

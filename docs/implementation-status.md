@@ -6,7 +6,10 @@ under either the SQL/events profile or the SQL-free events profile. A signed
 group configuration selects the peer or coordinated history policy; native and
 browser hosts supply storage and connection adapters. The default Tendriller
 composition places portable roster administration on Cloudflare, with a separate
-fixed native ordering authority and full application replicas. The transaction
+fixed native finality signer and full application replicas. Both durable policies
+use the same signed author-time ordering; inclusion receipts never order
+application execution. Independent live signals require neither this history
+nor its finality service. The transaction
 contract is
 [Specification 10](implementation-specs/10-deterministic-sql-transactions.md)
 and the [design](design.md).
@@ -73,7 +76,7 @@ Implemented and covered by executable tests:
   predecessors;
 - transport-neutral signed feed records and content-addressed immutable
   evidence, exact-byte durable storage, in-process peer links, native SQLite
-  storage and SSB secret-handshake replication. The coordinated ledger orders
+  storage and SSB secret-handshake replication. The coordinated ledger retains
   small typed descriptors with inline governance and detached application
   envelopes fetched through reader-authorized peers. Persisted fork evidence
   restores quarantine on reopen and is replayed to new subscribers;
@@ -87,24 +90,30 @@ Implemented and covered by executable tests:
 - peer history using validator attestations, heartbeats, watermarks and
   revision-closure evidence; its order uses author timestamp, signing key and
   stable proposal ID, independent of the outer transport sequence;
-- coordinated history using a fixed native authority, contiguous ordered
-  entries and portable prefix certificates. A fenced durable writer stores
+- coordinated history using a fixed native finality signer, contiguous inclusion
+  receipts and portable prefix/closed-time certificates. A fenced durable writer stores
   payloads before descriptors and commits exact-byte deduplication and head
   state before acknowledgment; certificates cover its own committed head.
-  Canonical position controls authorization, epoch acceptance and order; author
-  timestamps cannot move late submissions into final history;
+  Receipt positions enumerate proofs, while signed author time, author key and
+  proposal ID order application execution. Verified chronological boundaries
+  activate governance. A newly included backdated proposal cannot reopen a
+  closed prefix; exact retries retain their original timestamp and result;
 - distinct actual local/final SQL revisions, durable prefix publication and
   recovery, final accepted/rejected transaction waits, stable final event IDs
   and bounded durable cursor reads/subscriptions. Retained views pin SQL and
   events together, and projection state/cursor pairs commit atomically;
 - `change.submit`, signed publisher ingress, event publication/read/subscription,
-  durable operation status, retained views, outcome/settlement and local/live
+  durable operation status, retained views, coalesced view invalidation,
+  outcome/settlement and local/live
   query RPCs. The TypeScript client includes `program`, `platformOp`, enrollment,
-  sealed-data helpers, projections, explicit local/final views and React hooks.
+  sealed-data helpers, projections, final-default local/final views and React hooks.
+  `provisional()` exposes replaceable execution, `final()` returns either final
+  outcome, and `accepted()` waits for final acceptance or throws on final rejection.
   The CLI, daemon, examples and chaos workloads exercise schema-authorized DDL,
   mixed-author writes, cross-owner probes and platform invariants;
 - resident final-intent workers with durable dispatch/result journals, explicit
-  uncertain-effect recovery and cancellation/deadline propagation; SQL timers
+  uncertain-effect recovery, retained authenticated event origins and
+  cancellation/deadline propagation; SQL timers
   that enforce their captured generation; and separately signed, bounded ephemeral signals that never
   advance the application log or durable cursor;
 - fork seeding that keeps owners, teams, memberships and grants, and
@@ -124,9 +133,9 @@ second time.
 The portable `MembershipAdministrator` verifies the signed cumulative control
 projection and inline governance operations without receiving application descriptors. It has no application-payload
 fetch port or SQL materializer. Issuing a signed revision is separate from
-verifying its effective activation at a certified position; enrollment readiness
+verifying its effective activation at a certified chronological boundary; enrollment readiness
 also tracks keys, authorized connectivity and application catch-up. Host login,
-roster issuance, fixed ordering authority and application schema ownership remain
+roster issuance, fixed finality signing and application schema ownership remain
 separate roles. The [compact control proof](membership-control-proofs.md) and
 [typed ledger](typed-ledger-records.md) specify these
 boundaries and unavailable-versus-invalid input handling.
@@ -135,14 +144,17 @@ The [governed peer integration](../test/governed-peer.e2e.test.ts) exercises
 live reader/writer enrollment and fixed-validator revision closure. The
 [coordinated integration](../packages/node-core/src/coordinated-governed.integration.test.ts)
 checks grant receipt before activation, readiness after certification,
-revocation at canonical positions, rejection of backdated old-grant proposals,
+revocation at verified chronological boundaries, rejection of backdated old-grant proposals,
 same-key regrant, and durable reopen. Earlier final rows and outcomes stay
 unchanged. A clean replica also reconstructs encrypted history from certified
-ordered evidence alone: verified historical key envelopes are received before
+retained inclusion/closure evidence alone: verified historical key envelopes are received before
 replaying earlier SQL, without activating later membership early.
 
 The optional [Tendriller package](../packages/transport-tendriller/README.md)
-uses pinned public SDK/engine artifacts. It provides exact-envelope append
+uses pinned public SDK/engine artifacts. Its public application adapter maps
+programs, current operation receipts, authenticated events, captured views and
+view invalidations onto a native or RPC replica. The optional retained-log
+adapter provides exact-envelope append
 retry, retained catch-up, immutable proof storage, and an authenticated
 on-demand authority endpoint that reads its own committed head. Certificates
 stay outside the log they certify. Core packages do not depend on Tendriller.
@@ -203,7 +215,7 @@ peer link while the hub is offline, with zero hub or authority requests.
 ## Daemon operational profile
 
 The default Tendriller composition keeps the roster root in Cloudflare and
-runs the fixed ordering authority with its persistent volume on the native host.
+runs the fixed finality signer with its persistent volume on the native host.
 Signed genesis separately names the initial application schema administrator;
 worker signers receive explicit program rights. A standalone self-governed
 native configuration is also available.

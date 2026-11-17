@@ -312,12 +312,12 @@ Chronolog session above them.
 
 The live lane carries one original signed signal per datagram, up to 16 KiB.
 It has a separate 64 KiB SCTP buffered-amount budget and at most 64 queued
-received datagrams. A congested low-level `live.send` immediately returns
-`{ refused: 'backpressure' }`, guaranteeing that it queued and dispatched no
-bytes for that attempt. The public `signals.send` rejects with
-`SIGNAL_BACKPRESSURE`; the authenticated session and reliable history remain
-usable, and a later fresh signal can succeed. A slow receiver drops its oldest
-queued datagram and increments `live.stats.droppedPackets`. No history
+received datagrams. A congested send rejects immediately with
+`SignalBackpressureError` before dispatch, preserving the authenticated session
+and its durable lane for later work. A slow receiver drops
+its oldest queued datagram and increments `live.stats.droppedPackets`. Verification
+limits above this transport can discard additional live input. Neither form of
+congestion interrupts durable replication. No history
 credit, detached-body queue or reliable retransmission blocks this lane. This
 isolates application queues; both lanes still share the connection's network
 bandwidth and SCTP association, so it is not a reserved-bandwidth guarantee.

@@ -82,7 +82,7 @@ HTTP gateway's allowed origins; the library does not install permissive CORS.
 ## Queries and immutable results
 
 `query.localSql` and `query.liveSql` accept `view: 'local' | 'final'`; the default
-is `local`.
+is `final`; speculative readers explicitly select `local`.
 
 | View | Reader | Meaning |
 | --- | --- | --- |
@@ -112,7 +112,7 @@ are bounded and belong to the RPC principal that opened them; expired views fail
 with `revision_unavailable` so the caller can capture a fresh view.
 
 Transaction outcomes contain a separate `final` boolean. `accepted` or
-`rejected` alone describes the current SQL execution result. `final: true`
+`rejected` alone describes the current program execution result. `final: true`
 requires the transaction's stable result to be applied in the local immutable
 prefix. Acceptance, rejection, revision and finality are read together without
 an intervening asynchronous status query.
@@ -158,9 +158,11 @@ processing remains the separate `events.subscribe` contract.
 
 ## Durable transaction submission
 
-`transaction.submit` accepts SQL/platform steps, a `requestId`, and an optional
-`idempotencyKey`. The service derives one stable operation identity from the
-caller principal, group and `idempotencyKey ?? requestId`.
+`change.submit` accepts one canonical `ChangeProgram`, a `requestId`, and the
+application's required `operationId`. SQL, platform operations, durable events
+and mixed programs all use this one authoring path. The service derives one
+stable durable identity from the caller principal, group and `operationId`.
+The request ID identifies a transport call and never changes business identity.
 
 The node's durable operation journal owns the mapping from that identity to the
 canonical signed proposal. It persists the exact prepared bytes before append
@@ -214,10 +216,7 @@ Only the device that created the request can claim its local readiness.
 | Captured views | `view.open`, `view.query`, `view.events`, `view.release` | `view.changes` |
 | Live signals | `signals.send` | `signals.subscribe` |
 | SQL | `query.localSql` | `query.liveSql` |
-| Captured views | `view.open`, `view.query`, `view.events`, `view.release` | `view.changes` |
-| Application changes and events | `change.submit`, `events.read`, `operation.get` | `events.subscribe`, `operation.subscribe` |
-| Live signals | `signals.send` | `signals.subscribe` |
-| Transactions | `transaction.submit`, `transaction.getOutcome` | `transaction.streamOutcome` |
+| Transactions | `transaction.getOutcome` | `transaction.streamOutcome` |
 | Evidence | `evidence.getSettlement`, `evidence.getValidatorWatermark` | `evidence.streamSettlement` |
 | Governance | `governance.getStatus`, `governance.grantCapability`, `governance.revokeCapabilities`, `governance.rotateEpoch`, `governance.grantHistoricalAccess` | — |
 | Enrollment | `enrollment.createRequest`, `enrollment.approveRequest`, `enrollment.getStatus` | — |

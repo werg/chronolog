@@ -7,87 +7,126 @@ membership details are in [governance.md](governance.md); row ownership is in
 
 ## 1. What Chronolog is
 
-Chronolog is a permissioned, peer-to-peer SQL database. Members write
-**ordinary SQLite transactions**; every replica derives the same database by
-executing authenticated proposals in the order established by its group's
-history policy. A signed genesis chooses one of two built-in policies:
-**peer**, using validator admission and closure evidence, or **coordinated**,
-using an authenticated ordered prefix and a fixed authority's certificates.
+Chronolog provides independent live signals and a permissioned, peer-to-peer
+application log. A signal is a signed, expiring message with no database,
+durable operation, replay or finality prerequisite. A durable change program
+records bounded events, optionally together with **ordinary SQLite statements**
+and platform operations. SQL is an execution profile, not a requirement for
+using live messages or durable events.
 
-Peers durably prepare their own proposals, retain records and proofs, verify
-history, and execute SQL locally. Under the peer policy, a late admitted
-proposal can change the tentative suffix. Under the coordinated policy, an
-offline proposal joins the ordered log when submitted. Neither policy permits
+Every durable replica derives application order from the original signed
+`(author_timestamp_ms, signing_public_key, proposal_id)`. Signed genesis selects
+the inclusion and finality policy. The built-in **peer** policy uses validator
+admission and closure evidence. The built-in **coordinated** policy uses a
+pinned signer's inclusion receipts and closed-time promises. These policies
+determine which proposals are included and which author-time prefix is closed;
+neither chooses a different execution order.
+
+Peers prepare their own durable proposals, retain original records and proofs,
+verify history, and materialize the selected profile locally. An earlier
+proposal admitted before its timestamp closes can replay the tentative suffix.
+An offline proposal first included after its timestamp has closed is rejected;
+it does not acquire a new position from arrival order. Neither policy permits
 new arrivals to change an already applied final prefix.
 
-Authenticated records and immutable evidence are the replicated source of
-truth; SQL databases and their publication metadata are derived state. A
-replica can rebuild from a peer without contacting a particular relay. Peer
-groups can establish new finality without Tendriller or another coordinating
-authority.
+Authenticated records and immutable evidence are the durable source of truth;
+SQL databases, effective event views and application projections are derived
+state. A replica can rebuild available history from another authorized peer.
+The selected validator policy or finality signer is needed for new finality,
+not for every local read or live message. Page hosting, membership administration,
+finality and external-effect execution are separately granted roles.
 
 ## 2. Moving parts
 
 ```mermaid
 flowchart TD
-  Records["Shared signed records and immutable evidence"] --> Peer["Peer history policy"]
-  Records --> Coordinated["Coordinated history policy"]
-  Peer --> Materializer["One deterministic materializer"]
-  Coordinated --> Materializer
-  Materializer --> Local["Local SQL revision"]
-  Materializer --> Final["Final SQL revision"]
+  Signals["Signed live signals"] --> Live["Authenticated live routes"]
+  Live --> Subscribers["Expiring subscriber views"]
+  Records["Original signed durable programs"] --> Included["Included set and closed-time proofs"]
+  Records --> Order["Author time, key, proposal ID"]
+  Included --> Order
+  Order --> Events["Event-only replay"]
+  Order --> SQL["SQL and event replay"]
+  Events --> Views["Captured local and final views"]
+  SQL --> Views
 ```
 
-A group selects one policy. Both use the same record/evidence storage,
-governance, transaction codec, node orchestration and materializer.
+A durable group selects one policy and execution profile. Both policies share
+record/evidence storage, governance, program codecs and node orchestration.
+The standalone signal channel has its own explicit authorization and transport
+ports; the governed adapter can reuse current group permissions and connections.
 
 | Piece | Package |
 | --- | --- |
 | Signed messages, transaction and value codecs, execution manifest | `protocol`, `canonical`, `crypto` |
 | Membership: genesis, capability revisions, validation policy | `capabilities` |
+| Independent signed live messages, bounded subscriptions and expiry | `signals` |
 | Signed feed records, immutable evidence, durable storage ports and replication | `records` |
 | Native authenticated SSB connection and SQLite storage | `transport-ssb` |
-| Optional Tendriller connection and prefix authority composition | `transport-tendriller` |
+| Reliable replication and independent live lanes over authenticated RTC sessions | `transport-webrtc`, `agent-service` |
+| Public Tendriller application adapter and optional retained-log finality adapter | `transport-tendriller` |
 | Node: ingest, history policy, membership activation, enrollment and finality | `node-core`, `control-store` |
+| SQL-free event materialization and durable operation recovery | `node-core` |
 | Deterministic execution on DoltLite | `materializer-doltlite`, `materializer` |
-| Dedicated Worker, OPFS storage, Web Locks and WASM engine | `runtime-browser` |
+| Dedicated Worker, OPFS storage, Web Locks and optional WASM SQL engine | `runtime-browser` |
+| Native finality service and durable effect/timer workers | `agent-service` |
 | Client API, RPC, React hooks, CLI, daemon | `client`, `rpc`, `react`, `apps/*` |
 | Experimental workerd execution path | `runtime-workerd` ([plan](workerd-reconstruction-plan.md)) |
 
-## 3. Transactions
+Signals use bounded FIFO delivery by default, or explicit `latest` coalescing
+for replaceable values. They never enter the durable record log. A successful
+send establishes local dispatch, not remote processing. Reconnect starts with
+fresh observations; temporary live congestion may lose a message without
+invalidating the durable replication session. See the
+[signal contract](../packages/signals/README.md) for authentication, expiry,
+cancellation and transport bounds.
+
+## 3. Durable programs
 
 A transaction candidate is signed by its author and carries:
 
 - the group, membership revision and validation policy it was written for;
+- the author's stable `operationId`;
 - `author_timestamp_ms`, fixed by the author;
-- the execution manifest digest (engine build, platform code and limits);
-- a program: an ordered list of steps, each a SQLite statement with bindings
-  or a typed platform operation (grant, collective,
-  transfer).
+- the execution manifest digest (profile, implementation and limits);
+- a program: an ordered list of bounded literal event emissions and, in the SQL
+  profile, SQLite statements with bindings or typed platform operations
+  (grant, collective, transfer).
 
 The proposal ID is the digest of its canonical transaction core. Signatures,
 encryption envelopes and outer feed records carry that proposal without
 changing its identity. Receiving it through another peer, or inside another
-outer feed record, does not create another transaction or SQL effect.
+outer feed record, does not create another transaction, event or SQL effect.
+
+An event-only program uses the same durable identity, inclusion and finality
+rules without loading a SQL engine. A mixed program commits its SQL changes
+and event emissions atomically. Rejected programs expose no effective events.
+Each event has a stable proposal/ordinal identity and authenticated `origin`
+derived from its original signed transaction, separately from application JSON.
+Durable event subscriptions expose accepted final events in whole-transaction
+batches, with opaque history/filter-bound cursors.
 
 Values are SQLite's own storage classes (NULL, INTEGER, REAL, TEXT, BLOB).
 DDL and DML travel in the same stream. Application schema is whatever the
 accepted transactions created; the execution manifest identifies the engine
 and execution rules, not the application's tables.
-Only schema administrators (admins of the `group` collective, starting with
-the root administrator) may run DDL.
+Only schema administrators (admins of the `group` collective, starting with the
+schema administrator named separately in signed genesis) may run DDL. The
+membership root does not receive this role implicitly. The convenience native
+bootstrap deliberately grants both roles to its owner.
 
 A transaction that depends on earlier state says so in SQL, usually with
 `chronolog_assert(condition, 'code')`. If any statement fails, the transaction
-is **rejected** and has no effect; otherwise it is **accepted**. Only the
-outcome (and a rejection code and step index) is recorded. Values
-returned by statements are not replicated.
+is **rejected** and has no effect; otherwise it is **accepted**. Execution records
+the outcome (and a rejection code and step index), with effective events only
+from accepted programs. Values returned by SQL statements are not replicated.
 
 An application's stable operation ID is durably bound to the exact prepared
 proposal before publication. A lost response or restart resumes that proposal
 with its original identity; an established final outcome remains unchanged.
-The shared operation journal serializes
-unfinished work before dependent work can be authored. A relay adapter retries
+The shared operation journal serializes exact publication recovery. Dependent
+application work waits for final acceptance and retains its own state guards;
+publication order alone is not a dependency guarantee. A relay adapter retries
 the original local record and envelope bytes; it does not keep another outbox.
 
 ## 3a. Owner-controlled rows
@@ -113,8 +152,10 @@ See [design-owner-rows.md](design-owner-rows.md).
 ## 4. Determinism
 
 Every replica runs the pinned execution profile on the same state in the same
-policy-supplied order. Native and browser hosts inject the storage and engine
-adapters; the SQL materializer and deterministic restrictions are shared. The
+fixed chronological order. Event-only replicas materialize accepted event
+programs without SQL. For SQL profiles, native and browser hosts inject the
+storage and engine adapters; the materializer and deterministic restrictions
+are shared. The
 engine inputs that do not come from SQL are fixed per
 transaction: `'now'` is the author timestamp, `random()` is seeded from the
 transaction id, `localtime` is UTC, connection counters start at zero, and
@@ -185,6 +226,10 @@ reconnect and restart. Future-dated included proposals remain pending until a
 later closure covers their signed time. SQL and event finality require complete
 proofs, required payloads/keys and successful local replay of that prefix.
 
+An exact retry retains its original signed timestamp and outcome. A deliberate
+redo after rejection uses a new operation ID and current assumptions; the
+runtime never retimestamps a rejected original to make it enter the history.
+
 Certificates are immutable evidence outside the log they certify. The
 optional Tendriller adapter maps its public receipt format to this verifier;
 the same verifier works against an independent reference log. A stored append
@@ -212,7 +257,7 @@ default). Other connections apply their own explicit bounds.
 
 The portable in-process connection exchanges the same signed records and
 evidence. The optional Tendriller connection submits exact candidate and
-governance envelopes to a retained opaque log, stores returned order proofs in
+governance envelopes to a retained opaque log, stores returned inclusion proofs in
 the same evidence store, and uses existing authenticated connections for hints.
 Hints trigger retained reads; they are never required for correctness. Quota
 exhaustion, a changed history identity or conflicting restored history stops
@@ -231,6 +276,13 @@ operation. Live enrollment grants ordinary reader/writer membership. The built-i
 signed configurations keep the root, administration feed, validator set and validation
 policy fixed. Their authoring APIs reject reconfiguration of those components.
 
+Every writer grant declares explicit `ProgramRights`: SQL permission, durable
+event topics and ephemeral signal topics. Missing rights never imply SQL
+permission. One exact grant must cover a whole program; separate grants are
+not pooled to authorize it. Forwarding through another enrolled feed requires
+an explicit `forwarded: true`. An enrollment approval can narrow requested
+rights but cannot widen them.
+
 A joining device persists its own signing and reader keys and an exact signed
 request. An authorized issuer approves explicit roles and historical access
 through the live client/RPC workflow. Readiness requires active grants, the
@@ -243,42 +295,50 @@ boundaries determine when a new revision takes effect. Revocation is
 prospective in that order: earlier final outcomes remain unchanged, and a later
 regrant does not revive a revoked capability or a previously rejected proposal.
 
-Records are encrypted with per-epoch keys. The administrator rotates epochs
+Application bodies are encrypted with per-epoch keys. The administrator rotates epochs
 and wraps each epoch key to every reader's HPKE key; historical epochs are
 given to a reader only by an explicit administrator action. A replica can
 receive verified governance and historical keys from a complete certified
-prefix before replaying its earlier encrypted SQL. Membership activation still
+prefix before replaying its earlier encrypted programs. Membership activation still
 follows its signed causal chain and proved author-time closure boundary.
 
 ## 8. Materialization
 
-The node passes the fixed chronological order to one materializer, which does
-not independently re-sort it. Each published revision is a
-Dolt commit (`chronolog_head`, `chronolog_rev_*`); checkpoints
+The node passes the fixed chronological order to the selected materializer,
+which does not independently re-sort it. The SQL-free materializer persists its
+applied event history and final boundary. In the SQL profile each published
+revision is a Dolt commit (`chronolog_head`, `chronolog_rev_*`); checkpoints
 (`chronolog_cp_*`) are kept every N transactions so a late arrival replays
 only from the nearest checkpoint. Publication binds the durable SQL revision
 to its applied prefix and reconciles control metadata after interruption.
 
-Readers choose `local` or `final`. The local view includes the applied final
-prefix and its selected provisional suffix. An unadmitted preview can leave that
-suffix; an admitted candidate remains included while its application outcome
-may still change on replay. The final view uses an actual separate immutable SQL
-revision of the locally applied final prefix; it is not a label on the tentative reader.
-Queries and live queries report the selected view and revision. A replica's
+Readers default to `final` and explicitly select `local` for the applied final
+prefix and its selected provisional suffix. An unadmitted preview may leave that
+suffix; an admitted proposal stays included while its outcome can still change
+through replay. A captured read view pins the effective event stream and, when available,
+SQL to one applied revision. The SQL profile's final reader is an actual
+separate immutable revision; it is not a label on tentative rows. A replica's
 final view can still be behind another replica's.
 
-`transaction.final()` waits for final acceptance or rejection after local
-application. `accepted()` waits for immutable acceptance and throws on final
-rejection. `settled()` describes the current result, which can still change
-through peer-policy replay. See the
-[client guide](../packages/client/README.md). The replicated
-log of outcomes is the table `chronolog_transactions`, readable by
-transactions.
+`changes({ view })` yields the current view identity, then coalesced
+invalidations. A UI captures and renders a replacement view after each change;
+it does not accumulate irreversible effects during replay. Durable consumers
+instead process final event batches and atomically commit their projection or
+effect journal with the processed cursor.
+
+`handle.final()` waits for final acceptance or rejection after local application;
+callers inspect its outcome. `accepted()` waits for final acceptance and throws
+on final rejection. `provisional()` observes the current accepted/rejected
+result, which can still change through replay. The public application receipt
+separates lifecycle (`queued`, `provisional`, `final`) from acceptance
+(`accepted`, `rejected`). See the [client guide](../packages/client/README.md).
+SQL groups also expose their outcome log as `chronolog_transactions`, readable
+by transactions.
 
 ## 9. Failure handling
 
 Durable operation journals, exact-byte retries, retained records and verified
-evidence recover interrupted submission, governance, replication and SQL
+evidence recover interrupted submission, governance, replication and materialized
 publication. A browser peer also requires one effective storage owner; losing
 a tab does not discard its durable identity or proposal.
 
@@ -291,12 +351,25 @@ participants coordinate out of band and **fork**: a new group whose genesis
 names its origin and is seeded by its root administrator, keeping every row's
 owner ([governance.md](governance.md#forking-a-group)).
 
+Replica rollback changes only the provisional suffix. Undo of a final action
+is a new guarded compensation. External effects consume final accepted intent
+through a designated worker with its own durable dispatch journal and an
+explicit provider idempotency, reconciliation or manual recovery contract.
+Database replay never invokes a provider. See
+[application primitives](application-primitives.md) for these boundaries.
+
 ## 10. Security consequences
 
-Signatures authenticate authors and governance; policy evidence authenticates
-admission, order and finality. Feed forks and conflicting certified positions
-are detected. Backdating cannot bypass a closed peer revision or a coordinated
-revocation position, and duplicates cannot repeat SQL effects.
+Signatures authenticate authors and governance; policy evidence establishes
+inclusion and closed-time promises. Replicas verify chronological execution
+independently. Feed forks and conflicting certified positions are detected.
+Backdating cannot bypass a closed author-time boundary or an effective
+revocation, and duplicates cannot repeat durable events or SQL effects.
+
+Authenticated provenance does not grant instruction authority or external tool
+credentials. A handler validates the payload and checks its application's policy
+against the backend-supplied origin. Live topic rights, durable publication,
+SQL ownership, membership administration and finality signing remain distinct.
 
 A writer can change rows it owns or has been granted. Validators decide
 admission under the pinned policy; the replica also verifies writer authority

@@ -1,46 +1,55 @@
-# Tendriller application and history adapters
+# Tendriller application adapter and optional retained finality
 
-`@chronolog/transport-tendriller` connects Tendriller's public application contract
-to an owned Chronolog replica. It also supplies an optional public record-log
-adapter and signed inclusion/closure endpoint for deployments that select hosted
-finality. The portable record store, Chronolog protocol and history policy remain
-usable independently. `coordinated` names the signed-inclusion protocol; all
-replicas execute the same signed author-time order with deterministic tie-breakers.
+## Bind a peer application's history
 
-## Use the replica as the application backend
+`createChronologApplicationBackend` exposes an existing native node or public
+Chronolog client through Tendriller's application contract. It does not open a
+second database, send application work to the host, allocate replacement
+operations, or select the group's finality provider.
 
 ```ts
 import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
 
-const application = createChronologApplicationBackend({
-  id: 'project-replica',
-  replica: client, // ChronologClient or ChronologNode
-  sql: true, // The selected execution profile supports SQL.
+// Install live messaging before durable catch-up when the UI needs it.
+tendril.signals.install(client.signals)
+const backend = createChronologApplicationBackend({
+  id: tendril.application.selection.id, replica: client, sql: true,
 })
+tendril.application.install(backend)
+
+for await (const change of backend.changes({ view: 'final', signal })) {
+  const view = await backend.readView({ view: change.view })
+  try { render(await view.query('SELECT id, status FROM tasks'), await view.readEvents()) }
+  finally { await view.release() }
+}
 ```
 
-The adapter forwards durable submission, event reads and operation status to
-that replica. `changes({ view, signal })` defaults to `final`, emits the current
-view identity and coalesces later invalidations, including SQL-only changes and
-finality-only advances. It has no replay cursor or SQL lease and makes no page-host
-polls. Reconnection observes current state. Use `readView({ view })` to capture
-SQL and effective events from one locally applied prefix, then release the view
-after rendering. Durable consumers use final event batches and processed cursors.
+`changes` begins with the current revision and coalesces display invalidations,
+including SQL-only changes and finality-only advances. It holds no SQL lease or
+durable cursor and makes no page-host polls. Reconnection observes current state. A worker uses `events.subscribe` and commits its
+processed cursor with its own state. `readView` pins queries and events to one
+coherent revision. The default is final state; an explicitly selected local view
+may rebase as earlier eligible history arrives.
 
-Operation lifecycle is `queued | provisional | final`; outcome is independently
-`accepted | rejected`. A final rejection is `status: 'final', outcome: 'rejected'`,
-and an exact retry returns that original result. Captured events and subscriptions
-preserve `event.origin` from the verified canonical proposal, including its
-author, group, operation, signed timestamp, membership revision and writer grant.
-Effect workers retain that origin when checkpointing their dispatch intent.
+`submit` and `events.publish` return the current operation snapshot. Its `status`
+is `queued`, `provisional`, or `final`; executed results separately identify an
+`accepted` or `rejected` `outcome`. A final rejection is terminal. An exact retry
+can return either original final outcome without queueing another proposal.
+`operations.subscribe({operationId})` observes the same identity through replay
+and finality. Authenticated `event.origin` passes through unchanged from the
+verified signed proposal, including after replica restart.
 
-Wire the selected peer's `signals` port separately for typing, presence and other
-ephemeral sends. `submit` and `events.publish` remain durable application actions.
-The application adapter owns no host request, signing identity, replay queue or
-membership policy. Its `sql` flag describes the selected execution profile and
-does not grant SQL permission.
+The `sql` option describes the execution profile, never a permission grant.
+An event-only backend rejects SQL queries and uses the same event, operation and
+view contract. Live signals need neither profile and are installed separately.
 
 ## Connect an optional hosted receipt log
+
+The package also supplies a public record-log adapter and signed
+inclusion/closure endpoint for deployments that select hosted finality. The
+portable record store, Chronolog protocol and history policy remain usable
+independently. `coordinated` names the signed-inclusion protocol; replicas execute
+the same signed author-time order with deterministic tie-breakers.
 
 Create the ordinary durable transport first, using `PortableFeedTransport` in a
 browser or the native transport. Both expose the immutable evidence methods that
@@ -70,10 +79,12 @@ const transport = new TendrillerTransport({
 })
 ```
 
-The page runtime's `tendril.records` and the native client's `client.records`
+The hosted Cloudflare page runtime's `tendril.records` and the native client's `client.records`
 implement the same public record client contract. A page can pass
 `tendril.records` directly to reuse its existing authenticated connection and
-head-change hints. The deployment authenticates certificate requests separately
+head-change hints. Peer-selected pages deliberately disable hosted record APIs;
+their application adapter above uses the replica's selected transport instead.
+The deployment authenticates certificate requests separately
 with the same owner or authorized-agent policy; a database membership grant does
 not grant Tendriller administration or access.
 

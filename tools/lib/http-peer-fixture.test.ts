@@ -1,10 +1,12 @@
-import type { FramedPeerConnection } from '@chronolog/agent-service/framing'
+import { framePeerStream, type FramedPeerConnection } from '@chronolog/agent-service/framing'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
 import { ChangeSignal, type FeedLink } from '@chronolog/records'
 import { describe, expect, it } from 'vitest'
+import { SignalBackpressureError } from '@chronolog/signals'
 
 import { openHttpPeerConnection } from '../../test/browser/event-connection.js'
+import { liveFrameLane } from '../../test/fixtures/live-frame-lane.js'
 import { createHttpPeerFixture } from './http-peer-fixture.js'
 
 function emptyLink(identity: string): FeedLink {
@@ -15,6 +17,21 @@ function emptyLink(identity: string): FeedLink {
 }
 
 describe('paired HTTP qualification transport', () => {
+  it('refuses saturated live dispatch without writing or closing its stream', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve }), writes: Uint8Array[] = []
+    const lane = liveFrameLane(framePeerStream({ readable: new ReadableStream(), maxPendingSends: 1,
+      writable: new WritableStream({ write: bytes => { writes.push(bytes); return gate } }) }))
+    const first = lane.send(new Uint8Array([1]))
+    await expect(lane.send(new Uint8Array([2]))).rejects.toBeInstanceOf(SignalBackpressureError)
+    release()
+    await expect(first).resolves.toBeUndefined()
+    await expect(lane.send(new Uint8Array([3]))).resolves.toBeUndefined()
+    expect(writes.map(frame => [...frame.subarray(4)])).toEqual([[1], [3]])
+    await lane.close()
+    await expect(lane.send(new Uint8Array([4]))).rejects.toThrow('PEER_CONNECTION_CLOSED')
+  })
+
   it('carries live frames independently of a blocked reliable stream and closes both lanes together', async () => {
     let connected!: (connection: FramedPeerConnection) => void, ended!: () => void, closes = 0
     const accepted = new Promise<FramedPeerConnection>(resolve => { connected = resolve })

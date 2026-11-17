@@ -9,7 +9,7 @@ import { MAX_LEDGER_PAYLOAD_BYTES } from '@chronolog/node-core/ledger'
 import { assertCanonicalCbor, encodeCanonicalCbor, equalBytes, generateEd25519KeyPair, utf8, type CborValue } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type FeedLink } from '@chronolog/records'
 import { FeedTransport } from '@chronolog/transport-ssb'
-import { SignalChannel, SIGNAL_DOMAIN } from '@chronolog/signals'
+import { SignalBackpressureError, SignalChannel, SIGNAL_DOMAIN } from '@chronolog/signals'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { framePeerStream } from './framing.js'
@@ -115,8 +115,9 @@ async function signalSession(receive?: (frame: Uint8Array) => Promise<void>, opt
   const groupId = new Uint8Array(32).fill(31), grantId = new Uint8Array(32).fill(32)
   const [sender, receiver] = await Promise.all([
     openAuthenticatedPeerLink({ connection: { ...outgoing, live: { ...outgoing.live, async send(bytes, sendOptions) {
-      sent.push(bytes.slice()); await options?.dispatch?.()
-      await outgoing.live.send(bytes, sendOptions)
+      await options?.dispatch?.()
+      sent.push(bytes.slice())
+      return outgoing.live.send(bytes, sendOptions)
     } } }, local: server.transport.asLink(), identity: server.identity, groupId, grantId,
       async authorizePeer() { await guard?.(); return active },
       ...(options?.sendTimeoutMs === undefined ? {} : { sendTimeoutMs: options.sendTimeoutMs }) }),
@@ -403,6 +404,55 @@ describe('authenticated framed range synchronization', () => {
     const closed = expect(session.sender.completion).rejects.toThrow('PEER_SIGNAL_SEND_TIMEOUT')
     await vi.advanceTimersByTimeAsync(26)
     await failed; await closed
+  })
+
+  it('drops excess live verification work while durable reads and later signals continue', async () => {
+    let release!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const session = await signalSession(async () => blocked)
+    try {
+      for (let index = 0; index < 12; index += 1) {
+        await session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, BigInt(index)]))
+      }
+      await expect.poll(() => session.received.length).toBe(8)
+      await expect(session.sender.link.read(session.sender.peer.feedId, 0n, 1)).resolves.toEqual([])
+      release()
+      // A completed reliable read gives the released verification work a turn.
+      await session.sender.link.read(session.sender.peer.feedId, 0n, 1)
+      const fresh = encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'fresh'])
+      await session.sender.sendSignal(fresh)
+      await expect.poll(() => session.received.length).toBe(9)
+      expect(session.received.at(-1)).toEqual(fresh)
+    } finally { release() }
+  })
+
+  it('keeps the reliable session and live route after transport congestion', async () => {
+    let busy = true
+    const session = await signalSession(undefined, { dispatch: async () => { if (busy) throw new SignalBackpressureError() } })
+    const discarded = encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'discarded'])
+    await expect(session.sender.sendSignal(discarded)).rejects.toBeInstanceOf(SignalBackpressureError)
+    expect(session.sent).toEqual([])
+    await expect(session.sender.link.read(session.sender.peer.feedId, 0n, 1)).resolves.toEqual([])
+    busy = false
+    const fresh = encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'fresh'])
+    await session.sender.sendSignal(fresh)
+    await expect.poll(() => session.received).toEqual([fresh])
+  })
+
+  it('treats channel replay or verification capacity as a live gap rather than a connection failure', async () => {
+    let overloaded = true
+    const refusal = Object.assign(new Error('independently bundled channel capacity'), { code: 'SIGNAL_BACKPRESSURE', dispatched: false })
+    expect(refusal).not.toBeInstanceOf(SignalBackpressureError)
+    const session = await signalSession(async () => {
+      if (overloaded) throw refusal
+    })
+    await session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'capacity exhausted']))
+    await expect(session.sender.link.read(session.sender.peer.feedId, 0n, 1)).resolves.toEqual([])
+    overloaded = false
+    const fresh = encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'fresh'])
+    await session.sender.sendSignal(fresh)
+    await expect.poll(() => session.received.length).toBe(2)
+    expect(session.received.at(-1)).toEqual(fresh)
   })
 
   it('surfaces a failed signal verification through the owned peer completion', async () => {

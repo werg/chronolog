@@ -1,13 +1,11 @@
 import {
   base64UrlToBytes,
   bytesToBase64Url as toBase64Url,
-  encodePlatformOp,
   encodeChangeProgram,
   emit,
   isEmitStep,
   program,
   isPlatformOp,
-  isSqlValue,
   platformOp,
   toSqlValue,
   type CollectiveGovernance,
@@ -17,6 +15,7 @@ import {
   type SqlStatement,
   type SqlValue,
   type ChangeProgram,
+  type ProgramStep,
   type EmitStep,
   type EventPayload,
   type EventBatch,
@@ -32,13 +31,10 @@ import {
   type ProgramRights,
   type EnrollmentStatus,
   type LiveSqlEvent,
-  type LocalSqlValue,
   type NodeStatus,
   type ReplicationStatus,
   type RevisionMetadata,
   type RpcCallOptions,
-  type RpcProgramStep,
-  type RpcSqlStatement,
   type RpcTransport,
   type SettlementEvidence,
   type SqlView,
@@ -86,7 +82,7 @@ export interface QueryOptions {
   readonly signal?: AbortSignal
   readonly maxRows?: number
   readonly atRevision?: string
-  /** local is speculative; final selects the applied immutable SQL prefix. */
+  /** Defaults to final. Select local explicitly for a speculative, replayable view. */
   readonly view?: SqlView
 }
 
@@ -105,8 +101,8 @@ export interface LiveQueryValue {
 
 export interface TransactionOptions {
   readonly signal?: AbortSignal
-  /** Repeating a key with the same steps returns the original submission. */
-  readonly idempotencyKey?: string
+  /** Exact retries reuse this identity and program. A generated identity is returned on the handle. */
+  readonly operationId?: string
 }
 
 export interface ChangeOptions { readonly operationId: string; readonly signal?: AbortSignal }
@@ -138,11 +134,11 @@ export type TransactionStatementInput = string | CompiledSqlStatement | SqlState
 export type TransactionStepInput = TransactionStatementInput | PlatformOp | EmitStep
 
 /** A current accepted/rejected result; it may still change through replay. */
-export type SettledTransactionOutcome = TransactionOutcome & {
+export type ExecutedTransactionOutcome = TransactionOutcome & {
   readonly outcome: Exclude<TransactionOutcome['outcome'], { readonly type: 'pending' }>
 }
 /** The immutable accepted/rejected result applied on this replica. */
-export type FinalTransactionOutcome = SettledTransactionOutcome & { readonly final: true }
+export type FinalTransactionOutcome = ExecutedTransactionOutcome & { readonly final: true }
 export type AcceptedTransactionOutcome = FinalTransactionOutcome & {
   readonly outcome: Extract<TransactionOutcome['outcome'], { readonly type: 'accepted' }>
 }
@@ -164,8 +160,8 @@ export class TransactionHandle {
   get proposalId(): string { return this.submission.transactionId }
 
   /** The current speculative result. Replay can change this until final() resolves. */
-  settled(options: { readonly signal?: AbortSignal } = {}): Promise<SettledTransactionOutcome> {
-    return this.#waitForOutcome((value): value is SettledTransactionOutcome => value.outcome.type !== 'pending', options.signal)
+  provisional(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutedTransactionOutcome> {
+    return this.#waitForOutcome((value): value is ExecutedTransactionOutcome => value.outcome.type !== 'pending', options.signal)
   }
 
   /** Resolves only when the accepted or rejected result is applied in the immutable prefix. */
@@ -372,7 +368,7 @@ export class ChronologClient {
       requestId: this._requestId(),
       sql,
       parameters: encodeLocalSqlParameters(bindings),
-      view: options.view ?? 'local',
+      view: options.view ?? 'final',
       ...(options.maxRows === undefined ? {} : { maxRows: options.maxRows }),
       ...(options.atRevision === undefined ? {} : { atRevision: options.atRevision }),
     }, options.signal === undefined ? {} : { signal: options.signal })
@@ -396,7 +392,7 @@ export class ChronologClient {
           requestId,
           sql,
           parameters,
-          view: options.view ?? 'local',
+          view: options.view ?? 'final',
           ...(options.maxRows === undefined ? {} : { maxRows: options.maxRows }),
           ...(cursor === undefined || queryDigest === undefined ? {} : { resume: { groupId: this.groupId, queryDigest, eventSetRevision: cursor } }),
         }, this.#callOptions(options.signal === undefined ? signal : AbortSignal.any([signal, options.signal]))),
@@ -425,13 +421,10 @@ export class ChronologClient {
    * unless a grant or collective says otherwise.
    */
   async transaction(steps: readonly TransactionStepInput[], options: TransactionOptions = {}): Promise<TransactionHandle> {
-    const submission = await this._unary('transaction.submit', {
-      groupId: this.groupId,
-      requestId: this._requestId(),
-      steps: steps.map(encodeTransactionStep),
-      ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
-    }, options.signal === undefined ? {} : { signal: options.signal })
-    return new TransactionHandle(this, submission)
+    return this.submit(program(...steps.map(compileTransactionStep)), {
+      operationId: options.operationId ?? crypto.randomUUID(),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    })
   }
 
   async getTransactionOutcome(transactionId: string): Promise<TransactionOutcome> {
@@ -518,7 +511,7 @@ export class ChronologClient {
     return this.#identity
   }
 
-  queryResourceKey(sql: string, bindings: readonly LocalSqlInput[] = [], view: SqlView = 'local'): string {
+  queryResourceKey(sql: string, bindings: readonly LocalSqlInput[] = [], view: SqlView = 'final'): string {
     return `${view}\0${sql}\0${stableClientValue(bindings)}`
   }
 
@@ -603,25 +596,32 @@ export class ChronologClient {
 
   #reconnecting<T>(open: (signal: AbortSignal) => AsyncIterable<T>, externalSignal?: AbortSignal): AsyncIterable<T> {
     const self = this
-    return { async *[Symbol.asyncIterator]() {
+    return { [Symbol.asyncIterator]() {
       const controller = new AbortController()
       const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(externalSignal === undefined ? [] : [externalSignal])])
-      let attempt = 0
-      try {
-        while (!signal.aborted) {
-          if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
-          try {
-            for await (const value of open(signal)) { attempt = 0; yield value }
-            if (signal.aborted) return
-            throw new ChronologRpcError('transport_unavailable', 'Subscription disconnected')
-          } catch (error) {
-            if (signal.aborted) return
-            if (!isChronologRpcError(error) || !error.retryable) throw error
-            attempt++
-            await delay(self.#streamRetryDelayMs?.(attempt) ?? Math.min(100 * 2 ** Math.min(attempt, 5), 3000), signal)
+      const iterator = (async function* () {
+        let attempt = 0
+        try {
+          while (!signal.aborted) {
+            if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
+            try {
+              for await (const value of open(signal)) { attempt = 0; yield value }
+              if (signal.aborted) return
+              throw new ChronologRpcError('transport_unavailable', 'Subscription disconnected')
+            } catch (error) {
+              if (signal.aborted) return
+              if (!isChronologRpcError(error) || !error.retryable) throw error
+              attempt++
+              await delay(self.#streamRetryDelayMs?.(attempt) ?? Math.min(100 * 2 ** Math.min(attempt, 5), 3000), signal)
+            }
           }
-        }
-      } finally { controller.abort() }
+        } finally { controller.abort() }
+      })()
+      return {
+        next: () => iterator.next(),
+        async return() { controller.abort(); await iterator.return(); return { done: true as const, value: undefined } },
+        async throw(error: unknown) { controller.abort(error); await iterator.return(); throw error },
+      }
     } }
   }
 
@@ -780,12 +780,9 @@ export class OwnershipActions {
   }
 }
 
-function encodeTransactionStep(input: TransactionStepInput): RpcProgramStep {
-  if (isEmitStep(input)) {
-    const validated = emit(input.topic, input.payload)
-    return { emit: { topic: validated.topic, payload: validated.payload } }
-  }
-  return typeof input !== 'string' && isPlatformOp(input) ? { platform: encodePlatformOp(input) } : encodeTransactionStatement(input)
+function compileTransactionStep(input: TransactionStepInput): ProgramStep {
+  if (isEmitStep(input)) return emit(input.topic, input.payload)
+  return typeof input !== 'string' && isPlatformOp(input) ? input : compileTransactionStatement(input)
 }
 
 function eventReadOptions(options: EventReadOptions): EventReadOptions {
@@ -794,19 +791,19 @@ function eventReadOptions(options: EventReadOptions): EventReadOptions {
     ...(options.limit === undefined ? {} : { limit: options.limit }) }
 }
 
-function encodeTransactionStatement(input: TransactionStatementInput): RpcSqlStatement {
+function compileTransactionStatement(input: TransactionStatementInput): SqlStatement {
   if (typeof input === 'string') return { sql: input, bindings: [] }
   if ('bindings' in input) {
     return {
       sql: input.sql,
-      bindings: input.bindings.map((binding) => ({ parameter: binding.parameter, value: toRpcValue(binding.value) })),
+      bindings: input.bindings.map((binding) => ({ parameter: binding.parameter, value: toSqlValue(binding.value) })),
     }
   }
   const params = input.params ?? []
   if (isClientSqlValueArray(params)) {
     return {
       sql: input.sql,
-      bindings: params.map((value, index) => ({ parameter: { kind: 'index' as const, index: index + 1 }, value: toRpcValue(toSqlValue(value)) })),
+      bindings: params.map((value, index) => ({ parameter: { kind: 'index' as const, index: index + 1 }, value: toSqlValue(value) })),
     }
   }
   const used = new Set<string>()
@@ -815,22 +812,11 @@ function encodeTransactionStatement(input: TransactionStatementInput): RpcSqlSta
     const key = Object.hasOwn(params, token) ? token : Object.hasOwn(params, bare) ? bare : undefined
     if (key === undefined) throw new TypeError(`Missing SQL binding ${token}`)
     used.add(key)
-    return { parameter: { kind: 'name' as const, name: token }, value: toRpcValue(toSqlValue(params[key])) }
+    return { parameter: { kind: 'name' as const, name: token }, value: toSqlValue(params[key]) }
   })
   const unused = Object.keys(params).filter((key) => !used.has(key))
   if (unused.length > 0) throw new TypeError(`Unused SQL bindings: ${unused.join(', ')}`)
   return { sql: input.sql, bindings }
-}
-
-function toRpcValue(value: SqlValue): LocalSqlValue {
-  if (!isSqlValue(value)) throw new TypeError('Invalid SQL value')
-  switch (value.kind) {
-    case 'null': return { kind: 'null' }
-    case 'integer': return { kind: 'integer', value: value.value.toString(10) }
-    case 'real': return { kind: 'real', value: value.value }
-    case 'text': return { kind: 'text', value: value.value }
-    case 'blob': return { kind: 'blob', value: Uint8Array.from(value.value) }
-  }
 }
 
 /** Finds SQLite named parameters while ignoring quoted text, identifiers, and comments. */

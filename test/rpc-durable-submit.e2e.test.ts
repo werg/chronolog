@@ -5,9 +5,9 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { ChronologNode } from '@chronolog/node-core'
-import { bytesToBase64Url, generateEd25519KeyPair } from '@chronolog/protocol'
+import { bytesToBase64Url, generateEd25519KeyPair, encodeChangeProgram, program, sqlStatement } from '@chronolog/protocol'
 import { feedIdFromPublicKey, PortableFeedTransport } from '@chronolog/records'
-import { InProcessRpcTransport, NodeRpcService, type SubmitTransactionRequest } from '@chronolog/rpc'
+import { InProcessRpcTransport, NodeRpcService, type SubmitChangeRequest } from '@chronolog/rpc'
 import { FeedStore, nativeFeedCrypto, type ChronologTransport } from '@chronolog/transport-ssb'
 import { expect, it } from 'vitest'
 
@@ -63,25 +63,25 @@ it('recovers the exact signed transaction after a lost RPC response and full rep
   let replica: Awaited<ReturnType<typeof open>> | undefined
   try {
     replica = await open()
-    const request: SubmitTransactionRequest = { groupId: bytesToBase64Url(groupId), requestId: 'stable-request', steps: [{ sql: 'SELECT 1', bindings: [] }] }
-    await expect(replica.rpc.unary('transaction.submit', request)).rejects.toThrow('lost durable append response')
+    const request: SubmitChangeRequest = { groupId: bytesToBase64Url(groupId), requestId: 'first-call', operationId: 'stable-operation', program: encodeChangeProgram(program(sqlStatement('SELECT 1'))) }
+    await expect(replica.rpc.unary('change.submit', request)).rejects.toThrow('lost durable append response')
     const saved = await replica.feed.history()
     expect(saved).toHaveLength(1)
     await replica.close()
 
     replica = await open()
     writable = false
-    const recovered = await replica.rpc.unary('transaction.submit', request)
+    const recovered = await replica.rpc.unary('change.submit', request)
     expect(recovered.authorTimestampMs).toBe('1234')
     expect(recovered.publishedAt).toBe('1970-01-01T00:00:01.234Z')
     expect(await replica.feed.history()).toEqual(saved)
     // Recreating the facade and changing a connection address do not change the
     // authenticated principal's operation identity or require a live grant.
     const service = new NodeRpcService({ node: replica.node })
-    expect(await service.submitTransaction(request, { method: 'transaction.submit', peer: 'new-connection' })).toEqual(recovered)
-    await expect(service.submitTransaction({ ...request, steps: [{ sql: 'SELECT 2', bindings: [] }] }, { method: 'transaction.submit' }))
+    expect(await service.submitChange({ ...request, requestId: 'new-call' }, { method: 'change.submit', peer: 'new-connection' })).toEqual(recovered)
+    await expect(service.submitChange({ ...request, program: encodeChangeProgram(program(sqlStatement('SELECT 2'))) }, { method: 'change.submit' }))
       .rejects.toMatchObject({ code: 'already_exists' })
-    await expect(service.submitTransaction({ ...request, requestId: 'new-request' }, { method: 'transaction.submit' }))
+    await expect(service.submitChange({ ...request, operationId: 'new-operation' }, { method: 'change.submit' }))
       .rejects.toMatchObject({ code: 'failed_precondition' })
     expect(await replica.feed.history()).toEqual(saved)
   } finally {

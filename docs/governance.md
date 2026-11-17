@@ -444,15 +444,20 @@ validator. The frontier accounts for each pending proposal's own policy and
 revision, every allowed admission policy, and complete indexed feed prefixes.
 Once the revoke is final, no later admission can be inserted before it.
 
-`TransactionHandle.settled()` reports the materialized outcome at the
-transaction's **current position** and does not wait for finality.
-`accepted()` waits for locally applied immutable acceptance and throws on final
-rejection; `final()` returns either immutable outcome. External
-effects consume final events and retain their own dispatch checkpoint and
-idempotency key. Settlement evidence explains pending proof and admission
-blockers; a raw cutoff or an accepted speculative outcome does not establish
-finality. The common timestamp order and replay primitives do not themselves
-require finality; these readers and effects belong to the live history policy.
+`TransactionHandle.provisional()` reports the materialized outcome at the
+transaction's **current position**, which can change during replay.
+`accepted()` waits for immutable final acceptance and throws on final rejection.
+`final()` returns the immutable accepted or rejected result. Both wait for
+verified finality and local application of the required prefix; callers do not
+need to reconstruct finality from raw settlement evidence. Settlement evidence
+explains pending proof and admission blockers; a raw cutoff or an accepted
+provisional outcome does not establish finality. Designated final-intent
+workers consume final events and retain their own dispatch checkpoint and
+idempotency key for irreversible external effects.
+
+The common timestamp order and replay primitives do not themselves require
+finality. Final readers and effects belong to the live history policy. A group
+without finality can explicitly use local reads and provisional outcomes.
 
 Group capability revocations are signed control records. A new membership
 revision takes effect after its verified closed-time boundary; authorization

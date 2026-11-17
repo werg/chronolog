@@ -16,7 +16,7 @@ semantics; new qualification must run against the changed public artifacts.
 The 16 November 2026 follow-up extends portable peer core with one signed
 application history for SQL, durable events and resident agent work. The revised
 deployment places portable membership administration on Cloudflare by default,
-with a separate fixed native ordering authority and full application replicas.
+with a separate fixed native finality service and full application replicas.
 Small typed descriptors commit detached application envelopes; capability and
 epoch records stay inline. Full peers fetch the application bodies through their
 authorized peer path. The earlier event/application qualification is retained
@@ -90,7 +90,7 @@ deployed application gates remain in the contrib issues below.
 
 | Roadmap phase | Implemented boundary | Evidence and next qualification |
 | --- | --- | --- |
-| A. Authority and administration placement | Fixed native ordering authority, portable Cloudflare membership administrator, separately signed schema administrator, typed descriptor history and detached envelopes. | Native late-join/revocation and exact-retry fixture; complete packaged workerd/native/fresh-browser gate passed in [run 43940378818](https://github.com/werg/chronolog-db/actions/runs/43940378818), authored head `5cfa04440029c24d4313e7b8e88e593952180adb`. Separate administrator/native volume recovery remains [contrib #16](https://github.com/werg/tendriller-contrib/issues/16). |
+| A. Authority and administration placement | Fixed native finality service, portable Cloudflare membership administrator, separately signed schema administrator, typed descriptor history and detached envelopes. | Native late-join/revocation and exact-retry fixture; complete packaged workerd/native/fresh-browser gate passed in [run 43940378818](https://github.com/werg/chronolog-db/actions/runs/43940378818), authored head `5cfa04440029c24d4313e7b8e88e593952180adb`. Separate administrator/native volume recovery remains [contrib #16](https://github.com/werg/tendriller-contrib/issues/16). |
 | B. General durable events | Version 3 `ChangeProgram` contains SQL, platform operations and bounded literal emits. Event-only and mixed execution, stable event IDs and final durable cursors. | Actual native SQL rollback/reopen and event-only restart. Actual SQL-free Chromium/OPFS qualification passed at the recorded head below. |
 | C. Projections, workers and timers | Pinned combined views, keyed operation status, atomic projection checkpoints, final-intent worker journal, explicit provider recovery, signed signals and generation-fenced SQL timer publication. | Native rebase/finality, SQLite checkpoint rollback, worker ambiguity/deadline and SQL timer integration. Complete two-layout UI gate is separately reported. |
 | D. Production connection path | Bounded WebRTC framing and mutual grant-checked sessions carry records, evidence, wake hints and ephemeral frames. Cold browsers contact a configured resident HTTPS introduction endpoint; an explicitly coordinated pair may use Tendriller's short-lived SDP rendezvous. The browser Worker owns authentication, storage and replay. | Actual native/Chromium RTC gates measure continued application exchange after signaling closes and the host listener stops. See [the current qualification runbook](../route-qualification.md). Public-network reachability, optional TURN and provider measurements remain [contrib #14](https://github.com/werg/tendriller-contrib/issues/14). |

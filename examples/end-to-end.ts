@@ -53,7 +53,7 @@ try {
   // now belong to the key that signed their insert.
   await settled(aliceNode.node, await aliceNode.node.publish({ authorTimestampMs: 1n, program: bootstrapProgram() }), 'accepted')
   console.log('owner of account 1 is Alice:',
-    equalBytes((await client.query('SELECT p.key FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner WHERE a.id = 1')).result.rows[0]![0] as Uint8Array, alice.publicKeyBytes))
+    equalBytes((await client.query('SELECT p.key FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner WHERE a.id = 1', [], { view: 'local' })).result.rows[0]![0] as Uint8Array, alice.publicKeyBytes))
 
   // Bob may write, but not Alice's row.
   const theft = await bobNode.node.publish({ authorTimestampMs: 2n, program: program('UPDATE accounts SET balance = 0 WHERE id = 1') })
@@ -73,7 +73,7 @@ try {
   await settled(aliceNode.node, predecessor, 'accepted')
   await eventually(() => aliceNode.node.outcome(granted.txId)?.rejectionCode === 'assert:balance_changed')
   console.log('Bob\'s update after replay:', aliceNode.node.outcome(granted.txId)?.rejectionCode)
-  console.log('balance', (await client.query('SELECT balance FROM accounts WHERE id = ?', [1n])).result.rows)
+  console.log('balance', (await client.query('SELECT balance FROM accounts WHERE id = ?', [1n], { view: 'local' })).result.rows)
   console.log('checkpoints', aliceNode.materializer.checkpoints().length)
 } finally {
   await client.close()

@@ -41,7 +41,7 @@ await mkdir(resolve(output, '..'), { recursive: true })
 await mkdir(output) // Never mix an earlier run's assets or evidence into this run.
 const deployment = join(output, 'deployment'), pages = join(output, 'pages')
 await mkdir(deployment)
-const report = { format: 'chronolog-application-pilot/v2', status: 'building', passed: false,
+const report = { format: 'chronolog-application-pilot/v3', status: 'building', passed: false,
   startedAt: new Date().toISOString(), command: process.argv.slice(1), checks: [] as string[],
   revisions: { chronolog: gitState(workspace), contrib: gitState(contrib), tendrillerRuntime: gitState(runtime) },
   publicArtifacts: {} as Record<string, unknown>, counts: { effectDispatches: 0, hostApplicationRequests: 0, hostApplicationWrites: 0 },
@@ -127,7 +127,7 @@ try {
         })) })
       readInclusions = observeIncludedProposals(native)
       await accepted(await native.client.submit(program(sqlStatement("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL CHECK(status IN ('open','done'))) STRICT")), { operationId: 'pilot-schema' }))
-      const team = await native.client.ownership.createTeam({ invite: [...registrations.values()].map(value => base64UrlToBytes(value.identity.identity)) }, { idempotencyKey: 'pilot-team' })
+      const team = await native.client.ownership.createTeam({ invite: [...registrations.values()].map(value => base64UrlToBytes(value.identity.identity)) }, { operationId: 'pilot-team' })
       await accepted(team.handle)
       await accepted(await native.client.submit(program(sqlStatement(`INSERT INTO tasks (id, title, claimed_by, status, chronolog_owner) VALUES (?, ?, NULL, 'open', ${OWNER_FOR_KEY_SQL})`,
         ['task-1', 'Review the shared inspection evidence', team.id])), { operationId: 'pilot-task' }))

@@ -55,7 +55,7 @@ describe('TransactionHandle finality', () => {
     try {
       await waitFor(() => f.opened === 1)
       f.values.push(outcome(1, false))
-      await expect(handle.settled()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
+      await expect(handle.provisional()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
       expect(finished).toBe(false)
       f.values.push(outcome(2, false, true))
       await waitFor(() => handle.outcome.getSnapshot().value?.eventSetRevision === '2')
@@ -78,7 +78,8 @@ describe('TransactionHandle finality', () => {
     const handle = await fixture_.client.transaction(['SELECT 1'])
     let finished = false
     const final = handle.final().then((value) => { finished = true; return value })
-    const speculative = handle.settled()
+    const acceptance = expect(handle.accepted()).rejects.toMatchObject({ code: 'constraint', transactionId: 'tx-1' })
+    const speculative = handle.provisional()
     await waitFor(() => fixture_.opened === 1)
     fixture_.values.push(outcome(1, false))
     await expect(speculative).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
@@ -88,9 +89,24 @@ describe('TransactionHandle finality', () => {
     expect(finished).toBe(false)
     fixture_.values.push(outcome(3, true, true))
     await expect(final).resolves.toMatchObject({ final: true, outcome: { type: 'rejected' } })
+    await acceptance
     // A second final waiter can use the retained immutable result without
     // waiting for another event or disrupting other subscribers.
     await expect(handle.final()).resolves.toMatchObject({ eventSetRevision: '3', final: true })
+    await fixture_.client.close()
+  })
+
+  it('waits through provisional rejection and resolves only final acceptance', async () => {
+    const fixture_ = fixture()
+    const handle = await fixture_.client.transaction(['SELECT 1'])
+    let finished = false
+    const accepted = handle.accepted().then(value => { finished = true; return value })
+    await waitFor(() => fixture_.opened === 1)
+    fixture_.values.push(outcome(1, false, true))
+    await waitFor(() => handle.outcome.getSnapshot().value?.eventSetRevision === '1')
+    expect(finished).toBe(false)
+    fixture_.values.push(outcome(2, true))
+    await expect(accepted).resolves.toMatchObject({ final: true, outcome: { type: 'accepted' } })
     await fixture_.client.close()
   })
 

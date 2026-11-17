@@ -103,7 +103,7 @@ describe('public application backend with native durable execution', () => {
     const acceptedProgram = program(
       sqlStatement("UPDATE tasks SET value = 10 WHERE id = 'one'"),
       emit('tasks', { type: 'task.updated', taskId: 'one', value: 10 }),
-      emit('conversation', { type: 'message.posted', messageId: 'm1', text: 'Updated' }),
+      emit('conversation', { type: 'message.posted', messageId: 'm1', text: 'Updated', authorId: 'pretend-administrator' }),
     )
     const rejectedProgram = program(
       sqlStatement("UPDATE tasks SET value = 20 WHERE id = 'one'"),
@@ -131,7 +131,7 @@ describe('public application backend with native durable execution', () => {
       expect(history.revision).toBe(view.revision)
       expect(history.transactions).toEqual([{ proposalId: accepted.proposalId, events: [
         { id: `${accepted.proposalId}:0`, proposalId: accepted.proposalId, eventOrdinal: 0, topic: 'tasks', payload: { type: 'task.updated', taskId: 'one', value: 10 }, origin },
-        { id: `${accepted.proposalId}:1`, proposalId: accepted.proposalId, eventOrdinal: 1, topic: 'conversation', payload: { type: 'message.posted', messageId: 'm1', text: 'Updated' }, origin },
+        { id: `${accepted.proposalId}:1`, proposalId: accepted.proposalId, eventOrdinal: 1, topic: 'conversation', payload: { type: 'message.posted', messageId: 'm1', text: 'Updated', authorId: 'pretend-administrator' }, origin },
       ] }])
       expect((await client.events.read()).transactions).toEqual(history.transactions)
       expect((await node.events.read()).transactions).toEqual(history.transactions)
@@ -151,7 +151,10 @@ describe('public application backend with native durable execution', () => {
     expect(retryRejected.proposalId).toBe(rejected.proposalId)
     expect(await fixture.current.backend.operations.get('accepted')).toMatchObject({ status: 'final', outcome: 'accepted' })
     expect(await fixture.current.backend.operations.get('rejected')).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
+    expect(retryAccepted).toMatchObject({ status: 'final', outcome: 'accepted' })
     expect(retryRejected).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
+    const recovered = await fixture.current.backend.events.read()
+    expect(recovered.transactions[0]!.events.map(event => event.origin)).toEqual([origin, origin])
     await expect(fixture.current.backend.submit(program(emit('tasks', { changed: true })), { operationId: 'accepted' })).rejects.toMatchObject({ code: 'already_exists' })
     await expect(fixture.current.backend.submit(acceptedProgram, { operationId: 'new-after-revocation' })).rejects.toMatchObject({ code: 'failed_precondition' })
     expect(await fixture.current.feed.history()).toEqual(retained)
@@ -181,7 +184,7 @@ describe('public application backend with native durable execution', () => {
     const statuses = backend.operations.subscribe({ operationId: 'later', signal: AbortSignal.timeout(10_000) })[Symbol.asyncIterator]()
     try {
       expect((await statuses.next()).value).toMatchObject({ status: 'provisional', outcome: 'accepted' })
-      expect((await later.settled()).outcome).toEqual({ type: 'accepted' })
+      expect((await later.provisional()).outcome).toEqual({ type: 'accepted' })
       expect(acceptanceFinished).toBe(false)
       const afterRebase = statuses.next()
       const predecessor = await node.publish({ operationId: 'earlier-arrival', authorTimestampMs: setupTime + 1n,

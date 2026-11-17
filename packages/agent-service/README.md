@@ -446,10 +446,12 @@ use `chronolog/signal/v1`. The reliable lane multiplexes scalar availability-hea
 responses, bounded range responses, content-addressed payload responses and change hints. Best-effort signals use
 the separately bounded `connection.live` lane after the same peer authentication;
 a reliable-only connection provides replication without advertising a signal route.
-Signals cannot hold up retained range handling. At most eight signal callbacks run per
-connection; excess live frames are dropped before admission while durable
-replication continues. An admitted frame that fails authentication or protocol
-validation still terminates its session. There are at most four pending requests in either direction and each
+Signals cannot hold up retained range handling. At most eight signal callbacks
+run per connection; excess disposable input is dropped before further
+verification. Channel verification/replay capacity can also reject a live
+attempt without closing the session. Malformed frames, invalid signatures,
+failed current authorization and broken transports still retire the connection.
+There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement
 before making direct-connect, relay-bandwidth, or cost claims.
@@ -495,6 +497,20 @@ topic. Messages expire, have no catch-up history, and never advance a durable
 cursor or trigger a finality wait. TTL begins at the original `send()` call,
 including queued work. No route means immediate `SIGNAL_ROUTE_UNAVAILABLE`; the client
 never retries sends or reconnects subscriptions behind the application's back.
+
+Live transports resolve after local dispatch. A bounded queue that cannot accept
+any bytes throws `SignalBackpressureError` with `dispatched: false`; the route
+remains usable. `SignalBackpressureError.is(error)` recognizes that contract
+across separately bundled adapters. A matching code without the pre-dispatch
+marker is not a healthy refusal. When every route refuses dispatch, public
+`signals.send` rejects with the same typed `SIGNAL_BACKPRESSURE` error; reliable
+feed and payload transfer continue. Success acknowledges local dispatch on at least
+one route, not remote receipt or application processing. Expired or discarded
+live observations never become retryable durable work.
+
+`createGovernedPeerService` accepts `signalLimits` for TTL, replay memory,
+concurrent work and subscriber budgets. These live resource choices are local
+configuration and do not change signed group governance or finality semantics.
 
 The group adapter checks independent current `program.signals` rights; a
 signal-only grant may set `sql: false` and `topics: []`. Reading alone does not

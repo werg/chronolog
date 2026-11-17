@@ -64,14 +64,6 @@ import { ValidatorRevisionClosures } from './validator-closures.js'
 
 export type { ViewChange, ViewChangeOptions } from '@chronolog/protocol'
 
-interface AppliedApplicationSnapshot {
-  readonly historyId: string
-  readonly manifestDigest: string
-  readonly order: readonly Uint8Array[]
-  readonly local: { readonly revision: string; readonly numericRevision: bigint; readonly orderLength: number }
-  readonly final: { readonly revision: string; readonly numericRevision: bigint; readonly orderLength: number }
-}
-
 export class ChronologNode {
   readonly #options: ChronologNodeOptions
   readonly #control: ControlStore
@@ -89,7 +81,6 @@ export class ChronologNode {
   readonly #mutex = new Mutex()
   readonly #events = new RevisionBroadcaster<NodeRevisionEvent>()
   readonly #applicationChanges = new ChangeSignal()
-  #applicationSnapshot: AppliedApplicationSnapshot | undefined
   readonly events = {
     publish: (topic: string, payload: EventPayload, options: { readonly operationId: string }) =>
       this.publish({ program: program(emit(topic, payload)), operationId: options.operationId }),
@@ -351,13 +342,12 @@ export class ChronologNode {
   }> {
     return this.#mutex.run(() => {
       const view = options.view ?? 'final'
-      const applied = this.#requireApplicationSnapshot(view)
       const queries = this.#options.materialization.queries
       if (queries.captureRead === undefined) throw new Error('MATERIALIZER_SNAPSHOT_UNAVAILABLE')
       const sql: MaterializedReadHandle = queries.captureRead({ view })
       try {
       const snapshot = this.#eventSnapshot(sql)
-      const finalRevision = applied.final.revision
+      const finalRevision = this.#viewRevision('final', sql.finalRevision, sql.finalOrderLength)
       let released = false
       return { revision: snapshot.revision, finalRevision, view,
         query: (statement, parameters) => {
@@ -412,45 +402,17 @@ export class ChronologNode {
     let previous: ViewChange | undefined
     while (!this.#closed && !signal.aborted) {
       const version = this.#applicationChanges.version
-      const applied = this.#currentApplicationSnapshot(view)
-      if (applied !== undefined) {
-        const current: ViewChange = { view, revision: applied[view].revision, finalRevision: applied.final.revision }
-        if (current.revision !== previous?.revision || current.finalRevision !== previous?.finalRevision) {
-          previous = current
-          yield { ...current }
-        }
+      const current = await this.#mutex.run(() => ({ view,
+        revision: this.#viewRevision(view, view === 'final' ? this.finalRevision : this.materializedRevision,
+          view === 'final' ? this.finalOrderLength : this.orderLength),
+        finalRevision: this.#viewRevision('final', this.finalRevision, this.finalOrderLength) }))
+      if (this.#closed || signal.aborted) return
+      if (current.revision !== previous?.revision || current.finalRevision !== previous?.finalRevision) {
+        previous = current
+        yield { ...current }
       }
       await this.#applicationChanges.wait(version, signal)
     }
-  }
-
-  #cacheApplicationSnapshot(ordered: readonly AdmittedTransaction[]): void {
-    const policy = this.#options.historyPolicy, digest = bytesToHex(this.executionManifestDigest)
-    const historyId = `${bytesToHex(this.groupId)}/${digest}/${policy?.kind === 'coordinated' ? this.#finalityHistoryId() : 'peer'}`
-    const order = ordered.map(entry => entry.txId.slice())
-    const capture = (view: 'local' | 'final') => {
-      const numericRevision = view === 'final' ? this.finalRevision : this.materializedRevision
-      const orderLength = view === 'final' ? this.finalOrderLength : this.orderLength
-      const anchor = orderLength === 0 ? null : this.#idKey(order[orderLength - 1]!)
-      return { numericRevision, orderLength, revision: bytesToBase64Url(encodeCanonicalCbor([
-        'chronolog/view/v1', historyId, view, numericRevision, BigInt(orderLength), anchor,
-      ])) }
-    }
-    this.#applicationSnapshot = { historyId, manifestDigest: digest, order, local: capture('local'), final: capture('final') }
-  }
-
-  #currentApplicationSnapshot(view: 'local' | 'final'): AppliedApplicationSnapshot | undefined {
-    const applied = this.#applicationSnapshot
-    if (applied === undefined || applied.manifestDigest !== bytesToHex(this.executionManifestDigest) ||
-        applied.final.numericRevision !== this.finalRevision || applied.final.orderLength !== this.finalOrderLength ||
-        (view === 'local' && (applied.local.numericRevision !== this.materializedRevision || applied.local.orderLength !== this.orderLength))) return undefined
-    return applied
-  }
-
-  #requireApplicationSnapshot(view: 'local' | 'final'): AppliedApplicationSnapshot {
-    const applied = this.#currentApplicationSnapshot(view)
-    if (applied === undefined) throw new Error('MATERIALIZER_VIEW_NOT_RECONCILED')
-    return applied
   }
 
   async *#subscribeEvents(options: EventReadOptions & { readonly signal?: AbortSignal }): AsyncIterable<EventBatch> {
@@ -464,18 +426,24 @@ export class ChronologNode {
     }
   }
 
-  #eventSnapshot(captured: MaterializedApplicationSnapshot): EventHistorySnapshot {
-    const applied = this.#requireApplicationSnapshot(captured.view), view = applied[captured.view]
-    if (captured.revision !== view.numericRevision || captured.orderLength !== view.orderLength ||
-        captured.finalRevision !== applied.final.numericRevision || captured.finalOrderLength !== applied.final.orderLength ||
-        captured.transactions.length !== view.orderLength ||
-        captured.transactions.some((entry, index) => !equalBytes(entry.txId, applied.order[index]!))) {
-      throw new Error('MATERIALIZER_VIEW_NOT_RECONCILED')
-    }
-    const items: EventHistoryItem[] = captured.transactions.map(entry => {
-      // SQL and events share the materializer's detached published snapshot.
-      // Pending control selection and replay cannot substitute a different
-      // proposal or outcome beneath the cached applied-view identity.
+  #applicationHistoryId(): string {
+    const policy = this.#options.historyPolicy
+    return `${bytesToHex(this.groupId)}/${bytesToHex(this.executionManifestDigest)}/${policy?.kind === 'coordinated' ? this.#finalityHistoryId() : 'peer'}`
+  }
+
+  #viewRevision(view: 'local' | 'final', revision: bigint, orderLength: number): string {
+    // Pending admissions and transport progress never rename an applied view.
+    return bytesToBase64Url(encodeCanonicalCbor(['chronolog/view/v2', this.#applicationHistoryId(), view, revision, BigInt(orderLength)]))
+  }
+
+  #eventSnapshot(applied: MaterializedApplicationSnapshot): EventHistorySnapshot {
+    const historyId = this.#applicationHistoryId()
+    const revision = this.#viewRevision(applied.view, applied.revision, applied.orderLength)
+    const itemAt = (index: number): EventHistoryItem | null => {
+      const entry = applied.transactionAt(index)
+      if (entry === null) return null
+      // The published materialization retains the original verified canonical
+      // proposal. Reopening or pending control replay cannot change this view.
       const core = decodeTransactionCore(entry.canonicalCandidate)
       return { anchor: this.#idKey(entry.txId), proposalId: new TextDecoder().decode(entry.txId),
         program: core.program, outcome: entry.outcome, origin: {
@@ -484,9 +452,9 @@ export class ChronologNode {
           membershipRevision: bytesToBase64Url(core.membershipRevision),
           writerCapability: core.writerCapability === undefined ? null : bytesToBase64Url(core.writerCapability),
         } }
-    })
-    const { historyId } = applied, { revision } = view
-    return { historyId: captured.view === 'local' ? `${historyId}/local/${revision}` : historyId, revision, items }
+    }
+    return { historyId: applied.view === 'local' ? `${historyId}/local/${revision}` : historyId,
+      revision, length: applied.orderLength, itemAt }
   }
 
   /** Permanently stops old-revision admission before publishing its signed promise. */
@@ -712,20 +680,23 @@ export class ChronologNode {
   }
 
   isFinal(txId: Uint8Array): boolean {
-    if (this.#control.getCandidate(txId)?.state === 'inadmissible') {
+    const candidate = this.#control.getCandidate(txId)
+    if (candidate?.state === 'inadmissible' ||
+        this.historyPolicy === 'peer' && candidate?.state === 'unauthorized') {
+      // These authenticated proposals are permanently excluded from admission.
+      // Missing governance is retryable ingestion, never an authorization denial.
       return this.#options.materialization.queries.outcome(txId) === null
     }
     if (this.historyPolicy === 'coordinated') {
       const position = this.#canonicalPositions.get(this.#idKey(txId))
-      const candidate = this.#control.getCandidate(txId)
       if (candidate?.state === 'unauthorized') {
         return position !== undefined && position <= this.#coordinatedAppliedThrough &&
           (candidate.stateReason === 'FINALITY_TIMESTAMP_FUTURE' ||
             candidate.orderKey.authorTimestampMs <= this.#appliedClosedThroughMs)
       }
     }
-    const index = this.#control.orderedTransactionIds().findIndex((id) => equalBytes(id, txId))
-    return index >= 0 && index < this.finalOrderLength
+    const outcome = this.#options.materialization.queries.outcome(txId)
+    return outcome !== null && outcome.orderIndex >= 0 && outcome.orderIndex < this.finalOrderLength
   }
 
   async finalTarget(): Promise<Uint8Array> {
@@ -736,8 +707,8 @@ export class ChronologNode {
         BigInt(this.#coordinatedAppliedThrough), closure?.includedRoot ?? await orderedGenesisRoot(this.#finalityHistoryId()),
         this.#appliedClosedThroughMs])
     }
-    const ids = this.#control.orderedTransactionIds().slice(0, this.finalOrderLength)
-    return encodeCanonicalCbor([2n, this.groupId, this.historyPolicy, BigInt(ids.length), await sha256(encodeCanonicalCbor(ids)),
+    const length = this.finalOrderLength
+    return encodeCanonicalCbor([2n, this.groupId, this.historyPolicy, BigInt(length), await this.#appliedPrefixDigest(length),
       null, null,
     ])
   }
@@ -757,9 +728,17 @@ export class ChronologNode {
     if (!Array.isArray(value) || value.length !== 7 || value[0] !== 2n || !(value[1] instanceof Uint8Array) ||
         !equalBytes(value[1], this.groupId) || value[2] !== this.historyPolicy || typeof value[3] !== 'bigint' ||
         value[3] < 0n || value[3] > BigInt(this.finalOrderLength) || !(value[4] instanceof Uint8Array)) return false
-    const ids = this.#control.orderedTransactionIds().slice(0, Number(value[3]))
     if (value[5] !== null || value[6] !== null) return false
-    return equalBytes(await sha256(encodeCanonicalCbor(ids)), value[4])
+    return equalBytes(await this.#appliedPrefixDigest(Number(value[3])), value[4])
+  }
+
+  #appliedPrefixDigest(length: number): Promise<Uint8Array> {
+    const ids = Array.from({ length }, (_, index) => {
+      const id = this.#options.materialization.queries.proposalIdAt(index)
+      if (id === null) throw new Error('MATERIALIZATION_APPLIED_ORDER_MISSING')
+      return id
+    })
+    return sha256(encodeCanonicalCbor(ids))
   }
 
   async ingestOrderingEvidence(evidence: OrderingEvidence): Promise<void> {
@@ -1380,8 +1359,8 @@ export class ChronologNode {
       if (error instanceof ControlStoreConflictError) throw error
       throw new MaterializationProgressError(error)
     } finally {
-      // A partial publication invalidates the old cached view. Wake waiters
-      // to recheck it; only successful reconciliation publishes a new identity.
+      // Local publication can succeed before a later finality/storage step
+      // fails. The materializer still owns a coherent published local view.
       if (this.materializedRevision !== beforeLocal || this.finalRevision !== beforeFinal) this.#applicationChanges.notify()
     }
   }
@@ -1400,8 +1379,8 @@ export class ChronologNode {
         admissionClosed = true
       }
     }
-    // Exclusion can remove a provisional preview. Reconcile that selected
-    // suffix before publishing an immutable prefix over the remaining order.
+    // Exclusion can remove a selected preview. Replay that removal before
+    // exposing a final denial or advancing the immutable application prefix.
     const ordered: AdmittedTransaction[] = this.#control.orderedCandidates().map((candidate) => {
       const core = this.#candidateCores.get(this.#idKey(candidate.txId))
       if (!core || !candidate.canonicalPayload) throw new Error('ADMITTED_CANDIDATE_PAYLOAD_MISSING')
@@ -1425,6 +1404,8 @@ export class ChronologNode {
       ) {
         throw new Error('MATERIALIZATION_PUBLICATION_RESULT_MISMATCH')
       }
+      // The snapshot is readable now, even if reconciliation or finality retries.
+      this.#observeAuthorTime(ordered.at(-1)?.core.authorTimestampMs ?? -1n)
     }
     const reconciled = await this.#options.materialization.publications.reconcile({
       targetOrderLength: ordered.length,
@@ -1439,6 +1420,10 @@ export class ChronologNode {
     ) {
       throw new Error('MATERIALIZATION_RECONCILIATION_RESULT_MISMATCH')
     }
+    // Local reads can expose this published history even if later finality
+    // work fails. New intent must already sort after the applied selection.
+    // Startup reconciles retained inputs before authoring is allowed.
+    this.#observeAuthorTime(ordered.at(-1)?.core.authorTimestampMs ?? -1n)
     let finalLength = this.finalOrderLength
     for (let index = finalLength; index < ordered.length; index += 1) {
       // Closing a timestamp does not admit a selected provisional preview.
@@ -1476,14 +1461,9 @@ export class ChronologNode {
     }
     const recovered = this.#materializationError !== undefined
     this.#materializationError = undefined
-    // Reads can now expose this applied history. New intent must sort after
-    // it even when the local wall clock trails another writer. Startup runs
-    // the same reconciliation over retained inputs before allowing authoring.
-    const observed = ordered.at(-1)?.core.authorTimestampMs ?? -1n
-    const closed = frontier.closedThroughMs ?? -1n
-    if (observed > this.#observedAuthorTimestampMs) this.#observedAuthorTimestampMs = observed
-    if (closed > this.#observedAuthorTimestampMs) this.#observedAuthorTimestampMs = closed
-    this.#cacheApplicationSnapshot(ordered)
+    // A completed closure also bounds the timestamp of new authoring, even
+    // when no proposal occupies the newly closed interval.
+    this.#observeAuthorTime(frontier.closedThroughMs ?? -1n)
     this.#applicationChanges.notify()
     if (coordinated !== null || admissionClosed || this.finalOrderLength !== previousFinalLength ||
         this.#coordinatedAppliedThrough !== previousAppliedThrough || recovered) this.#emit('materialized')
@@ -1796,6 +1776,9 @@ export class ChronologNode {
       this.#materializationPending = true
       this.#scheduleMaterialization()
     }
+  }
+  #observeAuthorTime(timestamp: bigint): void {
+    if (timestamp > this.#observedAuthorTimestampMs) this.#observedAuthorTimestampMs = timestamp
   }
   #nextAuthorTimestamp(): bigint {
     const wallClock = BigInt(Math.max(0, Math.trunc(this.#clockNow())))

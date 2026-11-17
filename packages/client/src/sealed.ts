@@ -3,7 +3,6 @@ import {
   MAX_SEALED_PLAINTEXT_BYTES, base64UrlToBytes, decodeSealedEnvelope, encodeSealedContext, equalBytes, sealedOp, toSqlValue,
   type SealedContext, type SealedEnvelope, type SealedRecipient,
 } from '@chronolog/protocol'
-import type { SettlementConfidence } from '@chronolog/rpc'
 
 import type {
   ChronologClient, LocalSqlQueryResponse, QueryOptions, TransactionHandle, TransactionOptions,
@@ -69,8 +68,8 @@ export interface SealedPutOptions extends TransactionOptions {
 
 export class SealedPolicyNotFinalError extends Error {
   readonly code = 'SEALED_POLICY_NOT_FINAL'
-  constructor(readonly transactionId: string, readonly confidence: SettlementConfidence) {
-    super(`Reader policy transaction ${transactionId} has no immutable accepted outcome with all required references resolved; no value was encrypted or submitted. Wait for final acceptance before sharing.`)
+  constructor(readonly transactionId: string) {
+    super(`Reader policy transaction ${transactionId} does not have an applied final acceptance; no value was encrypted or submitted. Wait for finality before sharing.`)
     this.name = 'SealedPolicyNotFinalError'
   }
 }
@@ -84,7 +83,7 @@ export class SealedVersionConflictError extends Error {
 }
 
 /** The sealed helpers pass neither plaintext nor private keys to this node/RPC facade. */
-type SealedClient = Pick<ChronologClient, 'groupId' | 'identity' | 'query' | 'transaction' | 'getSettlementEvidence'>
+type SealedClient = Pick<ChronologClient, 'groupId' | 'identity' | 'query' | 'transaction' | 'getTransactionOutcome'>
 
 const POLICY_SELECT = `SELECT p.policy_id, p.tbl, p.row_key, p.version, p.updated_tx, p.closed_tx,
                              r.reader_key, r.hpke_public_key
@@ -165,7 +164,8 @@ export class SealedDataActions {
   }
 
   async #putCopied(requestedPolicyId: Uint8Array, slot: string, plaintext: Uint8Array, options: SealedPutOptions): Promise<SealedPutChange> {
-    const queryOptions = options.signal === undefined ? {} : { signal: options.signal }
+    const queryOptions: QueryOptions = { view: options.allowProvisionalPolicy === true ? 'local' : 'final',
+      ...(options.signal === undefined ? {} : { signal: options.signal }) }
     const policy = await this.policy(requestedPolicyId, queryOptions)
     if (policy === null || policy.closed) throw new Error('SEALED_POLICY_UNAVAILABLE')
     if (options.expectedPolicyVersion !== undefined && options.expectedPolicyVersion !== policy.version) {
@@ -177,10 +177,9 @@ export class SealedDataActions {
       throw new SealedVersionConflictError('data', options.expectedDataVersion, dataVersion)
     }
     if (options.allowProvisionalPolicy !== true) {
-      const evidence = await this.client.getSettlementEvidence(policy.updatedTransactionId)
-      if (!evidence.outcome.final || evidence.unresolvedReferences.length !== 0 ||
-          evidence.outcome.outcome.type !== 'accepted') {
-        throw new SealedPolicyNotFinalError(policy.updatedTransactionId, evidence.confidence)
+      const outcome = await this.client.getTransactionOutcome(policy.updatedTransactionId)
+      if (!outcome.final || outcome.outcome.type !== 'accepted') {
+        throw new SealedPolicyNotFinalError(policy.updatedTransactionId)
       }
     }
     assertNotAborted(options.signal)
@@ -193,7 +192,7 @@ export class SealedDataActions {
     const step = sealedOp.put({ policyId: policy.policyId, expectedPolicyVersion: policy.version, expectedDataVersion: dataVersion, slot, envelope })
     const handle = await this.client.transaction([step], {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
-      ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
     })
     return { handle, context }
   }

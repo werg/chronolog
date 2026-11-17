@@ -5,7 +5,7 @@ import { promisify } from 'node:util'
 import * as sealedCrypto from '@chronolog/crypto'
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { encodeSealedEnvelope, utf8, type SealedEnvelope, type SealedPlatformOp } from '@chronolog/protocol'
-import type { SettlementEvidence } from '@chronolog/rpc'
+import type { TransactionOutcome } from '@chronolog/rpc'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { LocalSqlQueryResponse, TransactionHandle, TransactionStepInput } from './client.js'
@@ -29,9 +29,7 @@ function fixture(publicKey: Uint8Array) {
   const state = {
     policyVersion: 1n,
     policyClosed: false,
-    confidence: 'policy_watermark_reached' as SettlementEvidence['confidence'],
     final: true,
-    unresolvedReferences: [] as SettlementEvidence['unresolvedReferences'],
     accepted: true,
     envelope: undefined as SealedEnvelope | undefined,
   }
@@ -50,10 +48,10 @@ function fixture(publicKey: Uint8Array) {
       throw new Error(`Unexpected query ${sql}`)
     }),
     transaction: vi.fn(async (_steps: readonly TransactionStepInput[]) => handle),
-    getSettlementEvidence: vi.fn(async (transactionId: string): Promise<SettlementEvidence> => ({
-      transactionId, confidence: state.confidence, unresolvedReferences: state.unresolvedReferences,
-      outcome: { final: state.final, outcome: { type: state.accepted ? 'accepted' : 'pending' } },
-    }) as SettlementEvidence),
+    getTransactionOutcome: vi.fn(async (transactionId: string): Promise<TransactionOutcome> => ({
+      transactionId, final: state.final,
+      outcome: { type: state.accepted ? 'accepted' : 'pending' },
+    }) as TransactionOutcome),
   }
   return { client, state, actions: new SealedDataActions(client), handle }
 }
@@ -61,7 +59,6 @@ function fixture(publicKey: Uint8Array) {
 describe('sealed client helpers', () => {
   it('preserves caller-owned Buffer plaintext when policy preflight rejects', async () => {
     const { actions, state } = fixture(bytes(8))
-    state.confidence = 'provisional'
     state.final = false
     const plaintext = Buffer.from('the caller still owns these bytes')
     const expected = Uint8Array.from(plaintext)
@@ -124,29 +121,23 @@ describe('sealed client helpers', () => {
     await expect(actions.getPolicy('notes', [10n])).rejects.toThrow('primary-key')
   })
 
-  it('refuses unfinalized policies before encryption or publication, including unresolved evidence', async () => {
+  it('uses applied final acceptance rather than a provider-specific proof before encryption', async () => {
     const reader = await generateX25519KeyPair()
     const { actions, state, client } = fixture(reader.publicKeyBytes)
     const seal = vi.spyOn(sealedCrypto, 'sealSealedValue')
-    // A watermark observation alone is insufficient until its result is applied.
     state.final = false
     await expect(actions.put(bytes(2), 'body', utf8('never encrypt yet'))).rejects.toBeInstanceOf(SealedPolicyNotFinalError)
     state.final = true
-    state.unresolvedReferences = [{ kind: 'attestation', reference: 'missing' }]
-    await expect(actions.put(bytes(2), 'body', utf8('still unresolved'))).rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
-    state.unresolvedReferences = []
     state.accepted = false
     await expect(actions.put(bytes(2), 'body', utf8('not accepted'))).rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
     expect(seal).not.toHaveBeenCalled()
     expect(client.transaction).not.toHaveBeenCalled()
-    expect(client.getSettlementEvidence).toHaveBeenCalledWith('policy-tx-id')
+    expect(client.getTransactionOutcome).toHaveBeenCalledWith('policy-tx-id')
   })
 
   it('uses immutable acceptance rather than requiring a peer-policy watermark from the selected provider', async () => {
     const reader = await generateX25519KeyPair()
-    const { actions, state, client } = fixture(reader.publicKeyBytes)
-    state.confidence = 'insufficient'
-    state.final = true
+    const { actions, client } = fixture(reader.publicKeyBytes)
     const change = await actions.put(bytes(2), 'body', utf8('final coordinated policy'))
     expect(change.context.policyVersion).toBe(1n)
     expect(client.transaction).toHaveBeenCalledOnce()
@@ -155,10 +146,9 @@ describe('sealed client helpers', () => {
   it('encrypts only the explicit reader snapshot, with an explicit provisional override for development', async () => {
     const reader = await generateX25519KeyPair()
     const { actions, state, client } = fixture(reader.publicKeyBytes)
-    state.confidence = 'provisional'
     state.final = false
     const change = await actions.put(bytes(2), 'body', utf8('secret'), { allowProvisionalPolicy: true })
-    expect(client.getSettlementEvidence).not.toHaveBeenCalled()
+    expect(client.getTransactionOutcome).not.toHaveBeenCalled()
     expect(change.context).toEqual({ groupId: bytes(1), policyId: bytes(2), policyVersion: 1n, slot: 'body', dataVersion: 1n })
     const step = client.transaction.mock.calls[0]![0][0] as SealedPlatformOp
     expect(step.op).toBe('sealed_put')
@@ -185,7 +175,7 @@ describe('sealed client helpers', () => {
     expect(await actions.decrypt(stored!, reader.privateKey)).toEqual(utf8('old secret'))
     const change = await actions.put(bytes(2), 'body', utf8('new'), { expectedPolicyVersion: 2n, expectedDataVersion: 3n })
     expect(change.context).toMatchObject({ policyVersion: 2n, dataVersion: 4n })
-    expect(client.getSettlementEvidence).toHaveBeenCalledWith('policy-tx-id')
+    expect(client.getTransactionOutcome).toHaveBeenCalledWith('policy-tx-id')
   })
 
   it('binds reads/decryption to the configured group and requested policy/column, not ciphertext claims', async () => {

@@ -1,7 +1,7 @@
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { bytesToBase64Url, encodeSealedEnvelope, equalBytes, utf8 } from '@chronolog/protocol'
 import type { SealedEnvelope, SealedPlatformOp } from '@chronolog/protocol'
-import type { SettlementEvidence } from '@chronolog/rpc'
+import type { TransactionOutcome } from '@chronolog/rpc'
 
 import type { LocalSqlQueryResponse, TransactionHandle } from '../../packages/client/src/client.js'
 import type { DecodedLocalSqlValue } from '../../packages/client/src/local-sql.js'
@@ -19,7 +19,7 @@ try {
   let envelope: SealedEnvelope | undefined
   const response = (rows: readonly (readonly DecodedLocalSqlValue[])[]): LocalSqlQueryResponse => ({
     revision: { groupId, materializedRevision: '7', eventSetRevision: '9', publishedOrderLength: '3', executionManifestDigest: '',
-      replaying: false, view: 'local', finalRevision: '7', finalOrderLength: '3' },
+      replaying: false, view: 'final', finalRevision: '7', finalOrderLength: '3' },
     result: { columns: [], rows, truncated: false, consensusSafe: false,
       raw: { columns: [], rows: [], truncated: false, consensusSafe: false } },
   })
@@ -41,15 +41,10 @@ try {
       envelope = step.envelope
       return { createdId: async () => bytes(2) } as unknown as TransactionHandle
     },
-    getSettlementEvidence: async (transactionId): Promise<SettlementEvidence> => ({
-      transactionId,
-      outcome: { transactionId, phase: 'accepted', outcome: { type: 'accepted' },
-        eventSetRevision: '9', materializedRevision: '7', orderKey: 'policy-order',
-        changedByReplay: false, admissible: true, final: true, observedAt: '1970-01-01T00:00:00.001Z' },
-      evidenceRevision: '9', orderKey: 'policy-order', authorTimestamp: '1',
-      validationPolicyId: 'validation-policy', membershipRevision: '0', policyWatermarkTimestamp: '1',
-      blockingHeartbeats: [], unresolvedReferences: [], confidence: 'policy_watermark_reached',
-      calculatedAt: '1970-01-01T00:00:00.001Z',
+    getTransactionOutcome: async (transactionId): Promise<TransactionOutcome> => ({
+      transactionId, phase: 'accepted', outcome: { type: 'accepted' },
+      eventSetRevision: '9', materializedRevision: '7', orderKey: 'policy-order',
+      changedByReplay: false, admissible: true, final: true, observedAt: '1970-01-01T00:00:00.001Z',
     }),
   })
   const plaintext = utf8('browser secret')

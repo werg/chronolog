@@ -1,12 +1,12 @@
-import { decodePlatformOp } from '@chronolog/protocol'
-import type { RpcPlatformStep, RpcSqlStatement, RpcTransport, SubmitTransactionRequest, SubmitTransactionResponse } from '@chronolog/rpc'
+import { decodeChangeProgram, type SqlStatement } from '@chronolog/protocol'
+import type { RpcTransport, SubmitChangeRequest, SubmitTransactionResponse } from '@chronolog/rpc'
 import { describe, expect, it } from 'vitest'
 
 import { ChronologClient } from './client.js'
 import { platformOp, sqlValue } from './values.js'
 
-function recordingClient(): { readonly client: ChronologClient; readonly submitted: SubmitTransactionRequest[] } {
-  const submitted: SubmitTransactionRequest[] = []
+function recordingClient(): { readonly client: ChronologClient; readonly submitted: SubmitChangeRequest[] } {
+  const submitted: SubmitChangeRequest[] = []
   const response: SubmitTransactionResponse = {
     transactionId: 'tx-1',
     candidateDigest: 'digest',
@@ -17,10 +17,10 @@ function recordingClient(): { readonly client: ChronologClient; readonly submitt
     publishedAt: '2026-11-13T00:00:00.000Z',
   }
   const transport = {
-    async unary(method: string, request: SubmitTransactionRequest) {
-      if (method !== 'transaction.submit') throw new Error(`unexpected ${method}`)
+    async unary(method: string, request: SubmitChangeRequest) {
+      if (method !== 'change.submit') throw new Error(`unexpected ${method}`)
       submitted.push(request)
-      return response
+      return { ...response, operationId: request.operationId, proposalId: response.transactionId }
     },
     stream() { return { async *[Symbol.asyncIterator]() { /* no events */ } } },
   } as unknown as RpcTransport
@@ -28,36 +28,48 @@ function recordingClient(): { readonly client: ChronologClient; readonly submitt
 }
 
 describe('ChronologClient.transaction', () => {
-  it('submits plain SQL statements with JSON-safe SQLite values', async () => {
+  it('submits plain SQL and platform operations through the canonical change program', async () => {
     const { client, submitted } = recordingClient()
     const handle = await client.transaction([
       "SELECT chronolog_assert(1, 'ok')",
       { sql: 'INSERT INTO t VALUES (?, ?, ?, ?, ?)', params: [1, 2n ** 62n, 1.5, 'text', new Uint8Array([1, 2])] },
       { sql: 'UPDATE t SET v = :v, w = @w WHERE id = :id', params: { v: sqlValue.real(1), '@w': null, id: true } },
       platformOp.grant({ table: 't', grantee: new Uint8Array(32).fill(2), operations: ['update'], rowKey: [1n] }),
-    ], { idempotencyKey: 'key-1' })
+    ], { operationId: 'key-1' })
     handle.dispose()
     expect(handle.transactionId).toBe('tx-1')
     expect(submitted).toHaveLength(1)
     const request = submitted[0]!
-    expect(request.idempotencyKey).toBe('key-1')
-    const statement = (index: number): RpcSqlStatement => request.steps[index] as RpcSqlStatement
+    expect(request.operationId).toBe('key-1')
+    const change = decodeChangeProgram(request.program)
+    const statement = (index: number): SqlStatement => change.steps[index] as SqlStatement
+    expect(handle.operationId).toBe('key-1')
     expect(statement(0)).toEqual({ sql: "SELECT chronolog_assert(1, 'ok')", bindings: [] })
     expect(statement(1).bindings.map((binding) => binding.value)).toEqual([
-      { kind: 'integer', value: '1' },
-      { kind: 'integer', value: (2n ** 62n).toString() },
+      { kind: 'integer', value: 1n },
+      { kind: 'integer', value: 2n ** 62n },
       { kind: 'real', value: 1.5 },
       { kind: 'text', value: 'text' },
       { kind: 'blob', value: new Uint8Array([1, 2]) },
     ])
     // Platform operations travel as their canonical CBOR.
-    expect(decodePlatformOp((request.steps[3] as RpcPlatformStep).platform)).toEqual(
+    expect(change.steps[3]).toEqual(
       platformOp.grant({ table: 't', grantee: new Uint8Array(32).fill(2), operations: ['update'], rowKey: [1n] }))
     expect(statement(2).bindings).toEqual([
       { parameter: { kind: 'name', name: ':v' }, value: { kind: 'real', value: 1 } },
       { parameter: { kind: 'name', name: '@w' }, value: { kind: 'null' } },
-      { parameter: { kind: 'name', name: ':id' }, value: { kind: 'integer', value: '1' } },
+      { parameter: { kind: 'name', name: ':id' }, value: { kind: 'integer', value: 1n } },
     ])
+    await client.close()
+  })
+
+  it('returns the generated durable operation identity for an ordinary transaction', async () => {
+    const { client, submitted } = recordingClient()
+    const handle = await client.transaction(['SELECT 1'])
+    expect(handle.operationId).toMatch(/^[0-9a-f-]{36}$/u)
+    expect(submitted[0]?.operationId).toBe(handle.operationId)
+    expect(submitted[0]?.requestId).not.toBe(handle.operationId)
+    handle.dispose()
     await client.close()
   })
 
@@ -88,7 +100,7 @@ describe('ChronologClient policy views and enrollment', () => {
       },
     } as unknown as RpcTransport
     const client = new ChronologClient({ transport, groupId: 'group', requestId: () => 'query-id' })
-    expect((await client.query('SELECT 42', [], { view: 'final' })).result.rows).toEqual([[42n]])
+    expect((await client.query('SELECT 42')).result.rows).toEqual([[42n]])
     expect(client.queryResourceKey('SELECT 42', [], 'local')).not.toBe(client.queryResourceKey('SELECT 42', [], 'final'))
     expect(await client.enrollment.createRequest({ requestId: 'device-join', roles: ['reader'] })).toEqual({ signedRequest: 'signed-request' })
     expect(await client.enrollment.approveRequest({ operationId: 'approve-join', signedRequest: 'signed-request', roles: ['reader'], grantFullHistory: true }))

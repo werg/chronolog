@@ -16,6 +16,8 @@ import type { OrderedRecordEntry } from './history-policy.js'
 import type { LiveInclusionFinalityProvider } from './finality.js'
 import type { DurableOperationStore } from './operations.js'
 
+export type { ViewChange, ViewChangeOptions } from '@chronolog/protocol'
+
 export interface Clock {
   now(): number
 }
@@ -84,6 +86,10 @@ export interface AdmissionScope {
  * operator-controlled out-of-band source. No fixed validator set is assumed.
  */
 export interface MembershipResolver {
+  /**
+   * False is a permanent denial under complete pinned authority. Throw while
+   * required governance or activation evidence is missing so ingestion retries.
+   */
   canWrite(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): boolean | Promise<boolean>
   canValidate(context: CandidateAdmissionContext): boolean | Promise<boolean>
   threshold(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): number | Promise<number>

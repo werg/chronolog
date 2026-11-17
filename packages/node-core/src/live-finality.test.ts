@@ -1,4 +1,4 @@
-import { createEventMaterializationRuntime } from '@chronolog/materializer'
+import { createEventMaterializationRuntime, type ChronologMaterializationRuntime } from '@chronolog/materializer'
 import { ControlStore, MemoryControlStorePersistence } from '@chronolog/control-store/browser'
 import {
   bytesToHex, emit, encodeTransactionCore, encodeValidatorAttestation, encodeValidatorHeartbeat,
@@ -44,15 +44,17 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
   const finalPublications: Array<{ length: number; excluded: string[] }> = []
   let revisions = [{ membershipRevision, authorTimeAfterMs: -1n }]
   let closures: readonly ClosedAdmissionRevision[] = []
-  const nodeOptions = (): ChronologNodeOptions => ({ identity: identities[4]!, groupId, membershipRevision, validationPolicy: twoVotes,
-    transport: observer, operationStore: store, controlStore,
-    materialization: { ...materialization, coordinator: { ...materialization.coordinator,
+  const createRuntime = (): ChronologMaterializationRuntime => ({ ...materialization,
+    coordinator: { ...materialization.coordinator,
       publishFinal: async length => {
         if (length > (materialization.queries.finalOrderLength ?? 0)) finalPublications.push({ length,
           excluded: (persistence.load()?.candidates ?? []).filter(candidate => candidate.state === 'inadmissible').map(candidate => bytesToHex(candidate.txId)) })
         await materialization.coordinator.publishFinal!(length)
       },
-    } },
+    } })
+  let runtime = createRuntime()
+  const nodeOptions = (): ChronologNodeOptions => ({ identity: identities[4]!, groupId, membershipRevision, validationPolicy: twoVotes,
+    transport: observer, operationStore: store, controlStore, materialization: runtime,
     membershipState: () => ({ membershipRevision: revisions.at(-1)!.membershipRevision, validationPolicy: twoVotes }),
     ...(options.now === undefined ? {} : { clock: { now: options.now } }),
     ...(options.maxFutureSkewMs === undefined ? {} : { authorClockPolicy: { maxFutureSkewMs: options.maxFutureSkewMs } }),
@@ -109,7 +111,7 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
       validatorId: identities[validator]!.publicKeyBytes, acceptanceCutoffMs: cutoff,
     }), identities[validator]!)))
   }
-  return { get node() { return node }, get control() { return controlStore }, transports, candidate, vote, heartbeat, ingest, retain, finalPublications,
+  return { get node() { return node }, get control() { return controlStore }, get materialization() { return runtime }, transports, candidate, vote, heartbeat, ingest, retain, finalPublications,
     setRevisions(value: typeof revisions) { revisions = value },
     async selectProvisional(txId: Uint8Array) {
       controlStore.setCandidateState(txId, 'provisional')
@@ -128,6 +130,7 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
       }
       for (const record of history) observer.receive(record)
       materialization = await createEventMaterializationRuntime({ store, namespace: 'live-finality' })
+      runtime = createRuntime()
       controlStore = new ControlStore(persistence)
       feedForkRegistry = registry
       node = new ChronologNode(nodeOptions())
@@ -141,6 +144,81 @@ async function fixture(options: { multiplePolicies?: boolean; completePolicySet?
 }
 
 describe('live chronological finality', () => {
+  it.each(['reconciliation', 'finality'] as const)('retains a coherent local view and author clock while %s retries', async stage => {
+    const f = await fixture({ now: () => 10, maxFutureSkewMs: 1_000 })
+    const proposal = await f.candidate('published-local', 50n)
+    const local = f.node.changes({ view: 'local' })[Symbol.asyncIterator]()
+    const initial = (await local.next()).value!
+    const reconcile = f.materialization.publications.reconcile
+    const publishFinal = f.materialization.coordinator.publishFinal!
+    const unavailable = () => Promise.reject(new Error('PUBLICATION_RETRY_REQUIRED'))
+    if (stage === 'reconciliation') f.materialization.publications.reconcile = unavailable
+    else f.materialization.coordinator.publishFinal = unavailable
+    try {
+      await f.vote(0, proposal); await f.vote(1, proposal)
+      await expect(f.node.waitForIdle()).rejects.toThrow('PUBLICATION_RETRY_REQUIRED')
+      const changed = (await local.next()).value!
+      const captured = await f.node.readView({ view: 'local' })
+      try {
+        expect(changed.revision).not.toBe(initial.revision)
+        expect(changed.revision).toBe(captured.revision)
+        expect(changed.finalRevision).toBe(initial.finalRevision)
+        expect(captured.readEvents().transactions.flatMap(item => item.events.map(event => event.payload))).toEqual(['published-local'])
+      } finally { captured.release() }
+      expect(f.node.finalOrderLength).toBe(0)
+      expect(f.node.isFinal(proposal.txId)).toBe(false)
+      const dependent = await f.node.publish({ operationId: 'dependent-during-retry', program: program(emit('changes', 'dependent')) })
+      expect(dependent.core.authorTimestampMs).toBe(51n)
+    } finally {
+      f.materialization.publications.reconcile = reconcile
+      f.materialization.coordinator.publishFinal = publishFinal
+      await local.return?.()
+      await f.node.waitForIdle()
+    }
+  })
+
+  it('removes an excluded preview before publishing final rejection or finalizing a later proposal', async () => {
+    const f = await fixture(), preview = await f.candidate('preview', 50n), later = await f.candidate('later', 100n)
+    f.node.controlStore.setCandidateState(preview.txId, 'provisional')
+    await f.vote(0, preview); await f.vote(0, later); await f.vote(1, later)
+    await f.node.refreshMembership(); await f.node.waitForIdle()
+    expect(f.node.candidate(preview.txId)?.state).toBe('provisional')
+    expect(f.node.outcome(preview.txId)?.outcome).toBe('accepted')
+    const held = await f.node.readView({ view: 'local' }), before = held.readEvents()
+    const materialize = f.materialization.coordinator.materialize
+    let paused = true
+    f.materialization.coordinator.materialize = input => {
+      if (paused && !input.some(item => equalBytes(item.txId, preview.txId))) {
+        return Promise.reject(new Error('PREVIEW_REMOVAL_TEMPORARILY_UNAVAILABLE'))
+      }
+      return materialize(input)
+    }
+    try {
+      await f.heartbeat(0); await f.heartbeat(1); await f.heartbeat(2)
+      await expect(f.node.waitForIdle()).rejects.toThrow('PREVIEW_REMOVAL_TEMPORARILY_UNAVAILABLE')
+      expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
+      // The control decision cannot relabel the still-applied acceptance final.
+      expect(f.node.outcome(preview.txId)?.outcome).toBe('accepted')
+      expect(f.node.isFinal(preview.txId)).toBe(false)
+      expect(f.node.finalOrderLength).toBe(0)
+      const pending = await f.node.readView({ view: 'local' })
+      try {
+        expect(pending.revision).toBe(held.revision)
+        expect(pending.readEvents()).toEqual(before)
+      } finally { pending.release() }
+      paused = false
+      await f.node.waitForIdle()
+      expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
+      expect(f.node.isFinal(preview.txId)).toBe(true)
+      expect(f.node.finalOrderLength).toBe(1)
+      expect(f.node.isFinal(later.txId)).toBe(true)
+      const final = await f.node.events.read()
+      expect(final.transactions.map(item => item.proposalId)).toEqual([new TextDecoder().decode(later.txId)])
+      expect(final.transactions[0]!.events[0]).toEqual(before.transactions[1]!.events[0])
+      expect(held.readEvents()).toEqual(before)
+    } finally { paused = false; held.release() }
+  })
+
   it('promotes provisional selection only after its verified admission proof arrives', async () => {
     const f = await fixture(), proposal = await f.candidate('preview', 50n)
     await f.selectProvisional(proposal.txId)
@@ -234,6 +312,7 @@ describe('live chronological finality', () => {
     expect(f.node.orderLength).toBe(1)
     expect(f.node.candidate(preview.txId)?.state).toBe('inadmissible')
     expect(f.node.outcome(preview.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'ADMISSION_CLOSED' })
+    expect(f.node.isFinal(preview.txId)).toBe(true)
     expect(f.node.finalOrderLength).toBe(1)
     expect(f.finalPublications.at(-1)).toEqual({ length: 1, excluded: [bytesToHex(preview.txId)] })
     expect((await f.node.events.read()).transactions.map(item => item.proposalId))

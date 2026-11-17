@@ -6,7 +6,7 @@ import {
 import type { CborValue, Ed25519KeyPair } from '@chronolog/protocol'
 import { assertFeedPosition, ChangeSignal } from '@chronolog/records'
 import type { FeedLink } from '@chronolog/records'
-import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN, type SignalDispatchResult } from '@chronolog/signals'
+import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN, SignalBackpressureError } from '@chronolog/signals'
 
 import type { FramedPeerConnection } from './framing.js'
 
@@ -65,7 +65,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   readonly link: FeedLink
   readonly peer: PeerAuthorization
   readonly completion: Promise<void>
-  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<SignalDispatchResult>
+  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
   close(): Promise<void>
 }> {
   for (const bytes of [options.groupId, options.identity.publicKeyBytes, options.grantId]) {
@@ -296,17 +296,22 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
         if (controller.signal.aborted) break
         try {
           if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
+          // Capacity is a delivery gap, never a protocol failure. Drop excess
+          // disposable input before starting more verification; reliable history
+          // keeps its independent reader and lifetime.
+          if (signalsInFlight >= 8) continue
           const frame = assertCanonicalCbor(bytes)
           if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
-          // The live lane is lossy. Drop before admission at capacity instead of
-          // interrupting reliable history; admitted validation failures still retire.
-          if (signalsInFlight >= 8) continue
           const incoming = bytes.slice()
           signalsInFlight += 1
           void (async () => {
             if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
             if (!controller.signal.aborted) await options.receiveSignal?.(incoming)
-          })().catch(fail).finally(() => { signalsInFlight -= 1 })
+          })().catch((error: unknown) => {
+            // The channel may have exhausted its global verification or replay
+            // budget across routes. It admitted nothing; keep the session usable.
+            if (!SignalBackpressureError.is(error)) fail(error)
+          }).finally(() => { signalsInFlight -= 1 })
         } catch (error) { fail(error); break }
       }
       if (!controller.signal.aborted) fail(new Error('PEER_LIVE_ENDED'))
@@ -395,14 +400,13 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
       try {
         const result = await interruptible(live.send(outgoing, { signal }), signal)
-        if (result !== undefined && (typeof result !== 'object' || result === null || result.refused !== 'backpressure')) {
+        if (result !== undefined) {
           throw new Error('PEER_SIGNAL_DISPATCH_RESULT_INVALID')
         }
-        return result
       }
       catch (error) {
         if (controller.signal.aborted) throw failure ?? controller.signal.reason
-        if (!signal.aborted) fail(error)
+        if (!signal.aborted && !SignalBackpressureError.is(error)) fail(error)
         throw error
       }
       finally { clearTimeout(timer) }

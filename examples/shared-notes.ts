@@ -54,7 +54,7 @@ try {
   await reached(bob, setup)
 
   // Bob cannot change Alice's note at the current local position.
-  const denied = await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).settled()
+  const denied = await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).provisional()
   assert.equal(denied.outcome.type, 'rejected')
   if (denied.outcome.type === 'rejected') console.log('Bob editing Alice\'s note:', parseRejectionCode(denied.outcome.rejection.code))
 
@@ -98,7 +98,7 @@ async function list<T>(client: ChronologClient, query: OwnershipQuery<T>): Promi
 
 /** The walkthrough has no closure service; each displayed result is tentative. */
 async function expectLocalAcceptance(handle: TransactionHandle): Promise<void> {
-  const result = await handle.settled()
+  const result = await handle.provisional()
   assert.equal(result.outcome.type, 'accepted')
   assert.equal(result.final, false)
 }
@@ -108,7 +108,7 @@ async function reached(client: ChronologClient, handle: TransactionHandle): Prom
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
     const outcome = await client.getTransactionOutcome(handle.transactionId).catch(() => undefined)
-    if (outcome !== undefined && outcome.outcome.type !== 'pending') return
+    if (outcome !== undefined && outcome.final && outcome.outcome.type !== 'pending') return
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   throw new Error('transaction did not replicate')
@@ -121,6 +121,11 @@ async function start(name: string, identity: Ed25519KeyPair, validator: boolean)
     canValidate: ({ validatorId, validatorCapability }) =>
       equalBytes(validatorId, aliceKeys.publicKeyBytes) && equalBytes(validatorCapability, capability),
     threshold: () => 1,
+    canHeartbeat: ({ validatorId, validatorCapability }) =>
+      equalBytes(validatorId, aliceKeys.publicKeyBytes) && equalBytes(validatorCapability, capability),
+    watermarkPolicy: () => ({ kind: 'threshold', policyId: 'alice-finality', validatorIds: [aliceKeys.publicKeyBytes], threshold: 1 }),
+    admissionScopes: () => [{ membershipRevision: bytes32(2), authorTimeAfterMs: -1n,
+      policies: [{ kind: 'threshold', policyId: 'alice-finality', validatorIds: [aliceKeys.publicKeyBytes], threshold: 1 }] }],
     canUseTransportAuthor: ({ signingId, transportAuthor }) =>
       (equalBytes(signingId, aliceKeys.publicKeyBytes) && transportAuthor === 'alice') ||
       (equalBytes(signingId, bobKeys.publicKeyBytes) && transportAuthor === 'bob'),
@@ -139,7 +144,7 @@ async function start(name: string, identity: Ed25519KeyPair, validator: boolean)
     transport: network.createNode(name),
     materialization: createDoltLiteMaterializationRuntime(materializer),
     membership,
-    ...(validator ? { validator: { capabilityId: capability, cutoffLagMs: Number.MAX_SAFE_INTEGER } } : {}),
+    ...(validator ? { validator: { capabilityId: capability, cutoffLagMs: 1_000, heartbeatIntervalMs: 100 } } : {}),
   })
   await node.start()
   nodes.push(node)

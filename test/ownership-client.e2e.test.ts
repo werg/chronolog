@@ -134,7 +134,7 @@ describe('ownership client API', () => {
     const readers = await alice.sealed.setReaders({ table: 'docs', row: [1n], readers: [bobId], expectedVersion: 0n })
     await expectLocalAcceptance(readers.handle)
     await seenBy(bob, readers.handle)
-    expect(await bob.sealed.getPolicy('docs', [1n])).toMatchObject({
+    expect(await bob.sealed.getPolicy('docs', [1n], { view: 'local' })).toMatchObject({
       policyId: readers.id, table: 'docs', rowKey: encodeRowKey([1n]), version: 1n, closed: false,
       readers: [{ readerId: bobId, publicKey: bobReader.publicKeyBytes }],
     })
@@ -142,13 +142,13 @@ describe('ownership client API', () => {
     // This fixture has no policy watermark. Production defaults refuse to encrypt
     // until the policy is final; the override is explicit for this development fixture.
     await expect(alice.sealed.put(readers.id, 'body', utf8('first secret')))
-      .rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL' })
+      .rejects.toThrow('SEALED_POLICY_UNAVAILABLE')
     const first = await alice.sealed.put(readers.id, 'body', utf8('first secret'), {
       allowProvisionalPolicy: true, expectedPolicyVersion: 1n, expectedDataVersion: 0n,
     })
     await expectLocalAcceptance(first.handle)
     await seenBy(bob, first.handle)
-    const saved = await bob.sealed.get(readers.id, 'body')
+    const saved = await bob.sealed.get(readers.id, 'body', { view: 'local' })
     expect(saved).not.toBeNull()
     expect(saved).toMatchObject({ policyVersion: 1n, dataVersion: 1n })
     const encoded = encodeSealedEnvelope(saved!.envelope)
@@ -167,7 +167,7 @@ describe('ownership client API', () => {
     })
     await expectLocalAcceptance(edited.handle)
     await seenBy(alice, edited.handle)
-    const updated = await alice.sealed.get(readers.id, 'body')
+    const updated = await alice.sealed.get(readers.id, 'body', { view: 'local' })
     expect(updated).toMatchObject({ policyVersion: 1n, dataVersion: 2n })
     expect(await bob.sealed.decrypt(updated!, bobReader.privateKey)).toEqual(utf8('edited by the granted writer'))
     const outsideGrant = await bob.transaction(["UPDATE docs SET label = 'outside the grant' WHERE id = 1"])
@@ -180,7 +180,7 @@ describe('ownership client API', () => {
     })
     await expectLocalAcceptance(removed.handle)
     await seenBy(bob, removed.handle)
-    expect(await bob.sealed.getPolicy('docs', [1n])).toMatchObject({
+    expect(await bob.sealed.getPolicy('docs', [1n], { view: 'local' })).toMatchObject({
       policyId: readers.id, version: 2n, readers: [{ readerId: aliceId, publicKey: aliceReader.publicKeyBytes }],
     })
     const future = await alice.sealed.put(readers.id, 'body', utf8('new audience only'), {
@@ -188,7 +188,7 @@ describe('ownership client API', () => {
     })
     await expectLocalAcceptance(future.handle)
     await seenBy(bob, future.handle)
-    const latest = await bob.sealed.get(readers.id, 'body')
+    const latest = await bob.sealed.get(readers.id, 'body', { view: 'local' })
     expect(latest).toMatchObject({ policyVersion: 2n, dataVersion: 3n })
     expect(latest!.envelope.wraps.map((wrap) => wrap.readerId)).toEqual([aliceId])
     expect(await alice.sealed.decrypt(latest!, aliceReader.privateKey, undefined, future.context)).toEqual(utf8('new audience only'))
@@ -199,24 +199,24 @@ describe('ownership client API', () => {
 
 // This static-membership fixture deliberately never closes its final prefix.
 async function expectLocalAcceptance(handle: TransactionHandle): Promise<void> {
-  await expect(handle.settled()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
+  await expect(handle.provisional()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
 }
 async function expectLocalRejection(handle: TransactionHandle, code: string) {
-  const outcome = await handle.settled()
+  const outcome = await handle.provisional()
   expect(outcome).toMatchObject({ final: false, outcome: { type: 'rejected', rejection: { code } } })
   if (outcome.outcome.type !== 'rejected') throw new Error('Expected a provisional rejection')
   return outcome.outcome.rejection
 }
 
 async function list<T>(client: ChronologClient, query: OwnershipQuery<T>): Promise<readonly T[]> {
-  return query.decode((await client.query(query.sql, query.parameters)).result)
+  return query.decode((await client.query(query.sql, query.parameters, { view: 'local' })).result)
 }
 
 async function rows(client: ChronologClient, sql: string, parameters: readonly (Uint8Array | bigint)[] = []) {
-  return (await client.query(sql, parameters)).result.rows
+  return (await client.query(sql, parameters, { view: 'local' })).result.rows
 }
 
-/** Waits until `client`'s node has settled a transaction submitted elsewhere. */
+/** Waits until `client`'s node has applied a transaction submitted elsewhere. */
 async function seenBy(client: ChronologClient, handle: TransactionHandle): Promise<void> {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {

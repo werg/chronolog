@@ -36,7 +36,17 @@ export class SignalError extends Error {
 }
 /** The frame was not dispatched; the bounded transport remains usable. */
 export class SignalBackpressureError extends SignalError {
+  readonly dispatched = false
   constructor() { super('SIGNAL_BACKPRESSURE'); this.name = 'SignalBackpressureError' }
+
+  /** Recognize independently bundled adapters without relying on class identity. */
+  static is(value: unknown): value is SignalBackpressureError {
+    return typeof value === 'object' && value !== null &&
+      'code' in value && value.code === 'SIGNAL_BACKPRESSURE' &&
+      'dispatched' in value && value.dispatched === false &&
+      'name' in value && typeof value.name === 'string' &&
+      'message' in value && typeof value.message === 'string'
+  }
 }
 
 /** Credentials are authenticated opaque bytes; only the supplied policy interprets them. */
@@ -46,12 +56,11 @@ export interface SignalAuthorization {
   readonly topic: string
   readonly credential: Uint8Array | null
 }
-/** A refusal guarantees that this attempt queued and dispatched no frame. */
-export interface SignalDispatchRefusal { readonly refused: 'backpressure' }
-export type SignalDispatchResult = void | SignalDispatchRefusal
+/** Lifetime of this attempt, including caller cancellation, channel close and its deadline. */
+export interface SignalPolicyContext { readonly signal: AbortSignal }
 export interface SignalTransport {
-  /** Honor cancellation; return a refusal only before queueing or dispatching. */
-  send(frame: Uint8Array, options: { readonly signal: AbortSignal }): Promise<SignalDispatchResult>
+  /** Honor cancellation; throw SignalBackpressureError only before queueing or dispatching. */
+  send(frame: Uint8Array, options: { readonly signal: AbortSignal }): Promise<void>
   /** Retire an underlying connection that cannot complete a dispatched write. */
   close?(): void | Promise<void>
 }
@@ -64,15 +73,18 @@ export interface SignalRoute {
   receive(frame: Uint8Array): Promise<EphemeralSignal | null>
   close(): void
 }
-export interface SignalChannelOptions {
+export interface SignalChannelOptions extends SignalLimits {
   readonly scope: string
   readonly identity: SignalIdentity
-  readonly authorize: (input: SignalAuthorization) => boolean | Promise<boolean>
-  readonly credential?: Uint8Array | ((topic: string) => Uint8Array | undefined | Promise<Uint8Array | undefined>)
+  readonly authorize: (input: SignalAuthorization, context: SignalPolicyContext) => boolean | Promise<boolean>
+  readonly credential?: Uint8Array | ((topic: string, context: SignalPolicyContext) => Uint8Array | undefined | Promise<Uint8Array | undefined>)
   /** Optional standalone outgoing transport. Attach routes for bidirectional relay. */
   readonly send?: SignalTransport['send']
   readonly relay?: boolean
   readonly now?: () => number
+}
+/** Independent live-resource budgets; no database or finality configuration. */
+export interface SignalLimits {
   readonly maxTtlMs?: number
   readonly maxClockSkewMs?: number
   readonly maxSessions?: number
@@ -189,7 +201,7 @@ export class SignalChannel implements Signals {
         started = true
         const operation = (async () => {
           const configured = this.#options.credential
-          const credential = credentialBytes(typeof configured === 'function' ? await configured(topic) : configured)
+          const credential = credentialBytes(typeof configured === 'function' ? await configured(topic, { signal }) : configured)
           const authorization: SignalAuthorization = { scope: this.#options.scope, authorId: this.#options.identity.publicKeyBytes.slice(), topic, credential: credential ?? null }
           await this.#authorize(authorization, signal)
           if (this.#sequence >= Number.MAX_SAFE_INTEGER) throw new SignalError('SIGNAL_SEQUENCE_EXHAUSTED')
@@ -205,7 +217,13 @@ export class SignalChannel implements Signals {
           await this.#authorize(authorization, signal)
           this.#assertFresh(value)
           this.#remember(value)
-          await this.#dispatch({ value, authorization, frame }, undefined, signal, true)
+          try { await this.#dispatch({ value, authorization, frame }, undefined, signal, true) }
+          catch (error) {
+            // Every route explicitly refused before dispatch. No future loop can
+            // replay this intent; retain its sequence but release replay budget.
+            if (SignalBackpressureError.is(error)) this.#forget(value)
+            throw error
+          }
           return structuredClone(value)
         })().finally(() => { clearTimeout(timer); this.#pendingSends -= 1 })
         return interrupted(operation, signal)
@@ -225,7 +243,7 @@ export class SignalChannel implements Signals {
       if (route?.lifetime.signal.aborted === true) throw new SignalError('SIGNAL_ROUTE_CLOSED')
       if (this.#pendingReceives >= this.#maxReceives) {
         if (route !== undefined) return Promise.resolve(null)
-        throw new SignalError('SIGNAL_BACKPRESSURE')
+        throw new SignalBackpressureError()
       }
       const frame = input.slice()
       this.#pendingReceives += 1
@@ -274,7 +292,7 @@ export class SignalChannel implements Signals {
 
   async #authorize(input: SignalAuthorization, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted()
-    if (!await this.#options.authorize(structuredClone(input))) throw new SignalError('SIGNAL_UNAUTHORIZED')
+    if (!await this.#options.authorize(structuredClone(input), { signal })) throw new SignalError('SIGNAL_UNAUTHORIZED')
     signal.throwIfAborted()
   }
 
@@ -296,10 +314,6 @@ export class SignalChannel implements Signals {
         handedOff = true
         const result = await route.send(verified.frame.slice(), { signal: lifetime })
         if (result !== undefined) {
-          if (typeof result === 'object' && result !== null && result.refused === 'backpressure') {
-            handedOff = false
-            throw new SignalBackpressureError()
-          }
           throw new SignalError('SIGNAL_TRANSPORT_RESULT_INVALID')
         }
       })().finally(() => { settled = true; route.busy = false })
@@ -307,7 +321,8 @@ export class SignalChannel implements Signals {
         // Give cooperative cancellation its microtask turn. A route whose write
         // remains outstanding cannot admit another write or survive indefinitely.
         if (handedOff && lifetime.aborted && !settled) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
-        if (handedOff && (!lifetime.aborted || !settled)) this.#detach(route, true)
+        const refused = SignalBackpressureError.is(error) && settled && !route.lifetime.signal.aborted
+        if (handedOff && !refused && (!lifetime.aborted || !settled)) this.#detach(route, true)
         throw error
       }).finally(() => { clearTimeout(timer) })
     })
@@ -317,10 +332,12 @@ export class SignalChannel implements Signals {
       try { await Promise.any(attempts) }
       catch (error) {
         if (error instanceof AggregateError && error.errors.length === 1) throw error.errors[0]
-        if (error instanceof AggregateError && error.errors.every(value => value instanceof SignalBackpressureError)) throw new SignalBackpressureError()
+        if (error instanceof AggregateError && error.errors.every(SignalBackpressureError.is)) throw new SignalBackpressureError()
         throw new SignalError('SIGNAL_SEND_FAILED')
       }
-    } else await Promise.allSettled(attempts)
+      return
+    }
+    await Promise.allSettled(attempts)
   }
 
   #remember(value: EphemeralSignal): boolean {
@@ -331,14 +348,20 @@ export class SignalChannel implements Signals {
     }
     const key = `${value.authorId}/${value.sessionId}`, previous = this.#sessions.get(key)
     if (previous?.seen.has(value.sequence) === true) return false
-    if (previous === undefined && this.#sessions.size >= this.#maxSessions) throw new SignalError('SIGNAL_SESSION_QUOTA_EXCEEDED')
-    if ((previous?.seen.size ?? 0) >= this.#maxSequences || this.#remembered >= this.#maxRemembered) throw new SignalError('SIGNAL_REPLAY_QUOTA_EXCEEDED')
+    if (previous === undefined && this.#sessions.size >= this.#maxSessions) throw new SignalBackpressureError()
+    if ((previous?.seen.size ?? 0) >= this.#maxSequences || this.#remembered >= this.#maxRemembered) throw new SignalBackpressureError()
     // Relay paths can reorder distinct sequences. Retain each fresh identity;
     // never evict still-valid duplicates to make room for unbounded traffic.
     const progress = previous ?? { seen: new Map<number, number>() }
     progress.seen.set(value.sequence, value.expiresAtMs); this.#remembered += 1
     this.#sessions.set(key, progress)
     return true
+  }
+
+  #forget(value: EphemeralSignal): void {
+    const key = `${value.authorId}/${value.sessionId}`, session = this.#sessions.get(key)
+    if (session?.seen.delete(value.sequence) === true) this.#remembered -= 1
+    if (session?.seen.size === 0) this.#sessions.delete(key)
   }
 
   #deliver(value: EphemeralSignal, bytes: number): void {

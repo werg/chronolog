@@ -15,7 +15,9 @@ export interface EventHistoryItem {
 export interface EventHistorySnapshot {
   readonly historyId: string
   readonly revision: string
-  readonly items: readonly EventHistoryItem[]
+  readonly length: number
+  /** Reads one item from this captured revision without expanding its history. */
+  itemAt(index: number): EventHistoryItem | null
 }
 export const MAX_EVENT_BATCH_BYTES = 1_048_576
 export const MAX_EVENT_SCAN = 1024
@@ -34,7 +36,7 @@ function cursor(snapshot: EventHistorySnapshot, topics: readonly string[] | null
   // a completed proposal. The canonical anchor prevents cross-branch reuse.
   return bytesToBase64Url(encodeCanonicalCbor([
     'chronolog/events/v1', snapshot.historyId, topics, BigInt(scan), 0n,
-    scan === 0 ? null : snapshot.items[scan - 1]!.anchor,
+    scan === 0 ? null : itemAt(snapshot, scan - 1).anchor,
   ]))
 }
 function resume(snapshot: EventHistorySnapshot, topics: readonly string[] | null, token?: string): number {
@@ -46,12 +48,18 @@ function resume(snapshot: EventHistorySnapshot, topics: readonly string[] | null
   const fields = value as readonly CborValue[]
   if (fields[0] !== 'chronolog/events/v1' ||
       fields[1] !== snapshot.historyId || !equalBytes(encodeCanonicalCbor(fields[2] ?? null), encodeCanonicalCbor(topics)) ||
-      typeof fields[3] !== 'bigint' || fields[3] < 0n || fields[3] > BigInt(snapshot.items.length) || fields[4] !== 0n) {
+      typeof fields[3] !== 'bigint' || fields[3] < 0n || fields[3] > BigInt(snapshot.length) || fields[4] !== 0n) {
     throw new Error('EVENT_CURSOR_MISMATCH')
   }
   const scan = Number(fields[3])
-  if (fields[5] !== (scan === 0 ? null : snapshot.items[scan - 1]!.anchor)) throw new Error('EVENT_CURSOR_PREFIX_MISMATCH')
+  if (fields[5] !== (scan === 0 ? null : itemAt(snapshot, scan - 1).anchor)) throw new Error('EVENT_CURSOR_PREFIX_MISMATCH')
   return scan
+}
+
+function itemAt(snapshot: EventHistorySnapshot, index: number): EventHistoryItem {
+  const item = snapshot.itemAt(index)
+  if (item === null) throw new Error('EVENT_APPLIED_INPUT_MISSING')
+  return item
 }
 
 /** Rebuildable index over applied outcomes. Certificates alone never supply outcomes. */
@@ -60,11 +68,11 @@ export function readEffectiveEvents(snapshot: EventHistorySnapshot, options: Eve
   const limit = options.limit ?? 32
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_EVENT_BATCH_TRANSACTIONS) throw new Error('EVENT_LIMIT_INVALID')
   let scan = resume(snapshot, topics, options.cursor)
-  const end = Math.min(snapshot.items.length, scan + MAX_EVENT_SCAN)
+  const end = Math.min(snapshot.length, scan + MAX_EVENT_SCAN)
   const transactions: EventTransaction[] = []
   let bytes = 0
   while (scan < end && transactions.length < limit) {
-    const item = snapshot.items[scan]!
+    const item = itemAt(snapshot, scan)
     if (item.outcome === 'unresolved') break
     if (item.outcome === 'accepted') {
       if (item.program === undefined || item.proposalId === undefined || item.origin === undefined) throw new Error('EVENT_APPLIED_INPUT_MISSING')
@@ -89,7 +97,7 @@ export function readEffectiveEvents(snapshot: EventHistorySnapshot, options: Eve
     }
     scan++
   }
-  return { transactions, scannedThrough: cursor(snapshot, topics, scan), hasMore: scan < snapshot.items.length && snapshot.items[scan]?.outcome !== 'unresolved', revision: snapshot.revision }
+  return { transactions, scannedThrough: cursor(snapshot, topics, scan), hasMore: scan < snapshot.length && itemAt(snapshot, scan).outcome !== 'unresolved', revision: snapshot.revision }
 }
 
 export interface DurableEventSource {

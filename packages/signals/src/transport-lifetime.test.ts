@@ -22,7 +22,7 @@ describe('authorized ephemeral peer signals', () => {
     let congested = true, retired = 0
     const received: Uint8Array[] = []
     for (let index = 0; index < 2; index++) channel.attachRoute({
-      async send(frame) { if (congested) return { refused: 'backpressure' }; received.push(frame) },
+      async send(frame) { if (congested) throw new SignalBackpressureError(); received.push(frame) },
       close() { retired++ },
     })
     try {
@@ -43,7 +43,7 @@ describe('authorized ephemeral peer signals', () => {
     let congested = true, closed = 0
     const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
     channel.attachRoute({ async send(frame) {
-      if (congested) return { refused: 'backpressure' }
+      if (congested) throw new SignalBackpressureError()
       delivered.push(frame)
     }, close() { closed++ } })
     try {
@@ -57,18 +57,18 @@ describe('authorized ephemeral peer signals', () => {
     } finally { channel.close(); f.sender.close(); f.receiver.close() }
   })
 
-  it.each(['exception', 'backpressure exception', 'invalid result'] as const)('retires a route after a transport %s without treating it as a dispatch refusal', async kind => {
+  it.each(['exception', 'unmarked backpressure exception', 'invalid result'] as const)('retires a route after a transport %s without treating it as a dispatch refusal', async kind => {
     const f = await fixture()
     let closed = 0
     const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
     channel.attachRoute({ send: (async () => {
       if (kind === 'exception') throw new Error('transport failed')
-      if (kind === 'backpressure exception') throw new SignalBackpressureError()
-      return { refused: 'something else' }
+      if (kind === 'unmarked backpressure exception') throw Object.assign(new Error('SIGNAL_BACKPRESSURE'), { code: 'SIGNAL_BACKPRESSURE' })
+      return { unexpected: 'result' }
     }) as unknown as SignalTransport['send'], close() { closed++ } })
     try {
       const reason = kind === 'exception' ? 'transport failed'
-        : kind === 'backpressure exception' ? 'SIGNAL_BACKPRESSURE' : 'SIGNAL_TRANSPORT_RESULT_INVALID'
+        : kind === 'unmarked backpressure exception' ? 'SIGNAL_BACKPRESSURE' : 'SIGNAL_TRANSPORT_RESULT_INVALID'
       await expect(channel.send('typing', 1)).rejects.toThrow(reason)
       expect(closed).toBe(1)
       await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
@@ -116,7 +116,7 @@ describe('authorized ephemeral peer signals', () => {
     const f = await fixture()
     let calls = 0, entered!: () => void
     const started = new Promise<void>(resolve => { entered = resolve })
-    const channel = new SignalChannel({ ...f.options, async send() { calls++; entered(); await new Promise<void>(() => {}) } })
+    const channel = new SignalChannel({ ...f.options, async send() { calls++; entered(); return await new Promise<never>(() => {}) } })
     const abort = new AbortController(), pending = channel.send('typing', 1, { signal: abort.signal })
     await started
     const refused = expect(pending).rejects.toThrow('cancelled')
@@ -146,7 +146,7 @@ describe('authorized ephemeral peer signals', () => {
     const f = await fixture()
     let calls = 0
     const relay = new SignalChannel({ ...f.options, relay: true, sendTimeoutMs: 20,
-      async send() { calls++; await new Promise<void>(() => {}) } })
+      async send() { calls++; return await new Promise<never>(() => {}) } })
     await f.sender.send('typing', 1)
     expect((await relay.receive(f.frames[0]!))?.payload).toBe(1)
     await f.sender.send('typing', 2)
@@ -193,7 +193,7 @@ describe('authorized ephemeral peer signals', () => {
     const f = await fixture(), delivered: Uint8Array[] = []
     let stalled = 0
     const channel = new SignalChannel({ ...f.options,
-      async send() { stalled++; await new Promise<void>(() => {}) } })
+      async send() { stalled++; return await new Promise<never>(() => {}) } })
     channel.attachRoute({ async send(frame) { delivered.push(frame) } })
     const abort = new AbortController()
     await channel.send('typing', 1, { signal: abort.signal })
@@ -350,7 +350,7 @@ describe('authorized ephemeral peer signals', () => {
     await f.sender.send('typing', 1); await receiver.receive(f.frames[0]!)
     const replacement = new SignalChannel(f.options)
     await replacement.send('typing', 2)
-    await expect(receiver.receive(f.frames[1]!)).rejects.toThrow('SIGNAL_SESSION_QUOTA_EXCEEDED')
+    await expect(receiver.receive(f.frames[1]!)).rejects.toBeInstanceOf(SignalBackpressureError)
     f.setNow(40_000)
     await replacement.send('typing', 3)
     expect((await receiver.receive(f.frames[2]!))?.payload).toBe(3)
