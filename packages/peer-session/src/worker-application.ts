@@ -13,7 +13,8 @@ import {
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
 import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
 import type { EventPayload } from '@chronolog/protocol'
-import type { ApplicationProjectionHandle, ApplicationProjectionSnapshot } from './projection.js'
+import { APPLICATION_PROJECTION_LIMITS, type ApplicationProjectionHandle, type ApplicationProjectionSnapshot } from './projection.js'
+import { awaitOwnedTask } from './lifetime.js'
 
 const PROTOCOL = 'chronolog/peer-session/worker-application/v1'
 const MAX_REQUESTS = 64, MAX_STREAMS = 16, MAX_BYTES = 1_048_576
@@ -54,10 +55,11 @@ export interface WorkerApplicationReadView {
 export function serveApplicationWorker(session: ApplicationSession, endpoint: Endpoint, options: {
   readonly host?: ApplicationControlHost
 } = {}): { close(): Promise<void> } {
-  let port: MessagePort | undefined, closed = false, lastId = 0, nextView = 0
+  let port: MessagePort | undefined, closed = false, lastId = 0, nextView = 0, nextProjection = 0
   let closing: Promise<void> | undefined
   const calls = new Map<number, AbortController>(), streams = new Map<number, Stream>()
   const views = new Map<number, { readonly handle: ApplicationReadView; readonly requestId: number }>()
+  const projections = new Map<number, ApplicationProjectionHandle>()
   const send = (value: unknown): void => { bounded(value); port?.postMessage(value) }
   const respond = (id: number, value: unknown): void => { send({ id, value, snapshot: snapshot(session) } satisfies Response) }
   const cancelStream = async (id: number): Promise<void> => {
@@ -73,7 +75,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     session.signal.removeEventListener('abort', aborted)
     for (const controller of calls.values()) controller.abort(reason)
     for (const view of views.values()) view.handle.release()
-    views.clear()
+    views.clear(); projections.clear()
     port?.removeEventListener('message', receive); port?.removeEventListener('messageerror', messageError)
     closing = Promise.allSettled([...streams.keys()].map(cancelStream)).then(async () => {
       try { await session.close() }
@@ -100,6 +102,23 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     const result = typeof id === 'number' ? views.get(id) : undefined
     if (result === undefined) throw new Error('APPLICATION_VIEW_RELEASED')
     return result.handle
+  }
+  const captureProjection = (name: string): number => {
+    const current = session.projection(name)
+    for (const [id, handle] of projections) {
+      try { if (session.projection(handle.id) !== handle) projections.delete(id) }
+      catch { projections.delete(id) }
+      if (handle === current) return id
+    }
+    if (projections.size >= APPLICATION_PROJECTION_LIMITS.active) throw new Error('APPLICATION_PROJECTION_LIMIT')
+    const id = ++nextProjection
+    if (!Number.isSafeInteger(id)) throw new Error('APPLICATION_WORKER_REQUEST_ID_EXHAUSTED')
+    projections.set(id, current); return id
+  }
+  const projection = (id: unknown): ApplicationProjectionHandle => {
+    const handle = typeof id === 'number' ? projections.get(id) : undefined
+    if (handle === undefined) throw new Error('APPLICATION_PROJECTION_CLOSED')
+    return handle
   }
   const invoke = async (method: string, args: readonly unknown[], signal: AbortSignal, requestId: number): Promise<unknown> => {
     switch (method) {
@@ -130,8 +149,12 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'view.query': return view(args[0]).query(args[1] as string, args[2] as readonly QueryParameter[])
       case 'view.events': return view(args[0]).readEvents(args[1] as ApplicationEventOptions)
       case 'view.release': { const captured = views.get(args[0] as number); views.delete(args[0] as number); captured?.handle.release(); return null }
-      case 'projection.read': return session.projection(args[0] as string).read({ signal })
-      case 'projection.close': return session.projection(args[0] as string).close()
+      case 'projection.open': return captureProjection(args[0] as string)
+      case 'projection.read': return projection(args[0]).read({ signal })
+      case 'projection.close': {
+        const id = args[0] as number, captured = projections.get(id)
+        await captured?.close(); projections.delete(id); return null
+      }
       case 'content.stage': return (await session.content.stage(args[0] as { bytes: number; mediaType?: string })).id
       case 'content.resume': return (await session.content.resume(args[0] as string)).id
       case 'content.write': return (await session.content.resume(args[0] as string)).write(args[1] as number, args[2] as Uint8Array)
@@ -151,7 +174,10 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'participation': return observe<ApplicationParticipationStatus>(listener => participation().onStatus(listener), signal)
       case 'recovery': return observe<RecoveryNotice>(listener => session.onRecovery(listener), signal)
       case 'content': return session.content.read(args[0] as ContentReference, { ...args[1] as { offset?: number; length?: number }, signal })[Symbol.asyncIterator]()
-      case 'projection': return session.projection(args[0] as string).changes({ signal })[Symbol.asyncIterator]()
+      case 'projection': {
+        const captured = projections.get(args[0] as number)
+        return captured?.changes({ signal })[Symbol.asyncIterator]() ?? { next: async () => ({ done: true, value: undefined }) }
+      }
       default: throw new Error('APPLICATION_WORKER_STREAM_UNKNOWN')
     }
   }
@@ -355,10 +381,26 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> { return this.#call('adopt', [authority]) }
   changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> { return this.#stream('changes', [], options.signal) }
   projection<State extends EventPayload = EventPayload>(id: string): ApplicationProjectionHandle<State> {
+    const captured = this.#call<number>('projection.open', [id]), lifetime = new AbortController()
+    // An unused facade may outlive a failed remote lookup without an unhandled rejection.
+    void captured.catch(() => undefined)
+    let closing: Promise<void> | undefined
+    const signal = (external?: AbortSignal): AbortSignal => AbortSignal.any([this.signal, lifetime.signal,
+      ...(external === undefined ? [] : [external])])
     return Object.freeze({ id,
-      read: (options: { readonly signal?: AbortSignal } = {}): Promise<ApplicationProjectionSnapshot<State>> => this.#call('projection.read', [id], options.signal),
-      changes: (options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationProjectionSnapshot<State>> => this.#stream('projection', [id], options.signal),
-      close: (): Promise<void> => this.#call('projection.close', [id]),
+      read: async (options: { readonly signal?: AbortSignal } = {}): Promise<ApplicationProjectionSnapshot<State>> => {
+        const owned = signal(options.signal), token = await awaitOwnedTask(owned, () => captured)
+        return this.#call('projection.read', [token], owned)
+      },
+      changes: (options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationProjectionSnapshot<State>> =>
+        this.#stream('projection', async () => [await captured], signal(options.signal)),
+      close: (): Promise<void> => {
+        if (closing !== undefined) return closing
+        closing = captured.then(token => this.signal.aborted ? undefined : this.#call<void>('projection.close', [token]))
+          .catch(error => { if (!this.signal.aborted) throw error })
+        lifetime.abort(new Error('APPLICATION_PROJECTION_CLOSED'))
+        return closing
+      },
     })
   }
   async readView(): Promise<WorkerApplicationReadView> {
@@ -400,7 +442,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       try { this.#port.postMessage(request) } catch (error) { this.#pending.delete(id); clean(); reject(error) }
     })
   }
-  #stream<T>(name: string, args: readonly unknown[], signal?: AbortSignal): AsyncIterable<T> {
+  #stream<T>(name: string, args: readonly unknown[] | (() => Promise<readonly unknown[]>), signal?: AbortSignal): AsyncIterable<T> {
     const client = this
     return { [Symbol.asyncIterator]() {
       if (client.#streams.size >= MAX_STREAMS) throw new Error('APPLICATION_WORKER_STREAM_LIMIT')
@@ -414,13 +456,16 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
         else void opened?.then(value => client.#cancel(value), () => undefined)
       }
       lifetime.addEventListener('abort', finish, { once: true })
+      if (lifetime.aborted) finish()
       return {
         async next(): Promise<IteratorResult<T>> {
           if (done) return { done: true, value: undefined }
           if (pulling) throw new Error('APPLICATION_WORKER_STREAM_BUSY')
           pulling = true
           try {
-            opened ??= client.#call<number>('stream.open', [name, ...args], lifetime)
+            opened ??= typeof args === 'function'
+              ? awaitOwnedTask(lifetime, args).then(values => client.#call<number>('stream.open', [name, ...values], lifetime))
+              : client.#call<number>('stream.open', [name, ...args], lifetime)
             id = await opened
             const result = await client.#call<IteratorResult<T>>('stream.next', [id], lifetime, true)
             if (result.done) finish()

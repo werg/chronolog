@@ -80,8 +80,41 @@ describe('owned browser application facade', () => {
     expect(result.revision).toEqual(client.revision)
     expect(result.state).toBe(1); expect(reduce).toHaveBeenCalledOnce()
     await updates.return?.(); await projection.close()
-    await expect(projection.read()).rejects.toThrow('APPLICATION_PROJECTION_NOT_FOUND')
+    await expect(projection.read()).rejects.toThrow('APPLICATION_PROJECTION_CLOSED')
     expect((await client.query('messages', null)).value.events).toHaveLength(1)
+  })
+
+  it('keeps page projection handles bound to the owner registration across replacement', async () => {
+    const f = await fixture(), first = f.a.project<number>({ id: 'replaceable', version: '1', initial: 0, reduce: count => count + 1 })
+    const { client } = await facade(f.a), old = client.projection<number>('replaceable')
+    expect((await old.read()).state).toBe(0)
+    const changes = old.changes()[Symbol.asyncIterator]()
+    expect((await changes.next()).value?.state).toBe(0)
+    const waiting = changes.next()
+    await first.close()
+    expect((await waiting).done).toBe(true)
+    f.a.project<number>({ id: 'replaceable', version: '2', initial: 42, reduce: count => count + 1 })
+    const current = client.projection<number>('replaceable')
+    expect((await current.read()).state).toBe(42)
+    await expect(old.read()).rejects.toThrow('APPLICATION_PROJECTION_CLOSED')
+    expect((await old.changes()[Symbol.asyncIterator]().next()).done).toBe(true)
+    await old.close(); await old.close()
+    expect((await current.read()).state).toBe(42)
+    await current.close()
+    f.a.project<number>({ id: 'replaceable', version: '3', initial: 84, reduce: count => count + 1 })
+    await current.close()
+    expect((await client.projection<number>('replaceable').read()).state).toBe(84)
+  })
+
+  it('retires obsolete projection bindings when owners repeatedly replace registrations', async () => {
+    const f = await fixture(), { client } = await facade(f.a)
+    for (let index = 0; index < 12; index++) {
+      const owner = f.a.project({ id: `projection-${index}`, version: '1', initial: index, reduce: count => count + 1 })
+      const page = client.projection<number>(owner.id)
+      expect((await page.read()).state).toBe(index)
+      await owner.close()
+      await expect(page.read()).rejects.toThrow('APPLICATION_PROJECTION_CLOSED')
+    }
   })
 
   it('settles the requesting waiter when its response contains malformed participation metadata', async () => {
