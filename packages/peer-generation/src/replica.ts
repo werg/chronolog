@@ -232,10 +232,13 @@ class Replica implements PeerReplica {
           [{ publicKey: hexToBytes(grant.publicKey), role: grant.dataRole }]) }))) }
     const output = await this.#options.materializer.coordinator.materialize(admitted, controls)
     if (output !== null) await this.#options.materializer.publications.publish(output.publication)
-    for (const item of selected) {
-      const { receipt, attempt } = item.command
-      const outcome = this.#options.materializer.queries.outcome(hexToBytes(attempt.id))
-      check(outcome !== null, 'PEER_OUTCOME_MISSING')
+    // Indexed reads stay linear, including reopen when the applied revision is already current.
+    const applied = this.#options.materializer.queries.captureApplication({ view: 'local' })
+    check(applied.orderLength === selected.length, 'PEER_MATERIALIZATION_MISMATCH')
+    for (let index = 0; index < selected.length; index++) {
+      const { receipt, attempt } = selected[index]!.command
+      const outcome = applied.transactionAt(index)
+      check(outcome !== null && bytesToHex(outcome.txId) === attempt.id, 'PEER_OUTCOME_MISSING')
       const result: AppliedResult = { status: 'applied', attemptId: attempt.id, operationId: receipt.payload.operationId,
         author: receipt.payload.author, generation: receipt.payload.generation, sequence: receipt.payload.sequence,
         outcome: outcome.outcome, rejectionCode: outcome.rejectionCode }
@@ -252,7 +255,7 @@ class Replica implements PeerReplica {
     this.#selected = selected; this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
     this.#publishedRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
       generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
-      controlRevision: generation.payload.controlRevision, materializationRevision: String(this.#options.materializer.queries.revision) }
+      controlRevision: generation.payload.controlRevision, materializationRevision: String(applied.revision) }
     this.#ready = true
   }
   #publish(): void { for (const listener of [...this.#listeners]) { try { listener() } catch { /* Consumer failure cannot undo persistence. */ } } }
@@ -427,8 +430,7 @@ class Replica implements PeerReplica {
     return this.#serial.run(async () => {
       this.#assertReady(); check(this.#options.materializer.queries.captureRead !== undefined, 'PEER_CAPTURE_UNSUPPORTED')
       const read = this.#options.materializer.queries.captureRead({ view: 'local' })
-      const outcomes = this.#selected.map(value => this.#options.materializer.queries.outcome(hexToBytes(value.command.attempt.id))!)
-      return { authority: this.authority, revision: this.revision, read, outcomes: structuredClone(outcomes), release: () => read.release() }
+      return { authority: this.authority, revision: this.revision, read, release: () => read.release() }
     })
   }
   async #proof(point: HistoryPoint): Promise<PrefixProof> {

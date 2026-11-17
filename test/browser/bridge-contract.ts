@@ -27,4 +27,13 @@ export interface BrowserBridgeSnapshot {
   readonly finalThrough: number
   readonly rows: MaterializedLocalSqlResult['rows']
   readonly outcomes: readonly TransactionOutcome[]
+  /** SQL and outcome flags captured together from the current applied preview. */
+  readonly local: {
+    readonly rows: MaterializedLocalSqlResult['rows']
+    readonly outcomes: readonly {
+      readonly transactionId: string
+      readonly type: 'pending' | 'accepted' | 'rejected'
+      readonly final: boolean
+    }[]
+  }
 }

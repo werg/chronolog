@@ -93,7 +93,13 @@ it.each([7, 29, 101, 997])('matches the independent prefix model across bounded 
     await expect(pa.order(excluded.attempt)).rejects.toThrow('PEER_ATTEMPT_ABANDONED')
     await pb.close(); pb = await open(1)
     const av = await pa.capture(), bv = await pb.capture()
-    try { expect(bv.outcomes).toEqual(av.outcomes); expect(bv.read.orderLength).toBe(model.selected.length) }
+    try {
+      expect(bv.read.orderLength).toBe(model.selected.length)
+      expect(av.read.orderLength).toBe(bv.read.orderLength)
+      for (let index = 0; index < bv.read.orderLength; index++) {
+        expect(bv.read.transactionAt(index)).toEqual(av.read.transactionAt(index))
+      }
+    }
     finally { av.release(); bv.release() }
     expect((await pb.exportCommands()).map(command => command.attempt.id)).toEqual(model.selected)
     for (const id of model.excluded) expect(model.selected).not.toContain(id)

@@ -52,7 +52,12 @@ export function createApplicationMcpServer(session: ApplicationSession, options:
       const signal = AbortSignal.any([controller.signal, lifetime.signal, session.signal, AbortSignal.timeout(timeoutMs),
         ...(options.signal === undefined ? [] : [options.signal])])
       try {
-        const value = await tools.call(params.name, params.arguments ?? {}, { signal })
+        const work = tools.call(params.name, params.arguments ?? {}, { signal })
+        // Cancelling a reply never cancels journalled work or frees its slot.
+        // Retain the active request ID and concurrency bound until work settles.
+        const settled = (): void => { pending.delete(id) }
+        void work.then(settled, settled)
+        const value = await waitForResponse(work, signal)
         const text = formatApplicationToolResult(value)
         if (new TextEncoder().encode(text).length > MAX_BYTES) throw new Error('APPLICATION_MCP_RESULT_TOO_LARGE')
         return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } }
@@ -60,13 +65,22 @@ export function createApplicationMcpServer(session: ApplicationSession, options:
         const text = formatApplicationToolResult({ error: failure instanceof Error ? failure.message : 'APPLICATION_TOOL_FAILED',
           ...(failure instanceof Error && 'operation' in failure ? { operation: failure.operation } : {}) })
         return { jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text }] } }
-      } finally { pending.delete(id) }
+      }
     },
     close(): void {
       lifetime.abort(new Error('APPLICATION_MCP_CLOSED'))
       for (const controller of pending.values()) controller.abort(lifetime.signal.reason)
     },
   }
+}
+
+function waitForResponse<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted()
+  return new Promise((resolve, reject) => {
+    const abort = (): void => { reject(signal.reason) }
+    signal.addEventListener('abort', abort, { once: true })
+    void work.then(resolve, reject).finally(() => { signal.removeEventListener('abort', abort) })
+  })
 }
 
 /** Standard MCP JSON-RPC over newline-delimited stdin/stdout; cancellation remains independent of saved commands. */

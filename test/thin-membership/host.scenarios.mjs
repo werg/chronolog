@@ -88,14 +88,35 @@ it('administers an independently ordered native/browser group through the actual
   const configured = await owner.configure(setup);
   expect(configured.descriptor).not.toBeNull();
   const genesis = decodeSignedGenesis(base64UrlToBytes(configured.descriptor.genesis));
-  expect(bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).not.toBe(setup.nativeAuthority.publicKey);
+  const rootPublicKey = bytesToBase64Url(genesis.manifest.rootAdminPublicKey);
+  expect(genesis.manifest.rootAdminPublicKey).toHaveLength(32);
+  expect(rootPublicKey).not.toBe(setup.nativeAuthority.publicKey);
+  expect(rootPublicKey).not.toBe(setup.schemaAdministratorPublicKey);
   expect(bytesToBase64Url(genesis.manifest.schemaAdminPublicKey)).toBe(setup.schemaAdministratorPublicKey);
+  expect(genesis.manifest.historyPolicy).toMatchObject({ kind: 'coordinated',
+    historyId: setup.nativeAuthority.historyId, authorityPublicKey: base64UrlToBytes(setup.nativeAuthority.publicKey),
+    executionManifestDigest: base64UrlToBytes(setup.executionManifestDigest) });
+  // The signed genesis pins the membership issuer. Administration is not a
+  // grant role, and that root receives no implicit application read/write grant.
   const rootRoles = genesis.manifest.initialCapabilities.filter(grant =>
-    bytesToBase64Url(grant.signingPublicKey) === bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).map(grant => grant.role);
-  expect(rootRoles).toEqual(['administrator']);
+    bytesToBase64Url(grant.signingPublicKey) === rootPublicKey).map(grant => grant.role);
+  expect(rootRoles).toEqual([]);
+  const explicitGrants = setup.initialMembers.flatMap(member => {
+    const signingPublicKey = base64UrlToBytes(member.signingPublicKey);
+    const common = { subjectId: signingPublicKey, signingPublicKey, transportAuthor: member.transportAuthor, validFromRevision: 0n };
+    return [{ ...common, role: 'reader', hpkePublicKey: base64UrlToBytes(member.readerPublicKey) },
+      ...(member.writerProgram === undefined ? [] : [{ ...common, role: 'writer', program: {
+        ...member.writerProgram, topics: [...member.writerProgram.topics].sort(), signals: [...member.writerProgram.signals].sort(),
+        forwarded: member.writerProgram.forwarded ?? false,
+      } }])];
+  });
+  expect(genesis.manifest.initialCapabilities).toEqual(explicitGrants);
   const bootstrap = await fixture('start', configured.descriptor);
+  expect(bootstrap.genesis).toBe(configured.descriptor.genesis);
+  expect(bootstrap.groupRoute).toBe(configured.descriptor.groupRoute);
   await owner.sync();
-  await passed('Cloudflare owns a durable membership-only root; the separate native signer owns application schema and ordering');
+  await passed('Cloudflare owns a durable membership-only root; the separate native signer owns application schema and ordering',
+    { membershipRoot: rootPublicKey, initialMemberRoles: explicitGrants.map(grant => grant.role) });
 
   await phase('large and small native workloads');
   const small = await fixture('workload', { namespace: 'host-small', count: 4, payloadBytes: 16 });
@@ -147,7 +168,8 @@ it('administers an independently ordered native/browser group through the actual
   const approval = await decision(owner, 'approve', approvalDecision);
   expect(approval.signedApproval).toBe(retained.signedApproval);
   expect(approval.capabilityIds).toEqual(retained.capabilityIds);
-  await expect(owner.approve({ ...approvalDecision, roles: ['reader'] })).rejects.toMatchObject({ status: 409 });
+  await expect(owner.approve({ operationId: approvalDecision.operationId, requestId: approvalDecision.requestId,
+    roles: ['reader'], grantFullHistory: approvalDecision.grantFullHistory })).rejects.toMatchObject({ status: 409 });
   await passed('host authentication binds device ownership and exact approval survives a lost reply plus real Durable Object eviction');
 
   await phase('first fresh Worker authenticated history replay');

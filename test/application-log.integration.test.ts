@@ -9,7 +9,7 @@ import { ChronologClient, DurableProjection, ProjectionConflictError, type Proje
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
 import { ChronologNode, type MembershipResolver } from '@chronolog/node-core'
-import { bytesToBase64Url, bytesToHex, emit, equalBytes, generateEd25519KeyPair, program, sqlStatement, type ViewChange } from '@chronolog/protocol'
+import { bytesToBase64Url, bytesToHex, decodeEnvelope, emit, equalBytes, generateEd25519KeyPair, program, sqlStatement, type ViewChange } from '@chronolog/protocol'
 import { feedIdFromPublicKey, PortableFeedTransport } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { FeedStore, nativeFeedCrypto } from '@chronolog/transport-ssb'
@@ -141,7 +141,8 @@ describe('public application backend with native durable execution', () => {
     expect(node.candidateCore(new TextEncoder().encode(rejected.proposalId))?.program).toEqual(rejectedProgram)
     expect(await backend.operations.get('accepted')).toMatchObject({ proposalId: accepted.proposalId, status: 'final', outcome: 'accepted' })
     expect(await backend.operations.get('rejected')).toMatchObject({ proposalId: rejected.proposalId, status: 'final', outcome: 'rejected', error: 'assert:claim_lost' })
-    const retained = await fixture.current.feed.history()
+    const retained = (await fixture.current.feed.history()).filter(record => decodeEnvelope(record.payload).messageType === 'candidate')
+    expect(retained).toHaveLength(3)
 
     fixture.revokeWriter()
     await fixture.restart()
@@ -158,7 +159,9 @@ describe('public application backend with native durable execution', () => {
     expect(recovered.transactions[0]!.events.map(event => event.origin)).toEqual([origin, origin])
     await expect(fixture.current.backend.submit(program(emit('tasks', { changed: true })), { operationId: 'accepted' })).rejects.toMatchObject({ code: 'already_exists' })
     await expect(fixture.current.backend.submit(acceptedProgram, { operationId: 'new-after-revocation' })).rejects.toMatchObject({ code: 'failed_precondition' })
-    expect(await fixture.current.feed.history()).toEqual(retained)
+    // Exact retries retain the original candidates while validator heartbeats
+    // may continue independently of application writer authority.
+    expect((await fixture.current.feed.history()).filter(record => decodeEnvelope(record.payload).messageType === 'candidate')).toEqual(retained)
   })
 
   it('keeps SQL/events pinned through a speculative rebase and observes finality-only rejection changes', async () => {

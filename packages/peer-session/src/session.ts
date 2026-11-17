@@ -345,28 +345,32 @@ export async function connectApplications(left: ApplicationSession, right: Appli
   let detachA = () => {}, detachB = () => {}, unsubscribeA = () => {}, unsubscribeB = () => {}
   let contentA = () => {}, contentB = () => {}, keysA = () => {}, keysB = () => {}
   let signalA: ReturnType<SignalChannel['attachRoute']> | undefined, signalB: ReturnType<SignalChannel['attachRoute']> | undefined
-  const assertConnected = (): void => {
+  const assertLifetime = (): void => {
     if (closed) throw new Error('APPLICATION_PEER_DISCONNECTED')
+    left.signal.throwIfAborted(); right.signal.throwIfAborted()
   }
   const assertOpen = (): void => {
-    assertConnected()
+    assertLifetime()
     if (!currentReader(a.replica, right.deviceId) || !currentReader(b.replica, left.deviceId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
   }
+  const learnAuthority = async (): Promise<void> => {
+    assertLifetime()
+    if (a.replica.generation.id !== b.replica.generation.id) {
+      const [source, target] = a.replica.generation.payload.number > b.replica.generation.payload.number ? [a.replica, b.replica] : [b.replica, a.replica]
+      // Like the network Hello, verify and learn newer signed authority before
+      // checking reader grants. Adoption durably fences controls even when the
+      // selected bodies have not arrived yet.
+      try { await target.adopt(source.authority) }
+      catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') throw error }
+      assertLifetime()
+    }
+  }
   const synchronize = async (): Promise<void> => {
-    assertConnected(); requested = true
+    assertLifetime(); requested = true
     const previous = pending
     const task = previous.then(async () => {
       while (requested && !closed) {
-        requested = false; assertConnected()
-        // Like the network Hello, learn the newer signed authority before
-        // checking reader grants. A newly admitted peer may carry that grant
-        // to an existing reader that has not consulted the host again.
-        if (a.replica.generation.id !== b.replica.generation.id) {
-          const [source, target] = a.replica.generation.payload.number > b.replica.generation.payload.number ? [a.replica, b.replica] : [b.replica, a.replica]
-          try { await target.adopt(source.authority) }
-          catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') throw error }
-        }
-        assertOpen()
+        requested = false; await learnAuthority(); assertOpen()
         for (const [receiver, issuer] of [[a, b], [b, a]] as const) {
           for (let batch = 0; batch < 256; batch++) {
             const ticket = await receiver.keys.request()
@@ -414,6 +418,7 @@ export async function connectApplications(left: ApplicationSession, right: Appli
     await synchronize()
   }
   try {
+    await learnAuthority(); assertOpen()
     signalA = a.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalB!.receive(frame); return true } })
     signalB = b.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalA!.receive(frame); return true } })
     let priorA = revisionKeySafe(a.replica), priorB = revisionKeySafe(b.replica)
@@ -426,6 +431,8 @@ export async function connectApplications(left: ApplicationSession, right: Appli
       if (current !== priorB) { priorB = current; void synchronize().catch(() => { link.close() }) }
     })
     await synchronize()
+    detachA = left.attachPeer(right.deviceId, submit(b.replica), link)
+    detachB = right.attachPeer(left.deviceId, submit(a.replica), link)
     keysA = a.keys.attachSource(right.deviceId, async request => { assertOpen(); const share = await b.keys.offer(request); assertOpen(); return share })
     keysB = b.keys.attachSource(left.deviceId, async request => { assertOpen(); const share = await a.keys.offer(request); assertOpen(); return share })
     contentA = a.content.attachSource(right.deviceId, {
@@ -440,8 +447,6 @@ export async function connectApplications(left: ApplicationSession, right: Appli
       retained: async reference => { assertOpen(); const value = await a.content.retained(reference); assertOpen(); return value },
       observeRetention: async receipt => { assertOpen(); await a.content.observeRetention(receipt); assertOpen() },
     })
-    detachA = left.attachPeer(right.deviceId, submit(b.replica), link)
-    detachB = right.attachPeer(left.deviceId, submit(a.replica), link)
     await Promise.all([left.resume(), right.resume()])
     return link
   } catch (error) { link.close(); throw error }

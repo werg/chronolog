@@ -110,8 +110,9 @@ export async function createEventMaterializationRuntime(options: {
       finalRevision, finalOrderLength: finalLength,
       transactionAt(index) {
         if (!Number.isSafeInteger(index) || index < 0 || index >= length) return null
-        const entry = selected[index]!
-        return { txId: entry.txId.slice(), canonicalCandidate: entry.canonicalCandidate.slice(), outcome: selectedOutcomes[index]!.outcome }
+        const entry = selected[index]!, outcome = selectedOutcomes[index]!
+        return { txId: entry.txId.slice(), canonicalCandidate: entry.canonicalCandidate.slice(), outcome: outcome.outcome,
+          rejectionCode: outcome.rejectionCode, failingStatementIndex: outcome.failingStatementIndex }
       },
     }
   }

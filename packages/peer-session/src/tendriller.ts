@@ -46,11 +46,11 @@ export function createPeerGenerationApplicationBackend(options: {
     submit,
     changes(input: ViewOptions & { readonly signal?: AbortSignal } = {}) {
       assertView(input)
-      return { async *[Symbol.asyncIterator]() {
-        for await (const change of session.changes(input)) yield { view: 'applied' as const, revision: JSON.stringify(change.revision),
+      return subscription(input.signal, async function* (signal) {
+        for await (const change of session.changes({ signal })) yield { view: 'applied' as const, revision: JSON.stringify(change.revision),
           generation: change.revision.generation, kind: change.kind === 'recovery' ? 'recovery' as const : 'update' as const,
           ...(change.recovery === null ? {} : { recovery: recoveryNotice(change.recovery) }) }
-      } }
+      })
     },
     async readView(input: ViewOptions = {}) {
       assertView(input)
@@ -69,13 +69,13 @@ export function createPeerGenerationApplicationBackend(options: {
     operations: Object.freeze({
       get: (id: string) => session.operations.get(id),
       subscribe(input: { readonly operationId: string; readonly signal?: AbortSignal }) {
-        return { async *[Symbol.asyncIterator]() {
+        return subscription(input.signal, async function* (signal) {
           let previous: string | undefined
-          for await (const _change of session.changes(input)) {
+          for await (const _change of session.changes({ signal })) {
             const state = await session.operations.get(input.operationId), encoded = JSON.stringify(state)
             if (state !== null && encoded !== previous) { previous = encoded; yield state }
           }
-        } }
+        })
       },
     }),
     events: Object.freeze({
@@ -85,21 +85,39 @@ export function createPeerGenerationApplicationBackend(options: {
       },
       read,
       subscribe(input: EventOptions = {}) {
-        return { async *[Symbol.asyncIterator]() {
+        return subscription(input.signal, async function* (signal) {
           let cursor = input.cursor
-          for await (const _change of session.changes(input)) {
+          for await (const _change of session.changes({ signal })) {
             for (;;) {
-              const batch = await read({ ...input, ...(cursor === undefined ? {} : { cursor }) })
+              const batch = await read({ ...input, signal, ...(cursor === undefined ? {} : { cursor }) })
               if (batch.scannedThrough === cursor) break
               cursor = batch.scannedThrough
               yield batch
               if (!batch.hasMore) break
             }
           }
-        } }
+        })
       },
     }),
   })
+}
+
+function subscription<T>(signal: AbortSignal | undefined, observe: (signal: AbortSignal) => AsyncIterable<T>): AsyncIterable<T> {
+  return { [Symbol.asyncIterator]() {
+    const stop = new AbortController()
+    const combined = signal === undefined ? stop.signal : AbortSignal.any([stop.signal, signal])
+    const iterator = observe(combined)[Symbol.asyncIterator]()
+    return {
+      async next() {
+        try { return await iterator.next() }
+        catch (error) { if (stop.signal.aborted) return { done: true as const, value: undefined }; throw error }
+      },
+      // Abort outside the generator: return() must release a pending next()
+      // without waiting for a future change from the application.
+      async return() { stop.abort(); await iterator.return?.(); return { done: true as const, value: undefined } },
+      async throw(error: unknown) { stop.abort(error); await iterator.return?.(); throw error },
+    }
+  } }
 }
 
 function assertView(input: ViewOptions): void { if (input.view !== undefined && input.view !== 'applied') throw new Error('APPLICATION_VIEW_UNSUPPORTED') }

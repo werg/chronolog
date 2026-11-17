@@ -159,18 +159,19 @@ describe('SQL-free durable event execution', () => {
     expect(changed?.revision.outcomeChanges).toContainEqual({ txId: late.txId, previous: 'accepted', current: 'rejected',
       previousRejectionCode: null, currentRejectionCode: 'operation_conflict' })
     expect(snapshotData(held)).toEqual(snapshotData(before))
-    expect(snapshotData(before).transactions).toEqual([{ txId: late.txId, canonicalCandidate: late.canonicalCandidate, outcome: 'accepted' }])
+    expect(snapshotData(before).transactions).toEqual([{ txId: late.txId, canonicalCandidate: late.canonicalCandidate,
+      outcome: 'accepted', rejectionCode: null, failingStatementIndex: null }])
     const applied = runtime.queries.captureApplication({ view: 'local' })
     expect(snapshotData(applied)).toMatchObject({ revision: 2n, orderLength: 2, finalRevision: 0n, finalOrderLength: 0,
       transactions: [
-        { txId: early.txId, canonicalCandidate: early.canonicalCandidate, outcome: 'accepted' },
-        { txId: late.txId, canonicalCandidate: late.canonicalCandidate, outcome: 'rejected' },
+        { txId: early.txId, canonicalCandidate: early.canonicalCandidate, outcome: 'accepted', rejectionCode: null, failingStatementIndex: null },
+        { txId: late.txId, canonicalCandidate: late.canonicalCandidate, outcome: 'rejected', rejectionCode: 'operation_conflict', failingStatementIndex: null },
       ] })
     const detached = applied.transactionAt(0)!
     detached.txId.fill(0)
     detached.canonicalCandidate.fill(0)
     expect(applied.transactionAt(0))
-      .toEqual({ txId: early.txId, canonicalCandidate: early.canonicalCandidate, outcome: 'accepted' })
+      .toEqual({ txId: early.txId, canonicalCandidate: early.canonicalCandidate, outcome: 'accepted', rejectionCode: null, failingStatementIndex: null })
     await runtime.coordinator.publishFinal!(2)
     const final = runtime.queries.captureApplication()
     expect(final).toMatchObject({ view: 'final', revision: 1n, orderLength: 2, finalRevision: 1n, finalOrderLength: 2 })

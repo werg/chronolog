@@ -23,6 +23,21 @@ signed data-collective membership separately from sequencing/control rights.
 Consumers use an explicitly built, source-pinned package archive during
 prerelease qualification.
 
+The implemented composition surfaces include:
+
+- `@chronolog/peer-session/browser` exports `serveApplicationWorker`,
+  `connectApplicationWorker` and `WorkerApplicationSession`. The owning Worker
+  retains signing keys, durable work and projections while the page calls the
+  application API through the facade.
+- `@chronolog/peer-session/tendriller` exports
+  `createPeerGenerationApplicationBackend` for an owned session or its Worker
+  facade. It exposes the current applied-view backend; durable event publication
+  is opt-in through an ordinary declared application command.
+- Signed encrypted epoch-enrollment packages and the session's
+  `ApplicationKeyring` supply and retain decryption keys. Peer key exchange checks
+  current reader authority and authenticated epoch commitments; possessing keys
+  does not grant sequencing, recovery or SQL administration rights.
+
 Tendriller implements the hosted control registry and lifecycle API using the
 same verifier. That service selects authenticated generations; it does not
 execute application commands. The new session does not reinterpret existing
@@ -138,8 +153,9 @@ linked to the old intent, under current controls and freshly selected domain gua
 
 ## Honest application results
 
-An operation can be saved, applied (accepted or rejected), shared, abandoned, or
-need reapplication. `applied` includes its generation and position. It remains
+An operation can be saved, applied (accepted or rejected), abandoned, or need
+reapplication. Independently retained coverage is observed through `shared()`.
+`applied` includes its generation and position. It remains
 stable while that history is selected; it is not irreversible across recovery.
 The current preview spells its wait `applied()`, not `final()`. The unified target's
 selected-history final result still has the explicit recovery exception above.
@@ -179,6 +195,12 @@ actions. Protect the complete accepted prerequisite program and dependencies onl
 when the application requires them to survive recovery. An unavailable protected
 prefix blocks that action, not unrelated collaboration; it does not require a
 second default architecture.
+
+The current `FinalEventSource` consumers and automatic effect workers assume an
+append-only history. They still need explicit reset handling and dispatch-journal
+retention before being connected to this session. That is an adapter integration
+requirement within the unified model. See the
+[integration details](plans/peer-generation-integration-details.md).
 
 ## Required storage and qualification
 

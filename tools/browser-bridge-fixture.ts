@@ -33,7 +33,7 @@ import {
 } from '@tendriller/core/records'
 
 import { SqliteOperationStore } from '../apps/chronologd/src/operation-store.js'
-import type { BrowserBridgeBootstrap } from '../test/browser/bridge-contract.js'
+import type { BrowserBridgeBootstrap, BrowserBridgeSnapshot } from '../test/browser/bridge-contract.js'
 import { createHttpPeerFixture } from './lib/http-peer-fixture.js'
 
 /**
@@ -192,6 +192,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
   const materializer = await DeterministicMaterializer.open({ path: join(options.rootDirectory, 'native-application.db'),
     executionManifest, rootAdministrator: genesis.manifest.schemaAdminPublicKey, checkpointEvery: 1 })
   let client: ChronologClient | undefined
+  const claimHandles = new Map<string, TransactionHandle>()
   let closed = false
   const close = async () => {
     if (closed) return
@@ -199,6 +200,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
     try {
       await peerHttp.close()
       await peers?.close()
+      for (const handle of claimHandles.values()) handle.dispose()
       await client?.close()
       if (governed !== undefined) await governed.close()
       else { materializer.close(); await local.close() }
@@ -292,6 +294,13 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
         identity: bootstrap.rootIdentity, hash: materializer.databaseContentHash,
         finalOrderLength: root.node.finalOrderLength, finalThrough: root.node.finalThrough,
         rows: root.node.localSql('SELECT id, claimed_by FROM tasks ORDER BY id', [], { view: 'final' }).rows,
+        local: {
+          rows: root.node.localSql('SELECT id, claimed_by FROM tasks ORDER BY id', [], { view: 'local' }).rows,
+          outcomes: transactionIds.map(transactionId => ({ transactionId,
+            type: root.node.outcome(utf8(transactionId))?.outcome ?? 'pending',
+            final: root.node.isFinal(utf8(transactionId)),
+          })),
+        } satisfies BrowserBridgeSnapshot['local'],
         outcomes: await Promise.all(transactionIds.map((transactionId) => native.getTransactionOutcome(transactionId))),
         logPosition: (await log.head()).position,
         includedRecordCount: (await log.read()).filter(entry => !isFinalityClosureRecord(entry.bytes)).length,
@@ -319,8 +328,12 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
           "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",
           { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = 1', params: ['native'] },
         ], { operationId: operationId })
-        try { return handle.transactionId } finally { handle.dispose() }
+        claimHandles.get(handle.transactionId)?.dispose()
+        claimHandles.set(handle.transactionId, handle)
+        await handle.local({ signal: AbortSignal.timeout(10_000) })
+        return handle.transactionId
       },
+      final(transactionId: string) { return claimHandles.get(transactionId)!.final({ signal: AbortSignal.timeout(10_000) }) },
       async sync(transactionIds: readonly string[] = []) { await syncEvidence(); return snapshot(transactionIds) },
       snapshot,
       loseNextAppendResponse() { loseAppendResponse = true; lostAppend = undefined },

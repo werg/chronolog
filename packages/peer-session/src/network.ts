@@ -326,13 +326,13 @@ export async function connectApplicationTransport(session: ApplicationSession, o
       })().catch(() => undefined)
     }
     await synchronize(); authorized()
-    detachKeys = owned.keys.attachSource(peerId, async keyRequest => request<ApplicationKeyShare>('keyShare', keyRequest))
     detach = session.attachPeer(peerId, async attempt => {
       authorized()
       await request<OrderedCommand>('submit', attempt)
       authorized()
       await synchronize()
     }, { close: () => close() })
+    detachKeys = owned.keys.attachSource(peerId, async keyRequest => request<ApplicationKeyShare>('keyShare', keyRequest))
     detachContent = owned.content.attachSource(peerId, {
       manifest: async reference => request<ContentManifest | null>('contentManifest', reference),
       chunk: async (reference, index) => {

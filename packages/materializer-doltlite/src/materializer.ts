@@ -279,7 +279,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       transactionAt(index) {
         if (!Number.isSafeInteger(index) || index < 0 || index >= log.length) return null
         const entry = log[index]!
-        return { txId: copyBytes(entry.txId), canonicalCandidate: copyBytes(entry.canonicalCandidate), outcome: entry.outcome }
+        return { txId: copyBytes(entry.txId), canonicalCandidate: copyBytes(entry.canonicalCandidate), outcome: entry.outcome,
+          rejectionCode: entry.rejectionCode, failingStatementIndex: entry.failingStatementIndex }
       },
     }
   }

@@ -5,9 +5,44 @@ timers, and peer connections alongside an application agent. The loops do not
 depend on model turns. Provider calls stay in trusted application modules;
 Chronolog's execution and UI replay never call them.
 
+The examples below describe the existing native composition. The unified
+generation session already implements coordinator selection and recovery.
+These examples are component documentation; the durable consumer adapters in
+this package still need the reset handling described below before consuming
+generation history.
+
 Start with the [application primitives guide](../../docs/application-primitives.md)
 for the choice between signals, durable events and SQL, and for the separate
 membership, finality and external-effect roles.
+
+## Scope of the durable consumer adapters
+
+The unified contract is `local()` for work applied here and `final()` for work
+committed and applied under the selected history. Explicit recovery may abandon
+recent work. The name `final` does not promise immutability across that recovery.
+
+The current `DurableProjection`, `DurableTimerScheduler`, and
+`DurableEffectWorker` implementations assume append-only event delivery and
+persist cursors and private state without a reset protocol. Their structural
+`FinalEventSource` port does not supply reset handling. Generation integration
+needs projection rebuilds and checkpoint reconciliation, plus a distinction
+between retrying the original prepared operation and abandoning an attempt.
+These are current adapter limitations; those recovery updates are not yet
+implemented here.
+
+Generation-aware workers may deliberately tolerate source history being
+abandoned after an external action. Preserve the dispatch journal, provider
+idempotency identities, and original authenticated request origin across resets;
+link results to that request. Dispatch still requires current tool authorization,
+and the scheduler or worker's credentials do not become the requester's authority.
+An uncertain provider call needs idempotent recovery, provider reconciliation,
+or explicit manual resolution. Resetting an application view or checkpoint does
+not establish that the call never happened and must not erase that recovery
+record.
+
+The [generation integration notes](../../docs/plans/peer-generation-integration-details.md)
+also cover SQL permission recovery, sealed-reader policies and package wire
+compatibility.
 
 ## Run the native profile
 

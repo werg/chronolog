@@ -51,6 +51,7 @@ class BrowserClaimPeer {
       { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = 1', params: ['browser'] },
     ], { operationId: operationId })
     this.handles.set(handle.transactionId, handle)
+    await handle.local({ signal: AbortSignal.timeout(30_000) })
     return handle.transactionId
   }
 
@@ -62,7 +63,7 @@ class BrowserClaimPeer {
 
   async state(transactionIds: readonly string[]): Promise<BrowserBridgeSnapshot> {
     return {
-      ...await this.command('state') as Omit<BrowserBridgeSnapshot, 'outcomes'>,
+      ...await this.command('state', { transactionIds }) as Omit<BrowserBridgeSnapshot, 'outcomes'>,
       outcomes: await Promise.all(transactionIds.map((id) => this.client.getTransactionOutcome(id))),
     }
   }

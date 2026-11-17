@@ -55,7 +55,7 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
     const av = await pa.replica.capture(), bv = await pb.replica.capture()
     try {
       expect(av.read.query('SELECT id,title FROM tasks ORDER BY id').rows).toEqual(bv.read.query('SELECT id,title FROM tasks ORDER BY id').rows)
-      expect(av.outcomes).toEqual(bv.outcomes)
+      expect([0, 1].map(index => av.read.transactionAt(index))).toEqual([0, 1].map(index => bv.read.transactionAt(index)))
     } finally { av.release(); bv.release() }
     await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       transitionId: 'takeover', expectedGeneration: pa.replica.generation.id, requester: b.publicKey, coordinator: b.publicKey,
@@ -95,7 +95,9 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
         // rewriting historical outcomes or relabelling the held old view.
         expect(afterControl.read.orderLength).toBe(beforeControl.read.orderLength)
         expect(afterControl.read.revision).toBe(beforeControl.read.revision + 1n)
-        expect(afterControl.outcomes).toEqual(beforeControl.outcomes)
+        for (let index = 0; index < beforeControl.read.orderLength; index++) {
+          expect(afterControl.read.transactionAt(index)).toEqual(beforeControl.read.transactionAt(index))
+        }
         expect(afterControl.revision.controlRevision).toBe(1)
         expect(afterControl.authority.controls.at(-1)).toEqual(nextControl)
         expect(afterControl.read.query(membership).rows).toEqual([[{ kind: 'text', value: 'member' }, { kind: 'text', value: 'left' }]])

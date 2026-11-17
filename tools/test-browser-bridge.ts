@@ -5,6 +5,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { extname, join, resolve } from 'node:path'
 
+import type { FinalTransactionOutcome } from '@chronolog/client'
 import { chromium } from '@playwright/test'
 import { build } from 'esbuild'
 
@@ -73,10 +74,26 @@ const compare = (actual: BrowserBridgeSnapshot, expected: BrowserBridgeSnapshot)
   assert(actual.finalThrough >= expected.finalThrough, 'browser has not applied the native inclusion checkpoint')
   assert.deepEqual(actual.rows, expected.rows)
   assert.deepEqual(actual.outcomes.map(({ outcome, final }) => ({ outcome, final })), expected.outcomes.map(({ outcome, final }) => ({ outcome, final })))
+  assert.deepEqual(actual.local.rows, actual.rows)
+  assert.deepEqual(actual.local.outcomes.map(({ type, final }) => ({ type, final })),
+    actual.outcomes.map(({ outcome, final }) => ({ type: outcome.type, final })))
+}
+const assertPreview = (snapshot: BrowserBridgeSnapshot, baseline: BrowserBridgeSnapshot, transactionId: string, claimant: 'native' | 'browser'): void => {
+  const [claim] = snapshot.local.outcomes
+  assert.equal(snapshot.local.outcomes.length, 1)
+  assert.equal(claim!.transactionId, transactionId)
+  assert(claim!.type === 'accepted' || claim!.type === 'rejected', 'authorized claim has not executed locally')
+  assert.equal(claim!.final, false)
+  const localWinner = claim!.type === 'accepted' ? claimant : claimant === 'native' ? 'browser' : 'native'
+  assert.deepEqual(snapshot.local.rows, [[{ kind: 'integer', value: '1' }, { kind: 'text', value: localWinner }]],
+    'local SQL does not match the outcome captured in the same applied preview')
+  assert.deepEqual(snapshot.rows, baseline.rows, 'an uncertified preview changed final SQL')
+  assert.equal(snapshot.finalOrderLength, baseline.finalOrderLength, 'an uncertified preview advanced the final prefix')
+  assert(snapshot.outcomes.every(({ outcome, final }) => outcome.type !== 'pending' && !final))
 }
 const report = async (details: Record<string, unknown>): Promise<void> => {
   await writeFile(join(output, 'report.json'), JSON.stringify({
-    ...details, browser: browser.version(), checks,
+    ...details, historyPolicy: 'coordinated', executionProfile: 'sql', browser: browser.version(), checks,
     wasmManifest: JSON.parse(await readFile(join(artifacts, 'manifest.json'), 'utf8')) as unknown,
   }, null, 2) + '\n')
 }
@@ -113,21 +130,40 @@ try {
   assert.equal(membershipFinal.outcome.type, 'accepted')
   passed('native agent and browser explicitly join one collective owning the SQL task')
 
+  const [nativeBaseline, browserBaseline] = await Promise.all([fixture.snapshot(), state('browser')])
+  assert.deepEqual(nativeBaseline.rows, [[{ kind: 'integer', value: '1' }, { kind: 'null' }]])
+  assert.deepEqual(browserBaseline.rows, nativeBaseline.rows)
   const [nativeClaim, browserClaim] = await Promise.all([
     fixture.claimTask('native-claim'),
     page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserBridge.claim('browser', 'browser-claim')),
   ])
   const transactionIds = [nativeClaim, browserClaim]
-  const beforeCertification = await fixture.snapshot([nativeClaim])
-  assert(beforeCertification.outcomes.every(({ outcome, final }) => outcome.type === 'pending' && !final))
-  const browserPending = await page.evaluate((transactionId) =>
-    (globalThis as unknown as TestWindow).chronologBrowserBridge.outcome('browser', transactionId), browserClaim)
-  assert.equal(browserPending.outcome.type, 'pending')
-  assert.equal(browserPending.final, false)
+  const completedFinalWaiters: string[] = [], effects: string[] = []
+  // Model an external action behind the public final() boundary. Both rejected
+  // and accepted waiters must stay pending before proof; only final success acts.
+  const recordFinal = async (pending: Promise<FinalTransactionOutcome>): Promise<FinalTransactionOutcome> => {
+    const result = await pending
+    completedFinalWaiters.push(result.transactionId)
+    if (result.outcome.type === 'accepted') effects.push(result.transactionId)
+    return result
+  }
+  const finalClaims = Promise.all([
+    recordFinal(fixture.final(nativeClaim)),
+    recordFinal(page.evaluate((transactionId) => (globalThis as unknown as TestWindow).chronologBrowserBridge.final('browser', transactionId), browserClaim)),
+  ])
+  // Observe early rejection while preserving it for the awaited assertion below.
+  void finalClaims.catch(() => undefined)
+  const [nativePreview, browserPreview] = await Promise.all([fixture.snapshot([nativeClaim]), state('browser', [browserClaim])])
+  assertPreview(nativePreview, nativeBaseline, nativeClaim, 'native')
+  assertPreview(browserPreview, browserBaseline, browserClaim, 'browser')
+  assert.deepEqual(completedFinalWaiters, [], 'final() resolved before certification')
+  assert.deepEqual(effects, [], 'an uncertified claim triggered an external action')
+  passed('authorized local previews keep coherent SQL and outcomes without changing final SQL or triggering finality-gated effects')
   const nativeFinal = await fixture.sync(transactionIds)
+  assert.deepEqual(nativeFinal.local.rows, nativeFinal.rows)
   await sync()
-  const browserFinal = await page.evaluate((transactionId) =>
-    (globalThis as unknown as TestWindow).chronologBrowserBridge.final('browser', transactionId), browserClaim)
+  const [nativeClaimFinal, browserFinal] = await finalClaims
+  assert.equal(nativeClaimFinal.final, true)
   assert.equal(browserFinal.final, true)
   const shared = await state('browser', transactionIds)
   compare(shared, nativeFinal)
@@ -137,6 +173,8 @@ try {
   assert.deepEqual(rejected.outcome, { type: 'rejected', rejection: { code: 'assert:already_claimed', statementIndex: 0 } })
   const winner = shared.outcomes[0]!.outcome.type === 'accepted' ? 'native' : 'browser'
   assert.deepEqual(shared.rows, [[{ kind: 'integer', value: '1' }, { kind: 'text', value: winner }]])
+  assert.deepEqual(completedFinalWaiters.toSorted(), transactionIds.toSorted())
+  assert.deepEqual(effects, [winner === 'native' ? nativeClaim : browserClaim], 'only the immutable accepted claim may trigger an external action')
   passed('two claims through the public Tendriller SDK produce one final winner and one assertion rejection in real native/WASM SQL')
 
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserBridge.stop('browser'))

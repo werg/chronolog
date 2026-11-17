@@ -23,12 +23,13 @@ const definition = defineApplication({ id: 'messages', version: '1', commands: {
 } })
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
-async function fixture() {
+async function fixture(extraDevices: readonly string[] = [], options: { readonly grantExtraDevices?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'peer-session-'))
   cleanup.push(() => rm(directory, { recursive: true, force: true }))
   const host = await createPeerIdentity()
   const a = await openNativeDevice({ path: join(directory, 'a.sqlite'), create: true }), b = await openNativeDevice({ path: join(directory, 'b.sqlite'), create: true })
-  cleanup.push(() => a.close(), () => b.close())
+  const others = await Promise.all(extraDevices.map(name => openNativeDevice({ path: join(directory, `${name}.sqlite`), create: true })))
+  cleanup.push(...[a, b, ...others].map(device => () => device.close()))
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
   const artifacts = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
   const descriptor = await signApplicationDescriptor({ applicationId: '77'.repeat(32), historyId: 'session-test', profile: 'peer-generation-v1',
@@ -36,7 +37,7 @@ async function fixture() {
     executionManifestDigest: bytesToHex(artifacts.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: [a, b].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true, dataRole: 'member' as const })) }, host)
+    grants: [a, b, ...(options.grantExtraDevices === false ? [] : others)].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true, dataRole: 'member' as const })) }, host)
   const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
   const select = async (identity: PeerIdentity, base: PrefixProof | null, transitionId: string) => {
     const bundle = await registry.read()
@@ -45,11 +46,11 @@ async function fixture() {
       requester: identity.publicKey, controlRevision: 0, base, transitionId, reason: base === null ? 'create' : 'takeover' }, identity))
   }
   await select(a.identity, null, 'create')
-  const open = async (device: typeof a) => {
-    const session = await openNativeApplication({ device, authority: await registry.read(), epochKeys, definition })
+  const open = async (device: typeof a, seedKeys = true) => {
+    const session = await openNativeApplication({ device, authority: await registry.read(), ...(seedKeys ? { epochKeys } : {}), definition })
     cleanup.push(() => session.close()); return session
   }
-  return { a, b, directory, registry, select, open, host }
+  return { a, b, others, directory, registry, select, open, host, control }
 }
 
 async function applied(session: ApplicationSession<typeof definition>, text: string, id: string) {
@@ -58,27 +59,36 @@ async function applied(session: ApplicationSession<typeof definition>, text: str
 }
 
 describe('public peer application sessions', () => {
-  it('learns a newly granted reader’s signed authority before authorizing its direct connection', async () => {
-    const f = await fixture(), a = await f.open(f.a)
-    await applied(a, 'before the new reader', 'before-grant')
-    const device = await openNativeDevice({ path: join(f.directory, 'c.sqlite'), create: true })
-    cleanup.push(() => device.close())
-    const before = await f.registry.read(), previous = before.controls[0]!
-    const control = await signControlRevision({ ...previous.payload, revision: 1, previous: await peerDigest(previous),
-      grants: [...previous.payload.grants, participantGrant(device.identity.publicKey)] }, f.host)
-    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-      expectedGeneration: before.generations.at(-1)!.id, coordinator: a.deviceId, requester: a.deviceId,
-      controlRevision: 1, base: await a.recoveryPoint(), transitionId: 'enroll-reader', reason: 'control-change' }, f.a.identity), { control })
-    const c = await openNativeApplication({ device, definition, authority: await f.registry.read() })
-    cleanup.push(() => c.close())
+  it('learns a newly granted reader before embedded admission and transfers keys only after authorization', async () => {
+    const f = await fixture(['c'], { grantExtraDevices: false }), a = await f.open(f.a), c = await f.open(f.others[0]!, false)
+    await applied(a, 'surviving prefix', 'before-grant')
+    await expect(connectApplications(c, a)).rejects.toThrow('APPLICATION_PEER_NOT_AUTHORIZED')
+    expect(a.status.connectedPeers).toBe(0)
+    expect(c.status.connectedPeers).toBe(0)
+    expect(c.keys.missing()).toEqual([0])
+
+    const before = await f.registry.read()
+    const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
+      grants: [...f.control.payload.grants, participantGrant(c.deviceId)] }, f.host)
+    const generation = await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId,
+      profile: 'peer-generation-v1', policy: 'eligible-members-v1', expectedGeneration: before.generations.at(-1)!.id,
+      coordinator: a.deviceId, requester: a.deviceId, controlRevision: 1, base: await a.recoveryPoint(),
+      transitionId: 'enroll-reader', reason: 'control-change',
+    }, f.a.identity), { control })
+    await expect(c.adopt(await f.registry.read())).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
     expect(a.status.generation).not.toBe(c.status.generation)
     expect(c.status.phase).toBe('awaiting-keys')
-    const link = await connectApplications(a, c)
+
+    const link = await connectApplications(c, a)
     cleanup.push(() => link.close())
-    expect(a.status.generation).toBe(c.status.generation)
+    expect(a.revision).toMatchObject({ generation: generation.id, controlRevision: 1 })
+    expect(c.revision).toMatchObject({ generation: generation.id, controlRevision: 1 })
     expect(c.status.phase).toBe('ready')
-    expect((await c.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['before-grant'])
-    expect(await applied(c, 'new reader contribution', 'after-grant')).toMatchObject({ outcome: 'accepted', author: c.deviceId })
+    expect(c.keys.missing()).toEqual([])
+    expect((await c.query('messages', null)).value.events).toEqual([
+      expect.objectContaining({ author: a.deviceId, operationId: 'before-grant' }),
+    ])
+    expect(await applied(c, 'newly enrolled', 'after-grant')).toMatchObject({ outcome: 'accepted', author: c.deviceId })
     await link.synchronize()
     expect((await a.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['before-grant', 'after-grant'])
   })
@@ -181,6 +191,45 @@ describe('public peer application sessions', () => {
     expect((await reopened.query('messages', null)).value.events).toHaveLength(1)
   })
 
+  it.each(['current', 'previous'] as const)('hydrates fresh peers from an adopted prefix held in the %s generation', async sourceGeneration => {
+    const f = await fixture(['c', 'd']), a = await f.open(f.a), b = await f.open(f.b)
+    const originalLink = await connectApplications(a, b)
+    cleanup.push(() => originalLink.close())
+    await applied(a, 'retained', 'retained'); await originalLink.synchronize(); originalLink.close()
+    const original = await a.operations.inspect('retained')
+    const generation = await f.select(f.b.identity, await b.recoveryPoint(), 'successor')
+    if (sourceGeneration === 'current') await b.adopt(await f.registry.read())
+
+    const c = await f.open(f.others[0]!), d = await f.open(f.others[1]!)
+    await expect(c.readView()).rejects.toThrow('PEER_RECOVERING')
+    await expect(d.readView()).rejects.toThrow('PEER_RECOVERING')
+    const followerLink = await connectApplications(c, d)
+    cleanup.push(() => followerLink.close())
+    expect(c.status).toMatchObject({ phase: 'recovering', connectedPeers: 1 })
+    expect(d.status).toMatchObject({ phase: 'recovering', connectedPeers: 1 })
+    await expect(c.readView()).rejects.toThrow('PEER_RECOVERING')
+    await expect(d.readView()).rejects.toThrow('PEER_RECOVERING')
+
+    // The fresh peer comes first; the other peer need not have adopted the
+    // successor yet. Its verified retained prefix is enough to hydrate both.
+    const hydratedLink = await connectApplications(c, b)
+    cleanup.push(() => hydratedLink.close())
+    expect(c.revision.generation).toBe(generation.id)
+    expect(b.revision.generation).toBe(generation.id)
+    expect((await c.query('messages', null)).value.events).toEqual((await b.query('messages', null)).value.events)
+    expect((await c.operations.inspect('retained', { author: a.deviceId }))?.attempt).toEqual(original?.attempt)
+
+    // The existing recovering link becomes useful once one follower obtains
+    // the adopted bodies; the coordinator need not be one of its endpoints.
+    await followerLink.synchronize()
+    expect((await d.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['retained'])
+    const next = await b.command('say', 'after recovery', { operationId: 'after' })
+    await next.applied({ signal: AbortSignal.timeout(5000) })
+    await hydratedLink.synchronize(); await followerLink.synchronize()
+    expect((await d.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['retained', 'after'])
+    expect(await next.shared({ signal: AbortSignal.timeout(5000) })).not.toHaveLength(0)
+  })
+
   it('persists the exact recovery request across a lost hosted reply and device reopen', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const link = await connectApplications(a, b)
@@ -252,5 +301,38 @@ describe('public peer application sessions', () => {
     await expect(backend.events.publish('anything', {}, { operationId: 'undeclared' })).rejects.toThrow('APPLICATION_EVENT_PUBLICATION_NOT_CONFIGURED')
     link.close()
     expect(phases.at(-1)).toBe('waiting')
+  })
+
+  it('replaces an in-process peer before installing its new content and key sources', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const original = await connectApplications(a, b)
+    cleanup.push(() => original.close())
+    const replacement = await connectApplications(a, b)
+    cleanup.push(() => replacement.close())
+    await expect(original.synchronize()).rejects.toThrow('APPLICATION_PEER_DISCONNECTED')
+    expect(a.status.connectedPeers).toBe(1)
+    expect(b.status.connectedPeers).toBe(1)
+    const bytes = new Uint8Array([1, 2, 3]), upload = await a.content.stage({ bytes: bytes.length })
+    await upload.write(0, bytes)
+    const reference = await upload.commit(), copied: Uint8Array[] = []
+    for await (const chunk of b.content.read(reference)) copied.push(chunk)
+    expect(copied).toEqual([bytes])
+    expect((await applied(b, 'replacement command', 'replacement')).outcome).toBe('accepted')
+  })
+
+  it.each(['changes', 'operations', 'events'] as const)('closes a quiet Tendriller %s subscription while its next pull is pending', async kind => {
+    const f = await fixture(), app = await f.open(f.a)
+    await applied(app, 'before observation', 'observed')
+    const backend = createPeerGenerationApplicationBackend({ id: app.applicationId, session: app })
+    const stream = kind === 'changes' ? backend.changes()
+      : kind === 'operations' ? backend.operations.subscribe({ operationId: 'observed' }) : backend.events.subscribe()
+    const iterator = stream[Symbol.asyncIterator]()
+    expect((await iterator.next()).done).toBe(false)
+    const pending = iterator.next()
+    await Promise.resolve()
+    await iterator.return?.()
+    expect(await pending).toEqual({ done: true, value: undefined })
+    expect((await iterator.next()).done).toBe(true)
+    expect((await app.query('messages', null)).value.events).toHaveLength(1)
   })
 })

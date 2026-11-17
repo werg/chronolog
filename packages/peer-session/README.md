@@ -6,9 +6,15 @@ live signals need no hosted request while that generation is healthy. A signed
 control service selects a successor during takeover. Recovery can abandon a
 recent suffix, which remains inspectable and requires explicit reapplication.
 
-An applied result is accepted or rejected at one generation and sequence. It is
-stable in that history, but is not irreversible finality. This package exposes
-no `final()` wait and no automatic external-effect dispatcher.
+The unified completion contract is `local()` for applied here and `final()` for
+committed and applied under the selected history. Exceptional recovery may abandon
+a recent suffix, including previously final work. The waits may coincide; no
+additional speculative stage or stronger-finality service is required.
+
+This preview currently exposes that committed, locally applied result through
+`applied()`, which reports accepted or rejected at one generation and sequence.
+The executable examples below use that implemented spelling. External-effect
+dispatchers still need recovery integration; the preview does not install one.
 
 ## Native events application
 
@@ -200,6 +206,16 @@ Werift implementation. Returned connections expose logical frame byte counts,
 request counts, and `rtc.getRoute()` observations. An unknown observed route
 stays unknown.
 
+For an owned network lifecycle, `/webrtc` exports
+`maintainApplicationWebRtc(session, { host })` and
+`maintainWorkerApplicationWebRtc(session, worker, { host })`. The optional
+`/webrtc-native` entry supplies
+`maintainNativeApplicationWebRtc(session, { host })`. These helpers own discovery,
+coarse advertisements, invitations, bounded reconnect, catch-up and permitted
+takeover. The returned owner exposes `ready`, `status`, `onStatus()`, `reconnect()`
+after retry exhaustion, and async `close()`; closing it leaves the application
+session's lifetime unchanged.
+
 In a browser, the Worker owns the device and session. The maintained page facade
 owns application calls and both-channel RTC handoff; its separate host bridge
 uses the page's existing signed-in host connection for bootstrap and recovery.
@@ -377,8 +393,14 @@ Shared SQL rows can use `APPLICATION_COLLECTIVE_ID` ownership when the domain
 permits every currently authorized application member to edit them. Signed
 controls define its current data roles, so creator departure does not freeze
 shared data and data-role revocation survives history rollback. Private row
-ownership remains tied to its actual author. Irreversible effects require a
-separately declared protected boundary.
+ownership remains tied to its actual author.
+
+Effects retain their original dispatch journal and provider retry key across
+recovery, because an external call may
+outlive an abandoned application record. Before dispatch, check current intent
+and authorization; reconcile uncertain calls with the provider. Use the recovery
+floor when an application specifically requires an action's prerequisite to survive
+recovery. See [integration details](../../docs/plans/peer-generation-integration-details.md).
 
 ### A shared SQL command with a domain guard
 

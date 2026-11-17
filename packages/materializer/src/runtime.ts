@@ -96,6 +96,8 @@ export interface MaterializedApplicationTransaction {
   readonly txId: Uint8Array
   readonly canonicalCandidate: Uint8Array
   readonly outcome: MaterializedTransactionOutcomeKind
+  readonly rejectionCode: string | null
+  readonly failingStatementIndex: number | null
 }
 
 /** Immutable published revision; only requested application entries are copied. */

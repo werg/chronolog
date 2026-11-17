@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
-import { emit, executionManifestArtifacts, program } from '@chronolog/protocol'
+import { decodeTransactionCore, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
@@ -52,14 +52,82 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     const av = await a.capture(), bv = await b.capture()
     try {
       expect(av.read.orderLength).toBe(2)
-      expect(av.outcomes).toEqual(bv.outcomes)
-      expect(av.outcomes.map(value => value.orderKey.authorTimestampMs)).toEqual([500n, 100n])
-      expect(av.read.transactionAt(0)).toEqual(bv.read.transactionAt(0))
+      const transactions = [0, 1].map(index => av.read.transactionAt(index)!)
+      expect(transactions).toEqual([0, 1].map(index => bv.read.transactionAt(index)))
+      expect(transactions.map(value => decodeTransactionCore(value.canonicalCandidate).authorTimestampMs)).toEqual([500n, 100n])
     } finally { av.release(); bv.release() }
     expect(await a.order(first)).toEqual((await a.exportCommands())[0])
     expect((await a.exportCommands()).length).toBe(2)
     await b.observeCoverage(await a.retainedCoverage())
     expect(b.shared()).toHaveLength(1)
+  })
+  it('bounds captured reads and publishes outcomes with one indexed pass instead of history lookups', async () => {
+    const f = await fixture(), a = await f.open(f.a)
+    for (let index = 0; index < 4; index++) {
+      await a.order(await a.prepare({ operationId: `entry-${index}`, program: index === 3 ? program('SELECT 1') : event(String(index)) }))
+    }
+    const store = new MemoryPeerStore()
+    const runtime = await createEventMaterializationRuntime({ store, namespace: 'test', historyProfile: 'peer-generation-v1' })
+    const outcomeLookups = vi.spyOn(runtime.queries, 'outcome'), materialize = vi.spyOn(runtime.coordinator, 'materialize')
+    const publicationReads: number[] = [], viewReads: number[] = []
+    const captureApplication = runtime.queries.captureApplication.bind(runtime.queries)
+    const captureRead = runtime.queries.captureRead!.bind(runtime.queries)
+    vi.spyOn(runtime.queries, 'captureApplication').mockImplementation(options => {
+      const snapshot = captureApplication(options)
+      return { ...snapshot, transactionAt(index) { publicationReads.push(index); return snapshot.transactionAt(index) } }
+    })
+    vi.spyOn(runtime.queries, 'captureRead').mockImplementation(options => {
+      const read = captureRead(options)
+      return { ...read, transactionAt(index) { viewReads.push(index); return read.transactionAt(index) } }
+    })
+    const b = await createPeerReplica({ authority: await f.registry.read(), device: f.b, store,
+      storageId: f.b.publicKey, materializer: runtime, epochKeys: f.keys })
+    opened.push(b)
+    await b.ingest(await a.exportCommands())
+    expect(publicationReads).toHaveLength(4)
+    expect(outcomeLookups).not.toHaveBeenCalled()
+    expect(await b.operation('entry-3', f.a.publicKey)).toMatchObject({ outcome: 'rejected', rejectionCode: 'profile:sql-disabled' })
+
+    publicationReads.length = 0
+    await b.ingest([])
+    expect(await materialize.mock.results.at(-1)!.value).toBeNull()
+    expect(publicationReads).toHaveLength(4)
+    expect(outcomeLookups).not.toHaveBeenCalled()
+
+    const captured = await b.capture()
+    try {
+      expect(captured.read.orderLength).toBe(4)
+      expect(viewReads).toHaveLength(0)
+      expect(publicationReads).toHaveLength(4)
+      expect(outcomeLookups).not.toHaveBeenCalled()
+      const window = [2, 3].map(index => captured.read.transactionAt(index)!)
+      expect(viewReads).toHaveLength(2)
+      expect(window.map(({ outcome, rejectionCode, failingStatementIndex }) => ({ outcome, rejectionCode, failingStatementIndex }))).toEqual([
+        { outcome: 'accepted', rejectionCode: null, failingStatementIndex: null },
+        { outcome: 'rejected', rejectionCode: 'profile:sql-disabled', failingStatementIndex: 0 },
+      ])
+    } finally { captured.release() }
+  })
+  it('recovers rejection details from the applied snapshot when its result journal write was lost', async () => {
+    const f = await fixture(), retained = new MemoryPeerStore()
+    let failResult = false
+    const store: PeerStore = { get: key => retained.get(key), async put(key, value) {
+      if (failResult && key.includes('/result/')) { failResult = false; throw new Error('RESULT_WRITE_LOST') }
+      await retained.put(key, value)
+    } }
+    const a = await f.open(f.a, store), attempt = await a.prepare({ operationId: 'rejected', program: program('SELECT 1') })
+    failResult = true
+    await expect(a.order(attempt)).rejects.toThrow('RESULT_WRITE_LOST')
+    await a.close()
+
+    const runtime = await createEventMaterializationRuntime({ store, namespace: 'test', historyProfile: 'peer-generation-v1' })
+    const outcomeLookups = vi.spyOn(runtime.queries, 'outcome'), materialize = vi.spyOn(runtime.coordinator, 'materialize')
+    const reopened = await createPeerReplica({ authority: await f.registry.read(), device: f.a, store,
+      storageId: f.a.publicKey, materializer: runtime, epochKeys: f.keys })
+    opened.push(reopened)
+    expect(await materialize.mock.results.at(-1)!.value).toBeNull()
+    expect(outcomeLookups).not.toHaveBeenCalled()
+    expect(await reopened.operation('rejected')).toMatchObject({ status: 'applied', outcome: 'rejected', rejectionCode: 'profile:sql-disabled' })
   })
   it('adopts an older complete prefix, seeds a fresh peer and quarantines the returning suffix', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
@@ -68,7 +136,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     const inheritedView = await b.capture(); const inheritedRevision = inheritedView.revision; inheritedView.release()
     const two = await a.prepare({ operationId: 'two', program: event('two') })
     await a.order(two)
-    const held = await a.capture(), oldRevision = held.revision
+    const held = await a.capture(), oldRevision = held.revision, oldEntry = held.read.transactionAt(1)
     const base = await b.recoveryPoint(), g2 = await f.select(f.b, base, 'second')
     await b.adopt(await f.registry.read())
     await expect(b.exportCommands({ at: inheritedRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
@@ -81,7 +149,9 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect(notice?.abandoned).toContainEqual(expect.objectContaining({ operationId: 'two', status: 'abandoned' }))
     expect(notice?.unknownLoss, 'known abandoned work does not prove that no unseen suffix exists').toBe(true)
     expect((await a.operation('two'))?.status).toBe('abandoned')
-    expect(held.read.orderLength).toBe(2); held.release()
+    expect(held.read.orderLength).toBe(2)
+    expect(held.read.transactionAt(1)).toEqual(oldEntry)
+    held.release()
     await expect(a.prepare({ operationId: 'stale-view', program: event('stale'), basedOn: oldRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
     await expect(b.order(two)).rejects.toThrow('PEER_ATTEMPT_NEEDS_REAPPLY')
     expect(await b.order(one)).toEqual((await b.exportCommands())[0])

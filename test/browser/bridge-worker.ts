@@ -3,7 +3,7 @@ import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { LedgerRecordError } from '@chronolog/node-core/ledger'
 import {
   DOMAINS, base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest,
-  digestExecutionManifest, equalBytes, hashDomain,
+  digestExecutionManifest, equalBytes, hashDomain, utf8,
 } from '@chronolog/protocol'
 import { assertFeedPosition, ChangeSignal, type FeedLink } from '@chronolog/records'
 import { openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
@@ -42,6 +42,7 @@ interface FixtureRequest {
   readonly relay?: boolean
   readonly port?: MessagePort
   readonly identity?: string
+  readonly transactionIds?: readonly string[]
 }
 
 type LinkRequestFields = {
@@ -205,6 +206,13 @@ endpoint.addEventListener('message', (event) => {
           identity: bytesToBase64Url(peer!.node.identity), hash: peer!.materializer.databaseContentHash,
           finalOrderLength: peer!.node.finalOrderLength, finalThrough: peer!.node.finalThrough,
           rows: peer!.node.localSql('SELECT id, claimed_by FROM tasks ORDER BY id', [], { view: 'final' }).rows,
+          local: {
+            rows: peer!.node.localSql('SELECT id, claimed_by FROM tasks ORDER BY id', [], { view: 'local' }).rows,
+            outcomes: (request.transactionIds ?? []).map(transactionId => ({ transactionId,
+              type: peer!.node.outcome(utf8(transactionId))?.outcome ?? 'pending',
+              final: peer!.node.isFinal(utf8(transactionId)),
+            })),
+          },
           ...(status.lastError === undefined ? {} : { lastError: status.lastError }),
         } satisfies Omit<BrowserBridgeSnapshot, 'outcomes'>
       }

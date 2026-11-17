@@ -50,7 +50,7 @@ async function fixture(initialMembers = [0, 1, 2]) {
     const app = await openPeerApplication({ device: devices[index]!, authority: await registry.read(), definition, ...(seedKeys ? { epochKeys } : {}) })
     cleanup.push(() => app.close()); return app
   }
-  return { devices, open, select, registry, key, directory, host }
+  return { devices, open, select, registry, host, descriptor, control, key, directory }
 }
 
 function pair(): readonly [FramedPeerConnection, FramedPeerConnection] {
@@ -197,23 +197,51 @@ describe('authenticated application transport', () => {
     expect(b.status.connectedPeers).toBe(0)
   })
 
-  it('connects an empty peer to a selected retained prefix before exposing a ready view', async () => {
+  it.each(['current', 'previous'] as const)('hydrates an empty peer from the %s generation without restoring an excluded suffix or old controls', async sourceGeneration => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
     const original = await connect(a, b)
     await (await a.command('say', 'retained', { operationId: 'retained' })).applied()
     await original[1].synchronize()
+    const base = await b.recoveryPoint(), retained = await a.operations.inspect('retained')
+    for (const operationId of ['tail-one', 'tail-two']) await (await a.command('say', 'excluded', { operationId })).applied()
+    await original[1].synchronize()
+    const excluded = await b.operations.inspect('tail-two', { author: a.deviceId })
+    expect((await b.query('messages', null)).value.events).toHaveLength(3)
     await Promise.all(original.map(link => link.close()))
-    await f.select(f.devices[1]!.identity, await b.recoveryPoint(), 'move')
-    await b.adopt(await f.registry.read())
+
+    const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
+      grants: f.control.payload.grants.map(grant => grant.publicKey === a.deviceId ? { ...grant, writer: false } : grant) }, f.host)
+    const generation = await f.registry.select(await signTransitionRequest({ applicationId: f.descriptor.payload.applicationId,
+      profile: f.descriptor.payload.profile, policy: f.descriptor.payload.policy, expectedGeneration: base.point.generation,
+      coordinator: b.deviceId, requester: a.deviceId, controlRevision: 1, base, transitionId: 'move', reason: 'control-change',
+    }, f.devices[0]!.identity), { control })
+    if (sourceGeneration === 'current') await b.adopt(await f.registry.read())
     const c = await f.open(2)
     expect(c.status.phase).toBe('recovering')
     await expect(c.query('messages', null)).rejects.toThrow('PEER_RECOVERING')
-    await connect(b, c)
+    const links = await connect(b, c)
+    await Promise.all(links.map(link => link.synchronize()))
     expect(c.status.phase).toBe('ready')
-    expect((await c.query('messages', null)).value.events).toHaveLength(1)
+    expect(c.revision).toMatchObject({ generation: generation.id, controlRevision: 1 })
+    expect(b.revision).toMatchObject({ generation: generation.id, controlRevision: 1 })
+    expect((await c.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['retained'])
+    expect((await b.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['retained'])
+    expect((await c.operations.inspect('retained', { author: a.deviceId }))?.attempt).toEqual(retained?.attempt)
+    expect(await b.operations.inspect('tail-two', { author: a.deviceId })).toMatchObject({
+      state: { status: 'abandoned', selectedGeneration: generation.id }, attempt: excluded?.attempt,
+    })
+
     const oldLink = await connectApplications(a, c)
     cleanup.push(() => oldLink.close())
     expect(a.revision.generation).toBe(c.revision.generation)
+    await expect(a.command('say', 'revoked writer', { operationId: 'forbidden' })).rejects.toThrow('PEER_AUTHOR_FORBIDDEN')
+    const next = await c.command('say', 'after recovery', { operationId: 'after' })
+    expect((await next.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
+    await Promise.all(links.map(link => link.synchronize()))
+    expect((await c.operations.inspect('after'))?.attempt.payload.header.controlRevision).toBe(1)
+    expect((await b.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['retained', 'after'])
+    expect((await next.shared({ signal: AbortSignal.timeout(5000) })).some(value => value.payload.peer === b.deviceId && value.payload.generation === generation.id)).toBe(true)
+    expect(links.every(link => !link.signal.aborted)).toBe(true)
   })
 
   it('resumes encrypted content over bounded peer chunks without changing application history', async () => {

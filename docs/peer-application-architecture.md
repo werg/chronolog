@@ -121,10 +121,16 @@ seen time or a signed checkpoint without its original bodies is not a recovery
 source. Prompt replication aims for an independently stored complete prefix;
 reports distinguish known abandoned work from unknown loss.
 
-`peer-generation-v1` does not expose `final()` or automatically dispatch
-irreversible external effects. Stronger Chronolog profiles remain explicit
-compositions with different guarantees; their finality is not inferred from an
-ordinary peer-session result.
+The unified application contract uses `local()` for applied-here results and
+`final()` for committed/applied results under the selected history. Explicit
+recovery may abandon a recent suffix, including a previously final result. The
+current preview exposes `applied()`; it exports no `local()` or `final()` aliases.
+
+External-effect consumers need reset-aware projections, a retained dispatch
+journal, stable provider retry identities and reconciliation of uncertain calls.
+The current append-only consumers still need that integration. Protect a complete
+prerequisite program and its dependencies only when the application requires them
+to survive recovery. See the [integration details](plans/peer-generation-integration-details.md).
 
 ## Extending the same machinery to code and page updates
 

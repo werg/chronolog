@@ -31,7 +31,10 @@ export async function prepareBrowserSqlApplication(options: {
 }
 
 type BrowserSqlOptions<D extends ApplicationDefinition> = Omit<OpenPeerApplicationOptions<D>, 'createMaterializer'> & {
-  /** URL of the engine directory shipped with the SQL-enabled session artifact. */
+  /**
+   * URL of the verified browser-engine directory included by --sql-browser.
+   * Deployments serve these packaged assets with JavaScript/WASM content types.
+   */
   readonly engineUrl: string | URL
   readonly schema: SignedApplicationSchema
 }
