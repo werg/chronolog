@@ -127,7 +127,8 @@ export function createChronologApplicationBackend(options: {
       async throw(error: unknown) { stop.abort(error); await iterator.return?.(); throw error },
     }
   } })
-  const wrapView = (view: { readonly view: 'local' | 'final'; readonly revision: string; readonly finalRevision: string; readEvents(options?: ApplicationEventReadOptions): ApplicationEventBatch | Promise<ApplicationEventBatch>; release(): void | Promise<void> },
+  const wrapView = (view: { readonly view: 'local' | 'final'; readonly revision: string; readonly finalRevision: string;
+      readEvents(options?: ApplicationEventReadOptions): ApplicationEventBatch | Promise<ApplicationEventBatch>; release(): void | Promise<void> },
     query: (sql: string, parameters: readonly LocalSqlInput[]) => Promise<ChronologApplicationQuery>): ApplicationReadView<ChronologApplicationQuery, LocalSqlInput> => {
     let released = false
     const assertHeld = (): void => { if (released) throw new Error('APPLICATION_VIEW_RELEASED') }

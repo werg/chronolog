@@ -70,7 +70,7 @@ export interface SealedPutOptions extends TransactionOptions {
 export class SealedPolicyNotFinalError extends Error {
   readonly code = 'SEALED_POLICY_NOT_FINAL'
   constructor(readonly transactionId: string, readonly confidence: SettlementConfidence) {
-    super(`Reader policy transaction ${transactionId} is not accepted below a resolved policy watermark; no value was encrypted or submitted. Wait for settlement before sharing.`)
+    super(`Reader policy transaction ${transactionId} has no immutable accepted outcome with all required references resolved; no value was encrypted or submitted. Wait for final acceptance before sharing.`)
     this.name = 'SealedPolicyNotFinalError'
   }
 }
@@ -178,7 +178,7 @@ export class SealedDataActions {
     }
     if (options.allowProvisionalPolicy !== true) {
       const evidence = await this.client.getSettlementEvidence(policy.updatedTransactionId)
-      if (evidence.confidence !== 'policy_watermark_reached' || evidence.unresolvedReferences.length !== 0 ||
+      if (!evidence.outcome.final || evidence.unresolvedReferences.length !== 0 ||
           evidence.outcome.outcome.type !== 'accepted') {
         throw new SealedPolicyNotFinalError(policy.updatedTransactionId, evidence.confidence)
       }

@@ -211,7 +211,7 @@ application callbacks do not become consensus code.
 | `client.events.subscribe(options)` | Pull-based durable catch-up/live continuation; no snapshot coalescing. |
 | `client.operations.get(operationId)` / `.subscribe({ operationId, signal })` | Current original proposal/outcome/finality for a retained caller operation. |
 | `client.readView({ view: 'local' \| 'final' })` | Captured immutable revision with SQL, event range and explicit release. |
-| `createChronologApplicationBackend({ id, replica, sql })` | Public `@chronolog/transport-tendriller` node/client adapter; SQL primitives and queued/provisional/final/rejected status. |
+| `createChronologApplicationBackend({ id, replica, sql })` | Public `@chronolog/transport-tendriller` node/client adapter; SQL primitives, queued/provisional/final status, and separate accepted/rejected outcome. |
 | `tendril.application.ready()` | Awaits the single installed backend selected for the page. |
 
 See [RPC contracts](../../packages/rpc/README.md),

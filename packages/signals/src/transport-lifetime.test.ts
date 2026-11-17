@@ -1,7 +1,7 @@
 import { assertCanonicalCbor, encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
-import { SignalBackpressureError, SignalChannel } from './index.js'
+import { SignalBackpressureError, SignalChannel, type SignalTransport } from './index.js'
 
 async function fixture() {
   const identity = await generateEd25519KeyPair(), receiverIdentity = await generateEd25519KeyPair()
@@ -22,7 +22,7 @@ describe('authorized ephemeral peer signals', () => {
     let congested = true, retired = 0
     const received: Uint8Array[] = []
     for (let index = 0; index < 2; index++) channel.attachRoute({
-      async send(frame) { if (congested) throw new SignalBackpressureError(); received.push(frame) },
+      async send(frame) { if (congested) return { refused: 'backpressure' }; received.push(frame) },
       close() { retired++ },
     })
     try {
@@ -36,6 +36,64 @@ describe('authorized ephemeral peer signals', () => {
       expect((await f.receiver.receive(received[0]!))?.payload).toEqual(sent.payload)
       expect(retired).toBe(0)
     } finally { channel.close(); f.sender.close(); f.receiver.close() }
+  })
+
+  it('keeps a route after an explicit refusal before dispatch without retaining a retry', async () => {
+    const f = await fixture(), delivered: Uint8Array[] = []
+    let congested = true, closed = 0
+    const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
+    channel.attachRoute({ async send(frame) {
+      if (congested) return { refused: 'backpressure' }
+      delivered.push(frame)
+    }, close() { closed++ } })
+    try {
+      await expect(channel.send('typing', 'discard this attempt')).rejects.toThrow('SIGNAL_BACKPRESSURE')
+      expect(delivered).toEqual([]); expect(closed).toBe(0)
+      congested = false
+      await channel.send('typing', 'current value')
+      expect(delivered).toHaveLength(1)
+      expect((assertCanonicalCbor(delivered[0]!) as unknown[])[10]).toBe('"current value"')
+      expect(closed).toBe(0)
+    } finally { channel.close(); f.sender.close(); f.receiver.close() }
+  })
+
+  it.each(['exception', 'backpressure exception', 'invalid result'] as const)('retires a route after a transport %s without treating it as a dispatch refusal', async kind => {
+    const f = await fixture()
+    let closed = 0
+    const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
+    channel.attachRoute({ send: (async () => {
+      if (kind === 'exception') throw new Error('transport failed')
+      if (kind === 'backpressure exception') throw new SignalBackpressureError()
+      return { refused: 'something else' }
+    }) as unknown as SignalTransport['send'], close() { closed++ } })
+    try {
+      const reason = kind === 'exception' ? 'transport failed'
+        : kind === 'backpressure exception' ? 'SIGNAL_BACKPRESSURE' : 'SIGNAL_TRANSPORT_RESULT_INVALID'
+      await expect(channel.send('typing', 1)).rejects.toThrow(reason)
+      expect(closed).toBe(1)
+      await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+    } finally { channel.close(); f.sender.close(); f.receiver.close() }
+  })
+
+  it('drops an attached route frame before shared receive admission without remembering it or revoking routes', async () => {
+    const f = await fixture()
+    let entered!: () => void, release!: () => void, authorizations = 0, closed = 0
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const channel = new SignalChannel({ scope: f.options.scope, identity: f.options.identity, maxPendingReceives: 1,
+      now: f.options.now, async authorize() { authorizations++; if (authorizations === 1) { entered(); await gate }; return true } })
+    const transport = { async send() {}, close() { closed++ } }
+    const first = channel.attachRoute(transport), second = channel.attachRoute(transport)
+    await f.sender.send('typing', 'held'); await f.sender.send('typing', 'later')
+    const admitted = first.receive(f.frames[0]!)
+    try {
+      await started
+      expect(await second.receive(f.frames[1]!)).toBeNull()
+      await expect(channel.receive(f.frames[1]!)).rejects.toThrow('SIGNAL_BACKPRESSURE')
+      expect(authorizations).toBe(1); expect(closed).toBe(0)
+      release(); expect((await admitted)?.payload).toBe('held')
+      expect((await second.receive(f.frames[1]!))?.payload).toBe('later')
+      expect(authorizations).toBe(2); expect(closed).toBe(0)
+    } finally { release(); await admitted.catch(() => undefined); channel.close(); f.sender.close(); f.receiver.close() }
   })
 
   it('does not refresh the TTL of a message waiting behind a backpressured send', async () => {

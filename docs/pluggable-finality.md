@@ -79,6 +79,13 @@ closures supply the same admission-completeness evidence through their verified
 feed prefixes. The execution core consumes the resulting frontier without a
 separate governance-finality shortcut.
 
+A custom peer membership resolver supplies this complete `admissionScopes()`
+history. A verified revision closure does not substitute for missing scope
+completeness. With complete scopes, closure evidence can establish progress
+without heartbeats, bounded by the authenticated floors of still-open scopes
+and requiring indexed admission prefixes. Each pending proposal's own policy
+and verified votes determine whether it can still be admitted.
+
 ## Live inclusion verifier interface and configuration
 
 `LiveInclusionFinalityProvider` is exported from `@chronolog/node-core/finality`.
@@ -174,17 +181,23 @@ does not authorize silently replacing its history.
 
 ## Membership is ledger data
 
-Membership grants/revocations (`capability`) and key rotations (`epoch-manifest`)
-are signed inline record kinds in the same ledger as application candidates.
-They are privileged control events, not ordinary application `emit` topics.
-Changing a topic name cannot grant a user membership administration rights.
+Signed governance revisions (`capability`) declare grants, revocations and the
+encryption epoch together. Genesis authorizes epoch zero; later revisions retain
+that identity or advance it by one. Removing a reader also advances the epoch
+in the same revision. Signed key distributions (`epoch-manifest`) reference the
+issuing revision and a commitment to the group, epoch and content key. Both are
+inline record kinds in the same ledger as application candidates. They are
+privileged controls, not ordinary application `emit` topics. Changing a topic
+name cannot grant membership administration rights.
 
-Control events follow their signed predecessor/revision chains, independently
-of receipt order. Their activation is a closed author-time boundary; multiple
+Governance revisions follow their signed predecessor chain, independently of
+receipt order. Their activation is a closed author-time boundary; multiple
 causally successive revisions may share a boundary. A later-arriving predecessor
 cannot retroactively move activation behind an already established boundary.
-Application authorization uses its signed timestamp and exact grant, never a
-receipt position. Old final results survive later revocation and key rotation.
+Application authorization selects both the exact writer grant and encryption
+epoch from this author-time state. Key distributions supply availability and
+never create another activation timeline. Old final results survive later
+revocation and rotation; historical rewraps cannot reactivate a retired epoch.
 
 Multiple encryptions of the same signed proposal resolve in the first closure
 that can decide that proposal. A valid envelope takes precedence over obsolete
@@ -193,13 +206,20 @@ tie. Subsequent inclusion cannot replace an earlier final result. This rule is
 the same for incremental delivery and a fresh replica replaying all proofs.
 
 Thin administrators can obtain and verify these controls without application
-bodies. Epoch issuance must be included with its dependencies in the candidate's
-first covered inclusion checkpoint; later issuance cannot revive an already
-excluded descriptor. A known issued key that this reader has not received is
-unavailable input, not an invented application rejection. Initial epoch zero
-bootstraps genesis-authorized history; later rotations apply after their closed
-boundary. Application replay waits for required bodies and keys independently
-of control discovery.
+bodies. A future-author-time proposal may be included before a later governance
+transition, so first receipt does not decide its epoch eligibility. Before
+decryption, exclusion requires a verified closed time window covering every
+permitted author timestamp and proving that the named epoch could authorize
+none of them. The window includes the lower admission bound and the bounded
+future-clock allowance; an intermediate epoch with no author-time interval
+cannot authorize a proposal. After decryption, the exact signed timestamp
+selects the effective governance state.
+
+A key that can authorize that window but has not reached this reader is
+unavailable input, not an application rejection. Key distributions may arrive
+before their issuing revision and remain retriable; received future keys do not
+change the active authoring key. Application replay waits for required bodies
+and keys independently of control discovery.
 
 ## Regression evidence
 
@@ -214,7 +234,7 @@ of control discovery.
   verification on retained-prefix extension and retry after failed persistence.
 - `packages/node-core/src/governance-activation.test.ts` and
   `canonical-epoch.integration.test.ts`: causal membership activation, cutoff
-  authorization and immutable epoch dependency eligibility.
+  authorization, atomic epoch transitions, and exact eligible-time windows.
 - Native authority, membership HTTP and public Tendriller adapter tests cover
   durable publication, idle progress, conditional append and restart.
 

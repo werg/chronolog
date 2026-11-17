@@ -1,4 +1,4 @@
-import type { EventBatch, EventPayload, EventReadOptions, ViewChange } from '@chronolog/protocol'
+import type { EventBatch, EventPayload, EventReadOptions } from '@chronolog/protocol'
 import type { SignalPayload } from '@chronolog/signals'
 import type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
 export type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
@@ -93,8 +93,8 @@ export interface GetOperationRequest { readonly groupId: GroupId; readonly reque
 export interface StreamOperationsRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly operationId: string }
 
 export interface OpenReadViewRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly view?: SqlView }
-export interface ViewChangesRequest { readonly groupId: GroupId; readonly requestId: RequestId; readonly view?: SqlView }
-export type ViewChangesResponse = ViewChange
+export interface ViewChangesRequest { readonly groupId: GroupId; readonly view?: SqlView }
+export type { ViewChange } from '@chronolog/protocol'
 export interface OpenReadViewResponse {
   readonly viewId: string
   readonly revision: string

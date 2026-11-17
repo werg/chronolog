@@ -173,8 +173,9 @@ the transaction later fails a row-write check, a trigger or compare-and-swap.
 SQL rollback and deterministic replay cannot withdraw those bytes.
 
 For that reason `put()` checks the policy update's settlement evidence before
-encrypting. Its default requires an accepted outcome,
-`confidence === 'policy_watermark_reached'` and no unresolved references.
+encrypting. Its default requires an accepted outcome with `final === true` and
+no unresolved references. This condition uses the selected finality provider;
+it does not require peer-validator watermark metadata for a coordinated group.
 Otherwise it throws `SealedPolicyNotFinalError` without encrypting or submitting
 the value. Tests or development tools can explicitly pass
 `allowProvisionalPolicy: true`; that permits irreversible disclosure under a

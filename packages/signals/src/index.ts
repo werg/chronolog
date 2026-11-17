@@ -46,14 +46,21 @@ export interface SignalAuthorization {
   readonly topic: string
   readonly credential: Uint8Array | null
 }
+/** A refusal guarantees that this attempt queued and dispatched no frame. */
+export interface SignalDispatchRefusal { readonly refused: 'backpressure' }
+export type SignalDispatchResult = void | SignalDispatchRefusal
 export interface SignalTransport {
-  /** Must honor cancellation and bound its queues. A healthy pre-dispatch refusal uses SignalBackpressureError. */
-  send(frame: Uint8Array, options: { readonly signal: AbortSignal }): Promise<void>
+  /** Honor cancellation; return a refusal only before queueing or dispatching. */
+  send(frame: Uint8Array, options: { readonly signal: AbortSignal }): Promise<SignalDispatchResult>
   /** Retire an underlying connection that cannot complete a dispatched write. */
   close?(): void | Promise<void>
 }
 export interface SignalRoute {
-  /** Verify once, deliver locally and relay unchanged to the other live routes. */
+  /**
+   * Verify once, deliver locally and relay unchanged to the other live routes.
+   * Returns null for duplicate/expired frames or a drop before admission when
+   * shared receive capacity is full. Capacity drops do not verify or remember.
+   */
   receive(frame: Uint8Array): Promise<EphemeralSignal | null>
   close(): void
 }
@@ -215,8 +222,11 @@ export class SignalChannel implements Signals {
     try {
       this.#assertOpen()
       if (!(input instanceof Uint8Array) || input.byteLength > MAX_SIGNAL_BYTES) throw new SignalError('SIGNAL_FRAME_TOO_LARGE')
-      if (this.#pendingReceives >= this.#maxReceives) throw new SignalError('SIGNAL_BACKPRESSURE')
       if (route?.lifetime.signal.aborted === true) throw new SignalError('SIGNAL_ROUTE_CLOSED')
+      if (this.#pendingReceives >= this.#maxReceives) {
+        if (route !== undefined) return Promise.resolve(null)
+        throw new SignalError('SIGNAL_BACKPRESSURE')
+      }
       const frame = input.slice()
       this.#pendingReceives += 1
       const expiry = new AbortController()
@@ -284,14 +294,20 @@ export class SignalChannel implements Signals {
         await this.#authorize(verified.authorization, lifetime)
         this.#assertFresh(verified.value)
         handedOff = true
-        await route.send(verified.frame.slice(), { signal: lifetime })
+        const result = await route.send(verified.frame.slice(), { signal: lifetime })
+        if (result !== undefined) {
+          if (typeof result === 'object' && result !== null && result.refused === 'backpressure') {
+            handedOff = false
+            throw new SignalBackpressureError()
+          }
+          throw new SignalError('SIGNAL_TRANSPORT_RESULT_INVALID')
+        }
       })().finally(() => { settled = true; route.busy = false })
       return interrupted(operation, lifetime).catch(async (error: unknown) => {
         // Give cooperative cancellation its microtask turn. A route whose write
         // remains outstanding cannot admit another write or survive indefinitely.
         if (handedOff && lifetime.aborted && !settled) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
-        const refused = error instanceof SignalBackpressureError && settled && !route.lifetime.signal.aborted
-        if (handedOff && !refused && (!lifetime.aborted || !settled)) this.#detach(route, true)
+        if (handedOff && (!lifetime.aborted || !settled)) this.#detach(route, true)
         throw error
       }).finally(() => { clearTimeout(timer) })
     })

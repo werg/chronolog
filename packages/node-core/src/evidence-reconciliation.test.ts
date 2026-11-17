@@ -20,7 +20,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 const bytes = (value: number) => new Uint8Array(32).fill(value)
 const groupId = bytes(71), membershipRevision = bytes(72), validationPolicy = bytes(73)
 const emptyCounts = () => ({ materialize: 0, changed: 0, publish: 0, reconcile: 0, publishFinal: 0, proofs: 0, writes: 0 })
-type FixtureMode = 'available' | 'missing-body' | 'missing-key' | 'failed-reconcile' | 'failed-retention'
+type FixtureMode = 'available' | 'missing-body' | 'missing-key' | 'failed-reconcile' | 'failed-retention' | 'failed-final-publication'
 
 async function fixture(mode: FixtureMode) {
   const identity = await generateEd25519KeyPair(), finalityIdentity = await generateEd25519KeyPair()
@@ -38,7 +38,10 @@ async function fixture(mode: FixtureMode) {
         if (result !== null) counts.changed++
         return result
       },
-      async publishFinal(length) { counts.publishFinal++; await underlying.coordinator.publishFinal!(length) },
+      async publishFinal(length) {
+        counts.publishFinal++; await underlying.coordinator.publishFinal!(length)
+        if (unavailable && mode === 'failed-final-publication' && length > 0) throw new Error('FINAL_PUBLICATION_REPLY_LOST')
+      },
     },
     publications: {
       async publish(input) { counts.publish++; return underlying.publications.publish(input) },
@@ -103,6 +106,45 @@ async function fixture(mode: FixtureMode) {
 }
 
 describe('application reconciliation after finality evidence', () => {
+  it.each(['failed-reconcile', 'failed-final-publication'] as const)('keeps authoritative published snapshots observable after %s', async mode => {
+    const f = await fixture(mode)
+    const local = f.node.changes({ view: 'local' })[Symbol.asyncIterator](), final = f.node.changes()[Symbol.asyncIterator]()
+    await local.next()
+    const initialFinal = (await final.next()).value!
+    const localPending = local.next(), finalPending = final.next()
+    // Verified retained evidence is accepted even when an application reply
+    // fails. waitForIdle remains the explicit application recovery barrier.
+    await f.node.ingestFinalityEvidence(f.proof)
+    await expect(f.node.waitForIdle()).rejects.toThrow(
+      mode === 'failed-reconcile' ? 'RECONCILIATION_FAILED' : 'FINAL_PUBLICATION_REPLY_LOST')
+    const publishedLocal = await f.node.readView({ view: 'local' }), publishedFinal = await f.node.readView()
+    const localChange = (await localPending).value!
+    try {
+      expect(localChange).toEqual({ view: 'local', revision: publishedLocal.revision, finalRevision: publishedFinal.revision })
+      expect(publishedLocal.readEvents().transactions).toHaveLength(1)
+      expect((await f.node.events.read()).transactions).toEqual(publishedFinal.readEvents().transactions)
+      if (mode === 'failed-final-publication') {
+        // The actual final publication succeeded before its acknowledgement
+        // was lost. Its immutable snapshot remains the source of truth.
+        expect(publishedFinal.readEvents().transactions).toHaveLength(1)
+        expect(f.node.isFinal(f.txId)).toBe(true)
+      } else {
+        expect(publishedFinal.revision).toBe(initialFinal.revision)
+        expect(publishedFinal.readEvents().transactions).toEqual([])
+        expect(f.node.isFinal(f.txId)).toBe(false)
+      }
+    } finally {
+      publishedLocal.release(); publishedFinal.release()
+    }
+    f.restore(); await f.node.waitForIdle()
+    const localView = await f.node.readView({ view: 'local' }), finalView = await f.node.readView()
+    expect(localView.revision).toBe(localChange.revision)
+    expect((await finalPending).value).toEqual({ view: 'final', revision: finalView.revision, finalRevision: finalView.revision })
+    expect(localView.readEvents().transactions).toHaveLength(1)
+    expect(finalView.readEvents().transactions).toHaveLength(1)
+    localView.release(); finalView.release(); await local.return?.(); await final.return?.()
+  })
+
   it('verifies repeated retained proofs without redoing an applied materialization', async () => {
     const f = await fixture('available')
     await f.node.ingestFinalityEvidence(f.proof)

@@ -372,17 +372,119 @@ describe('native signed-inclusion finality service', () => {
     await Promise.all(['one', 'two', 'three'].map((text) => authority.append(envelope(text))))
     const captured: Uint8Array[] = []
     const sink = { putEvidence: async (bytes: Uint8Array) => { captured.push(bytes) } }
-    const first = await authority.share(sink, { limit: 1 })
+    const first = await authority.certifiedRead({ limit: 1 })
+    for (const entry of first.entries) await sink.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
+    await sink.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: first.certificate }))
     const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
     for (const bytes of captured.splice(0)) await peer.ingest(decodeOrderingEvidence(bytes))
     expect(peer.progress.finalThrough).toBe(0)
-    await authority.share(sink, { after: first.position, limit: 3 })
+    await authority.share(sink, { after: first.entries.at(-1)!.position })
     for (const bytes of captured.reverse()) await peer.ingest(decodeOrderingEvidence(bytes))
     expect(peer.progress.finalThrough).toBe(4)
     expect(peer.snapshot().closedThroughMs).toBe(1_000n)
     const third = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
     for (const evidence of [...peer.evidence()].reverse()) await third.ingest(evidence)
     expect(third.progress).toEqual(peer.progress)
+  })
+
+  it('shares every page of a captured prefix and leaves concurrent appends for the next call', async () => {
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
+    await Promise.all(Array.from({ length: 65 }, (_, index) => authority.append(envelope(`proposal-${index}`))))
+    const captured: Uint8Array[] = []
+    let added = false, laterPosition = 0
+    const shared = await authority.share({ putEvidence: async bytes => {
+      captured.push(bytes.slice())
+      const evidence = decodeOrderingEvidence(bytes)
+      if (!added && evidence.kind === 'ordered-entry' && evidence.entry.position === 64) {
+        added = true
+        laterPosition = (await authority.append(envelope('after-captured-prefix'))).position
+      }
+    } })
+    expect(laterPosition).toBe(67)
+    expect(shared.position).toBe(66)
+    const evidence = captured.map(decodeOrderingEvidence)
+    expect(evidence.flatMap(item => item.kind === 'ordered-entry' ? [item.entry.position] : []))
+      .toEqual(Array.from({ length: 66 }, (_, index) => index + 1))
+    expect(evidence.at(-1)).toMatchObject({ kind: 'prefix-certificate', certificate: shared })
+    expect((await authority.head()).position).toBe(67)
+    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    await peer.ingestBatch(evidence)
+    expect(peer.progress.finalThrough).toBe(66)
+
+    const resumed: Uint8Array[] = []
+    const next = await authority.share({ putEvidence: async bytes => { resumed.push(bytes.slice()) } }, { after: shared.position })
+    expect(next.position).toBe(68)
+    expect(resumed.map(decodeOrderingEvidence).flatMap(item => item.kind === 'ordered-entry' ? [item.entry.position] : []))
+      .toEqual([67, 68])
+    await peer.ingestBatch(resumed.map(decodeOrderingEvidence))
+    expect(peer.progress.finalThrough).toBe(68)
+  })
+
+  it.each(['entry', 'certificate'] as const)('propagates a lost %s sink acknowledgment and retries exact evidence', async (boundary) => {
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
+    await Promise.all(['one', 'two', 'three'].map(text => authority.append(envelope(text))))
+    const peer = await CoordinatedHistoryPolicy.open(f.configuration, new MemoryOperationStore())
+    const captured: Uint8Array[] = [], lost = new Error('sink acknowledgment lost')
+    let fail = true
+    const sink = { putEvidence: async (bytes: Uint8Array) => {
+      captured.push(bytes.slice())
+      const evidence = decodeOrderingEvidence(bytes)
+      await peer.ingest(evidence)
+      if (fail && (boundary === 'entry' ? evidence.kind === 'ordered-entry' && evidence.entry.position === 2
+        : evidence.kind === 'prefix-certificate')) {
+        fail = false
+        throw lost
+      }
+    } }
+    await expect(authority.share(sink)).rejects.toBe(lost)
+    const firstAttempt = captured.splice(0), beforeRetry = await authority.head()
+    expect(await authority.share(sink)).toEqual(beforeRetry)
+    expect(captured.slice(0, firstAttempt.length)).toEqual(firstAttempt)
+    expect(peer.progress.finalThrough).toBe(4)
+    expect((await authority.head()).position).toBe(4)
+  })
+
+  it('validates a share cursor before closing time and accepts an already shared head', async () => {
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
+    await authority.append(envelope('one'))
+    const before = structuredClone(f.values), captured: Uint8Array[] = []
+    const sink = { putEvidence: async (bytes: Uint8Array) => { captured.push(bytes.slice()) } }
+    for (const after of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(authority.share(sink, { after })).rejects.toThrow('AUTHORITY_RANGE_INVALID')
+    }
+    await expect(authority.share(sink, { after: 2 })).rejects.toThrow('AUTHORITY_RANGE_AHEAD')
+    expect(f.values).toEqual(before)
+    expect(captured).toHaveLength(0)
+    const shared = await authority.share(sink)
+    captured.length = 0
+    expect(await authority.share(sink, { after: shared.position })).toEqual(shared)
+    expect(captured.map(decodeOrderingEvidence)).toEqual([
+      expect.objectContaining({ kind: 'prefix-certificate', certificate: expect.objectContaining(shared) }),
+    ])
+  })
+
+  it('cancels sharing between acknowledged writes without publishing a partial certificate', async () => {
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
+    await authority.append(envelope('one'))
+    const stopped = new AbortController(), reason = new Error('sharing stopped'), captured: Uint8Array[] = []
+    const before = structuredClone(f.values)
+    stopped.abort(reason)
+    await expect(authority.share({ putEvidence: async bytes => { captured.push(bytes.slice()) } }, { signal: stopped.signal }))
+      .rejects.toBe(reason)
+    expect(f.values).toEqual(before)
+    expect(captured).toHaveLength(0)
+    const during = new AbortController()
+    await expect(authority.share({ putEvidence: async bytes => {
+      captured.push(bytes.slice())
+      during.abort(reason)
+    } }, { signal: during.signal })).rejects.toBe(reason)
+    expect(captured.map(decodeOrderingEvidence)).toEqual([
+      expect.objectContaining({ kind: 'ordered-entry', entry: expect.objectContaining({ position: 1 }) }),
+    ])
+    const retried: Uint8Array[] = []
+    expect((await authority.share({ putEvidence: async bytes => { retried.push(bytes.slice()) } })).position).toBe(2)
+    expect(retried[0]).toEqual(captured[0])
+    expect(decodeOrderingEvidence(retried.at(-1)!)).toMatchObject({ kind: 'prefix-certificate', certificate: { position: 2 } })
   })
 
   it('recovers a durable closure after certificate publication fails and the provider clock moves backward', async () => {

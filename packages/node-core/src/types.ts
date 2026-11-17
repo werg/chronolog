@@ -140,7 +140,7 @@ export interface ClosedAdmissionRevision {
 }
 
 export interface ChronologNodeOptions {
-  /** Live preview bounds apply to every replica, including non-validating readers. */
+  /** Shared live preview and automatic author-clock bounds, including non-validating readers. */
   readonly live?: { readonly maxFutureSkewMs?: number }
   /** Envelope authorization at signed author time, independent of its proof mechanism. */
   readonly encryptionEpochStatusAt?: (authorTimestampMs: bigint, epochId: Uint8Array | null) => 'active' | 'closed' | 'unissued' | 'pending'

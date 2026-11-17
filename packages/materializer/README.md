@@ -32,9 +32,15 @@ ordered proposals, local revision and immutable final prefix in one bounded
 atomic storage value. Duplicate operations have deterministic outcomes; a SQL
 step receives `profile:sql-disabled` rather than loading an engine.
 
-The admitted set only grows. A newly admitted earlier proposal can change the
-provisional suffix, but existing proposal identities and relative order cannot
-disappear or change. Finalized identities and their event IDs are immutable.
+The coordinator supplies a chronological selection of already verified proposals.
+A newly eligible earlier proposal can change the provisional suffix; a proposal
+that loses eligibility can leave that suffix and later reenter with its original
+identity. Removing a provisional outcome emits a change with `current: null`.
+The final prefix, its complete proposal identities and its event IDs are immutable.
+The direct materializer port trusts its caller to supply immutable proposal IDs;
+the shipped node derives each ID from the canonical proposal hash. It does not
+maintain a second historical identity registry for proposals outside its current
+selection.
 Inputs are copied before waiting for queued work, and returned outcomes cannot
 mutate the runtime's retained state.
 

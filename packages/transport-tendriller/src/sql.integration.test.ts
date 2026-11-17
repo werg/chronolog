@@ -9,6 +9,7 @@ import {
 } from '@chronolog/materializer-doltlite'
 import { ChronologNode, Mutex, membershipDescriptor, provisionMembership } from '@chronolog/node-core'
 import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
+import { createLedgerRecord } from '@chronolog/node-core/ledger'
 import {
   CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog,
 } from '@chronolog/node-core/history'
@@ -132,7 +133,7 @@ describe('Tendriller coordinated SQL connection', () => {
     }
     const alice = await open('alice', aliceKey, true), bob = await open('bob', bobKey, true)
     // The host retains small descriptors; application envelopes travel between peers.
-    connectInProcess(alice.local, bob.local)
+    const disconnect = connectInProcess(alice.local, bob.local)
     const participants = [alice, bob]
     const sync = async () => {
       authority.clock.now += 100
@@ -165,10 +166,22 @@ describe('Tendriller coordinated SQL connection', () => {
       "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",
       { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = 1', params: [name] },
     ]
-    // Alice reaches the receipt log first. Bob's signed author time is earlier,
-    // so every replica must execute Bob's claim first after the shared closure.
+    // Author concurrently from the same final setup. If Bob applied Alice's
+    // claim first, the causal author clock would correctly put his claim later.
+    await bob.local.catchUp()
+    await bob.node.waitForIdle()
+    expect(await bob.client.getTransactionOutcome(inserted.transactionId)).toMatchObject({ final: true })
+    disconnect()
+    // Alice reaches the receipt log first. Bob's independently signed author
+    // time is earlier, so every replica must execute his claim first.
     const aliceClaim = await alice.client.transaction(claim('alice'))
     const bobClaim = await bob.client.transaction(claim('bob'))
+    expect(BigInt(bobClaim.submission.authorTimestampMs)).toBeLessThan(BigInt(aliceClaim.submission.authorTimestampMs))
+    const claimReceipts = await Promise.all(participants.map(async peer => {
+      const ownRecords = (await peer.local.history()).filter(record => record.author === peer.local.identity)
+      return (await createLedgerRecord(ownRecords.at(-1)!.payload)).recordBytes
+    }))
+    connectInProcess(alice.local, bob.local)
     // Both have local results, but a stored append does not make either final.
     expect((await aliceClaim.local()).final).toBe(false)
     expect((await bobClaim.local()).final).toBe(false)
@@ -180,6 +193,7 @@ describe('Tendriller coordinated SQL connection', () => {
     const finalRows = (node: ChronologNode) => node.localSql('SELECT id, claimed_by FROM tasks', [], { view: 'final' })
     const expectedRows = [[{ kind: 'integer', value: '1' }, { kind: 'text', value: 'bob' }]]
     const proof = await evaluateFinalitySnapshot(authority.configuration, await authority.log.read())
+    expect(proof.records.slice(-2).map(({ entry }) => entry.bytes)).toEqual(claimReceipts)
     for (const peer of participants) {
       expect(finalRows(peer.node).rows).toEqual(expectedRows)
       expect(peer.node.finalOrderLength).toBe(6)

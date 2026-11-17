@@ -96,10 +96,20 @@ reopen, and skips full-history validation on quiet timer ticks once it is reache
 An empty log needs no closure marker. New receipts restart the bounded tail.
 
 Closure markers consume the same explicit retained-history quota as other
-records. `certifiedRead()` captures the post-closure range and certificate under
-one append lock, and `share()` forwards the selected entries and their covering
-certificate. A receiver waits for every retained entry needed to verify the
-complete prefix, including its closure markers.
+records. `certifiedRead({ after, limit })` is the lower-level paged read: its
+certificate can cover more entries than that page contains. A receiver waits
+for every retained entry needed to verify the complete prefix, including its
+closure markers.
+
+`await finality.share(sink)` captures one certified head and publishes all of
+its entries in bounded pages, followed by that certificate. It returns the
+completed `{ historyId, position, root }`; concurrent appends belong to a later
+call. `share(sink, { after: head.position })` resumes after a position already
+acknowledged by that sink. There is no page limit on this complete operation.
+Sink failures reject the call; retrying retained evidence is idempotent and
+never authors another application proposal. Optional `signal` cancellation is
+checked between acknowledged sink writes and does not roll back accepted data.
+The resident `serve()` loop uses the same complete-prefix publication path.
 
 Before storing a detached body, the service durably reserves its exact hash and
 length against `payloadQuotaBytes`. Exact retries reuse that reservation, including
@@ -395,6 +405,17 @@ Normal disconnect, revocation and bad peer data retire that session;
 `session.completion` and `onError` report it without stopping unrelated peers or
 authority work. Resident task failures and storage failures remain service-fatal.
 
+`FeedLink.head(feed)` and `evidenceHead()` report retained availability as
+nonnegative integer positions. They do not certify ordering or finality.
+`catchUp()` / `catchUpLinks()` capture the currently connected links and requested
+feeds, then each queued pass captures all their heads before copying any ranges.
+The pass completes after durably storing those finite prefixes. Continuous
+publication and idle finality closures cannot keep moving its target; later
+change hints or another explicit catch-up collect later records. A peer that
+advertises a prefix but cannot supply it fails that pass. If its connection is
+closed or replaced, that pass reports cancellation even when a replacement is
+healthy. Application materialization and final-target checks remain separate.
+
 `readPayload(hash)` requests one detached application envelope by its SHA-256
 address. Header/evidence synchronization does not request these bodies. The
 provider and receiver both check the address and the 1 MiB envelope bound, and
@@ -421,12 +442,14 @@ explicit `disconnect(identity)` / `disconnectLink(identity)` methods deliberatel
 remove whichever connection currently owns that identity.
 
 Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
-use `chronolog/signal/v1`. The reliable lane multiplexes bounded range responses,
-content-addressed payload responses and change hints. Best-effort signals use
+use `chronolog/signal/v1`. The reliable lane multiplexes scalar availability-head
+responses, bounded range responses, content-addressed payload responses and change hints. Best-effort signals use
 the separately bounded `connection.live` lane after the same peer authentication;
 a reliable-only connection provides replication without advertising a signal route.
 Signals cannot hold up retained range handling. At most eight signal callbacks run per
-connection; exceeding this bound fails the session before application acceptance. There are at most four pending requests in either direction and each
+connection; excess live frames are dropped before admission while durable
+replication continues. An admitted frame that fails authentication or protocol
+validation still terminates its session. There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement
 before making direct-connect, relay-bandwidth, or cost claims.
@@ -443,7 +466,7 @@ before making direct-connect, relay-bandwidth, or cost claims.
 Values are positive integer milliseconds. Authentication permits at most
 60 seconds; each other option permits at most 120 seconds. The dispatch and
 idle defaults allow the RTC adapter's ordinary 30-second frame-send budget.
-These limits apply to feed ranges, evidence ranges and detached payload reads.
+These limits apply to availability heads, feed ranges, evidence ranges and detached payload reads.
 
 Validated record progress restarts only that request's idle deadline. Change
 hints, ephemeral signals and another request's responses do not extend it, and
@@ -459,7 +482,8 @@ resumes from retained verified history with the original operation identities.
 Native application modules use `context.signals.send(topic, payload, { ttlMs })`
 and `context.signals.subscribe({ topics, mode, signal })`. The public
 `ChronologClient.signals` uses the same interface through native or Worker RPC.
-`context.connectPeer()` automatically attaches signal routes and the resident
+`context.connectPeer()` automatically attaches signal routes when the framed
+connection supplies its separate `live` lane, and the resident
 forwards verified original frames to its other current readers. Application code
 no longer constructs a separate channel or hand-wires forwarding. Connection
 completion and shutdown detach the exact route that owns the session.
@@ -469,7 +493,7 @@ The default `mode: 'all'` preserves accepted messages in a bounded FIFO and rais
 `mode: 'latest'` for replaceable presence/cursor values per author, session and
 topic. Messages expire, have no catch-up history, and never advance a durable
 cursor or trigger a finality wait. TTL begins at the original `send()` call,
-including queued work. No route means immediate `SIGNAL_DISCONNECTED`; the client
+including queued work. No route means immediate `SIGNAL_ROUTE_UNAVAILABLE`; the client
 never retries sends or reconnects subscriptions behind the application's back.
 
 The group adapter checks independent current `program.signals` rights; a

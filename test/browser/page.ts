@@ -43,6 +43,7 @@ class TestPeer {
   async submit(steps: string[], operationId: string): Promise<string> {
     const handle = await this.client.transaction(steps, { idempotencyKey: operationId })
     try {
+      // These crash/replay fixtures inspect local SQL before closing finality.
       const result = await handle.local()
       if (result.outcome.type === 'rejected') throw new TransactionRejectedError(handle.transactionId, result.outcome.rejection)
       return handle.transactionId

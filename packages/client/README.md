@@ -80,29 +80,9 @@ cancels its live sends and streams. Durable application events use
 For standalone use without any Chronolog database, use
 [`SignalChannel`](../signals/README.md) with your own transport and authorization.
 
-## Observe application views and authenticated events
+## Consume authenticated durable events
 
-`client.changes({ view, signal })` yields a current `{ view, revision,
-finalRevision }` snapshot and coalesces later invalidations. It defaults to
-`final`. SQL-only writes, a provisional rebase, and finality advancing without
-changed rows can all invalidate the selected view. `readView()` captures SQL,
-effective events and revision metadata from one locally applied application
-prefix. Capture them together and release the read lease after rendering:
-
-```ts
-for await (const change of client.changes({ view: 'local', signal: pageLifetime.signal })) {
-  const view = await client.readView({ view: change.view })
-  try {
-    render(await view.query('SELECT id, title FROM tasks ORDER BY id'), await view.readEvents())
-  } finally { await view.release() }
-}
-```
-
-Invalidations have no replay cursor and may skip intermediate views. A
-reconnection reads current state. The subscription holds no SQL read lease and
-does not poll the Tendriller page host. The captured view stays coherent while
-new proof or replay advances the replica; its identity may already be newer than
-the invalidation that prompted it. Use `client.events.subscribe()` for durable
+Use `client.events.subscribe()` for durable
 processing: it delivers whole final event batches and advances received progress
 only on the next pull. Persist the processed cursor together with derived state.
 
@@ -110,7 +90,8 @@ Each effective event includes authenticated `origin`, derived from its signed
 proposal rather than its payload. `origin.authorId` is the same lowercase hex
 public key used by signals. Chronolog also exposes `groupId`, `operationId`,
 `authorTimestampMs` as a decimal string, `membershipRevision` and the exact
-`writerCapability` (null only for static membership). These facts survive
+`writerCapability` (null only for static membership). Group, membership and
+capability identities use canonical base64url strings. These facts survive
 HTTP/Worker serialization and replica restart. They describe the original
 author's signed intent; they do not replace the handler's application-specific
 authorization for an external action. Payload fields claiming a role or author
@@ -164,7 +145,9 @@ cancelled even while the stream is quiet; cancellation stops that waiter, not
 the transaction. A final result may wait indefinitely while required validators,
 certificates, records or keys are unavailable.
 
-Execution and finality are independent fields, without a second phase enum.
+The return types exclude pending results; `final()` additionally guarantees
+`final: true`. Execution and finality are independent fields, without a second
+phase enum.
 `outcome.type === 'pending'` means no executed result is available; an accepted
 or rejected result with `final: false` is provisional. `final: true` identifies
 the immutable executed result. `admissible` separately reports inclusion under
@@ -191,9 +174,12 @@ console.log(final.revision.view)             // 'final'
 console.log(final.revision.finalOrderLength) // decimal string
 ```
 
-The default `local` reader includes authorized proposals with the inputs needed
-for execution, even before an inclusion receipt or validator quorum. The `final`
-reader is a separate SQL snapshot of the locally applied immutable prefix.
+The default `local` reader includes the applied final prefix and a selected
+provisional suffix. A locally authorized proposal can appear before consensus
+admission and disappear if excluded. Admission makes its inclusion immutable,
+but its provisional application outcome can still change through replay.
+The `final` reader is a separate SQL snapshot of the locally applied immutable
+prefix.
 Both carry view, selected revision, order length, final-prefix metadata and
 execution-manifest identity. A final replica can still be behind other peers.
 
@@ -202,6 +188,50 @@ lazy `StreamResource`. Subscribe for snapshot updates or iterate it; dispose
 the resource when no longer needed. Final live queries advance only when that
 replica applies a larger final prefix. React's `useChronologQuery` accepts the
 same `view` option and includes it in the resource identity.
+
+## Observe and capture an application view
+
+`client.changes({ view, signal })` yields the current applied view identity,
+then coalesced invalidations. It defaults to `final`; choose `local` explicitly
+when the display can replace speculative state after replay.
+
+```ts
+for await (const change of client.changes({
+  view: 'local', signal: pageLifetime.signal,
+})) {
+  const view = await client.readView({ view: change.view })
+  try {
+    const rows = await view.query('SELECT id, title FROM tasks ORDER BY id')
+    renderTasks(rows, { revision: view.revision, finalRevision: view.finalRevision })
+    // Any readEvents() calls on this handle use the same captured snapshot.
+  } finally {
+    await view.release()
+  }
+}
+```
+
+`readView()` captures SQL, effective events and revision metadata from one
+locally applied application prefix. The notification is
+`{ view, revision, finalRevision }`. Both tokens are opaque
+and match the captured-read API; compare them for equality, without parsing
+them or treating them as global progress. A read captured after notification
+may already be newer, so render using that handle's own tokens. A captured view
+does not change while it is held, including across a local rebase.
+
+Only successful application publication changes these identities. SQL-only
+transactions and replayed outcomes can invalidate a local view without emitting
+an event. Status, admission and transport progress do not. A final subscription
+stays quiet during speculative changes; a local notification can carry a new
+`finalRevision` with the same local `revision` after finality advances.
+
+The subscription itself acquires no SQL/read lease, does not poll the page host,
+and works for event-only replicas. It keeps only the latest pending invalidation
+for a slow consumer.
+Reconnect starts from current state, without a replay cursor or a promise to
+deliver intermediate revisions. Iterator return/throw, caller abort and client
+close release both idle and paused subscriptions. Use `client.events.subscribe`
+with a durable processed checkpoint when every effective final event matters;
+use `client.signals.subscribe` for expiring live messages.
 
 ## Enroll a reader or writer
 

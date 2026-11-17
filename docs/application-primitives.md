@@ -18,6 +18,7 @@ own inclusion and merge rules and is not implemented by the live API.
 | A change that must preserve an invariant, or a state change and event that must agree | `submit(program(...), { operationId })` | One atomic SQL/event program, with a durable accepted or rejected outcome. |
 | Payment, email, a provider call or another irreversible action | A final intent event and one designated effect worker | Durable dispatch state plus an explicit provider idempotency, reconciliation or manual recovery contract. |
 | A local display/cache derived from durable events | A checkpointed projection | Rebuildable state and processed progress committed together. |
+| Refresh a screen after applied SQL, events, replay or finality changes | `changes({ view })` followed by `readView({ view })` | The current applied view identity, then coalesced invalidations; each captured read remains coherent until released. |
 
 Ephemeral does not mean restricted to presence. Choose signals whenever losing
 an individual message, missing messages while disconnected, and receiving a
@@ -93,6 +94,21 @@ wait for authorization, acceptable clock bounds or required inputs. Wait
 cancellation stops the caller's wait and leaves a prepared durable operation
 intact.
 
+Author dependent work after observing its prerequisite's final accepted result,
+and keep the required business guards in the new program. Automatic timestamps
+advance past the replica's successfully applied history and verified closed-time
+frontier, even when its wall clock trails another writer. Reopening reconstructs
+that floor from retained proofs and application history. Merely receiving an
+unadmitted proposal does not advance it, and it creates no dependency on unseen
+work. Applications should preserve an original observation time as domain data
+instead of calculating ordering timestamps.
+
+Governed authoring uses the maximum future skew in signed genesis. If advancing
+the automatic clock would exceed that bound, new authoring fails with
+`AUTHOR_CLOCK_AHEAD`; it does not change the requested operation or its guards.
+Correct the clock before trying new intent again. Retrying an already prepared
+operation preserves its original timestamp and bytes.
+
 Signed genesis selects the trust policy. The built-in validator policy needs
 the specified validators' admission and closed-time evidence. The built-in
 signed-inclusion policy needs one pinned finality signer and its continuous
@@ -101,6 +117,13 @@ trades finality availability for a simpler single-service trust model. A signer
 can withhold inclusion; contradictory authentic promises are continuity errors,
 not a reason to silently select another history. There is no automatic signer,
 validator-set or provider replacement.
+
+Peer catch-up has a finite boundary: it captures retained feed and evidence
+heads and copies through those positions. Publication may continue while that
+copy finishes. Later hints or another catch-up collect the new tail. Catch-up
+does not promise that every application input is available or that a final
+target has been applied; those remain explicit materialization and finality
+checks. Availability heads carry no extra authority.
 
 ## Replay, retries, redo and undo
 
@@ -113,13 +136,19 @@ These operations have different meanings:
 | Redo a business action after a final rejection | Make a deliberate new proposal with a new operation ID and current assumptions. The old rejection remains final. |
 | Undo a final change | Submit a new compensating transaction. Final history is not erased or rolled back. |
 
+A locally authorized proposal may be selected for preview before consensus
+admission. That unadmitted preview can be removed when the proposal is excluded
+or loses authorization. Admission is a separate immutable inclusion decision:
+an admitted proposal cannot be removed or replaced, but its application result
+can remain provisional.
+
 A late proposal may change a provisional SQL outcome from accepted to rejected,
 or rejected to accepted. The materializer returns to a checkpoint before the
 affected suffix, re-executes pure programs and atomically publishes the new
-view. Events from rejected programs are suppressed. Already admitted identities
-cannot be removed or replaced, and an established final prefix cannot change.
-The SQL-free event materializer enforces those same identity and growing-history
-constraints.
+view. Events from rejected programs are suppressed. An established final prefix
+cannot change. The SQL-free event materializer preserves original proposal
+bytes and that final-prefix boundary while allowing unadmitted previews to leave
+the selected suffix.
 
 An uncertain storage acknowledgment requires reopening the event runtime before
 more replay or finality publication. A write may already have committed; it is
@@ -134,21 +163,50 @@ revision metadata agree even if new proof or replay arrives during rendering.
 Release the read lease after rendering. Durable projections and effect workers
 consume the final event stream using stable event IDs and processed checkpoints.
 
-`changes({ view: 'final' | 'local', signal })` yields the current view identity
-and then coalesces invalidations, including SQL-only changes and finality-only
-advances. It defaults to `final`, like `readView()`. Its `{ revision,
-finalRevision }` tokens tell the UI to capture a new view; they are not durable
-event cursors. Reconnecting observes current state. A slow reader may skip
-intermediate invalidations, while durable event readers retain whole-batch
-delivery and explicit processed cursors. The invalidation subscription holds no
-SQL read lease and does not poll the page host; capture a view only when needed.
-
 A backdated proposal first included after its timestamp is closed receives
 `FINALITY_TIMESTAMP_CLOSED`. Re-signing it silently under a new timestamp would
 change its meaning. Exact retries still recover the original result. If the
 user wants to try again, create a new operation explicitly. Excessive future
 timestamps receive `FINALITY_TIMESTAMP_FUTURE`; a timestamp within the signed
 future window waits until its time closes.
+
+## Observe and capture an application view
+
+`node.changes()` and `client.changes()` start with the current applied **final**
+view. Use `{ view: 'local' }` for a display that intentionally includes
+speculative state. Each notification is `{ view, revision, finalRevision }`,
+using the same opaque tokens as `readView()` and its event reader. Tokens identify
+this replica's applied snapshots; they are not global sequence numbers, finality
+proofs or values to parse or order.
+
+The stream emits after successful application reconciliation. SQL-only changes
+and changed outcomes during replay invalidate the local view even when they
+emit no event. Admission, transport and heartbeat bookkeeping alone do not.
+Final subscriptions remain quiet while only speculative state changes. A local
+subscription also reports final-prefix advancement, which can change
+`finalRevision` without changing its local `revision`.
+
+These notifications are bounded, coalesced refresh requests. A slow consumer
+receives the latest snapshot identity and can miss intermediate ones. There is
+no history cursor; the client reconnects by obtaining the current identity.
+Reading tokens acquires no SQL snapshot lease, does not scan event outcomes,
+and does not poll the page host.
+Capture a read view when ready to render, and release it afterward. The captured
+view may be newer than the notification, so its own tokens describe the data
+being displayed. SQL and `readEvents()` on that handle remain pinned together.
+
+During incomplete or ambiguous publication, a view whose underlying counters
+have advanced without successful reconciliation is unavailable. A genuinely
+unchanged final view remains readable. Change streams wait for a usable applied
+snapshot; they never relabel partially published state with an older token.
+Returning or throwing from the iterator, aborting its signal, or closing its
+owner releases idle and paused subscriptions.
+
+Use `events.subscribe()` with a processed checkpoint when every effective final
+event must be consumed, including after reconnect. Use `signals.subscribe()`
+for expiring live messages. Neither is a substitute for application view
+invalidation: SQL-only replay may emit no event, and signals do not establish
+what durable state this replica has applied.
 
 ## Give each authority a precise job
 
@@ -181,6 +239,16 @@ is the replica-side verifier of proof bytes. `AgentApplicationContext.finality`
 is non-null only where this process hosts the selected signer. Effect modules
 normally need `context.publisher`, `context.signals` and their final-event
 handlers, not direct access to the service.
+
+Effective durable events carry `event.origin` from their verified signed
+proposal: the group and signing key, original operation ID, membership revision,
+writer capability (or `null` for static membership), and exact signed author
+timestamp. The same provenance accompanies event reads, subscriptions and
+captured read views. Keep it attached when projecting an event or presenting it
+to an agent. Payload fields named `author`, `role`, `origin` or `instruction`
+remain application data; they cannot replace authenticated provenance or grant
+tool permissions. Historical authorization is not a claim that a grant remains
+active now, and authentication alone does not authorize every requested effect.
 
 Participant administration receives compact finalized controls and a signed
 completeness checkpoint, without application descriptors or bodies. The same

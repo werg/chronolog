@@ -31,11 +31,23 @@ jobs:
         run: |
           pnpm package:signals
           pnpm test:signals-package
+      - name: Check out the exact standalone signal recipe
+        uses: actions/checkout@v6
+        with:
+          repository: werg/tendriller-contrib
+          ref: a6a9e4b89ecb2f74fe15322735418116e7931204
+          path: artifacts/signal-recipe
+          persist-credentials: false
+      - name: Qualify previews through the standalone public package
+        run: node artifacts/signal-recipe/cookbooks/share-live-signals/checks/run.mjs --signals-module artifacts/signals/index.mjs > artifacts/signals/contrib.consumer.json
       - name: Preserve the standalone live-signal package
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: chronolog-signals-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/signals/*.tgz
+          path: |
+            artifacts/signals/*.tgz
+            artifacts/signals/*.consumer.json
           if-no-files-found: error
           retention-days: 30
       - run: pnpm test:coverage

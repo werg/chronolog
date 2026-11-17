@@ -2,6 +2,7 @@
 // Bob, each with its own ChronologClient. Rows belong to the key that wrote
 // them; Alice shares one row with Bob, they work in a team, and Alice hands
 // a note over to Bob. Run with `pnpm demo:ownership`.
+// Dependent work waits for final outcomes under an explicit live policy.
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'

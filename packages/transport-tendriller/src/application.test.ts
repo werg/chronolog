@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import { program, emit } from '@chronolog/protocol'
 import { RevisionBroadcaster, type NodeRevisionEvent } from '@chronolog/node-core'
-import { createChronologApplicationBackend, type NodeApplicationSource } from './application.js'
+import { createChronologApplicationBackend, type ClientApplicationSource, type NodeApplicationSource } from './application.js'
 
 function fixture() {
   type RawStatus = NonNullable<Awaited<ReturnType<NodeApplicationSource['operation']>>>
-  let current: RawStatus | null = null, revision = 0n, reads = 0, watchers = 0, released = 0
-  const calls: unknown[] = [], parameters: unknown[] = [], revisions = new RevisionBroadcaster<NodeRevisionEvent>()
+  let current: RawStatus | null = null, revision = 0n, reads = 0, watchers = 0, released = 0, changesReleased = 0
+  const calls: unknown[] = [], parameters: unknown[] = [], changeCalls: unknown[] = [], revisions = new RevisionBroadcaster<NodeRevisionEvent>()
   const batch = { revision: 'pinned', transactions: [], scannedThrough: 'cursor', hasMore: false }
+  const changes = { async *[Symbol.asyncIterator]() {
+    try { yield { view: 'final' as const, revision: batch.revision, finalRevision: batch.revision } }
+    finally { changesReleased++ }
+  } }
   const source = {
     get revision() { return revision },
     async publish(input: unknown) { calls.push(input); return { txIdText: 'original-proposal' } },
@@ -18,12 +22,15 @@ function fixture() {
       finally { watchers-- }
     },
     events: { read: async () => batch, async *subscribe() { yield batch } },
-    async readView(options = { view: 'final' as const }) { return { view: options.view, revision: batch.revision, finalRevision: 'pinned-final',
+    changes(options: unknown) { changeCalls.push(options); return changes },
+    async readView(options: { view?: 'local' | 'final' } = {}) { return { view: options.view ?? 'final', revision: batch.revision,
+      finalRevision: options.view === 'local' ? 'pinned-final' : batch.revision,
       query(_sql: string, values: unknown[]) { parameters.push(values); return { columns: [{ name: 'count' }], rows: [[{ kind: 'integer', value: '7' }]] } },
       readEvents: () => batch, release() { released++ },
     } },
   } as unknown as NodeApplicationSource
-  return { source, calls, parameters, get reads() { return reads }, get watchers() { return watchers }, get released() { return released },
+  return { source, calls, parameters, changes, changeCalls, get changesReleased() { return changesReleased },
+    get reads() { return reads }, get watchers() { return watchers }, get released() { return released },
     set(outcome: 'accepted' | 'rejected' | null, final: boolean) {
       current = { operationId: 'stable', proposalId: 'original-proposal', final,
         outcome: outcome === null ? null : { outcome, rejectionCode: outcome === 'rejected' ? 'claim_conflict' : null, failingStatementIndex: outcome === 'rejected' ? 1 : null } } as RawStatus
@@ -73,10 +80,31 @@ describe('selected Chronolog application adapter', () => {
     expect(f.watchers).toBe(0)
   })
 
+  it.each(['node', 'client'] as const)('delegates the %s view changes stream and preserves its revision and lifetime', async kind => {
+    const f = fixture(), controller = new AbortController()
+    const replica = kind === 'node' ? f.source : {
+      changes: f.source.changes, readView: f.source.readView, events: f.source.events,
+      submit: async () => { throw new Error('not used') },
+      operations: { get: f.source.operation, async *subscribe() {} },
+    } as unknown as ClientApplicationSource
+    const backend = createChronologApplicationBackend({ id: 'history', replica, sql: false })
+    const options = { view: 'final' as const, signal: controller.signal }
+    const stream = backend.changes(options)
+    expect(stream).toBe(f.changes)
+    expect(f.changeCalls).toEqual([options])
+    const iterator = stream[Symbol.asyncIterator](), view = await backend.readView({ view: 'final' })
+    try {
+      expect(view).toMatchObject({ view: 'final', revision: 'pinned', finalRevision: 'pinned' })
+      expect((await iterator.next()).value).toEqual({ view: 'final', revision: view.revision, finalRevision: view.revision })
+      await iterator.return?.()
+      expect(f.changesReleased).toBe(1)
+    } finally { await iterator.return?.(); await view.release() }
+  })
+
   it('captures one view, normalizes native SQL values and releases it once', async () => {
     const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: true })
-    const view = await backend.readView({ view: 'final' })
-    expect(view).toMatchObject({ view: 'final', revision: 'pinned', finalRevision: 'pinned-final' })
+    const view = await backend.readView({ view: 'local' })
+    expect(view).toMatchObject({ view: 'local', revision: 'pinned', finalRevision: 'pinned-final' })
     const result = await view.query('SELECT ?', [7n])
     expect(result).toEqual({ revision: 'pinned', columns: [{ name: 'count' }], rows: [[7n]], truncated: false })
     expect(f.parameters).toEqual([[{ kind: 'integer', value: '7' }]])

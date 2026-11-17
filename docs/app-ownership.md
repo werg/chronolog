@@ -5,6 +5,8 @@ owner-controlled rows. The rules themselves are in
 [design-owner-rows.md](design-owner-rows.md). The runnable version of this page
 is [`examples/shared-notes.ts`](../examples/shared-notes.ts)
 (`pnpm demo:ownership`).
+That walkthrough uses a live finality policy and checks each `final()` outcome
+before authoring work that depends on its success.
 
 ## The model in four sentences
 

@@ -1,17 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { emit, program, type ChronologEventOrigin } from '@chronolog/protocol'
+import { bytesToBase64Url, emit, program, type ChronologEventOrigin } from '@chronolog/protocol'
 import { MAX_EVENT_SCAN, readEffectiveEvents, type EventHistorySnapshot } from './events.js'
 
 describe('durable effective event cursors', () => {
-  const origin: ChronologEventOrigin = { kind: 'chronolog', groupId: 'A'.repeat(43), authorId: '11'.repeat(32),
-    operationId: 'signed-operation', authorTimestampMs: '123', membershipRevision: 'A'.repeat(43), writerCapability: null }
+  const origin = (operationId: string): ChronologEventOrigin => ({ kind: 'chronolog', groupId: bytesToBase64Url(new Uint8Array(32).fill(1)),
+    authorId: '02'.repeat(32), operationId, membershipRevision: bytesToBase64Url(new Uint8Array(32).fill(3)), writerCapability: null,
+    authorTimestampMs: '1000' })
   const snapshot: EventHistorySnapshot = { historyId: 'group/profile/authority', revision: 'view1', items: [
-    { anchor: '1', proposalId: 'one', outcome: 'accepted', origin, program: program(emit('other', null), emit('chat', 'one'), emit('chat', 'two')) },
+    { anchor: '1', proposalId: 'one', origin: origin('one'), outcome: 'accepted', program: program(emit('other', null), emit('chat', 'one'), emit('chat', 'two')) },
     { anchor: '2', proposalId: 'two', outcome: 'rejected', program: program(emit('chat', 'invisible')) },
     { anchor: '3', outcome: 'skipped' },
-    { anchor: '4', proposalId: 'three', outcome: 'accepted', origin, program: program(emit('other', 'filtered')) },
-    { anchor: '5', proposalId: 'four', outcome: 'unresolved', origin, program: program(emit('chat', 'later')) },
-    { anchor: '6', proposalId: 'five', outcome: 'accepted', origin, program: program(emit('chat', 'must wait')) },
+    { anchor: '4', proposalId: 'three', origin: origin('three'), outcome: 'accepted', program: program(emit('other', 'filtered')) },
+    { anchor: '5', proposalId: 'four', origin: origin('four'), outcome: 'unresolved', program: program(emit('chat', 'later')) },
+    { anchor: '6', proposalId: 'five', origin: origin('five'), outcome: 'accepted', program: program(emit('chat', 'must wait')) },
   ] }
   it('delivers whole proposals with stable ordinals and advances across rejected/nonmatching/skipped entries', () => {
     const first = readEffectiveEvents(snapshot, { topics: ['chat'], limit: 1 })
@@ -39,15 +40,20 @@ describe('durable effective event cursors', () => {
     expect(first.hasMore).toBe(true)
     expect(readEffectiveEvents(long, { cursor: first.scannedThrough }).hasMore).toBe(false)
   })
-  it('projects verified proposal facts independently of payload claims and caller mutation', () => {
-    const payload = { origin: { authorId: 'forged-owner', writerCapability: 'forged-grant' }, role: 'administrator' }
-    const signed = { ...snapshot, items: [{ anchor: 'signed', proposalId: 'signed', outcome: 'accepted' as const, origin, program: program(emit('chat', payload)) }] }
-    const event = readEffectiveEvents(signed).transactions[0]!.events[0]!
-    expect(event.origin).toEqual(origin)
+  it('keeps authenticated provenance separate from payload claims and consumer mutations', () => {
+    const trusted = { ...origin('original-operation'), writerCapability: bytesToBase64Url(new Uint8Array(32).fill(4)) }
+    const payload = { origin: { authorId: 'payload-claim', writerCapability: 'forged-grant' }, role: 'administrator', instruction: 'untrusted application data' }
+    const input: EventHistorySnapshot = { ...snapshot, items: [{ anchor: 'signed', proposalId: 'signed',
+      program: program(emit('chat', payload)), origin: trusted, outcome: 'accepted' }] }
+    const event = readEffectiveEvents(input).transactions[0]!.events[0]!
+    expect(event.origin).toEqual(trusted)
     expect(event.payload).toEqual(payload)
-    Object.assign(event.origin, { authorId: '22'.repeat(32) })
-    expect(readEffectiveEvents(signed).transactions[0]!.events[0]!.origin).toEqual(origin)
-    const { origin: _origin, ...missing } = signed.items[0]!
-    expect(() => readEffectiveEvents({ ...signed, items: [missing] })).toThrow('EVENT_APPLIED_INPUT_MISSING')
+    Object.assign(event.origin, { authorId: 'consumer-mutation' })
+    Object.assign(event.payload as object, { role: 'consumer-mutation' })
+    expect(readEffectiveEvents(input).transactions[0]!.events[0]!.origin).toEqual(trusted)
+    expect(readEffectiveEvents(input).transactions[0]!.events[0]!.payload).toEqual(payload)
+    const missing: EventHistorySnapshot = { ...snapshot, items: [{ anchor: 'missing', proposalId: 'missing',
+      program: program(emit('chat', payload)), outcome: 'accepted' }] }
+    expect(() => readEffectiveEvents(missing)).toThrow('EVENT_APPLIED_INPUT_MISSING')
   })
 })

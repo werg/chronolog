@@ -2,6 +2,7 @@ import { AsyncQueue, type RpcCallOptions, type RpcTransport, type SubmitTransact
 import { describe, expect, it } from 'vitest'
 
 import { ChronologClient } from './client.js'
+import { TransactionRejectedError } from './ownership.js'
 
 const submission: SubmitTransactionResponse = {
   transactionId: 'tx-1', candidateDigest: 'digest', authorTimestampMs: '1', transactionNonce: 'nonce',
@@ -46,6 +47,31 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe('TransactionHandle finality', () => {
+  it.each([false, true])('returns the immutable result after replay (final rejection: %s)', async rejected => {
+    const f = fixture(), handle = await f.client.transaction(['SELECT 1'])
+    let finished = false
+    const final = handle.final().then(value => { finished = true; return value })
+    try {
+      await waitFor(() => f.opened === 1)
+      f.values.push(outcome(1, false))
+      await expect(handle.local()).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
+      expect(finished).toBe(false)
+      f.values.push(outcome(2, false, true))
+      await waitFor(() => handle.outcome.getSnapshot().value?.eventSetRevision === '2')
+      expect(finished).toBe(false)
+      f.values.push(outcome(3, true, rejected))
+      const result = await final
+      expect(result).toMatchObject({ final: true, eventSetRevision: '3', outcome: { type: rejected ? 'rejected' : 'accepted' } })
+      if (result.outcome.type === 'rejected') {
+        // An application may deliberately convert a rejected result into a rich error.
+        expect(new TransactionRejectedError(handle.transactionId, result.outcome.rejection)).toMatchObject({
+          name: 'TransactionRejectedError', code: 'constraint', stepIndex: 0, reason: { kind: 'engine', code: 'constraint' },
+        })
+      }
+      await expect(handle.final()).resolves.toMatchObject({ final: true, eventSetRevision: '3' })
+    } finally { handle.dispose(); await f.client.close() }
+  })
+
   it('waits through speculative acceptance and replay until the applied final outcome', async () => {
     const fixture_ = fixture()
     const handle = await fixture_.client.transaction(['SELECT 1'])
@@ -68,12 +94,12 @@ describe('TransactionHandle finality', () => {
     await fixture_.client.close()
   })
 
-  it('aborts immediately while the outcome stream is quiet', async () => {
+  it.each(['local', 'final'] as const)('%s aborts immediately while the outcome stream is quiet', async method => {
     const fixture_ = fixture()
     const handle = await fixture_.client.transaction(['SELECT 1'])
     const abort = new AbortController()
     const failure = new Error('caller stopped waiting')
-    const waiting = expect(handle.final({ signal: abort.signal })).rejects.toBe(failure)
+    const waiting = expect(handle[method]({ signal: abort.signal })).rejects.toBe(failure)
     await waitFor(() => fixture_.opened === 1)
     abort.abort(failure)
     await waiting
@@ -81,13 +107,13 @@ describe('TransactionHandle finality', () => {
     await fixture_.client.close()
   })
 
-  it('does not open a stream for a previously aborted wait and rejects on disposal', async () => {
+  it.each(['local', 'final'] as const)('%s does not open a stream for a previously aborted wait and rejects on disposal', async method => {
     const fixture_ = fixture()
     const handle = await fixture_.client.transaction(['SELECT 1'])
     const failure = new Error('already aborted')
-    await expect(handle.final({ signal: AbortSignal.abort(failure) })).rejects.toBe(failure)
+    await expect(handle[method]({ signal: AbortSignal.abort(failure) })).rejects.toBe(failure)
     expect(fixture_.opened).toBe(0)
-    const waiting = expect(handle.final()).rejects.toMatchObject({ code: 'transport_unavailable' })
+    const waiting = expect(handle[method]()).rejects.toMatchObject({ code: 'transport_unavailable' })
     handle.dispose()
     await waiting
     await fixture_.client.close()

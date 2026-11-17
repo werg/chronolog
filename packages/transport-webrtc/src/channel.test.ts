@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest'
-import { SignalBackpressureError } from '@chronolog/signals'
 
 import { frameRtcDataChannel, frameRtcPeerChannels, WEBRTC_LIMITS } from './channel.js'
 import { frameRtcLiveChannel, WEBRTC_LIVE_LIMITS } from './live.js'
@@ -184,7 +183,7 @@ describe('independent live WebRTC lane', () => {
       const controller = new AbortController(); controller.abort(new Error('preview expired'))
       await expect(a.send(new Uint8Array([2]), { signal: controller.signal })).rejects.toThrow('preview expired')
       source.left.bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
-      await expect(a.send(new Uint8Array([3]))).rejects.toBeInstanceOf(SignalBackpressureError)
+      await expect(a.send(new Uint8Array([3]))).resolves.toEqual({ refused: 'backpressure' })
       source.left.bufferedAmount = 0
       await a.send(new Uint8Array([4]))
       expect(source.left.sent).toEqual([new Uint8Array([4])])
@@ -202,6 +201,22 @@ describe('independent live WebRTC lane', () => {
       expect((await received.next()).value).toEqual(new Uint8Array([1]))
       await expect(a.send(new Uint8Array(WEBRTC_LIVE_LIMITS.frameBytes + 1))).rejects.toThrow('WEBRTC_LIVE_FRAME_TOO_LARGE')
     } finally { await Promise.all([a.close(), b.close()]); await received.return?.() }
+  })
+
+  it('ends an idle pending read when its iterator is returned', async () => {
+    const source = channels(false, 0), a = frameRtcLiveChannel(source.left), b = frameRtcLiveChannel(source.right)
+    source.open()
+    try {
+      const unused = b.frames()[Symbol.asyncIterator]()
+      await unused.return?.()
+      expect(b.signal.aborted).toBe(false)
+      const iterator = b.frames()[Symbol.asyncIterator](), pending = iterator.next()
+      expect((await iterator.return?.())?.done).toBe(true)
+      expect((await pending).done).toBe(true)
+      expect(b.signal.aborted).toBe(true)
+      expect(a.signal.aborted).toBe(true)
+      expect(b.stats.queuedReceiveFrames).toBe(0)
+    } finally { await Promise.all([a.close(), b.close()]) }
   })
 
   it('rejects a malformed live frame and closes the shared connection lifetime', async () => {

@@ -5,7 +5,7 @@ import {
   DOMAINS, base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest,
   digestExecutionManifest, equalBytes, hashDomain,
 } from '@chronolog/protocol'
-import { ChangeSignal, type FeedLink } from '@chronolog/records'
+import { assertFeedPosition, ChangeSignal, type FeedLink } from '@chronolog/records'
 import { openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
 import { createCertificateFetcher, TendrillerTransport } from '@chronolog/transport-tendriller'
 import { createRecordLogClient } from '@tendriller/core/records'
@@ -50,11 +50,14 @@ type LinkRequestFields = {
   readonly after: bigint
   readonly limit: number
 } | { readonly method: 'payload'; readonly hash: string }
+  | { readonly method: 'head'; readonly feed: string }
+  | { readonly method: 'evidence-head' }
 type LinkRequest = LinkRequestFields & { readonly id: number }
 interface LinkResponse {
   readonly id?: number
   readonly hint?: true
   readonly bytes?: readonly Uint8Array[]
+  readonly head?: bigint
   readonly error?: string
 }
 
@@ -63,7 +66,7 @@ function receiveLink(port: MessagePort, identity: string): FeedLink {
   ports.add(port)
   const changes = new ChangeSignal()
   let next = 0
-  const pending = new Map<number, { resolve(value: readonly Uint8Array[]): void; reject(error: Error): void }>()
+  const pending = new Map<number, { resolve(value: readonly Uint8Array[] | bigint): void; reject(error: Error): void }>()
   port.addEventListener('message', (event: MessageEvent<LinkResponse>) => {
     const message = event.data
     if (message.hint) { changes.notify(); return }
@@ -71,7 +74,7 @@ function receiveLink(port: MessagePort, identity: string): FeedLink {
     const request = pending.get(message.id)
     pending.delete(message.id)
     if (message.error !== undefined) request?.reject(new Error(message.error))
-    else request?.resolve(message.bytes ?? [])
+    else request?.resolve(message.head ?? message.bytes ?? [])
   })
   port.start()
   closing.signal.addEventListener('abort', () => {
@@ -79,17 +82,28 @@ function receiveLink(port: MessagePort, identity: string): FeedLink {
     for (const request of pending.values()) request.reject(new Error('BROWSER_PEER_LINK_CLOSED'))
     pending.clear()
   }, { once: true })
-  const request = (fields: LinkRequestFields): Promise<readonly Uint8Array[]> => new Promise((resolve, reject) => {
+  const request = (fields: LinkRequestFields): Promise<readonly Uint8Array[] | bigint> => new Promise((resolve, reject) => {
     const id = ++next
     pending.set(id, { resolve, reject })
     port.postMessage({ id, ...fields } satisfies LinkRequest)
   })
+  const bytes = async (fields: LinkRequestFields): Promise<readonly Uint8Array[]> => {
+    const value = await request(fields)
+    if (typeof value === 'bigint') throw new Error('BROWSER_PEER_LINK_RESPONSE_INVALID')
+    return value
+  }
+  const head = async (fields: LinkRequestFields): Promise<bigint> => {
+    const value = await request(fields)
+    assertFeedPosition(value)
+    return value
+  }
   return {
     identity,
-    read: (feed, after, limit) => request({ method: 'read', feed, after, limit }),
-    readEvidence: (after, limit) => request({ method: 'evidence', after, limit }),
+    head: feed => head({ method: 'head', feed }), evidenceHead: () => head({ method: 'evidence-head' }),
+    read: (feed, after, limit) => bytes({ method: 'read', feed, after, limit }),
+    readEvidence: (after, limit) => bytes({ method: 'evidence', after, limit }),
     async readPayload(hash) {
-      const values = await request({ method: 'payload', hash })
+      const values = await bytes({ method: 'payload', hash })
       if (values.length > 1) throw new Error('BROWSER_PEER_PAYLOAD_RESPONSE_INVALID')
       return values[0] ?? null
     },
@@ -102,6 +116,12 @@ function serveLink(port: MessagePort): void {
   const link = peer!.transport.asLink()
   port.addEventListener('message', (event: MessageEvent<LinkRequest>) => {
     const request = event.data, id = request.id
+    if (request.method === 'head' || request.method === 'evidence-head') {
+      const result = request.method === 'head' ? link.head(request.feed) : link.evidenceHead()
+      void result.then(head => port.postMessage({ id, head } satisfies LinkResponse),
+        (error: unknown) => port.postMessage({ id, error: error instanceof Error ? error.message : String(error) } satisfies LinkResponse))
+      return
+    }
     const result = request.method === 'payload'
       ? link.readPayload(request.hash).then(bytes => bytes === null ? [] : [bytes])
       : request.method === 'read' ? link.read(request.feed!, request.after, request.limit) : link.readEvidence(request.after, request.limit)
