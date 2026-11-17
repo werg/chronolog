@@ -232,8 +232,9 @@ describe('governed chronological native replicas with a finality provider', () =
     const relayOnly = await open('relay-only', joining, new MemoryOperationStore())
     for (const entry of await log.read()) await relayOnly.node.ingestOrderingEvidence({ kind: 'ordered-entry', entry })
     const retainedCertificate = await authority.certify()
-    await expect(relayOnly.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: retainedCertificate }))
-      .rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
+    await relayOnly.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: retainedCertificate })
+    // Proof retention and governance progress do not wait for application bodies.
+    await expect(relayOnly.node.waitForIdle()).rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
     expect(relayOnly.activeSnapshot.revision).toBe(3n)
     // Fetch application envelopes by hash without replicating any author feed.
     relayOnly.transport.connect({ ...admin.transport.asLink(), head: async () => 0n, read: async () => [] })

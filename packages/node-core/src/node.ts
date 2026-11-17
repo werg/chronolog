@@ -1,4 +1,5 @@
 import { bytesToHex, sha256 } from '@chronolog/canonical'
+import { DEFAULT_LIVE_CLOCK_POLICY } from '@chronolog/capabilities'
 
 import {
   ControlStore,
@@ -66,6 +67,7 @@ import { ValidatorRevisionClosures } from './validator-closures.js'
 export type { ViewChange, ViewChangeOptions } from '@chronolog/protocol'
 
 const MAX_AUTHOR_TIMESTAMP_MS = (1n << 63n) - 1n
+const DEFAULT_FUTURE_ADMISSION_WINDOW_MS = Number(DEFAULT_LIVE_CLOCK_POLICY.maxFutureSkewMs + DEFAULT_LIVE_CLOCK_POLICY.cutoffLagMs)
 
 export class ChronologNode {
   readonly #options: ChronologNodeOptions
@@ -102,6 +104,8 @@ export class ChronologNode {
   readonly #candidateCores = new Map<string, TransactionCore>()
   readonly #candidateEpochs = new Map<string, Map<string, Uint8Array | null>>()
   readonly #maxFutureSkewMs: bigint
+  readonly #cutoffLagMs: number
+  readonly #heartbeatIntervalMs: number
   readonly #replayedOutcomes = new Set<string>()
   readonly #abort = new AbortController()
   #revision = 0n
@@ -134,9 +138,15 @@ export class ChronologNode {
 
   constructor(options: ChronologNodeOptions) {
     this.#options = options
-    const maxFutureSkewMs = options.live?.maxFutureSkewMs ?? 30_000
+    const maxFutureSkewMs = options.live?.maxFutureSkewMs ?? Number(DEFAULT_LIVE_CLOCK_POLICY.maxFutureSkewMs)
     if (!Number.isSafeInteger(maxFutureSkewMs) || maxFutureSkewMs < 0) throw new Error('LIVE_MAX_FUTURE_SKEW_INVALID')
     this.#maxFutureSkewMs = BigInt(maxFutureSkewMs)
+    this.#cutoffLagMs = options.validator?.cutoffLagMs ?? Number(DEFAULT_LIVE_CLOCK_POLICY.cutoffLagMs)
+    this.#heartbeatIntervalMs = options.validator?.heartbeatIntervalMs ?? Number(DEFAULT_LIVE_CLOCK_POLICY.heartbeatIntervalMs)
+    if (!Number.isSafeInteger(this.#cutoffLagMs) || this.#cutoffLagMs < 0) throw new Error('LIVE_CUTOFF_LAG_INVALID')
+    if (!Number.isSafeInteger(this.#heartbeatIntervalMs) || this.#heartbeatIntervalMs < 1 || this.#heartbeatIntervalMs > 60_000) {
+      throw new Error('LIVE_HEARTBEAT_INTERVAL_INVALID')
+    }
     this.#control = options.controlStore ?? new ControlStore()
     const operationStore = options.operationStore ?? new MemoryOperationStore()
     this.#operations = new DurableOperationJournal(operationStore, `transactions/${bytesToHex(options.groupId)}/${bytesToHex(options.identity.publicKeyBytes)}`)
@@ -155,7 +165,7 @@ export class ChronologNode {
       if (options.envelopeCipher !== undefined && options.encryptionEpochStatusAt === undefined) {
         throw new Error('COORDINATED_ENCRYPTION_POLICY_REQUIRED')
       }
-      const futureAdmissionWindowMs = options.historyPolicy.futureAdmissionWindowMs ?? 31_000
+      const futureAdmissionWindowMs = options.historyPolicy.futureAdmissionWindowMs ?? DEFAULT_FUTURE_ADMISSION_WINDOW_MS
       if (!Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0) {
         throw new Error('FINALITY_FUTURE_ADMISSION_WINDOW_INVALID')
       }
@@ -259,14 +269,13 @@ export class ChronologNode {
         this.#scheduleMaterializationRetry()
       }
     })
-    if (this.#options.validator?.heartbeatIntervalMs) {
-      const interval = this.#options.validator.heartbeatIntervalMs
+    if (this.#options.validator !== undefined) {
       this.#heartbeatTimer = setInterval(() => {
         // Governed membership can grant or revoke the validator role at any
         // time; while this node holds none, there is nothing to publish.
         if (this.#validatorCapability() === undefined) return
         void this.publishHeartbeat().catch((error) => this.#recordError(error))
-      }, interval)
+      }, this.#heartbeatIntervalMs)
       this.#heartbeatTimer.unref?.()
     }
   }
@@ -467,6 +476,17 @@ export class ChronologNode {
     const id = this.#options.materialization.queries.proposalIdAt(index)
     if (id === null) throw new Error('MATERIALIZED_ORDER_MISSING')
     return id
+  }
+
+  #appliedAuthorTimestamp(index: number): bigint {
+    const id = this.#appliedProposalId(index)
+    const core = this.#candidateCores.get(this.#idKey(id))
+    if (core !== undefined) return core.authorTimestampMs
+    // Recovery can expose a retained published view before its proof cache is
+    // rebuilt. Read only this entry from that actual immutable publication.
+    const entry = this.#options.materialization.queries.captureApplication({ view: 'local' }).transactionAt(index)
+    if (entry === null || !equalBytes(entry.txId, id)) throw new Error('MATERIALIZED_ORDER_MISSING')
+    return decodeTransactionCore(entry.canonicalCandidate).authorTimestampMs
   }
 
   /** Permanently stops old-revision admission before publishing its signed promise. */
@@ -859,7 +879,7 @@ export class ChronologNode {
           continue
         }
         if (inclusion.closureBoundary !== null) {
-          const proposedHorizon = inclusion.closureBoundary.closedThroughMs + BigInt(selected.futureAdmissionWindowMs ?? 31_000)
+          const proposedHorizon = inclusion.closureBoundary.closedThroughMs + BigInt(selected.futureAdmissionWindowMs ?? DEFAULT_FUTURE_ADMISSION_WINDOW_MS)
           const horizon = proposedHorizon > MAX_AUTHOR_TIMESTAMP_MS ? MAX_AUTHOR_TIMESTAMP_MS : proposedHorizon
           const issued = this.#options.encryptionEpochCanAuthorize?.(inclusion.admissionFloorMs, horizon, ledger.encryptionEpoch)
           if (issued === null) throw new GovernanceEvidencePendingError()
@@ -884,7 +904,7 @@ export class ChronologNode {
           if (!equalBytes(core.authorId, wire.signer)) invalid('CANDIDATE_SIGNER_MISMATCH')
           try { assertValidChangeProgram(core.program) } catch { invalid('CANDIDATE_SQL_INVALID') }
           const tooFuture = inclusion.closureBoundary !== null && core.authorTimestampMs > inclusion.closureBoundary.closedThroughMs +
-            BigInt(selected.futureAdmissionWindowMs ?? 31_000)
+            BigInt(selected.futureAdmissionWindowMs ?? DEFAULT_FUTURE_ADMISSION_WINDOW_MS)
           const decision = tooFuture ? inclusion.closureBoundary : snapshot.closures.find(closure =>
             entry.position <= closure.includedThrough && core.authorTimestampMs <= closure.closedThroughMs) ?? null
           if (decision === null && inclusion.closureBoundary !== null && core.authorTimestampMs <= snapshot.closedThroughMs) {
@@ -1203,10 +1223,8 @@ export class ChronologNode {
   }
 
   #closedAuthorTime(): bigint {
-    const last = this.finalOrderLength === 0 ? undefined
-      : this.#candidateCores.get(this.#idKey(this.#appliedProposalId(this.finalOrderLength - 1)))
-    return last !== undefined && last.authorTimestampMs > this.#appliedClosedThroughMs
-      ? last.authorTimestampMs : this.#appliedClosedThroughMs
+    const last = this.finalOrderLength === 0 ? -1n : this.#appliedAuthorTimestamp(this.finalOrderLength - 1)
+    return last > this.#appliedClosedThroughMs ? last : this.#appliedClosedThroughMs
   }
 
   #isAppliedFinal(txId: Uint8Array): boolean {
@@ -1470,6 +1488,9 @@ export class ChronologNode {
       await this.#refreshCandidateSelection(candidate, core)
     }
     const frontier = await this.#liveFinalityFrontier()
+    // The verified admission bound already rules out newly authored work at
+    // earlier times, even while application publication needs a retry.
+    this.#observeAuthorTime(frontier.provenThroughMs ?? -1n)
     let admissionClosed = false
     for (const id of frontier.excludedProposalIds) {
       const candidate = this.#control.getCandidate(id)
@@ -1883,13 +1904,15 @@ export class ChronologNode {
     if (timestamp > this.#observedAuthorTimestampMs) this.#observedAuthorTimestampMs = timestamp
   }
   #nextAuthorTimestamp(): bigint {
+    // Publication can succeed before its acknowledgement. Causal allocation
+    // follows the same applied snapshot readers can actually observe.
+    if (this.orderLength > 0) this.#observeAuthorTime(this.#appliedAuthorTimestamp(this.orderLength - 1))
     const wallClock = BigInt(Math.max(0, Math.trunc(this.#clockNow())))
     const previous = this.#lastAuthoredTimestampMs > this.#observedAuthorTimestampMs
       ? this.#lastAuthoredTimestampMs : this.#observedAuthorTimestampMs
     const next = wallClock > previous ? wallClock : previous + 1n
     const membershipFloor = this.#membershipState().minimumAuthorTimestampMs ?? 0n
-    const selected = this.#options.historyPolicy
-    const closedFloor = selected?.kind === 'coordinated' ? selected.policy.snapshot().closedThroughMs + 1n : 0n
+    const closedFloor = this.#closedAuthorTime() + 1n
     const floor = membershipFloor > closedFloor ? membershipFloor : closedFloor
     const timestamp = next < floor ? floor : next
     if (timestamp > wallClock + this.#maxFutureSkewMs) {
@@ -1974,7 +1997,7 @@ export class ChronologNode {
   #advanceValidatorCutoff(now: number): void {
     const validator = this.#options.validator
     if (!validator) return
-    const proposed = BigInt(Math.max(0, Math.trunc(now - (validator.cutoffLagMs ?? 60_000))))
+    const proposed = BigInt(Math.max(0, Math.trunc(now - this.#cutoffLagMs)))
     if (proposed > this.#acceptedAboveMs) this.#acceptedAboveMs = proposed
   }
   #randomBytes(length: number): Uint8Array { return this.#options.random?.bytes(length) ?? crypto.getRandomValues(new Uint8Array(length)) }

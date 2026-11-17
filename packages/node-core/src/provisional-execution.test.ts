@@ -21,7 +21,7 @@ const groupId = bytes(121), membershipRevision = bytes(122), validationPolicy = 
 async function fixture(mode: 'peer' | 'coordinated') {
   const identity = await generateEd25519KeyPair(), authorityIdentity = await generateEd25519KeyPair()
   const store = new MemoryOperationStore(), denied = new Set<bigint>()
-  let failReplay = false, now = 1_000
+  let failReplay = false, failFinalReply = false, now = 1_000
   const descriptorRuntime = await createEventMaterializationRuntime({ store, namespace: 'profile' })
   const configuration = { kind: 'coordinated' as const, groupId, genesisDigest: bytes(125),
     executionManifestDigest: descriptorRuntime.queries.executionManifestDigest,
@@ -37,6 +37,9 @@ async function fixture(mode: 'peer' | 'coordinated') {
       coordinator: { ...base.coordinator, async materialize(input) {
         if (failReplay) throw new Error('REPLAY_TEMPORARILY_UNAVAILABLE')
         return base.coordinator.materialize(input)
+      }, async publishFinal(length) {
+        await base.coordinator.publishFinal!(length)
+        if (failFinalReply && length > 0) throw new Error('FINAL_PUBLICATION_REPLY_LOST')
       } },
     }
     const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
@@ -94,6 +97,7 @@ async function fixture(mode: 'peer' | 'coordinated') {
   }
   return { propose, finalize, denied, get node() { return current.node },
     set failReplay(value: boolean) { failReplay = value },
+    set failFinalReply(value: boolean) { failFinalReply = value },
     set now(value: number) { now = value },
     async restart() { await current.node.close(); current = await open(); await current.node.waitForIdle() },
   }
@@ -107,6 +111,27 @@ async function view(node: ChronologNode, selected: 'local' | 'final') {
 }
 
 describe.each(['peer', 'coordinated'] as const)('%s live provisional execution', mode => {
+  it('authors new intent after observed work and closed time while exact retries retain their original timestamp', async () => {
+    const f = await fixture(mode), observed = await f.propose('observed', 1_010n)
+    const input = { operationId: 'dependent', program: program(emit('preview', 'dependent')) }
+    const dependent = await f.node.publish(input)
+    expect(dependent.core.authorTimestampMs).toBe(1_011n)
+    await f.node.waitForIdle()
+    f.failFinalReply = true
+    try {
+      await expect(f.finalize([observed], 1_020n)).rejects.toThrow('FINAL_PUBLICATION_REPLY_LOST')
+      expect(f.node.isFinal(observed.txId)).toBe(true)
+      expect((await view(f.node, 'final')).events).toEqual(['observed'])
+      const afterClosure = await f.node.publish({ operationId: 'after-closure', program: program(emit('preview', 'after')) })
+      expect(afterClosure.core.authorTimestampMs).toBe(1_021n)
+      // A backwards wall clock cannot silently rewrite an existing operation.
+      f.now = 900
+      expect((await f.node.publish(input)).core).toEqual(dependent.core)
+      await expect(f.node.publish({ operationId: 'clock-ahead', program: program(emit('preview', 'new')) }))
+        .rejects.toThrow('AUTHOR_CLOCK_AHEAD')
+    } finally { f.failFinalReply = false; await f.node.waitForIdle() }
+  })
+
   it('applies a raw authorized proposal before consensus and freezes the same outcome after closure', async () => {
     const f = await fixture(mode), proposal = await f.propose('prompt', 10n)
     expect(f.node.candidate(proposal.txId)?.state).toBe('provisional')
