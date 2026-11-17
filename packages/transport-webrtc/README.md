@@ -6,9 +6,11 @@ authentication, commands, history synchronization and content protocol. WebRTC
 supplies two independent channels: reliable ordered application/control traffic
 and disposable live traffic.
 
-The transport owns negotiation, framing, flow control and connection lifetime.
-The application session checks signing keys, current grants, update scope and
-signatures. Successful HTTP admission or ICE negotiation never grants access to
+RTC negotiation supplies its channels to the transport-neutral framing, flow
+control and lifetime owner in `@chronolog/records`, also used by the WebSocket
+adapter. The application session authenticates and encrypts both lanes through
+one channel implementation, checking signing keys, current grants, update scope
+and signatures. Successful HTTP admission or ICE negotiation never grants access to
 application data. A hosted control participant attaches through
 `session.connectControlParticipant({ exchange })`; its restricted HTTP transport
 does not carry the peer's database or ordinary content traffic.
@@ -38,8 +40,10 @@ await peer.synchronize()
 The optional `./native` entrypoint adapts the pinned Werift implementation.
 Browser imports never include Werift or Node modules. No STUN or TURN server is
 selected implicitly. Native interface bindings and port ranges can be supplied
-as the factory's second argument. TURN provides transport relay capacity; it
-does not change Chronolog authorization or execution semantics.
+as the factory's second argument. The maintained fallback uses two independent
+WebSockets through the host relay; it does not require a TURN service. See the
+[session connection guide](../peer-session/README.md#owned-participation-and-recovery)
+for direct and relay openers under the same participation owner.
 
 ## Direct HTTP introduction
 
@@ -130,7 +134,7 @@ deadline and cancellation. Fixed negotiated SCTP channels use protocol
 `chronolog.peer.v2`: stream 0 is reliable and ordered; stream 1 is unordered with
 `maxRetransmits: 0`. Unexpected remotely opened channels are refused.
 
-Reliable framing limits complete messages, packet sizes, partial frames, queued
+Shared reliable framing limits complete messages, packet sizes, partial frames, queued
 sends and receiver credit. Credit is returned only after the reader advances
 past the processed frame. Queued writes capture their input and have deadlines.
 Closing the connection rejects pending writes and releases blocked readers.
