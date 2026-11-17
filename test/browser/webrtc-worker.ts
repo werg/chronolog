@@ -6,12 +6,12 @@ import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToBase64Url, bytesToHex } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { openBrowserEventPeer, prepareBrowserIdentity, type BrowserEventPeer } from '@chronolog/runtime-browser/events'
-import { frameRtcDataChannel, type DataChannelConnection } from '@chronolog/transport-webrtc'
+import { frameRtcPeerChannels, type PeerDataChannelConnection, type WebRtcChannels } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventBootstrap } from './event-contract.js'
 
 let peer: BrowserEventPeer | undefined, identity: EnrollmentIdentity | undefined, client: ChronologClient | undefined
-let channel: DataChannelConnection | undefined, session: GovernedPeerSession | undefined
+let channel: PeerDataChannelConnection | undefined, session: GovernedPeerSession | undefined
 let completionError: string | undefined
 let generation = 0
 let nativeIdentity: Uint8Array | undefined
@@ -29,7 +29,7 @@ async function disconnect(expected?: number): Promise<void> {
 const endpoint = globalThis as unknown as { addEventListener(type: 'message', listener: (event: MessageEvent) => void): void; postMessage(value: unknown): void }
 endpoint.addEventListener('message', event => {
   const request = event.data as { id: number; method: string; name?: string; bootstrap?: BrowserEventBootstrap;
-    channel?: RTCDataChannel; attachmentId?: number; operationId?: string; text?: string; hash?: string }
+    channels?: WebRtcChannels; attachmentId?: number; operationId?: string; text?: string; hash?: string }
   const run = async (): Promise<unknown> => {
     switch (request.method) {
       case 'prepare': {
@@ -52,7 +52,7 @@ endpoint.addEventListener('message', event => {
       case 'channel': {
         await disconnect()
         const currentGeneration = ++generation
-        const framed = frameRtcDataChannel(request.channel!)
+        const framed = frameRtcPeerChannels(request.channels!)
         channel = framed; attachmentId = request.attachmentId; completionError = undefined
         try {
           await framed.ready

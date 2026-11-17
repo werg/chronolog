@@ -59,8 +59,8 @@ export async function createGovernedPeerService(options: {
       const { connection } = input
       const attempt = ++nextOpening
       openings.set(connection, attempt)
-      let resolveRoute!: (route: SignalRoute) => void, rejectRoute!: (error: unknown) => void
-      const routeReady = new Promise<SignalRoute>((resolve, reject) => { resolveRoute = resolve; rejectRoute = reject })
+      let resolveRoute!: (route: SignalRoute | undefined) => void, rejectRoute!: (error: unknown) => void
+      const routeReady = new Promise<SignalRoute | undefined>((resolve, reject) => { resolveRoute = resolve; rejectRoute = reject })
       void routeReady.catch(() => undefined)
       let raw: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined
       let route: SignalRoute | undefined, detach: (() => void) | undefined
@@ -77,7 +77,7 @@ export async function createGovernedPeerService(options: {
             return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, active.revision) &&
               capability.grant.transportAuthor === peer.feedId && equalBytes(capability.grant.signingPublicKey, peer.authorId)
           },
-          receiveSignal: async frame => { await (await routeReady).receive(frame) },
+          receiveSignal: async frame => { await (await routeReady)?.receive(frame) },
         })
         if (lifetime.signal.aborted) throw new Error('PEER_SERVICE_CLOSED')
         if ((accepted.get(raw.peer.feedId) ?? 0) > attempt) throw new Error('PEER_CONNECTION_SUPERSEDED')
@@ -91,12 +91,12 @@ export async function createGovernedPeerService(options: {
           pruneAttempts()
         }
         const close = async (): Promise<void> => { dispose(); await authenticated.close() }
-        route = signals.attachRoute({ close, async send(frame, { signal }) {
+        if (connection.live !== undefined) route = signals.attachRoute({ close, async send(frame, { signal }) {
           signal.throwIfAborted()
           try {
             const active = current(), localReader = active.capabilities.get(bytesToHex(reader.id))
             if (localReader === undefined || !isCapabilityActive(localReader, active.revision)) throw new Error('PEER_LOCAL_READER_GRANT_REQUIRED')
-            await authenticated.sendSignal(frame, signal)
+            await authenticated.sendSignal(frame, { signal })
           } catch (error) {
             if (!signal.aborted) void close().catch(() => undefined)
             throw error

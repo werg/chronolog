@@ -18,7 +18,8 @@ async function fixture() {
       grant: { role: 'reader', transportAuthor: 'local', subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes,
         validFromRevision: 0n, hpkePublicKey: new Uint8Array(32) } }]]) }
   const detach = vi.fn(), close = vi.fn(async () => {}), rawClose = vi.fn(async () => {})
-  const connection = { send: async () => {}, async *frames() {}, close: rawClose }
+  const connection = { send: async () => {}, async *frames() {}, close: rawClose,
+    live: { send: async () => {}, async *frames() {}, close: rawClose } }
   const local: FeedLink = { identity: 'local', read: async () => [], readEvidence: async () => [], readPayload: async () => null, async *watch() {} }
   const session = { link: { ...local, identity: 'remote' }, peer: { authorId: identity.publicKeyBytes, grantId, feedId: 'remote' },
     completion: new Promise<void>(() => {}), sendSignal: async () => {}, close }

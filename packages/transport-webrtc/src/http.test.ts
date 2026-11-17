@@ -25,7 +25,12 @@ function pendingPeer(close: () => Promise<void> = async () => undefined) {
     return { get localDescription() { return localDescription as PeerDescription ?? null }, iceGatheringState: 'complete', connectionState: 'connecting',
       createOffer: async () => offer, createAnswer: async () => answer,
       async setLocalDescription(description) { localDescription = description }, async setRemoteDescription() {},
-      createDataChannel() { throw new Error('ANSWERER_MUST_NOT_CREATE_CHANNEL') },
+      createDataChannel(label, options) {
+        const channel = new EventTarget()
+        return Object.assign(channel, { label, ordered: options.ordered, maxPacketLifeTime: null, maxRetransmits: options.maxRetransmits ?? null,
+          readyState: 'connecting', bufferedAmount: 0, bufferedAmountLowThreshold: 0, binaryType: 'arraybuffer',
+          send() { throw new Error('PENDING_CHANNEL_MUST_NOT_SEND') }, close() { channel.dispatchEvent(new Event('close')) } })
+      },
       addEventListener: (name, listener) => events.addEventListener(name, listener), removeEventListener: (name, listener) => events.removeEventListener(name, listener),
       async close() { calls.closed++; await close() } }
   }

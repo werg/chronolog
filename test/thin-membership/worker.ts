@@ -6,7 +6,7 @@ import { decodeMembershipLedgerResponse } from '@chronolog/node-core/membership'
 import { base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest, emit, equalBytes, program } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { openBrowserPeer, prepareBrowserIdentity, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
-import { frameRtcDataChannel, type DataChannelConnection, type RtcDataChannel } from '@chronolog/transport-webrtc'
+import { frameRtcPeerChannels, type PeerDataChannelConnection, type WebRtcChannels } from '@chronolog/transport-webrtc'
 
 import { attachMembershipPeer } from './peer.js'
 import type { ThinMembershipBootstrap } from '../../tools/thin-membership-native.js'
@@ -22,7 +22,7 @@ type Request = {
   readonly pages?: readonly string[]
   readonly operationId?: string
   readonly text?: string
-  readonly channel?: RtcDataChannel
+  readonly channels?: WebRtcChannels
   readonly connectionId?: number
 }
 
@@ -30,7 +30,7 @@ const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined, client: ChronologClient | undefined, identity: EnrollmentIdentity | undefined
 let bootstrap: ThinMembershipBootstrap | undefined
 let connection: Awaited<ReturnType<typeof attachMembershipPeer>> | undefined
-let opening: DataChannelConnection | undefined, connectionGeneration = 0
+let opening: PeerDataChannelConnection | undefined, connectionGeneration = 0
 let connectionError: string | undefined
 let requestId: string | undefined
 interface SyncProgress { phase: string; startedAt: number; phaseStartedAt: number; completedAt: number | undefined }
@@ -106,9 +106,9 @@ endpoint.addEventListener('message', event => {
         return status()
       }
       case 'channel': {
-        if (connection !== undefined || opening !== undefined) { request.channel!.close(); throw new Error('THIN_BROWSER_ALREADY_CONNECTED') }
+        if (connection !== undefined || opening !== undefined) { request.channels!.reliable.close(); request.channels!.live.close(); throw new Error('THIN_BROWSER_ALREADY_CONNECTED') }
         connectionError = undefined
-        const generation = ++connectionGeneration, framed = frameRtcDataChannel(request.channel!)
+        const generation = ++connectionGeneration, framed = frameRtcPeerChannels(request.channels!)
         opening = framed
         try {
           const attached = await attachMembershipPeer({ connection: framed,

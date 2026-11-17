@@ -2,7 +2,7 @@ import type { RuntimeApi, RuntimeConfiguration } from '@tendriller/core/contract
 import type { ApplicationBackend } from '@tendriller/core/application'
 import type { EventBatch } from '@chronolog/protocol'
 import type { ApplicationOperation } from '@tendriller/core/application'
-import type { RtcDataChannel, WebRtcSession } from '@chronolog/transport-webrtc'
+import type { WebRtcChannels, WebRtcSession } from '@chronolog/transport-webrtc'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from '../browser/event-contract.js'
 
 export type PilotPeerBootstrap = Omit<BrowserEventBootstrap, 'peerUrl' | 'peerToken'>
@@ -14,7 +14,7 @@ export interface PilotBootstrap {
 }
 export interface PeerIntroductionModule {
   readonly introducePeerWorker: (options: { readonly peers: RuntimeApi['peers']; readonly channel: string; readonly peerId: string;
-    readonly signal: AbortSignal; readonly configuration: RTCConfiguration; readonly handoff: (channel: RtcDataChannel) => void }) => Promise<WebRtcSession>
+    readonly signal: AbortSignal; readonly configuration: RTCConfiguration; readonly handoff: (channels: WebRtcChannels) => void }) => Promise<WebRtcSession>
 }
 export interface PilotRouteStats {
   readonly route: 'webrtc'

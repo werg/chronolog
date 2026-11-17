@@ -2,7 +2,7 @@ import { decodeSignedGenesis } from '@chronolog/capabilities'
 import { base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { prepareBrowserIdentity, openBrowserPeer, serveBrowserPeer, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
-import { frameRtcDataChannel, type DataChannelConnection, type RtcDataChannel } from '@chronolog/transport-webrtc'
+import { frameRtcPeerChannels, type PeerDataChannelConnection, type WebRtcChannels } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
 import type { PilotPeerBootstrap, PilotProgress, PilotRouteStats } from './contract.js'
@@ -12,16 +12,16 @@ import { attachPilotPeer } from './peer.js'
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined
 let connection: { close(): Promise<void>; stats(): PilotRouteStats } | undefined
-let opening: DataChannelConnection | undefined, connectionGeneration = 0
+let opening: PeerDataChannelConnection | undefined, connectionGeneration = 0
 let bootstrap: PilotPeerBootstrap | undefined
 const connectionHistory: PilotRouteStats[] = []
 
 /** The Window transfers an untouched channel; keys and application frames stay here. */
-async function connect(channel: RtcDataChannel, connectionId: number): Promise<void> {
+async function connect(channels: WebRtcChannels, connectionId: number): Promise<void> {
   if (peer === undefined || bootstrap === undefined) throw new Error('PILOT_NOT_OPEN')
   await disconnect()
   const generation = ++connectionGeneration
-  const framed = frameRtcDataChannel(channel)
+  const framed = frameRtcPeerChannels(channels)
   opening = framed
   try {
     const authenticated = await attachPilotPeer({ connection: framed, peer, nativeIdentity: bootstrap.nativeIdentity })
@@ -57,7 +57,7 @@ async function disconnect(): Promise<void> {
 endpoint.addEventListener('message', (event) => {
   const request = event.data as { pilot?: string; id?: number; name?: string; bootstrap?: PilotPeerBootstrap;
     createIdentity?: boolean;
-    channel?: RtcDataChannel; connectionId?: number }
+    channels?: WebRtcChannels; connectionId?: number }
   if (request.pilot === undefined) return
   const run = async (): Promise<unknown> => {
     switch (request.pilot) {
@@ -77,7 +77,7 @@ endpoint.addEventListener('message', (event) => {
         serveBrowserPeer(endpoint, peer)
         return { groupId: bytesToBase64Url(genesis.manifest.groupId), identity: bytesToBase64Url(peer.node.identity) }
       }
-      case 'channel': await connect(request.channel!, request.connectionId!); return null
+      case 'channel': await connect(request.channels!, request.connectionId!); return null
       case 'sync': await peer!.transport.catchUp(); await peer!.node.waitForIdle(); return null
       case 'disconnect': await disconnect(); return null
       case 'routeStats': return [...connectionHistory, ...(connection === undefined ? [] : [connection.stats()])]

@@ -1,6 +1,8 @@
 import type { FramedPeerConnection } from '@chronolog/agent-service/framing'
 
 import type { RtcDataChannel } from './types.js'
+import type { WebRtcChannels } from './types.js'
+import { frameRtcLiveChannel, type LiveDataChannelConnection } from './live.js'
 
 export const WEBRTC_LIMITS = Object.freeze({
   frameBytes: 1_048_576 + 65_536,
@@ -26,6 +28,36 @@ export interface DataChannelConnection extends FramedPeerConnection {
   /** Ends on framing failure or channel closure, even if ICE stays connected. */
   readonly signal: AbortSignal
   readonly stats: DataChannelStats
+}
+
+export interface PeerDataChannelConnection extends DataChannelConnection {
+  readonly live: LiveDataChannelConnection
+}
+
+/** Compose separate traffic lanes while retaining one close/authentication lifetime. */
+export function frameRtcPeerChannels(channels: WebRtcChannels,
+  options: Parameters<typeof frameRtcDataChannel>[1] = {}): PeerDataChannelConnection {
+  const reliable = frameRtcDataChannel(channels.reliable, options)
+  let live: LiveDataChannelConnection
+  try { live = frameRtcLiveChannel(channels.live) }
+  catch (error) { void reliable.close(); channels.live.close(); throw error }
+  const signal = AbortSignal.any([reliable.signal, live.signal])
+  const close = async (): Promise<void> => { await Promise.all([reliable.close(), live.close()]) }
+  signal.addEventListener('abort', () => { void close() }, { once: true })
+  if (signal.aborted) void close()
+  const ready = Promise.all([reliable.ready, live.ready]).then(() => undefined)
+  void ready.catch(() => undefined)
+  return {
+    ready, signal, live,
+    get stats() {
+      const a = reliable.stats, b = live.stats
+      return { sentBytes: a.sentBytes + b.sentBytes, receivedBytes: a.receivedBytes + b.receivedBytes,
+        sentPackets: a.sentPackets + b.sentPackets, receivedPackets: a.receivedPackets + b.receivedPackets,
+        queuedSendBytes: a.queuedSendBytes + b.queuedSendBytes, queuedReceiveBytes: a.queuedReceiveBytes + b.queuedReceiveBytes,
+        queuedReceiveFrames: a.queuedReceiveFrames + b.queuedReceiveFrames }
+    },
+    send: (bytes, sendOptions) => reliable.send(bytes, sendOptions), frames: input => reliable.frames(input), close,
+  }
 }
 
 /**

@@ -86,11 +86,12 @@ async function connect(): Promise<void> {
       const attempt = AbortSignal.any([signal, workerLifetime.signal])
       try {
         introduced = await introducePeerWorker({ peers: target.tendril.peers, channel: crypto.randomUUID(), peerId: device!,
-          signal: attempt, configuration: { iceServers: [] }, handoff(channel) {
+          signal: attempt, configuration: { iceServers: [] }, handoff(channels) {
             // Transfer synchronously; only the Worker owns keys, frames and replay.
             activeConnection = ++connectionSequence
             activeWorkerLifetime = workerLifetime
-            attached = command('channel', { channel, connectionId: activeConnection }, 60_000, [channel as RTCDataChannel], attempt)
+            attached = command('channel', { channels, connectionId: activeConnection }, 60_000,
+              [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel], attempt)
             void attached.catch(() => undefined)
           } })
         sessions.push(introduced)
@@ -111,10 +112,6 @@ async function disconnect(): Promise<void> {
   const stopping = previous?.close()
   try { await command('disconnect') } finally { await stopping }
 }
-await connect()
-// The invitation and schema-dependent application calls need the initial state.
-// Reconnect only attaches; the qualification observes its replay frontier separately.
-await command('sync', {}, 120_000)
 const rpc = new WorkerRpcTransport(worker)
 let hold: { promise: Promise<void>; release(): void; receipt: { operationId: string; proposalId: string } | null } | null = null
 const transport: RpcTransport = {
@@ -132,17 +129,28 @@ const transport: RpcTransport = {
   close: () => rpc.close(),
 }
 const client = new ChronologClient({ transport, groupId: opened.groupId })
-const membership = await client.ownership.acceptInvitation(base64UrlToBytes(bootstrap.teamId), { idempotencyKey: 'accept-pilot-team' })
-try {
-  const outcome = await membership.handle.final({ signal: AbortSignal.timeout(30_000) })
-  if (outcome.outcome.type !== 'accepted') throw new Error(`PILOT_MEMBERSHIP_REJECTED: ${JSON.stringify(outcome.outcome)}`)
-} finally { membership.handle.dispose() }
-const backend = createChronologApplicationBackend({ id: bootstrap.applicationId, replica: client, sql: true })
-target.tendril.application.install(backend)
+// Live clients are installed before synchronization or membership finality.
+// The page can start their subscriptions while durable readiness is pending.
 target.tendril.signals.install(client.signals)
+export const applicationReady = (async () => {
+  await connect()
+  // The invitation and schema-dependent application calls need the initial state.
+  // Reconnect only attaches; qualification observes its replay separately.
+  await command('sync', {}, 120_000)
+  const membership = await client.ownership.acceptInvitation(base64UrlToBytes(bootstrap.teamId), { idempotencyKey: 'accept-pilot-team' })
+  try {
+    const outcome = await membership.handle.final({ signal: AbortSignal.timeout(30_000) })
+    if (outcome.outcome.type !== 'accepted') throw new Error(`PILOT_MEMBERSHIP_REJECTED: ${JSON.stringify(outcome.outcome)}`)
+  } finally { membership.handle.dispose() }
+  const backend = createChronologApplicationBackend({ id: bootstrap.applicationId, replica: client, sql: true })
+  target.tendril.application.install(backend)
+  return backend
+})()
+// The page owns the visible readiness error; no top-level await blocks signals.
+void applicationReady.catch(() => undefined)
 
 let closed = false
-target.applicationPilot = {
+const diagnostics: PilotWindow['applicationPilot'] = {
   identity: opened.identity, connectionErrors,
   holdNextSubmission() {
     if (hold !== null) throw new Error('PILOT_REPLY_ALREADY_HELD')
@@ -157,7 +165,7 @@ target.applicationPilot = {
   progress: () => command('progress') as ReturnType<PilotWindow['applicationPilot']['progress']>,
   signalingStats: () => sessions.map(value => ({ ...value.signaling })),
   routeState: () => command('routeState') as ReturnType<PilotWindow['applicationPilot']['routeState']>,
-  events: () => client.events.read(), operation: async operationId => backend.operations.get(operationId),
+  events: () => client.events.read(), operation: async operationId => (await applicationReady).operations.get(operationId),
   async close() {
     if (closed) return
     closed = true
@@ -167,4 +175,5 @@ target.applicationPilot = {
     await navigator.locks.request(`chronolog:${name}`, { mode: 'exclusive' }, () => undefined)
   },
 }
+void applicationReady.then(() => { target.applicationPilot = diagnostics }).catch(() => undefined)
 addEventListener('pagehide', () => { lifetime.abort(new Error('PILOT_OWNER_CLOSED')); worker.terminate(); void supervisor?.close() })

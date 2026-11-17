@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path'
 import os from 'node:os'
 import { syncBuiltinESMExports } from 'node:module'
 
-import { openWebRtcConnection, WEBRTC_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
+import { openWebRtcConnection, WEBRTC_LIMITS } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
 import { createPeerRendezvous, PEER_RENDEZVOUS_LIMITS, PEER_RENDEZVOUS_PROTOCOL, type PeerRendezvous } from '@tendriller/core/peers'
 import { Miniflare, Response as HostResponse } from 'miniflare'
@@ -140,11 +140,13 @@ export async function createPeerRouteFixture(options: {
         createPeerConnection(configuration) {
           const peer = createNativePeerConnection(configuration, { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false })
           peer.addEventListener('connectionstatechange', () => appendTrace({ session: id, event: 'rtc-state', state: peer.connectionState }))
-          peer.addEventListener('datachannel', event => {
-            const channel = (event as Event & { channel: RtcDataChannel }).channel
-            appendTrace({ session: id, event: 'rtc-channel', state: channel.readyState })
-            channel.addEventListener('close', () => { appendTrace({ session: id, event: 'rtc-closed' }); void close() })
-          })
+          const createChannel = peer.createDataChannel.bind(peer)
+          peer.createDataChannel = (label, configuration) => {
+            const channel = createChannel(label, configuration)
+            appendTrace({ session: id, event: 'rtc-channel', lane: label, state: channel.readyState })
+            channel.addEventListener('close', () => { appendTrace({ session: id, event: 'rtc-closed', lane: label }); void close() })
+            return channel
+          }
           return peer
         } })
       measurement.readyMs = performance.now() - started

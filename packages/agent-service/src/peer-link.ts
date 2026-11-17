@@ -64,7 +64,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   readonly link: FeedLink
   readonly peer: PeerAuthorization
   readonly completion: Promise<void>
-  sendSignal(frame: Uint8Array, signal?: AbortSignal): Promise<void>
+  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
   close(): Promise<void>
 }> {
   for (const bytes of [options.groupId, options.identity.publicKeyBytes, options.grantId]) {
@@ -107,7 +107,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     rejectOpening?.(failure)
     for (const request of pending.values()) { clearRequestTimers(request); request.reject(failure) }
     pending.clear()
-    controller.abort(); changes.close()
+    controller.abort(failure); changes.close()
     void options.connection.close().catch(() => undefined)
   }
   const responseProgress = (request: PendingRequest): void => {
@@ -166,19 +166,6 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     if (bytes.length > MAX_RECORD_FRAME) throw new Error('PEER_FRAME_TOO_LARGE')
     const frame = assertCanonicalCbor(bytes)
     if (!Array.isArray(frame) || frame[0] !== 1n) throw new Error('PEER_FRAME_INVALID')
-    if (frame[1] === SIGNAL_DOMAIN) {
-      if (!authenticated || bytes.length > MAX_SIGNAL_BYTES) throw new Error('PEER_SIGNAL_BEFORE_AUTHENTICATION')
-      // Bounded signal work cannot silently drop admitted FIFO messages or
-      // prevent durable range progress. Overload/failure closes this lifetime.
-      if (signalsInFlight >= 8) throw new Error('PEER_SIGNAL_BACKPRESSURE')
-      const incoming = bytes.slice()
-      signalsInFlight += 1
-      void (async () => {
-        if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
-        if (!controller.signal.aborted) await options.receiveSignal?.(incoming)
-      })().catch(fail).finally(() => { signalsInFlight -= 1 })
-      return
-    }
     if (frame[1] !== PEER_DOMAIN || typeof frame[2] !== 'string') throw new Error('PEER_PROTOCOL_DOMAIN_INVALID')
     if (frame[2] === 'hello') {
       if (remote !== null || frame.length !== 8 || !(frame[3] instanceof Uint8Array) || !equalBytes(frame[3], groupId) ||
@@ -263,6 +250,28 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       if (!controller.signal.aborted) fail(new Error('PEER_CONNECTION_ENDED'))
     } catch (error) { fail(error) }
   })()
+  const liveReading = (async () => {
+    if (options.connection.live === undefined) return
+    try {
+      await ready
+      for await (const bytes of options.connection.live.frames(controller.signal)) {
+        if (controller.signal.aborted) break
+        if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
+        const frame = assertCanonicalCbor(bytes)
+        if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
+        // Verification may suspend independently of the reliable history reader.
+        // Once admitted here, failures and overload retire this owned lifetime.
+        if (signalsInFlight >= 8) throw new Error('PEER_SIGNAL_BACKPRESSURE')
+        const incoming = bytes.slice()
+        signalsInFlight += 1
+        void (async () => {
+          if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
+          if (!controller.signal.aborted) await options.receiveSignal?.(incoming)
+        })().catch(fail).finally(() => { signalsInFlight -= 1 })
+      }
+      if (!controller.signal.aborted) fail(new Error('PEER_LIVE_ENDED'))
+    } catch (error) { fail(error) }
+  })()
   const hints = (async () => {
     try {
       await ready
@@ -272,7 +281,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       }
     } catch (error) { fail(error) }
   })()
-  const completion = Promise.all([reading, hints]).then(() => { if (failure !== null) throw failure })
+  const completion = Promise.all([reading, liveReading, hints]).then(() => { if (failure !== null) throw failure })
   void completion.catch(() => undefined)
   // Proof validation can finish before local HELLO dispatch settles. Its ready
   // promise then cannot reject, so opening failures need an independent gate.
@@ -317,8 +326,11 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       readEvidence: (after, limit) => requestRange(null, after, limit), readPayload: requestPayload,
       watch: (signal) => changes.watch(signal) },
     completion,
-    async sendSignal(bytes, signal) {
-      signal?.throwIfAborted()
+    async sendSignal(bytes, sendOptions = {}) {
+      const live = options.connection.live
+      if (live === undefined) throw new Error('PEER_LIVE_UNAVAILABLE')
+      const signal = sendOptions.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, sendOptions.signal])
+      signal.throwIfAborted()
       if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
       if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
       const frame = assertCanonicalCbor(bytes)
@@ -327,25 +339,20 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       // permanent reader grant, and writer authorization at the signal layer
       // does not authorize this recipient after its read grant is revoked.
       const outgoing = bytes.slice()
-      if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
-      signal?.throwIfAborted()
+      if (!await interruptible(authorized(), signal)) throw new Error('PEER_READ_UNAUTHORIZED')
+      signal.throwIfAborted()
       if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
-      // Cancellation cannot recall a frame already handed to the transport.
-      // Independently bound that handoff so a stuck writer retires its route.
-      await new Promise<void>((resolve, reject) => {
-        const clean = (): void => { clearTimeout(timer); controller.signal.removeEventListener('abort', interrupted) }
-        const interrupted = (): void => { clean(); reject(failure ?? new Error('PEER_CONNECTION_CLOSED')) }
-        const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
-        controller.signal.addEventListener('abort', interrupted, { once: true })
-        try {
-          void options.connection.send(outgoing).then(() => { clean(); resolve() }, fail)
-        } catch (error) { fail(error) }
-      })
+      // Live transports must honor cancellation before dispatch. Bound a stuck
+      // implementation too; data already handed to the network is not recallable.
+      const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
+      try { await interruptible(live.send(outgoing, { signal }), signal) }
+      catch (error) { if (!signal.aborted) fail(error); throw error }
+      finally { clearTimeout(timer) }
     },
     async close() {
       if (!controller.signal.aborted) {
         for (const request of pending.values()) { clearRequestTimers(request); request.reject(new Error('PEER_CONNECTION_CLOSED')) }
-        pending.clear(); controller.abort(); changes.close()
+        pending.clear(); controller.abort(new Error('PEER_CONNECTION_CLOSED')); changes.close()
         await options.connection.close()
       }
       await completion.catch(() => undefined)
@@ -361,4 +368,13 @@ function validateRange(after: bigint, limit: number): void {
 
 function validPayloadHash(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value)
+}
+
+function interruptible<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) { void operation.catch(() => undefined); return Promise.reject(signal.reason) }
+  return new Promise((resolve, reject) => {
+    const abort = (): void => { reject(signal.reason) }
+    signal.addEventListener('abort', abort, { once: true })
+    void operation.then(resolve, reject).finally(() => { signal.removeEventListener('abort', abort) })
+  })
 }

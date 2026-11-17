@@ -22,9 +22,15 @@ afterEach(async () => {
 })
 
 function connections() {
-  const leftToRight = new TransformStream<Uint8Array, Uint8Array>(), rightToLeft = new TransformStream<Uint8Array, Uint8Array>()
-  return [framePeerStream({ readable: rightToLeft.readable, writable: leftToRight.writable }),
-    framePeerStream({ readable: leftToRight.readable, writable: rightToLeft.writable })] as const
+  const lane = () => {
+    const leftToRight = new TransformStream<Uint8Array, Uint8Array>(), rightToLeft = new TransformStream<Uint8Array, Uint8Array>()
+    return [framePeerStream({ readable: rightToLeft.readable, writable: leftToRight.writable }),
+      framePeerStream({ readable: leftToRight.readable, writable: rightToLeft.writable })] as const
+  }
+  const reliable = lane(), live = lane()
+  return reliable.map((connection, index) => ({ ...connection, live: live[index]!,
+    async close() { await Promise.all([connection.close(), live[index]!.close()]) } })) as unknown as
+    readonly [typeof reliable[0] & { readonly live: typeof live[0] }, typeof reliable[1] & { readonly live: typeof live[1] }]
 }
 
 async function portable() {
@@ -107,11 +113,10 @@ async function signalSession(receive?: (frame: Uint8Array) => Promise<void>, opt
   let active = true, incomingActive = true, guard: (() => Promise<void>) | undefined
   const groupId = new Uint8Array(32).fill(31), grantId = new Uint8Array(32).fill(32)
   const [sender, receiver] = await Promise.all([
-    openAuthenticatedPeerLink({ connection: { ...outgoing, async send(bytes) {
-      const frame = assertCanonicalCbor(bytes)
-      if (Array.isArray(frame) && frame[1] === SIGNAL_DOMAIN) { sent.push(bytes.slice()); await options?.dispatch?.() }
-      await outgoing.send(bytes)
-    } }, local: server.transport.asLink(), identity: server.identity, groupId, grantId,
+    openAuthenticatedPeerLink({ connection: { ...outgoing, live: { ...outgoing.live, async send(bytes, sendOptions) {
+      sent.push(bytes.slice()); await options?.dispatch?.()
+      await outgoing.live.send(bytes, sendOptions)
+    } } }, local: server.transport.asLink(), identity: server.identity, groupId, grantId,
       async authorizePeer() { await guard?.(); return active },
       ...(options?.sendTimeoutMs === undefined ? {} : { sendTimeoutMs: options.sendTimeoutMs }) }),
     openAuthenticatedPeerLink({ connection: incoming, local: client.transport.asLink(), identity: client.identity,
@@ -251,6 +256,18 @@ describe('authenticated framed range synchronization', () => {
     expect(session.sent).toEqual([signal])
   })
 
+  it('cancels live dispatch during asynchronous authorization without later leaking the frame', async () => {
+    const session = await signalSession(), gate = session.block(), controller = new AbortController()
+    const sending = session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'expired preview']), { signal: controller.signal })
+    const rejected = expect(sending).rejects.toThrow('preview expired')
+    await gate.blocked
+    controller.abort(new Error('preview expired'))
+    await rejected
+    gate.release()
+    await Promise.resolve()
+    expect(session.sent).toEqual([])
+  })
+
   it.each(['revocation', 'close'] as const)('does not release a signal after %s during asynchronous reader authorization', async ending => {
     const session = await signalSession(), gate = session.block()
     const sending = session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'private presence']))
@@ -274,7 +291,7 @@ describe('authenticated framed range synchronization', () => {
   it('honors cancellation during asynchronous reader authorization without closing the healthy route', async () => {
     const session = await signalSession(), gate = session.block(), controller = new AbortController()
     const frame = encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'cancel before transport handoff'])
-    const sending = session.sender.sendSignal(frame, controller.signal)
+    const sending = session.sender.sendSignal(frame, { signal: controller.signal })
     const rejected = expect(sending).rejects.toThrow('cancel this signal')
     await gate.blocked
     controller.abort(new Error('cancel this signal')); gate.release(); await rejected

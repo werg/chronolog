@@ -35,15 +35,30 @@ async function replicas(writer = true) {
   }
   return { identities, snapshots, transports, services }
 }
-async function connect(left: GovernedPeerService, right: GovernedPeerService, expected?: Uint8Array) {
-  const forward = new TransformStream<Uint8Array, Uint8Array>(), backward = new TransformStream<Uint8Array, Uint8Array>()
-  const connections = [framePeerStream({ readable: backward.readable, writable: forward.writable }),
-    framePeerStream({ readable: forward.readable, writable: backward.writable })]
+async function connect(left: GovernedPeerService, right: GovernedPeerService, expected?: Uint8Array, withLive = true) {
+  const lane = () => {
+    const forward = new TransformStream<Uint8Array, Uint8Array>(), backward = new TransformStream<Uint8Array, Uint8Array>()
+    return [framePeerStream({ readable: backward.readable, writable: forward.writable }),
+      framePeerStream({ readable: forward.readable, writable: backward.writable })]
+  }
+  const reliable = lane(), live = withLive ? lane() : undefined
+  const connections = reliable.map((connection, index) => ({ ...connection, ...(live === undefined ? {} : { live: live[index]! }),
+    async close() { await Promise.all([connection.close(), live?.[index]?.close()]) } }))
   return Promise.all([left.connectPeer({ connection: connections[0]!, ...(expected === undefined ? {} : { peerIdentity: expected }) }),
     right.connectPeer({ connection: connections[1]! })])
 }
 
 describe('owned governed peer composition', () => {
+  it('attaches reliable-only peers for replication without claiming a live route', async () => {
+    const { services, transports } = await replicas()
+    const sessions = await connect(services[0]!, services[1]!, undefined, false)
+    expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+    expect((await transports[0]!.status()).peers).toContain(transports[1]!.identity)
+    await expect(services[0]!.signals.send('typing', true)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+    await transports[0]!.catchUp()
+    expect(await transports[0]!.history()).toEqual([])
+  })
+
   it('opens without a publisher grant, receives read-only, and selects a later topic grant dynamically', async () => {
     const { services, identities, snapshots, transports } = await replicas(false)
     const [sender, receiver] = services

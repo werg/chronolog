@@ -1,7 +1,7 @@
 # WebRTC peer transport
 
-This package carries Chronolog's existing authenticated peer protocol over a
-reliable ordered WebRTC data channel. A reachable resident accepts one HTTPS
+This package carries Chronolog's authenticated peer protocol over one WebRTC
+connection with independent reliable and live data channels. A reachable resident accepts one HTTPS
 offer and returns one answer; the page host need not participate. An explicitly
 coordinated pair can also use a separate signaling service. Once connected, records, finality
 proofs, detached application bodies and ephemeral signals travel over WebRTC.
@@ -57,9 +57,9 @@ const signaling = createHttpWebRtcSignaling({
 })
 const session = await negotiateWebRtc({
   role: 'offerer', signaling, configuration: { iceServers },
-  onDataChannel(channel) {
-    const transferable = channel as RTCDataChannel
-    worker.postMessage({ type: 'peer-channel', channel: transferable }, [transferable])
+  onDataChannels(channels) {
+    worker.postMessage({ type: 'peer-channels', channels },
+      [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel])
   },
 })
 ```
@@ -241,8 +241,8 @@ be reported separately from signaling counts and provider billing.
 
 ## Browser ownership
 
-`RTCPeerConnection` negotiation belongs to the Window. Transfer its data channel
-immediately to the exclusive Chronolog Worker, which retains private keys,
+`RTCPeerConnection` negotiation belongs to the Window. Transfer both data channels
+together immediately to the exclusive Chronolog Worker, which retains private keys,
 OPFS, authentication, frame processing and synchronization:
 
 ```ts
@@ -251,15 +251,15 @@ const session = await negotiateWebRtc({
   role,
   signaling,
   configuration: { iceServers },
-  onDataChannel(channel) {
-    const transferable = channel as RTCDataChannel
-    worker.postMessage({ type: 'peer-channel', channel: transferable }, [transferable])
+  onDataChannels(channels) {
+    worker.postMessage({ type: 'peer-channels', channels },
+      [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel])
   },
   signal,
 })
 
-// DedicatedWorker, receiving the transferred RTCDataChannel.
-const connection = frameRtcDataChannel(channel)
+// DedicatedWorker, receiving both transferred RTCDataChannels.
+const connection = frameRtcPeerChannels(channels)
 await connection.ready
 const authenticated = await openAuthenticatedPeerLink({
   connection, local: transport.asLink(), groupId, identity, grantId,
@@ -270,7 +270,7 @@ void authenticated.completion.finally(detach).catch(reportConnectionFailure)
 ```
 
 The handoff callback must be synchronous. Do not send, await, delay, wrap the
-callback in a Promise, or store a data channel for later transfer. The WebRTC
+callback in a Promise, or store either data channel for later transfer. The WebRTC
 transfer operation is only valid immediately after creation or receipt. A
 browser without channel-transfer support fails explicitly. `session.close()`
 closes the underlying peer connection; release the authenticated Worker session
@@ -289,8 +289,13 @@ maximum. Both sides wait for ICE gathering completion. A negotiation has an
 explicit deadline and cancellation signal; it cannot wait forever for a lost
 answer or abandoned channel.
 
-The data channel uses protocol `chronolog.peer.v1`, reliable delivery and
-ordered messages. Each packet is at most 16 KiB. The framing header commits a
+Both endpoints create fixed negotiated channels using protocol
+`chronolog.peer.v2`: stream 0 carries reliable ordered history/control, while
+stream 1 carries unordered live datagrams with `maxRetransmits: 0`. This allows
+one synchronous transfer of both untouched channels to the Worker. Unexpected
+remotely opened channels are refused.
+
+The reliable lane uses a bounded framing protocol. Each packet is at most 16 KiB. The framing header commits a
 protocol version, message kind, complete frame size and exact fragment offset.
 Unexpected messages, fragments, credit, partial frames and unreliable channels
 fail visibly.
@@ -305,7 +310,22 @@ channel rejects pending sends and wakes blocked readers. These bounds are local
 resource guarantees; protocol authentication remains the responsibility of the
 Chronolog session above them.
 
-`ready` requires both local and remote framing HELLO messages. Its 10-second
+The live lane carries one original signed signal per datagram, up to 16 KiB.
+It has a separate 64 KiB SCTP buffered-amount budget and at most 64 queued
+received datagrams. A congested send rejects immediately; a slow receiver drops
+its oldest queued datagram and increments `live.stats.droppedPackets`. No history
+credit, detached-body queue or reliable retransmission blocks this lane. This
+isolates application queues; both lanes still share the connection's network
+bandwidth and SCTP association, so it is not a reserved-bandwidth guarantee.
+
+Signals are released only after the reliable lane's authenticated peer handshake
+and current reader checks. Signal signatures, scope, topics, replay protection
+and expiry remain the signal channel's responsibility. Cancellation propagates
+to local live dispatch. A send already handed to SCTP cannot be recalled; its
+receiver still enforces expiry. There is no fallback that inserts a live signal
+into reliable history when the independent lane is absent.
+
+`ready` requires the live lane to open and both local and remote reliable framing HELLO messages. Its 10-second
 HELLO deadline starts after the local channel opens, allowing ICE negotiation
 to finish first. Worker consumers await `ready` before starting Chronolog's
 separate authenticated-session handshake deadline.
@@ -313,7 +333,8 @@ separate authenticated-session handshake deadline.
 ## Verification
 
 `packages/transport-webrtc/src/channel.test.ts` checks fragmentation, exact bytes,
-credit/backpressure, invalid frames and close behavior. `native.test.ts` connects
+credit/backpressure, independent live delivery under stalled history, live loss
+bounds, cancellation, invalid frames and close behavior. `native.test.ts` connects
 two real Werift implementations over loopback ICE/DTLS/SCTP and exchanges large
 frames after signaling closes and verifies their measured direct route.
 `supervisor.test.ts` checks bounded retry, flapping sessions, independent waiter
@@ -330,7 +351,7 @@ CHRONOLOG_CHROMIUM_EXECUTABLE=/path/to/chromium \
 ```
 
 The browser gate runs a real native governed finality service and a Chromium
-OPFS event peer. It transfers the RTCDataChannel into the owning Worker, closes
+OPFS event peer. It transfers both RTCDataChannels into the owning Worker, closes
 the loopback HTTP page/signaling host, publishes from both peers, retries an
 original operation, transfers a 512 KiB content-addressed body and compares
 final events plus original-record digests. Its JSON report records exact source

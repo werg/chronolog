@@ -137,9 +137,10 @@ headers, ownership, and qualification commands.
 
 [WebRTC transport](../packages/transport-webrtc/README.md) introduces peers with one
 complete SDP offer and answer, then closes signaling. The browser transfers its
-data channel directly into the owning Worker. Native peers use the optional
+reliable and live data channels together into the owning Worker. Native peers use the optional
 Werift adapter. The existing authenticated peer session exchanges original
-records, detached bodies and finality evidence; the host does not carry ordinary
+records, detached bodies and finality evidence on the reliable lane, with
+separately bounded expiring signals on the live lane; the host does not carry ordinary
 application frames. STUN/TURN configuration and reconnection are explicit.
 
 `tools/test-browser-webrtc.ts` verifies actual native/Chromium interoperability,

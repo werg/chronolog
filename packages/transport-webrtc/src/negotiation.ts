@@ -1,17 +1,17 @@
-import { frameRtcDataChannel, WEBRTC_LIMITS } from './channel.js'
-import type { DataChannelConnection } from './channel.js'
+import { frameRtcPeerChannels, WEBRTC_LIMITS } from './channel.js'
+import type { PeerDataChannelConnection } from './channel.js'
 import { observeWebRtcRoute } from './route.js'
-import type { PeerDescription, RtcDataChannel, RtcPeerConnection, WebRtcOptions, WebRtcSession } from './types.js'
+import type { PeerDescription, RtcPeerConnection, WebRtcChannels, WebRtcOptions, WebRtcSession } from './types.js'
 
-const LABEL = 'chronolog', PROTOCOL = 'chronolog.peer.v1'
+const PROTOCOL = 'chronolog.peer.v2'
 
 /**
- * The callback runs synchronously at channel creation/receipt, so a browser can
- * transfer the channel straight to its owning Worker before it ceases to be
- * transferable. Only negotiation remains on the page.
+ * Both fixed negotiated channels are created synchronously on each endpoint.
+ * The callback transfers them together to their owning Worker before either
+ * ceases to be transferable. Only negotiation remains on the page.
  */
 export async function negotiateWebRtc(options: WebRtcOptions & {
-  readonly onDataChannel: (channel: RtcDataChannel) => void
+  readonly onDataChannels: (channels: WebRtcChannels) => void
 }): Promise<WebRtcSession> {
   const timeoutMs = options.timeoutMs ?? 30_000
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error('WEBRTC_TIMEOUT_INVALID')
@@ -27,11 +27,9 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     throw error
   }
   const controller = new AbortController(), signal = controller.signal
-  let channel: RtcDataChannel | undefined, negotiationFailed = false
+  let negotiationFailed = false
   let closing: Promise<void> | undefined, outcome: WebRtcSession | undefined
   let negotiationError: unknown
-  let channelCreated!: () => void
-  const channelReady = new Promise<void>(resolve => { channelCreated = resolve })
   let sentMessages = 0, receivedMessages = 0, sentBytes = 0, receivedBytes = 0
   const close = (): Promise<void> => {
     if (closing !== undefined) return closing
@@ -50,21 +48,14 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     }
   }
   connection.addEventListener('connectionstatechange', failed)
-  const accept = (incoming: RtcDataChannel): void => {
-    if (channel !== undefined || incoming.label !== LABEL || !incoming.ordered || incoming.maxPacketLifeTime !== null || incoming.maxRetransmits !== null) {
-      incoming.close(); controller.abort(new Error('WEBRTC_CHANNEL_UNEXPECTED')); void close().catch(() => undefined); return
-    }
-    channel = incoming
-    try {
-      const returned: unknown = options.onDataChannel(incoming)
-      if (typeof returned === 'object' && returned !== null && 'then' in returned) {
-        void Promise.resolve(returned).catch(() => undefined)
-        throw new Error('WEBRTC_CHANNEL_HANDOFF_MUST_BE_SYNCHRONOUS')
-      }
-      channelCreated()
-    } catch (error) { controller.abort(error) }
+  // Only the two predeclared lanes belong to this connection. A remote DCEP
+  // channel cannot inject a new unbound application path into the session.
+  const dataChannel: EventListener = event => {
+    const unexpected = (event as RTCDataChannelEvent).channel
+    unexpected.close()
+    controller.abort(new Error('WEBRTC_CHANNEL_UNEXPECTED'))
+    void close().catch(() => undefined)
   }
-  const dataChannel: EventListener = event => accept((event as RTCDataChannelEvent).channel)
   connection.addEventListener('datachannel', dataChannel)
   if (options.signal?.aborted === true) abort()
   const timeout = setTimeout(() => controller.abort(new Error('WEBRTC_NEGOTIATION_TIMEOUT')), timeoutMs)
@@ -83,9 +74,17 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     sentMessages += 1; sentBytes += new TextEncoder().encode(description.sdp).length
   }
   try {
+    const channels: WebRtcChannels = {
+      reliable: connection.createDataChannel('chronolog.reliable', { negotiated: true, id: 0, ordered: true, protocol: PROTOCOL }),
+      live: connection.createDataChannel('chronolog.live', { negotiated: true, id: 1, ordered: false, maxRetransmits: 0, protocol: PROTOCOL }),
+    }
+    const returned: unknown = options.onDataChannels(channels)
+    if (typeof returned === 'object' && returned !== null && 'then' in returned) {
+      void Promise.resolve(returned).catch(() => undefined)
+      throw new Error('WEBRTC_CHANNEL_HANDOFF_MUST_BE_SYNCHRONOUS')
+    }
     descriptions = options.signaling.messages[Symbol.asyncIterator]()
     if (options.role === 'offerer') {
-      accept(connection.createDataChannel(LABEL, { ordered: true, protocol: PROTOCOL }))
       await interruptible(connection.setLocalDescription(await interruptible(connection.createOffer(), signal)), signal)
       await publish('offer')
       await interruptible(connection.setRemoteDescription(await receivedDescription('answer')), signal)
@@ -95,7 +94,6 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
       await publish('answer')
     }
     await waitFor(connection, 'connectionstatechange', () => connection.connectionState === 'connected', signal)
-    await interruptible(channelReady, signal)
     signal.throwIfAborted()
     outcome = { connection, signal, signaling: { sentMessages, receivedMessages, sentBytes, receivedBytes },
       getRoute: () => observeWebRtcRoute(connection), close }
@@ -114,10 +112,10 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
   return outcome
 }
 
-export async function openWebRtcConnection(options: WebRtcOptions): Promise<DataChannelConnection & { readonly session: WebRtcSession }> {
+export async function openWebRtcConnection(options: WebRtcOptions): Promise<PeerDataChannelConnection & { readonly session: WebRtcSession }> {
   const deadline = Date.now() + (options.timeoutMs ?? 30_000)
-  let framed: DataChannelConnection | undefined
-  const session = await negotiateWebRtc({ ...options, onDataChannel(channel) { framed = frameRtcDataChannel(channel) } })
+  let framed: PeerDataChannelConnection | undefined
+  const session = await negotiateWebRtc({ ...options, onDataChannels(channels) { framed = frameRtcPeerChannels(channels) } })
   if (framed === undefined) { await session.close(); throw new Error('WEBRTC_CHANNEL_MISSING') }
   const selected = framed
   const retire = (): void => { void session.close().catch(() => undefined) }
@@ -128,7 +126,8 @@ export async function openWebRtcConnection(options: WebRtcOptions): Promise<Data
   try { await interruptible(selected.ready, AbortSignal.any([handshake.signal, session.signal])) }
   catch (error) { await selected.close(); await session.close(); throw error }
   finally { clearTimeout(timer) }
-  return { ready: selected.ready, signal: selected.signal, session, get stats() { return selected.stats }, send: bytes => selected.send(bytes),
+  return { ready: selected.ready, signal: selected.signal, session, live: selected.live, get stats() { return selected.stats },
+    send: (bytes, sendOptions) => selected.send(bytes, sendOptions),
     frames: signal => selected.frames(signal), async close() { await selected.close(); await session.close() } }
 }
 

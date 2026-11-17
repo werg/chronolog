@@ -20,7 +20,13 @@ export interface RtcPeerConnection {
   readonly connectionState: string
   /** Optional on adapters; unavailable observations must remain unknown. */
   getStats?(): Promise<{ forEach(callback: (value: unknown) => void): void }>
-  createDataChannel(label: string, options: { readonly ordered: boolean; readonly protocol: string }): RtcDataChannel
+  createDataChannel(label: string, options: {
+    readonly ordered: boolean
+    readonly protocol: string
+    readonly negotiated: true
+    readonly id: number
+    readonly maxRetransmits?: number
+  }): RtcDataChannel
   createOffer(): Promise<RTCSessionDescriptionInit>
   createAnswer(): Promise<RTCSessionDescriptionInit>
   setLocalDescription(description: RTCSessionDescriptionInit): Promise<void>
@@ -46,6 +52,12 @@ export interface WebRtcOptions {
   readonly createPeerConnection?: (configuration: RTCConfiguration) => RtcPeerConnection
   readonly signal?: AbortSignal
   readonly timeoutMs?: number
+}
+
+/** Two independent SCTP streams belonging to one authenticated peer session. */
+export interface WebRtcChannels {
+  readonly reliable: RtcDataChannel
+  readonly live: RtcDataChannel
 }
 
 export interface WebRtcSession {

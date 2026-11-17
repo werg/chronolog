@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { frameRtcDataChannel, WEBRTC_LIMITS } from './channel.js'
+import { frameRtcDataChannel, frameRtcPeerChannels, WEBRTC_LIMITS } from './channel.js'
+import { frameRtcLiveChannel, WEBRTC_LIVE_LIMITS } from './live.js'
 import type { RtcDataChannel } from './types.js'
 
 class Channel extends EventTarget implements RtcDataChannel {
   readonly label = 'chronolog'
-  readonly ordered = true
   readonly maxPacketLifeTime = null
-  readonly maxRetransmits = null
+  constructor(readonly ordered = true, readonly maxRetransmits: number | null = null) { super() }
   readyState = 'connecting'
   bufferedAmount = 0
   bufferedAmountLowThreshold = 0
@@ -139,5 +139,80 @@ describe('reliable WebRTC frame transport', () => {
     const channel = new Channel()
     Object.defineProperty(channel, 'maxRetransmits', { value: 0 })
     expect(() => frameRtcDataChannel(channel)).toThrow('WEBRTC_RELIABLE_ORDERED_REQUIRED')
+  })
+})
+
+
+describe('independent live WebRTC lane', () => {
+  function channels(ordered: boolean, retransmits: number | null) {
+    const left = new Channel(ordered, retransmits), right = new Channel(ordered, retransmits)
+    left.other = right; right.other = left
+    return { left, right, open() {
+      left.readyState = right.readyState = 'open'
+      left.dispatchEvent(new Event('open')); right.dispatchEvent(new Event('open'))
+    } }
+  }
+
+  it('delivers live datagrams while reliable history has exhausted receiver credit', async () => {
+    const history = channels(true, null), live = channels(false, 0)
+    const options = { maxFrameBytes: 32, queueBytes: 32, queueFrames: 1 }
+    const a = frameRtcPeerChannels({ reliable: history.left, live: live.left }, options)
+    const b = frameRtcPeerChannels({ reliable: history.right, live: live.right }, options)
+    const received = b.live.frames()[Symbol.asyncIterator]()
+    history.open(); live.open()
+    let completed = false
+    let waiting: Promise<void> | undefined
+    try {
+      await Promise.all([a.ready, b.ready])
+      await a.send(new Uint8Array(32).fill(1))
+      waiting = a.send(new Uint8Array(32).fill(2)).then(() => { completed = true })
+      void waiting.catch(() => undefined)
+      await a.live.send(new Uint8Array([7]))
+      expect((await received.next()).value).toEqual(new Uint8Array([7]))
+      expect(completed).toBe(false)
+      expect(history.left.sent.filter(packet => packet[3] === 2)).toHaveLength(1)
+      expect(live.left.sent).toEqual([new Uint8Array([7])])
+    } finally { await Promise.all([a.close(), b.close()]); await waiting?.catch(() => undefined); await received.return?.() }
+  })
+
+  it('never queues a cancelled, disconnected or congested live send', async () => {
+    const source = channels(false, 0), a = frameRtcLiveChannel(source.left), b = frameRtcLiveChannel(source.right)
+    try {
+      await expect(a.send(new Uint8Array([1]))).rejects.toThrow('WEBRTC_LIVE_NOT_OPEN')
+      source.open()
+      const controller = new AbortController(); controller.abort(new Error('preview expired'))
+      await expect(a.send(new Uint8Array([2]), { signal: controller.signal })).rejects.toThrow('preview expired')
+      source.left.bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
+      await expect(a.send(new Uint8Array([3]))).rejects.toThrow('WEBRTC_LIVE_BACKPRESSURE')
+      source.left.bufferedAmount = 0
+      await a.send(new Uint8Array([4]))
+      expect(source.left.sent).toEqual([new Uint8Array([4])])
+    } finally { await Promise.all([a.close(), b.close()]) }
+  })
+
+  it('bounds a slow live consumer and drops its oldest pending datagrams without a retry queue', async () => {
+    const source = channels(false, 0), a = frameRtcLiveChannel(source.left), b = frameRtcLiveChannel(source.right)
+    source.open()
+    const received = b.frames()[Symbol.asyncIterator]()
+    try {
+      for (let index = 0; index <= WEBRTC_LIVE_LIMITS.queueFrames; index++) await a.send(new Uint8Array([index]))
+      expect(b.stats.queuedReceiveFrames).toBe(WEBRTC_LIVE_LIMITS.queueFrames)
+      expect(b.stats.droppedPackets).toBe(1)
+      expect((await received.next()).value).toEqual(new Uint8Array([1]))
+      await expect(a.send(new Uint8Array(WEBRTC_LIVE_LIMITS.frameBytes + 1))).rejects.toThrow('WEBRTC_LIVE_FRAME_TOO_LARGE')
+    } finally { await Promise.all([a.close(), b.close()]); await received.return?.() }
+  })
+
+  it('rejects a malformed live frame and closes the shared connection lifetime', async () => {
+    const history = channels(true, null), live = channels(false, 0)
+    const a = frameRtcPeerChannels({ reliable: history.left, live: live.left })
+    const b = frameRtcPeerChannels({ reliable: history.right, live: live.right })
+    history.open(); live.open()
+    try {
+      await Promise.all([a.ready, b.ready])
+      live.right.dispatchEvent(new MessageEvent('message', { data: new ArrayBuffer(WEBRTC_LIVE_LIMITS.frameBytes + 1) }))
+      expect(b.signal.aborted).toBe(true)
+      expect(history.right.readyState).toBe('closed')
+    } finally { await Promise.all([a.close(), b.close()]) }
   })
 })

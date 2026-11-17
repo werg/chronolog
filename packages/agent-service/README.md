@@ -323,11 +323,14 @@ an external call atomic with a later cancellation.
 
 ## Authenticated peer connections
 
-The default browser/native composition uses the reliable ordered data channel
-from [`@chronolog/transport-webrtc`](../transport-webrtc/README.md). The page
-negotiates the connection and synchronously transfers its untouched channel to
-the exclusive replica Worker. The Worker frames the channel, awaits the bounded
-framing handshake, then authenticates the Chronolog peer and attaches replication.
+The default browser/native composition uses independent reliable and live data
+channels from [`@chronolog/transport-webrtc`](../transport-webrtc/README.md). The
+page negotiates one connection and synchronously transfers both untouched
+channels to the exclusive replica Worker. The Worker frames them, awaits the
+bounded reliable handshake, then authenticates the Chronolog peer and attaches
+replication. Signals use the separate unordered datagram lane after the same
+authentication; a large body or exhausted history credit cannot queue a signal
+behind durable replication. A reliable-only stream has no implicit signal path.
 A reachable resident accepts one direct HTTPS offer/answer; optional Tendriller
 rendezvous requires both endpoints to join the same attempt. Neither introduction
 path carries application frames or supplies an automatic hosted data fallback.
@@ -362,7 +365,7 @@ connections share the same signed record store. The portable browser transport
 uses `asLink()` and `connect()`. The daemon module context exposes `signals` on every governed replica and
 `finality` only when it owns the signed native provider.
 `connectPeer({ connection, peerIdentity? })` performs active reader authorization,
-attaches replication and live signal routes, and returns a session with an
+attaches replication and the connection's optional live signal lane, and returns a session with an
 `AbortSignal`, `completion` and `close()`. No writer grant or callback injection is
 needed to receive signals. Sending selects the currently active writer credential
 for that topic at the time of publication. `connect()` and `connectLink()` return a detach function bound to that
@@ -372,9 +375,11 @@ explicit `disconnect(identity)` / `disconnectLink(identity)` methods deliberatel
 remove whichever connection currently owns that identity.
 
 Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
-use `chronolog/signal/v1`. The session multiplexes bounded range responses,
-content-addressed payload responses, change hints, and best-effort signals. Signals
-cannot hold up retained range handling. At most eight signal callbacks run per
+use `chronolog/signal/v1`. The reliable lane multiplexes bounded range responses,
+content-addressed payload responses and change hints. Best-effort signals use
+the separately bounded `connection.live` lane after the same peer authentication;
+a reliable-only connection provides replication without advertising a signal route.
+Signals cannot hold up retained range handling. At most eight signal callbacks run per
 connection; exceeding this bound fails the session before application acceptance. There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement

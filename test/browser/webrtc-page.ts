@@ -1,4 +1,4 @@
-import type { HttpWebRtcSignaling, RtcDataChannel, SupervisedPeerSession, WebRtcSession, supervisePeerSession } from '@chronolog/transport-webrtc'
+import type { HttpWebRtcSignaling, WebRtcChannels, SupervisedPeerSession, WebRtcSession, supervisePeerSession } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contract.js'
 
@@ -6,7 +6,7 @@ type ResidentSession = WebRtcSession & { readonly introduction: HttpWebRtcSignal
 interface ResidentRecipe {
   connectResidentWorker(this: void, options: { readonly endpoint: string; readonly headers: HeadersInit; readonly configuration: RTCConfiguration;
     readonly signal: AbortSignal; readonly retry: { readonly initialDelayMs: number; readonly maxDelayMs: number; readonly maxAttempts: number };
-    readonly attach: (channel: RtcDataChannel, signal: AbortSignal) => Promise<SupervisedPeerSession> }): ReturnType<typeof supervisePeerSession<ResidentSession>>
+    readonly attach: (channels: WebRtcChannels, signal: AbortSignal) => Promise<SupervisedPeerSession> }): ReturnType<typeof supervisePeerSession<ResidentSession>>
 }
 // This module is bundled from the exact public contrib recipe supplied to the CLI.
 const { connectResidentWorker } = await import(new URL('./connect-resident-worker.js', import.meta.url).href) as ResidentRecipe
@@ -46,7 +46,7 @@ function command(method: string, fields: Record<string, unknown> = {}, transfer:
     catch (error) { clear(); pending.delete(id); reject(error) }
   })
 }
-function attach(channel: RtcDataChannel, signal: AbortSignal): Promise<SupervisedPeerSession> {
+function attach(channels: WebRtcChannels, signal: AbortSignal): Promise<SupervisedPeerSession> {
   const attachmentId = ++attachmentSequence, controller = new AbortController()
   attachments.set(attachmentId, controller)
   let closing: Promise<void> | undefined
@@ -63,7 +63,7 @@ function attach(channel: RtcDataChannel, signal: AbortSignal): Promise<Supervise
   const abort = (): void => { controller.abort(signal.reason); void close().catch(() => undefined) }
   signal.addEventListener('abort', abort, { once: true })
   // command transfers synchronously, before this function returns its promise.
-  return command('channel', { channel, attachmentId }, [channel as RTCDataChannel], signal).then(
+  return command('channel', { channels, attachmentId }, [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel], signal).then(
     () => ({ signal: controller.signal, close }),
     async (error: unknown) => { await close().catch(() => undefined); throw error })
 }

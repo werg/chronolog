@@ -28,7 +28,10 @@ interpret a SQL group's history.
 
 Both governed browser profiles expose `peer.signals` and
 `peer.connectPeer({ connection, peerIdentity? })`. Supply a ready framed connection,
-for example `frameRtcDataChannel(channel)` after its `ready` promise resolves.
+for example `frameRtcPeerChannels({ reliable, live })` after its `ready` promise
+resolves. Its independent live lane carries signals without waiting for history
+credits or large body transfers. A reliable-only connection carries replication
+and installs no signal route.
 The runtime selects the local reader grant, verifies the remote current reader,
 attaches replication and signals through the same governed service used by native
 peers, and returns `{ peer, signal, completion, close }`. The session's `signal`

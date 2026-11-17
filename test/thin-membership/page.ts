@@ -58,9 +58,10 @@ async function connect(): Promise<unknown> {
       let introduced: WebRtcSession | undefined
       try {
         let attached: Promise<unknown> | undefined
-        introduced = await negotiateWebRtc({ role: 'offerer', signaling, signal, configuration: { iceServers: [] }, onDataChannel(channel) {
+        introduced = await negotiateWebRtc({ role: 'offerer', signaling, signal, configuration: { iceServers: [] }, onDataChannels(channels) {
           activeConnection = ++connectionSequence
-          attached = command({ method: 'channel', channel, connectionId: activeConnection }, [channel as RTCDataChannel], signal)
+          attached = command({ method: 'channel', channels, connectionId: activeConnection },
+            [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel], signal)
           void attached.catch(() => undefined)
         } })
         introductions.push(signaling.stats)
