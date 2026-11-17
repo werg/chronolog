@@ -8,7 +8,7 @@ import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolo
 import { applicationDefinitionDigest, defineApplication, defineCommand } from './definition.js'
 import { openApplicationDevice } from './device.js'
 import { openPeerApplication } from './runtime.js'
-import { connectApplications, type ApplicationEvent } from './session.js'
+import { APPLICATION_EVENT_CURSOR_LIMIT, connectApplications, type ApplicationEvent } from './session.js'
 
 const definition = defineApplication({ id: 'projection-example', version: '1', commands: {
   say: defineCommand({ description: 'Post a message', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
@@ -69,6 +69,39 @@ const messages = (reduce = (state: string[], event: ApplicationEvent) => [...sta
 })
 
 describe('owned durable projections', () => {
+  it('advances and reopens a checkpoint with the largest admitted topic filter', async () => {
+    const f = await fixture(), reduce = vi.fn((state: string[], event: ApplicationEvent) => [...state, event.operationId])
+    const topics = ['message', ...Array.from({ length: 127 }, (_, index) => `t${String(index).padStart(3, '0')}${'x'.repeat(124)}`)]
+    const definition = { ...messages(reduce), topics }, projection = f.a.project(definition)
+    expect((await projection.read()).state).toEqual([])
+    await (await f.a.command('say', 'one', { operationId: 'one' })).applied()
+    expect((await projection.read()).state).toEqual(['one'])
+    await f.a.close()
+    const reopened = await f.open(0), resumed = reopened.project(definition)
+    expect((await resumed.read()).state).toEqual(['one']); expect(reduce).toHaveBeenCalledOnce()
+    await (await reopened.command('say', 'two', { operationId: 'two' })).applied()
+    expect((await resumed.read()).state).toEqual(['one', 'two']); expect(reduce).toHaveBeenCalledTimes(2)
+  })
+
+  it('round-trips event cursors for worst-case escaped topic filters within the shared bound', async () => {
+    const f = await fixture()
+    const topics = Array.from({ length: 128 }, (_, index) => String.fromCharCode(0xd800 + index).repeat(128))
+    const view = await f.a.readView()
+    let cursor: string
+    try {
+      cursor = view.readEvents({ topics }).cursor
+      expect(cursor.length).toBeLessThanOrEqual(APPLICATION_EVENT_CURSOR_LIMIT)
+      expect(view.readEvents({ topics, cursor }).events).toEqual([])
+    } finally { view.release() }
+    await (await f.a.command('say', 'one', { operationId: 'one' })).applied()
+    const advanced = await f.a.readView()
+    try {
+      const batch = advanced.readEvents({ topics, cursor })
+      expect(batch.revision.point.sequence).toBe(1); expect(batch.events).toEqual([])
+      expect(advanced.readEvents({ topics, cursor: batch.cursor }).hasMore).toBe(false)
+    } finally { advanced.release() }
+  })
+
   it('releases an idle change observer immediately and bounds concurrent pulls', async () => {
     const f = await fixture(), projection = f.a.project(messages())
     const observer = projection.changes()[Symbol.asyncIterator]()

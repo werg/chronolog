@@ -43,6 +43,8 @@ export interface ApplicationEventBatch {
   readonly cursor: string
   readonly hasMore: boolean
 }
+/** Covers 128 topic filters of 128 UTF-16 units, including worst-case JSON escapes and scope metadata. */
+export const APPLICATION_EVENT_CURSOR_LIMIT = 128 * 1024
 export interface ApplicationEventOptions { readonly cursor?: string; readonly topics?: readonly string[]; readonly limit?: number }
 export interface ApplicationReadView {
   readonly revision: PeerRevision
@@ -428,7 +430,7 @@ function readEvents(captured: CapturedPeerView, options: ApplicationEventOptions
   let index = 0
   if (options.cursor !== undefined) {
     try {
-      if (options.cursor.length > 8192) throw new Error()
+      if (options.cursor.length > APPLICATION_EVENT_CURSOR_LIMIT) throw new Error()
       const cursor = JSON.parse(options.cursor) as { historyId: string; generation: string; index: number; anchor: string | null; topics: readonly string[] | null }
       if (cursor.historyId !== captured.revision.historyId || cursor.generation !== captured.revision.generation) throw new RecoveredViewError(captured.revision)
       if (!Number.isSafeInteger(cursor.index) || cursor.index < 0 || cursor.index > captured.read.orderLength || JSON.stringify(cursor.topics) !== JSON.stringify(topics) ||

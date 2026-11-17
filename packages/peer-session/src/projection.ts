@@ -1,7 +1,7 @@
 import type { BytesStore } from '@chronolog/records'
 import { decodePeerValue, encodePeerValue, samePeerValue, validatePeerRevision, type PeerRevision } from '@chronolog/peer-generation'
 import { assertEventTopic, canonicalJson, type EventPayload } from '@chronolog/protocol'
-import { RecoveredViewError, type ApplicationChange, type ApplicationEvent, type ApplicationReadView } from './session.js'
+import { APPLICATION_EVENT_CURSOR_LIMIT, RecoveredViewError, type ApplicationChange, type ApplicationEvent, type ApplicationReadView } from './session.js'
 import { awaitOwnedTask } from './lifetime.js'
 
 export const APPLICATION_PROJECTION_LIMITS = Object.freeze({ active: 8, pending: 8, stateBytes: 524_288, checkpointBytes: 2_097_152 })
@@ -122,7 +122,7 @@ export class ApplicationProjection<State extends EventPayload> implements Applic
         validatePeerRevision(checkpoint.revision); identifier(checkpoint.version)
         if (checkpoint.applicationId !== this.#source.applicationId || checkpoint.historyId !== this.#source.historyId || checkpoint.id !== this.id ||
           checkpoint.revision.applicationId !== checkpoint.applicationId || checkpoint.revision.historyId !== checkpoint.historyId ||
-          typeof checkpoint.cursor !== 'string' || checkpoint.cursor.length > 8192 || typeof checkpoint.state !== 'string' ||
+          typeof checkpoint.cursor !== 'string' || checkpoint.cursor.length > APPLICATION_EVENT_CURSOR_LIMIT || typeof checkpoint.state !== 'string' ||
           stateBytes(JSON.parse(checkpoint.state) as EventPayload) !== checkpoint.state ||
           checkpoint.topics !== null && !samePeerValue(topics(checkpoint.topics), checkpoint.topics)) {
           throw new Error('APPLICATION_PROJECTION_CHECKPOINT_INVALID')
