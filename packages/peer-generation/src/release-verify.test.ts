@@ -3,7 +3,7 @@ import { DOMAINS } from '@chronolog/protocol'
 import {
   assertReleaseStateExtension, bytesDigest, createPeerIdentity, peerDigest, RELEASE_LIMITS, RELEASE_PROFILE,
   signReleaseActivationRequest, signReleaseManifest, signReleasePolicy, validateReleaseManifest,
-  verifyReleaseActivation, verifyReleaseContent, verifyReleaseManifest, verifyReleaseState,
+  verifyReleaseActivation, verifyReleaseAsset, verifyReleaseContent, verifyReleaseManifest, verifyReleaseState,
   type ReleaseManifest, type ReleaseState, type SignedReleaseActivation,
 } from './control.js'
 import { signPeerValue } from './codec.js'
@@ -28,6 +28,22 @@ async function fixture() {
 }
 
 describe('separate signed release authority', () => {
+  it('verifies a binary storage asset incrementally before exposing its bytes', async () => {
+    const bytes = new Uint8Array(70_000).fill(255), digest = await bytesDigest(bytes)
+    const asset = { path: 'assets/binary.dat', digest, bytes: bytes.length, mediaType: 'application/octet-stream' }
+    let requestedSignal: AbortSignal | undefined
+    await verifyReleaseAsset(asset, { async *read(value, options) {
+      expect(value).toEqual(asset); requestedSignal = options?.signal
+      yield bytes.subarray(0, RELEASE_LIMITS.chunkBytes); yield bytes.subarray(RELEASE_LIMITS.chunkBytes)
+    } })
+    expect(requestedSignal?.aborted).toBe(false)
+    const corrupt = bytes.slice(); corrupt[0] = 0
+    await expect(verifyReleaseAsset(asset, { async *read() {
+      yield corrupt.subarray(0, RELEASE_LIMITS.chunkBytes); yield corrupt.subarray(RELEASE_LIMITS.chunkBytes)
+    } })).rejects.toThrow('RELEASE_CONTENT_DIGEST_MISMATCH')
+    await expect(verifyReleaseAsset(asset, { async *read() { yield bytes } })).rejects.toThrow('RELEASE_CONTENT_CHUNK_INVALID')
+  })
+
   it('binds code to the publisher policy, scope, exact manifest and explicit activation', async () => {
     const f = await fixture()
     expect(await verifyReleaseManifest(f.signed, f.policy, f.trust)).toBe(f.id)
