@@ -154,7 +154,8 @@ it('administers an independently ordered native/browser group through the actual
   const approval = await decision(owner, 'approve', approvalDecision);
   expect(approval.signedApproval).toBe(retained.signedApproval);
   expect(approval.capabilityIds).toEqual(retained.capabilityIds);
-  await expect(owner.approve({ ...approvalDecision, roles: ['reader'] })).rejects.toMatchObject({ status: 409 });
+  await expect(owner.approve({ operationId: approvalDecision.operationId, requestId: submitted.id,
+    roles: ['reader'], grantFullHistory: true })).rejects.toMatchObject({ status: 409 });
   await passed('host authentication binds device ownership and exact approval survives a lost reply plus real Durable Object eviction');
 
   await phase('first fresh Worker authenticated history replay');
@@ -176,7 +177,7 @@ it('administers an independently ordered native/browser group through the actual
   await passed('a fresh OPFS device verifies live approval and HPKE controls, then fetches detached history through authenticated WebRTC in its Worker', { elapsedMs: joined.elapsedMs, rtc: joined.value.rtc });
 
   await phase('writer revocation and original operation retry');
-  const accepted = await device({ method: 'publish', operationId: 'device-before-revocation', text: 'accepted before revocation' });
+  const accepted = await fixture('publish-device', { operationId: 'device-before-revocation', text: 'accepted before revocation' });
   await until(() => device({ method: 'operation', operationId: accepted.operationId }), value => value?.final && value.outcome?.outcome === 'accepted', 'device operation did not become final');
   const active = await device({ method: 'status' }), writer = active.grants.find(grant => grant.role === 'writer' && grant.active);
   expect(writer).toBeDefined();
@@ -184,8 +185,7 @@ it('administers an independently ordered native/browser group through the actual
   const writerDecision = { operationId: 'host-revoke-writer', capabilityIds: [writer.id] };
   const writerRemoved = await decision(owner, 'revoke', writerDecision);
   expect((await applicantMembers.info()).identity.accountId).toBe(applicantInfo.identity.accountId);
-  const rejected = await device({ method: 'publish', operationId: 'device-after-writer-revocation', text: 'must fail through direct peer path' });
-  await device({ method: 'connect' });
+  const rejected = await fixture('publish-device', { operationId: 'device-after-writer-revocation', text: 'must fail through direct peer path', reconnect: true });
   const finalRejection = await until(() => device({ method: 'operation', operationId: rejected.operationId }),
     value => value?.final && value.outcome?.outcome === 'rejected', 'revoked direct write was not rejected');
   expect((await device({ method: 'publish', operationId: accepted.operationId, text: 'accepted before revocation' })).proposalId).toBe(accepted.proposalId);

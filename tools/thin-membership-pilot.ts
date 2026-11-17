@@ -45,7 +45,7 @@ const report = { format: 'chronolog-thin-membership/v3', passed: false, status: 
     application: ['DedicatedWorker with OPFS/WASM', 'authenticated RTCDataChannel', 'native full replica and finality service'],
     nativeImplementation: 'werift@0.27.0' },
   measurement: { applicationBytes: 'Logical authenticated RTC frame payload; excludes framing headers/credit and SCTP/DTLS/IP overhead.',
-    finalityClock: 'Native workload authoring holds the fixture authority clock until each original signed proposal has a retained inclusion receipt, then releases it before waiting for finality. Snapshots and diagnostics record every held window. Device publication uses the advancing clock.',
+    finalityClock: 'Native workloads and the two original browser permission probes hold the fixture authority clock before signing until each original signed proposal has a retained inclusion receipt. The disconnected probe reconnects within that hold. The clock is released before waiting for finality, and snapshots and diagnostics record every held window.',
     rtcSdpBytes: 'UTF-8 bytes of the complete offer and answer SDP descriptions.',
     rtcSignalingRequestBytes: 'Actual direct introduction HTTP request bodies, including the protocol JSON envelope; excludes HTTP headers.',
     rtcSignalingResponseBytes: 'Actual direct introduction HTTP response bodies, including the protocol JSON envelope; excludes HTTP headers.' },
@@ -56,7 +56,7 @@ const report = { format: 'chronolog-thin-membership/v3', passed: false, status: 
     'The built Cloudflare Worker runs in the real local workerd test harness with synthetic authenticated accounts; this is not a deployed Cloudflare service or public-network qualification.',
     'Descriptor/body byte counters cover the actual loopback membership and peer boundaries; they do not predict provider billing or NAT traversal.',
     'Application peer bytes are logical authenticated RTC frame payloads, excluding framing headers/credit and SCTP/DTLS/IP overhead. SDP HTTP body bytes are measured separately.',
-    'Native workload admission uses explicitly recorded fixture clock holds. Phase timings include those holds and do not measure production finality latency; no proposal is re-authored to repair a closed timestamp.',
+    'Native workload and browser permission-probe admission use explicitly recorded fixture clock holds. Phase timings include those holds and do not measure production finality latency; no proposal is re-authored to repair a closed timestamp.',
   ] }
 let saving = Promise.resolve()
 function save(): Promise<void> {
@@ -188,6 +188,19 @@ try {
           case 'workload': result = await native!.publishWorkload(input as unknown as Parameters<NativeFixture['publishWorkload']>[0]); break
           case 'snapshot': result = await native!.snapshot(); break
           case 'device': result = await callDevice(page!, input!); break
+          case 'publish-device': {
+            if (input === undefined || typeof input.operationId !== 'string' || typeof input.text !== 'string' ||
+                (input.reconnect !== undefined && typeof input.reconnect !== 'boolean')) throw new Error('THIN_DEVICE_PUBLICATION_INVALID')
+            result = await native!.includeProposals(`browser permission probe: ${input.operationId}`, async () => {
+              const value = await callDevice(page!, { method: 'publish', operationId: input.operationId, text: input.text })
+              if (value === null || typeof value !== 'object' || !('proposalId' in value) || typeof value.proposalId !== 'string') {
+                throw new Error('THIN_DEVICE_PROPOSAL_REQUIRED')
+              }
+              if (input.reconnect === true) await callDevice(page!, { method: 'connect' })
+              return { value, proposalIds: [value.proposalId] }
+            })
+            break
+          }
           case 'new-device': {
             await page!.evaluate(() => (globalThis as unknown as BrowserPage).thinMembership.replaceWorker())
             const prepared = await callDevice(page!, { method: 'prepare', name: input!.name })
