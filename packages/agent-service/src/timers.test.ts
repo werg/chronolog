@@ -44,6 +44,51 @@ describe('durable agent timers', () => {
     expect(f.delivered[0]!.occurrence).toMatchObject({ timerId: 'morning', generation: 'generation-1', configurationEventId: 'proposal-0:0', scheduledAtMs: 100 })
   })
 
+  it('preserves the verified requester through schedule and pending-occurrence restart, ignoring payload provenance claims', async () => {
+    const f = fixture()
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'reviewed-generation', timerId: 'reminder', dueAtMs: 100,
+      origin: { authorId: 'forged-owner' }, configurationOrigin: { authorId: 'forged-owner', writerCapability: 'forged-grant' },
+      payload: { role: 'administrator', action: 'remind' } })
+    const verified = (await f.source.read()).transactions[0]!.events[0]!
+    await (await DurableTimerScheduler.open(f.options)).tick(99)
+    let lost = true
+    const options = { ...f.options, publisher: { async publishOccurrence(occurrence: TimerOccurrence, { operationId }: { operationId: string }): Promise<'accepted'> {
+      // The application's publisher receives the verified requester separately
+      // from arbitrary requested action data, even after its private restart.
+      expect(occurrence.configurationOrigin).toEqual(verified.origin)
+      f.delivered.push({ occurrence: structuredClone(occurrence), operationId })
+      if (lost) { lost = false; throw new Error('publication reply lost') }
+      return 'accepted'
+    } } }
+    const restarted = await DurableTimerScheduler.open(options)
+    await expect(restarted.tick(100)).rejects.toThrow('publication reply lost')
+    const saved = (await restarted.status()).pending!
+    expect(saved.configurationEventId).toBe(verified.id)
+    expect(saved.configurationOrigin).toEqual(verified.origin)
+    Object.assign(saved.configurationOrigin, { authorId: '22'.repeat(32) })
+    expect(await (await DurableTimerScheduler.open(options)).tick(500)).toEqual({ emitted: 1, needsCatchUp: false })
+    expect(f.delivered).toHaveLength(2)
+    expect(f.delivered[1]).toEqual(f.delivered[0])
+    expect(f.delivered[1]!.occurrence.observedAtMs).toBe(100)
+  })
+
+  it('lets the occurrence publisher enforce requester policy without promoting payload role claims', async () => {
+    const f = fixture()
+    f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'unprivileged-generation', timerId: 'tool', dueAtMs: 100,
+      payload: { role: 'owner', origin: { authorId: '22'.repeat(32) }, action: 'privileged-tool' } })
+    let authorized = 0
+    const scheduler = await DurableTimerScheduler.open({ ...f.options, publisher: {
+      async publishOccurrence(occurrence) {
+        if (occurrence.configurationOrigin.authorId !== '22'.repeat(32)) return 'cancelled'
+        authorized++
+        return 'accepted'
+      },
+    } })
+    expect(await scheduler.tick(100)).toEqual({ emitted: 0, needsCatchUp: false })
+    expect(authorized).toBe(0)
+    expect((await scheduler.status()).active).toBe(0)
+  })
+
   it('catches up recurring occurrences in bounded turns without drifting schedule time', async () => {
     const f = fixture()
     f.source.entries.push({ type: 'timer.scheduled', version: 1, generation: 'generation-1', timerId: 'interval', dueAtMs: 10, intervalMs: 10 })

@@ -47,13 +47,13 @@ async function fixture() {
     options: { id: 'native-scheduler', sourceId: 'native-fixture/history', configurationTopic, store: native.store,
       source: native.node.events, publisher, maxOccurrencesPerTick: 2 },
     fired: async () => (await native.node.events.read({ topics: [occurrenceTopic] })).transactions.flatMap((entry) => entry.events),
-    configurationId: async (generation: string) => {
+    configuration: async (generation: string) => {
       const events = (await native.node.events.read({ topics: [configurationTopic] })).transactions.flatMap((entry) => entry.events)
       const event = events.find((entry) => entry.payload !== null && typeof entry.payload === 'object' &&
         'type' in entry.payload && entry.payload.type === 'timer.scheduled' &&
         'generation' in entry.payload && entry.payload.generation === generation)
       if (event === undefined) throw new Error('TIMER_CONFIGURATION_NOT_APPLIED')
-      return event.id
+      return event
     },
   }
 }
@@ -91,9 +91,13 @@ describe('native SQL timer publication', () => {
     await expect(losing.tick(2000)).rejects.toThrow('final occurrence response lost')
     const saved = (await losing.status()).pending!
     expect(saved.observedAtMs).toBe(2000)
-    expect(saved.configurationEventId).toBe(await f.configurationId('g2'))
+    const configuration = await f.configuration('g2')
+    expect(saved.configurationEventId).toBe(configuration.id)
+    expect(saved.configurationOrigin).toEqual(configuration.origin)
     const before = await f.fired()
     expect(before).toHaveLength(1)
+    expect(before[0]!.payload).toMatchObject({ configurationEventId: configuration.id, configurationOrigin: configuration.origin })
+    expect(before[0]!.origin.operationId).not.toBe(configuration.origin.operationId)
     const restarted = await DurableTimerScheduler.open(f.options)
     expect(await restarted.tick(9000)).toEqual({ emitted: 1, needsCatchUp: false })
     expect(await restarted.status()).toMatchObject({ pending: null, active: 0 })
@@ -109,9 +113,10 @@ describe('native SQL timer publication', () => {
     const f = await fixture()
     await f.publisher.schedule({ timerId: 'recurring', generation: 'recurring-g1', dueAtMs: 1000, intervalMs: 100,
       payload: { action: 'poll' } }, { operationId: 'schedule-recurring', expectedGeneration: null })
-    const configurationEventId = await f.configurationId('recurring-g1')
+    const configuration = await f.configuration('recurring-g1')
     const occurrence: TimerOccurrence = { type: 'timer.fired', version: 1, timerId: 'recurring', generation: 'recurring-g1',
-      configurationEventId, occurrenceId: 'mismatched-payload', scheduledAtMs: 1000, observedAtMs: 1250, payload: { action: 'tampered' } }
+      configurationEventId: configuration.id, configurationOrigin: configuration.origin,
+      occurrenceId: 'mismatched-payload', scheduledAtMs: 1000, observedAtMs: 1250, payload: { action: 'tampered' } }
     expect(await f.publisher.publishOccurrence(occurrence, { operationId: 'mismatched-payload' })).toBe('cancelled')
     expect(await f.publisher.publishOccurrence({ ...occurrence, occurrenceId: 'stale-time', scheduledAtMs: 900,
       payload: { action: 'poll' } }, { operationId: 'stale-time' })).toBe('cancelled')

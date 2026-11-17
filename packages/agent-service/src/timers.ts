@@ -1,10 +1,11 @@
 import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { Mutex } from '@chronolog/node-core/browser'
 import type { DurableOperationStore } from '@chronolog/node-core'
-import { assertCanonicalCbor, assertEventTopic, canonicalEventPayload, encodeCanonicalCbor } from '@chronolog/protocol'
-import type { CborValue, EventPayload } from '@chronolog/protocol'
+import { assertCanonicalCbor, assertEventTopic, canonicalEventPayload, cloneEventOrigin, encodeCanonicalCbor } from '@chronolog/protocol'
+import type { CborValue, ChronologEventOrigin, EventPayload } from '@chronolog/protocol'
 
 import { CheckpointStore } from './checkpoint.js'
+import { decodeEventOrigin, encodeEventOrigin } from './event-origin.js'
 import { batchEvents, validateConsumerId } from './event-source.js'
 import type { FinalEvent, FinalEventSource } from './event-source.js'
 import { waitForAbortableDelay } from './service.js'
@@ -17,6 +18,8 @@ export interface TimerOccurrence {
   readonly generation: string
   /** Original final configuration event, preserved as audit provenance. */
   readonly configurationEventId: string
+  /** Verified configuration provenance; the fired event itself is authored by the scheduler. */
+  readonly configurationOrigin: ChronologEventOrigin
   readonly occurrenceId: string
   readonly scheduledAtMs: number
   readonly observedAtMs: number
@@ -30,6 +33,9 @@ export interface TimerOccurrencePublisher {
    * A mixed SQL assertion + emit is one implementation. A local-only check is
    * insufficient: a final cancellation may race the timer's clock observation.
    * Exact accepted retries retain their result after a later cancellation.
+   * Authorize the derived action against configurationOrigin, not payload role
+   * claims or the scheduler's own tool permissions. Keep original final outcomes
+   * on retry; a current policy denial cannot rewrite an earlier publication.
    */
   publishOccurrence(occurrence: TimerOccurrence, options: { readonly operationId: string; readonly signal?: AbortSignal }): Promise<'accepted' | 'cancelled'>
 }
@@ -51,6 +57,7 @@ interface Schedule {
   readonly timerId: string
   readonly generation: string
   readonly configurationEventId: string
+  readonly configurationOrigin: ChronologEventOrigin
   readonly nextDueAtMs: number
   readonly intervalMs: number | null
   readonly payload: EventPayload
@@ -125,7 +132,7 @@ export class DurableTimerScheduler {
             'chronolog/timer-occurrence/v1', this.#options.sourceId, due.timerId, due.generation, BigInt(due.nextDueAtMs),
           ])))}`
           occurrence = { type: 'timer.fired', version: 1, timerId: due.timerId, generation: due.generation, configurationEventId: due.configurationEventId,
-            occurrenceId, scheduledAtMs: due.nextDueAtMs, observedAtMs: now, payload: due.payload }
+            configurationOrigin: cloneEventOrigin(due.configurationOrigin), occurrenceId, scheduledAtMs: due.nextDueAtMs, observedAtMs: now, payload: due.payload }
           state = { ...state, pending: occurrence }
           await this.#save(state)
         }
@@ -172,16 +179,16 @@ export class DurableTimerScheduler {
     const checkpoint = await this.#checkpoint.load()
     if (checkpoint === null) return { cursor: null, revision: null, schedules: new Map(), pending: null }
     const value = assertCanonicalCbor(checkpoint.state)
-    if (!Array.isArray(value) || value.length !== 3 || value[0] !== 1n || !Array.isArray(value[1]) || value[1].length > this.#maxTimers) {
+    if (!Array.isArray(value) || value.length !== 3 || value[0] !== 2n || !Array.isArray(value[1]) || value[1].length > this.#maxTimers) {
       throw new Error('TIMER_CHECKPOINT_INVALID')
     }
     const schedules = new Map<string, Schedule>()
     for (const row of value[1]) {
       if (!Array.isArray(row) || row.length !== 8 || typeof row[0] !== 'string' || typeof row[1] !== 'string' || typeof row[2] !== 'string' ||
           typeof row[3] !== 'bigint' || (row[4] !== null && typeof row[4] !== 'bigint') ||
-          typeof row[5] !== 'string' || typeof row[6] !== 'boolean' || row[7] !== 1n) throw new Error('TIMER_CHECKPOINT_INVALID')
+          typeof row[5] !== 'string' || typeof row[6] !== 'boolean') throw new Error('TIMER_CHECKPOINT_INVALID')
       const schedule: Schedule = { timerId: row[0], generation: row[1], configurationEventId: row[2], nextDueAtMs: Number(row[3]),
-        intervalMs: row[4] === null ? null : Number(row[4]), payload: parsePayload(row[5]), cancelled: row[6] }
+        intervalMs: row[4] === null ? null : Number(row[4]), payload: parsePayload(row[5]), cancelled: row[6], configurationOrigin: decodeEventOrigin(row[7]) }
       validateConsumerId(schedule.timerId); validateConsumerId(schedule.generation); validateConsumerId(schedule.configurationEventId); assertTimestamp(schedule.nextDueAtMs)
       if (schedule.intervalMs !== null && (!Number.isSafeInteger(schedule.intervalMs) || schedule.intervalMs < 1)) throw new Error('TIMER_CHECKPOINT_INVALID')
       if (schedules.has(schedule.timerId)) throw new Error('TIMER_CHECKPOINT_INVALID')
@@ -193,9 +200,9 @@ export class DurableTimerScheduler {
 
   async #save(state: TimerState): Promise<void> {
     await this.#checkpoint.commit({ cursor: state.cursor, revision: state.revision, state: encodeCanonicalCbor([
-      1n, [...state.schedules.values()].sort((a, b) => (a.timerId < b.timerId ? -1 : a.timerId > b.timerId ? 1 : 0)).map((timer) => [
+      2n, [...state.schedules.values()].sort((a, b) => (a.timerId < b.timerId ? -1 : a.timerId > b.timerId ? 1 : 0)).map((timer) => [
         timer.timerId, timer.generation, timer.configurationEventId, BigInt(timer.nextDueAtMs), timer.intervalMs === null ? null : BigInt(timer.intervalMs),
-        canonicalEventPayload(timer.payload), timer.cancelled, 1n,
+        canonicalEventPayload(timer.payload), timer.cancelled, encodeEventOrigin(timer.configurationOrigin),
       ]), state.pending === null ? null : encodeOccurrence(state.pending),
     ]) })
   }
@@ -214,6 +221,7 @@ function applyConfiguration(schedules: Map<string, Schedule>, event: FinalEvent)
     }
     assertTimestamp(fields.dueAtMs)
     schedules.set(fields.timerId, { timerId: fields.timerId, generation: fields.generation, configurationEventId: event.id, nextDueAtMs: fields.dueAtMs,
+      configurationOrigin: cloneEventOrigin(event.origin),
       intervalMs: typeof fields.intervalMs === 'number' ? fields.intervalMs : null,
       payload: parsePayload(canonicalEventPayload(fields.payload ?? null)), cancelled: false })
   } else if (fields.type === 'timer.cancelled') {
@@ -231,15 +239,16 @@ function parsePayload(value: string): EventPayload {
   return parsed
 }
 function encodeOccurrence(value: TimerOccurrence): CborValue {
-  return [value.timerId, value.generation, value.configurationEventId, value.occurrenceId, BigInt(value.scheduledAtMs), BigInt(value.observedAtMs), canonicalEventPayload(value.payload)]
+  return [value.timerId, value.generation, value.configurationEventId, value.occurrenceId, BigInt(value.scheduledAtMs), BigInt(value.observedAtMs),
+    canonicalEventPayload(value.payload), encodeEventOrigin(value.configurationOrigin)]
 }
 function decodeOccurrence(value: unknown): TimerOccurrence {
-  if (!Array.isArray(value) || value.length !== 7 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
+  if (!Array.isArray(value) || value.length !== 8 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
       typeof value[2] !== 'string' || typeof value[3] !== 'string' || typeof value[4] !== 'bigint' || typeof value[5] !== 'bigint' || typeof value[6] !== 'string') {
     throw new Error('TIMER_CHECKPOINT_INVALID')
   }
   const occurrence: TimerOccurrence = { type: 'timer.fired', version: 1, timerId: value[0], generation: value[1], configurationEventId: value[2], occurrenceId: value[3],
-    scheduledAtMs: Number(value[4]), observedAtMs: Number(value[5]), payload: parsePayload(value[6]) }
+    scheduledAtMs: Number(value[4]), observedAtMs: Number(value[5]), payload: parsePayload(value[6]), configurationOrigin: decodeEventOrigin(value[7]) }
   validateTimerOccurrence(occurrence)
   return occurrence
 }
@@ -250,4 +259,5 @@ export function validateTimerOccurrence(value: TimerOccurrence): void {
   assertTimestamp(value.scheduledAtMs); assertTimestamp(value.observedAtMs)
   if (value.observedAtMs < value.scheduledAtMs) throw new Error('TIMER_TIME_INVALID')
   canonicalEventPayload(value.payload)
+  cloneEventOrigin(value.configurationOrigin)
 }

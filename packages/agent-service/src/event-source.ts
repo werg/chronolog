@@ -1,28 +1,10 @@
 import { assertEventTopic, canonicalEventPayload, cloneEventOrigin } from '@chronolog/protocol'
-import type { ChronologEventOrigin, EventPayload } from '@chronolog/protocol'
+import type { EffectiveEvent, EventBatch, EventPayload, EventReadOptions } from '@chronolog/protocol'
 
 /** Structural public port: provider integrations do not depend on node internals. */
-export interface FinalEvent {
-  readonly id: string
-  readonly proposalId: string
-  readonly eventOrdinal: number
-  readonly topic: string
-  readonly payload: EventPayload
-  readonly origin: ChronologEventOrigin
-}
-
-export interface FinalEventBatch {
-  readonly transactions: readonly { readonly proposalId: string; readonly events: readonly FinalEvent[] }[]
-  readonly scannedThrough: string
-  readonly hasMore: boolean
-  readonly revision: string
-}
-
-export interface EventReadOptions {
-  readonly cursor?: string
-  readonly topics?: readonly string[]
-  readonly limit?: number
-}
+export type FinalEvent = EffectiveEvent
+export type FinalEventBatch = EventBatch
+export type { EventReadOptions } from '@chronolog/protocol'
 
 export interface FinalEventSource {
   read(options?: EventReadOptions): Promise<FinalEventBatch>

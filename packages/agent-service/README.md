@@ -283,9 +283,13 @@ preallocated schedule generations:
 
 Allocate the generation before the signed SQL + event program. The resulting
 content-derived event ID cannot be inserted into that same program without a
-hash cycle. The scheduler separately preserves `configurationEventId` as audit
-provenance. Occurrences bind source/history, timer, generation, and scheduled time;
-their ID and observed time are durable before publication and survive retries.
+hash cycle. The scheduler separately preserves `configurationEventId` and the
+verified configuration event's complete `configurationOrigin` as audit
+provenance. It derives these from authenticated event metadata, never similarly named
+configuration payload fields. Both the schedule and pending occurrence keep
+that provenance across restart. Occurrences bind source/history, timer,
+generation, and scheduled time; their ID and observed time are durable before
+publication and survive retries.
 An older cancellation cannot cancel a replacement generation. Recurrence uses
 scheduled time, not dispatch time, so bounded catch-up does not drift the schedule.
 
@@ -336,6 +340,23 @@ publication from `createAgent` before the daemon starts its resident loops.
 Event-only groups can use the smaller `TimerOccurrencePublisher` port with their
 own defined atomic acceptance model; they cannot use the SQL implementation.
 
+The application-supplied occurrence publisher receives `configurationOrigin`
+alongside the active generation and requested action. Use the original author,
+group and grant context when deciding what that requester may schedule; do not
+promote a payload's role claim or the scheduler's own tool access. Put shared
+authorization conditions in the same atomic program as occurrence admission.
+The SQL helper supplies generation, due-time, payload and ordinary row-ownership
+guards; applications add any domain-specific action policy in their publisher.
+Retain the original operation identity on exact retry: current revocation or
+policy changes must not rewrite a previously final publication result.
+
+The emitted occurrence's authenticated `event.origin` identifies the scheduler
+that actually signed it. Its payload's `configurationOrigin` is
+scheduler-attested lineage, not another verified signature. A downstream worker
+must trust an explicitly authorized scheduler for that assertion, or verify
+the referenced retained configuration event. It must not accept an arbitrary
+writer's payload as proof of another author or grant.
+
 Timers emit final intent, and an effect worker performs any outside action.
 Cancellation prevents an occurrence that has not already won canonical
 admission. A previously final intent and an in-flight external action need the
@@ -369,6 +390,10 @@ rendezvous hints or a host login as database membership. Each record or payload
 release rechecks the receiver's known active grant, including after asynchronous
 storage reads or previous writes. A connection can carry records by other
 original authors; endpoint and record identities remain distinct.
+
+Normal disconnect, revocation and bad peer data retire that session;
+`session.completion` and `onError` report it without stopping unrelated peers or
+authority work. Resident task failures and storage failures remain service-fatal.
 
 `readPayload(hash)` requests one detached application envelope by its SHA-256
 address. Header/evidence synchronization does not request these bodies. The

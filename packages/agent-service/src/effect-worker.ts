@@ -5,6 +5,7 @@ import { assertCanonicalCbor, assertEventTopic, canonicalEventPayload, encodeCan
 import type { CborValue, EventPayload } from '@chronolog/protocol'
 
 import { CheckpointStore } from './checkpoint.js'
+import { decodeEventOrigin, encodeEventOrigin } from './event-origin.js'
 import { batchEvents, canonicalTopics, cloneFinalEvent, validateConsumerId } from './event-source.js'
 import type { FinalEvent, FinalEventBatch, FinalEventPublisher, FinalEventSource } from './event-source.js'
 
@@ -316,22 +317,12 @@ function parsePayload(value: string): EventPayload {
   return payload
 }
 function encodeEvent(event: FinalEvent): CborValue {
-  const origin = event.origin
   return [event.id, event.proposalId, BigInt(event.eventOrdinal), event.topic, canonicalEventPayload(event.payload),
-    [origin.kind, origin.groupId, origin.authorId, origin.operationId, origin.authorTimestampMs, origin.membershipRevision, origin.writerCapability]]
+    encodeEventOrigin(event.origin)]
 }
 function decodeEvent(value: CborValue): FinalEvent {
   if (!Array.isArray(value) || value.length !== 6 || typeof value[0] !== 'string' || typeof value[1] !== 'string' ||
       typeof value[2] !== 'bigint' || typeof value[3] !== 'string' || typeof value[4] !== 'string') throw new Error('EFFECT_CHECKPOINT_INVALID')
-  const rawOrigin: unknown = value[5]
-  if (!Array.isArray(rawOrigin) || rawOrigin.length !== 7) throw new Error('EFFECT_CHECKPOINT_INVALID')
-  const origin = rawOrigin as readonly CborValue[]
-  if (origin[0] !== 'chronolog' ||
-      typeof origin[1] !== 'string' || typeof origin[2] !== 'string' || typeof origin[3] !== 'string' ||
-      typeof origin[4] !== 'string' || typeof origin[5] !== 'string' || (origin[6] !== null && typeof origin[6] !== 'string')) {
-    throw new Error('EFFECT_CHECKPOINT_INVALID')
-  }
   return cloneFinalEvent({ id: value[0], proposalId: value[1], eventOrdinal: Number(value[2]), topic: value[3], payload: parsePayload(value[4]),
-    origin: { kind: origin[0], groupId: origin[1], authorId: origin[2], operationId: origin[3], authorTimestampMs: origin[4],
-      membershipRevision: origin[5], writerCapability: origin[6] } })
+    origin: decodeEventOrigin(value[5]) })
 }

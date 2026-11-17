@@ -144,7 +144,7 @@ export function createSqlTimerPublisher(options: {
         sqlStatement(`INSERT INTO ${occurrences} (occurrence_id, timer_id, generation, configuration_event_id, scheduled_at_ms, observed_at_ms) VALUES (?, ?, ?, ?, ?, ?)`,
           [occurrence.occurrenceId, occurrence.timerId, occurrence.generation, occurrence.configurationEventId, occurrence.scheduledAtMs, occurrence.observedAtMs]),
         sqlStatement(`UPDATE ${heads} SET next_due_at_ms = CASE WHEN interval_ms IS NULL THEN next_due_at_ms ELSE next_due_at_ms + interval_ms END, active = CASE WHEN interval_ms IS NULL THEN 0 ELSE 1 END WHERE timer_id = ? AND generation = ?`, [occurrence.timerId, occurrence.generation]),
-        emit(occurrenceTopic, { ...occurrence }),
+        emit(occurrenceTopic, { ...occurrence, configurationOrigin: { ...occurrence.configurationOrigin } }),
       ), changeOptions)
       if (result.outcome.outcome === 'accepted') return 'accepted' as const
       if (result.outcome.rejectionCode === 'assert:timer_inactive_generation') return 'cancelled' as const
