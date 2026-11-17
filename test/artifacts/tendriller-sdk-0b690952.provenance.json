@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "0b690952e6eefc42b11a58563cf696ddd9489f05",
+  "sourceTree": "4b8e5a0a161ea59a27101152e642e9fef5683da1",
+  "sourceDirty": false,
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm ci --ignore-scripts --offline --no-audit --no-fund",
+  "consumerCommand": "npm run test:consumer",
+  "membershipSource": "f5ac73003f0b8bcec42f91e8a708ba79a666fd5a",
+  "purpose": "Clean portable membership with bounded retained evidence and coherent application publication.",
+  "package": "@tendriller/core",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-sdk-0b690952.tgz",
+  "sha256": "3077971c1ac4b2695c770724844be239950edf41fd5d2a8a21e0ae30517c72e4"
+}

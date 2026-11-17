@@ -139,7 +139,7 @@ describe('public Tendriller adapter', () => {
   it('pins the built public SDK/engine dependencies and provenance', async () => {
     // Independent reviewed source pin: never infer the expected commit from
     // the provenance being checked. Package dependencies must select it too.
-    const sourceCommit = '0c73282d816e3ffc7cba7e5c43a6b544867d629e'
+    const sourceCommit = '0b690952e6eefc42b11a58563cf696ddd9489f05'
     const revision = sourceCommit.slice(0, 8)
     const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
       devDependencies: Record<string, string>
