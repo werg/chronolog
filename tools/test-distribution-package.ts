@@ -101,7 +101,8 @@ async function withinArchive(path) {
 const daemonManifest = await withinArchive(join(runtime, 'node_modules/chronologd/package.json'));
 const daemonRequire = createRequire(daemonManifest);
 const agentEntry = await withinArchive(daemonRequire.resolve('@chronolog/agent-service'));
-const { NativeAgentStore } = await import(pathToFileURL(agentEntry).href);
+const storeEntry = await withinArchive(createRequire(agentEntry).resolve('@chronolog/records/native'));
+const { NativeBytesStore } = await import(pathToFileURL(storeEntry).href);
 const daemon = await import(pathToFileURL(join(dirname(daemonManifest), 'src/agent-runtime.ts')).href);
 assert.equal(typeof daemon.createDaemonAgentRuntime, 'function');
 const cliRequire = createRequire(await withinArchive(join(runtime, 'node_modules/chronolog-cli/package.json')));
@@ -126,10 +127,10 @@ try {
 
 const bytes = Uint8Array.of(0, 1, 127, 255);
 const operationPath = join(process.cwd(), 'operations.sqlite');
-let store = new NativeAgentStore(operationPath);
+let store = new NativeBytesStore(operationPath);
 await store.put('payload', bytes);
 store.close();
-store = new NativeAgentStore(operationPath);
+store = new NativeBytesStore(operationPath);
 try { assert.deepEqual(await store.get('payload'), bytes); } finally { store.close(); }
 
 const materializerEntry = await withinArchive(daemonRequire.resolve('@chronolog/materializer-doltlite'));

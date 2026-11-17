@@ -3,7 +3,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { NativeAgentStore, frameLivePeerStream, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+import { frameLivePeerStream, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
 import { signGenesis } from '@chronolog/capabilities'
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
@@ -24,7 +25,7 @@ describe('native agent composition', () => {
   it('runs a SQL-free governed native authority and final-intent worker through the actual peer core', async () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), 'chronolog-resident-agent-'))
     cleanup.push(() => rm(dataDirectory, { recursive: true, force: true }))
-    const store = new NativeAgentStore(join(dataDirectory, 'agent.sqlite'))
+    const store = new NativeBytesStore(join(dataDirectory, 'agent.sqlite'))
     cleanup.push(() => store.close())
     const identity = await generateEd25519KeyPair(), groupId = new Uint8Array(32).fill(71)
     let clockNow = Date.now()

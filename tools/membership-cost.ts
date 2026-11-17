@@ -8,7 +8,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
-import { NativeAgentStore } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+
 import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
 import {
   MembershipAdministrator, createMembershipLedgerClient, encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity,
@@ -20,11 +21,11 @@ import { feedIdFromPublicKey } from '@chronolog/records'
 import { createThinMembershipNative, type ThinMembershipTraffic } from './thin-membership-native.js'
 
 class MeasuredStore implements DurableOperationStore {
-  #store: NativeAgentStore
+  #store: NativeBytesStore
   #putCalls = 0
   #valueBytesWritten = 0
   readonly #categories = new Map<string, { calls: number; bytes: number }>()
-  constructor(readonly path: string) { this.#store = new NativeAgentStore(path) }
+  constructor(readonly path: string) { this.#store = new NativeBytesStore(path) }
   get(key: string): Promise<Uint8Array | null> { return this.#store.get(key) }
   async put(key: string, bytes: Uint8Array): Promise<void> {
     await this.#store.put(key, bytes)
@@ -37,7 +38,7 @@ class MeasuredStore implements DurableOperationStore {
   }
   snapshot() { return { putCalls: this.#putCalls, valueBytesWritten: this.#valueBytesWritten,
     retainedValueBytes: this.#store.usageBytes(), categories: Object.fromEntries([...this.#categories].map(([key, value]) => [key, { ...value }])) } }
-  reopen(): void { this.#store.close(); this.#store = new NativeAgentStore(this.path) }
+  reopen(): void { this.#store.close(); this.#store = new NativeBytesStore(this.path) }
   close(): void { this.#store.close() }
 }
 
@@ -53,7 +54,7 @@ const adminPath = join(output, 'private-administrator.sqlite'), devicePath = joi
 const measured = new MeasuredStore(adminPath)
 let native: Awaited<ReturnType<typeof createThinMembershipNative>> | undefined
 let administrator: MembershipAdministrator | undefined
-let deviceStore: NativeAgentStore | undefined
+let deviceStore: NativeBytesStore | undefined
 const source = {
   head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim(),
   dirtyPaths: execFileSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).trim().split('\n').filter(Boolean),
@@ -63,7 +64,7 @@ const source = {
 const report = {
   format: 'chronolog-membership-cost/v2', passed: false, startedAt: new Date().toISOString(), finishedAt: '',
   command: process.argv.slice(1), source, environment: { node: process.version, platform: platform(), release: release(), arch: arch() },
-  topology: { route: 'signed HTTP loopback', administratorStore: 'NativeAgentStore SQLite WAL FULL',
+  topology: { route: 'signed HTTP loopback', administratorStore: 'NativeBytesStore SQLite WAL FULL',
     nativeAuthority: 'separate identity and persistent stores, same process', applicationMaterializer: 'actual native DoltLite',
     provider: null, browser: null, relay: null },
   phases: [] as Array<Record<string, unknown>>, checks: [] as string[], final: {} as Record<string, unknown>, error: '',
@@ -105,7 +106,7 @@ try {
   report.checks.push('independent payload-size and candidate-count workloads used real accepted SQL/event candidates')
   await phase('warm-empty-sync', async () => ({ newCandidates: 0 }))
 
-  deviceStore = new NativeAgentStore(devicePath)
+  deviceStore = new NativeBytesStore(devicePath)
   const device = await loadOrCreateEnrollmentIdentity(deviceStore, 'cost-device')
   const request = await prepareEnrollmentRequest({ descriptor: provisioned.descriptor, store: deviceStore,
     requestId: 'cost-device-enrollment', requestedRoles: ['reader', 'writer'],

@@ -5,7 +5,8 @@ import { arch, platform, release } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
 
-import { NativeAgentStore } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+
 import { createDoltLiteExecutionManifest, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { SignedInclusionFinalityProvider, decodeLedgerRecord, decodeOrderingEvidence, isFinalityClosureRecord, ReferenceRecordLog,
   type CoordinatedHistoryConfiguration, type OrderedRecordHead } from '@chronolog/node-core'
@@ -143,7 +144,7 @@ try {
   const final = state(child('submit', original, 'rejected'))
   const fencing = completed(child('fencing', original))
   assert(fencing.stdout.includes('AGENT_STORE_IN_USE'))
-  checked('single-file-process-fence', { owner: 'NativeAgentStore', result: 'AGENT_STORE_IN_USE', sameFile: true,
+  checked('single-file-process-fence', { owner: 'NativeBytesStore', result: 'AGENT_STORE_IN_USE', sameFile: true,
     independentCopiesFenced: false })
 
   const floor = join(volumes, 'independent-latest-acknowledged-head.json')
@@ -170,11 +171,11 @@ try {
   const projectionPath = join(volumes, 'independent-application.db')
   await copyFile(join(restored, 'application.db'), projectionPath)
   const held = await holdAuthority(restored)
-  let one: NativeAgentStore | undefined, two: NativeAgentStore | undefined
+  let one: NativeBytesStore | undefined, two: NativeBytesStore | undefined
   let projection: DeterministicMaterializer | undefined
   try {
-    one = new NativeAgentStore(join(volumes, 'retained-observer-one.sqlite'))
-    two = new NativeAgentStore(join(volumes, 'retained-observer-two.sqlite'))
+    one = new NativeBytesStore(join(volumes, 'retained-observer-one.sqlite'))
+    two = new NativeBytesStore(join(volumes, 'retained-observer-two.sqlite'))
     const publicConfiguration: CoordinatedHistoryConfiguration = { kind: 'coordinated', historyId: held.value.configuration.historyId,
       authorityPublicKey: base64UrlToBytes(held.value.configuration.authorityPublicKey), groupId: base64UrlToBytes(held.value.configuration.groupId),
       genesisDigest: base64UrlToBytes(held.value.configuration.genesisDigest), executionManifestDigest: base64UrlToBytes(held.value.configuration.executionManifestDigest),
@@ -217,8 +218,8 @@ try {
 
   // Keep only small ordering state in a separate observer store. It receives no
   // private identities, feed bodies, operation journal or SQL projection.
-  const descriptorStore = new NativeAgentStore(join(volumes, 'descriptor-only.sqlite'))
-  const fullStore = new NativeAgentStore(join(restored, 'agent.sqlite'))
+  const descriptorStore = new NativeBytesStore(join(volumes, 'descriptor-only.sqlite'))
+  const fullStore = new NativeBytesStore(join(restored, 'agent.sqlite'))
   try {
     const historyId = resumed.head.historyId
     for (const key of [`record-log/${historyId}`, `agent/authority/${historyId}/configuration`, `agent/authority/${historyId}/certificate`]) {

@@ -19,8 +19,8 @@ if (action === 'raw') {
   process.stdout.write(`${recoveryJson(await inspectStoppedAuthority(directory))}\n`)
 } else if (action === 'fence') {
   // Another real process opens the production store while its owner is live.
-  const { NativeAgentStore } = await import('@chronolog/agent-service')
-  const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
+  const { NativeBytesStore } = await import('@chronolog/records/native')
+  const store = new NativeBytesStore(join(directory, 'agent.sqlite'))
   store.close()
   process.stdout.write('{"opened":true}\n')
 } else {

@@ -12,7 +12,7 @@ import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCr
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { NativeFinalityService } from './finality-service.js'
-import { NativeAgentStore } from './native-store.js'
+import { NativeBytesStore } from '@chronolog/records/native'
 
 const envelope = (text: string) => encodeEnvelope({ groupRoute: new Uint8Array(32).fill(1),
   messageType: 'candidate', encryptionEpoch: null, payload: utf8(text) })
@@ -43,7 +43,7 @@ async function fixture(clockPolicy?: ClockPolicy) {
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-agent-authority-'))
   cleanup.push(() => rm(directory, { recursive: true, force: true }))
   const path = join(directory, 'agent.sqlite')
-  const store = new NativeAgentStore(path)
+  const store = new NativeBytesStore(path)
   cleanup.push(() => store.close())
   const clock = { now: 1_000 }
   return { ...credentialsValue, store, path, clock, now: () => clock.now }
@@ -134,7 +134,7 @@ describe('native signed-inclusion finality service', () => {
     const authority = await NativeFinalityService.open(f)
     const entry = await authority.append(envelope('one'))
     const certificate = await authority.certify()
-    expect(() => new NativeAgentStore(f.path)).toThrow('AGENT_STORE_IN_USE')
+    expect(() => new NativeBytesStore(f.path)).toThrow('AGENT_STORE_IN_USE')
     const second = spawnSync(process.execPath, ['--input-type=module', '-e', `
       import { DatabaseSync } from 'node:sqlite';
       const db = new DatabaseSync(process.argv[1]);
@@ -144,7 +144,7 @@ describe('native signed-inclusion finality service', () => {
     expect(second.status).not.toBe(0)
     expect(second.stderr).toMatch(/locked|busy/u)
     f.store.close()
-    const reopenedStore = new NativeAgentStore(f.path)
+    const reopenedStore = new NativeBytesStore(f.path)
     cleanup.push(() => reopenedStore.close())
     const reopened = await NativeFinalityService.open({ ...f, store: reopenedStore, continuity: certificate })
     expect(await reopened.append(envelope('one'))).toEqual(entry)
@@ -161,7 +161,7 @@ describe('native signed-inclusion finality service', () => {
     await expect(authority.append(envelope('two'))).rejects.toThrow('RECORD_LOG_QUOTA_EXCEEDED')
     expect((await authority.head()).position).toBe(1)
     expect(await authority.append(envelope('one'))).toEqual(original)
-    const isolated = new NativeAgentStore(':memory:', { quotaBytes: 3, maxValueBytes: 4 })
+    const isolated = new NativeBytesStore(':memory:', { quotaBytes: 3, maxValueBytes: 4 })
     cleanup.push(() => isolated.close())
     await isolated.put('state', utf8('one'))
     await expect(isolated.put('state', utf8('four'))).rejects.toThrow('AGENT_STORE_QUOTA_EXCEEDED')

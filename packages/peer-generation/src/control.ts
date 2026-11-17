@@ -1,6 +1,6 @@
 import { DOMAINS } from '@chronolog/protocol'
 import {
-  boundedText, check, decodePeerValue, encodePeerValue, hex, object, peerDigest,
+  boundedText, check, isArray, decodePeerValue, encodePeerValue, hex, object, peerDigest,
   samePeerValue, Serial, signPeerValue, uint, verifyPeerValue,
 } from './codec.js'
 import {
@@ -32,7 +32,7 @@ function validateControl(value: ControlRevision): void {
   object(value, ['applicationId', 'profile', 'policy', 'revision', 'previous', 'epoch', 'keyDigest', 'grants', 'recoveryFloor'])
   hex(value.applicationId); uint(value.revision); uint(value.epoch); hex(value.keyDigest)
   if (value.previous !== null) hex(value.previous)
-  check(Array.isArray(value.grants) && value.grants.length > 0 && value.grants.length <= 1024, 'PEER_GRANTS_INVALID')
+  check(isArray(value.grants) && value.grants.length > 0 && value.grants.length <= 1024, 'PEER_GRANTS_INVALID')
   const keys = new Set<string>()
   for (const grant of value.grants) {
     object(grant, ['publicKey', 'reader', 'writer', 'coordinator', 'recovery', 'administrator']); hex(grant.publicKey)
@@ -50,7 +50,7 @@ function validateRequest(value: TransitionRequest): void {
   check(['create', 'handover', 'takeover', 'control-change'].includes(value.reason), 'PEER_TRANSITION_REASON_INVALID')
   if (value.base !== null) {
     object(value.base, ['point', 'receipt', 'bridge']); validateHistoryPoint(value.base.point)
-    check(Array.isArray(value.base.bridge) && value.base.bridge.length <= 4096, 'PEER_PREFIX_PROOF_TOO_LARGE')
+    check(isArray(value.base.bridge) && value.base.bridge.length <= 4096, 'PEER_PREFIX_PROOF_TOO_LARGE')
   }
 }
 function validateGeneration(value: GenerationRecord): void {
@@ -126,7 +126,7 @@ export class PeerAuthority {
   }
   async verifyPrefix(proof: PrefixProof): Promise<void> {
     object(proof, ['point', 'receipt', 'bridge']); validateHistoryPoint(proof.point)
-    check(Array.isArray(proof.bridge) && proof.bridge.length <= 4096, 'PEER_PREFIX_PROOF_TOO_LARGE')
+    check(isArray(proof.bridge) && proof.bridge.length <= 4096, 'PEER_PREFIX_PROOF_TOO_LARGE')
     const segment = this.selectedSegments().find(value => value.generation.id === proof.point.generation)
     check(segment !== undefined && this.contains(proof.point), 'PEER_PREFIX_EXCLUDED')
     const { point } = proof
@@ -190,8 +190,8 @@ export class PeerAuthority {
     validateDescriptor(bundle.descriptor.payload)
     await verifyPeerValue(DOMAINS.peerDescriptor, bundle.descriptor, bundle.descriptor.payload.controlPublicKey)
     if (pinned !== undefined) check(samePeerValue(bundle.descriptor, pinned), 'PEER_DESCRIPTOR_CHANGED')
-    check(Array.isArray(bundle.controls) && bundle.controls.length > 0 && bundle.controls.length <= 4096 &&
-      Array.isArray(bundle.generations) && bundle.generations.length <= 4096, 'PEER_AUTHORITY_LIMIT')
+    check(isArray(bundle.controls) && bundle.controls.length > 0 && bundle.controls.length <= 4096 &&
+      isArray(bundle.generations) && bundle.generations.length <= 4096, 'PEER_AUTHORITY_LIMIT')
     const descriptor = bundle.descriptor.payload
     for (const [index, control] of bundle.controls.entries()) {
       validateControl(control.payload); scope(control.payload, descriptor)
@@ -233,7 +233,9 @@ async function verifyNextControl(descriptor: ApplicationDescriptor, previous: Si
   if (revokedReader) check(next.payload.epoch > previous.payload.epoch && next.payload.keyDigest !== previous.payload.keyDigest, 'PEER_REVOCATION_REQUIRES_KEY_ROTATION')
   if (next.payload.epoch === previous.payload.epoch) check(next.payload.keyDigest === previous.payload.keyDigest, 'PEER_EPOCH_KEY_CHANGED')
 }
-export const verifyAuthorityBundle = PeerAuthority.verify
+export function verifyAuthorityBundle(bundle: AuthorityBundle, pinned?: SignedApplicationDescriptor): Promise<PeerAuthority> {
+  return PeerAuthority.verify(bundle, pinned)
+}
 
 export interface GenerationRegistry {
   read(): Promise<AuthorityBundle>

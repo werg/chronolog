@@ -16,11 +16,11 @@ export interface EventExecutionStore {
 }
 
 /** A pinned SQL-absent execution profile; importing it never loads an SQL engine. */
-export async function eventExecutionManifest() {
+export async function eventExecutionManifest(historyProfile: 'chronological' | 'peer-generation-v1' = 'chronological') {
   return createExecutionManifest({
     profile: 'chronolog-events-v1', engine: 'none',
     engineDigest: await sha256(utf8('chronolog/events-only/v1')),
-    platformDigest: await sha256(utf8('chronolog/change-program/v3;literal-events;operation-conflicts/v1;author-time-order/v1')),
+    platformDigest: await sha256(utf8(`chronolog/change-program/v3;literal-events;operation-conflicts/v1;${historyProfile === 'chronological' ? 'author-time-order/v1' : 'peer-generation-order/v1'}`)),
   })
 }
 
@@ -28,9 +28,12 @@ export async function createEventMaterializationRuntime(options: {
   readonly store: EventExecutionStore
   readonly namespace: string
   readonly maxHistoryBytes?: number
+  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
 }): Promise<ChronologMaterializationRuntime> {
   if (options.namespace.length === 0) throw new Error('EVENT_EXECUTION_NAMESPACE_REQUIRED')
-  const manifest = await eventExecutionManifest()
+  const historyProfile = options.historyProfile ?? 'chronological'
+  if (historyProfile !== 'chronological' && historyProfile !== 'peer-generation-v1') throw new Error('EVENT_HISTORY_PROFILE_UNSUPPORTED')
+  const manifest = await eventExecutionManifest(historyProfile)
   const artifacts = await executionManifestArtifacts(manifest)
   const digest = artifacts.executionManifestDigest
   const key = `event-execution/${options.namespace}`
@@ -71,7 +74,7 @@ export async function createEventMaterializationRuntime(options: {
       if (proposals.has(proposalId)) throw new Error('EVENT_EXECUTION_DUPLICATE_PROPOSAL')
       transactions.add(transactionId); proposals.add(proposalId)
       const orderKey = transactionOrderKey(core, entry.txId)
-      if (index > 0 && compareTransactionOrder(result[index - 1]!.orderKey, orderKey) >= 0) {
+      if (historyProfile === 'chronological' && index > 0 && compareTransactionOrder(result[index - 1]!.orderKey, orderKey) >= 0) {
         throw new Error('EVENT_EXECUTION_ORDER_NOT_CHRONOLOGICAL')
       }
       const operation = `${bytesToHex(core.authorId)}/${core.operationId}`
@@ -114,7 +117,8 @@ export async function createEventMaterializationRuntime(options: {
   }
   const captureApplication = (input: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot => {
     if (closed) throw new Error('EVENT_EXECUTION_CLOSED')
-    const view = input.view ?? 'final'
+    const view = input.view ?? (historyProfile === 'peer-generation-v1' ? 'local' : 'final')
+    if (view === 'final' && historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
     const length = view === 'final' ? finalLength : order.length
     const selected = order, selectedOutcomes = outcomes
     return {
@@ -128,6 +132,7 @@ export async function createEventMaterializationRuntime(options: {
     }
   }
   return {
+    historyProfile,
     coordinator: {
       materialize: async (input) => {
         const next = structuredClone(input) as ReplayProposal[]
@@ -171,6 +176,7 @@ export async function createEventMaterializationRuntime(options: {
         })
       },
       publishFinal: (length) => serial(async () => {
+        if (historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
         if (!Number.isSafeInteger(length) || length < finalLength || length > order.length) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_INVALID')
         if (length === finalLength) return
         await persist(encode(order, revision, length, finalRevision + 1n))

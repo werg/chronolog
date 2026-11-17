@@ -20,7 +20,7 @@ export function object(value: unknown, keys: readonly string[]): Record<string, 
   return record
 }
 export function boundedText(value: unknown, max = 512): asserts value is string {
-  check(typeof value === 'string' && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value), 'PEER_TEXT_INVALID')
+  check(typeof value === 'string' && value.length > 0 && value.length <= max && [...value].every(character => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127), 'PEER_TEXT_INVALID')
 }
 export function hex(value: unknown, bytes = 32): asserts value is string {
   check(typeof value === 'string' && value.length === bytes * 2 && /^[0-9a-f]+$/u.test(value), 'PEER_HEX_INVALID')
@@ -86,3 +86,6 @@ export class Serial {
     try { return await task() } finally { release() }
   }
 }
+
+/** Boolean guard avoids widening typed readonly lists to any[]. */
+export function isArray(value: unknown): boolean { return Array.isArray(value) }

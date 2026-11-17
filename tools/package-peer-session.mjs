@@ -1,0 +1,92 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, relative, resolve } from 'node:path';
+import process from 'node:process';
+import { parseArgs } from 'node:util';
+
+import { build } from 'esbuild';
+import ts from 'typescript';
+
+const root = resolve(import.meta.dirname, '..');
+const { values } = parseArgs({ options: { output: { type: 'string', default: 'artifacts/peer-session' },
+  'allow-dirty': { type: 'boolean', default: false } } });
+const output = resolve(values.output), packageRoot = join(output, 'package');
+const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
+const entries = Object.fromEntries(['index', 'native', 'browser'].map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
+const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
+  // Shared chunks preserve class identity and session ownership across all entrypoints.
+  splitting: true, platform: 'neutral', conditions: ['import', 'default'], mainFields: ['module', 'main'],
+  format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root, external: ['node:*'],
+  outExtension: { '.js': '.mjs' }, chunkNames: 'chunks/[name]-[hash]' });
+const runtimeInputs = Object.keys(bundled.metafile.inputs).sort();
+assert(runtimeInputs.every(path => !/(?:materializer-doltlite|transport-ssb|agent-service|control-store|runtime-browser|testkit)\//u.test(path)),
+  'The default session artifact must not contain SQL, legacy native services or fixtures');
+assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).every(value => !value.external || value.path.startsWith('node:')),
+  'The session artifact must not fetch external runtime dependencies');
+const declaration = declarations(Object.values(entries));
+const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
+  'packages/peer-session/package.json', 'packages/peer-session/README.md', 'tools/package-peer-session.mjs'])].sort();
+const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
+if (changed && !values['allow-dirty']) throw new Error('PEER_SESSION_PACKAGE_REQUIRES_CLEAN_INPUTS');
+const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}`, version = `0.0.0-g${suffix}`;
+await rm(packageRoot, { force: true, recursive: true });
+await mkdir(packageRoot, { recursive: true });
+const files = new Map();
+for (const file of bundled.outputFiles) files.set(relative(packageRoot, file.path).replaceAll('\\', '/'), file.contents);
+for (const [path, content] of declaration.files) files.set(path, content);
+for (const name of Object.keys(entries)) files.set(`${name}.d.ts`, `export * from './types/packages/peer-session/src/${name}.js';\n`);
+files.set('README.md', await readFile(join(root, 'packages/peer-session/README.md')));
+files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', version, type: 'module',
+  description: 'Authenticated movable-peer application sessions with explicit recovery and applied outcomes',
+  exports: Object.fromEntries(Object.keys(entries).map(name => [name === 'index' ? '.' : `./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
+  files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json'], dependencies: {}, engines: { node: '>=22.15' },
+}, null, 2) + '\n');
+for (const [path, content] of files) { await mkdir(dirname(join(packageRoot, path)), { recursive: true }); await writeFile(join(packageRoot, path), content); }
+assert.equal(git(['rev-parse', 'HEAD']).trim(), source, 'Source commit changed during packaging');
+assert.equal(git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim(), changed, 'Package inputs changed during packaging');
+const sha256 = Object.fromEntries([...files].map(([path, content]) => [path, hash(content)]));
+await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: 'chronolog-peer-session-package/v1',
+  repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
+  inputs, runtimeInputs, sha256 }, null, 2) + '\n');
+const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
+  cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+}))[0];
+const artifact = join(output, `chronolog-peer-session-${suffix}.tgz`);
+await rename(join(output, packed.filename), artifact);
+process.stdout.write(JSON.stringify({ artifact, version, source, sourceTree, dirty, sha256: hash(await readFile(artifact)) }) + '\n');
+
+function declarations(entryPoints) {
+  const configuration = ts.readConfigFile(join(root, 'tsconfig.base.json'), ts.sys.readFile);
+  if (configuration.error) throw new Error(ts.flattenDiagnosticMessageText(configuration.error.messageText, '\n'));
+  const parsed = ts.parseJsonConfigFileContent(configuration.config, ts.sys, root);
+  const out = join(packageRoot, 'types');
+  const options = { ...parsed.options, rootDir: root, outDir: out, types: ['node'], noEmit: false,
+    declaration: true, declarationMap: false, sourceMap: false, emitDeclarationOnly: true, noEmitOnError: true };
+  const compiler = ts.createProgram(entryPoints, options);
+  const diagnostics = [...parsed.errors, ...ts.getPreEmitDiagnostics(compiler)];
+  if (diagnostics.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+    getCurrentDirectory: () => root, getCanonicalFileName: name => name, getNewLine: () => '\n',
+  }));
+  const files = new Map(), inputs = new Set();
+  const result = compiler.emit(undefined, (path, content, _bom, _error, sourceFiles) => {
+    if (!path.endsWith('.d.ts')) return;
+    for (const file of sourceFiles ?? []) inputs.add(relative(root, file.fileName).replaceAll('\\', '/'));
+    const rewritten = content.replace(/(['"])(@chronolog\/[^'"]+)\1/gu, (_match, quote, name) => {
+      const sourcePath = parsed.options.paths?.[name]?.[0];
+      assert(sourcePath, `Missing declaration alias: ${name}`);
+      const destination = join(out, sourcePath.replace(/\.ts$/u, '.js'));
+      let local = relative(dirname(path), destination).replaceAll('\\', '/');
+      if (!local.startsWith('.')) local = `./${local}`;
+      return `${quote}${local}${quote}`;
+    });
+    const imports = ts.preProcessFile(rewritten, true).importedFiles.map(value => value.fileName);
+    assert(imports.every(name => name.startsWith('.')), `Declarations must be self-contained: ${relative(root, path)} -> ${imports}`);
+    files.set(relative(packageRoot, path).replaceAll('\\', '/'), rewritten);
+  });
+  assert(!result.emitSkipped, 'Peer session declaration emit failed');
+  return { files, inputs: [...inputs] };
+}
+function git(args) { return execFileSync('git', args, { cwd: root, encoding: 'utf8' }); }
+function hash(bytes) { return createHash('sha256').update(bytes).digest('hex'); }

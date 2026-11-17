@@ -1,4 +1,4 @@
-import type { ExecutionManifest, TransactionOrderKey } from '@chronolog/protocol'
+import type { ChangeProgram, ExecutionManifest, TransactionOrderKey } from '@chronolog/protocol'
 export type { ReplayProposal } from '@chronolog/materializer'
 
 export type TransactionOutcomeKind = 'accepted' | 'rejected'
@@ -195,6 +195,11 @@ export interface DatabaseLike {
 }
 
 export interface MaterializerOptions {
+  /** Authenticated history policy; immutable for the retained database. */
+  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
+  /** Verified schema-author program, executed once before the genesis checkpoint. */
+  readonly bootstrapProgram?: ChangeProgram
+  readonly bootstrapGroupId?: Uint8Array
   /** Runtime-owned engine factory; browser and native use the same reducer. */
   readonly openDatabase?: (options: Pick<MaterializerOptions, 'path'>) => {
     readonly database: DatabaseLike
@@ -232,6 +237,8 @@ export type MaterializerPublicationFaultPoint =
   | 'after_reader_swap'
 
 export interface StoredExecutionManifest {
+  readonly historyProfile: 'chronological' | 'peer-generation-v1'
+  readonly bootstrapProgram: Uint8Array
   readonly manifestDigest: Uint8Array
   readonly canonicalManifest: Uint8Array
 }

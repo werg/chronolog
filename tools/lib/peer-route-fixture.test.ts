@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { NativeAgentStore } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+
 import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import { loadOrCreateEnrollmentIdentity } from '@chronolog/node-core'
 import { bytesToBase64Url } from '@chronolog/protocol'
@@ -20,7 +21,7 @@ import { createPeerRouteFixture } from './peer-route-fixture.js'
 
 it('introduces through the packaged host then replicates signed records over RTC with its listener stopped', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-host-rtc-'))
-  const readerStore = new NativeAgentStore(join(directory, 'reader.sqlite'))
+  const readerStore = new NativeBytesStore(join(directory, 'reader.sqlite'))
   const identity = await loadOrCreateEnrollmentIdentity(readerStore, 'rtc-reader')
   let releaseWrites!: () => void, writeStarted = false
   const writesBlocked = new Promise<void>(resolve => { releaseWrites = resolve })

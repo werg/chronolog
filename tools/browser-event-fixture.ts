@@ -1,7 +1,8 @@
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { NativeAgentStore, type AgentApplicationModule } from '@chronolog/agent-service'
+import { NativeBytesStore } from '@chronolog/records/native'
+import { type AgentApplicationModule } from '@chronolog/agent-service'
 import { encodeSignedGenesis, signGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
@@ -29,12 +30,12 @@ export async function createNativeBrowserFixture(options: {
   /** Qualification-only clock control; signed proposal timestamps are unchanged. */
   readonly finalityClock?: () => number
   readonly manifest?: ExecutionManifest
-  readonly materialization?: (context: { readonly store: NativeAgentStore; readonly identity: EnrollmentIdentity;
+  readonly materialization?: (context: { readonly store: NativeBytesStore; readonly identity: EnrollmentIdentity;
     readonly executionManifest: ExecutionManifest }) => Promise<ChronologMaterializationRuntime>
   readonly application?: AgentApplicationModule
 }) {
   await mkdir(options.directory, { recursive: true })
-  const store = new NativeAgentStore(join(options.directory, 'agent.sqlite'))
+  const store = new NativeBytesStore(join(options.directory, 'agent.sqlite'))
   const control = new NodeStateDatabase(join(options.directory, 'control.sqlite'))
   const identity = await loadOrCreateEnrollmentIdentity(store, 'browser-fixture-native')
   const feedStore = await DurableFeedStore.open(store, webFeedCrypto)

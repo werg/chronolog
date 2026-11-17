@@ -362,9 +362,33 @@ importers:
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
+      '@chronolog/crypto':
+        specifier: workspace:*
+        version: link:../crypto
+      '@chronolog/materializer':
+        specifier: workspace:*
+        version: link:../materializer
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
+
+  packages/peer-session:
+    dependencies:
+      '@chronolog/materializer':
+        specifier: workspace:*
+        version: link:../materializer
+      '@chronolog/peer-generation':
+        specifier: workspace:*
+        version: link:../peer-generation
+      '@chronolog/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:../signals
 
   packages/protocol:
     dependencies:

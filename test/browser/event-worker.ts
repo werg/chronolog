@@ -5,7 +5,7 @@ import { base64UrlToBytes, bytesToBase64Url, bytesToHex, utf8 } from '@chronolog
 import { feedIdFromPublicKey, type AtomicBytesStore } from '@chronolog/records'
 import { openBrowserEventPeer, prepareBrowserIdentity, serveBrowserEventPeer, type BrowserEventPeer } from '@chronolog/runtime-browser/events'
 
-import { acquireBrowserStorage } from '../../packages/runtime-browser/src/opfs.js'
+import { acquireBrowserStorage } from '@chronolog/records/browser'
 import { openSyncControl } from '../../packages/runtime-browser/src/sync-control.js'
 import type { WorkerEndpoint } from '../../packages/runtime-browser/src/worker-rpc.js'
 import { connectGovernedBrowserPeer } from './event-connection.js'

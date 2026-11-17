@@ -19,7 +19,7 @@ export interface NativeFinalityServiceOptions {
   /** Signed genesis pins the signer, history, execution profile and clock policy. */
   readonly descriptor: EnrollmentDescriptor
   readonly identity: Ed25519KeyPair
-  /** Must have one fenced storage owner, e.g. NativeAgentStore. */
+  /** Must have one fenced storage owner, e.g. NativeBytesStore. */
   readonly store: DurableOperationStore
   /** Retained ledger descriptors and closure records. Defaults to 64 MiB. */
   readonly recordQuotaBytes?: number

@@ -8,7 +8,7 @@ import {
 } from '@chronolog/node-core/browser'
 import { PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type AtomicBytesStore, type ChronologTransport } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService, type GovernanceRpcAdmin } from '@chronolog/rpc/browser'
-import { acquireBrowserStorage } from './opfs.js'
+import { acquireBrowserStorage } from '@chronolog/records/browser'
 import { openBrowserDeviceRecords } from './device-records.js'
 import { openSyncControl, type SyncControlPersistence } from './sync-control.js'
 import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'

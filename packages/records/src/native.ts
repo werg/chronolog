@@ -2,9 +2,9 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import type { DurableOperationStore } from '@chronolog/node-core'
+import type { AtomicBytesStore } from './store.js'
 
-export interface NativeAgentStoreOptions {
+export interface NativeBytesStoreOptions {
   readonly quotaBytes?: number
   readonly maxValueBytes?: number
 }
@@ -15,13 +15,13 @@ export interface NativeAgentStoreOptions {
  * DurableFeedStore. SQLite holds the exclusive writer fence until close (also
  * across processes); a process crash releases it without a stale lock file.
  */
-export class NativeAgentStore implements DurableOperationStore {
+export class NativeBytesStore implements AtomicBytesStore {
   readonly #database: DatabaseSync
   readonly #quotaBytes: number
   readonly #maxValueBytes: number
   #closed = false
 
-  constructor(path: string, options: NativeAgentStoreOptions = {}) {
+  constructor(path: string, options: NativeBytesStoreOptions = {}) {
     this.#quotaBytes = options.quotaBytes ?? 256 * 1024 * 1024
     this.#maxValueBytes = options.maxValueBytes ?? 128 * 1024 * 1024
     for (const value of [this.#quotaBytes, this.#maxValueBytes]) {
