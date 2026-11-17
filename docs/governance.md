@@ -60,8 +60,8 @@ a peer connection and fetch the full original application history, including
 its receipt descriptors and bodies. Governance activation continues while application replay waits for a
 missing body; the missing body is pending progress, never a rejected operation.
 Approvals and revocations retain their exact operation identities across lost
-responses and restarts. Revocation and key rotation resume as one durable
-administration operation.
+responses and restarts. Reader revocation and key rotation are one signed revision and resume as one
+durable administration operation.
 
 `npm run package:membership` builds the standalone `@chronolog/membership`
 artifact with bundled JavaScript, self-contained declarations and source/input
@@ -353,18 +353,25 @@ plaintext by RPC.
 `GovernanceControlPlane` in `@chronolog/node-core` backs that surface:
 
 - `publishCapabilityChange` serializes and durably publishes supported grants
-  and revocations; under a built-in signed configuration it rejects changes
-  to validators, validation policy, root and administration feed;
-- `revoke` removes every selected active capability at the next revision;
-- `rotateEpoch` publishes a fresh content key wrapped independently to every
-  active reader;
+  and revocations; the live controller always rejects changes to the fixed
+  validators and validation policy, including when no history adapter is attached;
+- `revoke` removes the selected capabilities at the next revision. Removing a
+  reader also advances the encryption epoch in that same revision and publishes
+  a fresh key wrapped only to the remaining readers;
+- `rotateEpoch` publishes a governance revision that advances the epoch without
+  changing grants, together with its encrypted key distributions;
+- `initializeEpochKey` distributes the genesis-authorized epoch-zero key without
+  creating a new authority transition;
 - `grantHistoricalAccess` rewraps retained historical epochs for an active
   reader; this is the only way a reader gets epochs from before its grant.
 - `ownsCapabilityFeed` tells whether this node is the administration-feed
   owner, the only node that publishes capability revisions and epochs.
 
-Every controller rebuilds signed revision snapshots and the epoch chain from
-retained records and follows new records live. Ordinary peer delivery verifies
+Every controller rebuilds the signed governance chain from retained records
+and follows new records live. Each revision explicitly retains the current
+encryption epoch or advances it by one; genesis authorizes epoch zero. Root
+and administration-feed succession are not protocol fields in the supported
+live system. Ordinary peer delivery verifies
 the configured administration feed and its complete prefix. Coordinated
 delivery verifies the ordered record and its signed governance content through
 the certified history. A replica may receive snapshots and key envelopes ahead
@@ -392,9 +399,11 @@ key creates a new capability; it cannot reactivate the revoked capability or
 resurrect a rejected proposal. Governance receipt, authorization activation,
 key availability and local application progress are separate conditions.
 
-Rotate the epoch after removing a reader: the removed device may retain
-plaintext and old epoch keys it already possessed, but it is not included in
-the new manifest and cannot decrypt traffic encrypted with that new key.
+Reader revocation retires the old epoch atomically with the grant change. The
+removed device may retain plaintext and old keys it already possessed, but the
+new distribution excludes it. A manual rotation uses the same governance
+transition with no grant changes. Both proof adapters activate permissions and
+epoch identity through the same author-time state index.
 
 Application acceptance also checks the epoch selected at the signed author
 timestamp. A verified rotation governs timestamps after its closed boundary, even
@@ -409,28 +418,42 @@ can deliberately submit a fresh operation with a new ID after synchronizing.
 An exact retry already finalized before the rotation retains its original outcome.
 
 This is a rule for canonical acceptance. It cannot prevent a participant from
-disclosing plaintext or old-key ciphertext it already knows. An unavailable
-application body, or a missing local key for an epoch already issued at that
-position, still blocks replay; it is not treated as a stale-epoch rejection.
-The full envelope must be retrieved and checked against its committed hash and
-metadata. An epoch not yet issued by the preceding canonical controls is
-permanently invalid at that position, even if a later rotation or received key
-wrap names it. Replicas skip that position without assigning an unverified
-proposal identity. Previously issued epochs must still be decrypted before a
-stale-epoch rejection can identify the original signed proposal.
-Unknown or future membership revisions in an already verified canonical prefix
-are unauthorized at that position. Malformed or out-of-order inline control
-operations occupy their positions without holding up later valid controls.
+disclosing plaintext or old-key ciphertext it already knows. The root is a
+trusted key issuer: it creates the shared content keys and can deny their
+availability. Each signed key distribution binds the group, epoch, issuing
+governance revision and content-key commitment. Replicas reject conflicting
+key assignments for one epoch. This detects issuer inconsistency; it does not
+claim consensus against a malicious root.
 
-Every active reader receives each new epoch at rotation. Earlier epochs reach
-a reader only through an explicit `grantHistoricalAccess`. Historical access
-never changes old transaction bytes.
+Key distributions supply availability, never a second authority timeline. A
+new key may arrive before its issuing revision and remain pending until that
+signed predecessor is known. Once its revision is known, the key can be retained
+before activation, but local authoring still selects the key for the **active**
+governance state. Historical rewraps use the same distribution format, keep the
+same key commitment and cannot reopen a retired epoch. Old encrypted operations
+remain decryptable for replay under their original author-time authorization.
 
-When replaying a complete certified prefix, a late replica first receives its
-verified governance and key envelopes. This lets a historical key grant later
-in the prefix unlock earlier encrypted SQL. That receipt does not activate a
-later writer grant early. Missing keys or an unsupported execution profile
-remain explicit blocked states, not SQL rejections or false readiness.
+An unavailable application body, or a missing key for an authorized epoch,
+blocks replay. Neither becomes a rejection or a false readiness report. Required
+enrollment epochs come from the captured active governance state, including
+keys whose manifests have not arrived. Readiness also requires the currently
+active epoch key if governance advances afterward. A future received revision
+does not add requirements to the captured target or activate its epoch early.
+
+The inclusion adapter verifies the envelope against its committed hash and
+metadata before interpreting it. A proposal may have a future author timestamp
+and be received before a later epoch transition. Its first receipt does not
+choose its permissions. An undecryptable envelope can be excluded as referring
+to a nonexistent epoch only after verified governance and live closure cover
+its entire permitted author-time window. An issued key that is merely missing
+locally remains pending. After decryption, the exact signed author timestamp
+selects the shared governance state and determines whether that epoch is active.
+
+Every active reader receives a new epoch's key at rotation. Earlier epochs reach
+a newly admitted reader through explicit `grantHistoricalAccess`. A late replica
+can receive these verified historical distributions before replaying earlier
+encrypted SQL, without activating a later writer grant early. An unsupported
+execution profile likewise remains an explicit blocked state.
 
 ### Row-grant revocation and finality
 
@@ -444,8 +467,8 @@ validator. The frontier accounts for each pending proposal's own policy and
 revision, every allowed admission policy, and complete indexed feed prefixes.
 Once the revoke is final, no later admission can be inserted before it.
 
-`TransactionHandle.accepted()` and `settled()` report the materialized outcome
-at the transaction's **current position**. Neither waits for finality. Use
+`TransactionHandle.local()` reports the materialized accepted or rejected
+outcome at the transaction's **current position**. It does not wait for finality. Use
 `handle.final()` to wait for its immutable accepted or rejected result. External
 effects consume final events and retain their own dispatch checkpoint and
 idempotency key. Settlement evidence explains pending proof and admission

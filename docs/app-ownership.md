@@ -15,8 +15,13 @@ is [`examples/shared-notes.ts`](../examples/shared-notes.ts)
   transaction. Nothing is skipped silently.
 - Every member of a group can read every row. Ownership controls writes only.
   Use a separate group for data some members must not see.
-- Group admins are the schema administrators. Only they run DDL, including
-  app triggers.
+- Schema administrators run DDL, including app triggers. Membership
+  administration is a separate role selected by signed genesis.
+
+These transactions require an explicit writer grant with `program.sql: true`.
+That publication right leaves row ownership, sharing rules and schema checks in
+force. A membership grant does not silently make its holder a schema or team
+administrator.
 
 ## Who am I, and who owns this row?
 
@@ -39,8 +44,19 @@ await client.transaction([{
 
 ## Knowing why a write failed
 
-`handle.accepted()` resolves on acceptance and throws a `TransactionRejectedError`
-on rejection. `error.reason` says what went wrong:
+Choose `handle.local()` for a provisional executed result or `handle.final()`
+before dependent work. Both return accepted **or rejected** outcomes. Rejection
+does not throw automatically; an application can turn it into the exported
+`TransactionRejectedError` when an exception fits its control flow:
+
+```ts
+const result = await handle.final()
+if (result.outcome.type === 'rejected') {
+  throw new TransactionRejectedError(handle.transactionId, result.outcome.rejection)
+}
+```
+
+`error.reason` says what went wrong:
 
 | `reason.kind` | Meaning |
 | --- | --- |
@@ -50,9 +66,9 @@ on rejection. `error.reason` says what went wrong:
 | `schema` | DDL left a table without an owner column or primary key (`schema_unregistered`), or a trigger used `RAISE(IGNORE)`. |
 | `engine` | SQLite refused the statement: `constraint`, `denied`, `step_limit`, … |
 
-`error.stepIndex` is the failing step. The outcome is the one at the
-transaction's current position: a late predecessor can still change it on
-replay (`TransactionOutcome.changedByReplay`).
+`error.stepIndex` is the failing step. A result returned by `local()` can change
+when a late predecessor causes replay (`TransactionOutcome.changedByReplay`).
+A result returned by `final()` is immutable in this live history.
 
 ## Sharing, teams and transfers
 

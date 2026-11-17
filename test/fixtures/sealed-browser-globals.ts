@@ -43,7 +43,7 @@ try {
     },
     getSettlementEvidence: async (transactionId): Promise<SettlementEvidence> => ({
       transactionId,
-      outcome: { transactionId, phase: 'accepted', outcome: { type: 'accepted' },
+      outcome: { transactionId, outcome: { type: 'accepted' },
         eventSetRevision: '9', materializedRevision: '7', orderKey: 'policy-order',
         changedByReplay: false, admissible: true, final: true, observedAt: '1970-01-01T00:00:00.001Z' },
       evidenceRevision: '9', orderKey: 'policy-order', authorTimestamp: '1',

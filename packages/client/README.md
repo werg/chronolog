@@ -155,15 +155,20 @@ must remain REAL. Put assumptions in SQL with `chronolog_assert`.
 | API | What it waits for |
 | --- | --- |
 | `client.transaction(...)` | Durable local publication of the signed proposal. |
-| `handle.settled()` | The current accepted/rejected SQL result, which can still change through replay. |
-| `handle.accepted()` | The current accepted SQL result; throws `TransactionRejectedError` for a current rejection. It is also speculative. |
+| `handle.local()` | The current accepted/rejected SQL result, which can still change through replay. |
 | `handle.final()` | The immutable accepted/rejected result after its policy-final prefix is applied locally. |
 
-`final()` returns final rejections as well as final acceptances. Always inspect
+`local()` and `final()` both return rejections as well as acceptances. Always inspect
 `outcome.type` before starting dependent application work. Waiting can be
 cancelled even while the stream is quiet; cancellation stops that waiter, not
 the transaction. A final result may wait indefinitely while required validators,
 certificates, records or keys are unavailable.
+
+Execution and finality are independent fields, without a second phase enum.
+`outcome.type === 'pending'` means no executed result is available; an accepted
+or rejected result with `final: false` is provisional. `final: true` identifies
+the immutable executed result. `admissible` separately reports inclusion under
+the selected policy; it does not turn a SQL rejection into a success.
 
 The `idempotencyKey` is the application's durable operation identity. Persist
 and reuse it with the same program after a lost response or client/process
@@ -186,7 +191,8 @@ console.log(final.revision.view)             // 'final'
 console.log(final.revision.finalOrderLength) // decimal string
 ```
 
-The default `local` reader includes admitted speculative work. The `final`
+The default `local` reader includes authorized proposals with the inputs needed
+for execution, even before an inclusion receipt or validator quorum. The `final`
 reader is a separate SQL snapshot of the locally applied immutable prefix.
 Both carry view, selected revision, order length, final-prefix metadata and
 execution-manifest identity. A final replica can still be behind other peers.
@@ -252,7 +258,7 @@ administration belongs to the genesis root key, independently of these grants.
 
 `client.ownership` handles row grants, teams and ownership transfers. Those are
 application transactions, separate from group enrollment. Their handles offer
-the same `settled()`, `accepted()` and `final()` distinction.
+the same `local()` and `final()` distinction; inspect the returned `outcome.type`.
 
 Close the client with `await client.close()` to dispose its live resources and
 close its transport. See [client.ts](src/client.ts) for the complete typed API.

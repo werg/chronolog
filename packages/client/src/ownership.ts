@@ -85,7 +85,7 @@ export function parseRejectionCode(code: string): RejectionReason {
   return { kind: 'engine', code }
 }
 
-/** Thrown by `TransactionHandle.accepted()` when the transaction is rejected. */
+/** An application may throw this after inspecting a rejected local() or final() result for a parsed reason. */
 export class TransactionRejectedError extends Error {
   readonly code: string
   /** Index of the failing step, or null for whole-transaction checks. */

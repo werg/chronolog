@@ -64,7 +64,6 @@ import {
   type LocalSqlInput,
 } from './local-sql.js'
 import {
-  TransactionRejectedError,
   createdObjectId,
   ownershipSteps,
   type OfferAllInput,
@@ -154,25 +153,14 @@ export class TransactionHandle {
   get transactionId(): string { return this.submission.transactionId }
   get proposalId(): string { return this.submission.transactionId }
 
-  /** The current speculative result. Replay can change this until final() resolves. */
-  settled(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
+  /** The current executed result, accepted or rejected. Replay can change it until final() resolves. */
+  local(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
     return this.#waitForOutcome((value) => value.outcome.type !== 'pending', options.signal)
   }
 
   /** Resolves only when the accepted or rejected result is applied in the immutable prefix. */
   final(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
     return this.#waitForOutcome((value) => value.final && value.outcome.type !== 'pending', options.signal)
-  }
-
-  /**
-   * Resolves once the transaction is accepted; throws `TransactionRejectedError`
-   * (with a parsed `reason`) if it is rejected. Like `settled()`, this is the
-   * outcome at the transaction's current position.
-   */
-  async accepted(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
-    const outcome = await this.settled(options)
-    if (outcome.outcome.type === 'rejected') throw new TransactionRejectedError(this.transactionId, outcome.outcome.rejection)
-    return outcome
   }
 
   #waitForOutcome(predicate: (value: TransactionOutcome) => boolean, signal?: AbortSignal): Promise<TransactionOutcome> {

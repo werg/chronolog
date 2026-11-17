@@ -40,40 +40,40 @@ describe('ownership client API', () => {
       'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'open\') STRICT',
       "INSERT INTO notes (id, body) VALUES (1, 'alice note')",
     ])
-    await created.accepted()
+    await expectLocalAccepted(created)
     await seenBy(bob, created)
     expect(await rows(bob, `SELECT id FROM notes AS n WHERE ${ownerKeySql('n')} = ?`, [aliceKey])).toEqual([[1n]])
 
     // Bob may not change it: a typed rejection says which table and operation.
     const theft = await bob.transaction(["UPDATE notes SET body = 'bob was here' WHERE id = 1"])
-    const error = await theft.accepted().catch((caught: unknown) => caught)
+    const error = await expectLocalAccepted(theft).catch((caught: unknown) => caught)
     expect(error).toBeInstanceOf(TransactionRejectedError)
     expect((error as TransactionRejectedError).reason).toEqual({ kind: 'policy', table: 'notes', operation: 'update' })
     expect((error as TransactionRejectedError).stepIndex).toBe(0)
 
     // Alice shares the status column of row 1 with Bob.
     const share = await alice.ownership.share({ table: 'notes', with: bobKey, operations: ['update'], row: [1n], columns: ['status'] })
-    await share.handle.accepted()
+    await expectLocalAccepted(share.handle)
     await seenBy(bob, share.handle)
     const received = await list(bob, ownershipQueries.grantsReceived(bobKey))
     expect(received).toEqual([{
       grantId: share.id, table: 'notes', grantor: aliceKey, grantee: bobKey, rowKey: encodeRowKey([1n]), operations: ['update'], columns: ['status'],
     }])
     expect(await list(alice, ownershipQueries.grantsGiven(aliceKey))).toEqual(received)
-    await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).accepted()
+    await expectLocalAccepted(await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"]))
     const outsideCaps = await bob.transaction(["UPDATE notes SET body = 'no' WHERE id = 1"])
-    await expect(outsideCaps.accepted()).rejects.toMatchObject({ code: 'policy:notes:update' })
+    await expect(expectLocalAccepted(outsideCaps)).rejects.toMatchObject({ code: 'policy:notes:update' })
 
     // The grantee may renounce the grant.
-    await (await bob.ownership.revoke(share.id)).handle.accepted()
+    await expectLocalAccepted((await bob.ownership.revoke(share.id)).handle)
     expect(await list(bob, ownershipQueries.grantsReceived(bobKey))).toEqual([])
 
     // A team: Alice creates it and invites Bob, who sees the invitation and accepts.
     const team = await alice.ownership.createTeam({ invite: [bobKey] })
-    await team.handle.accepted()
+    await expectLocalAccepted(team.handle)
     await seenBy(bob, team.handle)
     expect((await list(bob, ownershipQueries.invitations(bobKey))).map((entry) => entry.teamId)).toEqual([team.id])
-    await (await bob.ownership.acceptInvitation(team.id)).handle.accepted()
+    await expectLocalAccepted((await bob.ownership.acceptInvitation(team.id)).handle)
     expect(await list(bob, ownershipQueries.teams(bobKey))).toEqual([
       { teamId: team.id, role: 'member', governance: { insert: 'member', update: 'member', delete: 'admin' } },
     ])
@@ -82,28 +82,28 @@ describe('ownership client API', () => {
 
     // Bob writes a row owned by the team; Alice, a team member, may update it.
     const teamRow = await bob.transaction([{ sql: `INSERT INTO notes (id, body, chronolog_owner) VALUES (2, 'team note', ${OWNER_FOR_KEY_SQL})`, params: [team.id] }])
-    await teamRow.accepted()
+    await expectLocalAccepted(teamRow)
     await seenBy(alice, teamRow)
     expect(await rows(alice, `SELECT ${ownerKeySql()} FROM notes WHERE id = 2`)).toEqual([[team.id]])
-    await (await alice.transaction(["UPDATE notes SET status = 'reviewed' WHERE id = 2"])).accepted()
+    await expectLocalAccepted(await alice.transaction(["UPDATE notes SET status = 'reviewed' WHERE id = 2"]))
     // Governance: deleting team rows needs a team admin.
     const memberDelete = await bob.transaction(['DELETE FROM notes WHERE id = 2'])
-    await expect(memberDelete.accepted()).rejects.toMatchObject({ reason: { kind: 'policy', operation: 'delete' } })
+    await expect(expectLocalAccepted(memberDelete)).rejects.toMatchObject({ reason: { kind: 'policy', operation: 'delete' } })
 
     // A transfer: Alice offers row 1 to Bob, who sees the offer and accepts it.
     const offer = await alice.ownership.offerRow({ table: 'notes', row: [1n], to: bobKey })
-    await offer.handle.accepted()
+    await expectLocalAccepted(offer.handle)
     await seenBy(bob, offer.handle)
     expect(await list(bob, ownershipQueries.incomingOffers(bobKey))).toEqual([
       { offerId: offer.id, table: 'notes', rowKey: encodeRowKey([1n]), from: aliceKey, to: bobKey, carry: false },
     ])
     expect((await list(alice, ownershipQueries.outgoingOffers(aliceKey))).map((entry) => entry.offerId)).toEqual([offer.id])
-    await (await bob.ownership.acceptOffer(offer.id)).handle.accepted()
+    await expectLocalAccepted((await bob.ownership.acceptOffer(offer.id)).handle)
     expect(await rows(bob, `SELECT ${ownerKeySql()} FROM notes WHERE id = 1`)).toEqual([[bobKey]])
     expect(await list(bob, ownershipQueries.incomingOffers(bobKey))).toEqual([])
     // A second acceptance is refused with a platform reason.
     const again = await bob.ownership.acceptOffer(offer.id)
-    await expect(again.handle.accepted()).rejects.toMatchObject({ reason: { kind: 'platform', reason: 'offer_closed' } })
+    await expect(expectLocalAccepted(again.handle)).rejects.toMatchObject({ reason: { kind: 'platform', reason: 'offer_closed' } })
 
     // Alice is the schema administrator; Bob is not.
     expect(await list(alice, ownershipQueries.schemaAdmin(aliceKey))).toEqual([true])
@@ -119,18 +119,18 @@ describe('ownership client API', () => {
       'CREATE TABLE docs (id INTEGER PRIMARY KEY, body BLOB, label TEXT NOT NULL) STRICT',
       "INSERT INTO docs (id, label) VALUES (1, 'private document')",
     ])
-    await created.accepted()
+    await expectLocalAccepted(created)
     await seenBy(bob, created)
 
     // Each node signs its own reader-key registration; policies snapshot those keys.
     const aliceRegistration = await alice.sealed.registerKey(aliceReader.publicKeyBytes)
-    await aliceRegistration.accepted()
+    await expectLocalAccepted(aliceRegistration)
     await seenBy(bob, aliceRegistration)
     const bobRegistration = await bob.sealed.registerKey(bobReader.publicKeyBytes)
-    await bobRegistration.accepted()
+    await expectLocalAccepted(bobRegistration)
     await seenBy(alice, bobRegistration)
     const readers = await alice.sealed.setReaders({ table: 'docs', row: [1n], readers: [bobId], expectedVersion: 0n })
-    await readers.handle.accepted()
+    await expectLocalAccepted(readers.handle)
     await seenBy(bob, readers.handle)
     expect(await bob.sealed.getPolicy('docs', [1n])).toMatchObject({
       policyId: readers.id, table: 'docs', rowKey: encodeRowKey([1n]), version: 1n, closed: false,
@@ -144,7 +144,7 @@ describe('ownership client API', () => {
     const first = await alice.sealed.put(readers.id, 'body', utf8('first secret'), {
       allowProvisionalPolicy: true, expectedPolicyVersion: 1n, expectedDataVersion: 0n,
     })
-    await first.handle.accepted()
+    await expectLocalAccepted(first.handle)
     await seenBy(bob, first.handle)
     const saved = await bob.sealed.get(readers.id, 'body')
     expect(saved).not.toBeNull()
@@ -158,25 +158,25 @@ describe('ownership client API', () => {
 
     // The ordinary column grant authorizes sealed writes through the normal UPDATE path.
     const share = await alice.ownership.share({ table: 'docs', row: [1n], with: bobId, operations: ['update'], columns: ['body'] })
-    await share.handle.accepted()
+    await expectLocalAccepted(share.handle)
     await seenBy(bob, share.handle)
     const edited = await bob.sealed.put(readers.id, 'body', utf8('edited by the granted writer'), {
       allowProvisionalPolicy: true, expectedPolicyVersion: 1n, expectedDataVersion: 1n,
     })
-    await edited.handle.accepted()
+    await expectLocalAccepted(edited.handle)
     await seenBy(alice, edited.handle)
     const updated = await alice.sealed.get(readers.id, 'body')
     expect(updated).toMatchObject({ policyVersion: 1n, dataVersion: 2n })
     expect(await bob.sealed.decrypt(updated!, bobReader.privateKey)).toEqual(utf8('edited by the granted writer'))
     const outsideGrant = await bob.transaction(["UPDATE docs SET label = 'outside the grant' WHERE id = 1"])
-    await expect(outsideGrant.accepted()).rejects.toMatchObject({ code: 'policy:docs:update' })
+    await expect(expectLocalAccepted(outsideGrant)).rejects.toMatchObject({ code: 'policy:docs:update' })
 
     // Replace the exact policy generation/version. The next value receives a new
     // content key and Alice's wrap only; Bob's saved historical value still opens.
     const removed = await alice.sealed.setReaders({
       table: 'docs', row: [1n], readers: [aliceId], expectedPolicyId: readers.id, expectedVersion: 1n,
     })
-    await removed.handle.accepted()
+    await expectLocalAccepted(removed.handle)
     await seenBy(bob, removed.handle)
     expect(await bob.sealed.getPolicy('docs', [1n])).toMatchObject({
       policyId: readers.id, version: 2n, readers: [{ readerId: aliceId, publicKey: aliceReader.publicKeyBytes }],
@@ -184,7 +184,7 @@ describe('ownership client API', () => {
     const future = await alice.sealed.put(readers.id, 'body', utf8('new audience only'), {
       allowProvisionalPolicy: true, expectedPolicyVersion: 2n, expectedDataVersion: 2n,
     })
-    await future.handle.accepted()
+    await expectLocalAccepted(future.handle)
     await seenBy(bob, future.handle)
     const latest = await bob.sealed.get(readers.id, 'body')
     expect(latest).toMatchObject({ policyVersion: 2n, dataVersion: 3n })
@@ -194,6 +194,12 @@ describe('ownership client API', () => {
     expect(await bob.sealed.decrypt(saved!, bobReader.privateKey, undefined, first.context)).toEqual(utf8('first secret'))
   }, 60_000)
 })
+
+/** SQL-policy assertions deliberately observe local execution; this fixture has no live finality policy. */
+async function expectLocalAccepted(handle: TransactionHandle): Promise<void> {
+  const result = await handle.local()
+  if (result.outcome.type === 'rejected') throw new TransactionRejectedError(handle.transactionId, result.outcome.rejection)
+}
 
 async function list<T>(client: ChronologClient, query: OwnershipQuery<T>): Promise<readonly T[]> {
   return query.decode((await client.query(query.sql, query.parameters)).result)

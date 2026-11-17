@@ -76,8 +76,7 @@ the application has applied that state.
 | Observation | Meaning |
 | --- | --- |
 | `submit` / `events.publish` returns | The original proposal has been durably published locally. |
-| `handle.settled()` returns | A current accepted or rejected result; it may still change through replay. |
-| `handle.accepted()` returns | A current accepted result; a current rejection throws. Acceptance can still change through replay. |
+| `handle.local()` returns | A current accepted or rejected result; it may still change through replay. |
 | `handle.final()` returns | An immutable locally applied accepted **or rejected** result. Inspect `outcome.type`. |
 | A final read view exists | A coherent snapshot of this replica's applied final prefix. It may lag another replica. |
 | `signals.send()` returns | Local live dispatch completed; it has no relationship to durable finality. |
@@ -89,9 +88,10 @@ operation or waiting for another finality decision.
 
 Use final reads by default for shared business state. Use a local view when the
 UI intentionally presents speculative state and can replace it after replay.
-Not every locally submitted proposal is immediately in the local materialized
-view: admission and required inputs can still be pending. Wait cancellation
-stops the caller's wait and leaves a prepared durable operation intact.
+Local execution does not wait for a receipt or validator quorum. It can still
+wait for authorization, acceptable clock bounds or required inputs. Wait
+cancellation stops the caller's wait and leaves a prepared durable operation
+intact.
 
 Signed genesis selects the trust policy. The built-in validator policy needs
 the specified validators' admission and closed-time evidence. The built-in

@@ -1,4 +1,4 @@
-import { ChronologClient, type ClientReadView, type QueryOptions } from '@chronolog/client'
+import { ChronologClient, TransactionRejectedError, type ClientReadView, type QueryOptions } from '@chronolog/client'
 import { emit, program, sqlStatement } from '@chronolog/protocol'
 import { WorkerRpcTransport } from '@chronolog/runtime-browser'
 
@@ -42,7 +42,11 @@ class TestPeer {
   }
   async submit(steps: string[], operationId: string): Promise<string> {
     const handle = await this.client.transaction(steps, { idempotencyKey: operationId })
-    try { await handle.accepted(); return handle.transactionId } finally { handle.dispose() }
+    try {
+      const result = await handle.local()
+      if (result.outcome.type === 'rejected') throw new TransactionRejectedError(handle.transactionId, result.outcome.rejection)
+      return handle.transactionId
+    } finally { handle.dispose() }
   }
   async query(sql: string, options: QueryOptions = {}) { return this.client.query(sql, [], options) }
   async change(value: string, operationId: string, reject = false) {
@@ -51,7 +55,7 @@ class TestPeer {
       emit('notes.changed', { id: 1, value }),
       ...(reject ? [sqlStatement("SELECT chronolog_assert(0,'mixed_event_rollback')")] : []),
     ), { operationId })
-    try { return { proposalId: handle.proposalId, outcome: await handle.settled() } }
+    try { return { proposalId: handle.proposalId, outcome: await handle.local() } }
     finally { handle.dispose() }
   }
   async stop() { try { await this.rpc.close() } finally { this.worker.terminate() } }

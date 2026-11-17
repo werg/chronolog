@@ -133,17 +133,20 @@ The row now belongs to this node's key. Another node's
 From TypeScript:
 
 ```ts
-import { platformOp } from '@chronolog/client'
+import { platformOp, TransactionRejectedError } from '@chronolog/client'
 
 const tx = await client.transaction([
   { sql: "SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = :id) >= 50, 'insufficient_funds')", params: { id: 1 } },
   { sql: 'UPDATE accounts SET balance = balance - 50 WHERE id = :id', params: { id: 1 } },
   platformOp.grant({ table: 'accounts', grantee: bobKey, operations: ['update'], rowKey: [1] }),
 ])
-const provisional = await tx.settled()  // current accepted/rejected result
-const outcome = await tx.final()         // actual applied final result
+const provisional = await tx.local() // current accepted/rejected result
+const outcome = await tx.final()     // actual applied final result
+if (outcome.outcome.type === 'rejected') {
+  throw new TransactionRejectedError(tx.transactionId, outcome.outcome.rejection)
+}
 const rows = await client.query(`SELECT a.id, a.balance, p.key AS owner
-  FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner`)
+  FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner`, [], { view: 'final' })
 ```
 
 `platformOp` also builds collectives (`createCollective`, `acceptMembership`,
