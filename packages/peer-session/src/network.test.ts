@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, decodePeerValue, encodePeerValue,
   MemoryBytesStore, participantGrant, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest,
@@ -229,6 +229,54 @@ describe('authenticated peer application connections', () => {
     await expect(links[1].synchronize()).rejects.toThrow(field === 'recipient' ? 'APPLICATION_KEY_REQUEST_INVALID' : 'APPLICATION_KEY_SHARE_INVALID')
     expect(b.keys.missing()).toEqual([0])
     await Promise.all(links.map(link => link.close()))
+  })
+
+  it('keeps enrollment connected but cannot hand over to a retained peer until it holds the rotated key', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const [originalLeft, originalRight] = createFramedPeerConnectionPair()
+    const original = await Promise.all([a.connectPeer({ connection: originalLeft }), b.connectPeer({ connection: originalRight })])
+    await (await a.command('say', 'retained before rotation', { operationId: 'retained' })).applied()
+    await Promise.all(original.map(link => link.synchronize())); await Promise.all(original.map(link => link.close()))
+    const key = crypto.getRandomValues(new Uint8Array(32))
+    const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control), epoch: 1,
+      keyDigest: await bytesDigest(key) }, f.host)
+    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+      transitionId: 'rotate', expectedGeneration: a.revision.generation, requester: f.host.publicKey, coordinator: a.deviceId,
+      controlRevision: 1, reason: 'control-change', base: await a.recoveryPoint() }, f.host), { control })
+    const authority = await f.registry.read(); await a.adopt(authority); await b.adopt(authority)
+    await a.keys.install(new Map([[1, key]]))
+    expect(b.keys.missing()).toEqual([1])
+    const view = await b.readView()
+    try { expect(view.readEvents().events).toHaveLength(1) } finally { view.release() }
+
+    let entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const offer = a.keys.offer.bind(a.keys), delayed = vi.spyOn(a.keys, 'offer').mockImplementation(async request => {
+      entered(); await gate; return offer(request)
+    })
+    const coverage: unknown[] = [], [left, right] = createFramedPeerConnectionPair()
+    const observed = rewrite(right, value => {
+      const message = value.message as ParticipantRequest | undefined
+      if (value.kind === 'response' && message?.action === 'coverage') coverage.push(message.payload)
+      return value
+    })
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: observed })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    const receiving = links[1].synchronize()
+    try {
+      await started; await links[0].synchronize()
+      expect(coverage).toContain(null)
+      expect(links.every(link => !link.signal.aborted)).toBe(true)
+      const host = { application: () => f.registry.read(), selectGeneration: (request: Parameters<typeof f.registry.select>[0]) => f.registry.select(request) }
+      await expect(a.recovery.handover(host, { coordinator: b.deviceId, transitionId: 'after-key' })).rejects.toThrow('APPLICATION_HANDOVER_REQUIRES_RETAINED_PREFIX')
+      expect(await a.recovery.inspect()).toEqual([])
+      release(); await receiving; await links[0].synchronize()
+      expect(b.keys.missing()).toEqual([])
+      expect(coverage.at(-1)).toMatchObject({ payload: { peer: b.deviceId, generation: a.revision.generation, point: a.revision.point } })
+      await a.recovery.handover(host, { coordinator: b.deviceId, transitionId: 'after-key' })
+      expect((await f.registry.read()).generations.at(-1)?.payload.coordinator).toBe(b.deviceId)
+      expect((await a.recovery.inspect())[0]?.selected).toBe(a.revision.generation)
+    } finally { release(); delayed.mockRestore(); await receiving.catch(() => undefined) }
   })
 
   it('revokes an attached reader on the currently authenticated control transition', async () => {

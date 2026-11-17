@@ -268,10 +268,13 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     }, f.a), { control })
     expect((await b.receiveHistory(await f.registry.read(), [])).ready).toBe(false)
     await expect(b.recoveryPoint()).rejects.toThrow('PEER_EPOCH_KEY_UNAVAILABLE')
+    await expect(b.retainedCoverage(ancestor.point)).rejects.toThrow('PEER_EPOCH_KEY_UNAVAILABLE')
     f.keys.set(1, crypto.getRandomValues(new Uint8Array(32)))
     await expect(b.recoveryPoint()).rejects.toThrow('PEER_EPOCH_KEY_MISMATCH')
+    await expect(b.retainedCoverage(ancestor.point)).rejects.toThrow('PEER_EPOCH_KEY_MISMATCH')
     f.keys.set(1, key)
     expect(await b.recoveryPoint()).toEqual(ancestor)
+    expect((await b.retainedCoverage(ancestor.point)).payload).toMatchObject({ generation: b.generation.id, point: ancestor.point })
     expect(b.ready).toBe(false)
   })
   it('reopens a locally committed receipt after its acknowledgment is lost', async () => {

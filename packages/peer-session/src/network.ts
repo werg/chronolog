@@ -377,7 +377,9 @@ class NetworkPeer implements ApplicationPeerLink {
         if (request.generation === replica.generation.id) {
           try { value = await replica.retainedCoverage(request.point as HistoryPoint) }
           catch (error) {
-            if (!(error instanceof Error && error.message === 'PEER_RECOVERY_PREFIX_INCOMPLETE')) throw error
+            // Enrollment can still be acquiring a rotated key on this same
+            // link. Incomplete coverage is absence of evidence, not a broken peer.
+            if (!(error instanceof Error && ['PEER_RECOVERY_PREFIX_INCOMPLETE', 'PEER_EPOCH_KEY_UNAVAILABLE'].includes(error.message))) throw error
           }
         }
       } else if (method === 'keyShare') {

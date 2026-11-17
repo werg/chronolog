@@ -162,6 +162,11 @@ class Replica implements PeerReplica {
     this.#assertOpen(); check(this.#ready, 'PEER_RECOVERING')
     check(this.#authority.grant(this.device.publicKey)?.reader === true, 'PEER_READER_FORBIDDEN')
   }
+  async #checkCurrentKey(): Promise<void> {
+    const control = this.#authority.control, key = this.#options.epochKeys.get(control.payload.epoch)
+    check(key !== undefined, 'PEER_EPOCH_KEY_UNAVAILABLE')
+    check(key.length === 32 && await bytesDigest(key) === control.payload.keyDigest, 'PEER_EPOCH_KEY_MISMATCH')
+  }
   async #write(key: string, bytes: Uint8Array): Promise<void> {
     try { await this.#options.store.put(key, bytes) }
     catch (error) {
@@ -544,9 +549,7 @@ class Replica implements PeerReplica {
     return this.#serial.run(async () => {
       this.#assertOpen()
       check(this.#authority.grant(this.device.publicKey)?.reader === true, 'PEER_READER_FORBIDDEN')
-      const control = this.#authority.control, key = this.#options.epochKeys.get(control.payload.epoch)
-      check(key !== undefined, 'PEER_EPOCH_KEY_UNAVAILABLE')
-      check(key.length === 32 && await bytesDigest(key) === control.payload.keyDigest, 'PEER_EPOCH_KEY_MISMATCH')
+      await this.#checkCurrentKey()
       if (this.#ready) return this.#proof(this.revision.point)
       const selected: Retained[] = [], segments = this.#authority.selectedSegments()
       let point: HistoryPoint | null = null
@@ -624,6 +627,9 @@ class Replica implements PeerReplica {
       const retained = requested ?? this.revision.point
       validateHistoryPoint(retained)
       check(this.#pointAvailable(retained), 'PEER_RECOVERY_PREFIX_INCOMPLETE')
+      // Current-generation coverage can nominate a remote successor. Retaining
+      // old bodies alone does not prove it can verify new work after rotation.
+      await this.#checkCurrentKey()
       return signPeerValue(DOMAINS.peerCoverage, { applicationId: this.descriptor.applicationId, generation: this.generation.id,
         point: retained, peer: this.device.publicKey, storageId: this.#options.storageId, retainedAt: this.#now() }, this.device)
     })

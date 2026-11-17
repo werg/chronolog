@@ -247,7 +247,9 @@ segments are unavailable, a survivor can propose the last fully retained ancesto
 whose selected cutoff is provable. An empty survivor or partial segment without
 its receipt bridge cannot supply that evidence. Current coordinator and recovery grants are
 checked independently, and the candidate must hold the key committed by the active
-control epoch. Directory hints, advertised eligibility and remote
+control epoch. Current-generation retention acknowledgments require that same key;
+a peer still acquiring it returns no coverage while its enrollment connection remains
+available. Directory hints, advertised eligibility and remote
 retention timestamps supply no authority or freshness evidence.
 
 Automatic selection additionally requires recent local evidence from an
