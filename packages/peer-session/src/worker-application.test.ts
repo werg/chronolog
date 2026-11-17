@@ -117,6 +117,31 @@ describe('owned browser application facade', () => {
     }
   })
 
+  it('completes a pending projection observation when the page closes its handle', async () => {
+    const f = await fixture()
+    f.a.project<number>({ id: 'observed', version: '1', initial: 0, reduce: count => count + 1 })
+    const { client } = await facade(f.a), projection = client.projection<number>('observed')
+    const changes = projection.changes()[Symbol.asyncIterator]()
+    expect((await changes.next()).value?.state).toBe(0)
+    const pending = changes.next()
+    await projection.close()
+    expect((await pending).done).toBe(true)
+    expect((await projection.changes()[Symbol.asyncIterator]().next()).done).toBe(true)
+  })
+
+  it('releases a projection while ordinary RPC capacity is occupied by passive waits', async () => {
+    const f = await fixture()
+    f.b.project<number>({ id: 'releasable', version: '1', initial: 0, reduce: count => count + 1 })
+    const { client } = await facade(f.b), projection = client.projection<number>('releasable')
+    expect((await projection.read()).state).toBe(0)
+    const operation = await client.command('say', 'offline', { operationId: 'release-full' })
+    const pending = Promise.allSettled(Array.from({ length: 80 }, () => operation.applied()))
+    await projection.close(); await projection.close()
+    expect(() => f.b.projection('releasable')).toThrow('APPLICATION_PROJECTION_NOT_FOUND')
+    await client.close()
+    expect((await pending).every(value => value.status === 'rejected')).toBe(true)
+  })
+
   it('settles the requesting waiter when its response contains malformed participation metadata', async () => {
     const f = await fixture(), { client } = await facade(f.a)
     const getter = vi.spyOn(f.a, 'participation', 'get').mockReturnValue({ status: { phase: 'unknown' } } as unknown as ApplicationParticipation)

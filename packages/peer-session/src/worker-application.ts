@@ -17,7 +17,8 @@ import { APPLICATION_PROJECTION_LIMITS, type ApplicationProjectionHandle, type A
 import { awaitOwnedTask } from './lifetime.js'
 
 const PROTOCOL = 'chronolog/peer-session/worker-application/v1'
-const MAX_REQUESTS = 64, MAX_STREAMS = 16, MAX_BYTES = 1_048_576
+const MAX_REQUESTS = 64, MAX_RELEASES = 16, MAX_STREAMS = 16, MAX_BYTES = 1_048_576
+const releasesResource = (method: string): boolean => method === 'projection.close' || method === 'view.release'
 type Endpoint = ApplicationWorkerEndpoint & { start?(): void }
 type Description = ReturnType<ApplicationSession['describe']>
 type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
@@ -37,7 +38,7 @@ interface WireError { readonly name: string; readonly message: string; readonly 
 interface Request { readonly id: number; readonly method: string; readonly args: readonly unknown[] }
 interface Response { readonly id: number; readonly value?: unknown; readonly error?: WireError; readonly snapshot: Snapshot }
 interface Stream { readonly iterator: AsyncIterator<unknown>; readonly controller: AbortController; busy: boolean }
-interface Pending { resolve(value: unknown): void; reject(reason: unknown): void }
+interface Pending { readonly release: boolean; resolve(value: unknown): void; reject(reason: unknown): void }
 
 /** Captured SQL/events stay in the Worker until explicitly released. */
 export interface WorkerApplicationReadView {
@@ -57,7 +58,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
 } = {}): { close(): Promise<void> } {
   let port: MessagePort | undefined, closed = false, lastId = 0, nextView = 0, nextProjection = 0
   let closing: Promise<void> | undefined
-  const calls = new Map<number, AbortController>(), streams = new Map<number, Stream>()
+  const calls = new Map<number, { readonly controller: AbortController; readonly release: boolean }>(), streams = new Map<number, Stream>()
   const views = new Map<number, { readonly handle: ApplicationReadView; readonly requestId: number }>()
   const projections = new Map<number, ApplicationProjectionHandle>()
   const send = (value: unknown): void => { bounded(value); port?.postMessage(value) }
@@ -73,7 +74,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     closed = true
     endpoint.removeEventListener('message', connect)
     session.signal.removeEventListener('abort', aborted)
-    for (const controller of calls.values()) controller.abort(reason)
+    for (const call of calls.values()) call.controller.abort(reason)
     for (const view of views.values()) view.handle.release()
     views.clear(); projections.clear()
     port?.removeEventListener('message', receive); port?.removeEventListener('messageerror', messageError)
@@ -186,8 +187,10 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     // Shutdown must remain available when every ordinary request slot is
     // occupied by a passive operation or stream waiter.
     if (request.method === 'close') { await stop(new Error('APPLICATION_SESSION_CLOSED')); return }
-    if (calls.size >= MAX_REQUESTS) throw new Error('APPLICATION_WORKER_REQUEST_LIMIT')
-    const controller = new AbortController(); calls.set(request.id, controller)
+    // Bounded cleanup capacity cannot be consumed by passive application waits.
+    const release = releasesResource(request.method)
+    if ([...calls.values()].filter(call => call.release === release).length >= (release ? MAX_RELEASES : MAX_REQUESTS)) throw new Error('APPLICATION_WORKER_REQUEST_LIMIT')
+    const controller = new AbortController(); calls.set(request.id, { controller, release })
     try {
       let result: unknown
       if (request.method === 'stream.open') {
@@ -212,7 +215,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       bounded(input)
       if (input?.cancel !== undefined) {
         if (!Number.isSafeInteger(input.cancel)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
-        calls.get(input.cancel as number)?.abort(new Error('APPLICATION_WORKER_CANCELLED'))
+        calls.get(input.cancel as number)?.controller.abort(new Error('APPLICATION_WORKER_CANCELLED'))
         void cancelStream(input.cancel as number)
         // A captured view can outlive the request that created it. If its reply
         // crossed a cancelled page waiter, that request still owns its disposal.
@@ -397,7 +400,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       close: (): Promise<void> => {
         if (closing !== undefined) return closing
         closing = captured.then(token => this.signal.aborted ? undefined : this.#call<void>('projection.close', [token]))
-          .catch(error => { if (!this.signal.aborted) throw error })
+          .catch(error => { closing = undefined; if (!this.signal.aborted) throw error })
         lifetime.abort(new Error('APPLICATION_PROJECTION_CLOSED'))
         return closing
       },
@@ -425,7 +428,8 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   #call<T>(method: string, args: readonly unknown[], signal?: AbortSignal, passive = false): Promise<T> {
     if (this.signal.aborted) return Promise.reject(this.signal.reason)
     if (signal?.aborted) return Promise.reject(signal.reason)
-    if (method !== 'close' && this.#pending.size >= MAX_REQUESTS) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_LIMIT'))
+    const release = releasesResource(method)
+    if (method !== 'close' && [...this.#pending.values()].filter(call => call.release === release).length >= (release ? MAX_RELEASES : MAX_REQUESTS)) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_LIMIT'))
     const id = ++this.#nextId
     if (!Number.isSafeInteger(id)) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_ID_EXHAUSTED'))
     const request: Request = { id, method, args }
@@ -436,7 +440,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       const abort = (): void => {
         clean(); this.#pending.delete(id); this.#cancel(id); reject(signal?.reason ?? new Error('APPLICATION_WORKER_TIMEOUT'))
       }
-      this.#pending.set(id, { resolve: value => { clean(); resolve(value as T) }, reject: error => { clean(); reject(error) } })
+      this.#pending.set(id, { release, resolve: value => { clean(); resolve(value as T) }, reject: error => { clean(); reject(error) } })
       signal?.addEventListener('abort', abort, { once: true })
       if (!passive) timer = setTimeout(abort, this.#timeoutMs)
       try { this.#port.postMessage(request) } catch (error) { this.#pending.delete(id); clean(); reject(error) }
@@ -445,6 +449,10 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   #stream<T>(name: string, args: readonly unknown[] | (() => Promise<readonly unknown[]>), signal?: AbortSignal): AsyncIterable<T> {
     const client = this
     return { [Symbol.asyncIterator]() {
+      if (name !== 'content' && (client.signal.aborted || signal?.aborted)) {
+        const ended = async (): Promise<IteratorResult<T>> => ({ done: true, value: undefined })
+        return { next: ended, return: ended }
+      }
       if (client.#streams.size >= MAX_STREAMS) throw new Error('APPLICATION_WORKER_STREAM_LIMIT')
       const controller = new AbortController(); client.#streams.add(controller)
       const lifetime = AbortSignal.any([client.signal, controller.signal, ...(signal === undefined ? [] : [signal])])
@@ -456,7 +464,6 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
         else void opened?.then(value => client.#cancel(value), () => undefined)
       }
       lifetime.addEventListener('abort', finish, { once: true })
-      if (lifetime.aborted) finish()
       return {
         async next(): Promise<IteratorResult<T>> {
           if (done) return { done: true, value: undefined }
@@ -470,7 +477,13 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
             const result = await client.#call<IteratorResult<T>>('stream.next', [id], lifetime, true)
             if (result.done) finish()
             return result
-          } catch (error) { finish(); throw error }
+          } catch (error) {
+            const cancelled = lifetime.aborted; finish()
+            // Observation closes normally; interrupted byte reads must still
+            // report failure instead of appearing to be complete content.
+            if (cancelled && name !== 'content') return { done: true, value: undefined }
+            throw error
+          }
           finally { pulling = false }
         },
         async return(): Promise<IteratorResult<T>> { finish(); lifetime.removeEventListener('abort', finish); return { done: true, value: undefined } },
