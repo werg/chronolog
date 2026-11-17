@@ -428,7 +428,9 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       if (!Number.isSafeInteger(response.id)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
       const pending = this.#pending.get(response.id)
       if (pending === undefined) return // A cancelled waiter can have an already posted result.
-      this.#pending.delete(response.id); this.#update(response.snapshot)
+      // Validate and publish the response snapshot while this waiter is still
+      // owned. A malformed reply must reject it immediately when the port ends.
+      this.#update(response.snapshot); this.#pending.delete(response.id)
       if (response.error === undefined) pending.resolve(response.value)
       else pending.reject(fromError(response.error))
     } catch (error) { this.#fail(error) }

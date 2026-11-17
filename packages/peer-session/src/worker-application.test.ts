@@ -60,6 +60,18 @@ async function facade(session: ApplicationSession, host?: ApplicationControlHost
 }
 
 describe('owned browser application facade', () => {
+  it('settles the requesting waiter when its response contains malformed participation metadata', async () => {
+    const f = await fixture(), { client } = await facade(f.a)
+    const getter = vi.spyOn(f.a, 'participation', 'get').mockReturnValue({ status: { phase: 'unknown' } } as unknown as ApplicationParticipation)
+    cleanup.push(() => { getter.mockRestore() })
+    let settled = false
+    const query = client.query('messages', null).finally(() => { settled = true })
+    const rejected = expect(query).rejects.toThrow('APPLICATION_WORKER_METADATA_INVALID')
+    await vi.waitFor(() => expect(client.signal.aborted).toBe(true))
+    expect(settled).toBe(true)
+    await rejected
+  })
+
   it('observes the owner participation policy and forwards exact broader-recovery approval', async () => {
     const f = await fixture(), lifetime = new AbortController()
     const listeners = new Set<(status: ApplicationParticipationStatus) => void>()
