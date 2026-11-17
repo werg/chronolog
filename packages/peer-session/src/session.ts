@@ -92,7 +92,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       grant(publicKey) { return session.#authority.grant(publicKey) },
       adoptAuthority: async input => { await this.#adoptAuthority(input) },
       subscribe: listener => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener) } },
-      get data() { return session.#data }, openData: () => this.#openData(),
+      get data() { return session.#data?.replica.closed === false ? session.#data : undefined }, openData: () => this.#openData(),
     }
     const signals = new SignalChannel({ scope: this.applicationId,
       identity: { publicKeyBytes: hexToBytes(this.deviceId), privateKey: options.device.identity.privateKey },
@@ -141,7 +141,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   get storageId(): string { return this.#options.device.storageId }
   get participation(): ApplicationParticipation | undefined { return this.#participation }
   get status(): SessionStatus {
-    const coordinator = this.#participant.generation.payload.coordinator, data = this.#data
+    const coordinator = this.#participant.generation.payload.coordinator, data = this.#participant.data
     return { phase: this.#closed ? 'closed' : data !== undefined && data.keys.missing().length > 0 ? 'awaiting-keys'
       : data !== undefined && !data.replica.ready ? 'recovering' : this.#participant.isCoordinator || this.#peers.has(coordinator) ? 'ready' : 'waiting',
       database: this.#database, role: this.#participant.isCoordinator ? 'coordinator' : 'follower',
@@ -171,12 +171,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       assertAuthorityExtension(await verifyAuthorityBundle(this.#participant.authority), next)
       const retained = await retainApplicationAuthority(this.#options.device, next.bundle)
       this.#assertOpen(); this.#authority = retained
-      const received = this.#data === undefined ? null : await this.#data.replica.receiveHistory(retained.bundle, [])
-      this.#changed(); return received?.recovery ?? null
+      const data = this.#participant.data
+      let recovery: RecoveryNotice | null = null
+      if (data !== undefined) {
+        try { recovery = (await data.replica.receiveHistory(retained.bundle, [])).recovery }
+        catch (error) { if (!data.replica.closed) throw error }
+      }
+      this.#changed(); return recovery
     })
   }
   #openData(): Promise<ApplicationData<D>> {
-    this.#assertOpen()
+    this.#assertDataAvailable()
     if (this.#dataTask !== undefined) return this.#dataTask
     this.#database = 'opening'
     const task = (async () => {
@@ -193,7 +198,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           const retained = await retainApplicationAuthority(this.#options.device, opened.replica.authority)
           await opened.replica.receiveHistory(retained.bundle, []); this.#assertOpen()
           this.#authority = retained; this.#data = opened
-          this.#dataDisposers = [opened.replica.subscribe(() => this.#changed()), opened.keys.subscribe(() => this.#changed()),
+          this.#dataDisposers = [opened.replica.subscribe(() => {
+            if (opened.replica.closed && !this.#closed) {
+              this.#database = 'failed'
+              for (const dispose of this.#dataDisposers.splice(0)) dispose()
+              void opened.close(new Error('APPLICATION_DATA_UNAVAILABLE')).catch(() => undefined)
+            }
+            this.#changed()
+          }), opened.keys.subscribe(() => this.#changed()),
             opened.replica.onRecovery(notice => { for (const listener of this.#recoveryListeners) {
               try { listener(notice) } catch { /* Observers cannot undo durable recovery. */ }
             } })]
@@ -213,11 +225,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
   /** Existing links join the first public data demand once; inbound activation remains local-only. */
   #requireData(): Promise<ApplicationData<D>> {
-    this.#assertOpen()
+    this.#assertDataAvailable()
     this.#initialDataTask ??= Promise.resolve().then(async () => {
       const data = await this.#openData()
       await Promise.allSettled(connectedApplicationPeers(internals.get(this)!).map(link => link.synchronize()))
-      this.#assertOpen(); return data
+      this.#assertDataAvailable(); return data
     })
     return this.#initialDataTask
   }
@@ -242,6 +254,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async recoveryPoint(): Promise<PrefixProof> { return (await this.#requireData()).recoveryPoint() }
   async adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> {
     const data = await this.#requireData(), notice = await this.#adoptAuthority(authority)
+    this.#assertDataAvailable()
     return await data.adopt(this.#participant.authority) ?? notice
   }
   changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {
@@ -302,7 +315,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return participant
   }
   async retry(id: string): Promise<void> { return (await this.#requireData()).retry(id) }
-  async resume(): Promise<void> { this.#assertOpen(); await this.#data?.resume() }
+  async resume(): Promise<void> {
+    this.#assertOpen()
+    if (this.#participant.data !== undefined) await this.#data?.resume()
+  }
   async waitFor(id: string, options: { readonly author?: string; readonly signal?: AbortSignal } = {}): Promise<AppliedResult> {
     return (await this.#dataFor(options.signal)).waitFor(id, options)
   }
@@ -323,19 +339,23 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
   close(): Promise<void> {
     if (this.#closeTask !== undefined) return this.#closeTask
-    this.#closed = true; this.#database = 'closed'; this.#lifetime.abort(new Error('APPLICATION_SESSION_CLOSED'))
-    internals.get(this)!.signals.close(); this.#changed()
-    this.#listeners.clear(); this.#statusListeners.clear(); this.#recoveryListeners.clear()
-    this.#closeTask = (async () => {
+    this.#closeTask = Promise.resolve().then(async () => {
       await Promise.allSettled([...this.#links, ...this.#projections.values()].map(value => Promise.resolve().then(() => value.close())))
       await this.#dataTask?.catch(() => undefined)
       for (const dispose of this.#dataDisposers.splice(0)) dispose()
       await this.#authorityTail
       try { await this.#data?.close() } finally { await this.#closing() }
-    })()
+    })
+    this.#closed = true; this.#database = 'closed'; this.#lifetime.abort(new Error('APPLICATION_SESSION_CLOSED'))
+    internals.get(this)!.signals.close(); this.#changed()
+    this.#listeners.clear(); this.#statusListeners.clear(); this.#recoveryListeners.clear()
     return this.#closeTask
   }
   #assertOpen(): void { if (this.#closed) throw new Error('APPLICATION_SESSION_CLOSED') }
+  #assertDataAvailable(): void {
+    this.#assertOpen()
+    if (this.#data?.replica.closed === true) throw new Error('APPLICATION_DATA_UNAVAILABLE')
+  }
 }
 
 /** In-process transport uses the same participant and durable-facet protocol. */

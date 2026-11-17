@@ -203,9 +203,9 @@ export class ApplicationData<D extends ApplicationDefinition = ApplicationDefini
     })
   }
 
-  close(): Promise<void> {
+  close(reason: Error = new Error('APPLICATION_SESSION_CLOSED')): Promise<void> {
     if (this.#closeTask !== undefined) return this.#closeTask
-    this.#closed = true; this.#lifetime.abort(new Error('APPLICATION_SESSION_CLOSED'))
+    this.#closed = true; this.#lifetime.abort(reason)
     for (const view of [...this.#views]) view.release()
     this.content.close()
     this.#closeTask = (async () => {

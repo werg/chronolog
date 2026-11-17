@@ -1,14 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, decodePeerValue, encodePeerValue,
+  bytesDigest, controlParticipantGrant, createGenerationRegistry, createParticipantResponse, createPeerIdentity, decodePeerValue, encodePeerValue,
   MemoryBytesStore, participantGrant, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest,
   type OrderedCommand, type ParticipantRequest,
 } from '@chronolog/peer-generation'
-import { eventExecutionManifest } from '@chronolog/materializer'
+import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program } from '@chronolog/protocol'
 import { defineApplication, defineCommand, applicationDefinitionDigest } from './definition.js'
 import { openApplicationDevice } from './device.js'
-import { openPeerApplication } from './runtime.js'
+import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
 import { createFramedPeerConnectionPair, type FramedPeerConnection } from './network.js'
 import { observePeerWire } from './network.test-helpers.js'
 import { ApplicationKeyring } from './keys.js'
@@ -37,8 +37,9 @@ async function fixture(options: { readerOnly?: boolean } = {}) {
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
     profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
     coordinator: a.identity.publicKey, requester: a.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, a.identity))
-  const openCold = async (device: typeof a, epochKeys = keys) => {
-    const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys })
+  const openCold = async (device: typeof a, epochKeys = keys, createMaterializer?: OpenPeerApplicationOptions['createMaterializer']) => {
+    const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys,
+      ...(createMaterializer === undefined ? {} : { createMaterializer }) })
     closing.push(() => session.close()); return session
   }
   const open = async (...args: Parameters<typeof openCold>) => {
@@ -143,6 +144,53 @@ describe('authenticated peer application connections', () => {
     expect((await received).value).toEqual(sent); await stream.return?.()
     expect(links.every(link => !link.signal.aborted)).toBe(true)
     expect(openA).toHaveBeenCalledTimes(1)
+  })
+
+  it('retires a failed active database and its waiters while keeping authority and live traffic on the same connection', async () => {
+    const f = await fixture(), runtime = await createEventMaterializationRuntime({ store: f.a.store, namespace: f.descriptor.payload.historyId })
+    const released = vi.fn(), closeRuntime = vi.fn(() => runtime.close())
+    const openStorage = vi.fn(async () => {
+      const resource = await f.a.openStorage()
+      return { store: resource.store, async close() { released(); await resource.close() } }
+    })
+    const createMaterializer = vi.fn(() => ({ ...runtime, close: closeRuntime }))
+    const a = await f.open({ ...f.a, openStorage }, f.keys, createMaterializer), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize()))
+    const view = await a.readView()
+    let entered!: () => void, release!: () => void
+    const materializing = new Promise<void>(resolve => { entered = resolve }), blocked = new Promise<void>(resolve => { release = resolve })
+    const materialize = vi.spyOn(runtime.coordinator, 'materialize').mockImplementationOnce(async () => {
+      entered(); await blocked; throw new Error('ENGINE_FAILED')
+    })
+    try {
+      const operation = await a.command('say', 'saved before the engine failed', { operationId: 'engine-failed' })
+      const checked = expect(operation.applied({ signal: AbortSignal.timeout(5000) })).rejects.toThrow('APPLICATION_DATA_UNAVAILABLE')
+      await materializing; await new Promise(resolve => setTimeout(resolve, 0)); release()
+      await checked
+      await expect.poll(() => released.mock.calls.length).toBe(1)
+      expect(closeRuntime).toHaveBeenCalledTimes(1)
+      expect(a.status.database).toBe('failed'); expect(a.revision).toBeNull(); expect(a.signal.aborted).toBe(false)
+      expect(() => view.readEvents()).toThrow('APPLICATION_VIEW_RELEASED')
+      await expect(a.readView()).rejects.toThrow('APPLICATION_DATA_UNAVAILABLE')
+      expect(links.every(link => !link.signal.aborted)).toBe(true)
+      await expect(links[1].synchronize()).rejects.toThrow('APPLICATION_DATA_UNAVAILABLE')
+      await links[0].synchronize()
+      const control = a.connectControlParticipant({ exchange: async request => createParticipantResponse(request, await f.registry.read()) })
+      expect((await control.application()).descriptor).toEqual(f.descriptor)
+      const stream = b.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), received = stream.next()
+      const sent = await a.signals.send('typing', { active: true })
+      expect((await received).value).toEqual(sent); await stream.return?.()
+      expect(links.every(link => !link.signal.aborted)).toBe(true)
+      expect(createMaterializer).toHaveBeenCalledTimes(1); expect(openStorage).toHaveBeenCalledTimes(1)
+      let reentered: Promise<void> | undefined
+      a.onStatus(status => { if (status.phase === 'closed') reentered = a.close() })
+      const closing = a.close()
+      expect(reentered).toBe(closing); await closing
+      expect(closeRuntime).toHaveBeenCalledTimes(1); expect(released).toHaveBeenCalledTimes(1)
+    } finally { release(); materialize.mockRestore(); view.release() }
   })
 
   it('rejects an invalid advertised data prefix even while both participants remain cold', async () => {

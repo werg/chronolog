@@ -80,6 +80,7 @@ class Replica implements PeerReplica {
   }
   get isCoordinator(): boolean { return this.generation.payload.coordinator === this.device.publicKey }
   grant(publicKey: string): PeerGrant | null { this.#assertOpen(); return this.#authority.grant(publicKey) }
+  get closed(): boolean { return this.#closed }
   get ready(): boolean { return !this.#closed && this.#ready }
   get retainedPoint(): HistoryPoint | null {
     this.#assertOpen()
@@ -158,6 +159,10 @@ class Replica implements PeerReplica {
   }
   get #maxRecords(): number { return this.#options.maxRecords ?? PEER_MAX_RECORDS }
   #assertOpen(): void { check(!this.#closed, 'PEER_REPLICA_CLOSED') }
+  #fail(error: unknown): never {
+    if (!this.#closed) { this.#closed = true; this.#ready = false; this.#publish() }
+    throw error
+  }
   #assertReady(): void {
     this.#assertOpen(); check(this.#ready, 'PEER_RECOVERING')
     check(this.#authority.grant(this.device.publicKey)?.reader === true, 'PEER_READER_FORBIDDEN')
@@ -172,7 +177,7 @@ class Replica implements PeerReplica {
     catch (error) {
       // An atomic write may have committed before its reply was lost. Reopen;
       // never continue from stale signing or sequence state.
-      this.#closed = true; this.#ready = false; throw error
+      this.#fail(error)
     }
   }
   #writeSelection(authority: PeerAuthority, recovery: PendingRecovery | null): Promise<void> {
@@ -430,7 +435,7 @@ class Replica implements PeerReplica {
       const receipt = { ...await signPeerValue(DOMAINS.peerOrder, payload, this.device), root: await peerDigest(['chronolog/peer-generation/order/v1', payload]) }
       const command = { receipt, attempt }
       await this.#retain(command, this.#authority, true)
-      try { await this.#materialize(this.#authority) } catch (error) { this.#closed = true; throw error }
+      try { await this.#materialize(this.#authority) } catch (error) { this.#fail(error) }
       this.#publish(); return structuredClone(command)
     })
   }
@@ -441,7 +446,7 @@ class Replica implements PeerReplica {
       for (const command of commands) await this.#retain(command, this.#authority, true)
       try { await this.#materialize(this.#authority) }
       catch (error) {
-        if (!(error instanceof PeerGenerationError) || error.code !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') this.#closed = true
+        if (!(error instanceof PeerGenerationError) || error.code !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') this.#fail(error)
         throw error
       }
       await this.#finishRecovery(true)
@@ -504,7 +509,7 @@ class Replica implements PeerReplica {
         if (error instanceof PeerGenerationError && error.code === 'PEER_RECOVERY_PREFIX_INCOMPLETE') {
           this.#publish(); return { ready: false, recovery: null }
         }
-        this.#closed = true; throw error
+        this.#fail(error)
       }
       const recovery = await this.#finishRecovery(true)
       this.#publish(); return { ready: true, recovery }

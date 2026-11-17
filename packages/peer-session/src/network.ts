@@ -56,7 +56,7 @@ const interests: Readonly<Record<Method, ParticipantInterest>> = {
   contentManifest: { facet: 'content', action: 'manifest' }, contentChunk: { facet: 'content', action: 'chunk' },
   contentRetained: { facet: 'content', action: 'retained' }, contentObserveRetention: { facet: 'content', action: 'observeRetention' },
 }
-interface Pending { readonly request: ParticipantRequest; resolve(value: unknown): void; reject(error: unknown): void; cancel(): void }
+interface Pending { readonly method: Method; readonly request: ParticipantRequest; resolve(value: unknown): void; reject(error: unknown): void; cancel(): void }
 interface Owner { next: number; readonly openings: Map<NetworkPeer, number>; readonly accepted: Map<string, number>; readonly peers: Map<string, NetworkPeer> }
 const owners = new WeakMap<ApplicationPeerPort, Owner>()
 const hexadecimal = (value: unknown, length = 64): value is string => typeof value === 'string' && value.length === length && /^[0-9a-f]+$/u.test(value)
@@ -67,6 +67,18 @@ class PeerDataUnavailableError extends Error {
 /** A data-resource failure must not retire an otherwise authenticated participant. */
 export function isPeerDataUnavailable(error: unknown): error is PeerDataUnavailableError {
   return error instanceof PeerDataUnavailableError
+}
+/** Retirement fences pending data work without retiring its authenticated connection. */
+async function useData<T>(data: ApplicationDataPort, run: () => Promise<T>): Promise<T> {
+  try {
+    requireNetwork(!data.replica.closed, 'APPLICATION_DATA_UNAVAILABLE')
+    const value = await run()
+    requireNetwork(!data.replica.closed, 'APPLICATION_DATA_UNAVAILABLE')
+    return value
+  } catch (error) {
+    if (data.replica.closed) throw new PeerDataUnavailableError()
+    throw error
+  }
 }
 function availablePoint(replica: ApplicationDataPort['replica'] | undefined): HistoryPoint | null {
   if (replica === undefined) return null
@@ -338,8 +350,9 @@ class NetworkPeer implements ApplicationPeerLink {
           let failure: Error | undefined
           if (!message.ok) {
             requireNetwork(typeof payload === 'string' && /^[A-Z0-9_]{1,128}$/u.test(payload), 'APPLICATION_NETWORK_RESPONSE_INVALID')
-            failure = pending.request.facet === 'database' && pending.request.action === 'open' && payload === 'APPLICATION_DATA_UNAVAILABLE'
+            failure = pending.method !== 'state' && payload === 'APPLICATION_DATA_UNAVAILABLE'
               ? new PeerDataUnavailableError() : networkError(payload)
+            if (isPeerDataUnavailable(failure)) { this.#remoteData = false; this.#remoteDataFailure = failure }
           }
           this.#pending.delete(id); pending.cancel()
           if (failure === undefined) pending.resolve(payload)
@@ -377,7 +390,7 @@ class NetworkPeer implements ApplicationPeerLink {
       requestId: String(id), ...interests[method], payload: value }, PEER_PARTICIPANT_POLICY)
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.#fail(networkError('APPLICATION_NETWORK_REQUEST_TIMEOUT')), this.#requestMs)
-      this.#pending.set(id, { request, resolve, reject, cancel: () => clearTimeout(timer) })
+      this.#pending.set(id, { method, request, resolve, reject, cancel: () => clearTimeout(timer) })
       void Promise.resolve().then(() => this.#wire.send({ kind: 'request', message: request }, () => {
         if (method === 'submit') requireNetwork(grant(this.#port.participant, this.#port.participant.device.publicKey, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
         if (method === 'keyShare') requireNetwork((value as ApplicationKeyRequest).payload.recipient === this.#port.participant.device.publicKey,
@@ -403,10 +416,7 @@ class NetworkPeer implements ApplicationPeerLink {
       const value = await this.#request('openData', null)
       requireNetwork(value === null, 'APPLICATION_NETWORK_RESPONSE_INVALID')
       this.#reader(); this.#remoteData = true
-    })().catch((error: unknown) => {
-      if (isPeerDataUnavailable(error)) this.#remoteDataFailure = error
-      throw error
-    }).finally(() => { if (this.#remoteOpening === work) this.#remoteOpening = undefined })
+    })().finally(() => { if (this.#remoteOpening === work) this.#remoteOpening = undefined })
     this.#remoteOpening = work; return work
   }
   async #readState(): Promise<RemoteState> {
@@ -458,54 +468,56 @@ class NetworkPeer implements ApplicationPeerLink {
     requireNetwork(data !== undefined, 'APPLICATION_DATA_NOT_ACTIVE')
     this.#reader(); this.#attachData()
     if (method === 'openData') return null
-    const replica = data.replica
-    let value: unknown = null
-    if (method === 'range') {
-      const request = record(input, ['generation', 'after', 'through', 'at'])
-      requireNetwork(request.generation === replica.generation.id, 'APPLICATION_NETWORK_STATE_CHANGED')
-      if (request.after !== null) validateHistoryPoint(request.after as HistoryPoint)
-      validateHistoryPoint(request.through as HistoryPoint)
-      const authority = await verifyAuthorityBundle(replica.authority)
-      const commands = await replica.exportCommands({ ...(request.after === null ? {} : { after: request.after as HistoryPoint }),
-        ...(request.at === null ? {} : { at: request.at as PeerRevision }),
-        limit: LIMITS.rangeCommands, maxBytes: LIMITS.rangeBytes })
-      this.#reader(); requireNetwork(request.generation === replica.generation.id, 'APPLICATION_NETWORK_STATE_CHANGED')
-      value = commands.filter(command => atOrAfter(authority, request.through as HistoryPoint,
-        { generation: command.receipt.payload.generation, sequence: command.receipt.payload.sequence, root: command.receipt.root }))
-    } else if (method === 'submit') {
-      const attempt = input as SignedAttempt
-      requireNetwork(attempt?.payload?.header?.author === this.peerId && grant(replica, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
-      await replica.order(attempt); this.#reader(); requireNetwork(grant(replica, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
-    } else if (method === 'coverage') {
-      const request = record(input, ['generation', 'point'])
-      validateHistoryPoint(request.point as HistoryPoint)
-      // Coverage is evidence for the exact prefix the requester already owns,
-      // never an unsolicited claim about a possibly advancing remote head.
-      if (request.generation === replica.generation.id) {
-        try { value = await replica.retainedCoverage(request.point as HistoryPoint) }
-        catch (error) {
-          // Enrollment can still be acquiring a rotated key on this same
-          // link. Incomplete coverage is absence of evidence, not a broken peer.
-          if (!(error instanceof Error && ['PEER_RECOVERY_PREFIX_INCOMPLETE', 'PEER_EPOCH_KEY_UNAVAILABLE'].includes(error.message))) throw error
+    return useData(data, async () => {
+      const replica = data.replica
+      let value: unknown = null
+      if (method === 'range') {
+        const request = record(input, ['generation', 'after', 'through', 'at'])
+        requireNetwork(request.generation === replica.generation.id, 'APPLICATION_NETWORK_STATE_CHANGED')
+        if (request.after !== null) validateHistoryPoint(request.after as HistoryPoint)
+        validateHistoryPoint(request.through as HistoryPoint)
+        const authority = await verifyAuthorityBundle(replica.authority)
+        const commands = await replica.exportCommands({ ...(request.after === null ? {} : { after: request.after as HistoryPoint }),
+          ...(request.at === null ? {} : { at: request.at as PeerRevision }),
+          limit: LIMITS.rangeCommands, maxBytes: LIMITS.rangeBytes })
+        this.#reader(); requireNetwork(request.generation === replica.generation.id, 'APPLICATION_NETWORK_STATE_CHANGED')
+        value = commands.filter(command => atOrAfter(authority, request.through as HistoryPoint,
+          { generation: command.receipt.payload.generation, sequence: command.receipt.payload.sequence, root: command.receipt.root }))
+      } else if (method === 'submit') {
+        const attempt = input as SignedAttempt
+        requireNetwork(attempt?.payload?.header?.author === this.peerId && grant(replica, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+        await replica.order(attempt); this.#reader(); requireNetwork(grant(replica, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+      } else if (method === 'coverage') {
+        const request = record(input, ['generation', 'point'])
+        validateHistoryPoint(request.point as HistoryPoint)
+        // Coverage is evidence for the exact prefix the requester already owns,
+        // never an unsolicited claim about a possibly advancing remote head.
+        if (request.generation === replica.generation.id) {
+          try { value = await replica.retainedCoverage(request.point as HistoryPoint) }
+          catch (error) {
+            // Enrollment can still be acquiring a rotated key on this same
+            // link. Incomplete coverage is absence of evidence, not a broken peer.
+            if (!(error instanceof Error && ['PEER_RECOVERY_PREFIX_INCOMPLETE', 'PEER_EPOCH_KEY_UNAVAILABLE'].includes(error.message))) throw error
+          }
         }
+      } else if (method === 'keyShare') {
+        const request = input as ApplicationKeyRequest
+        requireNetwork(request?.payload?.recipient === this.peerId, 'APPLICATION_KEY_REQUEST_INVALID')
+        value = await data.keys.offer(request)
+      } else if (method === 'contentManifest') value = await data.content.serveManifest(this.peerId, input as ContentReference)
+      else if (method === 'contentChunk') {
+        const request = record(input, ['reference', 'index'])
+        requireNetwork(Number.isSafeInteger(request.index), 'APPLICATION_CONTENT_CHUNK_INVALID')
+        const bytes = await data.content.serveChunk(this.peerId, request.reference as ContentReference, request.index as number)
+        value = bytes === null ? null : bytesToHex(bytes)
+      } else if (method === 'contentRetained') value = await data.content.retained(input as ContentReference)
+      else {
+        const receipt = input as ContentRetention
+        requireNetwork(receipt?.payload?.peer === this.peerId, 'CONTENT_RETENTION_INVALID')
+        await data.content.observeRetention(receipt)
       }
-    } else if (method === 'keyShare') {
-      const request = input as ApplicationKeyRequest
-      requireNetwork(request?.payload?.recipient === this.peerId, 'APPLICATION_KEY_REQUEST_INVALID')
-      value = await data.keys.offer(request)
-    } else if (method === 'contentManifest') value = await data.content.serveManifest(this.peerId, input as ContentReference)
-    else if (method === 'contentChunk') {
-      const request = record(input, ['reference', 'index'])
-      requireNetwork(Number.isSafeInteger(request.index), 'APPLICATION_CONTENT_CHUNK_INVALID')
-      const bytes = await data.content.serveChunk(this.peerId, request.reference as ContentReference, request.index as number)
-      value = bytes === null ? null : bytesToHex(bytes)
-    } else if (method === 'contentRetained') value = await data.content.retained(input as ContentReference)
-    else {
-      const receipt = input as ContentRetention
-      requireNetwork(receipt?.payload?.peer === this.peerId, 'CONTENT_RETENTION_INVALID')
-      await data.content.observeRetention(receipt)
-    }
-    return value
+      return value
+    })
   }
   synchronize(): Promise<void> {
     this.#reader()
@@ -527,7 +539,7 @@ class NetworkPeer implements ApplicationPeerLink {
     this.#sync = task; return task
   }
   async #pull(opened = false): Promise<void> {
-    const requestedAt = Date.now(), participant = this.#port.participant, data = participant.data
+    const requestedAt = Date.now(), participant = this.#port.participant
     const response = await this.#readState()
     const remote = await verifyAuthorityBundle(response.authority, participant.authority.descriptor)
     const local = await verifyAuthorityBundle(participant.authority)
@@ -546,66 +558,69 @@ class NetworkPeer implements ApplicationPeerLink {
     }
     // A cold connection exchanges authority and live signals only. An active
     // remote announcement never opts this participant into durable storage.
+    const data = participant.data
     if (data === undefined) return
     if (!response.data && this.peerId !== participant.generation.payload.coordinator) return
     if (!response.data) {
       requireNetwork(!opened, 'APPLICATION_NETWORK_STATE_CHANGED')
       await this.#openRemoteData(); return this.#pull(true)
     }
-    const replica = data.replica
-    await data.keys.ensure()
-    this.#reader()
-    let after = availablePoint(replica)
-    if (after !== null && !remote.contains(after)) after = null
-    const peer = this
-    async function* pages(): AsyncGenerator<readonly OrderedCommand[]> {
-      const retained = availablePoint(replica)
-      if (target === null || retained !== null && atOrAfter(latest, retained, target)) return
-      for (;;) {
-        const input = await peer.#request('range', { generation: remote.current!.id, after, through: target, at })
-        requireNetwork(Array.isArray(input) && input.length > 0 && input.length <= LIMITS.rangeCommands && encodePeerValue(input).length <= LIMITS.rangeBytes,
-          'APPLICATION_NETWORK_RANGE_INVALID')
-        const commands = input as readonly OrderedCommand[]
-        let point = after
-        // Reject an overrun or non-progressing page before any durable write.
-        // The replica then verifies every original signature and chain link.
-        for (const command of commands) {
-          const receipt = command?.receipt
-          requireNetwork(receipt?.payload !== undefined, 'APPLICATION_NETWORK_RANGE_INVALID')
-          const next = { generation: receipt.payload.generation, sequence: receipt.payload.sequence, root: receipt.root }
-          requireNetwork((point === null || !atOrAfter(latest, point, next)) && atOrAfter(latest, target, next) &&
-            (!atOrAfter(latest, next, target) || same(next, target)),
+    await useData(data, async () => {
+      const replica = data.replica
+      await data.keys.ensure()
+      this.#reader()
+      let after = availablePoint(replica)
+      if (after !== null && !remote.contains(after)) after = null
+      const peer = this
+      async function* pages(): AsyncGenerator<readonly OrderedCommand[]> {
+        const retained = availablePoint(replica)
+        if (target === null || retained !== null && atOrAfter(latest, retained, target)) return
+        for (;;) {
+          const input = await peer.#request('range', { generation: remote.current!.id, after, through: target, at })
+          requireNetwork(Array.isArray(input) && input.length > 0 && input.length <= LIMITS.rangeCommands && encodePeerValue(input).length <= LIMITS.rangeBytes,
             'APPLICATION_NETWORK_RANGE_INVALID')
-          point = next
+          const commands = input as readonly OrderedCommand[]
+          let point = after
+          // Reject an overrun or non-progressing page before any durable write.
+          // The replica then verifies every original signature and chain link.
+          for (const command of commands) {
+            const receipt = command?.receipt
+            requireNetwork(receipt?.payload !== undefined, 'APPLICATION_NETWORK_RANGE_INVALID')
+            const next = { generation: receipt.payload.generation, sequence: receipt.payload.sequence, root: receipt.root }
+            requireNetwork((point === null || !atOrAfter(latest, point, next)) && atOrAfter(latest, target, next) &&
+              (!atOrAfter(latest, next, target) || same(next, target)),
+              'APPLICATION_NETWORK_RANGE_INVALID')
+            point = next
+          }
+          yield commands
+          peer.#reader()
+          after = point
+          if (same(point, target)) break
         }
-        yield commands
-        peer.#reader()
-        after = point
-        if (same(point, target)) break
       }
-    }
-    if (at !== null) await replica.synchronize(latest.bundle, pages(), { at })
-    else {
-      for await (const commands of pages()) await replica.receiveHistory(latest.bundle, commands)
-      // Installing a key can make an already retained selected prefix usable.
-      if (!replica.ready) await replica.receiveHistory(latest.bundle, [])
-    }
-    this.#reader()
-    if (replica.ready) {
-      const generation = replica.generation.id, point = at?.point ?? target ?? replica.revision.point
-      const remoteCoverage = await this.#request('coverage', { generation, point })
-      if (remoteCoverage !== null) {
-        const coverage = remoteCoverage as SignedRetainedCoverage
-        requireNetwork(coverage.payload?.peer === this.peerId && coverage.payload.generation === generation &&
-          same(coverage.payload.point, point), 'PEER_COVERAGE_INVALID')
-        if (replica.ready && replica.generation.id === generation) await replica.observeCoverage(coverage)
+      if (at !== null) await replica.synchronize(latest.bundle, pages(), { at })
+      else {
+        for await (const commands of pages()) await replica.receiveHistory(latest.bundle, commands)
+        // Installing a key can make an already retained selected prefix usable.
+        if (!replica.ready) await replica.receiveHistory(latest.bundle, [])
       }
       this.#reader()
-    }
-    if (at !== null && replica.generation.id === at.generation && this.peerId === replica.generation.payload.coordinator) {
-      this.#reader()
-      this.#port.observeHead?.(this.peerId, structuredClone(at), requestedAt)
-    }
+      if (replica.ready) {
+        const generation = replica.generation.id, point = at?.point ?? target ?? replica.revision.point
+        const remoteCoverage = await this.#request('coverage', { generation, point })
+        if (remoteCoverage !== null) {
+          const coverage = remoteCoverage as SignedRetainedCoverage
+          requireNetwork(coverage.payload?.peer === this.peerId && coverage.payload.generation === generation &&
+            same(coverage.payload.point, point), 'PEER_COVERAGE_INVALID')
+          if (replica.ready && replica.generation.id === generation) await replica.observeCoverage(coverage)
+        }
+        this.#reader()
+      }
+      if (at !== null && replica.generation.id === at.generation && this.peerId === replica.generation.payload.coordinator) {
+        this.#reader()
+        this.#port.observeHead?.(this.peerId, structuredClone(at), requestedAt)
+      }
+    })
   }
   #kick(): void {
     if (this.signal.aborted) return

@@ -109,6 +109,8 @@ export interface PeerReplica {
   readonly requiredEpochs: readonly number[]
   readonly authority: AuthorityBundle
   readonly generation: SignedGeneration
+  /** Fatal storage or execution failures fence this owner until it is reopened. */
+  readonly closed: boolean
   /** A complete selected prefix has been published as an application view. */
   readonly ready: boolean
   /** Last contiguous retained command in the selected history, before application publication if necessary. */
