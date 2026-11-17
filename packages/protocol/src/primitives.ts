@@ -31,6 +31,7 @@ export const DOMAINS = {
   drillEvidence: 'chronolog/drill-evidence/v1',
   peerDescriptor: 'chronolog/peer-generation/descriptor/v1',
   peerSchema: 'chronolog/peer-generation/schema/v1',
+  peerPublication: 'chronolog/publication/v1',
   peerControl: 'chronolog/peer-generation/control/v1',
   peerGeneration: 'chronolog/peer-generation/generation/v1',
   peerTransition: 'chronolog/peer-generation/transition/v1',
