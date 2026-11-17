@@ -93,7 +93,7 @@ export class ApplicationEffectWorker {
   inspect(): Promise<readonly ApplicationEffectEntry[]>
   inspect(effectId: string): Promise<ApplicationEffectEntry | null>
   inspect(effectId?: string): Promise<readonly ApplicationEffectEntry[] | ApplicationEffectEntry | null> {
-    return this.#journal.run(async () => { const state = await this.#load(); return structuredClone(effectId === undefined ? state.entries : state.entries.find(e => e.effectId === effectId) ?? null) })
+    return this.#journal.observe(async () => { const state = await this.#load(); return structuredClone(effectId === undefined ? state.entries : state.entries.find(e => e.effectId === effectId) ?? null) })
   }
   processNext(options: { readonly signal?: AbortSignal } = {}): Promise<{ readonly handled: number; readonly hasMore: boolean; readonly reset: boolean }> {
     if (this.#running) return Promise.reject(new Error('APPLICATION_CONSUMER_BUSY'))

@@ -134,12 +134,15 @@ describe('retained application effects', () => {
 
   it('bounds a non-cooperative provider call, retains uncertainty, and permits only a deliberate same-key retry', async () => {
     const f = await setup(); await publish(f.a, 'intent', payload, 'slow-mail')
-    let finish!: () => void, calls = 0
-    const blocked = new Promise<void>(resolve => { finish = resolve })
-    const options: ApplicationEffectOptions = { ...f.options, recovery: 'idempotent', timeoutMs: 20,
-      dispatch: async context => { calls++; f.calls.push({ id: context.idempotencyKey, author: context.event.author }); if (calls === 1) await blocked; return { delivered: true } } }
+    let finish!: () => void, entered!: () => void, calls = 0
+    const blocked = new Promise<void>(resolve => { finish = resolve }), dispatched = new Promise<void>(resolve => { entered = resolve })
+    const options: ApplicationEffectOptions = { ...f.options, recovery: 'idempotent', timeoutMs: 100,
+      dispatch: async context => { calls++; f.calls.push({ id: context.idempotencyKey, author: context.event.author }); if (calls === 1) { entered(); await blocked }; return { delivered: true } } }
     const worker = await ApplicationEffectWorker.open(options)
-    await expect(worker.processNext()).rejects.toBeInstanceOf(ApplicationEffectUncertainError)
+    const pending = worker.processNext(), timedOut = expect(pending).rejects.toBeInstanceOf(ApplicationEffectUncertainError)
+    await dispatched
+    expect((await worker.inspect())[0]?.stage).toBe('dispatching')
+    await timedOut
     const entry = (await worker.inspect())[0]!
     await expect(worker.retry(entry.effectId)).rejects.toThrow('APPLICATION_EFFECT_PROVIDER_BUSY')
     expect(calls).toBe(1); await worker.close()

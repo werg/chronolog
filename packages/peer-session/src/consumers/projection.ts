@@ -38,7 +38,7 @@ export class ApplicationProjection<State extends EventPayload> {
     catch (error) { await projection.close(); throw error }
   }
   inspect(): Promise<ApplicationProjectionCheckpoint<State> | null> {
-    return this.#journal.run(() => this.#load())
+    return this.#journal.observe(() => this.#load())
   }
   catchUp(options: { readonly signal?: AbortSignal } = {}): Promise<ApplicationProjectionCheckpoint<State> & { readonly reset: boolean }> {
     return this.#journal.run(async () => {

@@ -104,7 +104,7 @@ export class ApplicationTimerScheduler {
     const scheduler = new ApplicationTimerScheduler(options)
     try { await scheduler.inspect(); return scheduler } catch (error) { await scheduler.close(); throw error }
   }
-  inspect(): Promise<ApplicationTimerCheckpoint> { return this.#journal.run(async () => structuredClone(await this.#load())) }
+  inspect(): Promise<ApplicationTimerCheckpoint> { return this.#journal.observe(async () => structuredClone(await this.#load())) }
   tick(nowMs = this.#options.now?.() ?? Date.now(), options: { readonly signal?: AbortSignal } = {}): Promise<ApplicationTimerTurn> {
     if (this.#running) return Promise.reject(new Error('APPLICATION_CONSUMER_BUSY'))
     return this.#journal.run(() => this.#tick(nowMs, this.#signal(options.signal)))

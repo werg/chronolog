@@ -9,6 +9,24 @@ const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 describe('generation-aware application projections', () => {
+  it('bounds read-only observations and waits for them before releasing the owner', async () => {
+    const f = await consumerFixture(); cleanup.push(() => f.close())
+    const durable = new MemoryPeerStore(); let block = false, reads = 0, entered!: () => void, release!: () => void
+    const reading = new Promise<void>(resolve => { entered = resolve }), blocked = new Promise<void>(resolve => { release = resolve })
+    const store: PeerStore = { async get(key) { if (block) { reads++; entered(); await blocked }; return durable.get(key) }, put: (key, bytes) => durable.put(key, bytes) }
+    const projection = await ApplicationProjection.open({ id: 'observe', version: '1', session: f.a, store, initial: () => 0, reduce: (n: number) => n + 1 })
+    block = true
+    const observations = Array.from({ length: 16 }, () => projection.inspect())
+    await expect(projection.inspect()).rejects.toThrow('APPLICATION_CONSUMER_OBSERVATION_LIMIT')
+    await reading
+    let closed = false
+    const closing = f.a.close().then(() => { closed = true })
+    await Promise.resolve(); await Promise.resolve()
+    expect(closed).toBe(false); expect(reads).toBe(16)
+    release(); expect(await Promise.all(observations)).toEqual(Array.from({ length: 16 }, () => null))
+    await closing; expect(closed).toBe(true)
+  })
+
   it('settles an active durable checkpoint before the session releases its storage owner', async () => {
     const f = await consumerFixture(); cleanup.push(() => f.close())
     await publish(f.a, 'message', 'one', 'one')
@@ -18,6 +36,7 @@ describe('generation-aware application projections', () => {
     const store: PeerStore = { get: key => durable.get(key), async put(key, value) { entered(); await blocked; await durable.put(key, value) } }
     const projection = await ApplicationProjection.open({ id: 'close-order', version: '1', session: f.a, store, initial: () => 0, reduce: (n: number) => n + 1 })
     const checkpoint = projection.catchUp(); await writing
+    expect(await projection.inspect()).toBeNull()
     let closed = false
     const closing = f.a.close().then(() => { closed = true })
     await Promise.resolve(); await Promise.resolve()

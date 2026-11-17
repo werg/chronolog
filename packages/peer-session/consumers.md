@@ -33,8 +33,10 @@ facade fails with `APPLICATION_EFFECT_OWNER_REQUIRED` before checkpoint IO.
 Provider dispatch must compare authorization with the actual current runtime
 state, rather than a communicated revision snapshot.
 
-Each consumer exclusively owns its namespace while open. Concurrent turns fail
-with `APPLICATION_CONSUMER_BUSY`; run one loop per owner. Consumers register with
+Each consumer exclusively owns its namespace while open. Concurrent mutation
+turns fail with `APPLICATION_CONSUMER_BUSY`; run one loop per owner. Read-only
+`inspect()` remains available during that loop and returns the last atomic
+durable checkpoint, with at most 16 concurrent observations. Consumers register with
 the session before their first durable IO. `close()` cancels observation and
 waits for active checkpoint writes, and session shutdown closes its consumers
 before releasing device storage. Provider cancellation stops waiting; a remote

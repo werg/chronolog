@@ -54,6 +54,7 @@ export class ConsumerJournal {
   readonly #maximum: number
   readonly #stop: () => void
   readonly #release: () => void
+  readonly #observations = new Set<Promise<unknown>>()
   #active: Promise<unknown> | undefined
   #closed: Promise<void> | undefined
 
@@ -108,10 +109,20 @@ export class ConsumerJournal {
     return active.finally(() => { if (this.#active === active) this.#active = undefined })
   }
 
+  /** Observe the last atomic checkpoint while a writer works; never queue another mutation. */
+  observe<T>(operation: () => Promise<T>): Promise<T> {
+    this.signal.throwIfAborted()
+    if (this.#observations.size >= 16) return Promise.reject(new Error('APPLICATION_CONSUMER_OBSERVATION_LIMIT'))
+    const active = Promise.resolve().then(operation)
+    this.#observations.add(active)
+    return active.finally(() => { this.#observations.delete(active) })
+  }
+
   close(): Promise<void> {
     this.#closed ??= (async () => {
       this.#abort.abort(new Error('APPLICATION_CONSUMER_CLOSED')); this.#stop()
-      try { await this.#active } catch { /* The caller owns a failed or cancelled turn. */ }
+      // Callers own individual read/turn failures; storage stays open until all settle.
+      await Promise.allSettled([...(this.#active === undefined ? [] : [this.#active]), ...this.#observations])
       owners.get(this.#options.store)?.delete(this.#key)
       this.#release()
     })()
