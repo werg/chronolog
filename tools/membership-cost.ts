@@ -10,7 +10,6 @@ import { parseArgs } from 'node:util'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
 import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
-import { isFinalityClosureRecord } from '@chronolog/node-core/finality'
 import {
   MembershipAdministrator, createMembershipLedgerClient, encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity,
   prepareEnrollmentRequest, provisionMembership, verifyEnrollmentApproval, type DurableOperationStore,
@@ -62,7 +61,7 @@ const source = {
     [path, createHash('sha256').update(await readFile(join(workspace, path))).digest('hex')] as const))),
 }
 const report = {
-  format: 'chronolog-membership-cost/v1', passed: false, startedAt: new Date().toISOString(), finishedAt: '',
+  format: 'chronolog-membership-cost/v2', passed: false, startedAt: new Date().toISOString(), finishedAt: '',
   command: process.argv.slice(1), source, environment: { node: process.version, platform: platform(), release: release(), arch: arch() },
   topology: { route: 'signed HTTP loopback', administratorStore: 'NativeAgentStore SQLite WAL FULL',
     nativeAuthority: 'separate identity and persistent stores, same process', applicationMaterializer: 'actual native DoltLite',
@@ -138,17 +137,8 @@ try {
     await assert.rejects(administrator!.approve(request, { ...decision, roles: ['reader'] }))
     await administrator!.sync()
     const through = administrator!.progress.verifiedThrough
-    let cursor = before, newClosureRecords = 0
-    while (cursor < through) {
-      const page = administrator!.read({ after: cursor })
-      assert(page.entries.length > 0)
-      for (const entry of page.entries) {
-        assert(isFinalityClosureRecord(entry.bytes), 'Exact approval retry appended an application or control descriptor')
-        newClosureRecords += 1
-        cursor = entry.position
-      }
-    }
-    return { newApplicationOrControlEntries: 0, newClosureRecords, newReceiptEntries: through - before, conflictingRequestRefused: true }
+    assert.equal(through, before)
+    return { newApplicationOrControlEntries: 0, newControlEntries: 0, conflictingRequestRefused: true }
   })
   report.checks.push('lost append reply, administrator reopen and exact/conflicting approval retries preserve original identity and decision')
   const capabilities = [...administrator.snapshot.capabilities.values()].filter(capability =>
@@ -167,16 +157,16 @@ try {
   // closure while the measurement reads the administrator and native views.
   const target = (await native.snapshot()).head
   await administrator.sync()
-  const verifiedThrough = administrator.progress.verifiedThrough
+  const { verifiedThrough, receiptThrough, checkpointThrough } = administrator.progress
   const final = await native.snapshot()
   assert.equal(final.traffic.applicationEnvelopeBytesToAdministrator, 0)
   assert.equal(final.traffic.unexpectedAdministratorRequests, 0)
-  assert(verifiedThrough >= target.position)
-  assert(verifiedThrough <= final.head.position)
-  if (target.position > 0) assert.equal(administrator.read({ after: target.position - 1, limit: 1 }).entries[0]?.root, target.root)
+  assert(checkpointThrough >= target.position)
+  assert(receiptThrough <= final.head.position)
+  assert.equal(final.traffic.candidateDescriptorBytes, 0)
   assert.equal(final.schemaRoles.membershipRootGroupMembers, 0)
   report.checks.push('instrumented signed native endpoint returns no application envelopes and administrator attempts no body endpoint')
-  report.final = { traffic: final.traffic, verifiedThrough, verifiedTarget: target, observedHead: final.head,
+  report.final = { traffic: final.traffic, verifiedThrough, receiptThrough, checkpointThrough, verifiedTarget: target, observedHead: final.head,
     nativeFinalThrough: final.finalThrough, administrator: measured.snapshot(),
     nativeLiveFiles: await directoryBytes(nativeDirectory),
     deviceValueBytes: deviceStore.usageBytes(), backup: { measured: false, latestDurableCopy: null, lag: null },
@@ -218,7 +208,8 @@ async function phase<T>(name: string, work: () => Promise<T>, summarize: (value:
         durableValueBytesWritten: afterStore.valueBytesWritten - beforeStore.valueBytesWritten,
         retainedValueBytesDelta: afterStore.retainedValueBytes - beforeStore.retainedValueBytes },
       nativeStorage: { before: beforeFiles, after: afterFiles, fileBytesDelta: afterFiles.bytes - beforeFiles.bytes },
-      progress: { verifiedThrough: administrator!.progress.verifiedThrough, finalThrough: current.finalThrough, headPosition: current.head.position } })
+      progress: { verifiedThrough: administrator!.progress.verifiedThrough, receiptThrough: administrator!.progress.receiptThrough,
+        checkpointThrough: administrator!.progress.checkpointThrough, finalThrough: current.finalThrough, headPosition: current.head.position } })
     await save()
     process.stdout.write(`Measured ${name}\n`)
     return result

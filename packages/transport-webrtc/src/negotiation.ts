@@ -1,5 +1,6 @@
 import { frameRtcDataChannel, WEBRTC_LIMITS } from './channel.js'
 import type { DataChannelConnection } from './channel.js'
+import { observeWebRtcRoute } from './route.js'
 import type { PeerDescription, RtcDataChannel, RtcPeerConnection, WebRtcOptions, WebRtcSession } from './types.js'
 
 const LABEL = 'chronolog', PROTOCOL = 'chronolog.peer.v1'
@@ -14,9 +15,17 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
 }): Promise<WebRtcSession> {
   const timeoutMs = options.timeoutMs ?? 30_000
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error('WEBRTC_TIMEOUT_INVALID')
-  options.signal?.throwIfAborted()
-  const factory = options.createPeerConnection ?? ((configuration: RTCConfiguration) => new RTCPeerConnection(configuration))
-  const connection = factory(structuredClone(options.configuration ?? {}))
+  let connection: RtcPeerConnection
+  try {
+    options.signal?.throwIfAborted()
+    const factory = options.createPeerConnection ?? ((configuration: RTCConfiguration) => new RTCPeerConnection(configuration))
+    connection = factory(structuredClone(options.configuration ?? {}))
+  } catch (error) {
+    // The caller already handed us a signaling lifetime. Even a failed peer
+    // factory must retire it; an uncooperative cleanup cannot hide that error.
+    void Promise.resolve().then(() => options.signaling.close()).catch(() => undefined)
+    throw error
+  }
   const controller = new AbortController(), signal = controller.signal
   let channel: RtcDataChannel | undefined, negotiationFailed = false
   let closing: Promise<void> | undefined, outcome: WebRtcSession | undefined
@@ -57,10 +66,11 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
   }
   const dataChannel: EventListener = event => accept((event as RTCDataChannelEvent).channel)
   connection.addEventListener('datachannel', dataChannel)
+  if (options.signal?.aborted === true) abort()
   const timeout = setTimeout(() => controller.abort(new Error('WEBRTC_NEGOTIATION_TIMEOUT')), timeoutMs)
-  const descriptions = options.signaling.messages[Symbol.asyncIterator]()
+  let descriptions: AsyncIterator<PeerDescription> | undefined
   const receivedDescription = async (type: PeerDescription['type']): Promise<PeerDescription> => {
-    const item = await interruptible(descriptions.next(), signal)
+    const item = await interruptible(descriptions!.next(), signal)
     if (item.done) throw new Error('WEBRTC_SIGNALING_ENDED')
     const description = validateDescription(item.value, type)
     receivedMessages += 1; receivedBytes += new TextEncoder().encode(description.sdp).length
@@ -73,6 +83,7 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     sentMessages += 1; sentBytes += new TextEncoder().encode(description.sdp).length
   }
   try {
+    descriptions = options.signaling.messages[Symbol.asyncIterator]()
     if (options.role === 'offerer') {
       accept(connection.createDataChannel(LABEL, { ordered: true, protocol: PROTOCOL }))
       await interruptible(connection.setLocalDescription(await interruptible(connection.createOffer(), signal)), signal)
@@ -86,17 +97,18 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     await waitFor(connection, 'connectionstatechange', () => connection.connectionState === 'connected', signal)
     await interruptible(channelReady, signal)
     signal.throwIfAborted()
-    outcome = { connection, signal, signaling: { sentMessages, receivedMessages, sentBytes, receivedBytes }, close }
+    outcome = { connection, signal, signaling: { sentMessages, receivedMessages, sentBytes, receivedBytes },
+      getRoute: () => observeWebRtcRoute(connection), close }
   } catch (error) { negotiationFailed = true; negotiationError = error; await close().catch(() => undefined) }
-  clearTimeout(timeout)
-  try { await options.signaling.close() }
+  try { await interruptible(Promise.resolve().then(() => options.signaling.close()), signal) }
   catch (error) {
     await close().catch(() => undefined)
     if (!negotiationFailed) { negotiationFailed = true; negotiationError = error }
   }
+  clearTimeout(timeout)
   // close() is the signaling cancellation boundary; do not wait for a remote
   // iterator return that can remain blocked after an aborted negotiation.
-  void Promise.resolve().then(() => descriptions.return?.()).catch(() => undefined)
+  void Promise.resolve().then(() => descriptions?.return?.()).catch(() => undefined)
   if (negotiationFailed) throw negotiationError
   if (outcome === undefined) throw new Error('WEBRTC_NEGOTIATION_INCOMPLETE')
   return outcome
@@ -108,12 +120,15 @@ export async function openWebRtcConnection(options: WebRtcOptions): Promise<Data
   const session = await negotiateWebRtc({ ...options, onDataChannel(channel) { framed = frameRtcDataChannel(channel) } })
   if (framed === undefined) { await session.close(); throw new Error('WEBRTC_CHANNEL_MISSING') }
   const selected = framed
+  const retire = (): void => { void session.close().catch(() => undefined) }
+  selected.signal.addEventListener('abort', retire, { once: true })
+  if (selected.signal.aborted) retire()
   const handshake = new AbortController()
   const timer = setTimeout(() => handshake.abort(new Error('WEBRTC_HANDSHAKE_TIMEOUT')), Math.max(1, deadline - Date.now()))
   try { await interruptible(selected.ready, AbortSignal.any([handshake.signal, session.signal])) }
   catch (error) { await selected.close(); await session.close(); throw error }
   finally { clearTimeout(timer) }
-  return { ready: selected.ready, session, get stats() { return selected.stats }, send: bytes => selected.send(bytes),
+  return { ready: selected.ready, signal: selected.signal, session, get stats() { return selected.stats }, send: bytes => selected.send(bytes),
     frames: signal => selected.frames(signal), async close() { await selected.close(); await session.close() } }
 }
 
@@ -126,7 +141,7 @@ function validateDescription(value: unknown, type: PeerDescription['type']): Pee
 }
 
 function interruptible<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  signal.throwIfAborted()
+  if (signal.aborted) { void operation.catch(() => undefined); return Promise.reject(signal.reason) }
   return new Promise((resolve, reject) => {
     const abort = (): void => { reject(signal.reason) }
     signal.addEventListener('abort', abort, { once: true })

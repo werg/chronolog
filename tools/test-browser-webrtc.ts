@@ -21,6 +21,7 @@ import { build } from 'esbuild'
 
 import type { WebRtcTestApi } from '../test/browser/webrtc-page.js'
 import { createNativeBrowserFixture } from './browser-event-fixture.js'
+import { waitFor } from './lib/wait-for.js'
 
 interface TestWindow { readonly chronologWebRtcTest: WebRtcTestApi }
 interface BrowserState {
@@ -35,6 +36,10 @@ function finalDecision({ proposalId, outcome }: PublishedOperation) {
     orderKey: outcome.orderKey, admissible: outcome.admissible, final: outcome.final }
 }
 const workspace = resolve(import.meta.dirname, '..')
+const contribArg = process.argv.indexOf('--contrib')
+if (contribArg < 0 || process.argv[contribArg + 1] === undefined) throw new Error('Supply --contrib /exact/public-recipe-checkout')
+const contrib = resolve(process.argv[contribArg + 1]!)
+const recipe = join(contrib, 'cookbooks/run-a-peer-application/snippets/connect-resident-worker.mjs')
 const outputArg = process.argv.indexOf('--output')
 const output = outputArg < 0 ? join(workspace, 'artifacts/browser-webrtc') : resolve(process.argv[outputArg + 1]!)
 await mkdir(output, { recursive: true })
@@ -43,8 +48,9 @@ const alias = Object.fromEntries(['rpc', 'node-core', 'control-store'].flatMap(n
 for (const [name, file] of [['history', 'history-policy'], ['finality', 'finality'], ['ledger', 'ledger-record'], ['membership', 'membership']]) {
   alias[`@chronolog/node-core/${name}`] = join(workspace, `packages/node-core/src/${file}.ts`)
 }
+alias['@chronolog/transport-webrtc'] = join(workspace, 'packages/transport-webrtc/src/index.ts')
 const bundle = await build({ absWorkingDir: workspace,
-  entryPoints: { 'webrtc-worker': 'test/browser/webrtc-worker.ts', 'webrtc-page': 'test/browser/webrtc-page.ts' },
+  entryPoints: { 'webrtc-worker': 'test/browser/webrtc-worker.ts', 'webrtc-page': 'test/browser/webrtc-page.ts', 'connect-resident-worker': recipe },
   outdir: output, bundle: true, format: 'esm', platform: 'browser', target: 'es2022', alias, metafile: true })
 const forbidden = Object.values(bundle.metafile.outputs).flatMap(entry => Object.entries(entry.inputs)
   .filter(([name, input]) => input.bytesInOutput > 0 && /(?:werift|transport-webrtc\/src\/native|runtime-workerd|transport-tendriller)/u.test(name)).map(([name]) => name))
@@ -86,7 +92,8 @@ const server = createServer((request, response) => {
       result.headers.forEach((value, name) => response.setHeader(name, value))
       response.writeHead(result.status); response.end(returned); return
     }
-    const file = new Map([['/webrtc-page.js', 'webrtc-page.js'], ['/webrtc-worker.js', 'webrtc-worker.js']]).get(path)
+    const file = new Map([['/webrtc-page.js', 'webrtc-page.js'], ['/webrtc-worker.js', 'webrtc-worker.js'],
+      ['/connect-resident-worker.js', 'connect-resident-worker.js']]).get(path)
     const bytes = path === '/' ? Buffer.from('<!doctype html><meta charset="utf-8"><title>Chronolog WebRTC qualification</title><script type="module" src="/webrtc-page.js"></script>')
       : file === undefined ? null : await readFile(join(output, file))
     if (bytes === null) { if (path !== '/favicon.ico') host.applicationRequests += 1; response.writeHead(404); response.end(); return }
@@ -102,7 +109,7 @@ const base = `http://127.0.0.1:${address.port}`
 const browser = await chromium.launch({ headless: true,
   ...(process.env.CHRONOLOG_CHROMIUM_EXECUTABLE === undefined ? {} : { executablePath: process.env.CHRONOLOG_CHROMIUM_EXECUTABLE }) }).catch(async (error: unknown) => {
   server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()))
-  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v1', passed: false,
+  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v2', passed: false,
     phase: 'browser-launch', error: error instanceof Error ? error.message : String(error) }, null, 2) + '\n')
   throw error
 })
@@ -112,6 +119,8 @@ let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
 let nativeConnection: DataChannelConnection | undefined
 let nativeSession: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined, detach: (() => void) | undefined
 const errors: string[] = [], checks: Array<{ id: string; passed: boolean }> = []
+const expectedTerminations: string[] = []
+let injectingInterruption = false
 page.on('pageerror', error => errors.push(error.message))
 const passed = (id: string): void => { checks.push({ id, passed: true }); process.stdout.write(`Passed: ${id}\n`) }
 const closeHost = async (): Promise<void> => {
@@ -137,12 +146,16 @@ try {
     authorize: request => request.headers.get('Authorization') === `Bearer ${introductionToken}`,
     createPeerConnection: configuration => createNativePeerConnection(configuration,
       { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
-    onError: error => { errors.push(String(error)) }, async accept(connection) {
+    onError: error => {
+      const message = error instanceof Error ? error.message : String(error)
+      if (injectingInterruption && ['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED'].includes(message)) expectedTerminations.push(message)
+      else errors.push(String(error))
+    }, async accept(connection) {
     nativeConnection = connection
     const snapshot = native!.governed.activeSnapshot
     const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
       equalBytes(capability.grant.signingPublicKey, native!.identity.signing.publicKeyBytes))!
-    nativeSession = await openAuthenticatedPeerLink({ connection: nativeConnection,
+    const authenticated = await openAuthenticatedPeerLink({ connection,
       local: { ...native!.transport.asLink(), readPayload: hash => hash === payloadHash ? Promise.resolve(payload) : native!.transport.asLink().readPayload(hash) },
       groupId: snapshot.groupId, identity: native!.identity.signing, grantId: reader.id,
       authorizePeer: ({ authorId, grantId }) => {
@@ -150,17 +163,49 @@ try {
         return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
           equalBytes(capability.grant.signingPublicKey, authorId)
       } })
-    detach = native!.transport.connect(nativeSession.link)
-    return { completion: nativeSession.completion, async close() { detach?.(); await nativeSession?.close() } }
+    nativeSession = authenticated
+    const detachPeer = native!.transport.connect(authenticated.link)
+    detach = detachPeer
+    return { completion: authenticated.completion, async close() { detachPeer(); await authenticated.close() } }
   } })
-  const negotiation = await page.evaluate(options => (globalThis as unknown as TestWindow).chronologWebRtcTest.connect(options),
+  const firstIntroduction = await page.evaluate(options => (globalThis as unknown as TestWindow).chronologWebRtcTest.connect(options),
     { url: `${base}/signal`, token: introductionToken })
     .finally(() => { os.networkInterfaces = enumerate; syncBuiltinESMExports() })
-  const nativeSignalingClosed = introduction.stats.accepted === 1 && introduction.stats.pending === 0
-  assert.equal(negotiation.workerOwnsChannel, true); assert.equal(nativeSignalingClosed, true); assert.equal(negotiation.signalingClosed, true)
-  assert.equal(negotiation.http.requests, 1)
+  assert.equal(firstIntroduction.workerOwnsChannel, true); assert.equal(firstIntroduction.signalingClosed, true)
+  assert.equal(firstIntroduction.state.readiness, 'authenticated')
+  assert.equal(firstIntroduction.http.requests, 1)
   assert.equal(host.signalingMessages, 2)
+  await waitFor(async () => introduction!.stats.accepted === 1 && introduction!.stats.pending === 0,
+    'both ends authenticate the first resident connection', 10_000)
   passed('native-browser-rtc-and-worker-ownership')
+
+  const reconnectOriginal = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish(
+    'rtc-reconnect-operation', 'original operation before a forced RTC interruption')) as PublishedOperation
+  assert.equal(reconnectOriginal.outcome.final, true); assert.equal(reconnectOriginal.outcome.outcome.type, 'accepted')
+  const prior = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
+  const reconnectAuthoredBefore = prior.records.filter(record => record.author === identity.transportAuthor).map(record => record.id).sort()
+  const recovering = performance.now()
+  injectingInterruption = true
+  os.networkInterfaces = () => ({}); syncBuiltinESMExports()
+  const negotiation = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.interrupt())
+    .finally(() => { os.networkInterfaces = enumerate; syncBuiltinESMExports() })
+  await waitFor(async () => introduction!.stats.accepted === 2 && introduction!.stats.pending === 0 && introduction!.stats.active === 1,
+    'replacement authenticates and the injected old connection retires', 10_000)
+  injectingInterruption = false
+  const reconnectElapsedMs = performance.now() - recovering
+  assert.equal(negotiation.state.readiness, 'authenticated')
+  assert.equal(negotiation.introductions.length, 2)
+  assert(negotiation.introductions.every(value => value.requests === 1 && value.closed))
+  assert.equal(host.signalingMessages, 4)
+  assert.equal(introduction.stats.accepted, 2); assert.equal(introduction.stats.pending, 0)
+  const reconnectRetry = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.publish(
+    'rtc-reconnect-operation', 'original operation before a forced RTC interruption')) as PublishedOperation
+  assert.deepEqual(finalDecision(reconnectRetry), finalDecision(reconnectOriginal))
+  const resumed = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
+  const reconnectAuthoredAfter = resumed.records.filter(record => record.author === identity.transportAuthor).map(record => record.id).sort()
+  assert.deepEqual(reconnectAuthoredAfter, reconnectAuthoredBefore)
+  const nativeSignalingClosed = introduction.stats.accepted === 2 && introduction.stats.pending === 0
+  passed('public-resident-supervisor-reconnects-once-and-preserves-original-operations')
   const before = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.state()) as BrowserState
   const nativeBefore = nativeConnection!.stats
   await closeHost()
@@ -208,6 +253,7 @@ try {
   assert.deepEqual(final.events.transactions.flatMap(transaction => transaction.events).map(event =>
     ({ proposalId: event.proposalId, topic: event.topic, payload: event.payload })).sort((a, b) => a.proposalId.localeCompare(b.proposalId)),
   [{ proposalId: first.proposalId, topic: 'chat', payload: { text: 'browser after signaling host stopped' } },
+    { proposalId: reconnectOriginal.proposalId, topic: 'chat', payload: { text: 'original operation before a forced RTC interruption' } },
     { proposalId: nativeHandle.proposalId, topic: 'chat', payload: { text: 'native after signaling host stopped' } }]
     .sort((a, b) => a.proposalId.localeCompare(b.proposalId)))
   assert.deepEqual(host, hostBefore)
@@ -229,11 +275,16 @@ try {
     outcomes: { browser: first, retry, native: nativeOutcome, events: final.events },
     retry: { browserAuthoredBefore, browserAuthoredAfter },
     channels: { browser: final.stats, native: nativeConnection!.stats }, introduction: introduction.stats,
+    reconnect: { readiness: 'authenticated', introductions: negotiation.introductions, elapsedMs: reconnectElapsedMs,
+      original: reconnectOriginal, retry: reconnectRetry, browserAuthoredBefore: reconnectAuthoredBefore, browserAuthoredAfter: reconnectAuthoredAfter,
+      expectedTerminations, routes: [firstIntroduction.route, negotiation.route] },
     byteBoundary: 'Logical authenticated peer frame payload bytes; excludes framing headers/credit and SCTP/DTLS/IP overhead.' }
   assert(metrics.bytesAfterSignalingClosed.browserSent > 0); assert(metrics.bytesAfterSignalingClosed.nativeSent >= payload.length)
-  const source = { chronolog: { head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim(),
-    dirty: execFileSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).trim().length > 0 } }
-  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v1', passed: true, source,
+  const source = Object.fromEntries(([['chronolog', workspace], ['contrib', contrib]] as const).map(([name, cwd]) => [name, {
+    head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim(),
+    dirty: execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }).trim().length > 0 }]))
+  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v2', passed: true, source,
+    artifacts: { residentRecipeSha256: digest(await readFile(recipe)), residentBundleSha256: digest(await readFile(join(output, 'connect-resident-worker.js'))) },
     runtime: { node: process.version, browser: browser.version(), native: 'werift@0.27.0' },
     topology: { transport: 'webrtc', nativeImplementation: 'werift', signaling: 'public direct HTTP offer/answer client and native handler on loopback',
       networkDiscovery: 'native binds loopback explicitly; optional interface enumeration disabled in fixture', browserStorage: 'OPFS', channelOwner: 'DedicatedWorker', hostStoppedAfterNegotiation: true,
@@ -241,7 +292,7 @@ try {
     checks, metrics }, null, 2) + '\n')
   process.stdout.write(`WebRTC qualification passed: ${join(output, 'report.json')}\n`)
 } catch (error) {
-  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v1', passed: false, checks, errors,
+  await writeFile(join(output, 'report.json'), JSON.stringify({ format: 'chronolog-webrtc-qualification/v2', passed: false, checks, errors,
     error: error instanceof Error ? error.stack : String(error) }, null, 2) + '\n')
   throw error
 } finally {

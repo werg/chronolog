@@ -1,3 +1,4 @@
+import { controlCommitmentForClosure } from './finality.js'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -107,7 +108,8 @@ describe('governed chronological native replicas with a finality provider', () =
     const certify = async () => {
       now += 100
       await log.append(await createFinalityClosureRecord({ configuration, identity: authorityIdentity,
-        includedHead: await log.head(), closedThroughMs: BigInt(now) }))
+        includedHead: await log.head(), closedThroughMs: BigInt(now),
+      control: await controlCommitmentForClosure(configuration, await log.read(), BigInt(now)) }))
       now += 1
       const entries = await log.read(), certificate = await authority.certify()
       for (const peer of peers) {

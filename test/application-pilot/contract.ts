@@ -14,7 +14,7 @@ export interface PilotBootstrap {
 }
 export interface PeerIntroductionModule {
   readonly introducePeerWorker: (options: { readonly peers: RuntimeApi['peers']; readonly channel: string; readonly peerId: string;
-    readonly configuration: RTCConfiguration; readonly handoff: (channel: RtcDataChannel) => void }) => Promise<WebRtcSession>
+    readonly signal: AbortSignal; readonly configuration: RTCConfiguration; readonly handoff: (channel: RtcDataChannel) => void }) => Promise<WebRtcSession>
 }
 export interface PilotRouteStats {
   readonly route: 'webrtc'

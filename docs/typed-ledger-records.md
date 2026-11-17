@@ -36,14 +36,15 @@ length, envelope kind, group route and encryption epoch. The ordinary Chronolog
 wire and governance verifiers still check signatures and authorization. A valid
 descriptor by itself does not establish the inner message's validity.
 
-`decodeLedgerRecord` validates inline control bytes immediately, so a membership
-administrator can scan every certified descriptor and every governance operation
-without requesting application ciphertext. It must still verify the complete
-receipt prefix, including signed finality closures. Filtering out descriptors
-or closures on the server would not establish
-the absence of an omitted membership change. Unknown or malformed descriptors
-are deterministically invalid records; readers must not fall back to treating
-them as the previous envelope-in-ledger format.
+`decodeLedgerRecord` validates inline control bytes immediately. Full replicas
+verify the complete receipt prefix and every signed finality closure. The
+signed-inclusion-v2 closure also commits the exact complete control projection,
+including each control's original receipt and first covering author-time cutoff.
+Thin membership administrators verify this [compact proof](membership-control-proofs.md)
+without receiving application descriptors or bodies. Merely filtering a legacy
+receipt range cannot prove the absence of an omitted membership change.
+Unknown or malformed descriptors are deterministically invalid records; readers
+must not fall back to treating them as the previous envelope-in-ledger format.
 
 ## Storage and availability
 

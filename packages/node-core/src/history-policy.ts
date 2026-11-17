@@ -5,7 +5,8 @@ import {
 } from '@chronolog/protocol'
 
 import { Mutex } from './async.js'
-import { evaluateFinalitySnapshot, type FinalityProvider, type FinalitySnapshot } from './finality.js'
+import { controlGenesisRoot } from './control-chain.js'
+import { evaluateFinalitySnapshot, type FinalityProvider, type SignedInclusionSnapshot } from './finality.js'
 import type { DurableOperationStore } from './operations.js'
 
 /** Immutable group/provider binding. Execution always uses chronological order. */
@@ -75,7 +76,7 @@ export function encodeHistoryConfiguration(configuration: HistoryConfiguration):
   for (const bytes of [configuration.groupId, configuration.genesisDigest, configuration.executionManifestDigest]) {
     if (!(bytes instanceof Uint8Array) || bytes.length !== 32) throw new Error('HISTORY_CONFIGURATION_INVALID')
   }
-  const providerId = configuration.providerId ?? (configuration.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v1')
+  const providerId = configuration.providerId ?? (configuration.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v2')
   if (!/^[a-z][a-z0-9._-]{0,127}$/u.test(providerId)) throw new Error('HISTORY_PROVIDER_ID_INVALID')
   const parameters = configuration.providerParameters ?? new Uint8Array()
   if (!(parameters instanceof Uint8Array) || parameters.length > 16_384) throw new Error('HISTORY_PROVIDER_PARAMETERS_INVALID')
@@ -221,7 +222,7 @@ export class CoordinatedHistoryPolicy implements FinalityProvider {
   #selectedEntries = new Map<number, OrderedRecordEntry>()
   #certificates = new Map<number, PrefixCertificate>()
   #progress: CoordinatedProgress
-  #finality: FinalitySnapshot
+  #finality: SignedInclusionSnapshot
 
   private constructor(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore, root: string, quotaBytes: number) {
     this.#configuration = structuredClone(configuration)
@@ -230,7 +231,7 @@ export class CoordinatedHistoryPolicy implements FinalityProvider {
     this.#quotaBytes = quotaBytes
     this.#progress = { receivedThrough: 0, verifiedThrough: 0, certifiedThrough: 0, finalThrough: 0, root, missing: [] }
     this.#finality = { checkpointId: root, receivedThrough: 0, includedThrough: 0,
-      closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [] }
+      closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [], control: { count: 0, root: '' }, controls: [] }
   }
 
   static async open(configuration: CoordinatedHistoryConfiguration, store: DurableOperationStore,
@@ -239,6 +240,7 @@ export class CoordinatedHistoryPolicy implements FinalityProvider {
     const quotaBytes = options.quotaBytes ?? DEFAULT_EVIDENCE_QUOTA_BYTES
     if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 1024 || quotaBytes > MAX_LOCAL_HISTORY_BYTES) throw new Error('HISTORY_STORAGE_QUOTA_INVALID')
     const policy = new CoordinatedHistoryPolicy(configuration, store, await orderedGenesisRoot(configuration.historyId), quotaBytes)
+    policy.#finality = { ...policy.#finality, control: { count: 0, root: await controlGenesisRoot(configuration) } }
     const saved = await store.get(policy.#key)
     if (saved !== null) {
       if (saved.length > quotaBytes) throw new Error('HISTORY_STORAGE_QUOTA_EXCEEDED')
@@ -264,7 +266,7 @@ export class CoordinatedHistoryPolicy implements FinalityProvider {
   get closedThroughMs(): bigint { return this.#finality.closedThroughMs }
   get closedReceiptThrough(): number { return this.#finality.closedReceiptThrough }
 
-  snapshot(): FinalitySnapshot { return structuredClone(this.#finality) }
+  snapshot(): SignedInclusionSnapshot { return structuredClone(this.#finality) }
 
   async ingestEvidence(bytes: Uint8Array): Promise<CoordinatedProgress> {
     let evidence: OrderingEvidence
@@ -371,7 +373,7 @@ export class CoordinatedHistoryPolicy implements FinalityProvider {
   async #evaluate(entries: Map<number, Map<string, OrderedRecordEntry>>, certificates: Map<number, PrefixCertificate>): Promise<{
     readonly progress: CoordinatedProgress
     readonly selectedEntries: Map<number, OrderedRecordEntry>
-    readonly finality: FinalitySnapshot
+    readonly finality: SignedInclusionSnapshot
   }> {
     const genesisRoot = await orderedGenesisRoot(this.#configuration.historyId)
     let finalThrough = 0

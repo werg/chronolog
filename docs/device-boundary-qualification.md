@@ -46,7 +46,7 @@ and browser use authenticated loopback framing; no public network is claimed.
 
 The thin-membership gate additionally restarts the actual packaged Cloudflare
 Durable Object after completed writer and reader revocations. It compares the
-root descriptor, full public roster/decision metadata, certified descriptor
+root descriptor, full public roster/decision metadata, certified control
 pages, and exact approval/revocation receipts. A conflicting retry fails, a
 removed reader remains denied, and retries add no native position. Its report is
 `artifacts/thin-membership/ci/report.json`. This is real workerd storage reopening;
@@ -55,12 +55,15 @@ After that restart, a separately keyed, read-only browser device is enrolled
 under another synthetic account. The restored administrator must wrap its
 retained historical epoch keys for that device, which catches up through peers
 and reads the post-revocation data; the removed account remains denied.
-The current `chronolog-thin-membership/v2` gate introduces the fresh browser
+The current `chronolog-thin-membership/v3` gate introduces the fresh browser
 through the public HTTP signaling adapter, transfers its RTCDataChannel into
 the owning Worker and authenticates the native identity and active reader grant.
 Application records and bodies use that RTC session; participant administration
 uses the separately measured signed HTTP boundary. Connection attachment and
 durable application readiness are checked separately.
+The administrator verifies the signed compact control projection and receives
+zero application descriptors or bodies. Its control cursor is independent of
+the application receipt position and closed-time checkpoint.
 
 ## Authorization regression checks
 

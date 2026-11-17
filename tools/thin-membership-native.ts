@@ -158,8 +158,9 @@ export async function createThinMembershipNative(options: {
         const bytes = new Uint8Array(await response.arrayBuffer())
         if (response.ok) {
           const input = await verifyMembershipLedgerRequest(requestBytes, checked().governed.descriptor)
-          const entries = input.kind === 'read' ? decodeMembershipLedgerResponse(bytes, 'read').entries
-            : [decodeMembershipLedgerResponse(bytes, 'append')]
+          const page = input.kind === 'read' ? decodeMembershipLedgerResponse(bytes, 'read') : null
+          const entries = page === null ? [decodeMembershipLedgerResponse(bytes, 'append')]
+            : [...page.entries.map(control => control.entry), ...(page.checkpoint === null ? [] : [page.checkpoint])]
           for (const entry of entries) {
             if (isFinalityClosureRecord(entry.bytes)) {
               traffic.closureRecordTransfers += 1

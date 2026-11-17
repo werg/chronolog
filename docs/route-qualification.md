@@ -55,7 +55,8 @@ Two smaller gates exercise that path independently of the SQL application pilot:
 ```sh
 node --import tsx tools/test-resident-webrtc.ts \
   --contrib /checkout/tendriller-contrib --output artifacts/resident-webrtc
-node --import tsx tools/test-browser-webrtc.ts --output artifacts/browser-webrtc
+node --import tsx tools/test-browser-webrtc.ts \
+  --contrib /checkout/tendriller-contrib --output artifacts/browser-webrtc
 ```
 
 The resident gate uses the exact public recipe, a trusted generated TLS
@@ -64,9 +65,17 @@ that introduction permission alone cannot read history, that admitted peers
 still need an active Chronolog reader grant, and that abort/bind-error cleanup
 releases the listener and peer resources.
 
-The browser gate transfers the untouched RTCDataChannel from the Window into
-the exclusive OPFS Worker. It physically stops its combined page/introduction
-HTTP listener, then exchanges new operations and a 512 KiB content-addressed
+The browser gate bundles the exact supplied contrib resident connection recipe
+and transfers the untouched RTCDataChannel from the Window into the exclusive
+OPFS Worker. It interrupts an authenticated Worker peer session, waits for the
+supervisor's new authenticated connection, and retries the original operation
+without replacing its proposal, final decision or authored records. Both
+introductions must close after one POST, with attributed terminal outcomes and
+measured ICE candidate routes. The current report format is
+`chronolog-webrtc-qualification/v2`.
+
+It then physically stops its combined page/introduction HTTP listener,
+exchanges new operations and a 512 KiB content-addressed
 body, retries an original operation, and compares final events and original
 record digests. Its report separates signaling, host requests and subsequent
 logical RTC frame bytes. Build-only output is not passing runtime evidence.
@@ -141,8 +150,10 @@ The separate thin-membership gate uses authenticated native/browser RTC for
 application transfer and signed HTTP requests for participant administration.
 It counts descriptors, inline controls and detached application envelopes at
 the actual administrator/peer boundaries. The administrator must receive zero
-application bodies. It still verifies the required certified descriptors when
-invoked; these checks do not establish a sparse control-proof protocol.
+application descriptors and bodies. The current `chronolog-thin-membership/v3`
+gate verifies compact control completeness, zero application receipt bytes at
+the administrator, and fresh Worker grant/key readiness before complete application
+history arrives over RTC. See [the proof contract](membership-control-proofs.md).
 
 ## Deployment qualification
 

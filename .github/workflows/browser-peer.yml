@@ -41,9 +41,18 @@ jobs:
         id: chromium
         if: ${{ !cancelled() && steps.sql_engine.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
-      - name: Qualify native and browser WebRTC after signaling host shutdown
+      - name: Check out the exact contrib application specimens
+        id: contrib_source
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
-        run: node --import tsx tools/test-browser-webrtc.ts --output artifacts/browser-webrtc
+        uses: actions/checkout@v6
+        with:
+          repository: werg/tendriller-contrib
+          ref: 15053301742f617f8b07c4b403d495c8b57a6ea1
+          path: artifacts/pilot-source/contrib
+          persist-credentials: false
+      - name: Qualify native and browser WebRTC after signaling host shutdown
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' && steps.contrib_source.outcome == 'success' }}
+        run: node --import tsx tools/test-browser-webrtc.ts --contrib artifacts/pilot-source/contrib --output artifacts/browser-webrtc
       - name: Qualify SQL-free events, native framed authority and abrupt OPFS checkpoints
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: node --import tsx tools/test-browser-events.ts
@@ -61,15 +70,6 @@ jobs:
           repository: werg/tendriller
           ref: 4d63f48c9a0f8e9765fe4d90541d67648fa20340
           path: artifacts/pilot-source/tendriller
-          persist-credentials: false
-      - name: Check out the exact contrib application specimens
-        id: contrib_source
-        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
-        uses: actions/checkout@v6
-        with:
-          repository: werg/tendriller-contrib
-          ref: 7291598b566090d7893a209075861d57c29b1217
-          path: artifacts/pilot-source/contrib
           persist-credentials: false
       - name: Build the packaged public Tendriller SDK, runtime and engine
         id: public_artifacts

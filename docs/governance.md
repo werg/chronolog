@@ -24,11 +24,13 @@ The existing ordered ledger contains small typed records. A roster grant,
 revocation or encrypted key delivery is a signed operation in that ledger.
 An application operation contributes a descriptor with its hash, length and
 encryption epoch; full replicas fetch its original envelope from peers by hash.
-The administrator verifies every descriptor and processes inline roster and key
-operations. It never asks for application bodies. Bandwidth therefore grows with
-the number of descriptors and the number of recipients, independently of the
-size of detached application bodies. See [typed ledger records](typed-ledger-records.md)
-for byte limits and the exact verification rules.
+The administrator verifies a complete cumulative control projection committed
+by signed-inclusion-v2 closures and processes inline roster and key operations.
+It receives no application descriptors or bodies. Administrative history grows
+with participant changes and recipient key wraps, independently of application
+operation count and size. Full peers recompute the projection from the complete
+ledger. See [compact membership proofs](membership-control-proofs.md) for the
+completeness, cutoff, paging, and recovery rules.
 
 Each device generates and retains its own signing key pair and HPKE reader key
 pair. Its signed enrollment request contains the public keys. The administrator
@@ -49,12 +51,13 @@ descriptor from the native authority, execution profile, schema administrator
 and optional initial **public** reader/writer grants. The native peer starts
 from that descriptor. `MembershipAdministrator.open` then uses
 `createMembershipLedgerClient` to append signed inline operations and read
-certified descriptors through `POST /_chronolog/membership`. No reader grant is
+compact certified controls through `POST /_chronolog/membership`. No reader grant is
 required for this independently signed administration endpoint.
 
 A joining device first verifies its grant and encrypted key delivery from that
-small history. It can then authenticate a peer connection and fetch application
-bodies. Governance activation continues while application replay waits for a
+small history with `governed.ingestMembership(page)`. It can then authenticate
+a peer connection and fetch the full original application history, including
+its receipt descriptors and bodies. Governance activation continues while application replay waits for a
 missing body; the missing body is pending progress, never a rejected operation.
 Approvals and revocations retain their exact operation identities across lost
 responses and restarts. Revocation and key rotation resume as one durable

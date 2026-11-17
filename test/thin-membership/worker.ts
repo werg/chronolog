@@ -1,13 +1,12 @@
 import { decodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
 import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
-import { encodeOrderingEvidence } from '@chronolog/node-core/history'
 import { LedgerRecordError } from '@chronolog/node-core/ledger'
 import { decodeMembershipLedgerResponse } from '@chronolog/node-core/membership'
 import { base64UrlToBytes, bytesToBase64Url, decodeExecutionManifest, emit, equalBytes, program } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { openBrowserPeer, prepareBrowserIdentity, type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
-import { frameRtcDataChannel, type RtcDataChannel } from '@chronolog/transport-webrtc'
+import { frameRtcDataChannel, type DataChannelConnection, type RtcDataChannel } from '@chronolog/transport-webrtc'
 
 import { attachMembershipPeer } from './peer.js'
 import type { ThinMembershipBootstrap } from '../../tools/thin-membership-native.js'
@@ -24,18 +23,22 @@ type Request = {
   readonly operationId?: string
   readonly text?: string
   readonly channel?: RtcDataChannel
+  readonly connectionId?: number
 }
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined, client: ChronologClient | undefined, identity: EnrollmentIdentity | undefined
 let bootstrap: ThinMembershipBootstrap | undefined
 let connection: Awaited<ReturnType<typeof attachMembershipPeer>> | undefined
+let opening: DataChannelConnection | undefined, connectionGeneration = 0
 let connectionError: string | undefined
 let requestId: string | undefined
 
 async function disconnect(): Promise<void> {
+  connectionGeneration++
+  const pending = opening; opening = undefined
   const previous = connection; connection = undefined
-  await previous?.close()
+  await Promise.all([pending?.close(), previous?.close()])
 }
 
 async function status() {
@@ -93,20 +96,30 @@ endpoint.addEventListener('message', event => {
       case 'history': {
         for (const bytes of request.pages!) {
           const page = decodeMembershipLedgerResponse(base64UrlToBytes(bytes), 'read')
-          for (const entry of page.entries) await peer!.transport.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
-          await peer!.transport.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: page.certificate }))
+          await peer!.governed!.ingestMembership(page)
         }
         return status()
       }
       case 'channel': {
-        if (connection !== undefined) { request.channel!.close(); throw new Error('THIN_BROWSER_ALREADY_CONNECTED') }
+        if (connection !== undefined || opening !== undefined) { request.channel!.close(); throw new Error('THIN_BROWSER_ALREADY_CONNECTED') }
         connectionError = undefined
-        connection = await attachMembershipPeer({ connection: frameRtcDataChannel(request.channel!),
-          nativeIdentity: bootstrap!.nativeIdentity, identity: identity!, transport: peer!.transport,
-          activeMembership: () => peer!.governed!.activeSnapshot })
+        const generation = ++connectionGeneration, framed = frameRtcDataChannel(request.channel!)
+        opening = framed
+        try {
+          const attached = await attachMembershipPeer({ connection: framed,
+            nativeIdentity: bootstrap!.nativeIdentity, identity: identity!, transport: peer!.transport,
+            activeMembership: () => peer!.governed!.activeSnapshot })
+          if (generation !== connectionGeneration) { await attached.close(); throw new Error('THIN_BROWSER_ATTACHMENT_SUPERSEDED') }
+          connection = attached
+        } finally { if (opening === framed) opening = undefined }
         const active = connection
         void active.completion.catch((error: unknown) => { if (connection === active) connectionError = String(error) })
-          .finally(() => { if (connection === active) connection = undefined })
+          .finally(() => {
+            if (connection === active) {
+              connection = undefined
+              endpoint.postMessage({ kind: 'peer-ended', connectionId: request.connectionId, error: connectionError })
+            }
+          })
         // Attachment owns only RTC/framing and the peer identity proof. The
         // caller's explicit sync owns retained history and SQL materialization.
         return { connected: true, rtc: active.stats() }

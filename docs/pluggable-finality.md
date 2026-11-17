@@ -42,7 +42,7 @@ durable replay and peer transfer.
 `createGovernedNode` accepts a `finalityProviders` registry of asynchronous
 factories. The registry key is the `providerId` authenticated by signed genesis.
 `providerParameters` are bounded opaque configuration bytes, also authenticated.
-The built-in IDs are `peer-validators-v1` and `signed-inclusion-v1`; a custom
+The built-in IDs are `peer-validators-v1` and `signed-inclusion-v2`; a custom
 inclusion verifier is resolved through the registry. An unknown ID or a returned
 configuration that differs from genesis fails explicitly. Selecting a transport
 does not select a verifier, and a host response cannot silently switch providers.
@@ -139,3 +139,11 @@ of control discovery.
 
 Earlier qualification reports describing canonical receipt-order execution are
 historical results for that earlier architecture. They do not certify this change.
+
+## Compact participant evidence
+
+The signed-inclusion-v2 closure also commits the complete finalized control
+projection. Full peers recompute it from the original ledger; participant
+administrators and newly enrolled devices verify compact control pages without
+receiving application descriptors. See [compact membership proofs](membership-control-proofs.md)
+for the wire, cursor, trust, and recovery contract.

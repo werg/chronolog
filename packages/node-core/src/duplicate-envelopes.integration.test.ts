@@ -1,3 +1,4 @@
+import { controlCommitmentForClosure } from './finality.js'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
 import {
   bytesToHex, emit, encodeCanonicalCbor, encodeTransactionCore, equalBytes, generateEd25519KeyPair,
@@ -63,7 +64,8 @@ async function fixture(futureAdmissionWindowMs = 31_000) {
   }
   const closeThrough = async (closedThroughMs: bigint) => {
     await log.append(await createFinalityClosureRecord({ configuration, identity: authorityIdentity,
-      includedHead: await log.head(), closedThroughMs }))
+      includedHead: await log.head(), closedThroughMs,
+      control: await controlCommitmentForClosure(configuration, await log.read(), closedThroughMs) }))
     return authority.certify()
   }
   const deliver = async (peer: Awaited<ReturnType<typeof open>>, certificate: PrefixCertificate) => {

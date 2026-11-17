@@ -118,7 +118,7 @@ the report.
 
 | Responsibility | Continuity that must survive | What restoring it does not establish |
 | --- | --- | --- |
-| Portable membership administrator; Cloudflare by default | Root signing identity, signed genesis/configuration, certified descriptor history, roster and epoch state, exact enrollment/revocation decision journal, retained epoch keys and authorized wraps | Native authority continuity, SQL projection, detached bodies, or a second active administrator being safe |
+| Portable membership administrator; Cloudflare by default | Root signing identity, signed genesis/configuration, verified compact control history and signed checkpoint, roster and epoch state, exact enrollment/revocation decision journal, retained epoch keys and authorized wraps | Native authority continuity, SQL projection, detached bodies, or a second active administrator being safe |
 | Native application authority and its agent | Pinned authority identity/configuration, complete ordered prefix and head, certificates, exact append deduplication, private operation/effect journals, signed feed history and encryption/key state; SQL/control state for immediate service recovery | Cloudflare membership-store continuity or another provider's blob durability |
 | Full replicas and blob providers | Exact hash-committed application envelopes, retained encryption keys, signed feed/evidence needed for replay, application projection; blob/capture bytes plus independent availability/backup evidence | Roster authority or permission to reuse a lost native authority's identity/history |
 

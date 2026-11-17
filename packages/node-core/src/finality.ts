@@ -2,6 +2,7 @@ import {
   assertCanonicalCbor, concatBytes, encodeCanonicalCbor, equalBytes, utf8,
   type Ed25519KeyPair,
 } from '@chronolog/protocol'
+import { appendControl, controlGenesisRoot, isControlRecord, type ControlCommitment, type FinalizedControl } from './control-chain.js'
 
 import {
   encodeHistoryConfiguration, orderedGenesisRoot, verifyOrderedEntry,
@@ -53,15 +54,22 @@ export interface FinalitySnapshot {
   readonly closures: readonly FinalityClosureBoundary[]
 }
 
+/** Additional proof state owned by the signed-inclusion provider. */
+export interface SignedInclusionSnapshot extends FinalitySnapshot {
+  readonly control: ControlCommitment
+  readonly controls: readonly FinalizedControl[]
+}
+
 export interface SignedFinalityClosure {
   readonly configuration: Uint8Array
   readonly includedHead: OrderedRecordHead
   readonly closedThroughMs: bigint
+  readonly control: ControlCommitment
   readonly signature: Uint8Array
 }
 
 const FORMAT = 'chronolog/finality-closure'
-const SIGNING_DOMAIN = 'chronolog/finality-closure/v1\0'
+const SIGNING_DOMAIN = 'chronolog/finality-closure/v2\0'
 const MAX_TIMESTAMP = (1n << 63n) - 1n
 const MAX_CLOSURE_BYTES = 32_768
 
@@ -76,6 +84,7 @@ export async function createFinalityClosureRecord(options: {
   readonly identity: Ed25519KeyPair
   readonly includedHead: OrderedRecordHead
   readonly closedThroughMs: bigint
+  readonly control: ControlCommitment
 }): Promise<Uint8Array> {
   const configuration = encodeHistoryConfiguration(options.configuration)
   const includedHead = structuredClone(options.includedHead)
@@ -83,7 +92,7 @@ export async function createFinalityClosureRecord(options: {
   const publicKey = options.identity.publicKeyBytes.slice()
   if (!equalBytes(publicKey, options.configuration.authorityPublicKey)) throw new Error('FINALITY_CLOSURE_SIGNER_MISMATCH')
   if (includedHead.historyId !== options.configuration.historyId) throw new Error('FINALITY_CLOSURE_CONFIGURATION_MISMATCH')
-  const unsigned = { configuration, includedHead, closedThroughMs }
+  const unsigned = { configuration, includedHead, closedThroughMs, control: structuredClone(options.control) }
   const payload = closureSigningPayload(unsigned)
   const signature = new Uint8Array(await crypto.subtle.sign('Ed25519', options.identity.privateKey, payload.slice().buffer))
   return encodeFinalityClosureRecord({ ...unsigned, signature })
@@ -105,17 +114,17 @@ export function isFinalityClosureRecord(bytes: Uint8Array): boolean {
 
 export function decodeFinalityClosureRecord(bytes: Uint8Array): SignedFinalityClosure {
   let value: ReturnType<typeof assertCanonicalCbor>
-  try { value = assertCanonicalCbor(bytes, { maxBytes: MAX_CLOSURE_BYTES, maxDepth: 2, maxItems: 8 }) }
+  try { value = assertCanonicalCbor(bytes, { maxBytes: MAX_CLOSURE_BYTES, maxDepth: 2, maxItems: 10 }) }
   catch { throw new Error('FINALITY_CLOSURE_INVALID') }
-  if (!Array.isArray(value) || value.length !== 8 || value[0] !== 1n || value[1] !== FORMAT ||
+  if (!Array.isArray(value) || value.length !== 10 || value[0] !== 2n || value[1] !== FORMAT ||
       !(value[2] instanceof Uint8Array) || typeof value[3] !== 'string' ||
       typeof value[4] !== 'bigint' || typeof value[5] !== 'string' || typeof value[6] !== 'bigint' ||
-      !(value[7] instanceof Uint8Array)) throw new Error('FINALITY_CLOSURE_INVALID')
+      typeof value[7] !== 'bigint' || typeof value[8] !== 'string' || !(value[9] instanceof Uint8Array)) throw new Error('FINALITY_CLOSURE_INVALID')
   const position = Number(value[4])
   if (!Number.isSafeInteger(position) || BigInt(position) !== value[4]) throw new Error('FINALITY_CLOSURE_INVALID')
   const closure: SignedFinalityClosure = {
     configuration: value[2], includedHead: { historyId: value[3], position, root: value[5] },
-    closedThroughMs: value[6], signature: value[7],
+    closedThroughMs: value[6], control: { count: Number(value[7]), root: value[8] }, signature: value[9],
   }
   encodeFinalityClosureRecord(closure)
   return structuredClone(closure)
@@ -144,7 +153,7 @@ export async function verifyFinalityClosureRecord(bytes: Uint8Array,
  * after decryption and block application progress while a body is unavailable.
  */
 export async function evaluateFinalitySnapshot(configuration: CoordinatedHistoryConfiguration,
-  entries: readonly OrderedRecordEntry[], receivedThrough?: number): Promise<FinalitySnapshot> {
+  entries: readonly OrderedRecordEntry[], receivedThrough?: number): Promise<SignedInclusionSnapshot> {
   configuration = structuredClone(configuration)
   entries = structuredClone(entries)
   const records: IncludedRecord[] = []
@@ -153,6 +162,8 @@ export async function evaluateFinalitySnapshot(configuration: CoordinatedHistory
   let position = 0
   let closedThroughMs = -1n
   let coveredRecords = 0
+  const controls: FinalizedControl[] = []
+  let control: ControlCommitment = { count: 0, root: await controlGenesisRoot(configuration) }
   for (const entry of entries) {
     if (entry.historyId !== configuration.historyId || entry.position !== position + 1 || entry.previousRoot !== root) {
       throw new Error('FINALITY_CLOSURE_PREFIX_INCOMPLETE')
@@ -180,9 +191,15 @@ export async function evaluateFinalitySnapshot(configuration: CoordinatedHistory
       }
       closures.push(boundary)
       for (; coveredRecords < records.length; coveredRecords += 1) {
-        records[coveredRecords] = { ...records[coveredRecords]!,
+        const included = records[coveredRecords]!
+        if (isControlRecord(included.entry.bytes)) {
+          const next = await appendControl(control, included.entry, boundary.closedThroughMs)
+          controls.push(next); control = { count: next.index, root: next.root }
+        }
+        records[coveredRecords] = { ...included,
           closureBoundary: boundary, closedThroughMs: boundary.closedThroughMs }
       }
+      if (closure.control.count !== control.count || closure.control.root !== control.root) throw new Error('FINALITY_CONTROL_PROJECTION_MISMATCH')
       closedThroughMs = closure.closedThroughMs
     } else records.push({ entry, admissionFloorMs: closedThroughMs, closedThroughMs: -1n, closureBoundary: null })
     root = entry.root
@@ -193,19 +210,37 @@ export async function evaluateFinalitySnapshot(configuration: CoordinatedHistory
   return {
     checkpointId: root, receivedThrough: received, includedThrough: position,
     closedReceiptThrough: closures.at(-1)?.includedThrough ?? 0, closedThroughMs,
-    records, closures,
+    records, closures, control, controls,
   }
 }
 
 function closureFields(value: Omit<SignedFinalityClosure, 'signature'>) {
-  const { configuration, includedHead: head, closedThroughMs } = value
+  const { configuration, includedHead: head, closedThroughMs, control } = value
   if (!(configuration instanceof Uint8Array) || configuration.length < 1 || configuration.length > 32_000 ||
       !/^h_[0-9a-f]{32}$/u.test(head.historyId) || !Number.isSafeInteger(head.position) || head.position < 0 ||
       !/^[0-9a-f]{64}$/u.test(head.root) || typeof closedThroughMs !== 'bigint' ||
-      closedThroughMs < 0n || closedThroughMs > MAX_TIMESTAMP) throw new Error('FINALITY_CLOSURE_INVALID')
-  return [1n, FORMAT, configuration, head.historyId, BigInt(head.position), head.root, closedThroughMs] as const
+      closedThroughMs < 0n || closedThroughMs > MAX_TIMESTAMP ||
+      !control || !Number.isSafeInteger(control.count) || control.count < 0 || control.count > head.position ||
+      !/^[0-9a-f]{64}$/u.test(control.root)) throw new Error('FINALITY_CLOSURE_INVALID')
+  return [2n, FORMAT, configuration, head.historyId, BigInt(head.position), head.root, closedThroughMs, BigInt(control.count), control.root] as const
 }
 
 function closureSigningPayload(value: Omit<SignedFinalityClosure, 'signature'>): Uint8Array {
   return concatBytes(utf8(SIGNING_DOMAIN), encodeCanonicalCbor(closureFields(value)))
+}
+
+/** Compute the cumulative control root a new closure must authenticate. */
+export async function controlCommitmentForClosure(configuration: CoordinatedHistoryConfiguration,
+  entries: readonly OrderedRecordEntry[], closedThroughMs: bigint): Promise<ControlCommitment> {
+  return extendFinalityControlCommitment(await evaluateFinalitySnapshot(configuration, entries), closedThroughMs)
+}
+
+export async function extendFinalityControlCommitment(snapshot: SignedInclusionSnapshot, closedThroughMs: bigint): Promise<ControlCommitment> {
+  let control = snapshot.control
+  for (const record of snapshot.records) {
+    if (record.closureBoundary !== null || !isControlRecord(record.entry.bytes)) continue
+    const next = await appendControl(control, record.entry, closedThroughMs)
+    control = { count: next.index, root: next.root }
+  }
+  return control
 }

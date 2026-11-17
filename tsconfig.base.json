@@ -117,6 +117,9 @@
       ],
       "@chronolog/transport-webrtc/native": [
         "packages/transport-webrtc/src/native.ts"
+      ],
+      "@chronolog/transport-webrtc/resident": [
+        "packages/transport-webrtc/src/resident.ts"
       ]
     }
   }

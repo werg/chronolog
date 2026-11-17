@@ -174,7 +174,7 @@ function genesisToCbor(value: GenesisManifest): CborValue {
 function historyPolicyToCbor(value: NonNullable<GenesisManifest['historyPolicy']>): CborValue {
   protocolInvariant(value.executionManifestDigest.length === 32, 'SCHEMA_INVALID', 'History requires an execution manifest digest')
   protocolInvariant(value.kind === 'peer' || value.kind === 'coordinated', 'SCHEMA_INVALID', 'Unknown history policy')
-  const providerId = value.providerId ?? (value.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v1')
+  const providerId = value.providerId ?? (value.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v2')
   protocolInvariant(/^[a-z][a-z0-9._-]{0,127}$/u.test(providerId), 'SCHEMA_INVALID', 'Invalid finality provider')
   const parameters = value.providerParameters ?? new Uint8Array()
   protocolInvariant(parameters instanceof Uint8Array && parameters.length <= 16384, 'SCHEMA_INVALID', 'Invalid finality parameters')

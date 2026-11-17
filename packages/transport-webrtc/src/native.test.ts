@@ -34,12 +34,19 @@ describe('native WebRTC interoperability', () => {
     try {
       expect(signals.descriptions.map(description => description.type)).toEqual(['offer', 'answer'])
       expect(signals.closed()).toBe(true)
+      expect(await left.session.getRoute()).toEqual({ route: 'direct', localCandidateType: 'host', remoteCandidateType: 'host' })
+      expect(await right.session.getRoute()).toEqual({ route: 'direct', localCandidateType: 'host', remoteCandidateType: 'host' })
       const leftRead = left.frames()[Symbol.asyncIterator](), rightRead = right.frames()[Symbol.asyncIterator]()
       const body = new Uint8Array(512 * 1024 + 13).fill(67)
       await Promise.all([left.send(body), right.send(new Uint8Array([7, 8, 9]))])
       expect((await rightRead.next()).value).toEqual(body)
       expect((await leftRead.next()).value).toEqual(new Uint8Array([7, 8, 9]))
       expect(left.stats.sentBytes).toBe(body.length)
+      // A consumer ending its framed session must retire RTC even if the ICE
+      // connection itself has not failed; supervisors observe that lifetime.
+      await leftRead.return?.()
+      expect(left.signal.aborted).toBe(true)
+      expect(left.session.signal.aborted).toBe(true)
     } finally { await Promise.all([left.close(), right.close()]) }
   })
 

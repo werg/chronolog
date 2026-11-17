@@ -102,4 +102,27 @@ describe('WebRTC session lifecycle', () => {
     await expect(negotiateWebRtc({ ...value.options, onDataChannel: invalidHandoff as (channel: RtcDataChannel) => void })).rejects.toThrow('WEBRTC_CHANNEL_HANDOFF_MUST_BE_SYNCHRONOUS')
     expect(value.peer.closed).toBe(true)
   })
+
+  it('closes signaling if the peer factory fails before negotiation starts', async () => {
+    const value = fixture()
+    await expect(negotiateWebRtc({ ...value.options, createPeerConnection() { throw new Error('factory failed') }, onDataChannel() {} })).rejects.toThrow('factory failed')
+    expect(value.closed()).toBe(true)
+  })
+
+  it('bounds successful negotiation when a signaling adapter never finishes cleanup', async () => {
+    const value = fixture()
+    await expect(negotiateWebRtc({ ...value.options, timeoutMs: 20,
+      signaling: { ...value.signaling, close: () => new Promise(() => undefined) }, onDataChannel() {},
+    })).rejects.toThrow('WEBRTC_NEGOTIATION_TIMEOUT')
+    expect(value.peer.closed).toBe(true)
+  })
+
+  it('cleans up a connection when the signaling reader cannot be acquired', async () => {
+    const value = fixture()
+    await expect(negotiateWebRtc({ ...value.options, signaling: { ...value.signaling,
+      messages: { [Symbol.asyncIterator]() { throw new Error('reader already owned') } },
+    }, onDataChannel() {} })).rejects.toThrow('reader already owned')
+    expect(value.peer.closed).toBe(true)
+    expect(value.closed()).toBe(true)
+  })
 })

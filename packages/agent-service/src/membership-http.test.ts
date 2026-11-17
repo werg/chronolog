@@ -1,9 +1,9 @@
 import { MemoryOperationStore } from '@chronolog/node-core'
-import { decodeOrderingEvidence, encodeOrderingEvidence, verifyPrefixCertificate } from '@chronolog/node-core/history'
-import { createLedgerRecord, decodeLedgerRecord } from '@chronolog/node-core/ledger'
+import { decodeOrderingEvidence, verifyPrefixCertificate } from '@chronolog/node-core/history'
+import { createLedgerRecord } from '@chronolog/node-core/ledger'
 import { decodeFinalityClosureRecord } from '@chronolog/node-core/finality'
 import {
-  MAX_MEMBERSHIP_LEDGER_BYTES, decodeMembershipLedgerResponse, provisionMembership, signMembershipLedgerRequest,
+  MAX_MEMBERSHIP_LEDGER_BYTES, decodeMembershipLedgerResponse, provisionMembership, signMembershipLedgerRequest, encodeFinalizedControl,
   type MembershipLedgerRequest,
 } from '@chronolog/node-core/membership'
 import { assertCanonicalCbor, encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair } from '@chronolog/protocol'
@@ -32,7 +32,18 @@ function request(bytes: Uint8Array, suffix = ''): Request {
 }
 
 describe('signed native membership HTTP handler', () => {
-  it('serves a certified descriptor prefix without fetching application ciphertext', async () => {
+  it('times out incomplete request bodies without blocking later participant operations', async () => {
+    const f = await setup(), cancel = vi.fn(() => new Promise<void>(() => undefined))
+    const handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, now: () => 1_000, bodyTimeoutMs: 20 })
+    const body = new ReadableStream<Uint8Array>({ start(stream) { stream.enqueue(Uint8Array.of(1)) }, cancel })
+    const input = new Request('http://localhost/_chronolog/membership', { method: 'POST', headers: { 'Content-Type': 'application/cbor' },
+      ...{ body, duplex: 'half' } })
+    expect((await handler(input)).status).toBe(408)
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect((await handler(request(await f.signed({ kind: 'read', after: 0, limit: 128 })))).status).toBe(200)
+  })
+
+  it('serves a constant compact checkpoint without application descriptors or ciphertext', async () => {
     const f = await setup(), mirrored: Uint8Array[] = []
     expect(f.native.publicKeyBytes).not.toEqual(f.identity.publicKeyBytes)
     const body = encodeEnvelope({ groupRoute: f.descriptor.groupRoute, messageType: 'candidate',
@@ -46,11 +57,10 @@ describe('signed native membership HTTP handler', () => {
     const bytes = new Uint8Array(await response.arrayBuffer())
     expect(bytes.length).toBeLessThan(2_048)
     const page = decodeMembershipLedgerResponse(bytes, 'read')
-    expect(page.entries).toHaveLength(2)
+    expect(page.entries).toHaveLength(0)
     expect(page.hasMore).toBe(false)
-    expect(decodeLedgerRecord(page.entries[0]!.bytes)).toMatchObject({ kind: 'candidate', inlinePayload: null, payloadLength: body.length })
-    expect(decodeFinalityClosureRecord(page.entries[1]!.bytes)).toMatchObject({ closedThroughMs: 1_000n,
-      includedHead: { position: 1, root: page.entries[0]!.root } })
+    expect(decodeFinalityClosureRecord(page.checkpoint!.bytes)).toMatchObject({ closedThroughMs: 1_000n,
+      includedHead: { position: 1 }, control: { count: 0 } })
     await verifyPrefixCertificate(page.certificate, f.authority.configuration)
     expect(fetchPayload).not.toHaveBeenCalled()
     expect(mirrored.map(decodeOrderingEvidence).map(item => item.kind)).toEqual(['ordered-entry', 'ordered-entry', 'prefix-certificate'])
@@ -125,12 +135,12 @@ describe('signed native membership HTTP handler', () => {
     const bytes = new Uint8Array(await response.arrayBuffer()), first = decodeMembershipLedgerResponse(bytes, 'read')
     expect(bytes.length).toBeLessThan(MAX_MEMBERSHIP_LEDGER_BYTES)
     expect(first.entries).toHaveLength(4)
-    expect(first.entries.reduce((sum, entry) => sum + encodeOrderingEvidence({ kind: 'ordered-entry', entry }).length, 0))
+    expect(first.entries.reduce((sum, entry) => sum + encodeFinalizedControl(entry).length, 0))
       .toBeLessThanOrEqual(MAX_MEMBERSHIP_PAGE_ENTRY_BYTES)
     expect(first.hasMore).toBe(true)
-    const next = await handler(request(await f.signed({ kind: 'read', after: first.entries.at(-1)!.position, limit: 128 })))
+    const next = await handler(request(await f.signed({ kind: 'read', after: first.entries.at(-1)!.index, limit: 128 })))
     const second = decodeMembershipLedgerResponse(new Uint8Array(await next.arrayBuffer()), 'read')
-    expect(second.entries.map(entry => entry.position)).toEqual([5, 6])
+    expect(second.entries.map(entry => entry.index)).toEqual([5])
     expect(second.hasMore).toBe(false)
     expect((await handler(request(await f.signed({ kind: 'read', after: 7, limit: 1 })))).status).toBe(409)
   })

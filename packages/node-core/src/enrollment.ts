@@ -218,8 +218,8 @@ export async function verifyEnrollmentDescriptor(descriptor: EnrollmentDescripto
   if (configured === undefined) {
     if (history.kind !== 'peer') throw new Error('ENROLLMENT_POLICY_NOT_AUTHENTICATED')
   } else if (configured.kind !== history.kind || !equalBytes(configured.executionManifestDigest, history.executionManifestDigest) ||
-      (configured.providerId ?? (configured.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v1')) !==
-        (history.providerId ?? (history.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v1')) ||
+      (configured.providerId ?? (configured.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v2')) !==
+        (history.providerId ?? (history.kind === 'peer' ? 'peer-validators-v1' : 'signed-inclusion-v2')) ||
       !equalBytes(configured.providerParameters ?? new Uint8Array(), history.providerParameters ?? new Uint8Array()) ||
       (history.kind === 'coordinated' && (configured.historyId !== history.historyId ||
         configured.authorityPublicKey === undefined || !equalBytes(configured.authorityPublicKey, history.authorityPublicKey)))) {

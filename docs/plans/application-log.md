@@ -112,8 +112,8 @@ their descriptor. This replaces opaque payload-sized entries directly. There is
 no legacy decoder fallback, mirrored log, new page outbox or automatic policy
 switch.
 
-The portable `MembershipAdministrator` follows certified descriptors, verifies
-and applies control records, retains exact approval/revocation decisions and
+The portable `MembershipAdministrator` verifies cumulative signed control proofs,
+applies their original-cutoff governance records, retains exact approval/revocation decisions and
 distributes authorized epoch material. It has no application-body fetch port or
 application SQL engine. Its default Tendriller host supplies authenticated
 owner/device routes and a durable private metadata store. Cloudflare's SQLite
@@ -132,16 +132,16 @@ override would break deterministic agreement and is not permitted.
 | `@chronolog/node-core/membership` and independently packed `@chronolog/membership` | Portable provisioning, administrator, enrollment verification and signed bounded ledger protocol. |
 | `@tendriller/core/members` | Public host client for configuration, account-bound requests, owner approval/revocation, status and certified control-history pages. |
 | `PUT /members`, then `POST /members/sync` | Persist the host root and signed descriptor before starting the native participant; then open administration and synchronize control history. |
-| `GET /members/history` | Approved reader account or administrator obtains bounded certified descriptor/control history to bootstrap device verification. |
-| Signed `POST /_chronolog/membership` on the native host | Authenticate the immutable root signer, read bounded descriptors/certificates, or append exact inline control records. No local SQL signing or application body route is granted. |
+| `GET /members/history` | Approved reader account or administrator obtains bounded certified compact control history to bootstrap device verification. |
+| Signed `POST /_chronolog/membership` on the native host | Authenticate the immutable root signer, read bounded controls and cumulative checkpoints, or append exact inline control records. No local SQL signing or application body route is granted. |
 
 A joining device generates its own signing and reader keys. Its signed request
 binds the authenticated host account prefix; another logged-in account cannot
 reassign it by forwarding the same signature. An approval receipt alone is not
 readiness. The device first verifies certified controls and its grant/key wraps,
 then opens its reader-authenticated peer connection and fetches the missing
-application envelopes. Governance can advance through the certified descriptor
-prefix while application execution is pending. Each candidate still authorizes
+application receipt descriptors and envelopes. Governance can advance through
+the compact control proof while full application replay is pending. Each candidate still authorizes
 against membership at its own canonical position, so later revocation cannot
 rewrite an older final result.
 

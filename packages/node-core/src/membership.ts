@@ -16,12 +16,15 @@ import {
 } from './enrollment.js'
 import { GovernanceActivationIndex } from './governance-activation.js'
 import { GovernanceControlPlane, GovernanceRecordPendingError, isInvalidGovernanceRecord, orderFinalizedGovernanceRecords } from './governance.js'
-import { CoordinatedHistoryPolicy, verifyOrderedEntry, type CoordinatedProgress } from './history-policy.js'
+import { verifyOrderedEntry } from './history-policy.js'
+import { ControlHistory, verifyControlCheckpoint, type ControlProgress } from './control-proof.js'
 import { createLedgerRecord } from './ledger-record.js'
 import { DurableOperationJournal, validateOperationId, type DurableOperationStore } from './operations.js'
 import type { MembershipLedger, MembershipLedgerPage } from './membership-wire.js'
 
 export * from './membership-wire.js'
+export * from './control-proof.js'
+export * from './control-chain.js'
 export { encodeSignedGenesis, decodeSignedGenesis } from '@chronolog/capabilities'
 export {
   decodeSignedEnrollmentRequest, decodeSignedEnrollmentApproval, encodeSignedEnrollmentRequest, encodeSignedEnrollmentApproval,
@@ -141,7 +144,7 @@ export interface MembershipRevocation {
 
 /**
  * Portable administrator with one control feed, one key service and one durable
- * authoring journal. It verifies every small ordered descriptor, applies inline
+ * authoring journal. It verifies the cumulative finalized control projection, applies inline
  * governance only, and has no application-body fetch or SQL execution capability.
  */
 export class MembershipAdministrator {
@@ -151,7 +154,7 @@ export class MembershipAdministrator {
   readonly #ledger: MembershipLedger
   readonly #local: PortableFeedTransport
   readonly #governance: GovernanceControlPlane
-  readonly #policy: CoordinatedHistoryPolicy
+  readonly #policy: ControlHistory
   readonly #activation: GovernanceActivationIndex
   readonly #issuer: EnrollmentIssuer
   readonly #revocations: DurableOperationJournal
@@ -164,7 +167,7 @@ export class MembershipAdministrator {
   #closed = false
 
   private constructor(options: { descriptor: EnrollmentDescriptor; identity: Ed25519KeyPair; store: DurableOperationStore;
-    ledger: MembershipLedger; local: PortableFeedTransport; governance: GovernanceControlPlane; policy: CoordinatedHistoryPolicy }) {
+    ledger: MembershipLedger; local: PortableFeedTransport; governance: GovernanceControlPlane; policy: ControlHistory }) {
     this.#descriptor = options.descriptor; this.#identity = options.identity; this.#store = options.store; this.#ledger = options.ledger
     this.#local = options.local; this.#governance = options.governance; this.#policy = options.policy
     this.#activation = new GovernanceActivationIndex(options.governance.revisionSnapshots[0]!, 'coordinated')
@@ -174,7 +177,7 @@ export class MembershipAdministrator {
       rootPrivateKey: options.identity.privateKey, captureFinalTarget: async () => {
         await this.#sync()
         if (this.#activation.activeSnapshot.revision !== this.#governance.snapshot.revision ||
-            this.#policy.closedReceiptThrough < this.#published || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
+            this.#policy.progress.receiptThrough < this.#published || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
         return this.#target()
       } })
   }
@@ -184,7 +187,7 @@ export class MembershipAdministrator {
     const descriptor = structuredClone(input.descriptor), identity = { ...input.identity, publicKeyBytes: input.identity.publicKeyBytes.slice() }
     await verifyEnrollmentDescriptor(descriptor)
     if (descriptor.history.kind !== 'coordinated') throw new Error('MEMBERSHIP_COORDINATED_HISTORY_REQUIRED')
-    if ((descriptor.history.providerId ?? 'signed-inclusion-v1') !== 'signed-inclusion-v1') throw new Error('FINALITY_PROVIDER_UNAVAILABLE')
+    if ((descriptor.history.providerId ?? 'signed-inclusion-v2') !== 'signed-inclusion-v2') throw new Error('FINALITY_PROVIDER_UNAVAILABLE')
     const history = descriptor.history
     if (!equalBytes(identity.publicKeyBytes, descriptor.genesis.manifest.rootAdminPublicKey) ||
         new TextDecoder().decode(descriptor.genesis.manifest.capabilityLogFeed) !== feedIdFromPublicKey(identity.publicKeyBytes)) {
@@ -213,7 +216,7 @@ export class MembershipAdministrator {
     }
     const governance = await GovernanceControlPlane.create({ genesis: descriptor.genesis, groupRoute: descriptor.groupRoute,
       identity, operationStore: input.store, transport, replication: 'administration' })
-    const policy = await CoordinatedHistoryPolicy.open(descriptor.history, namespace(input.store, 'membership/ledger/'))
+    const policy = await ControlHistory.open(descriptor.history, input.store)
     const administrator = new MembershipAdministrator({ descriptor, identity, store: input.store, ledger: input.ledger, local, governance, policy })
     try {
       await governance.start()
@@ -226,27 +229,15 @@ export class MembershipAdministrator {
 
   get descriptor(): EnrollmentDescriptor { return structuredClone(this.#descriptor) }
   get snapshot(): CapabilitySnapshot { return this.#activation.activeSnapshot }
-  get progress(): CoordinatedProgress { return this.#policy.progress }
+  get progress(): ControlProgress { return this.#policy.progress }
   get epochs(): readonly bigint[] { return this.#governance.knownEpochs }
 
   /** Approved devices obtain verified inline grants/key wraps before their reader-authenticated peer connection. */
   read(options: { readonly after: number; readonly limit?: number }): MembershipLedgerPage {
-    const after = options.after, limit = options.limit ?? 128, through = this.#policy.progress.verifiedThrough
-    if (!Number.isSafeInteger(after) || after < 0 || after > through || !Number.isSafeInteger(limit) || limit < 1 || limit > 128) {
-      throw new Error('MEMBERSHIP_RANGE_INVALID')
-    }
-    const certificate = this.#policy.evidence().find(evidence => evidence.kind === 'prefix-certificate' && evidence.certificate.position === through)
-    if (certificate?.kind !== 'prefix-certificate') throw new Error('MEMBERSHIP_PREFIX_PENDING')
-    const entries = []
-    let bytes = 0
-    for (const entry of this.#policy.entries().slice(after, after + limit)) {
-      if (entries.length && bytes + entry.bytes.length > 1024 * 1024) break
-      entries.push(entry); bytes += entry.bytes.length
-    }
-    return { entries, certificate: certificate.certificate, hasMore: after + entries.length < through }
+    return this.#policy.read(options)
   }
 
-  sync(options: { readonly signal?: AbortSignal } = {}): Promise<CoordinatedProgress> {
+  sync(options: { readonly signal?: AbortSignal } = {}): Promise<ControlProgress> {
     return this.#run(async () => { await this.#sync(); return this.progress }, options.signal)
   }
 
@@ -301,28 +292,29 @@ export class MembershipAdministrator {
 
   async #sync(): Promise<void> {
     this.#signal.throwIfAborted()
-    let cursor = this.#policy.progress.verifiedThrough, target: number | undefined
-    do {
-      const page = await this.#ledger.read({ after: cursor, limit: 128, signal: this.#signal })
+    this.#policy.restart()
+    let target: MembershipLedgerPage | undefined, through = 0
+    for (;;) {
+      const cursor = this.#policy.progress.receivedThrough
+      const page = structuredClone(await this.#ledger.read({ after: cursor, limit: 128, signal: this.#signal }))
       if (page.entries.length > 128) throw new Error('MEMBERSHIP_RANGE_TOO_LARGE')
-      for (const entry of page.entries) {
-        if (entry.position !== cursor + 1) throw new Error('MEMBERSHIP_RANGE_GAP')
-        // Ordering authenticates exact bytes, including positions whose
-        // descriptor is invalid or belongs to another group. Retain them for
-        // the prefix proof; application interpretation cannot create a gap.
-        cursor = entry.position
+      if (target === undefined) {
+        if (this.#descriptor.history.kind !== 'coordinated') throw new Error('MEMBERSHIP_COORDINATED_HISTORY_REQUIRED')
+        through = (await verifyControlCheckpoint(page, this.#descriptor.history))?.control.count ?? 0
+        target = page
       }
-      await this.#policy.ingestBatch([
-        ...page.entries.map(entry => ({ kind: 'ordered-entry' as const, entry })),
-        { kind: 'prefix-certificate', certificate: page.certificate },
-      ])
-      target ??= page.certificate.position
-      if (cursor < target && page.entries.length === 0) throw new Error('MEMBERSHIP_RANGE_GAP')
+      // A participant operation catches one finite authenticated target. New
+      // controls on later pages cannot keep extending its Cloudflare lifetime.
+      const entries = page.entries.filter(control => control.index <= through)
+      const hasMore = (entries.at(-1)?.index ?? cursor) < through
+      if (page === target && page.hasMore !== hasMore) throw new Error('CONTROL_PAGE_PROGRESS_INVALID')
+      const progress = await this.#policy.ingest({ entries, hasMore, checkpoint: target.checkpoint, certificate: target.certificate })
       this.#signal.throwIfAborted()
-    } while (cursor < target)
-    const controls = await orderFinalizedGovernanceRecords(this.#policy.snapshot().records.flatMap(record =>
-      record.closureBoundary === null || this.#handledControls.has(record.entry.position) ? []
-        : [{ entry: record.entry, cutoffMs: record.closureBoundary.closedThroughMs }]), this.#descriptor.groupRoute)
+      if (progress.verifiedThrough >= through) break
+      if (progress.receivedThrough <= cursor) throw new Error('MEMBERSHIP_RANGE_GAP')
+    }
+    const controls = await orderFinalizedGovernanceRecords(this.#policy.entries().flatMap(control =>
+      this.#handledControls.has(control.entry.position) ? [] : [{ entry: control.entry, cutoffMs: control.cutoffMs }]), this.#descriptor.groupRoute)
     this.#pendingControls = false
     for (const { entry, cutoffMs } of controls) {
       try {
@@ -339,9 +331,9 @@ export class MembershipAdministrator {
   }
 
   #target(): EnrollmentFinalTarget {
-    const closure = this.#policy.snapshot().closures.at(-1)
-    if (closure === undefined || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
-    return { frontier: encodeMembershipFinalTarget(this.#descriptor, closure.includedThrough, closure.includedRoot, closure.closedThroughMs),
+    const closure = this.#policy.closure
+    if (closure === null || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
+    return { frontier: encodeMembershipFinalTarget(this.#descriptor, closure.includedHead.position, closure.includedHead.root, closure.closedThroughMs),
       requiredEpochs: this.#governance.knownEpochs, executionManifestDigest: this.#descriptor.history.executionManifestDigest.slice() }
   }
 
@@ -351,7 +343,7 @@ export class MembershipAdministrator {
     const revision = await this.#governance.revoke(ids, this.#identity.privateKey, { operationId: `revoke:${key}` })
     const epoch = await this.#governance.rotateEpoch(this.#identity.privateKey, undefined, { operationId: `rotate:${key}` })
     await this.#sync()
-    if (this.#policy.closedReceiptThrough < this.#published || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
+    if (this.#policy.progress.receiptThrough < this.#published || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
     const target = this.#target()
     await this.#store.put(resultKey, encodeCanonicalCbor([1n, await capabilityRevisionDigest(revision.revision),
       epoch.manifest.epoch, target.frontier, target.requiredEpochs, target.executionManifestDigest]))

@@ -365,15 +365,19 @@ The native authority key remains separate. The daemon mounts this handler only
 when it hosts the group's pinned native authority. The ordinary owner RPC bearer
 does not authorize this route; its independently verified signature does.
 
-Reads return every descriptor in a contiguous bounded range and a fresh signed
-prefix certificate. They never fetch detached application payloads. Appends
-accept only inline capability or epoch records. The native log commits before
-acknowledgment, so a lost response returns the same position on exact retry.
-When a sink is configured, the handler publishes only the returned entries and
-certificate; a later read can heal interrupted evidence delivery. Read pages
-carry at most 1 MiB of encoded entries, at most 128 entries, and responses and
-requests are capped at 2 MiB. Large recipient wrap lists remain subject to the
-explicit inline control limit.
+Reads return consecutive finalized controls, the signed cumulative projection
+checkpoint, and its covering prefix certificate. They return no application
+descriptors or bodies. The `after` cursor counts controls; the authenticated
+application receipt frontier is separate. Appends accept only inline capability
+or epoch records. The native log commits before acknowledgment, so a lost
+response returns the same original position on exact retry.
+
+When a sink is configured, the handler repairs complete receipt evidence to
+that local native sink. Those entries do not enter the membership HTTP response.
+Read pages carry at most 1 MiB of encoded controls and 128 entries; responses and
+requests are capped at 2 MiB. Key-wrap lists remain subject to the explicit
+inline control limit. See [compact membership proofs](../../docs/membership-control-proofs.md)
+for signature, completeness, activation, and bounded synchronization rules.
 
 ## Verification scope
 

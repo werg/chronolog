@@ -319,7 +319,13 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
       const frame = assertCanonicalCbor(bytes)
       if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== 'chronolog/ephemeral/v1') throw new Error('SIGNAL_FRAME_INVALID')
-      await options.connection.send(bytes.slice())
+      // Signals contain application data too. A completed handshake is not a
+      // permanent reader grant, and writer authorization at the signal layer
+      // does not authorize this recipient after its read grant is revoked.
+      const outgoing = bytes.slice()
+      if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
+      if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
+      await options.connection.send(outgoing)
     },
     async close() {
       if (!controller.signal.aborted) {

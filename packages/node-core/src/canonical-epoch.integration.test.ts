@@ -1,3 +1,4 @@
+import { controlCommitmentForClosure } from './finality.js'
 import { encodeGenesisManifest, signGenesis, type GenesisManifest } from '@chronolog/capabilities'
 import { sha256 } from '@chronolog/canonical'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
@@ -76,7 +77,8 @@ async function fixture(options: { readonly closeBootstrap?: boolean } = {}) {
   const certify = async (peer: { readonly node: ChronologNode }) => {
     now += 100
     await log.append(await createFinalityClosureRecord({ configuration, identity: authorityIdentity,
-      includedHead: await log.head(), closedThroughMs: BigInt(now) }))
+      includedHead: await log.head(), closedThroughMs: BigInt(now),
+      control: await controlCommitmentForClosure(configuration, await log.read(), BigInt(now)) }))
     now += 1
     for (const entry of await log.read()) await peer.node.ingestOrderingEvidence({ kind: 'ordered-entry', entry })
     await peer.node.ingestOrderingEvidence({ kind: 'prefix-certificate', certificate: await authority.certify() })

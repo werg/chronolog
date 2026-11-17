@@ -1,3 +1,5 @@
+import { controlGenesisRoot } from './control-chain.js'
+import { controlCommitmentForClosure } from './finality.js'
 import { describe, expect, it } from 'vitest'
 import { generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
 
@@ -24,6 +26,7 @@ async function fixture() {
   const authority = createPrefixAuthority({ configuration, identity, readHead: () => log.head() })
   const close = async (closedThroughMs: bigint) => log.append(await createFinalityClosureRecord({
     configuration, identity, includedHead: await log.head(), closedThroughMs,
+    control: await controlCommitmentForClosure(configuration, await log.read(), closedThroughMs),
   }))
   const share = async () => {
     for (const entry of await log.read()) await policy.ingestEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
@@ -88,7 +91,7 @@ describe('inclusion and chronological closure proofs', () => {
     const f = await fixture()
     await f.log.append(utf8('already included'))
     const marker = await createFinalityClosureRecord({ configuration: f.configuration, identity: f.identity,
-      includedHead: await f.log.head(), closedThroughMs: 100n })
+      control: { count: 0, root: await controlGenesisRoot(f.configuration) }, includedHead: await f.log.head(), closedThroughMs: 100n })
     await f.log.append(utf8('concurrent append'))
     await f.log.append(marker)
     await expect(f.share()).rejects.toThrow('FINALITY_CLOSURE_HEAD_MISMATCH')
@@ -113,7 +116,7 @@ describe('inclusion and chronological closure proofs', () => {
   it('authenticates the independent closure signature, provider binding and included head', async () => {
     const f = await fixture()
     const marker = await createFinalityClosureRecord({ configuration: f.configuration, identity: f.identity,
-      includedHead: await f.log.head(), closedThroughMs: 100n })
+      control: { count: 0, root: await controlGenesisRoot(f.configuration) }, includedHead: await f.log.head(), closedThroughMs: 100n })
     const altered = decodeFinalityClosureRecord(marker)
     altered.signature[0]! ^= 1
     await expect(verifyFinalityClosureRecord(encodeFinalityClosureRecord(altered), f.configuration))
@@ -121,9 +124,9 @@ describe('inclusion and chronological closure proofs', () => {
     await expect(verifyFinalityClosureRecord(marker, { ...f.configuration, providerId: 'another-provider-v1' }))
       .rejects.toThrow('FINALITY_CLOSURE_CONFIGURATION_MISMATCH')
     await expect(createFinalityClosureRecord({ configuration: f.configuration, identity: f.identity,
-      includedHead: await f.log.head(), closedThroughMs: -1n })).rejects.toThrow('FINALITY_CLOSURE_INVALID')
+      control: { count: 0, root: await controlGenesisRoot(f.configuration) }, includedHead: await f.log.head(), closedThroughMs: -1n })).rejects.toThrow('FINALITY_CLOSURE_INVALID')
     await expect(createFinalityClosureRecord({ configuration: f.configuration, identity: f.identity,
-      includedHead: await f.log.head(), closedThroughMs: 1n << 63n })).rejects.toThrow('FINALITY_CLOSURE_INVALID')
+      control: { count: 0, root: await controlGenesisRoot(f.configuration) }, includedHead: await f.log.head(), closedThroughMs: 1n << 63n })).rejects.toThrow('FINALITY_CLOSURE_INVALID')
   })
 
   it('does not publish a new closure when its evidence checkpoint cannot be persisted', async () => {
@@ -146,12 +149,12 @@ describe('inclusion and chronological closure proofs', () => {
   it('keeps forged and foreign marker-shaped writer bytes inert in an opaque hosted log', async () => {
     const f = await fixture()
     const marker = await createFinalityClosureRecord({ configuration: f.configuration, identity: f.identity,
-      includedHead: await f.log.head(), closedThroughMs: 10_000n })
+      control: { count: 0, root: await controlGenesisRoot(f.configuration) }, includedHead: await f.log.head(), closedThroughMs: 10_000n })
     const forged = decodeFinalityClosureRecord(marker)
     forged.signature[0]! ^= 1
     await f.log.append(encodeFinalityClosureRecord(forged))
     const foreign = await createFinalityClosureRecord({ configuration: { ...f.configuration, providerId: 'foreign-v1' },
-      identity: f.identity, includedHead: await f.log.head(), closedThroughMs: 10_000n })
+      identity: f.identity, control: { count: 0, root: await controlGenesisRoot(f.configuration) }, includedHead: await f.log.head(), closedThroughMs: 10_000n })
     await f.log.append(foreign)
     await f.log.append(utf8('valid application proposal'))
     await f.close(100n)

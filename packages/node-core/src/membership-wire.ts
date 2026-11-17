@@ -4,22 +4,20 @@ import {
 
 import type { EnrollmentDescriptor } from './enrollment.js'
 import {
-  decodeOrderingEvidence, encodeHistoryConfiguration, encodeOrderingEvidence, verifyOrderedEntry, verifyPrefixCertificate,
-  type OrderedRecordEntry, type PrefixCertificate,
+  decodeOrderingEvidence, encodeHistoryConfiguration, encodeOrderingEvidence, verifyOrderedEntry,
+  type OrderedRecordEntry,
 } from './history-policy.js'
 import { decodeLedgerRecord } from './ledger-record.js'
+import { decodeControlPage, encodeControlPage, verifyControlCheckpoint, type MembershipLedgerPage } from './control-proof.js'
+export type { MembershipLedgerPage } from './control-proof.js'
 
-const DOMAIN = 'chronolog/membership-ledger/v1'
+const DOMAIN = 'chronolog/membership-ledger/v2'
 export const MAX_MEMBERSHIP_LEDGER_BYTES = 2 * 1024 * 1024
+export const MAX_MEMBERSHIP_BODY_FRAGMENTS = 65_536
+export const MEMBERSHIP_IO_TIMEOUT_MS = 30_000
 const MAX_TTL_MS = 60_000
 
-export interface MembershipLedgerPage {
-  readonly entries: readonly OrderedRecordEntry[]
-  readonly certificate: PrefixCertificate
-  readonly hasMore: boolean
-}
-
-/** Only small ordered descriptors travel through this port. Application bodies never do. */
+/** Only finalized governance and its cumulative completeness proof travel through this port. */
 export interface MembershipLedger {
   read(options: { readonly after: number; readonly limit: number; readonly signal?: AbortSignal }): Promise<MembershipLedgerPage>
   append(recordBytes: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<OrderedRecordEntry>
@@ -83,17 +81,16 @@ export async function verifyMembershipLedgerRequest(bytes: Uint8Array, descripto
 
 export function encodeMembershipLedgerResponse(value: MembershipLedgerPage | OrderedRecordEntry): Uint8Array {
   return 'entries' in value
-    ? encodeCanonicalCbor([1n, 'read', value.entries.map(entry => encodeOrderingEvidence({ kind: 'ordered-entry', entry })),
-      encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: value.certificate }), value.hasMore])
-    : encodeCanonicalCbor([1n, 'append', encodeOrderingEvidence({ kind: 'ordered-entry', entry: value })])
+    ? encodeCanonicalCbor([2n, 'read', encodeControlPage(value)])
+    : encodeCanonicalCbor([2n, 'append', encodeOrderingEvidence({ kind: 'ordered-entry', entry: value })])
 }
 
 export function decodeMembershipLedgerResponse(bytes: Uint8Array, kind: 'read'): MembershipLedgerPage
 export function decodeMembershipLedgerResponse(bytes: Uint8Array, kind: 'append'): OrderedRecordEntry
 export function decodeMembershipLedgerResponse(bytes: Uint8Array, kind: 'read' | 'append'): MembershipLedgerPage | OrderedRecordEntry {
   if (bytes.length > MAX_MEMBERSHIP_LEDGER_BYTES) throw new Error('MEMBERSHIP_RESPONSE_TOO_LARGE')
-  const value = assertCanonicalCbor(bytes)
-  if (!Array.isArray(value) || value[0] !== 1n || value[1] !== kind) throw new Error('MEMBERSHIP_RESPONSE_INVALID')
+  const value = assertCanonicalCbor(bytes, { maxBytes: MAX_MEMBERSHIP_LEDGER_BYTES, maxByteStringBytes: MAX_MEMBERSHIP_LEDGER_BYTES })
+  if (!Array.isArray(value) || value[0] !== 2n || value[1] !== kind) throw new Error('MEMBERSHIP_RESPONSE_INVALID')
   const entry = (raw: unknown): OrderedRecordEntry => {
     if (!(raw instanceof Uint8Array)) throw new Error('MEMBERSHIP_RESPONSE_INVALID')
     const evidence = decodeOrderingEvidence(raw)
@@ -101,11 +98,8 @@ export function decodeMembershipLedgerResponse(bytes: Uint8Array, kind: 'read' |
     return evidence.entry
   }
   if (kind === 'append' && value.length === 3) return entry(value[2])
-  if (kind !== 'read' || value.length !== 5 || !Array.isArray(value[2]) || value[2].length > 128 ||
-      !(value[3] instanceof Uint8Array) || typeof value[4] !== 'boolean') throw new Error('MEMBERSHIP_RESPONSE_INVALID')
-  const evidence = decodeOrderingEvidence(value[3])
-  if (evidence.kind !== 'prefix-certificate') throw new Error('MEMBERSHIP_RESPONSE_INVALID')
-  return { entries: value[2].map(entry), certificate: evidence.certificate, hasMore: value[4] }
+  if (kind !== 'read' || value.length !== 3 || !(value[2] instanceof Uint8Array)) throw new Error('MEMBERSHIP_RESPONSE_INVALID')
+  return decodeControlPage(value[2])
 }
 
 /** Default Cloudflare administrator route to a separately pinned native ordering authority. */
@@ -115,38 +109,36 @@ export function createMembershipLedgerClient(options: {
   readonly identity: Ed25519KeyPair
   readonly fetch?: typeof globalThis.fetch
   readonly now?: () => number
+  /** One deadline covers signing, response headers and the complete bounded body. */
+  readonly timeoutMs?: number
 }): MembershipLedger {
   const descriptor = structuredClone(options.descriptor), identity = { ...options.identity, publicKeyBytes: options.identity.publicKeyBytes.slice() }
   const history = coordinated(descriptor), url = new URL(options.url), fetcher = options.fetch ?? globalThis.fetch
   if (url.username || url.password || url.hash || !(url.protocol === 'https:' || url.protocol === 'http:' &&
       ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) throw new Error('MEMBERSHIP_URL_INVALID')
+  const timeoutMs = ioTimeout(options.timeoutMs)
   const call = async (request: MembershipLedgerRequest, signal?: AbortSignal): Promise<Uint8Array> => {
-    const body = await signMembershipLedgerRequest({ descriptor, identity, request, now: options.now?.() ?? Date.now() })
-    const response = await fetcher(url, { method: 'POST', body: body.slice().buffer,
-      headers: { 'Content-Type': 'application/cbor' }, cache: 'no-store', ...(signal === undefined ? {} : { signal }) })
-    if (!response.ok) throw new Error(`MEMBERSHIP_LEDGER_HTTP_${response.status}`)
-    if (response.body === null) throw new Error('MEMBERSHIP_RESPONSE_INVALID')
-    const reader = response.body.getReader(), chunks: Uint8Array[] = []
-    let length = 0
+    const lifetime = ioLifetime(signal, timeoutMs)
     try {
-      for (;;) {
-        const item = await reader.read()
-        if (item.done) break
-        length += item.value.length
-        if (length > MAX_MEMBERSHIP_LEDGER_BYTES) throw new Error('MEMBERSHIP_RESPONSE_TOO_LARGE')
-        chunks.push(item.value)
+      lifetime.signal.throwIfAborted()
+      const body = await interruptible(signMembershipLedgerRequest({ descriptor, identity, request, now: options.now?.() ?? Date.now() }), lifetime.signal)
+      const fetching = fetcher(url, { method: 'POST', body: body.slice().buffer,
+        headers: { 'Content-Type': 'application/cbor' }, cache: 'no-store', redirect: 'error', credentials: 'omit', signal: lifetime.signal })
+      void fetching.then(response => { if (lifetime.signal.aborted) void response.body?.cancel().catch(() => undefined) }, () => undefined)
+      const response = await interruptible(fetching, lifetime.signal)
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => undefined)
+        throw new Error(`MEMBERSHIP_LEDGER_HTTP_${response.status}`)
       }
-    } finally { await reader.cancel().catch(() => undefined); reader.releaseLock() }
-    const bytes = new Uint8Array(length)
-    let offset = 0
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length }
-    return bytes
+      try { return await readMembershipLedgerBody(response, { signal: lifetime.signal, timeoutMs }) }
+      catch (error) { if (error instanceof RangeError) throw new Error('MEMBERSHIP_RESPONSE_TOO_LARGE', { cause: error }); throw error }
+    } finally { lifetime.close() }
   }
   return {
     async read(input) {
       const page = decodeMembershipLedgerResponse(await call({ kind: 'read', after: input.after, limit: input.limit }, input.signal), 'read')
       if (page.entries.length > input.limit) throw new Error('MEMBERSHIP_RANGE_TOO_LARGE')
-      await verifyPrefixCertificate(page.certificate, history)
+      await verifyControlCheckpoint(page, history)
       return page
     },
     async append(recordBytes, input = {}) {
@@ -157,6 +149,58 @@ export function createMembershipLedgerClient(options: {
       return entry
     },
   }
+}
+
+/** Fixed allocation, fragment quota and deadline shared by request/response adapters. */
+export async function readMembershipLedgerBody(message: Request | Response, options: {
+  readonly signal?: AbortSignal
+  readonly timeoutMs?: number
+} = {}): Promise<Uint8Array> {
+  const lifetime = ioLifetime(options.signal ?? ('signal' in message ? message.signal : undefined), ioTimeout(options.timeoutMs))
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  try {
+    lifetime.signal.throwIfAborted()
+    const declared = message.headers.get('Content-Length')
+    if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > MAX_MEMBERSHIP_LEDGER_BYTES)) throw new RangeError('MEMBERSHIP_BODY_TOO_LARGE')
+    if (message.body === null) throw new TypeError('MEMBERSHIP_BODY_REQUIRED')
+    reader = message.body.getReader()
+    const bytes = new Uint8Array(MAX_MEMBERSHIP_LEDGER_BYTES)
+    let length = 0, fragments = 0
+    for (;;) {
+      const item = await interruptible(reader.read(), lifetime.signal)
+      // Cancellation can make read() return done. It is never a complete body.
+      lifetime.signal.throwIfAborted()
+      if (item.done) return bytes.slice(0, length)
+      if (++fragments > MAX_MEMBERSHIP_BODY_FRAGMENTS || length + item.value.length > bytes.length) throw new RangeError('MEMBERSHIP_BODY_TOO_LARGE')
+      bytes.set(item.value, length); length += item.value.length
+    }
+  } finally {
+    lifetime.close()
+    // A custom stream's cancellation promise is not allowed to retain a host
+    // operation after its deadline. Pending reads already have rejection handlers.
+    if (reader !== undefined) { void reader.cancel().catch(() => undefined); reader.releaseLock() }
+    else void message.body?.cancel().catch(() => undefined)
+  }
+}
+
+function ioTimeout(value: number = MEMBERSHIP_IO_TIMEOUT_MS): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 120_000) throw new Error('MEMBERSHIP_TIMEOUT_INVALID')
+  return value
+}
+function ioLifetime(external: AbortSignal | undefined, timeoutMs: number) {
+  const controller = new AbortController(), abort = (): void => controller.abort(external?.reason)
+  const timer = setTimeout(() => controller.abort(new Error('MEMBERSHIP_IO_TIMEOUT')), timeoutMs)
+  external?.addEventListener('abort', abort, { once: true })
+  if (external?.aborted === true) abort()
+  return { signal: controller.signal, close() { clearTimeout(timer); external?.removeEventListener('abort', abort) } }
+}
+function interruptible<T>(value: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) { void value.catch(() => undefined); return Promise.reject(signal.reason) }
+  return new Promise((resolve, reject) => {
+    const abort = (): void => { reject(signal.reason) }
+    signal.addEventListener('abort', abort, { once: true })
+    void value.then(resolve, reject).finally(() => { signal.removeEventListener('abort', abort) })
+  })
 }
 
 function coordinated(descriptor: EnrollmentDescriptor) {

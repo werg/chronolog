@@ -2,7 +2,7 @@
 import { beforeAll, expect, inject, it } from 'vitest';
 import { createTestPage, initializeTestService } from '@tendriller/engine/testing';
 import { createMembersClient } from '@tendriller/core/members';
-import { base64UrlToBytes, bytesToBase64Url, decodeMembershipLedgerResponse, decodeSignedGenesis, isFinalityClosureRecord } from './membership-api.mjs';
+import { base64UrlToBytes, bytesToBase64Url, decodeMembershipLedgerResponse, decodeSignedGenesis } from './membership-api.mjs';
 
 beforeAll(() => initializeTestService(inject('d1Migrations')));
 const fixtureBase = inject('fixtureBase');
@@ -38,7 +38,7 @@ async function history(client) {
     const page = decodeMembershipLedgerResponse(bytes, 'read');
     pages.push(bytesToBase64Url(bytes));
     if (!page.hasMore) return pages;
-    const next = page.entries.at(-1)?.position;
+    const next = page.entries.at(-1)?.index;
     if (next === undefined || next <= after) throw new Error('Membership history made no progress');
     after = next;
   }
@@ -112,8 +112,9 @@ it('administers an independently ordered native/browser group through the actual
   const traffic = (await fixture('snapshot')).traffic;
   expect((await fixture('snapshot')).schemaRoles).toEqual({ nativeSchemaAdministrators: 1, membershipRootGroupMembers: 0 });
   expect(traffic.applicationEnvelopeBytesToAdministrator).toBe(0);
+  expect(traffic.candidateDescriptorBytes).toBe(0);
   expect(traffic.unexpectedAdministratorRequests).toBe(0);
-  await passed('large SQL/event envelopes remain on full peers while descriptor traffic grows with candidate count', { small, large, more, traffic });
+  await passed('application descriptors and envelopes remain on full peers while participant evidence contains only controls', { small, large, more, traffic });
 
   await phase('first device authorization and lost approval recovery');
   const prepared = await device({ method: 'prepare', name: 'thin-membership-device' });
@@ -155,8 +156,9 @@ it('administers an independently ordered native/browser group through the actual
   const activated = await device({ method: 'history', pages: await history(applicantMembers) });
   expect(activated.grants.filter(grant => grant.active).map(grant => grant.role).sort()).toEqual(['reader', 'writer']);
   expect(activated.availableEpochs.length).toBeGreaterThan(0);
-  expect(activated.applicationBlockedOnPayload).toBe(true);
-  // Header/control readiness cannot stand in for the missing prior SQL bodies.
+  expect(activated.applicationBlockedOnPayload).toBe(false);
+  expect(activated.finalThrough).toBe(0);
+  // Compact governance readiness cannot stand in for any application history.
   expect(activated.enrollment.state).not.toBe('ready');
   await device({ method: 'connect' });
   const joined = await until(() => device({ method: 'sync' }), value => value.enrollment.state === 'ready', 'browser enrollment did not become ready');
@@ -226,9 +228,8 @@ it('administers an independently ordered native/browser group through the actual
   await expect(applicantMembers.history({ after: 0 })).rejects.toMatchObject({ status: 403 });
   const entriesAfterRestore = entries(await history(owner));
   expect(entriesAfterRestore.slice(0, entriesBeforeRestore.length)).toEqual(entriesBeforeRestore);
-  expect(entriesAfterRestore[nativeBeforeRestore.position - 1]?.root).toBe(nativeBeforeRestore.root);
   const newReceipts = entriesAfterRestore.slice(entriesBeforeRestore.length);
-  expect(newReceipts.every(entry => isFinalityClosureRecord(entry.bytes))).toBe(true);
+  expect(newReceipts).toEqual([]);
   const nativeAfterRestore = (await fixture('snapshot')).head;
   expect(nativeAfterRestore.position).toBeGreaterThanOrEqual(nativeBeforeRestore.position);
   await passed('reopened actual Cloudflare metadata retains root, certified descriptor prefix, revoked roster, epoch decisions and exact action receipts without new application or control entries',
@@ -259,6 +260,9 @@ it('administers an independently ordered native/browser group through the actual
   await phase('final RTC and administrative byte boundaries');
   const final = await fixture('snapshot');
   expect(final.traffic.applicationEnvelopeBytesToAdministrator).toBe(0);
+  expect(final.traffic.candidateDescriptorBytes).toBe(0);
+  expect(final.traffic.inlineControlDescriptorBytes).toBeGreaterThan(0);
+  expect(final.traffic.closureRecordBytes).toBeGreaterThan(0);
   expect(final.traffic.unexpectedAdministratorRequests).toBe(0);
   expect(final.traffic.peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes);
   expect(final.rtc.transport).toBe('webrtc'); expect(final.rtc.accepted).toBe(3);

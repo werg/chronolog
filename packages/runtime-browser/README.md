@@ -5,8 +5,9 @@ This package runs a complete Chronolog peer in one dedicated browser Worker. The
 The same protocol, membership, admission, history policy, materializer, SQL restrictions, enrollment service, and RPC contract run in native and browser peers. `openBrowserPeer` supplies the browser storage and engine adapters. A group chooses its peer or coordinated history policy in its signed genesis descriptor; selecting a transport does not change that policy.
 
 In the default coordinated composition, a portable Cloudflare membership
-administrator verifies the same complete small descriptor history as full peers;
-a native finality service proves inclusion and closes author time. Every browser
+administrator verifies compact controls committed by the native closure;
+a native finality service proves inclusion and closes author time. Full browser
+replicas independently recompute that control projection from complete receipts. Every browser
 sorts application proposals itself with the shared chronological comparator.
 Application envelopes are detached and fetched
 only through reader-authorized peers. A SQL-free events peer still receives and
@@ -211,3 +212,13 @@ link. The [event Worker fixture](../../test/browser/event-worker.ts) shows a ful
 OPFS lifecycle with authenticated native framing. Durable application consumers
 save their processed `scannedThrough` cursor together with reducer state; RPC
 delivery acknowledgment alone never commits application progress.
+
+## Compact membership bootstrap
+
+A newly enrolled Worker calls `peer.governed.ingestMembership(page)` with the
+compact host pages. The owning Worker verifies the signed cumulative control
+root, original control cutoffs and covering certificate, then activates grants
+and unwraps keys. No application receipt is imported by this operation, so
+enrollment remains pending until authenticated peers provide the full original
+ledger and bodies. The proof is durable across Worker restart. See
+[compact membership proofs](../../docs/membership-control-proofs.md).

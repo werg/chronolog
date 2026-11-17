@@ -29,6 +29,7 @@ export function createNativePeerConnection(configuration: RTCConfiguration = {},
     get localDescription() { return peer.localDescription },
     get iceGatheringState() { return peer.iceGatheringState },
     get connectionState() { return peer.connectionState },
+    getStats: () => peer.getStats(),
     createDataChannel: (label, options) => wrap(peer.createDataChannel(label, options)),
     createOffer: () => peer.createOffer(), createAnswer: () => peer.createAnswer(),
     async setLocalDescription(description) {

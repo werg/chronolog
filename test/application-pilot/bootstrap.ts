@@ -4,7 +4,7 @@ import type { RpcTransport, RpcCallOptions, UnaryRpcMethod, UnaryRequest, UnaryR
 import { WorkerRpcTransport } from '@chronolog/runtime-browser'
 import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
 import type { EphemeralSignal } from '@chronolog/agent-service/signals'
-import type { WebRtcSession } from '@chronolog/transport-webrtc'
+import { supervisePeerSession, type WebRtcSession } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
 import type { PeerIntroductionModule, PilotBootstrap, PilotWindow, PublicKernel } from './contract.js'
@@ -16,12 +16,19 @@ const name = `application-pilot-${device}`
 // Terminating a previous page's Worker releases its OPFS lease asynchronously.
 await navigator.locks.request(`chronolog:${name}`, { mode: 'exclusive', signal: AbortSignal.timeout(30_000) }, () => undefined)
 const worker = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' })
+const lifetime = new AbortController()
 const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>()
 const connectionErrors: string[] = []
-let sequence = 0
+let supervisor: ReturnType<typeof supervisePeerSession<WebRtcSession>> | undefined
+let sequence = 0, connectionSequence = 0, activeConnection = 0
 worker.addEventListener('message', (event: MessageEvent) => {
-  const response = event.data as { pilot?: string; id?: number; value?: unknown; error?: string }
-  if (response.pilot === 'connection-error') { connectionErrors.push(response.error ?? 'Unknown connection failure'); return }
+  const response = event.data as { pilot?: string; id?: number; connectionId?: number; value?: unknown; error?: string }
+  if (response.pilot === 'connection-error') {
+    if (response.connectionId !== activeConnection) return
+    connectionErrors.push(response.error ?? 'Unknown connection failure')
+    void supervisor?.session?.close()
+    return
+  }
   if (response.pilot !== 'response' || response.id === undefined) return
   const waiter = pending.get(response.id)
   if (waiter === undefined) return
@@ -29,12 +36,22 @@ worker.addEventListener('message', (event: MessageEvent) => {
   if (response.error === undefined) waiter.resolve(response.value)
   else waiter.reject(new Error(response.error))
 })
-const command = (pilot: string, fields: Record<string, unknown> = {}, timeoutMs = 30_000, transfer: Transferable[] = []): Promise<unknown> => {
+worker.addEventListener('error', event => {
+  const error = new Error(event.message)
+  lifetime.abort(error)
+  for (const waiter of pending.values()) waiter.reject(error)
+  pending.clear()
+})
+const command = (pilot: string, fields: Record<string, unknown> = {}, timeoutMs = 30_000,
+  transfer: Transferable[] = [], signal?: AbortSignal): Promise<unknown> => {
+  signal?.throwIfAborted()
   const id = ++sequence
   return new Promise((resolve, reject) => {
-    const timer = timeoutMs === 0 ? undefined : setTimeout(() => { pending.delete(id); reject(new Error(`PILOT_WORKER_TIMEOUT: ${pilot}`)) }, timeoutMs)
-    const clear = () => { if (timer !== undefined) clearTimeout(timer) }
+    const abort = () => { pending.delete(id); clear(); reject(signal?.reason) }
+    const timer = timeoutMs === 0 ? undefined : setTimeout(() => { pending.delete(id); clear(); reject(new Error(`PILOT_WORKER_TIMEOUT: ${pilot}`)) }, timeoutMs)
+    const clear = () => { if (timer !== undefined) clearTimeout(timer); signal?.removeEventListener('abort', abort) }
     pending.set(id, { resolve(value) { clear(); resolve(value) }, reject(error) { clear(); reject(error) } })
+    signal?.addEventListener('abort', abort, { once: true })
     try { worker.postMessage({ pilot, id, ...fields }, transfer) }
     catch (error) { clear(); pending.delete(id); reject(error) }
   })
@@ -56,28 +73,31 @@ target.tendril = kernel.startRuntime({ id: 'peer-application-pilot', base: boots
   application: { kind: 'peer', id: bootstrap.applicationId }, features: { push: false, vapid: null, shared_by: '', speech: null } })
 // This bundle is built from the exact supplied contrib recipe, not a pilot copy.
 const { introducePeerWorker } = await import(new URL('./introduce-peer-worker.mjs', import.meta.url).href) as PeerIntroductionModule
-let session: WebRtcSession | undefined
 const sessions: WebRtcSession[] = []
 async function connect(): Promise<void> {
-  if (session !== undefined) return
-  let attached: Promise<unknown> | undefined
-  const introduced = await introducePeerWorker({ peers: target.tendril.peers, channel: crypto.randomUUID(), peerId: device!,
-    configuration: { iceServers: [] }, handoff(channel) {
-      // Transfer in the creation callback before any awaited work. The Worker
-      // alone frames and authenticates the channel, then opens feed replication.
-      // ICE, framing HELLO and peer authentication have separate bounded phases.
-      // This command ends at authenticated attachment, before SQL/WASM replay.
-      attached = command('channel', { channel }, 60_000, [channel as RTCDataChannel])
-      void attached.catch(() => undefined)
+  supervisor ??= supervisePeerSession({ signal: lifetime.signal, readiness: 'authenticated',
+    retry: { initialDelayMs: 250, maxDelayMs: 2_000, maxAttempts: 4 }, async connect(signal) {
+      let attached: Promise<unknown> | undefined
+      const introduced = await introducePeerWorker({ peers: target.tendril.peers, channel: crypto.randomUUID(), peerId: device!,
+        signal, configuration: { iceServers: [] }, handoff(channel) {
+          // Transfer synchronously; only the Worker owns keys, frames and replay.
+          activeConnection = ++connectionSequence
+          attached = command('channel', { channel, connectionId: activeConnection }, 60_000, [channel as RTCDataChannel], signal)
+          void attached.catch(() => undefined)
+        } })
+      sessions.push(introduced)
+      try { await attached; signal.throwIfAborted(); return introduced }
+      catch (error) { await introduced.close(); throw error }
     } })
-  sessions.push(introduced)
-  try { await attached; session = introduced }
-  catch (error) { await introduced.close(); throw error }
+  await supervisor.waitForSession()
 }
 async function disconnect(): Promise<void> {
-  const previous = session
-  session = undefined
-  try { await command('disconnect') } finally { await previous?.close() }
+  const previous = supervisor
+  supervisor = undefined
+  activeConnection = ++connectionSequence
+  // close() cancels the attempt immediately, before a late Worker reply can win.
+  const stopping = previous?.close()
+  try { await command('disconnect') } finally { await stopping }
 }
 await connect()
 // The invitation and schema-dependent application calls need the initial state.
@@ -145,8 +165,9 @@ target.applicationPilot = {
     if (closed) return
     closed = true
     target.applicationPilot.releaseSubmission()
-    try { await client.close() } finally { await session?.close(); worker.terminate() }
+    lifetime.abort(new Error('PILOT_OWNER_CLOSED'))
+    try { await client.close() } finally { await supervisor?.close(); worker.terminate() }
     await navigator.locks.request(`chronolog:${name}`, { mode: 'exclusive' }, () => undefined)
   },
 }
-addEventListener('pagehide', () => { worker.terminate(); void session?.close() })
+addEventListener('pagehide', () => { lifetime.abort(new Error('PILOT_OWNER_CLOSED')); worker.terminate(); void supervisor?.close() })

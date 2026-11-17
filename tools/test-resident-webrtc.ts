@@ -50,7 +50,8 @@ const recipe = join(contrib, 'cookbooks/run-a-peer-application/snippets/serve-re
 const bundlePath = join(output, 'serve-resident-webrtc.mjs')
 const bundle = await build({ entryPoints: [recipe], outfile: bundlePath, bundle: true, platform: 'node', format: 'esm', target: 'node22', metafile: true,
   banner: { js: 'import { createRequire as bundledCreateRequire } from "node:module"; const require = bundledCreateRequire(import.meta.url);' },
-  alias: Object.fromEntries(['@chronolog/transport-webrtc', '@chronolog/transport-webrtc/native'].map(name => [name, fileURLToPath(import.meta.resolve(name))])) })
+  alias: Object.fromEntries(['@chronolog/transport-webrtc', '@chronolog/transport-webrtc/native', '@chronolog/transport-webrtc/resident']
+    .map(name => [name, fileURLToPath(import.meta.resolve(name))])) })
 await writeFile(join(output, 'bundle.json'), JSON.stringify(bundle.metafile, null, 2) + '\n')
 const { createResidentWebRtcTask } = await import(pathToFileURL(bundlePath).href) as ResidentModule
 const report = { format: 'chronolog-resident-webrtc-qualification/v1', passed: false,

@@ -121,13 +121,14 @@ another connection cannot repeat its SQL or effective event results. The node
 supplies canonical order to the materializer instead of allowing it to sort a
 second time.
 
-The portable `MembershipAdministrator` verifies every certified descriptor and
-inline control operation in that same history. It has no application-payload
+The portable `MembershipAdministrator` verifies the signed cumulative control
+projection and inline governance operations without receiving application descriptors. It has no application-payload
 fetch port or SQL materializer. Issuing a signed revision is separate from
 verifying its effective activation at a certified position; enrollment readiness
 also tracks keys, authorized connectivity and application catch-up. Host login,
 roster issuance, fixed ordering authority and application schema ownership remain
-separate roles. The [typed ledger](typed-ledger-records.md) specifies these
+separate roles. The [compact control proof](membership-control-proofs.md) and
+[typed ledger](typed-ledger-records.md) specify these
 boundaries and unavailable-versus-invalid input handling.
 
 The [governed peer integration](../test/governed-peer.e2e.test.ts) exercises

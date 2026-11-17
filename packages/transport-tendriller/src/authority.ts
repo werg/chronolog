@@ -3,7 +3,7 @@ import {
   createPrefixAuthority, decodeOrderingEvidence, encodeOrderingEvidence,
   type CoordinatedHistoryConfiguration, type OrderedRecordEntry, type OrderedRecordHead, type PrefixCertificate,
 } from '@chronolog/node-core/history'
-import { createFinalityClosureRecord, evaluateFinalitySnapshot, type FinalitySnapshot } from '@chronolog/node-core/finality'
+import { createFinalityClosureRecord, evaluateFinalitySnapshot, extendFinalityControlCommitment, type SignedInclusionSnapshot } from '@chronolog/node-core/finality'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
 
 export interface AuthorityRequest {
@@ -85,7 +85,7 @@ export function withTendrillerAuthority<Env, Context, HostRequest extends Author
   if (!Number.isSafeInteger(cutoffLagMs) || cutoffLagMs < 0 ||
       !Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0) throw new Error('AUTHORITY_CLOCK_CONFIGURATION_INVALID')
   let committedHead: OrderedRecordHead | null = null
-  let cachedSnapshot: FinalitySnapshot | null = null
+  let cachedSnapshot: SignedInclusionSnapshot | null = null
   const authority = createPrefixAuthority({
     configuration, identity,
     readHead: async () => {
@@ -129,7 +129,7 @@ export function withTendrillerAuthority<Env, Context, HostRequest extends Author
         const requestedCutoff = uncovered || cutoff < coveredDemand ? cutoff : coveredDemand
         const closedThroughMs = requestedCutoff > snapshot.closedThroughMs ? requestedCutoff : snapshot.closedThroughMs
         if (closedThroughMs >= 0n && (closedThroughMs > snapshot.closedThroughMs || uncovered)) {
-          const marker = await createFinalityClosureRecord({ configuration, identity, includedHead: head, closedThroughMs })
+          const marker = await createFinalityClosureRecord({ configuration, identity, includedHead: head, closedThroughMs, control: await extendFinalityControlCommitment(snapshot, closedThroughMs) })
           try {
             // The generic conditional append prevents a concurrent submission
             // from separating this signed closure from its exact predecessor.

@@ -70,9 +70,13 @@ waiting for ICE/DTLS or the Chronolog handshake; waiting for connection completi
 before answering would deadlock a cold browser. HTTP credentials are omitted,
 redirects are rejected, and admission headers are explicit. Endpoint URLs require
 HTTPS without credentials, query or fragment; HTTP is restricted to loopback
-qualification. The contrib cookbook provides complete `connect-resident-worker`
-and `serve-resident-webrtc` recipes, including the actual native HTTPS resident
-task and cleanup when negotiation cannot start.
+qualification. The public Node-only `@chronolog/transport-webrtc/resident`
+entrypoint exports `createWebRtcHttpsListener({ endpoint, listen, tls,
+...introductionOptions })`. Its `run(signal)` owns the HTTPS listener and
+accepted peers until cancellation; deployment supplies TLS credentials, bind
+address, allowed origins and admission. The contrib cookbook supplies application
+composition around this transport, including a resident task and synchronous
+Worker handoff.
 
 The handler defaults to eight pending introductions, 32 total pending/live
 connections and a 30-second deadline covering introduction and authentication.
@@ -120,6 +124,81 @@ is separate from the page host and does not change Chronolog authorization or
 finality. The direct-connect success rate depends on the deployed network and
 must be measured. If a connection fails, create a fresh signaling session; this
 transport does not silently switch to an application-data host relay.
+
+## Owning reconnection
+
+`supervisePeerSession` owns a connector's attempt/session lifetime and explicit
+retry policy. An example for a native transport client is:
+
+```ts
+import { createHttpWebRtcSignaling, openWebRtcConnection, supervisePeerSession } from '@chronolog/transport-webrtc'
+import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
+
+const connections = supervisePeerSession({
+  readiness: 'transport',
+  retry: { initialDelayMs: 500, maxDelayMs: 15_000, maxAttempts: 8, jitter: 0.2, resetAfterMs: 30_000 },
+  signal: applicationLifetime,
+  async connect(signal) {
+    const connection = await openWebRtcConnection({
+      role: 'offerer', signal, configuration: { iceServers },
+      signaling: createHttpWebRtcSignaling({ url: residentIntroductionUrl, headers: introductionAdmissionHeaders, signal }),
+      createPeerConnection: configuration => createNativePeerConnection(configuration),
+    })
+    return { signal: connection.session.signal, transport: connection, close: () => connection.close() }
+  },
+})
+await connections.ready
+// Later callers need current readiness, not the already resolved first session.
+const current = await connections.waitForSession({ signal: operationLifetime })
+console.log(await current.transport.session.getRoute())
+// The application lifetime closes the attempt and current session together.
+await connections.close()
+```
+
+The connector receives a fresh cancellation signal and returns a session with
+`signal` and `close()`. It must honor cancellation and close partially acquired
+resources on failure. The supervisor fences a cancelled attempt and closes a
+late successful result, even if that connector ignored cancellation. Session
+loss aborts the attempt signal before asynchronous cleanup, so a stale Worker
+attachment cannot become the next session. Only one attempt/session is owned at
+a time. State observers cannot interrupt cleanup.
+
+The states are `connecting`, `connected`, `waiting` and `stopped`, with an
+attempt count, error and scheduled retry time. The first successful session
+resolves `ready`; `waitForSession` returns the current live session or waits for
+the next one. A waiter's cancellation does not cancel the shared connection.
+`completion` rejects on retry exhaustion. `close()` cancels a pending retry or
+dial; replacing the supervisor is an explicit manual retry.
+
+A healthy session has no supervisor timer, heartbeat, host subscription or
+discovery request. Only failures schedule bounded exponential retry with jitter.
+Brief connections consume the existing attempt budget; it resets only after
+`resetAfterMs` of connected time, measured when a session ends. This prevents a
+flapping resident from creating an unbounded stream of introductions. The
+policy should target the configured resident directly; it does not turn the
+coordinated Tendriller rendezvous into a resident polling service.
+
+Readiness is explicit. `transport` means negotiation completed. For
+`authenticated`, the connector must await its native peer or owning Worker's
+Chronolog authentication and attachment before returning. In a browser it still
+transfers the untouched data channel synchronously. Neither readiness level
+claims that durable history replay, SQL materialization or finality has caught
+up; those belong to the replica's progress APIs.
+
+## Observing the actual route
+
+`WebRtcSession.getRoute()` observes the selected ICE pair through browser or
+native WebRTC statistics. It returns `route: 'direct' | 'relay' | 'unknown'` and
+the local/remote candidate types, without exposing network addresses. A selected
+`relay` candidate on either endpoint means TURN is carrying traffic. Both known
+nonrelay candidates establish a direct route. Missing, ambiguous or unavailable
+selected-pair evidence remains `unknown`; neither a successful handshake nor
+the absence of configured TURN is used to invent a direct-route result.
+
+This is an on-demand observation, with no background statistics poll. Framing
+byte counters still measure logical payload bytes, excluding ICE, SCTP, DTLS,
+IP and relay billing overhead. Route observations and payload counters should
+be reported separately from signaling counts and provider billing.
 
 ## Browser ownership
 
@@ -197,14 +276,18 @@ separate authenticated-session handshake deadline.
 `packages/transport-webrtc/src/channel.test.ts` checks fragmentation, exact bytes,
 credit/backpressure, invalid frames and close behavior. `native.test.ts` connects
 two real Werift implementations over loopback ICE/DTLS/SCTP and exchanges large
-frames after signaling closes. `http.test.ts` checks admission, origins, body and
+frames after signaling closes and verifies their measured direct route.
+`supervisor.test.ts` checks bounded retry, flapping sessions, independent waiter
+cancellation, immediate attempt fencing and late-result disposal. `route.test.ts`
+covers selected direct/relay pairs and incomplete observations. `http.test.ts` checks admission, origins, body and
 concurrency limits, stalled request cancellation, native cleanup, and a real
 HTTP cold introduction followed by RTC exchange after its listener stops.
 
 ```sh
 pnpm exec vitest run packages/transport-webrtc/src
 CHRONOLOG_CHROMIUM_EXECUTABLE=/path/to/chromium \
-  node --import tsx tools/test-browser-webrtc.ts --output artifacts/browser-webrtc
+  node --import tsx tools/test-browser-webrtc.ts \
+  --contrib /checkout/tendriller-contrib --output artifacts/browser-webrtc
 ```
 
 The browser gate runs a real native governed finality service and a Chromium

@@ -330,6 +330,31 @@ describe('native fixed authority', () => {
     } finally { stopped.abort(); await running }
   })
 
+  it('does not advance a closure clock while asynchronous verification blocks queued appenders', async () => {
+    const f = await metadataFixture()
+    let advanceDuringRead = false
+    const store: DurableOperationStore = {
+      get: async key => {
+        if (advanceDuringRead && key === f.logKey) { advanceDuringRead = false; f.clock.now = 5_000 }
+        return f.store.get(key)
+      },
+      put: (key, bytes) => f.store.put(key, bytes),
+    }
+    const authority = await NativeAuthority.open({ ...f, store })
+    await authority.append(envelope('previously-included'))
+    advanceDuringRead = true
+    const closing = authority.certify()
+    const pending = authority.append(envelope('published-while-closure-was-verifying'))
+    await closing
+    const entry = await pending
+    const proof = await evaluateFinalitySnapshot(f.configuration, (await authority.read()).entries)
+    expect(proof.closedThroughMs).toBe(1_000n)
+    expect(proof.records.find(record => record.entry.position === entry.position)!.admissionFloorMs).toBe(1_000n)
+    // A later closure can use the newer clock, after that queued receipt exists.
+    await authority.certify()
+    expect((await evaluateFinalitySnapshot(f.configuration, (await authority.read()).entries)).closedThroughMs).toBe(5_000n)
+  })
+
   it('does not close additional author time merely to replay exact retained submissions', async () => {
     const f = await fixture(), authority = await NativeAuthority.open({ ...f,
       now: () => f.clock.now++, closureIntervalMs: 60_000 })

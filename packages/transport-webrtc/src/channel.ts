@@ -23,6 +23,8 @@ export interface DataChannelStats {
 }
 export interface DataChannelConnection extends FramedPeerConnection {
   readonly ready: Promise<void>
+  /** Ends on framing failure or channel closure, even if ICE stays connected. */
+  readonly signal: AbortSignal
   readonly stats: DataChannelStats
 }
 
@@ -55,6 +57,7 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
   let queuedSendBytes = 0, queuedSendFrames = 0, reservedBytes = 0, reservedFrames = 0
   let assembling: Uint8Array | null = null, received = 0
   let sentBytes = 0, receivedBytes = 0, sentPackets = 0, receivedPackets = 0
+  const lifetime = new AbortController()
   const queue: Uint8Array[] = [], waiters = new Set<() => void>()
   let tail: Promise<void> = Promise.resolve()
   let helloTimer: ReturnType<typeof setTimeout> | undefined
@@ -72,6 +75,7 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
     rejectReady(error ?? new Error('WEBRTC_CONNECTION_CLOSED'))
     for (const [type, listener] of listeners) channel.removeEventListener(type, listener)
     queue.length = 0; assembling = null; reservedBytes = 0; reservedFrames = 0
+    lifetime.abort(error ?? new Error('WEBRTC_CONNECTION_CLOSED'))
     channel.close(); wake()
   }
   const fail = (error: unknown): void => stop(error instanceof Error ? error : new Error(String(error)))
@@ -135,7 +139,7 @@ export function frameRtcDataChannel(channel: RtcDataChannel, options: {
   if (channel.readyState === 'open') queueMicrotask(open)
   else if (channel.readyState !== 'connecting') stop(new Error('WEBRTC_CONNECTION_CLOSED'))
   return {
-    ready,
+    ready, signal: lifetime.signal,
     get stats() { return { sentBytes, receivedBytes, sentPackets, receivedPackets, queuedSendBytes,
       queuedReceiveBytes: reservedBytes, queuedReceiveFrames: reservedFrames } },
     send(input) {

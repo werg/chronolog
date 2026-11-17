@@ -8,8 +8,7 @@ import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities
 import { ChronologClient } from '@chronolog/client'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import { createEnrollmentService, createGovernedNode } from '@chronolog/node-core'
-import { encodeOrderingEvidence } from '@chronolog/node-core/history'
-import { LedgerRecordError } from '@chronolog/node-core/ledger'
+import { LedgerRecordError, decodeLedgerRecord } from '@chronolog/node-core/ledger'
 import {
   MembershipAdministrator, createMembershipLedgerClient, encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity,
   prepareEnrollmentRequest, provisionMembership, verifyEnrollmentApproval,
@@ -28,8 +27,9 @@ const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 describe('thin membership qualification native boundary', () => {
-  // Large-body replay, lost-reply recovery and two revocations take about 64 s
-  // under V8 coverage; retain headroom for shared CI runners without shortcuts.
+  // Large-body replay and two real replica revocations can exceed 120 s on
+  // shared runners. Individual publication deadlines remain bounded at 20 s;
+  // allow the complete sequence to finish without dropping any qualification.
   it('keeps large SQL payloads off the administrator and recovers a lost enrollment append through the real native handler', async () => {
     const started = performance.now()
     let phase = 'create native fixture'
@@ -84,12 +84,12 @@ describe('thin membership qualification native boundary', () => {
     // the application data itself must not travel with it.
     expect(Math.abs(large.descriptorBytes - small.descriptorBytes)).toBeLessThanOrEqual(16)
     const beforeJoin = native.traffic()
-    expect(beforeJoin.candidateDescriptorBytes).toBeGreaterThan(0)
+    expect(beforeJoin.candidateDescriptorBytes).toBe(0)
     expect(beforeJoin.inlineControlEnvelopeBytes).toBeGreaterThan(0)
     expect(beforeJoin.applicationEnvelopeBytesToAdministrator).toBe(0)
     expect(beforeJoin.unexpectedAdministratorRequests).toBe(0)
-    expect(administrator.progress.verifiedThrough).toBeGreaterThanOrEqual(beforeJoinSnapshot.head.position)
-    expect(administrator.read({ after: beforeJoinSnapshot.head.position - 1, limit: 1 }).entries[0]?.root).toBe(beforeJoinSnapshot.head.root)
+    expect(administrator.progress.checkpointThrough).toBeGreaterThanOrEqual(beforeJoinSnapshot.head.position)
+    expect(administrator.read({ after: 0 }).entries.every(control => decodeLedgerRecord(control.entry.bytes).kind !== 'candidate')).toBe(true)
     expect(beforeJoinSnapshot.schemaRoles).toEqual({ nativeSchemaAdministrators: 1, membershipRootGroupMembers: 0 })
 
     const deviceStore = new NativeAgentStore(join(directory, 'device.sqlite'))
@@ -149,10 +149,9 @@ describe('thin membership qualification native boundary', () => {
       let after = 0
       for (;;) {
         const page = administrator.read({ after, limit: 128 })
-        for (const entry of page.entries) await transport.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
-        await transport.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: page.certificate }))
+        await replica.ingestMembership(page)
         if (!page.hasMore) break
-        after = page.entries.at(-1)!.position
+        after = page.entries.at(-1)!.index
       }
       observe(`${label}: local replay`)
       try { await replica.node.waitForIdle() }
@@ -166,7 +165,8 @@ describe('thin membership qualification native boundary', () => {
       equalBytes(capability.grant.signingPublicKey, device.signing.publicKeyBytes) && isCapabilityActive(capability, replica.activeSnapshot.revision))
       .map(capability => capability.grant.role).sort()).toEqual(['reader', 'writer'])
     expect(replica.governance.cipherRing.epochs().length).toBeGreaterThan(0)
-    expect(replica.node.finalThrough).toBeLessThan(administrator.progress.verifiedThrough)
+    expect(replica.node.finalThrough).toBe(0)
+    expect((await transport.status()).records).toBe(0)
     expect((await client.enrollment.getStatus(request.request.requestId)).state).not.toBe('ready')
     const connect = async () => {
       const label = phase
@@ -218,6 +218,9 @@ describe('thin membership qualification native boundary', () => {
     await native.publishWorkload({ namespace: 'future-epoch', count: 1, payloadBytes: 4096 })
     observe('future epoch healthy snapshot')
     expect((await native.snapshot()).availableEpochs).toContain(String(revoked.epoch))
+    expect(native.traffic().candidateDescriptorBytes).toBe(0)
+    expect(native.traffic().inlineControlDescriptorBytes).toBeGreaterThan(0)
+    expect(native.traffic().closureRecordBytes).toBeGreaterThan(0)
     expect(native.traffic().applicationEnvelopeBytesToAdministrator).toBe(0)
     expect(native.traffic().unexpectedAdministratorRequests).toBe(0)
     expect(native.traffic().rtcSignalingDescriptions).toBe(4)
@@ -253,5 +256,5 @@ describe('thin membership qualification native boundary', () => {
     expect(diagnostic.traffic.peerOutboundBytes).toBeGreaterThan(large.detachedEnvelopeBytes)
     expect(diagnostic.failure).toEqual(native.diagnostics().failure)
     observe('complete')
-  }, 120_000)
+  }, 180_000)
 })

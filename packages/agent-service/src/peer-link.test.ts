@@ -97,6 +97,30 @@ async function rangeSession(range: 'records' | 'evidence', read: () => Promise<r
     ? clientLink.link.read(server.transport.identity, 0n, limit) : clientLink.link.readEvidence(0n, limit) }
 }
 
+async function signalSession() {
+  const server = await portable(), client = await portable(), [outgoing, incoming] = connections()
+  const sent: Uint8Array[] = []
+  let active = true, guard: (() => Promise<void>) | undefined
+  const groupId = new Uint8Array(32).fill(31), grantId = new Uint8Array(32).fill(32)
+  const [sender, receiver] = await Promise.all([
+    openAuthenticatedPeerLink({ connection: { ...outgoing, async send(bytes) {
+      const frame = assertCanonicalCbor(bytes)
+      if (Array.isArray(frame) && frame[1] === 'chronolog/ephemeral/v1') sent.push(bytes.slice())
+      await outgoing.send(bytes)
+    } }, local: server.transport.asLink(), identity: server.identity, groupId, grantId,
+      async authorizePeer() { await guard?.(); return active } }),
+    openAuthenticatedPeerLink({ connection: incoming, local: client.transport.asLink(), identity: client.identity,
+      groupId, grantId, authorizePeer: () => true }),
+  ])
+  cleanup.push(async () => { await Promise.all([sender.close(), receiver.close()]) })
+  return { sender, sent, revoke() { active = false }, block() {
+    let entered!: () => void, release!: () => void
+    const blocked = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    guard = async () => { guard = undefined; entered(); await gate }
+    return { blocked, release }
+  } }
+}
+
 describe('authenticated framed range synchronization', () => {
   it('exchanges exact native/browser records and evidence bidirectionally over the same framed link', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-framed-native-'))
@@ -182,6 +206,26 @@ describe('authenticated framed range synchronization', () => {
     await lookedUp
     session.revoke(); release(body)
     await expect(result).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+  })
+
+  it('stops sending application signals to an established peer after reader revocation', async () => {
+    const session = await signalSession(), signal = encodeCanonicalCbor([1n, 'chronolog/ephemeral/v1', 'private presence'])
+    await session.sender.sendSignal(signal)
+    expect(session.sent).toEqual([signal])
+    session.revoke()
+    await expect(session.sender.sendSignal(signal)).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    expect(session.sent).toEqual([signal])
+  })
+
+  it.each(['revocation', 'close'] as const)('does not release a signal after %s during asynchronous reader authorization', async ending => {
+    const session = await signalSession(), gate = session.block()
+    const sending = session.sender.sendSignal(encodeCanonicalCbor([1n, 'chronolog/ephemeral/v1', 'private presence']))
+    const rejected = expect(sending).rejects.toThrow(ending === 'revocation' ? 'PEER_READ_UNAUTHORIZED' : 'PEER_CONNECTION_CLOSED')
+    await gate.blocked
+    if (ending === 'revocation') session.revoke()
+    else await session.sender.close()
+    gate.release(); await rejected
+    expect(session.sent).toEqual([])
   })
 
   it.each(['records', 'evidence'] as const)('does not release %s when a grant is revoked during the storage read', async range => {

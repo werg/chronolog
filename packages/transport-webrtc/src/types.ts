@@ -18,6 +18,8 @@ export interface RtcPeerConnection {
   readonly localDescription: { readonly type: string; readonly sdp: string } | null
   readonly iceGatheringState: string
   readonly connectionState: string
+  /** Optional on adapters; unavailable observations must remain unknown. */
+  getStats?(): Promise<{ forEach(callback: (value: unknown) => void): void }>
   createDataChannel(label: string, options: { readonly ordered: boolean; readonly protocol: string }): RtcDataChannel
   createOffer(): Promise<RTCSessionDescriptionInit>
   createAnswer(): Promise<RTCSessionDescriptionInit>
@@ -50,5 +52,14 @@ export interface WebRtcSession {
   readonly connection: RtcPeerConnection
   readonly signal: AbortSignal
   readonly signaling: { readonly sentMessages: number; readonly receivedMessages: number; readonly sentBytes: number; readonly receivedBytes: number }
+  /** Observes the currently selected ICE pair without exposing its addresses. */
+  getRoute(): Promise<WebRtcRoute>
   close(): Promise<void>
+}
+
+export type IceCandidateType = 'host' | 'srflx' | 'prflx' | 'relay'
+export interface WebRtcRoute {
+  readonly route: 'direct' | 'relay' | 'unknown'
+  readonly localCandidateType: IceCandidateType | null
+  readonly remoteCandidateType: IceCandidateType | null
 }

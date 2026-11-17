@@ -7,12 +7,14 @@ import type { ChronologMaterializationRuntime } from '@chronolog/materializer'
 import { DOMAINS, equalBytes, hashDomain, type Ed25519KeyPair } from '@chronolog/protocol'
 import type { ChronologTransport } from '@chronolog/records'
 
+import { Mutex } from './async.js'
+import { ControlHistory, type MembershipLedgerPage } from './control-proof.js'
 import { CapabilityMembershipResolver } from './capability-membership.js'
 import { EnrollmentIssuer, verifyEnrollmentDescriptor, type EnrollmentDescriptor } from './enrollment.js'
 import type { FeedForkRegistry } from './feed-forks.js'
 import { GovernanceActivationIndex } from './governance-activation.js'
-import { GovernanceControlPlane, isInvalidGovernanceRecord } from './governance.js'
-import { SignedInclusionFinalityProvider, encodeHistoryConfiguration, type CoordinatedHistoryConfiguration } from './history-policy.js'
+import { GovernanceControlPlane, GovernanceRecordPendingError, isInvalidGovernanceRecord, orderFinalizedGovernanceRecords } from './governance.js'
+import { SignedInclusionFinalityProvider, encodeHistoryConfiguration, type CoordinatedHistoryConfiguration, type OrderedRecordEntry } from './history-policy.js'
 import type { FinalityProvider } from './finality.js'
 import { ChronologNode } from './node.js'
 import type { DurableOperationStore } from './operations.js'
@@ -73,14 +75,38 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
   const activation = new GovernanceActivationIndex(initial, configured.kind)
   let coordinated: FinalityProvider | undefined
   if (descriptor.history.kind === 'coordinated') {
-    const providerId = descriptor.history.providerId ?? 'signed-inclusion-v1'
+    const providerId = descriptor.history.providerId ?? 'signed-inclusion-v2'
     const factory = options.finalityProviders?.[providerId]
     if (factory !== undefined) coordinated = await factory(structuredClone(descriptor.history), options.operationStore)
-    else if (providerId === 'signed-inclusion-v1') {
+    else if (providerId === 'signed-inclusion-v2') {
       coordinated = await SignedInclusionFinalityProvider.open(descriptor.history, options.operationStore)
     } else throw new Error('FINALITY_PROVIDER_UNAVAILABLE')
     if (!equalBytes(encodeHistoryConfiguration(coordinated.configuration), encodeHistoryConfiguration(descriptor.history))) {
       throw new Error('FINALITY_PROVIDER_CONFIGURATION_MISMATCH')
+    }
+  }
+  const bootstrapControls = descriptor.history.kind === 'coordinated' &&
+    (descriptor.history.providerId ?? 'signed-inclusion-v2') === 'signed-inclusion-v2'
+    ? await ControlHistory.open(descriptor.history, options.operationStore) : null
+  const controlApplication = new Mutex()
+  const applyControl = (entry: OrderedRecordEntry, cutoffMs: bigint) => controlApplication.run(async () => {
+    try {
+      const snapshot = await governance.ingestFinalized(entry, activation.activeSnapshot, cutoffMs)
+      if (snapshot !== null && snapshot.revision > activation.activeSnapshot.revision) {
+        activation.observe(snapshot); activation.activateFinalized(snapshot, cutoffMs)
+      }
+    } catch (error) {
+      if (!isInvalidGovernanceRecord(error)) throw error
+    }
+  })
+  const applyBootstrapControls = async (): Promise<void> => {
+    if (bootstrapControls === null) return
+    const controls = await orderFinalizedGovernanceRecords(bootstrapControls.entries().map(control => ({
+      entry: control.entry, cutoffMs: control.cutoffMs,
+    })), options.groupRoute)
+    for (const control of controls) {
+      try { await applyControl(control.entry, control.cutoffMs) }
+      catch (error) { if (!(error instanceof GovernanceRecordPendingError)) throw error }
     }
   }
   const peer = configured.kind === 'peer' ? new PeerGovernanceController({
@@ -129,18 +155,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     }),
     historyPolicy: coordinated === undefined ? { kind: 'peer' } : {
       kind: 'coordinated', policy: coordinated, futureAdmissionWindowMs,
-      applyGovernanceRecord: async (entry, cutoffMs) => {
-        try {
-          const snapshot = await governance.ingestFinalized(entry, activation.activeSnapshot, cutoffMs)
-          if (snapshot !== null && snapshot.revision > activation.activeSnapshot.revision) {
-            activation.observe(snapshot)
-            activation.activateFinalized(snapshot, cutoffMs)
-          }
-        } catch (error) {
-          if (!isInvalidGovernanceRecord(error)) throw error
-          // Known invalid control bytes are excluded without changing chronology.
-        }
-      },
+      applyGovernanceRecord: applyControl,
       hasEncryptionEpoch: (epochId, includedThrough) => governance.hasFinalizedEpoch(epochId, includedThrough),
       encryptionEpochStatusAt: (timestamp, epochId) => governance.finalizedEpochStatusAt(timestamp, epochId),
     },
@@ -159,11 +174,19 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     }) : undefined
   return {
     node, governance, descriptor, enrollmentIssuer,
+    /** Establish current reader grants/keys from compact host evidence; application history still comes from peers. */
+    async ingestMembership(page: MembershipLedgerPage): Promise<void> {
+      if (bootstrapControls === null) throw new Error('MEMBERSHIP_CONTROL_PROOF_UNAVAILABLE')
+      await bootstrapControls.ingest(page)
+      await applyBootstrapControls()
+      await node.refreshMembership()
+    },
     get activeSnapshot(): CapabilitySnapshot { return activeSnapshot() },
     get peerGovernance(): PeerGovernanceController | undefined { return peer },
     async start(): Promise<void> {
       if (started) return
       await governance.start()
+      await applyBootstrapControls()
       if (governance.currentEpoch === null && governance.ownsCapabilityFeed) {
         await governance.rotateEpoch(options.identity.privateKey, options.initialEpochContentKey,
           { operationId: 'bootstrap-epoch-0' })

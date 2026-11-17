@@ -38,7 +38,7 @@ const output = resolve(values.output ?? join(workspace, `artifacts/thin-membersh
 await mkdir(dirname(output), { recursive: true }); await mkdir(output)
 const host = join(output, 'host'), assets = join(output, 'browser')
 await mkdir(host); await mkdir(assets)
-const report = { format: 'chronolog-thin-membership/v2', passed: false, status: 'building', startedAt: new Date().toISOString(),
+const report = { format: 'chronolog-thin-membership/v3', passed: false, status: 'building', startedAt: new Date().toISOString(),
   command: process.argv.slice(1), revisions: { chronolog: gitState(workspace), tendrillerArtifacts: gitState(artifacts) },
   topology: { membership: ['packaged workerd administrator', 'signed native membership HTTP'],
     introduction: ['Window', 'one direct SDP HTTP offer/answer', 'resident native WebRTC handler'],

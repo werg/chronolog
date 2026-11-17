@@ -1,3 +1,4 @@
+import { controlCommitmentForClosure } from './finality.js'
 import { signGenesis, type GenesisManifest } from '@chronolog/capabilities'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
 import {
@@ -60,7 +61,8 @@ async function replica(decorate?: (provider: SignedInclusionFinalityProvider) =>
   }
   const closeThrough = async (closedThroughMs: bigint) => {
     await log.append(await createFinalityClosureRecord({ configuration, identity: authorityIdentity,
-      includedHead: await log.head(), closedThroughMs }))
+      includedHead: await log.head(), closedThroughMs,
+      control: await controlCommitmentForClosure(configuration, await log.read(), closedThroughMs) }))
     await certify()
   }
   return { configuration, identity, bodies, log, include, certify, closeThrough,

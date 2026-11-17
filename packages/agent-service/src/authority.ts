@@ -1,10 +1,11 @@
 import {
   Mutex, ReferenceRecordLog, createPrefixAuthority, encodeHistoryConfiguration, encodeOrderingEvidence, orderedGenesisRoot,
-  createFinalityClosureRecord, evaluateFinalitySnapshot, createLedgerRecord, decodeLedgerRecord, verifyLedgerPayload,
-  decodeOrderingEvidence, verifyPrefixCertificate,
+  createFinalityClosureRecord, evaluateFinalitySnapshot, extendFinalityControlCommitment, createLedgerRecord, decodeLedgerRecord, verifyLedgerPayload,
+  decodeOrderingEvidence, verifyPrefixCertificate, encodeFinalizedControl,
 } from '@chronolog/node-core'
 import type {
   CoordinatedHistoryConfiguration, DurableOperationStore, OrderedRecordEntry, OrderedRecordHead, PrefixCertificate,
+  MembershipLedgerPage,
 } from '@chronolog/node-core'
 import { decodeEnvelope, equalBytes } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
@@ -183,10 +184,13 @@ export class NativeAuthority {
   }
 
   async #certifyLocked(): Promise<PrefixCertificate> {
-    const entries = await this.#log.read()
-    const snapshot = await evaluateFinalitySnapshot(this.#configuration, entries)
+    // Snapshot time at the same boundary that excludes new appenders. Awaited
+    // storage and proof verification must not close additional author time
+    // while already published proposals wait for this authority's mutex.
     const observed = Math.trunc(this.#now())
     if (!Number.isSafeInteger(observed) || observed < 0) throw new Error('AUTHORITY_CLOCK_INVALID')
+    const entries = await this.#log.read()
+    const snapshot = await evaluateFinalitySnapshot(this.#configuration, entries)
     const observedCutoff = BigInt(observed) - BigInt(this.#cutoffLagMs)
     const uncovered = snapshot.records.some((record) => record.closureBoundary === null)
     let coveredDemand = -1n
@@ -201,7 +205,7 @@ export class NativeAuthority {
       const includedHead = { historyId: this.#configuration.historyId, position: entries.length,
         root: entries.at(-1)?.root ?? await orderedGenesisRoot(this.#configuration.historyId) }
       const marker = await createFinalityClosureRecord({ configuration: this.#configuration,
-        identity: this.#identity, includedHead, closedThroughMs })
+        identity: this.#identity, includedHead, closedThroughMs, control: await extendFinalityControlCommitment(snapshot, closedThroughMs) })
       await this.#log.append(marker)
     }
     // Every admissible encrypted proposal has an upper timestamp bound derived
@@ -231,6 +235,31 @@ export class NativeAuthority {
       const certificate = await this.#certifyLocked()
       const entries = (await this.#log.read()).slice(after, after + limit)
       return { entries, certificate, hasMore: after + entries.length < certificate.position }
+    })
+  }
+
+  /** Membership cursors count controls, independently of application receipts. */
+  certifiedControlRead(options: { readonly after?: number; readonly limit?: number } = {}): Promise<MembershipLedgerPage> {
+    const after = options.after ?? 0, limit = options.limit ?? 128
+    if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 128) {
+      return Promise.reject(new Error('AUTHORITY_RANGE_INVALID'))
+    }
+    return this.#mutex.run(async () => {
+      const certificate = await this.#certifyLocked()
+      const retained = await this.#log.read()
+      const snapshot = await evaluateFinalitySnapshot(this.#configuration, retained)
+      if (certificate.position > 0 && snapshot.closures.at(-1)?.position !== certificate.position) throw new Error('MEMBERSHIP_PREFIX_PENDING')
+      if (after > snapshot.controls.length) throw new Error('AUTHORITY_RANGE_AHEAD')
+      const entries = []
+      let bytes = 0
+      for (const control of snapshot.controls.slice(after, after + limit)) {
+        const size = encodeFinalizedControl(control).length
+        if (size > 1024 * 1024) throw new Error('MEMBERSHIP_ENTRY_TOO_LARGE')
+        if (entries.length && bytes + size > 1024 * 1024) break
+        entries.push(control); bytes += size
+      }
+      return { entries, checkpoint: retained.at(-1) ?? null, certificate,
+        hasMore: after + entries.length < snapshot.controls.length }
     })
   }
 
