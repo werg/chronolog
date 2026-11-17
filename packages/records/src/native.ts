@@ -1,0 +1,103 @@
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+
+import type { BytesStore } from './bytes-store.js'
+
+export interface NativeBytesStoreOptions {
+  readonly quotaBytes?: number
+  readonly maxValueBytes?: number
+}
+
+/**
+ * One native storage owner for records, authority state, outboxes and local
+ * consumer checkpoints. Each durable atomic key replacement shares the
+ * same BytesStore contract. SQLite holds the exclusive writer fence until close (also
+ * across processes); a process crash releases it without a stale lock file.
+ */
+export class NativeBytesStore implements BytesStore {
+  readonly #database: DatabaseSync
+  readonly #quotaBytes: number
+  readonly #maxValueBytes: number
+  #usedBytes = 0
+  #closed = false
+
+  constructor(path: string, options: NativeBytesStoreOptions = {}) {
+    this.#quotaBytes = options.quotaBytes ?? 256 * 1024 * 1024
+    this.#maxValueBytes = options.maxValueBytes ?? 128 * 1024 * 1024
+    for (const value of [this.#quotaBytes, this.#maxValueBytes]) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new Error('BYTES_STORE_QUOTA_INVALID')
+    }
+    if (path.length === 0) throw new Error('BYTES_STORE_PATH_REQUIRED')
+    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
+    this.#database = new DatabaseSync(path)
+    try {
+      // In WAL mode an exclusive connection retains its file lock after the
+      // initial commit, fencing every process until the owner closes.
+      this.#database.exec('PRAGMA busy_timeout = 0')
+      this.#database.exec('PRAGMA locking_mode = EXCLUSIVE')
+      this.#database.exec('PRAGMA journal_mode = WAL')
+      this.#database.exec('PRAGMA synchronous = FULL')
+      this.#database.exec('BEGIN EXCLUSIVE')
+      this.#database.exec(`CREATE TABLE IF NOT EXISTS stored_bytes (
+        key TEXT PRIMARY KEY,
+        value BLOB NOT NULL
+      )`)
+      this.#database.exec('COMMIT')
+      // An exclusive owner accounts once on reopen. Appending one value must
+      // not scan every retained body merely to enforce its storage quota.
+      this.#usedBytes = (this.#database.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get() as { bytes: number }).bytes
+    } catch (error) {
+      try { this.#database.close() } catch { /* failed opening */ }
+      if (/locked|busy/iu.test(error instanceof Error ? error.message : '')) {
+        throw new Error('BYTES_STORE_IN_USE', { cause: error })
+      }
+      throw error
+    }
+  }
+
+  async get(key: string): Promise<Uint8Array | null> {
+    this.#assertOpen()
+    validateKey(key)
+    const row = this.#database.prepare('SELECT value FROM stored_bytes WHERE key = ?').get(key) as
+      { value: Uint8Array } | undefined
+    return row === undefined ? null : Uint8Array.from(row.value)
+  }
+
+  async put(key: string, value: Uint8Array): Promise<void> {
+    this.#assertOpen()
+    validateKey(key)
+    if (!(value instanceof Uint8Array) || value.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
+    this.#database.exec('BEGIN IMMEDIATE')
+    try {
+      const previous = this.#database.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?').get(key) as
+        { bytes: number } | undefined
+      const used = this.#usedBytes - (previous?.bytes ?? 0) + value.byteLength
+      if (used > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
+      this.#database.prepare('INSERT INTO stored_bytes (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+        .run(key, value)
+      this.#database.exec('COMMIT')
+      this.#usedBytes = used
+    } catch (error) {
+      this.#database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  usageBytes(): number {
+    this.#assertOpen()
+    return this.#usedBytes
+  }
+
+  close(): void {
+    if (this.#closed) return
+    this.#database.close()
+    this.#closed = true
+  }
+
+  #assertOpen(): void { if (this.#closed) throw new Error('BYTES_STORE_CLOSED') }
+}
+
+function validateKey(key: string): void {
+  if (key.length === 0 || key.length > 2048 || [...key].some((character) => character.charCodeAt(0) < 32)) throw new Error('BYTES_STORE_KEY_INVALID')
+}

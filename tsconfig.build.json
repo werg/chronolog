@@ -9,10 +9,10 @@
     "outDir": "dist"
   },
   "include": [
-    "apps/**/*.ts",
     "packages/**/*.ts",
-    "examples/**/*.ts",
     "tools/**/*.ts"
   ],
-  "exclude": ["**/*.test.ts"]
+  "exclude": [
+    "**/*.test.ts"
+  ]
 }

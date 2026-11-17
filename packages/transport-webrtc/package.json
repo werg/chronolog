@@ -1,0 +1,16 @@
+{
+  "name": "@chronolog/transport-webrtc",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./native": "./src/native.ts"
+  },
+  "dependencies": {
+    "@chronolog/records": "workspace:*"
+  },
+  "optionalDependencies": {
+    "werift": "0.27.0"
+  }
+}

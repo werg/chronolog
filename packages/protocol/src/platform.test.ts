@@ -2,16 +2,16 @@ import { describe, expect, it } from 'vitest'
 
 import {
   GROUP_COLLECTIVE_ID,
-  decodeSqlTransactionProgram,
+  decodeChangeProgram,
   encodeCanonicalCbor,
-  encodeSqlTransactionProgram,
+  encodeChangeProgram,
   isPlatformOp,
   isSqlStatementStep,
   platformObjectId,
   platformOp,
   platformOpFromCanonicalCbor,
   platformOpToCanonicalCbor,
-  sqlProgram,
+  program,
   sqlValue,
   type PlatformOp,
 } from './index.js'
@@ -48,9 +48,9 @@ describe('platform operations', () => {
   })
 
   it('mixes SQL statements and platform operations in one program', () => {
-    const program = sqlProgram('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)')
-    const decoded = decodeSqlTransactionProgram(encodeSqlTransactionProgram(program))
-    expect(decoded).toEqual(program)
+    const change = program('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)')
+    const decoded = decodeChangeProgram(encodeChangeProgram(change))
+    expect(decoded).toEqual(change)
     expect(decoded.steps.map(isSqlStatementStep)).toEqual([true])
   })
 

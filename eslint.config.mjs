@@ -1,5 +1,4 @@
 import eslint from "@eslint/js";
-import reactHooks from "eslint-plugin-react-hooks";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
@@ -9,6 +8,7 @@ export default tseslint.config(
       ".claude/**",
       ".chronolog/**",
       "coverage/**",
+      "artifacts/**",
       "dist/**",
       "node_modules/**",
     ],
@@ -22,9 +22,6 @@ export default tseslint.config(
         projectService: true,
         tsconfigRootDir: import.meta.dirname,
       },
-    },
-    plugins: {
-      "react-hooks": reactHooks,
     },
     rules: {
       "@typescript-eslint/consistent-type-imports": [
@@ -45,8 +42,6 @@ export default tseslint.config(
           varsIgnorePattern: "^_",
         },
       ],
-      "react-hooks/exhaustive-deps": "error",
-      "react-hooks/rules-of-hooks": "error",
       eqeqeq: ["error", "always", { null: "ignore" }],
     },
   },

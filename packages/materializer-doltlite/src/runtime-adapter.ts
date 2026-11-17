@@ -1,10 +1,13 @@
 import {
   publicationRequestForRevision,
-  type AdmittedTransaction,
+  type ReplayProposal,
+  type PeerExecutionControls,
   type ChronologMaterializationRuntime,
+  type MaterializedApplicationSnapshot,
   type MaterializationPublicationRequest,
   type MaterializationPublicationResult,
   type MaterializedRevisionSnapshot,
+  type MaterializedReadHandle,
 } from '@chronolog/materializer'
 
 import type {
@@ -18,14 +21,20 @@ import type {
 export interface DoltLiteMaterializerRuntimeBackend {
   readonly revision: bigint
   readonly orderLength: number
+  readonly finalRevision?: bigint
+  readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
-  materialize(orderedTransactions: readonly AdmittedTransaction[]): Promise<MaterializedRevision | null>
+  proposalIdAt(index: number): Uint8Array | null
+  materialize(orderedTransactions: readonly ReplayProposal[], controls?: PeerExecutionControls): Promise<MaterializedRevision | null>
+  publishFinal?(prefixLength: number, controls?: PeerExecutionControls): Promise<void>
   localSql(
     sql: string,
     parameters?: readonly LocalSqlValue[],
     options?: LocalSqlOptions,
   ): LocalSqlQueryResult
   outcome(txId: Uint8Array): TransactionOutcome | null
+  captureApplication(options?: { readonly view?: 'local' | 'final' }): MaterializedApplicationSnapshot
+  captureRead?(options?: { readonly view?: 'local' | 'final' }): MaterializedReadHandle
   subscribe(subscriber: (revision: MaterializedRevision) => void): () => void
   close(): void
 }
@@ -52,11 +61,13 @@ export function createDoltLiteMaterializationRuntime(
     status: MaterializationPublicationResult['status'],
     publicationKey: string | null,
   ): MaterializationPublicationResult => ({ status, publicationKey, ...snapshot() })
+  const publishFinal = materializer.publishFinal?.bind(materializer)
 
   return {
     coordinator: {
-      async materialize(orderedTransactions) {
-        const revision = await materializer.materialize(orderedTransactions)
+      ...(publishFinal === undefined ? {} : { publishFinal }),
+      async materialize(orderedTransactions, controls) {
+        const revision = await materializer.materialize(orderedTransactions, controls)
         if (revision === null) return null
         const publication = publicationRequestForRevision(revision)
         prepared.set(publication.publicationKey, publication)
@@ -64,11 +75,20 @@ export function createDoltLiteMaterializationRuntime(
       },
     },
     queries: {
+      capabilities: Object.freeze({ sql: true }),
       get revision() { return materializer.revision },
       get orderLength() { return materializer.orderLength },
+      get finalRevision() { return materializer.finalRevision ?? 0n },
+      get finalOrderLength() { return materializer.finalOrderLength ?? 0 },
       get executionManifestDigest() { return materializer.executionManifestDigest },
+      proposalIdAt(index) { return materializer.proposalIdAt(index) },
       localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
       outcome(txId) { return materializer.outcome(txId) },
+      captureApplication(options) { return materializer.captureApplication(options) },
+      captureRead(options) {
+        if (materializer.captureRead === undefined) throw new Error('MATERIALIZER_SNAPSHOT_UNAVAILABLE')
+        return materializer.captureRead(options)
+      },
       subscribe(subscriber) {
         return materializer.subscribe((revision) => subscriber({
           revision: revision.revision,

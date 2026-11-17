@@ -6,8 +6,8 @@ import {
 import { afterEach, describe, expect, it } from 'vitest'
 
 import type { DeterministicMaterializer } from './materializer.js'
-import { MaterializerFixture, ROOT_KEY, admitted, rows, testKey } from './test-fixtures.js'
-import type { AdmittedTransaction } from './types.js'
+import { MaterializerFixture, ROOT_KEY, replayProposal, rows, testKey } from './test-fixtures.js'
+import type { ReplayProposal } from './types.js'
 
 const fixtures = new MaterializerFixture()
 const opened: DeterministicMaterializer[] = []
@@ -21,12 +21,12 @@ const CAROL = testKey(0x30)
 const GROUP = testKey(1)
 
 class SealedLedger {
-  readonly transactions: AdmittedTransaction[] = []
+  readonly transactions: ReplayProposal[] = []
   constructor(readonly materializer: DeterministicMaterializer) {}
 
   async submit(expected: string, actor: Uint8Array, ...steps: readonly (ProgramStep | string)[]): Promise<Uint8Array> {
     const clock = BigInt(this.transactions.length + 1)
-    const transaction = await admitted(clock, `sealed-${clock}`, steps, this.materializer.executionManifestDigest, actor)
+    const transaction = await replayProposal(clock, `sealed-${clock}`, steps, this.materializer.executionManifestDigest, actor)
     this.transactions.push(transaction)
     await this.materializer.materialize(this.transactions)
     expect(this.materializer.outcome(transaction.txId)?.rejectionCode ?? 'accepted').toBe(expected)

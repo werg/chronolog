@@ -1,6 +1,5 @@
-import { createHash } from 'node:crypto'
+import { createSha256, utf8 } from '@chronolog/canonical'
 
-import { chronologTriggerUsesIgnore } from '@dolthub/doltlite'
 import {
   GROUP_COLLECTIVE_ID,
   isSealedPlatformOp,
@@ -426,8 +425,8 @@ export class PlatformSession {
 
   /** Bind an offer to exact data, columns and dependent set, not future rows. */
   #transferScopeDigest(scope: readonly RowRef[], from: Uint8Array): Uint8Array {
-    const hash = createHash('sha256').update('chronolog-transfer-scope-v1\0').update(from)
-    const part = (value: string): void => { hash.update(`${Buffer.byteLength(value, 'utf8')}:`).update(value) }
+    const hash = createSha256().update('chronolog-transfer-scope-v1\0').update(from)
+    const part = (value: string): void => { hash.update(`${utf8(value).byteLength}:`).update(value) }
     for (const ref of scope) {
       const shape = tableShape(this.#database, ref.table)
       const columns = shape.columns.filter((column) => column.hidden === 0 && column.name !== OWNER_COLUMN)
@@ -741,7 +740,7 @@ export class PlatformSession {
       const name = String(object.name)
       if (name.toLowerCase().startsWith('chronolog_')) {
         if (!expected.has(name.toLowerCase())) throw new PlatformRejection('schema_unregistered')
-      } else if (object.type === 'trigger' && typeof object.sql === 'string' && chronologTriggerUsesIgnore(object.sql)) {
+      } else if (object.type === 'trigger' && typeof object.sql === 'string' && this.#database.triggerUsesIgnore(object.sql)) {
         throw new PlatformRejection('trigger_ignore')
       }
     }
@@ -750,7 +749,7 @@ export class PlatformSession {
   // ── statement helpers ─────────────────────────────────────────────────────
 
   #objectId(stepIndex: number): Uint8Array {
-    return Uint8Array.from(createHash('sha256')
+    return Uint8Array.from(createSha256()
       .update(platformObjectIdHashInput(this.#context.txId, stepIndex))
       .digest())
   }
@@ -877,7 +876,7 @@ export function toDatabaseValue(value: SqlValue): unknown {
     // A one-element Float64Array binds as an exact REAL even when integral.
     case 'real': return Float64Array.of(value.value)
     case 'text': return value.value
-    case 'blob': return Buffer.from(value.value.buffer, value.value.byteOffset, value.value.byteLength)
+    case 'blob': return value.value.slice()
   }
 }
 

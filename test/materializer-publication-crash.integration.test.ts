@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path'
 
 import {
   DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
+  createNativeSqlEngine,
   type MaterializerPublicationFaultPoint,
 } from '@chronolog/materializer-doltlite'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -32,21 +32,21 @@ describe('native publication crash recovery', () => {
       directories.push(directory)
       const path = join(directory, 'application.db')
       const result = spawnSync(
-        resolve('node_modules/.bin/tsx'),
-        [resolve('test/fixtures/materializer-publication-crash.ts'), path, point],
+        process.execPath,
+        ['--import', 'tsx', resolve('test/fixtures/materializer-publication-crash.ts'), path, point],
         { cwd: resolve('.'), encoding: 'utf8', timeout: 20_000 },
       )
-      // tsx forwards the worker's signal as the conventional shell status on
-      // some platforms and as ChildProcess.signal on others.
+      // Load the TypeScript hook in the process under test. No CLI wrapper or
+      // auxiliary IPC server is needed to observe its real abrupt death.
       expect(
         result.signal === 'SIGKILL' || result.status === 128 + 9,
         `${result.stdout}\n${result.stderr}`,
       ).toBe(true)
 
-      const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-native-production-v1' })
+      const engine = createNativeSqlEngine()
       const reopened = await DeterministicMaterializer.open({
         path,
-        executionManifest: manifest,
+        engine,
         rootAdministrator: Uint8Array.from({ length: 32 }, (_value, index) => (4 + index) & 0xff),
         checkpointEvery: 1,
       })

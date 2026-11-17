@@ -166,7 +166,7 @@ export function rowKeyBindings(key: string, primaryKey: readonly string[]): unkn
   if (values.length !== primaryKey.length) throw new Error('MATERIALIZER_ROW_KEY_INVALID')
   return [...values.flatMap((part) => {
     const value = part.kind === 'null' ? null : part.kind === 'real' ? Float64Array.of(part.value)
-      : part.kind === 'text' || part.kind === 'blob' ? Buffer.from(part.value) : part.value
+      : part.kind === 'text' || part.kind === 'blob' ? Uint8Array.from(part.value) : part.value
     return [part.kind === 'text' ? 1 : 0, value, value]
   }), key]
 }

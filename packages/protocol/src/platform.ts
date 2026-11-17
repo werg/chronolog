@@ -1,6 +1,6 @@
 import { domainSeparatedBytes, sha256 } from '@chronolog/canonical'
 
-import { bytesToHex, concatBytes, utf8 } from './bytes.js'
+import { bytesToHex, concatBytes, hexToBytes, utf8 } from './bytes.js'
 import { assertCanonicalCbor, encodeCanonicalCbor, type CborValue } from './cbor.js'
 import { protocolInvariant } from './errors.js'
 import {
@@ -33,6 +33,8 @@ export const MAX_SEED_ROWS = 10_000
 
 /** The `group` collective: created at genesis; its admins are the schema administrators. */
 export const GROUP_COLLECTIVE_ID: Uint8Array = new Uint8Array(PLATFORM_ID_BYTES)
+/** Durable shared-data owner for peer-generation applications; controlled by signed revisions. */
+export const APPLICATION_COLLECTIVE_ID: Uint8Array = hexToBytes('d089b2593cdd5a4a10734f1f7253cea7b72501dffebfcadfed37be1d01557608')
 
 export type GrantOperation = 'insert' | 'update' | 'delete'
 export type CollectiveRole = 'member' | 'admin'

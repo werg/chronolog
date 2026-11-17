@@ -1,144 +1,60 @@
-# Release hardening
+# Qualification and release evidence
 
-Status: active; the repository is not yet a production release
+Qualification targets one application composition: an owned session with explicit
+participant roles and transport adapters. Tests of removed daemon, hosted-data,
+RPC and resident products are not current acceptance evidence.
 
-This guide separates checks that run on every change from slower or
-toolchain-mutating release checks. Passing these commands is necessary but does
-not replace an external security review or operator pilot.
+## Semantic and lifecycle gates
 
-## Deterministic fuzz corpora
+`pnpm test` covers signed controls, author/coordinator separation, encrypted
+history, lost replies, exact retries, selection races, three-generation ancestry,
+revocation, missing bodies, coherent recovery, retained content, bounded streams,
+encrypted peer channels, replay and relay tampering, independent traffic lanes,
+device ownership and session shutdown. Deterministic model traces supplement the
+real replica and materializer tests.
 
-```sh
-pnpm test:fuzz
-```
+`pnpm test:publication-crash` kills a real native child process at publication
+boundaries, reopens the materializer and checks published SQL, outcomes and events.
+`pnpm test:fuzz` exercises canonical encodings and SQL inputs.
+`pnpm test:soak` measures repeated materialization, replay and reopen.
+`pnpm test:native-sanitizers` runs the patched C engine under sanitizers.
 
-The checked-in seeds cover arbitrary bounded canonical CBOR and mutations of
-the signed transaction program encoding. Every
-accepted mutation must re-encode byte-for-byte; rejected inputs must fail with
-an ordinary error rather than terminate the process. Seeds and case counts are
-fixed so CI failures reproduce locally. These tests complement, rather than
-replace, coverage-guided native fuzzing.
+`pnpm conformance` compares the common execution adapter with the materializer
+and emits engine and execution digests. Linux/macOS comparison requires matching
+portable semantics; operational platform metadata remains distinct. The WASM
+workflow builds the pinned engine and runs
+`packages/materializer-doltlite/src/wasm-conformance.test.ts` against native results.
 
-## Publication crash recovery
+## Independent public consumers
 
-```sh
-pnpm test:publication-crash
-```
+Build clean archives with `package-peer-session.mjs` and
+`package-peer-generation-control.mjs`. The session packager records source commit,
+tree, every input, emitted file hashes, optional RTC dependency and exact native
+SQL engine identity. Default imports are SQL-free and share ESM chunks so separate
+entry points cannot create duplicate session classes or ownership registries.
 
-Each case starts a child materializer and sends it `SIGKILL` after a named
-durability boundary. Reopen must expose the previous revision before the atomic
-head move and the new revision after it. No intermediate revision is valid.
+The contrib recipes consume archives without sibling-source imports. They cover
+conversation and guarded SQL tasks, native RTC, browser Worker/OPFS ownership,
+forced native/browser WebSocket fallback and Tendriller's actual hosted participant
+contract. Hosted checks include role filtering, account and signed authority,
+zero steady-state command traffic at the control service, measured relay traffic, lost
+transition responses, signed page publication, served assets and restart.
 
-## Recovery soak and resource characterization
+Evidence must name its exact source and artifact identities. A development
+`--allow-dirty` archive is not clean release evidence. A skipped test or blocked
+browser launch is not a pass. Reports preserve the transport, engine and limits
+actually exercised.
 
-```sh
-pnpm characterize
-pnpm test:soak
-```
+## Deployment gate
 
-Both commands repeatedly append transactions, inject older predecessors,
-replay suffixes, close and reopen the native repository, and verify the exact
-`chronolog_transactions` log and application row count. The JSON report splits deterministic
-workload/replay/state evidence from operational wall time, RSS, and repository
-bytes. Compare operational values only on equivalent release hardware; compare
-the deterministic section everywhere.
+Local native RTC and Worker tests do not qualify representative home, mobile or
+restrictive networks. Before deployment promotion, record actual authentication,
+discovery/control, direct WebRTC and WebSocket fallback, browser suspension, storage limits,
+content transfer, churn and recovery. Measure hosted requests, stored bytes,
+peer CPU/memory/bandwidth, retained-prefix age and time to usable state under a
+specified workload. Do not infer provider savings or a universal loss bound from
+loopback behavior.
 
-The scheduled release-hardening workflow preserves soak reports as CI
-artifacts. Pilot sizing must record the exact commit, engine digest, platform,
-storage class, and characterization options rather than presenting one machine
-as a universal capacity promise.
-
-## Native sanitizers
-
-```sh
-pnpm test:native-sanitizers
-```
-
-This command rebuilds the installed DoltLite native dependency with Clang
-AddressSanitizer and UndefinedBehaviorSanitizer, then runs native SQL,
-authorizer, and publication-crash integration tests. It mutates the local
-native build and should run in a clean CI checkout or disposable worktree. A
-normal `pnpm install --force` restores the pinned non-sanitized dependency.
-
-## Native distribution, SBOM, and provenance
-
-```sh
-pnpm release:distribution
-pnpm test:distribution-upgrade
-pnpm release:metadata
-```
-
-The distribution command requires a clean worktree and uses pnpm's isolated
-deployment to assemble the daemon, online CLI, snapshot tool, TypeScript runtime, and native dependencies for the current OS and
-architecture. It rejects escaping symlinks, records every regular file's hash
-and size, emits a relocatable tar archive, and includes `chronolog-verify` for
-post-extraction verification. Node.js 22 or later remains a host prerequisite.
-
-The upgrade drill verifies the package, starts it on a fresh persistent data
-directory, checks health and CLI status, stops cleanly, verifies the replacement
-package, and reopens the same identity, SSB feed, execution manifest,
-governance revision, and epoch. With no prior published release, the default
-drill is same-build package replacement; pass `--from` and `--to` to the tool
-for the mandatory previous-release-to-candidate drill once a prior artifact
-exists.
-
-Metadata generation builds the repository, emits a CycloneDX 1.6 component
-inventory, and writes an in-toto/SLSA provenance statement covering compiled
-files, native patches, and distribution artifacts. Dependency identity is tied
-to the exact pnpm lock digest. Tag and manual release workflows run production
-conformance and the package/upgrade drill on Linux and macOS, then request
-GitHub OIDC build-provenance attestations over the archive and evidence.
-
-## OS-backed key custody
-
-Linux pilot hosts can set `CHRONOLOG_SECRET_STORE=secret-service` to migrate
-daemon identity, epoch, and recipient private material out of JSON and into
-the host Secret Service. See the governance guide for host requirements and
-migration behavior.
-
-## Network and observability
-
-`/health` returns readiness/replay/degraded state and uses HTTP 503 for feed
-gaps, quarantines, or node errors. `/metrics` emits bounded label-free
-Prometheus metrics and requires the configured bearer token. It covers
-materialized revision, order/candidate/admission counts, replay pending state,
-feed gaps/quarantines, transport records, RSS, and heap use.
-
-Set `CHRONOLOG_PUBLIC_SSB_ADDRESS` for an operator-verified public multiserver
-address, or configure an HTTPS `CHRONOLOG_NAT_DISCOVERY_URL` that returns
-`{"address":"net:host:port~shs:key"}`. Discovery is bounded and non-fatal. It
-does not create a router mapping or prove inbound reachability.
-`CHRONOLOG_NAT_VERIFICATION_URL` adds an external-vantage SSB handshake proof:
-the service must return the exact address and observed server key. Public-scope
-health remains degraded until that proof succeeds. `chronolog doctor` combines
-health, write readiness, replication continuity, and governance availability
-for install/upgrade gates.
-
-Every consumed feed is checked by author, sequence, record ID, and previous
-link. A conflict is persisted to `feed-continuity.json`, makes the node
-non-writable, and appears in status/metrics. The repair primitive accepts only
-a complete prefix ending at an explicitly trusted head and is applied only
-through the offline signed-snapshot workflow described next.
-
-Signed snapshot manifests and the offline snapshot CLI now provide exact
-archive hashing, signer/group/manifest/rollback checks, independent staged
-Dolt/log validation, atomic database replacement with backup, derived-state
-rebuild, and signed-head-bound fork repair.
-
-## Outstanding release gates
-
-- previous-release-to-candidate upgrade evidence (self-verifying Linux/macOS
-  artifacts, same-build replacement, SBOM, provenance, and CI attestations are
-  implemented);
-- verified macOS/Windows OS key providers and hardware-backed custody (Linux
-  Secret Service migration is implemented);
-- cross-platform (Linux/macOS) replay comparison of the pinned engine build;
-- production drill evidence for trusted snapshot import and fork repair;
-- witnessed pilot execution of the sizing, alerting, traversal, restore,
-  repair, and upgrade runbook;
-- resolution or explicit acceptance of every finding in the
-  [internal threat review](security-threat-review.md);
-- an independent external security review of the release candidate.
-
-The active manifest must never advertise one of these operational capabilities
-merely because an interface or test fixture exists.
+Automatic irreversible effects are disabled. Any optional protected effect
+service requires its own authorization, prerequisite retention, idempotency and
+uncertain-result reconciliation evidence.

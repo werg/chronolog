@@ -3,20 +3,20 @@ import { describe, expect, it } from 'vitest'
 import {
   createExecutionManifest,
   decodeExecutionManifest,
-  decodeSqlTransactionProgram,
+  decodeChangeProgram,
   encodeCanonicalCbor,
   encodeExecutionManifest,
-  encodeSqlTransactionProgram,
+  encodeChangeProgram,
   sqlStatement,
   sqlValue,
   sqlValueFromCanonicalCbor,
   sqlValueToCanonicalCbor,
   toSqlValue,
-  type SqlTransactionProgram,
+  type ChangeProgram,
 } from './index.js'
 
-const program: SqlTransactionProgram = {
-  version: 2,
+const program: ChangeProgram = {
+  version: 3,
   steps: [
     sqlStatement('CREATE TABLE t (a, b, c, d, e)'),
     sqlStatement("SELECT chronolog_assert(NOT EXISTS (SELECT 1 FROM t), 'empty')"),
@@ -27,10 +27,10 @@ const program: SqlTransactionProgram = {
 
 describe('SQL transaction programs', () => {
   it('round-trips ordinary statements with every SQLite value class', () => {
-    const encoded = encodeSqlTransactionProgram(program)
-    const decoded = decodeSqlTransactionProgram(encoded)
+    const encoded = encodeChangeProgram(program)
+    const decoded = decodeChangeProgram(encoded)
     expect(decoded).toEqual(program)
-    expect(encodeSqlTransactionProgram(decoded)).toEqual(encoded)
+    expect(encodeChangeProgram(decoded)).toEqual(encoded)
   })
 
   it('keeps integral REALs distinct from INTEGERs', () => {
@@ -51,20 +51,20 @@ describe('SQL transaction programs', () => {
   })
 
   it('rejects empty programs, empty SQL, NUL, non-finite REALs, out-of-range INTEGERs and duplicate bindings', () => {
-    expect(() => encodeSqlTransactionProgram({ version: 2, steps: [] })).toThrow()
-    expect(() => encodeSqlTransactionProgram({ version: 2, steps: [{ sql: '  ', bindings: [] }] })).toThrow()
+    expect(() => encodeChangeProgram({ version: 3, steps: [] })).toThrow()
+    expect(() => encodeChangeProgram({ version: 3, steps: [{ sql: '  ', bindings: [] }] })).toThrow()
     expect(() => sqlStatement('SELECT 1\0')).toThrow()
     expect(() => sqlValue.real(Number.NaN)).toThrow()
     expect(() => sqlValue.integer(1n << 63n)).toThrow()
-    expect(() => encodeSqlTransactionProgram({
-      version: 2,
+    expect(() => encodeChangeProgram({
+      version: 3,
       steps: [{ sql: 'SELECT ?', bindings: [
         { parameter: { kind: 'index', index: 1 }, value: sqlValue.null() },
         { parameter: { kind: 'index', index: 1 }, value: sqlValue.null() },
       ] }],
     })).toThrow()
-    expect(() => encodeSqlTransactionProgram({
-      version: 2,
+    expect(() => encodeChangeProgram({
+      version: 3,
       steps: Array.from({ length: 257 }, () => sqlStatement('SELECT 1')),
     })).toThrow()
   })
@@ -78,7 +78,7 @@ describe('execution manifest', () => {
     const decoded = decodeExecutionManifest(encodeExecutionManifest(manifest))
     expect(decoded).toEqual(manifest)
     expect(decoded.limits.maxVmSteps).toBe(42)
-    expect(decoded.programVersion).toBe(2)
+    expect(decoded.programVersion).toBe(3)
     expect(decoded.recursiveTriggers).toBe(true)
     expect(() => createExecutionManifest({ profile: 'test', engineDigest: new Uint8Array(31), platformDigest: new Uint8Array(32) })).toThrow()
     expect(() => createExecutionManifest({ profile: 'test', engineDigest: new Uint8Array(32), platformDigest: new Uint8Array(31) })).toThrow()

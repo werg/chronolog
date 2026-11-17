@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v6
@@ -29,21 +30,29 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test:coverage
       - run: pnpm build
-      - name: Preserve coverage summary
+      - name: Verify public signal and participant artifacts
+        run: |
+          pnpm package:signals
+          pnpm test:signals-package
+          pnpm package:control
+      - uses: actions/upload-artifact@v6
         if: always()
-        uses: actions/upload-artifact@v6
         with:
-          name: coverage-${{ github.run_id }}-${{ github.run_attempt }}
-          path: coverage/coverage-summary.json
+          name: quality-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            coverage/coverage-summary.json
+            artifacts/signals/*.tgz
+            artifacts/signals/*.consumer.json
+            artifacts/peer-generation-control/*.tgz
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
 
   conformance:
     name: Conformance (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:

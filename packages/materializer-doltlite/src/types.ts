@@ -1,12 +1,5 @@
-import type { ExecutionManifest, TransactionCore, TransactionOrderKey } from '@chronolog/protocol'
-
-export interface AdmittedTransaction {
-  readonly txId: Uint8Array
-  readonly authorFeedSequence: bigint
-  readonly candidateDigest: Uint8Array
-  readonly canonicalCandidate: Uint8Array
-  readonly core: TransactionCore
-}
+import type { ChangeProgram, ExecutionManifest, TransactionOrderKey } from '@chronolog/protocol'
+export type { ReplayProposal } from '@chronolog/materializer'
 
 export type TransactionOutcomeKind = 'accepted' | 'rejected'
 
@@ -22,9 +15,9 @@ export interface TransactionOutcome {
 }
 
 export interface TransactionLogRow extends TransactionOutcome {
+  readonly operationId: string
   readonly authorId: Uint8Array
   readonly authorTimestampMs: bigint
-  readonly authorFeedSequence: bigint
   readonly candidateDigest: Uint8Array
   readonly canonicalCandidate: Uint8Array
 }
@@ -32,7 +25,7 @@ export interface TransactionLogRow extends TransactionOutcome {
 export interface OutcomeChange {
   readonly txId: Uint8Array
   readonly previous: TransactionOutcomeKind | null
-  readonly current: TransactionOutcomeKind
+  readonly current: TransactionOutcomeKind | null
   readonly previousRejectionCode: string | null
   readonly currentRejectionCode: string | null
 }
@@ -63,12 +56,12 @@ export interface MaterializerBackendInfo {
   readonly version: string
   readonly sqliteVersion: string
   readonly vecVersion: string | null
-  readonly nativeManifest: NativeEngineManifest
+  readonly nativeManifest: EngineBuildManifest
   readonly engineDigest: Uint8Array
   readonly securityConfigured: boolean
 }
 
-export interface NativeEngineManifest {
+export interface EngineBuildManifest {
   readonly doltliteVersion: string
   readonly doltliteSourceSha256: string
   readonly sqliteVecVersion: string
@@ -127,12 +120,15 @@ export type LocalSqlValue =
 export interface LocalSqlQueryResult {
   readonly revision: bigint
   readonly orderLength: number
+  readonly view?: 'local' | 'final'
+  readonly finalOrderLength?: number
   readonly columns: readonly { readonly name: string; readonly declaredType?: string }[]
   readonly rows: readonly (readonly LocalSqlValue[])[]
 }
 
 export interface LocalSqlOptions {
   readonly atRevision?: bigint
+  readonly view?: 'local' | 'final'
 }
 
 export interface MaterializerSqlBackend {
@@ -143,6 +139,8 @@ export interface MaterializerSqlBackend {
 }
 
 export interface StatementLike {
+  /** Release the prepared engine handle when the owning scope exits. */
+  finalize?(): void
   run(...parameters: unknown[]): { changes: number | bigint; lastInsertRowid: number | bigint }
   get(...parameters: unknown[]): Record<string, unknown> | unknown[] | undefined
   all(...parameters: unknown[]): Array<Record<string, unknown> | unknown[]>
@@ -159,6 +157,8 @@ export interface StatementLike {
 }
 
 export interface DatabaseLike {
+  /** Engine tokenizer inspection, identical in native and WASM profiles. */
+  triggerUsesIgnore(sql: string): boolean
   readonly inTransaction: boolean
   exec(sql: string): void
   prepare(sql: string): StatementLike
@@ -194,11 +194,25 @@ export interface DatabaseLike {
   doltActiveBranch(): string
 }
 
-export interface MaterializerOptions {
-  readonly path?: string
+/** Explicit execution capability; adapters supply an engine without owning an application. */
+export interface SqlEngine {
   readonly executionManifest: ExecutionManifest
+  openDatabase(options: { readonly path: string }): {
+    readonly database: DatabaseLike
+    readonly backend: MaterializerBackendInfo
+    readonly security: SecurityConfiguration
+  }
+}
+
+export interface MaterializerOptions {
+  /** Verified schema-author program, executed once before the genesis checkpoint. */
+  readonly bootstrapProgram?: ChangeProgram
+  readonly bootstrapGroupId?: Uint8Array
+  /** Native and browser supply the same explicit capability to the sole reducer. */
+  readonly engine: SqlEngine
+  readonly path: string
   /**
-   * The group's genesis root administrator key: the first admin of the
+   * The genesis schemaAdminPublicKey: the first SQL admin of the
    * `group` collective, and the only key that may seed rows into a fork.
    */
   readonly rootAdministrator: Uint8Array
@@ -226,6 +240,7 @@ export type MaterializerPublicationFaultPoint =
   | 'after_reader_swap'
 
 export interface StoredExecutionManifest {
+  readonly bootstrapProgram: Uint8Array
   readonly manifestDigest: Uint8Array
   readonly canonicalManifest: Uint8Array
 }

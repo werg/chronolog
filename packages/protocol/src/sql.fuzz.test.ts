@@ -2,16 +2,16 @@ import { describe, expect, it } from 'vitest'
 
 import { platformOp } from './platform.js'
 import {
-  decodeSqlTransactionProgram,
-  encodeSqlTransactionProgram,
-  type SqlTransactionProgram,
+  decodeChangeProgram,
+  encodeChangeProgram,
+  type ChangeProgram,
 } from './program.js'
 import { sqlStatement, sqlValue } from './sql.js'
 
 const key = (fill: number): Uint8Array => new Uint8Array(32).fill(fill)
 
-const fixture: SqlTransactionProgram = {
-  version: 2,
+const fixture: ChangeProgram = {
+  version: 3,
   steps: [
     sqlStatement("SELECT chronolog_assert(? > 0, 'positive')", [7n]),
     sqlStatement('INSERT INTO t VALUES (:a, :b, :c, :d)', { a: sqlValue.real(1.5), b: 'text', c: new Uint8Array([1, 2]), d: null }),
@@ -26,14 +26,14 @@ const fixture: SqlTransactionProgram = {
 
 describe('transaction program mutation fuzz corpus', () => {
   it('accepts only canonical mutated programs', () => {
-    const original = encodeSqlTransactionProgram(fixture)
+    const original = encodeChangeProgram(fixture)
     let state = 0x52534c54
     for (let index = 0; index < 4_000; index += 1) {
       state = next(state)
       const candidate = mutate(original, state)
       try {
-        const decoded = decodeSqlTransactionProgram(candidate)
-        expect(encodeSqlTransactionProgram(decoded)).toEqual(candidate)
+        const decoded = decodeChangeProgram(candidate)
+        expect(encodeChangeProgram(decoded)).toEqual(candidate)
       } catch (error) {
         expect(error).toBeInstanceOf(Error)
       }

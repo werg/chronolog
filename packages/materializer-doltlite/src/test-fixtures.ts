@@ -13,9 +13,9 @@ import {
   type TransactionCore,
 } from '@chronolog/protocol'
 
-import { createDoltLiteExecutionManifest } from './manifest.js'
+import { createNativeSqlEngine } from './native.js'
 import { DeterministicMaterializer } from './materializer.js'
-import type { AdmittedTransaction, LocalSqlValue, MaterializerOptions } from './types.js'
+import type { ReplayProposal, LocalSqlValue, MaterializerOptions } from './types.js'
 
 /** Test-only helpers for driving a real materializer with signed-looking transactions. */
 
@@ -36,10 +36,11 @@ export class MaterializerFixture {
     readonly path?: string
   } = {}): Promise<{ readonly materializer: DeterministicMaterializer; readonly path: string; readonly manifest: ExecutionManifest }> {
     const path = options.path ?? join(await this.directory(), 'application.db')
-    const manifest = createDoltLiteExecutionManifest(options.limits === undefined ? {} : { limits: options.limits })
+    const engine = createNativeSqlEngine(options.limits === undefined ? {} : { limits: options.limits })
+    const manifest = engine.executionManifest
     const materializerOptions: MaterializerOptions = {
       path,
-      executionManifest: manifest,
+      engine,
       rootAdministrator: options.rootAdministrator ?? ROOT_KEY,
       ...(options.forkSeeding === undefined ? {} : { forkSeeding: options.forkSeeding }),
       ...(options.checkpointEvery === undefined ? {} : { checkpointEvery: options.checkpointEvery }),
@@ -59,25 +60,25 @@ export class MaterializerFixture {
 }
 
 /**
- * An admitted transaction with id `id`, authored by `author` at `timestamp`.
+ * A replay proposal with id `id`, authored by `author` at `timestamp`.
  * String steps are SQL without parameters.
  */
-export async function admitted(
+export async function replayProposal(
   timestamp: bigint,
   id: string,
   steps: readonly (ProgramStep | string)[],
   executionManifestDigest: Uint8Array,
   author: Uint8Array = ROOT_KEY,
-): Promise<AdmittedTransaction> {
+): Promise<ReplayProposal> {
   const core: TransactionCore = {
+    operationId: id,
     groupId: testKey(1), membershipRevision: testKey(2), validationPolicy: testKey(3), authorId: author,
     authorTimestampMs: timestamp, nonce: testKey(Number(timestamp % 200n) + 10), executionManifestDigest,
-    program: { version: 2, steps: steps.map((step) => typeof step === 'string' ? sqlStatement(step) : step) },
+    program: { version: 3, steps: steps.map((step) => typeof step === 'string' ? sqlStatement(step) : step) },
   }
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(id),
-    authorFeedSequence: timestamp,
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

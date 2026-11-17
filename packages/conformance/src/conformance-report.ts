@@ -8,8 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   createDoltLiteMaterializationRuntime,
   DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
-  type AdmittedTransaction,
+  createNativeSqlEngine, type SqlEngine,
+  type ReplayProposal,
 } from '@chronolog/materializer-doltlite'
 import {
   encodeTransactionCore,
@@ -17,7 +17,6 @@ import {
   sqlStatement,
   transactionDigest,
   utf8,
-  type ExecutionManifest,
   type ProgramStep,
   type TransactionCore,
 } from '@chronolog/protocol'
@@ -56,17 +55,18 @@ interface ReportOptions {
 const moduleDirectory = dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = resolve(moduleDirectory, '../../..')
 export async function generateConformanceReport(options: ReportOptions = {}): Promise<ConformanceReport> {
-  const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-portable-core-conformance-v1' })
+  const engine = createNativeSqlEngine()
+  const manifest = engine.executionManifest
   const manifestArtifacts = await executionManifestArtifacts(manifest)
-  const replay = await runReplayFixture(manifest, 'reference')
-  const productionReplay = await runReplayFixture(manifest, 'native-daemon')
+  const replay = await runReplayFixture(engine, 'reference')
+  const productionReplay = await runReplayFixture(engine, 'runtime')
   if (productionReplay.replayDigest !== replay.replayDigest) {
-    throw new Error('CONFORMANCE_NATIVE_DAEMON_REPLAY_MISMATCH')
+    throw new Error('CONFORMANCE_RUNTIME_REPLAY_MISMATCH')
   }
   const testGroups: readonly ConformanceTestGroup[] = [
     { id: 'native-replay-v1', passed: true, evidenceDigest: replay.evidenceDigest },
     {
-      id: 'native-daemon-production-v1',
+      id: 'native-runtime-v1',
       passed: true,
       evidenceDigest: digestJson({
         reference: replay.evidenceDigest,
@@ -74,10 +74,10 @@ export async function generateConformanceReport(options: ReportOptions = {}): Pr
       }),
     },
   ]
-  const enabledFeatures = ['sql-core-v2', 'deployment-native-daemon-v1'] as const
+  const enabledFeatures = ['sql-core-v2', 'execution-runtime-v1'] as const
   const featureEvidence = {
-    'sql-core-v2': ['native-replay-v1', 'native-daemon-production-v1'],
-    'deployment-native-daemon-v1': ['native-daemon-production-v1'],
+    'sql-core-v2': ['native-replay-v1', 'native-runtime-v1'],
+    'execution-runtime-v1': ['native-runtime-v1'],
   }
   const deterministicWithoutDigest = {
     executionManifestDigest: hex(manifestArtifacts.executionManifestDigest),
@@ -149,8 +149,8 @@ export function assertConformanceReport(value: unknown): asserts value is Confor
 }
 
 async function runReplayFixture(
-  manifest: ExecutionManifest,
-  pathKind: 'reference' | 'native-daemon',
+  engine: SqlEngine,
+  pathKind: 'reference' | 'runtime',
 ): Promise<{
   readonly evidenceDigest: string
   readonly replayDigest: string
@@ -158,8 +158,8 @@ async function runReplayFixture(
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-conformance-'))
   const path = join(directory, 'application.db')
   try {
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, rootAdministrator: AUTHOR, checkpointEvery: 1 })
-    const runtime = pathKind === 'native-daemon'
+    const materializer = await DeterministicMaterializer.open({ path, engine, rootAdministrator: AUTHOR, checkpointEvery: 1 })
+    const runtime = pathKind === 'runtime'
       ? createDoltLiteMaterializationRuntime(materializer)
       : null
     try {
@@ -204,7 +204,7 @@ async function runReplayFixture(
 async function applyConformanceOrder(
   materializer: DeterministicMaterializer,
   runtime: ReturnType<typeof createDoltLiteMaterializationRuntime> | null,
-  transactions: readonly AdmittedTransaction[],
+  transactions: readonly ReplayProposal[],
 ): Promise<void> {
   if (runtime === null) {
     await materializer.materialize(transactions)
@@ -230,8 +230,9 @@ async function transaction(
   id: string,
   steps: readonly ProgramStep[],
   executionManifestDigest: Uint8Array,
-): Promise<AdmittedTransaction> {
+): Promise<ReplayProposal> {
   const core: TransactionCore = {
+    operationId: id,
     groupId: bytes32(1),
     membershipRevision: bytes32(2),
     validationPolicy: bytes32(3),
@@ -239,12 +240,11 @@ async function transaction(
     authorTimestampMs: timestamp,
     nonce: bytes32(Number(timestamp) + 10),
     executionManifestDigest,
-    program: { version: 2, steps },
+    program: { version: 3, steps },
   }
   const canonicalCandidate = encodeTransactionCore(core)
   return {
     txId: utf8(id),
-    authorFeedSequence: timestamp,
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

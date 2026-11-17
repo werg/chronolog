@@ -1,182 +1,129 @@
-# Chronolog DB
+# Chronolog
 
-Chronolog DB is a TypeScript prototype of a decentralized, permissioned SQL
-database. Members write **ordinary SQLite transactions**. Transactions are
-signed, replicated peer to peer, admitted by validator attestations, and
-ordered by their immutable author timestamps. Every replica executes them in
-that order on a pinned DoltLite (SQLite + Dolt) engine and derives the same
-database. When a transaction arrives late, replicas rewind to a checkpoint and
-replay from where it belongs. Validators never sign database states.
+Chronolog is an owned application session for browser Workers and native peers.
+One eligible peer orders commands. All readers verify the original author,
+selected order and execution contract, then materialize the same history.
 
-- **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
-  dialect or migration system. Assumptions are SQL statements, usually
-  `SELECT chronolog_assert(condition, 'code')`; a failing statement rejects the
-  whole transaction.
-- **Owner-controlled rows.** Every application table automatically gets a
-  `chronolog_owner` column stamped with the signer of the insert, stored as a
-  small integer id (`chronolog_principals` maps ids to keys).
-  Generated triggers let only the owner, a collective it belongs to, or a key
-  it granted access update or delete a row; administrators included. Schema
-  administrators may run DDL and write app triggers that narrow, never widen,
-  those rights. Violations abort the whole transaction
-  ([design](docs/design-owner-rows.md)).
-- **Explicit encrypted readers.** An owner controls a row's reader policy;
-  the client encrypts individual BLOB columns and wraps each fresh value key
-  only to those readers. Sealed writes still obey ordinary row grants and
-  application triggers. Ownership does not imply decryption rights
-  ([guide](docs/sealed-data.md)).
-- **Determinism from a pinned engine.** Every replica runs the same engine
-  build; `'now'`, `random()` and `localtime` are fixed per transaction; a short
-  authorizer block-list keeps statements inside the database.
-- **Replication.** Each node keeps signed, hash-chained feeds in one SQLite
-  file and pulls the feeds of all group members from its peers over Secure
-  Scuttlebutt's authenticated handshake. No record size limit beyond a
-  configurable maximum.
-- **Governance.** A signed genesis and capability revisions grant writer,
-  validator, reader and administrator roles; payloads are encrypted with
-  per-epoch keys wrapped to readers. There is no in-protocol recovery: failures
-  are handled by forking the group or out of band.
+The application API has one command journal, one query and event model, and one
+replication and recovery lifecycle. Participant roles determine what a participant
+may receive or do. Transports deliver those same scoped messages. A server can
+participate in control, discovery and signed code publication without receiving
+application bodies or executing ordinary commands. Its separate WebSocket relay
+capability forwards opaque peer ciphertext when a direct WebRTC route is
+unavailable. Both routes use the same authenticated encrypted channel and session.
 
-Read [the design](docs/design.md) for how it works,
-[Specification 10](docs/implementation-specs/10-deterministic-sql-transactions.md)
-for the transaction contract, and [the documentation index](docs/README.md) for
-everything else.
+This is prerelease software. Breaking changes update every maintained consumer;
+there are no alternate legacy applications, profile selectors or migration layers.
 
-## Quick start
+## Application contract
 
-Requirements: Node.js 22 or newer, pnpm, Python 3 and a C/C++ toolchain for
-`node-gyp`. The first install downloads the pinned DoltLite 0.11.29 source,
-verifies its SHA-256 and compiles the patched binding.
+- `command()` saves one signed, encrypted attempt before sending it. An exact
+  retry preserves the original bytes and operation identity.
+- `applied()` reports acceptance or rejection at a generation and sequence.
+  `shared()` reports independently retained copies of that prefix.
+- `query()` and `readView()` capture coherent state. SQL, events, outcomes and
+  revision switch together during recovery.
+- A signed control transition selects a replacement coordinator. It may adopt
+  an earlier surviving prefix. Excluded work remains inspectable and requires
+  deliberate reapplication with a new linked identity.
+- Revocation and other control state do not roll back with application data.
+  Reader, writer, coordinator, recovery and administration rights are explicit.
+- Live signals and encrypted chunked content use the same session identity,
+  ownership and lifetime. They do not create another outbox or execution path.
+- Irreversible external effects require an explicit protected service. Applying
+  an ordinary command never dispatches such an effect automatically.
 
-```sh
-pnpm install
-pnpm test
-pnpm demo        # two in-memory nodes: an ownership rejection, a grant, and a replay flip
-pnpm dev         # persistent daemon on http://127.0.0.1:8787, data in .chronolog/
-```
+A healthy generation on direct peer connections continues with every host
+endpoint blocked. Relayed connections require their forwarding service, while
+control-service outages do not interrupt an already selected generation. If both the
+coordinator and control service are unavailable, commands stay saved locally.
+The system does not fabricate a successor or promise that all data copies survive.
 
-In another terminal:
+## Start with the public session
 
-```sh
-pnpm cli status
-pnpm cli query 'SELECT * FROM accounts WHERE id = ?' '[1]'
-pnpm cli transact @transaction.json
-pnpm cli outcome TRANSACTION_ID
-```
+See the [session guide](packages/peer-session/README.md) for application
+definitions, owned storage, enrollment, network connections, Worker ownership,
+control attachment, publication, content, recovery and local agent tools.
 
-A transaction file lists steps: SQL statements and platform operations.
-Bindings are JSON scalars or tagged values
-(`{"kind":"integer","value":"9007199254740993"}`, `{"kind":"real","value":1}`,
-`{"kind":"blob","value":"BASE64URL"}`). The daemon's own node is the group's
-root administrator, so it may create a table (it is owner-checked from the
-next statement on):
-
-```json
-{
-  "steps": [
-    { "sql": "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT" },
-    { "sql": "INSERT INTO accounts (id, balance) VALUES (?, ?)", "bindings": [1, 100] }
-  ],
-  "wait": true
+```ts
+const session = await openNativeApplication({ device, definition, authority })
+const control = session.connectControlParticipant({ exchange })
+try {
+  const before = await session.query('messages', null)
+  const operation = await session.command('say', { text: 'Hello' }, {
+    operationId: crypto.randomUUID(), basedOn: before.revision,
+  })
+  const result = await operation.applied()
+  console.log(result.generation, result.sequence, result.outcome)
+} finally {
+  await session.close()
 }
 ```
 
-The row now belongs to this node's key. Another node's
-`UPDATE accounts SET balance = 0 WHERE id = 1` is rejected with
-`policy:accounts:update`, until the owner grants it access:
+`definition` is the shared schema-validated command/query declaration. `device`
+is explicitly created or enrolled and then resumed; missing keys never silently
+create a replacement identity. `authority` is the signed descriptor, controls and
+generation chain. `exchange` is the hosted participant transport. Attaching it
+performs no I/O and does not give the host reader access.
 
-```json
-{ "steps": [{ "platform": "grant", "table": "accounts", "grantee": "BOB_KEY_BASE64URL", "operations": ["update"], "rowKey": [1], "columns": ["balance"] }] }
-```
+A browser uses the same session in an owning Worker, with OPFS and a Web Lock.
+Native storage uses SQLite and an exclusive writer lock. The page facade forwards
+to that owner. Closing the session releases owned transports, streams and storage.
 
-From TypeScript:
-
-```ts
-import { platformOp } from '@chronolog/client'
-
-const tx = await client.transaction([
-  { sql: "SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = :id) >= 50, 'insufficient_funds')", params: { id: 1 } },
-  { sql: 'UPDATE accounts SET balance = balance - 50 WHERE id = :id', params: { id: 1 } },
-  platformOp.grant({ table: 'accounts', grantee: bobKey, operations: ['update'], rowKey: [1] }),
-])
-const outcome = await tx.settled()   // accepted, or rejected with { code, statementIndex }
-const rows = await client.query(`SELECT a.id, a.balance, p.key AS owner
-  FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner`)
-```
-
-`platformOp` also builds collectives (`createCollective`, `acceptMembership`,
-`setMembers`, `leave`), revocations and transfers (`transferRow`,
-`transferAll`, `acceptTransfer`); the CLI accepts the same operations as
-`{"platform": ...}` steps (see `apps/chronolog/src/main.ts`).
-
-Set `CHRONOLOG_URL`, `CHRONOLOG_GROUP_ID` and `CHRONOLOG_TOKEN` for a
-non-default daemon. RPC refuses a non-loopback bind without a token.
-
-## Running a group
-
-The daemon creates a signed governance genesis on first start; the local
-identity is administrator, writer, validator and reader. To add nodes, use
-`pnpm group descriptor` / `pnpm group join` and grant the printed capabilities
-with `pnpm cli governance grant`; see the [governance guide](docs/governance.md).
-Peers are configured with:
-
-```sh
-CHRONOLOG_SSB_HOST=0.0.0.0 CHRONOLOG_SSB_PORT=8008 CHRONOLOG_SSB_SCOPE=public \
-CHRONOLOG_SSB_PEERS='[{"address":"net:host:8008~shs:PUBLIC_KEY","feedId":"@FEED.ed25519"}]' \
-pnpm dev
-```
-
-A node replicates its configured peers' feeds and the feed of every granted
-member, relayed through any connected peer. The secret handshake authenticates
-the connection; Chronolog independently verifies every record's feed
-signature, the inner protocol signature, the capability revision, the
-validation policy and the encryption epoch.
-
-Operational tools: `pnpm snapshot export|import|repair` (signed archives and
-feed repair), `pnpm group fork|verify-fork` (forking a group),
-`pnpm release:distribution` (relocatable native archive), and
-`chronolog doctor`. See the [pilot runbook](docs/pilot-runbook.md).
-
-`CHRONOLOG_STATIC_MEMBERSHIP_FILE` is a testing override that replaces
-governance with a fixed out-of-band membership file; its `rootAdministrator`
-key is the first schema administrator.
-
-## Testing
-
-```sh
-pnpm test               # unit and integration tests
-pnpm conformance        # replay-equivalence report for this engine build
-pnpm test:soak          # long replay soak
-pnpm chaos:smoke        # container P2P fault runs (also :crash, :stress)
-```
-
-See the [chaos testing guide](docs/chaos-testing.md) and the
-[release-hardening guide](docs/release-hardening.md).
-
-## Workspace
+## Package boundaries
 
 | Package | Responsibility |
 | --- | --- |
-| `canonical` | Strict bounded CBOR, bytes, typed hash domains |
-| `protocol` | Signed messages, program (SQL and platform-operation) and value codecs, execution manifest, order keys |
-| `capabilities` | Genesis, grants, revocations, validation policy |
-| `crypto` | HPKE, signed epochs, content encryption |
-| `transport-ssb` | SQLite signed-feed store, replication over the SSB handshake, in-memory simulator |
-| `control-store` | Candidates, attestations, order, heartbeats, settlement evidence |
-| `node-core` | Ingestion, admission, attestation, encryption, orchestration |
-| `materializer-doltlite` | Deterministic SQL execution, owner-controlled rows (platform operations, generated triggers), Dolt checkpoints, suffix replay, local SQL |
-| `materializer` | Portable materialization contracts shared with the workerd path |
-| `runtime-workerd` | Experimental workerd execution contract ([plan](docs/workerd-reconstruction-plan.md)) |
-| `rpc` | Service contract, in-process and HTTP transports |
-| `client` / `react` | TypeScript client and React hooks |
-| `conformance` | Replay-equivalence and release characterization |
-| `chaos` | Container topology, faults, workloads, invariant checks |
-| `testkit` | Clocks, permutations, network helpers |
+| `peer-session` | Public lifecycle, commands, queries, operation journal, recovery, content, keys and tools |
+| `peer-generation` | Signed authority, ordering, selected ancestry, replica verification and participant protocol |
+| `records` | Shared byte store, native/browser ownership and bounded transport framing |
+| `materializer` | Execution contract and SQL-free event implementation |
+| `materializer-doltlite` | Deterministic SQL execution with native and WASM engine adapters |
+| `transport-webrtc` | RTC connections, bounded delivery and signaling mechanics |
+| `transport-websocket` | Two independent binary sockets using the same bounded message framing |
+| `signals` | Replaceable, bounded ephemeral application signals |
+| `protocol`, `crypto`, `canonical` | Programs, canonical encodings, digests and cryptography |
+| `conformance` | Execution equivalence, crash/reopen and resource qualification |
 
-## Status
+`peer-generation-v1` is the immutable signed record format identifier. It does
+not select a different application runtime or public API. SQL availability is an
+explicit engine capability; participant transport and role do not alter replay.
 
-A comprehensive prototype, not a production release. Remaining work before
-production: witnessed pilot drills, hardware-backed key providers, the open
-security findings, and an external security review. See
-[implementation status](docs/implementation-status.md) and
-[upcoming work](upcoming.md).
+## Build and qualify
+
+Use Node 24 and the pinned package manager:
+
+```sh
+corepack pnpm install --frozen-lockfile
+corepack pnpm lint
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm docs:check
+```
+
+Package the supported composition from clean source:
+
+```sh
+node tools/package-peer-session.mjs
+node tools/package-peer-session.mjs --native-rtc --output artifacts/peer-session-rtc
+node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
+node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-session-sql-browser
+node tools/package-peer-generation-control.mjs
+```
+
+Archives include self-contained declarations, shared ESM chunks and exact source,
+tree, input and artifact hashes. Native SQL packaging requires the exact patched
+engine. The default browser/native session archive remains SQL-free. A development
+archive requires explicit `--allow-dirty` and records that fact.
+
+The [independent Tendriller recipes](https://github.com/werg/tendriller-contrib/tree/refactor/owned-peer-data-plane/cookbooks/run-a-peer-application)
+consume these packages and qualify conversation, guarded tasks, native RTC,
+browser ownership, WebSocket fallback and actual hosted control/publication. CI
+pins exact consumer commits. Loopback and local Worker results do not establish
+Internet reachability, browser suspension or provider cost savings. TURN is not
+required; relay bandwidth and availability remain explicit operating costs.
+
+Read the [architecture](docs/peer-generation-v1.md), [SQL contract](docs/implementation-specs/10-deterministic-sql-transactions.md)
+and [qualification guide](docs/release-hardening.md) for the trust and operating
+limits. There is no mandatory permanent resident or hosted command executor.

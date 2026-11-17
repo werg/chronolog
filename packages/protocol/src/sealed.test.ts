@@ -9,7 +9,7 @@ import {
 } from './sealed.js'
 import { assertCanonicalCbor, encodeCanonicalCbor, type CborValue } from './cbor.js'
 import { decodePlatformOp, encodePlatformOp, isPlatformOp } from './platform.js'
-import { decodeSqlTransactionProgram, encodeSqlTransactionProgram, isSqlStatementStep, sqlProgram } from './program.js'
+import { decodeChangeProgram, encodeChangeProgram, isSqlStatementStep, MAX_PROGRAM_BYTES, program } from './program.js'
 
 const bytes = (seed: number, length = 32): Uint8Array => new Uint8Array(length).fill(seed)
 const envelope = (): SealedEnvelope => ({
@@ -33,9 +33,9 @@ describe('sealed protocol', () => {
       expect(isPlatformOp(op)).toBe(true)
       expect(decodePlatformOp(encodePlatformOp(op))).toEqual(op)
     }
-    const program = sqlProgram('INSERT INTO notes (id) VALUES (1)', ...operations)
-    const decoded = decodeSqlTransactionProgram(encodeSqlTransactionProgram(program))
-    expect(decoded).toEqual(program)
+    const change = program('INSERT INTO notes (id) VALUES (1)', ...operations)
+    const decoded = decodeChangeProgram(encodeChangeProgram(change))
+    expect(decoded).toEqual(change)
     expect(decoded.steps.map(isSqlStatementStep)).toEqual([true, false, false, false])
   })
 
@@ -54,6 +54,13 @@ describe('sealed protocol', () => {
     }
     const policy = operations[1]!
     expect(policy.op === 'reader_policy' ? policy.readers : []).toEqual([bytes(4), bytes(5)])
+  })
+
+  it('applies the complete change-program budget to otherwise valid sealed values', () => {
+    const value = { ...envelope(), ciphertext: bytes(4, MAX_PROGRAM_BYTES) }
+    expect(decodeSealedEnvelope(encodeSealedEnvelope(value))).toEqual(value)
+    const step = sealedOp.put({ policyId: bytes(2), expectedPolicyVersion: 1n, expectedDataVersion: 0n, slot: 'body', envelope: value })
+    expect(() => program(step)).toThrow('Change program is too large')
   })
 
   it('requires a generation id for replacement and prevents version overflow', () => {

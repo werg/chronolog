@@ -92,16 +92,23 @@ export const DEFAULT_SQL_RUNTIME_LIMITS: Readonly<SqlRuntimeLimits> = {
   maxResultRows: 10_000,
 }
 
+/** Included in the execution-manifest platform digest on every runtime. */
+export const SQL_PROFILE_VERSION = 'chronolog-portable-sql-policy-v2'
+
 /**
- * Read-only pragmas whose answers depend only on the schema and the pinned
- * engine build. They are allowed as statements and as table-valued functions.
+ * Read-only pragmas whose answers describe replicated SQL state. Build and
+ * connection catalogs are separate: native and WASM share SQL semantics while
+ * compiling different host adapters and diagnostic registrations.
  */
 export const READ_ONLY_PRAGMAS: ReadonlySet<string> = new Set([
-  'collation_list', 'compile_options', 'foreign_key_list', 'function_list',
-  'index_info', 'index_list', 'index_xinfo', 'module_list', 'pragma_list',
+  'foreign_key_list', 'index_info', 'index_list', 'index_xinfo',
   'table_info', 'table_list', 'table_xinfo',
   // SQLite runs quick_check itself while executing ALTER TABLE ... ADD COLUMN.
   'quick_check',
+])
+
+const LOCAL_DIAGNOSTIC_PRAGMAS: ReadonlySet<string> = new Set([
+  'collation_list', 'compile_options', 'function_list', 'module_list', 'pragma_list',
 ])
 
 /**
@@ -111,6 +118,7 @@ export const READ_ONLY_PRAGMAS: ReadonlySet<string> = new Set([
  */
 export const CONSENSUS_DENIED_FUNCTIONS: ReadonlySet<string> = new Set([
   'load_extension', 'total_changes', 'sqlite_offset', 'active_branch',
+  'sqlite_compileoption_get', 'sqlite_compileoption_used', 'sqlite_source_id',
 ])
 
 /** Virtual-table modules that read physical storage rather than SQL state. */
@@ -168,7 +176,7 @@ export const OWNER_COLUMN = 'chronolog_owner'
 export function isReservedSchemaObjectName(value: string): boolean {
   const key = asciiLower(value)
   return key.startsWith('chronolog_') || key.startsWith('sqlite_') || key.startsWith('dolt_') ||
-    key.startsWith('doltlite_') || key.startsWith('pragma_')
+    key.startsWith('doltlite_') || key.startsWith('pragma_') || CONSENSUS_DENIED_MODULES.has(key)
 }
 
 export class SqlProfileError extends Error {
@@ -251,13 +259,13 @@ export function prepareProfiledStatement(
 ): StatementLike {
   const limits = normalizeSqlRuntimeLimits(inputLimits)
   validateSqlSource(sql, limits)
-  if (mode === 'consensus' || mode === 'local_read') assertConsensusPragma(sql)
+  if (mode === 'consensus' || mode === 'local_read') assertProfilePragma(sql, mode)
   return withProfileControls(database, mode, limits, authorization, () => {
     let statement: StatementLike
     try {
       statement = database.prepare(sql)
     } catch (error) {
-      if (isSqlAuthorizationError(error)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
+      if (isSqlAuthorizationError(error) || isDeniedFeatureError(error, mode)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
       if (isOperationalSqliteError(error)) throw error
       throw new SqlProfileError('SQL_PREPARE_FAILED')
     }
@@ -280,20 +288,24 @@ export function withProfiledStatement<T>(
 ): T {
   const limits = normalizeSqlRuntimeLimits(inputLimits)
   validateSqlSource(sql, limits)
-  if (mode === 'consensus' || mode === 'local_read') assertConsensusPragma(sql)
+  if (mode === 'consensus' || mode === 'local_read') assertProfilePragma(sql, mode)
   const phase: StatementPhase = { stepping: false }
   return withProfileControls(database, mode, limits, authorization, () => {
     let statement: StatementLike
     try {
       statement = database.prepare(sql)
     } catch (error) {
-      if (isSqlAuthorizationError(error)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
+      if (isSqlAuthorizationError(error) || isDeniedFeatureError(error, mode)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
       if (isOperationalSqliteError(error)) throw error
       throw new SqlProfileError('SQL_PREPARE_FAILED')
     }
-    validateSingleStatement(sql, statement)
-    phase.stepping = true
-    return operation(statement)
+    try {
+      validateSingleStatement(sql, statement)
+      phase.stepping = true
+      return operation(statement)
+    } finally {
+      statement.finalize?.()
+    }
   }, phase)
 }
 
@@ -406,12 +418,12 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
       return CONSENSUS_DENIED_FUNCTIONS.has(functionName) ? SQLITE_DENY : SQLITE_OK
     }
     if (action === ACTION.PRAGMA) {
-      if (READ_ONLY_PRAGMAS.has(objectName)) return SQLITE_OK
+      if (isReadOnlyPragma(objectName, mode)) return SQLITE_OK
       // A virtual-table module's own query (no caller, no value set). App SQL
       // cannot issue these: inside views and triggers the caller is set, and
       // top-level SQL naming them (PRAGMA statements and pragma_* table
       // functions) is refused by its text before it is prepared
-      // (assertConsensusPragma), since data_version differs between replicas.
+      // (assertProfilePragma), since data_version differs between replicas.
       const moduleInternal = caller === '' && secondaryName === '' && MODULE_INTERNAL_PRAGMAS.has(objectName)
       return moduleInternal ? SQLITE_OK : SQLITE_DENY
     }
@@ -419,7 +431,8 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
       // SQLite may omit the database name on follow-on READ callbacks.
       if (database !== '' && database !== 'main' && database !== 'temp') return SQLITE_DENY
       // Dolt system tables expose per-replica history (commit hashes, times).
-      if (mode !== 'local_read' && isDoltName(objectName)) return SQLITE_DENY
+      if (mode !== 'local_read' && (isDoltName(objectName) || CONSENSUS_DENIED_MODULES.has(objectName))) return SQLITE_DENY
+      if (mode !== 'local_read' && objectName.startsWith('pragma_') && !READ_ONLY_PRAGMAS.has(objectName.slice('pragma_'.length))) return SQLITE_DENY
       return SQLITE_OK
     }
     if (mode === 'local_read') {
@@ -512,7 +525,7 @@ function asciiLower(value: string | null): string {
  * pragma query, so it is checked by its text. Anything this does not
  * recognize is refused.
  */
-export function assertConsensusPragma(sql: string): void {
+function assertProfilePragma(sql: string, mode: SqlAuthorizationMode): void {
   let rest = sql
   for (;;) {
     const skipped = rest.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)/u, '')
@@ -529,7 +542,35 @@ export function assertConsensusPragma(sql: string): void {
   rest = rest.replace(/^EXPLAIN(?:\s+QUERY\s+PLAN)?\s+/iu, '')
   if (!/^PRAGMA\b/iu.test(rest)) return
   const match = /^PRAGMA\s+(?:main\s*\.\s*)?([A-Za-z_]+)\s*(?:\(\s*[^()]*\)\s*)?;?\s*$/iu.exec(rest)
-  if (match === null || !READ_ONLY_PRAGMAS.has(match[1]!.toLowerCase())) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
+  if (match === null || !isReadOnlyPragma(match[1]!.toLowerCase(), mode)) throw new SqlProfileError('SQL_PROFILE_VIOLATION')
+}
+
+function isReadOnlyPragma(name: string, mode: SqlAuthorizationMode): boolean {
+  return READ_ONLY_PRAGMAS.has(name) || mode === 'local_read' && LOCAL_DIAGNOSTIC_PRAGMAS.has(name)
+}
+
+/**
+ * Some host builds omit a forbidden diagnostic entirely (e.g. WASM omits
+ * load_extension). SQLite resolves names before the authorizer sees them, so
+ * absence or a wrong argument count must produce the same policy rejection as
+ * an existing denied name. Both errors can precede authorizer callbacks.
+ * Use the parser's resolved error name; do not scan SQL literals or aliases.
+ */
+function isDeniedFeatureError(error: unknown, mode: SqlAuthorizationMode): boolean {
+  if (mode === 'internal_bootstrap' || !(error instanceof Error)) return false
+  const arity = /\bwrong number of arguments to function ([A-Za-z_][A-Za-z_0-9]*)\(\)/iu.exec(error.message)
+  if (arity !== null) return isDeniedFunction(asciiLower(arity[1]!), mode)
+  const match = /\bno such (function|table):\s*(?:(?:main|temp)\.)?([A-Za-z_][A-Za-z_0-9]*)\b/iu.exec(error.message)
+  if (match === null) return false
+  const name = asciiLower(match[2]!)
+  if (match[1]!.toLowerCase() === 'function') return isDeniedFunction(name, mode)
+  return mode !== 'local_read' && (isDoltName(name) || CONSENSUS_DENIED_MODULES.has(name) ||
+    name.startsWith('pragma_') && !READ_ONLY_PRAGMAS.has(name.slice('pragma_'.length)))
+}
+
+function isDeniedFunction(name: string, mode: SqlAuthorizationMode): boolean {
+  if (isDoltName(name)) return true
+  return mode === 'local_read' ? FORBIDDEN_LOCAL_READ_FUNCTIONS.has(name) : CONSENSUS_DENIED_FUNCTIONS.has(name)
 }
 
 function validateSqlSource(sql: string, limits: SqlRuntimeLimits): void {

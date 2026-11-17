@@ -27,6 +27,24 @@ export function decodeUtf8(value: Uint8Array): string { return wrap(() => shared
 export function bytesToHex(value: Uint8Array): string { return sharedBytesToHex(value) }
 export function hexToBytes(value: string): Uint8Array { return wrap(() => sharedHexToBytes(value)) }
 
+/** Canonical unpadded base64url using only APIs shared by browsers and Node. */
+export function bytesToBase64Url(value: Uint8Array): string {
+  let binary = ''
+  for (let offset = 0; offset < value.length; offset += 16_384) {
+    binary += String.fromCharCode(...value.subarray(offset, offset + 16_384))
+  }
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
+}
+
+export function base64UrlToBytes(value: string): Uint8Array {
+  protocolInvariant(/^[A-Za-z0-9_-]*$/u.test(value) && value.length % 4 !== 1,
+    'SCHEMA_INVALID', 'Bytes must use canonical unpadded base64url')
+  const binary = atob(value.replaceAll('-', '+').replaceAll('_', '/'))
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  protocolInvariant(bytesToBase64Url(bytes) === value, 'SCHEMA_INVALID', 'Bytes must use canonical unpadded base64url')
+  return bytes
+}
+
 export function assertByteLength(value: Uint8Array, length: number, field: string): Uint8Array {
   protocolInvariant(value.length === length, 'SCHEMA_INVALID', `${field} must contain exactly ${length} bytes`, { field, expected: length, actual: value.length })
   return value

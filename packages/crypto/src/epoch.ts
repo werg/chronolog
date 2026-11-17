@@ -12,6 +12,7 @@ import {
   expectString,
   expectUint64,
   expectVersion,
+  hashDomain,
   integerMap,
   protocolInvariant,
   required,
@@ -36,7 +37,10 @@ export interface EpochKeyWrap {
 export interface EpochManifest {
   readonly groupId: Uint8Array
   readonly epoch: bigint
-  readonly previousEpochDigest: Uint8Array | null
+  /** Governance revision that introduced this epoch; genesis digest for epoch zero. */
+  readonly membershipRevision: Uint8Array
+  /** Binds every distribution of this epoch to the same content key. */
+  readonly contentKeyDigest: Uint8Array
   readonly suite: typeof HPKE_SUITE
   readonly createdAtMs: bigint
   readonly wraps: readonly EpochKeyWrap[]
@@ -64,8 +68,15 @@ function source(value: Uint8Array): ArrayBuffer {
   return Uint8Array.from(value).buffer
 }
 
-function wrapContext(groupId: Uint8Array, epoch: bigint, previous: Uint8Array | null, recipientId: Uint8Array): Uint8Array {
-  return encodeCanonicalCbor(integerMap([[0, groupId], [1, epoch], [2, previous], [3, recipientId], [4, HPKE_SUITE]]))
+function wrapContext(groupId: Uint8Array, epoch: bigint, membershipRevision: Uint8Array,
+  contentKeyDigest: Uint8Array, recipientId: Uint8Array): Uint8Array {
+  return encodeCanonicalCbor(integerMap([[0, groupId], [1, epoch], [2, membershipRevision],
+    [3, recipientId], [4, HPKE_SUITE], [5, contentKeyDigest]]))
+}
+
+export async function epochContentKeyDigest(groupId: Uint8Array, epoch: bigint, contentKey: Uint8Array): Promise<Uint8Array> {
+  protocolInvariant(contentKey.length === 32, 'INVALID_KEY', 'Epoch content key must contain 32 bytes')
+  return hashDomain(DOMAINS.epochKey, encodeCanonicalCbor([groupId, epoch, contentKey]))
 }
 
 function wrapToCbor(value: EpochKeyWrap): CborValue {
@@ -75,14 +86,17 @@ function wrapToCbor(value: EpochKeyWrap): CborValue {
 function manifestToCbor(value: EpochManifest): CborValue {
   protocolInvariant(value.epoch >= 0n, 'INTEGER_OUT_OF_RANGE', 'Encryption epoch cannot be negative')
   protocolInvariant(value.suite === HPKE_SUITE, 'SCHEMA_INVALID', 'Unsupported HPKE suite')
-  protocolInvariant(value.wraps.length > 0, 'SCHEMA_INVALID', 'Epoch manifest requires at least one recipient')
+  protocolInvariant(value.membershipRevision.length === 32 && value.contentKeyDigest.length === 32,
+    'SCHEMA_INVALID', 'Epoch key distribution requires a governance revision and key commitment')
+  // A group with no readers still advances its key epoch. The administrator
+  // retains the key privately; no revoked reader receives a wrap for it.
   const sorted = [...value.wraps].sort((a, b) => compareBytes(a.recipientId, b.recipientId))
   for (let index = 1; index < sorted.length; index += 1) {
     protocolInvariant(compareBytes(sorted[index - 1]?.recipientId ?? new Uint8Array(), sorted[index]?.recipientId ?? new Uint8Array()) !== 0, 'SCHEMA_INVALID', 'Epoch manifest contains duplicate recipient')
   }
   return integerMap([
-    [0, 1n], [1, value.groupId], [2, value.epoch], [3, value.previousEpochDigest],
-    [4, value.suite], [5, value.createdAtMs], [6, sorted.map(wrapToCbor)],
+    [0, 1n], [1, value.groupId], [2, value.epoch], [3, value.membershipRevision],
+    [4, value.suite], [5, value.createdAtMs], [6, sorted.map(wrapToCbor)], [7, value.contentKeyDigest],
   ])
 }
 
@@ -92,16 +106,15 @@ export function encodeEpochManifest(value: EpochManifest): Uint8Array {
 
 export function decodeEpochManifest(bytes: Uint8Array): EpochManifest {
   const map = expectMap(assertCanonicalCbor(bytes), 'epoch_manifest')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6], 'epoch_manifest')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7], 'epoch_manifest')
   expectVersion(map, 1n, 'epoch_manifest')
-  const previous = required(map, 3, 'epoch_manifest.previous')
-  protocolInvariant(previous === null || previous instanceof Uint8Array, 'SCHEMA_INVALID', 'Previous epoch digest must be null or bytes')
   const suite = expectString(required(map, 4, 'epoch_manifest.suite'), 'epoch_manifest.suite')
   protocolInvariant(suite === HPKE_SUITE, 'SCHEMA_INVALID', 'Unsupported HPKE suite')
   const manifest: EpochManifest = {
     groupId: expectBytes(required(map, 1, 'epoch_manifest.group_id'), 'epoch_manifest.group_id'),
     epoch: expectUint64(required(map, 2, 'epoch_manifest.epoch'), 'epoch_manifest.epoch'),
-    previousEpochDigest: previous,
+    membershipRevision: expectBytes(required(map, 3, 'epoch_manifest.membership_revision'), 'epoch_manifest.membership_revision', 32),
+    contentKeyDigest: expectBytes(required(map, 7, 'epoch_manifest.content_key_digest'), 'epoch_manifest.content_key_digest', 32),
     suite,
     createdAtMs: expectUint64(required(map, 5, 'epoch_manifest.created_at'), 'epoch_manifest.created_at'),
     wraps: expectArray(required(map, 6, 'epoch_manifest.wraps'), 'epoch_manifest.wraps').map((item, index) => {
@@ -142,7 +155,7 @@ export function decodeSignedEpochManifest(bytes: Uint8Array): SignedEpochManifes
 export async function createEpochManifest(input: {
   readonly groupId: Uint8Array
   readonly epoch: bigint
-  readonly previousEpochDigest: Uint8Array | null
+  readonly membershipRevision: Uint8Array
   readonly createdAtMs: bigint
   readonly recipients: readonly EpochRecipient[]
   readonly signerPublicKey: Uint8Array
@@ -153,13 +166,13 @@ export async function createEpochManifest(input: {
     ? globalThis.crypto.getRandomValues(new Uint8Array(32))
     : Uint8Array.from(input.contentKey)
   protocolInvariant(contentKey.length === 32, 'SCHEMA_INVALID', 'Epoch content key must contain 32 bytes')
+  const contentKeyDigest = await epochContentKeyDigest(input.groupId, input.epoch, contentKey)
   const recipients = [...input.recipients].sort((a, b) => compareBytes(a.recipientId, b.recipientId))
-  protocolInvariant(recipients.length > 0, 'SCHEMA_INVALID', 'Epoch requires at least one reader recipient')
   const wraps: EpochKeyWrap[] = []
   for (let index = 0; index < recipients.length; index += 1) {
     const recipient = recipients[index] as EpochRecipient
     if (index > 0) protocolInvariant(compareBytes(recipients[index - 1]?.recipientId ?? new Uint8Array(), recipient.recipientId) !== 0, 'SCHEMA_INVALID', 'Epoch recipients must be unique')
-    const context = wrapContext(input.groupId, input.epoch, input.previousEpochDigest, recipient.recipientId)
+    const context = wrapContext(input.groupId, input.epoch, input.membershipRevision, contentKeyDigest, recipient.recipientId)
     const sealed = await hpkeSealBase(recipient.publicKey, contentKey, context, context)
     wraps.push({
       recipientId: recipient.recipientId,
@@ -171,7 +184,8 @@ export async function createEpochManifest(input: {
   const manifest: EpochManifest = {
     groupId: input.groupId,
     epoch: input.epoch,
-    previousEpochDigest: input.previousEpochDigest,
+    membershipRevision: input.membershipRevision,
+    contentKeyDigest,
     suite: HPKE_SUITE,
     createdAtMs: input.createdAtMs,
     wraps,
@@ -195,7 +209,7 @@ export async function unwrapEpochKey(input: {
   const { manifest } = input.signedManifest
   const wrap = manifest.wraps.find((candidate) => equalBytes(candidate.recipientId, input.recipientId))
   protocolInvariant(wrap !== undefined, 'INVALID_KEY', 'Epoch manifest has no wrap for recipient')
-  const context = wrapContext(manifest.groupId, manifest.epoch, manifest.previousEpochDigest, input.recipientId)
+  const context = wrapContext(manifest.groupId, manifest.epoch, manifest.membershipRevision, manifest.contentKeyDigest, input.recipientId)
   const key = await hpkeOpenBase(
     input.recipientPrivateKey,
     wrap.recipientPublicKey,
@@ -205,6 +219,8 @@ export async function unwrapEpochKey(input: {
     context,
   )
   protocolInvariant(key.length === 32, 'INVALID_KEY', 'Unwrapped epoch key has invalid length')
+  protocolInvariant(equalBytes(await epochContentKeyDigest(manifest.groupId, manifest.epoch, key), manifest.contentKeyDigest),
+    'INVALID_KEY', 'Unwrapped key contradicts the signed epoch commitment')
   return key
 }
 

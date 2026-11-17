@@ -1,5 +1,5 @@
 import { DatabaseSync } from '@dolthub/doltlite'
-import { sqlStatement, type SqlTransactionProgram } from '@chronolog/protocol'
+import { program } from '@chronolog/protocol'
 import { describe, expect, it } from 'vitest'
 
 import { initializePlatform } from './platform/schema.js'
@@ -21,8 +21,7 @@ function database(): DatabaseLike {
 }
 
 function execute(db: DatabaseLike, ...sql: readonly string[]): void {
-  const program: SqlTransactionProgram = { version: 2, steps: sql.map((step) => sqlStatement(step)) }
-  executeTransactionProgram(db, program, { actor: ROOT_KEY, txId: testKey(2), authorTimestampMs: 1n, groupId: testKey(3) })
+  executeTransactionProgram(db, program(...sql), { actor: ROOT_KEY, txId: testKey(2), authorTimestampMs: 1n, groupId: testKey(3) })
 }
 
 function schemaVersion(db: DatabaseLike): number {

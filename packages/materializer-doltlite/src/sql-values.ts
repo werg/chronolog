@@ -1,3 +1,4 @@
+import { utf8 } from '@chronolog/canonical'
 import { shadowTables } from './platform/session.js'
 import { SqlProfileError, withProfiledStatement } from './sql-profile.js'
 import type { DatabaseLike, LocalSqlValue, SqlRuntimeLimits } from './types.js'
@@ -65,7 +66,7 @@ function databaseValueToLocalValue(value: unknown): LocalSqlValue {
     return { kind: 'real', value }
   }
   if (typeof value === 'string') return { kind: 'text', value }
-  if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
+  if (value instanceof Uint8Array) {
     return { kind: 'blob', value: Uint8Array.from(value) }
   }
   throw new Error('SQL_UNSUPPORTED_RESULT_TYPE')
@@ -75,13 +76,13 @@ function approximateResultBytes(
   columns: readonly { readonly name: string }[],
   rows: readonly (readonly LocalSqlValue[])[],
 ): number {
-  let total = columns.reduce((sum, column) => sum + Buffer.byteLength(column.name), 0)
+  let total = columns.reduce((sum, column) => sum + utf8(column.name).length, 0)
   for (const row of rows) for (const value of row) {
     switch (value.kind) {
       case 'null': total += 1; break
-      case 'integer': total += Buffer.byteLength(value.value); break
+      case 'integer': total += utf8(value.value).length; break
       case 'real': total += 8; break
-      case 'text': total += Buffer.byteLength(value.value); break
+      case 'text': total += utf8(value.value).length; break
       case 'blob': total += value.value.length; break
     }
     if (!Number.isSafeInteger(total)) return Number.MAX_SAFE_INTEGER

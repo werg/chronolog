@@ -1,6 +1,6 @@
 import type { TransactionOrderKey } from '@chronolog/protocol'
 
-import type { AdmittedTransaction } from './types.js'
+import type { ReplayProposal } from './types.js'
 
 export type MaterializedTransactionOutcomeKind = 'accepted' | 'rejected'
 
@@ -16,7 +16,8 @@ export interface MaterializedTransactionOutcome {
 export interface MaterializationOutcomeChange {
   readonly txId: Uint8Array
   readonly previous: MaterializedTransactionOutcomeKind | null
-  readonly current: MaterializedTransactionOutcomeKind
+  /** Null when a previously selected provisional proposal leaves the replay. */
+  readonly current: MaterializedTransactionOutcomeKind | null
   readonly previousRejectionCode: string | null
   readonly currentRejectionCode: string | null
 }
@@ -47,11 +48,26 @@ export interface CoordinatedMaterialization {
   readonly publication: MaterializationPublicationRequest
 }
 
-/** Calculates or follows one immutable materialization candidate. */
+/** Executes one order already authenticated by the history owner, independently of transport or ordering policy. */
 export interface MaterializationCoordinator {
   materialize(
-    orderedTransactions: readonly AdmittedTransaction[],
+    orderedTransactions: readonly ReplayProposal[],
+    controls?: PeerExecutionControls,
   ): Promise<CoordinatedMaterialization | null>
+  /** Optional settlement capability, invoked only by an owner holding the required settlement evidence. */
+  publishFinal?(prefixLength: number, controls?: PeerExecutionControls): Promise<void>
+}
+
+/** A verified control projection supplied by the history owner, never an application callback. */
+export interface PeerExecutionControl {
+  readonly revision: number
+  readonly digest: Uint8Array
+  readonly members: readonly { readonly publicKey: Uint8Array; readonly role: 'member' | 'admin' }[]
+}
+export interface PeerExecutionControls {
+  readonly applicationId: Uint8Array
+  readonly currentRevision: number
+  readonly revisions: readonly PeerExecutionControl[]
 }
 
 export type MaterializedLocalSqlValue =
@@ -64,6 +80,8 @@ export type MaterializedLocalSqlValue =
 export interface MaterializedLocalSqlResult {
   readonly revision: bigint
   readonly orderLength: number
+  readonly view?: 'local' | 'final'
+  readonly finalOrderLength?: number
   readonly columns: readonly { readonly name: string; readonly declaredType?: string }[]
   readonly rows: readonly (readonly MaterializedLocalSqlValue[])[]
 }
@@ -74,17 +92,51 @@ export interface MaterializedRevisionSnapshot {
   readonly executionManifestDigest: Uint8Array
 }
 
-/** Reads one published immutable materialization and reports revision changes. */
-export interface MaterializedQueryService {
+export interface MaterializedApplicationTransaction {
+  readonly txId: Uint8Array
+  readonly canonicalCandidate: Uint8Array
+  readonly outcome: MaterializedTransactionOutcomeKind
+}
+
+/** Immutable published revision; only requested application entries are copied. */
+export interface MaterializedApplicationSnapshot {
   readonly revision: bigint
   readonly orderLength: number
+  readonly finalRevision: bigint
+  readonly finalOrderLength: number
+  readonly view: 'local' | 'final'
+  /** A detached entry at this captured revision, or null outside its prefix. */
+  transactionAt(index: number): MaterializedApplicationTransaction | null
+}
+
+/** A bounded SQL lease captured atomically with its published application snapshot. */
+export interface MaterializedReadHandle extends MaterializedApplicationSnapshot {
+  query(sql: string, parameters?: readonly MaterializedLocalSqlValue[]): MaterializedLocalSqlResult
+  release(): void
+}
+
+export interface MaterializedQueryCapabilities {
+  readonly sql: boolean
+}
+
+/** Reads one published immutable materialization and reports revision changes. */
+export interface MaterializedQueryService {
+  readonly capabilities: MaterializedQueryCapabilities
+  readonly revision: bigint
+  readonly orderLength: number
+  readonly finalRevision?: bigint
+  readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
+  /** Original proposal identity at this position in the currently applied local order. */
+  proposalIdAt(index: number): Uint8Array | null
   localSql(
     sql: string,
     parameters?: readonly MaterializedLocalSqlValue[],
-    options?: { readonly atRevision?: bigint },
+    options?: { readonly atRevision?: bigint; readonly view?: 'local' | 'final' },
   ): MaterializedLocalSqlResult
   outcome(txId: Uint8Array): MaterializedTransactionOutcome | null
+  captureApplication(options?: { readonly view?: 'local' | 'final' }): MaterializedApplicationSnapshot
+  captureRead?(options?: { readonly view?: 'local' | 'final' }): MaterializedReadHandle
   subscribe(subscriber: (revision: MaterializedRevisionSnapshot) => void): () => void
 }
 
@@ -113,7 +165,7 @@ export function publicationRequestForRevision(
   revision: MaterializedRevision,
 ): MaterializationPublicationRequest {
   return {
-    publicationKey: `revision:${revision.contentHash}`,
+    publicationKey: `revision:${revision.revision}:${revision.contentHash}`,
     expectedRevision: revision.previousRevision,
     targetRevision: revision.revision,
     targetOrderLength: revision.orderLength,

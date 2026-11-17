@@ -1,0 +1,30 @@
+{
+  "name": "@chronolog/peer-session",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./native": "./src/native.ts",
+    "./browser": "./src/browser.ts",
+    "./sql-native": "./src/sql-native.ts",
+    "./webrtc": "./src/webrtc.ts",
+    "./webrtc-native": "./src/webrtc-native.ts",
+    "./tendriller": "./src/tendriller.ts",
+    "./sql": "./src/sql.ts",
+    "./sql-browser": "./src/sql-browser.ts",
+    "./websocket": "./src/websocket.ts",
+    "./worker": "./src/worker.ts"
+  },
+  "dependencies": {
+    "@chronolog/peer-generation": "workspace:*",
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/materializer": "workspace:*",
+    "@chronolog/records": "workspace:*",
+    "@chronolog/signals": "workspace:*",
+    "@chronolog/materializer-doltlite": "workspace:*",
+    "@chronolog/transport-webrtc": "workspace:*",
+    "@chronolog/crypto": "workspace:*",
+    "@chronolog/transport-websocket": "workspace:*"
+  }
+}

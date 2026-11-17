@@ -4,9 +4,7 @@
     "noEmit": true
   },
   "include": [
-    "apps/**/*.ts",
     "packages/**/*.ts",
-    "examples/**/*.ts",
     "test/**/*.ts",
     "tools/**/*.ts",
     "vitest.config.ts"

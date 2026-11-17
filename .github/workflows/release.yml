@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
@@ -28,23 +28,37 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm conformance:production
-      - run: pnpm release:distribution
-      - run: pnpm test:distribution-upgrade
+      - run: pnpm conformance
+      - run: pnpm package:signals
+      - run: pnpm test:signals-package
+      - run: pnpm package:control
+      - run: node tools/package-peer-session.mjs --native-rtc --sql-native
+      - name: Verify native SQL package
+        shell: bash
+        run: |
+          archives=(artifacts/peer-session/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
       - run: pnpm release:metadata
       - uses: actions/attest-build-provenance@v3
         with:
           subject-path: |
             artifacts/release/sbom.cdx.json
             artifacts/release/provenance.intoto.jsonl
-            artifacts/conformance/production-native.json
-            artifacts/distribution/*.tar.gz
+            artifacts/conformance/report.json
+            artifacts/peer-session/*.tgz
+            artifacts/peer-generation-control/*.tgz
+            artifacts/signals/*.tgz
       - uses: actions/upload-artifact@v6
         with:
           name: release-evidence-${{ matrix.os }}-${{ github.sha }}
           path: |
             artifacts/release/
-            artifacts/conformance/production-native.json
-            artifacts/distribution/*.tar.gz
+            artifacts/conformance/report.json
+            artifacts/peer-session/*.tgz
+            artifacts/peer-generation-control/*.tgz
+            artifacts/signals/*.tgz
+            artifacts/signals/*.consumer.json
+            artifacts/peer-session-sql-check/report.json
           if-no-files-found: error
           retention-days: 90

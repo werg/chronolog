@@ -1,7 +1,7 @@
 import {
   DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
-  type AdmittedTransaction,
+  createNativeSqlEngine,
+  type ReplayProposal,
   type MaterializerPublicationFaultPoint,
 } from '@chronolog/materializer-doltlite'
 import {
@@ -14,10 +14,10 @@ import {
 const [path, requestedPoint] = process.argv.slice(2)
 if (path === undefined || requestedPoint === undefined) throw new Error('CRASH_FIXTURE_ARGUMENTS_REQUIRED')
 const point = requestedPoint as MaterializerPublicationFaultPoint
-const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-native-production-v1' })
+const engine = createNativeSqlEngine()
 const materializer = await DeterministicMaterializer.open({
   path,
-  executionManifest: manifest,
+  engine,
   // The probe's author is the root administrator, so it may create the table.
   rootAdministrator: bytes32(4),
   checkpointEvery: 1,
@@ -26,6 +26,7 @@ const materializer = await DeterministicMaterializer.open({
   },
 })
 const core: TransactionCore = {
+  operationId: 'publication-crash',
   groupId: bytes32(1),
   membershipRevision: bytes32(2),
   validationPolicy: bytes32(3),
@@ -34,14 +35,13 @@ const core: TransactionCore = {
   nonce: bytes32(5),
   executionManifestDigest: materializer.executionManifestDigest,
   program: {
-    version: 2,
+    version: 3,
     steps: [{ sql: 'CREATE TABLE crash_probe (id INTEGER PRIMARY KEY) STRICT', bindings: [] }],
   },
 }
 const canonicalCandidate = encodeTransactionCore(core)
-const transaction: AdmittedTransaction = {
+const transaction: ReplayProposal = {
   txId: utf8('crash-probe'),
-  authorFeedSequence: 1n,
   candidateDigest: await transactionDigest(canonicalCandidate),
   canonicalCandidate,
   core,

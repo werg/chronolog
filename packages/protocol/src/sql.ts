@@ -227,7 +227,7 @@ export interface ExecutionManifest {
   readonly engine: string
   /** SHA-256 over the native engine descriptor. */
   readonly engineDigest: Uint8Array
-  readonly programVersion: 2
+  readonly programVersion: 3
   /** SHA-256 over the platform operations and the trigger and view generators. */
   readonly platformDigest: Uint8Array
   /** `PRAGMA recursive_triggers` during consensus execution; always on. */
@@ -253,7 +253,7 @@ export function createExecutionManifest(options: {
     profile: options.profile,
     engine: options.engine ?? 'doltlite',
     engineDigest: Uint8Array.from(options.engineDigest),
-    programVersion: 2,
+    programVersion: 3,
     platformDigest: Uint8Array.from(options.platformDigest),
     recursiveTriggers: true,
     limits: { ...DEFAULT_EXECUTION_LIMITS, ...options.limits },
@@ -268,7 +268,7 @@ function positiveLimit(value: number, name: string): bigint {
 }
 
 export function executionManifestToCbor(value: ExecutionManifest): CborValue {
-  protocolInvariant(value.version === 2 && value.programVersion === 2, 'UNSUPPORTED_VERSION', 'Unsupported execution manifest version')
+  protocolInvariant(value.version === 2 && value.programVersion === 3, 'UNSUPPORTED_VERSION', 'Unsupported execution manifest version')
   protocolInvariant(value.profile.length > 0 && value.engine.length > 0, 'SCHEMA_INVALID', 'Execution manifest needs a profile and engine')
   protocolInvariant(value.engineDigest.length === 32, 'SCHEMA_INVALID', 'Execution manifest engine digest must be 32 bytes')
   protocolInvariant(value.platformDigest.length === 32, 'SCHEMA_INVALID', 'Execution manifest platform digest must be 32 bytes')
@@ -278,7 +278,7 @@ export function executionManifestToCbor(value: ExecutionManifest): CborValue {
     [1, value.profile],
     [2, value.engine],
     [3, Uint8Array.from(value.engineDigest)],
-    [4, 2n],
+    [4, 3n],
     [5, integerMap([
       [0, positiveLimit(value.limits.maxSqlBytes, 'maxSqlBytes')],
       [1, positiveLimit(value.limits.maxVmSteps, 'maxVmSteps')],
@@ -293,7 +293,7 @@ export function executionManifestFromCbor(value: CborValue): ExecutionManifest {
   const map = expectMap(value, 'execution_manifest')
   assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7], 'execution_manifest')
   expectVersion(map, 2n, 'execution_manifest')
-  protocolInvariant(expectUint64(required(map, 4, 'execution_manifest.program_version'), 'execution_manifest.program_version') === 2n,
+  protocolInvariant(expectUint64(required(map, 4, 'execution_manifest.program_version'), 'execution_manifest.program_version') === 3n,
     'UNSUPPORTED_VERSION', 'Unsupported program version')
   const limits = expectMap(required(map, 5, 'execution_manifest.limits'), 'execution_manifest.limits')
   assertKnownIntegerKeys(limits, [0, 1, 2], 'execution_manifest.limits')
@@ -311,7 +311,7 @@ export function executionManifestFromCbor(value: CborValue): ExecutionManifest {
     profile: expectString(required(map, 1, 'execution_manifest.profile'), 'execution_manifest.profile'),
     engine: expectString(required(map, 2, 'execution_manifest.engine'), 'execution_manifest.engine'),
     engineDigest: Uint8Array.from(expectBytes(required(map, 3, 'execution_manifest.engine_digest'), 'execution_manifest.engine_digest', 32)),
-    programVersion: 2,
+    programVersion: 3,
     platformDigest: Uint8Array.from(expectBytes(required(map, 6, 'execution_manifest.platform_digest'), 'execution_manifest.platform_digest', 32)),
     recursiveTriggers: true,
     limits: {
