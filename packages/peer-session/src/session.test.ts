@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createGenerationRegistry, createPeerIdentity, MemoryBytesStore, signApplicationDescriptor,
-  signControlRevision, signTransitionRequest, participantGrant, bytesDigest, type PeerIdentity, type PrefixProof,
+  signControlRevision, signTransitionRequest, participantGrant, bytesDigest, peerDigest, type PeerIdentity, type PrefixProof,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -50,7 +50,7 @@ async function fixture() {
     const session = await openNativeApplication({ device, authority: await registry.read(), epochKeys, definition })
     cleanup.push(() => session.close()); return session
   }
-  return { a, b, c, directory, registry, select, open }
+  return { a, b, c, directory, registry, select, open, host }
 }
 
 async function applied(session: ApplicationSession<typeof definition>, text: string, id: string) {
@@ -265,6 +265,28 @@ describe('public peer application sessions', () => {
     cleanup.push(() => recovered.close())
     expect(await a.operations.get('unavailable')).toMatchObject({ status: 'abandoned' })
     expect((await reopened.query('messages', null)).value.events).toHaveLength(1)
+  })
+
+  it.each(['recovery', 'coordinator'] as const)('does not journal an ancestor transition without current %s authority', async permission => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const link = await connectApplications(a, b)
+    await a.waitForCoverage(await applied(a, 'retained ancestor', 'retained'), { signal: AbortSignal.timeout(5000) })
+    const ancestor = await b.recoveryPoint()
+    await link.close()
+    await f.select(f.a.identity, ancestor, 'second'); await a.adopt(await f.registry.read())
+    await applied(a, 'unavailable newer data', 'unavailable')
+    const bundle = await f.registry.read(), previous = bundle.controls[0]!
+    const control = await signControlRevision({ ...previous.payload, revision: 1, previous: await peerDigest(previous),
+      grants: previous.payload.grants.map(grant => grant.publicKey === b.deviceId ? { ...grant, [permission]: false } : grant),
+    }, f.host)
+    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: bundle.descriptor.payload.profile,
+      policy: bundle.descriptor.payload.policy, expectedGeneration: a.revision.generation, requester: a.deviceId,
+      coordinator: a.deviceId, controlRevision: 1, reason: 'control-change', transitionId: `revoke-${permission}`,
+      base: await a.recoveryPoint() }, f.a.identity), { control })
+    const host = { application: () => f.registry.read(), selectGeneration: vi.fn((request: Parameters<typeof f.registry.select>[0]) => f.registry.select(request)) }
+    await expect(b.recovery.takeover(host, { transitionId: 'forbidden' })).rejects.toThrow(permission === 'recovery' ? 'PEER_RECOVERY_FORBIDDEN' : 'PEER_COORDINATOR_FORBIDDEN')
+    expect(await b.recovery.inspect()).toEqual([]); expect(host.selectGeneration).not.toHaveBeenCalled()
+    await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
   })
 
   it('closes an unanswered hosted recovery wait while retaining its exact saved request', async () => {

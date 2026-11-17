@@ -132,6 +132,9 @@ export class ApplicationRecovery {
         const request = await signTransitionRequest({ applicationId: descriptor.applicationId, profile: descriptor.profile,
           policy: descriptor.policy, expectedGeneration: generation.id, coordinator, requester: this.#replica.device.publicKey,
           controlRevision: generation.payload.controlRevision, base, transitionId: transitionId ?? crypto.randomUUID(), reason }, this.#replica.device)
+        // Reuse the current authority's admission rules before retaining a new
+        // intent. A forbidden transition must not become a pending exact retry.
+        await (await verifyAuthorityBundle(this.#replica.authority)).authorizeTransition(request)
         signal.throwIfAborted()
         entry = { request, selected: null, superseded: false }
         journal.push(entry)
