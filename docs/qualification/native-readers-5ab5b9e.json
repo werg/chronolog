@@ -1,0 +1,566 @@
+{
+  "format": "chronolog-native-reader-resources/v1",
+  "passed": true,
+  "startedAt": "2026-11-17T15:28:50.597Z",
+  "completedAt": "2026-11-17T15:28:56.114Z",
+  "source": {
+    "commit": "5ab5b9e895594e4feeaae92a874f0b2627bf580d",
+    "tree": "c395d46437f471ceee76f1d720a7a72af3bdcd3c",
+    "dirty": false,
+    "toolSha256": "8d0f6057945c81b90bfcc5e325bdfb3e42171f164a4a1616a20594b1c5384258",
+    "materializerSha256": "1a8c681a4ef1c692ce73b925b84429b34e79ba120a87b9fe23e3bfcac688437e"
+  },
+  "environment": {
+    "node": "v24.22.1",
+    "platform": "linux",
+    "architecture": "x64",
+    "osRelease": "6.18.57",
+    "engine": "doltlite-amalgamation",
+    "sqlite": "3.54.0",
+    "engineDigest": "ebfc460db03b74f617d361b60ca7d953462a92f46063d97dde98cf99e97b5e9f",
+    "executionManifestDigest": "c962c4d407c4c99a46fd202ace615074523c4d49434924e9ed9248f31756a65b"
+  },
+  "scope": "Native peer-generation SQL materializer with synthetic canonical replay inputs at the verified-input boundary; no peer transport or complete application session qualification.",
+  "workload": {
+    "historySizes": [
+      0,
+      8,
+      32
+    ],
+    "bytesPerRow": 128,
+    "checkpointEvery": 8,
+    "retainCheckpoints": 8,
+    "capturesPerHistory": 128
+  },
+  "reads": [
+    {
+      "label": "history-0",
+      "selectedCommands": 0,
+      "sequentialCaptures": 128,
+      "simultaneousCaptures": 16,
+      "existingLeases": 0,
+      "rejectedCapture": 17,
+      "before": {
+        "counters": {
+          "databaseOpens": 4,
+          "databaseCloses": 1,
+          "branchCreates": 8,
+          "branchDeletes": 3,
+          "branchMoves": 3,
+          "checkouts": 9,
+          "resets": 0,
+          "commits": 2
+        },
+        "activeReaders": 2,
+        "activeConnections": 3,
+        "readerBranches": 2
+      },
+      "after": {
+        "counters": {
+          "databaseOpens": 4,
+          "databaseCloses": 1,
+          "branchCreates": 8,
+          "branchDeletes": 3,
+          "branchMoves": 3,
+          "checkouts": 9,
+          "resets": 0,
+          "commits": 2
+        },
+        "activeReaders": 2,
+        "activeConnections": 3,
+        "readerBranches": 2
+      },
+      "changes": {
+        "databaseOpens": 0,
+        "databaseCloses": 0,
+        "branchCreates": 0,
+        "branchDeletes": 0,
+        "branchMoves": 0,
+        "checkouts": 0,
+        "resets": 0,
+        "commits": 0
+      },
+      "beforeStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 222080
+          }
+        ],
+        "totalBytes": 222080,
+        "mainDatabaseBytes": 222080,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      },
+      "afterStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 222080
+          }
+        ],
+        "totalBytes": 222080,
+        "mainDatabaseBytes": 222080,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      }
+    },
+    {
+      "label": "history-8",
+      "selectedCommands": 8,
+      "sequentialCaptures": 128,
+      "simultaneousCaptures": 16,
+      "existingLeases": 0,
+      "rejectedCapture": 17,
+      "before": {
+        "counters": {
+          "databaseOpens": 12,
+          "databaseCloses": 9,
+          "branchCreates": 33,
+          "branchDeletes": 27,
+          "branchMoves": 11,
+          "checkouts": 33,
+          "resets": 0,
+          "commits": 10
+        },
+        "activeReaders": 2,
+        "activeConnections": 3,
+        "readerBranches": 2
+      },
+      "after": {
+        "counters": {
+          "databaseOpens": 12,
+          "databaseCloses": 9,
+          "branchCreates": 33,
+          "branchDeletes": 27,
+          "branchMoves": 11,
+          "checkouts": 33,
+          "resets": 0,
+          "commits": 10
+        },
+        "activeReaders": 2,
+        "activeConnections": 3,
+        "readerBranches": 2
+      },
+      "changes": {
+        "databaseOpens": 0,
+        "databaseCloses": 0,
+        "branchCreates": 0,
+        "branchDeletes": 0,
+        "branchMoves": 0,
+        "checkouts": 0,
+        "resets": 0,
+        "commits": 0
+      },
+      "beforeStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 386672
+          }
+        ],
+        "totalBytes": 386672,
+        "mainDatabaseBytes": 386672,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      },
+      "afterStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 386672
+          }
+        ],
+        "totalBytes": 386672,
+        "mainDatabaseBytes": 386672,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      }
+    },
+    {
+      "label": "history-32",
+      "selectedCommands": 32,
+      "sequentialCaptures": 128,
+      "simultaneousCaptures": 16,
+      "existingLeases": 1,
+      "rejectedCapture": 17,
+      "before": {
+        "counters": {
+          "databaseOpens": 36,
+          "databaseCloses": 32,
+          "branchCreates": 108,
+          "branchDeletes": 98,
+          "branchMoves": 35,
+          "checkouts": 105,
+          "resets": 0,
+          "commits": 34
+        },
+        "activeReaders": 3,
+        "activeConnections": 4,
+        "readerBranches": 3
+      },
+      "after": {
+        "counters": {
+          "databaseOpens": 36,
+          "databaseCloses": 32,
+          "branchCreates": 108,
+          "branchDeletes": 98,
+          "branchMoves": 35,
+          "checkouts": 105,
+          "resets": 0,
+          "commits": 34
+        },
+        "activeReaders": 3,
+        "activeConnections": 4,
+        "readerBranches": 3
+      },
+      "changes": {
+        "databaseOpens": 0,
+        "databaseCloses": 0,
+        "branchCreates": 0,
+        "branchDeletes": 0,
+        "branchMoves": 0,
+        "checkouts": 0,
+        "resets": 0,
+        "commits": 0
+      },
+      "beforeStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 1126767
+          }
+        ],
+        "totalBytes": 1126767,
+        "mainDatabaseBytes": 1126767,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      },
+      "afterStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 1126767
+          }
+        ],
+        "totalBytes": 1126767,
+        "mainDatabaseBytes": 1126767,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      }
+    },
+    {
+      "label": "recovered-prefix-with-old-views",
+      "selectedCommands": 4,
+      "sequentialCaptures": 128,
+      "simultaneousCaptures": 16,
+      "existingLeases": 2,
+      "rejectedCapture": 17,
+      "before": {
+        "counters": {
+          "databaseOpens": 37,
+          "databaseCloses": 32,
+          "branchCreates": 111,
+          "branchDeletes": 100,
+          "branchMoves": 36,
+          "checkouts": 108,
+          "resets": 0,
+          "commits": 35
+        },
+        "activeReaders": 4,
+        "activeConnections": 5,
+        "readerBranches": 4
+      },
+      "after": {
+        "counters": {
+          "databaseOpens": 37,
+          "databaseCloses": 32,
+          "branchCreates": 111,
+          "branchDeletes": 100,
+          "branchMoves": 36,
+          "checkouts": 108,
+          "resets": 0,
+          "commits": 35
+        },
+        "activeReaders": 4,
+        "activeConnections": 5,
+        "readerBranches": 4
+      },
+      "changes": {
+        "databaseOpens": 0,
+        "databaseCloses": 0,
+        "branchCreates": 0,
+        "branchDeletes": 0,
+        "branchMoves": 0,
+        "checkouts": 0,
+        "resets": 0,
+        "commits": 0
+      },
+      "beforeStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 1153967
+          }
+        ],
+        "totalBytes": 1153967,
+        "mainDatabaseBytes": 1153967,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      },
+      "afterStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 1153967
+          }
+        ],
+        "totalBytes": 1153967,
+        "mainDatabaseBytes": 1153967,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      }
+    },
+    {
+      "label": "reopened-recovered-prefix",
+      "selectedCommands": 4,
+      "sequentialCaptures": 128,
+      "simultaneousCaptures": 16,
+      "existingLeases": 0,
+      "rejectedCapture": 17,
+      "before": {
+        "counters": {
+          "databaseOpens": 40,
+          "databaseCloses": 37,
+          "branchCreates": 113,
+          "branchDeletes": 108,
+          "branchMoves": 36,
+          "checkouts": 114,
+          "resets": 1,
+          "commits": 35
+        },
+        "activeReaders": 2,
+        "activeConnections": 3,
+        "readerBranches": 2
+      },
+      "after": {
+        "counters": {
+          "databaseOpens": 40,
+          "databaseCloses": 37,
+          "branchCreates": 113,
+          "branchDeletes": 108,
+          "branchMoves": 36,
+          "checkouts": 114,
+          "resets": 1,
+          "commits": 35
+        },
+        "activeReaders": 2,
+        "activeConnections": 3,
+        "readerBranches": 2
+      },
+      "changes": {
+        "databaseOpens": 0,
+        "databaseCloses": 0,
+        "branchCreates": 0,
+        "branchDeletes": 0,
+        "branchMoves": 0,
+        "checkouts": 0,
+        "resets": 0,
+        "commits": 0
+      },
+      "beforeStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 1167254
+          }
+        ],
+        "totalBytes": 1167254,
+        "mainDatabaseBytes": 1167254,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      },
+      "afterStorage": {
+        "files": [
+          {
+            "path": ".application.sqlite-lock",
+            "bytes": 0
+          },
+          {
+            "path": "application.sqlite",
+            "bytes": 1167254
+          }
+        ],
+        "totalBytes": 1167254,
+        "mainDatabaseBytes": 1167254,
+        "separateWalBytes": null,
+        "separateWalPaths": [],
+        "physicalReadBytes": null,
+        "physicalWriteBytes": null
+      }
+    }
+  ],
+  "heldViews": {
+    "heldRowsAfterRecovery": [
+      8,
+      32
+    ],
+    "currentRowsAfterRecovery": 4,
+    "beforeRecovery": {
+      "counters": {
+        "databaseOpens": 36,
+        "databaseCloses": 32,
+        "branchCreates": 108,
+        "branchDeletes": 98,
+        "branchMoves": 35,
+        "checkouts": 105,
+        "resets": 0,
+        "commits": 34
+      },
+      "activeReaders": 3,
+      "activeConnections": 4,
+      "readerBranches": 3
+    },
+    "whileHeld": {
+      "counters": {
+        "databaseOpens": 37,
+        "databaseCloses": 32,
+        "branchCreates": 111,
+        "branchDeletes": 100,
+        "branchMoves": 36,
+        "checkouts": 108,
+        "resets": 0,
+        "commits": 35
+      },
+      "activeReaders": 4,
+      "activeConnections": 5,
+      "readerBranches": 4
+    },
+    "afterFirstRelease": {
+      "counters": {
+        "databaseOpens": 37,
+        "databaseCloses": 33,
+        "branchCreates": 111,
+        "branchDeletes": 101,
+        "branchMoves": 36,
+        "checkouts": 108,
+        "resets": 0,
+        "commits": 35
+      },
+      "activeReaders": 3,
+      "activeConnections": 4,
+      "readerBranches": 3
+    },
+    "afterLastRelease": {
+      "counters": {
+        "databaseOpens": 37,
+        "databaseCloses": 34,
+        "branchCreates": 111,
+        "branchDeletes": 102,
+        "branchMoves": 36,
+        "checkouts": 108,
+        "resets": 0,
+        "commits": 35
+      },
+      "activeReaders": 2,
+      "activeConnections": 3,
+      "readerBranches": 2
+    }
+  },
+  "finalResources": {
+    "counters": {
+      "databaseOpens": 40,
+      "databaseCloses": 40,
+      "branchCreates": 113,
+      "branchDeletes": 110,
+      "branchMoves": 36,
+      "checkouts": 114,
+      "resets": 1,
+      "commits": 35
+    },
+    "activeReaders": 0,
+    "maximumActiveReaders": 4,
+    "activeConnections": 0,
+    "allConnectionsClosedExactlyOnce": true,
+    "storageAfterClose": {
+      "files": [
+        {
+          "path": ".application.sqlite-lock",
+          "bytes": 0
+        },
+        {
+          "path": "application.sqlite",
+          "bytes": 1168317
+        }
+      ],
+      "totalBytes": 1168317,
+      "mainDatabaseBytes": 1168317,
+      "separateWalBytes": null,
+      "separateWalPaths": [],
+      "physicalReadBytes": null,
+      "physicalWriteBytes": null
+    }
+  },
+  "limits": [
+    "Counters cover native database opens/closes and Dolt branch/publication methods at the maintained diagnostic factory seam.",
+    "File sizes describe physical files exposed in this disposable directory, not bytes read from disk or every possible in-place write.",
+    "No separate WAL-labelled file means separateWalBytes is unknown (null); it does not establish the absence of an internal append log.",
+    "Physical read/write bytes are unobserved (null). There is no filesystem tracing or native VFS instrumentation.",
+    "No GC, WAL truncation or retention deletion is performed. This bounded workload establishes neither long-run growth nor deployed-volume behavior."
+  ],
+  "error": null
+}
