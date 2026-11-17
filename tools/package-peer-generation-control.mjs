@@ -12,6 +12,7 @@ const entries = { control: join(root, 'packages/peer-generation/src/control.ts')
   participant: join(root, 'packages/peer-generation/src/participant.ts') };
 await mkdir(output, { recursive: true });
 const source = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+const sourceTree = execFileSync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: root, encoding: 'utf8' }).trim();
 const result = await build({ entryPoints: entries, outdir: output, outExtension: { '.js': '.mjs' }, bundle: true,
   platform: 'browser', format: 'esm', target: 'es2022', metafile: true, logLevel: 'warning', absWorkingDir: root });
 const inputs = [...Object.keys(result.metafile.inputs), 'tools/package-peer-generation-control.mjs', 'packages/peer-generation/package.json'].sort();
@@ -37,7 +38,7 @@ await writeFile(join(output, 'package.json'), JSON.stringify({ name: '@chronolog
   exports: Object.fromEntries(Object.keys(entries).map(name => [`./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
   files: ['control.mjs', 'control.d.ts', 'participant.mjs', 'participant.d.ts', 'provenance.json'] }, null, 2) + '\n');
 const digest = async name => createHash('sha256').update(await readFile(join(output, name))).digest('hex');
-await writeFile(join(output, 'provenance.json'), JSON.stringify({ repository: 'werg/chronolog-db', source,
+await writeFile(join(output, 'provenance.json'), JSON.stringify({ repository: 'werg/chronolog-db', source, sourceTree,
   profile: 'peer-generation-v1', dirty: Boolean(changed), inputs,
   sha256: Object.fromEntries(await Promise.all(Object.keys(entries).flatMap(name => [`${name}.mjs`, `${name}.d.ts`])
     .map(async name => [name, await digest(name)]))) }, null, 2) + '\n');
