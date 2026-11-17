@@ -85,7 +85,7 @@ describe('SQL-free durable event execution', () => {
     let loseReply = true
     const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
       await bytes.put(key, value)
-      if (loseReply) { loseReply = false; throw new Error('lost write acknowledgment') }
+      if (loseReply && key === 'event-execution/lost-order-reply') { loseReply = false; throw new Error('lost write acknowledgment') }
     } }
     const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'lost-order-reply' })
     const digest = runtime.queries.executionManifestDigest
@@ -99,6 +99,47 @@ describe('SQL-free durable event execution', () => {
     await reopened.coordinator.materialize([one, two])
     expect(reopened.queries.orderLength).toBe(2)
   })
+
+  it('keeps a body written before a lost acknowledgment outside the published history until exact retry', async () => {
+    const bytes = store(); let loseReply = true
+    const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
+      await bytes.put(key, value)
+      if (loseReply && key.includes('/node/')) { loseReply = false; throw new Error('lost body acknowledgment') }
+    } }
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'body-before-head' })
+    const entry = await proposal(runtime.queries.executionManifestDigest, 1, program(emit('chat', 'durable body')))
+    await expect(runtime.coordinator.materialize([entry])).rejects.toThrow('lost body acknowledgment')
+    expect(runtime.queries.orderLength).toBe(0)
+    const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'body-before-head' })
+    expect(reopened.queries.orderLength).toBe(0)
+    await reopened.coordinator.materialize([entry])
+    expect(reopened.queries.outcome(entry.txId)?.outcome).toBe('accepted')
+  })
+
+  it('writes only new immutable records and a bounded head while history grows', async () => {
+    const bytes = store(), writes: { key: string; bytes: number }[] = []
+    const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
+      writes.push({ key, bytes: value.length }); await bytes.put(key, value)
+    } }
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'bounded-growth', historyProfile: 'peer-generation-v1' })
+    const history: ReplayProposal[] = []
+    for (let index = 0; index < 32; index++) {
+      history.push(await proposal(runtime.queries.executionManifestDigest, index, program(emit('chat', 'x'.repeat(1024)))))
+      await runtime.coordinator.materialize(history)
+    }
+    const records = writes.filter(write => write.key.includes('/node/')), heads = writes.filter(write => !write.key.includes('/node/'))
+    expect(records).toHaveLength(history.length)
+    expect(new Set(records.map(write => write.key)).size).toBe(history.length)
+    expect(heads).toHaveLength(history.length)
+    expect(Math.max(...heads.map(write => write.bytes))).toBeLessThan(256)
+    const bodyBytes = history.reduce((total, entry) => total + entry.canonicalCandidate.length, 0)
+    expect(writes.reduce((total, write) => total + write.bytes, 0)).toBeLessThan(bodyBytes * 1.5)
+    await runtime.coordinator.materialize(history.slice(0, 12))
+    const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'bounded-growth', historyProfile: 'peer-generation-v1' })
+    expect(reopened.queries.orderLength).toBe(12)
+    expect(reopened.queries.outcome(history[12]!.txId)).toBeNull()
+    expect(records).toHaveLength(32)
+  }, 30_000)
 
   it('replays a provisional suffix on late insertion and retains its exact outcomes after reopen', async () => {
     const bytes = store(), runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'replay' })

@@ -1,7 +1,7 @@
 import { bytesToHex, sha256 } from '@chronolog/canonical'
 import {
-  assertCanonicalCbor, assertValidChangeProgram, createExecutionManifest, decodeTransactionCore,
-  encodeCanonicalCbor, encodeTransactionCore, equalBytes, executionManifestArtifacts,
+  assertValidChangeProgram, createExecutionManifest,
+  encodeTransactionCore, equalBytes, executionManifestArtifacts,
   isEmitStep, transactionDigest, transactionOrderKey, compareTransactionOrder, utf8,
 } from '@chronolog/protocol'
 import type { ReplayProposal } from './types.js'
@@ -10,10 +10,8 @@ import {
   type MaterializedApplicationSnapshot, type MaterializedRevisionSnapshot, type MaterializedTransactionOutcome,
 } from './runtime.js'
 
-export interface EventExecutionStore {
-  get(key: string): Promise<Uint8Array | null>
-  put(key: string, value: Uint8Array): Promise<void>
-}
+import { EventHistoryStore, type EventExecutionStore, type EventHistoryState } from './event-store.js'
+export type { EventExecutionStore } from './event-store.js'
 
 /** A pinned SQL-absent execution profile; importing it never loads an SQL engine. */
 export async function eventExecutionManifest(historyProfile: 'chronological' | 'peer-generation-v1' = 'chronological') {
@@ -53,10 +51,7 @@ export async function createEventMaterializationRuntime(options: {
     await previous
     try { if (closed) throw new Error('EVENT_EXECUTION_CLOSED'); return await task() } finally { release() }
   }
-  const encode = (next: readonly ReplayProposal[], rev: bigint, final: number, finalRev: bigint): Uint8Array => encodeCanonicalCbor([
-    'chronolog/event-execution/v1', digest, rev, BigInt(final), finalRev,
-    next.map((entry) => [entry.txId, entry.candidateDigest, entry.canonicalCandidate]),
-  ])
+  const storage = new EventHistoryStore(options.store, key, digest, quota)
   const evaluate = async (next: readonly ReplayProposal[]): Promise<MaterializedTransactionOutcome[]> => {
     const operations = new Set<string>(), transactions = new Set<string>(), proposals = new Set<string>()
     const result: MaterializedTransactionOutcome[] = []
@@ -87,29 +82,18 @@ export async function createEventMaterializationRuntime(options: {
     }
     return result
   }
-  const persisted = await options.store.get(key)
+  const persisted = await storage.load()
   if (persisted !== null) {
-    if (persisted.length > quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
-    const value = assertCanonicalCbor(persisted, { maxBytes: quota, maxByteStringBytes: quota, maxItems: quota })
-    if (!Array.isArray(value) || value.length !== 6 || value[0] !== 'chronolog/event-execution/v1' ||
-        !(value[1] instanceof Uint8Array) || !equalBytes(value[1], digest) || typeof value[2] !== 'bigint' ||
-        typeof value[3] !== 'bigint' || typeof value[4] !== 'bigint' || !Array.isArray(value[5]) ||
-        value[2] < 0n || value[3] < 0n || value[3] > BigInt(value[5].length) || value[4] < 0n) throw new Error('EVENT_EXECUTION_STORE_INVALID')
-    revision = value[2]; finalLength = Number(value[3]); finalRevision = value[4]
-    order = value[5].map((row) => {
-      if (!Array.isArray(row) || row.length !== 3 || !(row[0] instanceof Uint8Array) ||
-          !(row[1] instanceof Uint8Array) || !(row[2] instanceof Uint8Array)) throw new Error('EVENT_EXECUTION_STORE_INVALID')
-      return { txId: row[0], candidateDigest: row[1], canonicalCandidate: row[2], core: decodeTransactionCore(row[2]) }
-    })
+    revision = persisted.revision; finalLength = persisted.finalLength; finalRevision = persisted.finalRevision
+    order = [...persisted.order]
     outcomes = await evaluate(order)
   }
-  const persist = async (bytes: Uint8Array): Promise<void> => {
-    if (bytes.length > quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
-    try { await options.store.put(key, bytes) }
+  let outcomeIndex = new Map(outcomes.map(outcome => [bytesToHex(outcome.txId), outcome]))
+  const persist = async (state: EventHistoryState, difference: number): Promise<string> => {
+    try { return await storage.commit(state, difference) }
     catch (error) {
-      // Atomic storage may have committed before its acknowledgment was lost.
-      // Continuing from the old in-memory order/finality could overwrite that
-      // newer durable prefix. Reopen from storage before any further mutation.
+      // A body or atomic head may have committed before its reply was lost.
+      // Reopen from the durable head before any further mutation.
       closed = true
       subscribers.clear()
       throw error
@@ -151,10 +135,8 @@ export async function createEventMaterializationRuntime(options: {
           if (difference === order.length && difference === next.length) return null
           const previousRevision = revision
           const nextRevision = revision + 1n
-          const bytes = encode(next, nextRevision, finalLength, finalRevision)
-          const contentHash = bytesToHex(await sha256(bytes))
           const changes: MaterializationOutcomeChange[] = nextOutcomes.flatMap((current) => {
-            const before = outcomes.find((value) => equalBytes(value.txId, current.txId))
+            const before = outcomeIndex.get(bytesToHex(current.txId))
             return before?.outcome === current.outcome && before.rejectionCode === current.rejectionCode ? [] : [{
               txId: current.txId.slice(), previous: before?.outcome ?? null, current: current.outcome,
               previousRejectionCode: before?.rejectionCode ?? null, currentRejectionCode: current.rejectionCode,
@@ -165,9 +147,10 @@ export async function createEventMaterializationRuntime(options: {
             txId: removed.txId.slice(), previous: removed.outcome, current: null,
             previousRejectionCode: removed.rejectionCode, currentRejectionCode: null,
           })
-          // The applied anchor and outcomes share the atomic durable record.
-          await persist(bytes)
+          // Indexed immutable records are published by one small atomic head.
+          const contentHash = await persist({ order: next, revision: nextRevision, finalLength, finalRevision }, difference)
           order = next; outcomes = nextOutcomes; revision = nextRevision
+          outcomeIndex = new Map(outcomes.map(outcome => [bytesToHex(outcome.txId), outcome]))
           const result = { revision, previousRevision, orderLength: order.length, replayFromIndex: difference,
             replayedTransactions: order.length - difference, checkpointPrefix: difference, contentHash,
             manifestDigest: digest.slice(), earliestChangedOrderIndex: difference, outcomeChanges: changes }
@@ -179,7 +162,7 @@ export async function createEventMaterializationRuntime(options: {
         if (historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
         if (!Number.isSafeInteger(length) || length < finalLength || length > order.length) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_INVALID')
         if (length === finalLength) return
-        await persist(encode(order, revision, length, finalRevision + 1n))
+        await persist({ order, revision, finalLength: length, finalRevision: finalRevision + 1n }, order.length)
         finalLength = length; finalRevision++
       }),
     },
@@ -189,7 +172,7 @@ export async function createEventMaterializationRuntime(options: {
       get executionManifestDigest() { return digest.slice() },
       proposalIdAt(index) { return order[index]?.txId.slice() ?? null },
       localSql() { throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
-      outcome(id) { return structuredClone(outcomes.find((entry) => equalBytes(entry.txId, id)) ?? null) },
+      outcome(id) { return structuredClone(outcomeIndex.get(bytesToHex(id)) ?? null) },
       subscribe(subscriber) { subscribers.add(subscriber); return () => { subscribers.delete(subscriber) } },
       captureApplication,
       captureRead(input = {}) {
