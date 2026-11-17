@@ -121,10 +121,11 @@ seen time or a signed checkpoint without its original bodies is not a recovery
 source. Prompt replication aims for an independently stored complete prefix;
 reports distinguish known abandoned work from unknown loss.
 
-The unified application contract uses `local()` for applied-here results and
-`final()` for committed/applied results under the selected history. Explicit
-recovery may abandon a recent suffix, including a previously final result. The
-current preview exposes `applied()`; it exports no `local()` or `final()` aliases.
+The public application waits are `applied()` for the selected execution result
+and `shared()` for independently retained coverage. Their names and guarantees
+are the same in the session, Worker facade and local tools. A future change in
+completion vocabulary would require an explicit API decision; it is not part of
+this implemented contract.
 
 External-effect consumers need reset-aware projections, a retained dispatch
 journal, stable provider retry identities and reconciliation of uncertain calls.

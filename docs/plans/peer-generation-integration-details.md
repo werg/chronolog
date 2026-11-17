@@ -19,10 +19,12 @@ implemented mechanisms do not by themselves qualify a deployment.
 
 ## Completion and recovery
 
-Use one application model. `local()` means applied here; `final()` means
-committed and applied under the selected history. Explicit recovery may abandon
-recent work. The name `final` does not require a second protocol promising
-immutability across every recovery.
+The implemented application waits are `applied()` for accepted or rejected
+execution in the selected history, and `shared()` for independently retained
+coverage. Explicit recovery may abandon recent work after either observation.
+A proposed vocabulary using `local()` and `final()` remains an unimplemented
+API design question; application code and current documentation use the public
+methods above. A method name alone cannot supply an across-recovery guarantee.
 
 Do not add an extra execution stage just to make two wait methods differ. A
 completion wait still returns an accepted or rejected result. An exact retry

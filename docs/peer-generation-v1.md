@@ -2,12 +2,11 @@
 
 Status: implemented peer-generation preview; wider qualification is in progress.
 The authenticated history profile is `peer-generation-v1`, with the bounded
-`eligible-members-v1` authority policy. The selected-history target uses
-`local()` for applied-here results and `final()` for committed/applied results,
-with an explicit recovery exception that can abandon a recent suffix. The
-current public preview still exposes `applied()`; it exports no local/final
-aliases. Historical chronological immutability comes from that older
-implementation, not from the name of a wait method.
+`eligible-members-v1` authority policy. `applied()` reports an accepted or
+rejected result in the selected history; `shared()` observes an independent
+retained copy. Explicit recovery can abandon a recent suffix. The chronological
+profile's immutable final-prefix guarantee is a separate authenticated history
+contract, and is not inferred from the name of a wait method.
 
 ## Implementation boundary
 
@@ -46,16 +45,14 @@ application primitives](application-primitives.md) retain their existing APIs,
 immutable final-prefix guarantee and original evidence. They are historical
 implementation semantics, not a second architecture mandate for new applications.
 
-The preserved [independent native/events development run](https://github.com/werg/tendriller-contrib/blob/5dc62b8d1fd6bb323bf6ca272cb21064f33ab318/cookbooks/run-a-peer-application/notes/peer-generation-qualification.md)
-uses a packed public session, separate durable stores and the in-process link.
-It records lost-reply retry, blocked portable control calls, older-prefix recovery,
-fresh replay, excluded-branch isolation, linked reapplication and reopen. Both
-source checkouts were dirty. That evidence does not qualify a clean release,
-Tendriller HTTP control routes, physical WebRTC, browser storage, SQL replay,
-deployed networks or a universal recovery-age bound. The maintained native RTC
-consumer now exercises the same scenario over the public network composition;
-its exact clean-archive result remains a separate gate, and loopback RTC evidence
-cannot establish Internet or deployed behavior.
+The [independent qualification record](https://github.com/werg/tendriller-contrib/blob/1a63e2a69bdcb80b36a10759f7dac10cdf690a45/cookbooks/run-a-peer-application/notes/peer-generation-qualification.md)
+preserves each source/artifact pairing separately. It includes clean packed
+direct/native RTC consumers, actual Tendriller Worker control and rendezvous,
+and Chromium/Worker/OPFS recovery. Earlier dirty development runs remain labeled
+as such. SQL, developer-experience and combined-source gates have their own
+reports; a pass for one pairing does not qualify every later source change.
+Local RTC and Worker evidence do not establish deployed Internet behavior,
+provider cost or a universal recovery-age bound.
 
 ## Decision
 

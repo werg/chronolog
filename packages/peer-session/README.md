@@ -6,15 +6,13 @@ live signals need no hosted request while that generation is healthy. A signed
 control service selects a successor during takeover. Recovery can abandon a
 recent suffix, which remains inspectable and requires explicit reapplication.
 
-The unified completion contract is `local()` for applied here and `final()` for
-committed and applied under the selected history. Exceptional recovery may abandon
-a recent suffix, including previously final work. The waits may coincide; no
-additional speculative stage or stronger-finality service is required.
-
-This preview currently exposes that committed, locally applied result through
-`applied()`, which reports accepted or rejected at one generation and sequence.
-The executable examples below use that implemented spelling. External-effect
-dispatchers still need recovery integration; the preview does not install one.
+`operation.applied()` reports the accepted or rejected result at one selected
+generation and sequence. `operation.shared()` separately observes an independent
+peer's retained copy. Ordinary commands do not wait for that second copy, and
+neither result prevents an explicit recovery from abandoning a recent suffix.
+The current API uses these two names throughout sessions, tools and adapters.
+External-effect dispatchers need a separate supported recovery contract; the
+session does not install or trigger one automatically.
 
 ## Native events application
 
