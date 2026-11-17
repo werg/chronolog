@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createParticipantResponse, createPeerIdentity, createPublicationRegistry,
   MemoryBytesStore, participantGrant, signApplicationDescriptor, signControlRevision, signTransitionRequest,
@@ -15,7 +15,7 @@ const definition = defineApplication({ id: 'participant', version: '1', commands
   say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
 }, queries: {} })
 const cleanup: Array<() => void | Promise<void>> = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.restoreAllMocks() })
 
 async function fixture() {
   const signer = await createPeerIdentity(), stores = [new MemoryBytesStore(), new MemoryBytesStore()]
@@ -64,6 +64,35 @@ async function fixture() {
 }
 
 describe('session-owned control participant', () => {
+  it('drains a closing control participant journal before releasing the application session', async () => {
+    const f = await fixture(), session = await f.open(0), control = session.connectControlParticipant({ exchange: f.exchange })
+    const store = f.devices[0]!.store, put = store.put.bind(store)
+    let writing = false, release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    vi.spyOn(store, 'put').mockImplementation(async (key, bytes) => {
+      if (key.startsWith('peer-session/publication-attempt/')) { writing = true; await gate }
+      await put(key, bytes)
+    })
+    const bytes = new TextEncoder().encode('export default 1;')
+    const pending = control.preparePublication({ operationId: 'closing', entry: 'main.mjs',
+      files: [{ path: 'main.mjs', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/javascript' }] })
+    const rejected = expect(pending).rejects.toThrow('APPLICATION_CONTROL_CLOSED')
+    await vi.waitFor(() => { expect(writing).toBe(true) }, { timeout: 5000, interval: 5 })
+    const controlClosed = control.close()
+    let replacementError: unknown
+    try { session.connectControlParticipant({ exchange: f.exchange }) } catch (error) { replacementError = error }
+    let released = false
+    const closed = session.close().then(() => { released = true })
+    let releasedEarly: boolean
+    try {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      releasedEarly = released
+    } finally { release(); await Promise.all([controlClosed, closed, rejected]) }
+    expect(releasedEarly).toBe(false)
+    expect(replacementError).toEqual(new Error('APPLICATION_CONTROL_ALREADY_ATTACHED'))
+    expect(released).toBe(true)
+  })
+
   it('attaches without I/O and keeps commands, data, and live signals off the host', async () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
     const host = a.connectControlParticipant({ exchange: f.exchange })

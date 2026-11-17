@@ -265,11 +265,16 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   connectControlParticipant(options: ControlParticipantOptions): ApplicationControlParticipant {
     this.#assertOpen()
-    if (this.#control !== undefined && !this.#control.signal.aborted) throw new Error('APPLICATION_CONTROL_ALREADY_ATTACHED')
+    if (this.#control !== undefined && this.#links.has(this.#control)) throw new Error('APPLICATION_CONTROL_ALREADY_ATTACHED')
     const participant = new ApplicationControlParticipant(this.#replica, this.#store, this.#lifetime.signal, options)
     this.#control = participant
     this.#links.add(participant)
-    participant.signal.addEventListener('abort', () => { this.#links.delete(participant) }, { once: true })
+    participant.signal.addEventListener('abort', () => {
+      const released = (): void => { this.#links.delete(participant) }
+      // Cancellation fences new requests immediately; admitted journal writes
+      // still belong to this session until the control owner finishes draining.
+      void participant.close().then(released, released)
+    }, { once: true })
     return participant
   }
 
