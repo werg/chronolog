@@ -1,6 +1,7 @@
 import { chmod, mkdir, open, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import { DEFAULT_LIVE_CLOCK_POLICY } from '@chronolog/capabilities'
 import {
   DOMAINS,
   exportEd25519PrivateKey,
@@ -95,9 +96,9 @@ export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): Daemon
       staleReconnectMs: integer(environment.CHRONOLOG_SSB_STALE_RECONNECT_MS, 1, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_SSB_STALE_RECONNECT_MS'),
     }),
     checkpointEvery: integer(environment.CHRONOLOG_CHECKPOINT_EVERY ?? '100', 1, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_CHECKPOINT_EVERY'),
-    cutoffLagMs: integer(environment.CHRONOLOG_CUTOFF_LAG_MS ?? '60000', 0, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_CUTOFF_LAG_MS'),
-    maxFutureSkewMs: integer(environment.CHRONOLOG_MAX_FUTURE_SKEW_MS ?? '30000', 0, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_MAX_FUTURE_SKEW_MS'),
-    heartbeatIntervalMs: integer(environment.CHRONOLOG_HEARTBEAT_INTERVAL_MS ?? '30000', 1, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_HEARTBEAT_INTERVAL_MS'),
+    cutoffLagMs: integer(environment.CHRONOLOG_CUTOFF_LAG_MS ?? String(DEFAULT_LIVE_CLOCK_POLICY.cutoffLagMs), 0, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_CUTOFF_LAG_MS'),
+    maxFutureSkewMs: integer(environment.CHRONOLOG_MAX_FUTURE_SKEW_MS ?? String(DEFAULT_LIVE_CLOCK_POLICY.maxFutureSkewMs), 0, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_MAX_FUTURE_SKEW_MS'),
+    heartbeatIntervalMs: integer(environment.CHRONOLOG_HEARTBEAT_INTERVAL_MS ?? String(DEFAULT_LIVE_CLOCK_POLICY.heartbeatIntervalMs), 1, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_HEARTBEAT_INTERVAL_MS'),
     ...(environment.CHRONOLOG_PUBLIC_SSB_ADDRESS === undefined ? {} : {
       publicSsbAddress: nonempty(environment.CHRONOLOG_PUBLIC_SSB_ADDRESS, 'CHRONOLOG_PUBLIC_SSB_ADDRESS'),
     }),

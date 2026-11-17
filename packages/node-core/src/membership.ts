@@ -1,5 +1,5 @@
 import {
-  capabilityRevisionDigest, decodeSignedGenesis, encodeGenesisManifest, encodeSignedGenesis, isCapabilityActive, signGenesis,
+  DEFAULT_LIVE_CLOCK_POLICY, capabilityRevisionDigest, decodeSignedGenesis, encodeGenesisManifest, encodeSignedGenesis, isCapabilityActive, signGenesis,
   type CapabilityGrant, type CapabilitySnapshot, type GenesisManifest,
 } from '@chronolog/capabilities'
 import {
@@ -85,7 +85,7 @@ export async function provisionMembership(options: MembershipProvisionOptions): 
         ...(input.providerParameters === undefined ? {} : { providerParameters: input.providerParameters }) },
       initialCapabilities: input.initialCapabilities,
       validationPolicies: [{ version: 1n, minimumValidators: 1n }],
-      clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 1_000n, heartbeatIntervalMs: 1_000n },
+      clockPolicy: DEFAULT_LIVE_CLOCK_POLICY,
       resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 100n, maxMutations: 100n },
       encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM', createdAtMs,
     })

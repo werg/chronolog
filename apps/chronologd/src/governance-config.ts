@@ -2,6 +2,7 @@ import { chmod, mkdir, open, readFile, rename, writeFile } from 'node:fs/promise
 import { dirname, join } from 'node:path'
 
 import {
+  DEFAULT_LIVE_CLOCK_POLICY,
   decodeSignedGenesis,
   encodeSignedGenesis,
   signGenesis,
@@ -163,7 +164,7 @@ async function createGenesis(
       { ...common, role: 'reader', hpkePublicKey: recipientPublicKey },
     ],
     validationPolicies: [policy],
-    clockPolicy: options.clockPolicy ?? { maxFutureSkewMs: 30_000n, cutoffLagMs: 60_000n, heartbeatIntervalMs: 30_000n },
+    clockPolicy: options.clockPolicy ?? DEFAULT_LIVE_CLOCK_POLICY,
     resourcePolicy: { maxCandidateBytes: 16_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 1_000n, maxMutations: 1_000n },
     encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM',
     createdAtMs: BigInt(Math.trunc(options.now?.() ?? Date.now())),
