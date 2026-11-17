@@ -187,7 +187,9 @@ commands and live signals do not cause host requests.
 
 After coordinator loss, the controller first gives reconnection its configured
 grace. It verifies the current signed authority and synchronizes reachable peers
-before considering a successor. Candidate selection uses the complete best
+before considering a successor. Peers with a failed synchronization are retired
+and retried; old retention alone does not establish current reachability.
+Candidate selection uses the complete best
 prefix actually verified locally on the selected ancestry. A remote successor
 must hold a signed retention acknowledgment for that exact prefix; a self
 candidate must be locally ready. Current coordinator and recovery grants are
@@ -204,7 +206,8 @@ outages, suspension and long disconnection can leave freshness unknown or older
 than the budget. Such cases expose `phase: 'approval-required'` with the exact
 complete prefix, candidate, observation age and reason. Only approving that
 proposal ID permits the broader recovery; changed authority or prefix invalidates
-the choice. An incomplete selected prefix cannot be approved into completeness.
+the choice, including changes during the final host refresh before signing.
+An incomplete selected prefix cannot be approved into completeness.
 
 The controller uses the existing durable transition journal. Lost takeover and
 handover replies retry the same signed request, and competing valid selections
@@ -219,6 +222,9 @@ changing their signed meaning. There is no second application queue.
 its peer connections and attempts a bounded lease withdrawal. The closed handle
 remains inspectable; starting a second controller is rejected. Closing the
 session also closes participation before releasing its durable store.
+Control reads and selections carry the operation's cancellation signal, so a late
+reply cannot mutate a closed controller's session. An already dispatched selection
+may still commit remotely; its saved exact request remains available for recovery.
 
 ## Enrollment and epoch keys
 

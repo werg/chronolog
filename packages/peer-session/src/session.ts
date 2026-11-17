@@ -110,6 +110,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #inflight = new Map<string, Promise<void>>()
   readonly #links = new Set<{ close(): Promise<void> }>()
   readonly #views = new Set<ApplicationReadView>()
+  #openingViews = 0
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
   readonly #stopStatus: () => void
   readonly #stopKeys: () => void
@@ -208,8 +209,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   async readView(): Promise<ApplicationReadView> {
     this.#assertOpen()
-    if (this.#views.size >= 8) throw new Error('APPLICATION_VIEW_LIMIT')
-    const captured = await this.#replica.capture()
+    if (this.#views.size + this.#openingViews >= 8) throw new Error('APPLICATION_VIEW_LIMIT')
+    this.#openingViews++
+    let captured: CapturedPeerView
+    try { captured = await this.#replica.capture() } finally { this.#openingViews-- }
     if (this.#closed || this.#views.size >= 8) { captured.release(); throw new Error(this.#closed ? 'APPLICATION_SESSION_CLOSED' : 'APPLICATION_VIEW_LIMIT') }
     let released = false
     const views = this.#views

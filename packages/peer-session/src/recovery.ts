@@ -1,18 +1,25 @@
 import type { BytesStore } from '@chronolog/records'
 import {
-  decodePeerValue, encodePeerValue, peerDigest, signTransitionRequest, verifyAuthorityBundle,
-  type AuthorityBundle, type PeerReplica, type RecoveryNotice,
+  decodePeerValue, encodePeerValue, peerDigest, signTransitionRequest, verifyAuthorityBundle, validateHistoryPoint,
+  type AuthorityBundle, type PeerReplica, type RecoveryNotice, type HistoryPoint,
   type SignedGeneration, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
 import { awaitOwnedTask } from './lifetime.js'
 
 /** The small hosted control port. Calls occur only at explicit lifecycle boundaries. */
 export interface ApplicationControlHost {
-  application(): Promise<AuthorityBundle>
+  application(options?: { readonly signal?: AbortSignal }): Promise<AuthorityBundle>
   /** A lost generation CAS rejects with code `peer_generation_conflict`.
    * Other failures preserve the saved request for an exact retry. Messages are
    * diagnostic only; transport adapters must preserve or map the typed code. */
-  selectGeneration(request: SignedTransitionRequest): Promise<SignedGeneration>
+  selectGeneration(request: SignedTransitionRequest, options?: { readonly signal?: AbortSignal }): Promise<SignedGeneration>
+}
+
+/** A displayed recovery choice cannot silently cross a changed authority or prefix. */
+export interface ApplicationRecoveryExpectation {
+  readonly generation: string
+  readonly controlRevision: number
+  readonly point: HistoryPoint
 }
 
 /** The portable control-port conflict; adapters may preserve an equivalent typed error. */
@@ -54,8 +61,8 @@ export class ApplicationRecovery {
   }
 
   /** Select this device's complete usable prefix after the caller's reconnect grace policy. */
-  takeover(host: ApplicationControlHost, options: { readonly coordinator?: string; readonly transitionId?: string; readonly signal?: AbortSignal } = {}): Promise<RecoveryNotice | null> {
-    return this.#select(host, options.coordinator ?? this.#replica.device.publicKey, 'takeover', options.transitionId, options.signal)
+  takeover(host: ApplicationControlHost, options: { readonly coordinator?: string; readonly transitionId?: string; readonly signal?: AbortSignal; readonly expected?: ApplicationRecoveryExpectation } = {}): Promise<RecoveryNotice | null> {
+    return this.#select(host, options.coordinator ?? this.#replica.device.publicKey, 'takeover', options.transitionId, options.signal, options.expected)
   }
 
   /** Planned retirement requires the successor's signed retention of the exact current prefix. */
@@ -69,10 +76,15 @@ export class ApplicationRecovery {
     return this.#tail.then(() => undefined)
   }
 
-  #select(host: ApplicationControlHost, coordinator: string, reason: 'takeover' | 'handover', transitionId?: string, externalSignal?: AbortSignal): Promise<RecoveryNotice | null> {
+  #select(host: ApplicationControlHost, coordinator: string, reason: 'takeover' | 'handover', transitionId?: string, externalSignal?: AbortSignal, expectation?: ApplicationRecoveryExpectation): Promise<RecoveryNotice | null> {
     const signal = externalSignal === undefined ? this.#signal : AbortSignal.any([this.#signal, externalSignal])
+    const expected = expectation === undefined ? undefined : structuredClone(expectation)
     const operation = this.#tail.then(async () => {
       signal.throwIfAborted()
+      if (expected !== undefined) {
+        validateHistoryPoint(expected.point)
+        if (expected.generation !== expected.point.generation || !Number.isSafeInteger(expected.controlRevision) || expected.controlRevision < 0) throw new Error('APPLICATION_RECOVERY_EXPECTATION_INVALID')
+      }
       if (transitionId !== undefined && (transitionId.length < 1 || transitionId.length > 128)) throw new Error('APPLICATION_TRANSITION_ID_INVALID')
       if (!/^[0-9a-f]{64}$/u.test(coordinator)) throw new Error('APPLICATION_COORDINATOR_INVALID')
       const journal = await this.#journal(signal)
@@ -81,20 +93,31 @@ export class ApplicationRecovery {
       if (entry !== undefined && (entry.request.payload.coordinator !== coordinator || entry.request.payload.reason !== reason)) {
         throw new Error('APPLICATION_TRANSITION_ID_REUSED')
       }
+      if (entry !== undefined && expected !== undefined && (entry.request.payload.expectedGeneration !== expected.generation ||
+          entry.request.payload.controlRevision !== expected.controlRevision || entry.request.payload.base?.point.generation !== expected.point.generation ||
+          entry.request.payload.base.point.sequence !== expected.point.sequence || entry.request.payload.base.point.root !== expected.point.root)) {
+        throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
+      }
       if (entry?.superseded === true) throw new ApplicationControlConflictError()
       if (entry === undefined) {
-        const bundle = await this.#hostCall(() => host.application(), signal)
+        const bundle = await this.#hostCall(() => host.application({ signal }), signal)
         signal.throwIfAborted()
         await verifyAuthorityBundle(bundle, this.#replica.authority.descriptor)
         signal.throwIfAborted()
         await this.#replica.adopt(bundle)
         signal.throwIfAborted()
+        if (expected !== undefined && (expected.generation !== this.#replica.generation.id || expected.controlRevision !== this.#replica.generation.payload.controlRevision)) {
+          throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
+        }
         if (reason === 'takeover' && this.#replica.isCoordinator) return null
         if (reason === 'handover' && (!this.#replica.isCoordinator || coordinator === this.#replica.device.publicKey)) {
           throw new Error('APPLICATION_HANDOVER_REQUIRES_CURRENT_COORDINATOR')
         }
         const base = await this.#replica.recoveryPoint()
         signal.throwIfAborted()
+        if (expected !== undefined && (expected.point.generation !== base.point.generation || expected.point.sequence !== base.point.sequence || expected.point.root !== base.point.root)) {
+          throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
+        }
         if ((reason === 'handover' || coordinator !== this.#replica.device.publicKey) &&
             !this.#replica.shared(base.point).some(receipt => receipt.payload.peer === coordinator &&
               receipt.payload.point.generation === base.point.generation && receipt.payload.point.sequence === base.point.sequence && receipt.payload.point.root === base.point.root)) {
@@ -115,9 +138,9 @@ export class ApplicationRecovery {
       const request = entry.request
       const previousGeneration = this.#replica.generation.id
       try {
-        const selected = await this.#hostCall(() => host.selectGeneration(request), signal)
+        const selected = await this.#hostCall(() => host.selectGeneration(request, { signal }), signal)
         signal.throwIfAborted()
-        const bundle = await this.#hostCall(() => host.application(), signal)
+        const bundle = await this.#hostCall(() => host.application({ signal }), signal)
         signal.throwIfAborted()
         await verifyAuthorityBundle(bundle, this.#replica.authority.descriptor)
         signal.throwIfAborted()
@@ -139,7 +162,7 @@ export class ApplicationRecovery {
         // Competing permitted successors are resolved by the host CAS, never by
         // silently changing this request's expected generation or recovery base.
         if (isControlConflict(error)) {
-          const bundle = await this.#hostCall(() => host.application(), signal)
+          const bundle = await this.#hostCall(() => host.application({ signal }), signal)
           signal.throwIfAborted()
           await verifyAuthorityBundle(bundle, this.#replica.authority.descriptor)
           signal.throwIfAborted()

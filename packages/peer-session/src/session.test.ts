@@ -190,8 +190,8 @@ describe('public peer application sessions', () => {
     const link = await connectApplications(a, b)
     await applied(a, 'retained', 'retained'); await link.synchronize(); await link.close()
     let lost = true
-    const host = { application: () => f.registry.read(), selectGeneration: async (...args: Parameters<typeof f.registry.select>) => {
-      const result = await f.registry.select(...args)
+    const host = { application: () => f.registry.read(), selectGeneration: async (request: Parameters<typeof f.registry.select>[0]) => {
+      const result = await f.registry.select(request)
       if (lost) { lost = false; throw new Error('LOST_SELECTION_REPLY') }
       return result
     } }

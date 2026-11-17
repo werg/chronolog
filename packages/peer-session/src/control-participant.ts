@@ -51,18 +51,20 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
   get policy() { return this.#transport.policy }
 
   /** Learn and durably fence newer authority even while its selected data is still missing. */
-  async application(): Promise<AuthorityBundle> {
-    const bundle = await this.#request<AuthorityBundle>('control', 'read', {})
-    this.#signal.throwIfAborted()
+  async application(options: { readonly signal?: AbortSignal } = {}): Promise<AuthorityBundle> {
+    const signal = options.signal === undefined ? this.#signal : AbortSignal.any([this.#signal, options.signal])
+    const bundle = await this.#request<AuthorityBundle>('control', 'read', {}, signal)
+    signal.throwIfAborted()
     await this.#replica.receiveHistory(bundle, [])
-    this.#signal.throwIfAborted()
+    signal.throwIfAborted()
     return this.#replica.authority
   }
 
-  async selectGeneration(input: SignedTransitionRequest): Promise<SignedGeneration> {
+  async selectGeneration(input: SignedTransitionRequest, options: { readonly signal?: AbortSignal } = {}): Promise<SignedGeneration> {
+    const signal = options.signal === undefined ? this.#signal : AbortSignal.any([this.#signal, options.signal])
     const request = structuredClone(input)
     if (request.payload.applicationId !== this.#replica.descriptor.applicationId) throw new Error('PEER_SCOPE_MISMATCH')
-    const selected = await this.#request<SignedGeneration>('control', 'select', { request })
+    const selected = await this.#request<SignedGeneration>('control', 'select', { request }, signal)
     const bundle = this.#replica.authority
     if (await peerDigest(selected.payload.transition) !== await peerDigest(request)) throw new Error('APPLICATION_TRANSITION_REPLY_MISMATCH')
     const index = selected.payload.number, known = bundle.generations[index]
@@ -72,7 +74,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     await verifyAuthorityBundle({ descriptor: bundle.descriptor,
       controls: bundle.controls.slice(0, selected.payload.controlRevision + 1),
       generations: [...bundle.generations.slice(0, index), selected] }, bundle.descriptor)
-    this.#signal.throwIfAborted()
+    signal.throwIfAborted()
     return selected
   }
 
@@ -190,10 +192,10 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     this.#tail = result.catch(() => undefined)
     return result
   }
-  async #request<T>(facet: 'control' | 'publication', action: string, payload: unknown): Promise<T> {
-    this.#signal.throwIfAborted()
+  async #request<T>(facet: 'control' | 'publication', action: string, payload: unknown, lifetime = this.#signal): Promise<T> {
+    lifetime.throwIfAborted()
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(new Error('APPLICATION_CONTROL_TIMEOUT')), this.#timeoutMs)
-    const signal = AbortSignal.any([this.#signal, controller.signal])
+    const signal = AbortSignal.any([lifetime, controller.signal])
     try { return await awaitOwnedTask(signal, () => this.#transport.request<T>(facet, action, payload, { signal })) }
     finally { clearTimeout(timer) }
   }
