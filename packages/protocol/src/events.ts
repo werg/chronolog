@@ -4,14 +4,16 @@ import { base64UrlToBytes, bytesToBase64Url } from './bytes.js'
 /** Authenticated proposal facts, supplied by the replica rather than an emit payload. */
 export interface ChronologEventOrigin {
   readonly kind: 'chronolog'
+  /** Canonical unpadded base64url group digest. */
   readonly groupId: string
   /** Lowercase hex public key, identical to Signals.authorId for the same signer. */
   readonly authorId: string
   readonly operationId: string
   /** Signed ordering timestamp as an exact decimal integer, not delivery time. */
   readonly authorTimestampMs: string
+  /** Canonical unpadded base64url membership revision digest. */
   readonly membershipRevision: string
-  /** The exact signed grant; null only for explicit static membership. */
+  /** Canonical unpadded base64url signed grant digest; null only for explicit static membership. */
   readonly writerCapability: string | null
 }
 

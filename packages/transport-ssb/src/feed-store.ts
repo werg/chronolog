@@ -103,6 +103,7 @@ export class FeedStore {
     readonly maxIndex: StatementSync
     readonly evidenceById: StatementSync
     readonly evidenceInsert: StatementSync
+    readonly evidenceHead: StatementSync
     readonly evidenceAfter: StatementSync
     readonly payloadByHash: StatementSync
     readonly detachedPayloadByHash: StatementSync
@@ -183,6 +184,7 @@ export class FeedStore {
       maxIndex: prepare('SELECT coalesce(max(local_index), 0) AS local_index FROM records'),
       evidenceById: prepare('SELECT local_index FROM evidence WHERE id = ?'),
       evidenceInsert: prepare('INSERT INTO evidence (id, raw) VALUES (?, ?) RETURNING local_index'),
+      evidenceHead: prepare('SELECT coalesce(max(local_index), 0) AS position FROM evidence'),
       evidenceAfter: prepare('SELECT local_index, id, raw FROM evidence WHERE local_index > ? ORDER BY local_index LIMIT ?'),
       payloadByHash: prepare('SELECT payload AS bytes FROM records WHERE payload_hash = ? LIMIT 1'),
       detachedPayloadByHash: prepare('SELECT bytes FROM payloads WHERE hash = ?'),
@@ -288,6 +290,10 @@ export class FeedStore {
     if (existing !== undefined) return { kind: 'duplicate', index: existing.local_index, evidence: { id, bytes } }
     const row = this.#statements.evidenceInsert.get(id, bytes) as { local_index: bigint }
     return { kind: 'appended', index: row.local_index, evidence: { id, bytes } }
+  }
+
+  evidenceHead(): bigint {
+    return (this.#statements.evidenceHead.get() as { position: bigint }).position
   }
 
   evidenceAfter(after: bigint, limit: number): readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[] {

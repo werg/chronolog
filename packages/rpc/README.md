@@ -111,14 +111,6 @@ while the replica receives newer proof or replays its speculative suffix. Leases
 are bounded and belong to the RPC principal that opened them; expired views fail
 with `revision_unavailable` so the caller can capture a fresh view.
 
-`view.changes` defaults to `final` and yields current `{ view, revision,
-finalRevision }` metadata followed by coalesced invalidations. SQL-only changes,
-rebases and finality-only advances can all invalidate a selected view. This stream
-has no replay cursor, retains no SQL lease and does not poll the page host.
-Reconnecting observes current state; a slow consumer can skip intermediate
-invalidations. Durable event processing instead uses `events.subscribe` with
-whole transaction batches and explicit processed cursors.
-
 Transaction outcomes contain a separate `final` boolean. `accepted` or
 `rejected` alone describes the current SQL execution result. `final: true`
 requires the transaction's stable result to be applied in the local immutable
@@ -139,6 +131,30 @@ provenance. Effect workers retain the same origin in their durable checkpoints
 and apply their own dispatch policy before performing an external action.
 Ephemeral messages remain separate `signals.send` calls with no durable event
 cursor or automatic retry.
+
+## Application view invalidation and captured reads
+
+`view.changes` accepts `{ groupId, view?: 'local' | 'final' }`, defaults to
+`final`, and streams `{ view, revision, finalRevision }`. It uses the normal
+authenticated in-process, HTTP and Worker routes. The service validates the
+group and view, forwards cancellation, and ends its subscriptions on close.
+It delegates directly to the node's applied-view port; opening the stream does
+not acquire a read lease, execute SQL or poll the page host.
+
+The first value describes the current successfully reconciled application
+snapshot. Later values are bounded, coalesced invalidations. Final-only streams
+do not report speculative work. Local streams also report final-prefix changes
+even when only `finalRevision` changes. Admission, receipt and transport status
+alone do not invalidate application data. After reconnect, a fresh subscription
+gets current state; this method has no durable cursor.
+
+These `revision` and `finalRevision` strings are the opaque tokens returned by
+`view.open`, rather than the numeric materializer revisions in query metadata.
+Use `view.open` to capture coherent SQL and events, `view.query` and `view.events`
+to read that capture, and `view.release` when finished. The capture may be newer
+than a notification; its own tokens identify its data. Incomplete or uncertain
+publication cannot expose changed data under an old token. Durable event
+processing remains the separate `events.subscribe` contract.
 
 ## Durable transaction submission
 
@@ -193,6 +209,10 @@ Only the device that created the request can claim its local readiness.
 | Group | Unary methods | Streams |
 | --- | --- | --- |
 | Node | `node.getStatus`, `node.getReplicationStatus` | `node.streamStatus`, `node.streamReplicationStatus` |
+| Application | `change.submit`, `ingress.submit`, `operation.get` | `operation.subscribe` |
+| Durable events | `events.read` | `events.subscribe` |
+| Captured views | `view.open`, `view.query`, `view.events`, `view.release` | `view.changes` |
+| Live signals | `signals.send` | `signals.subscribe` |
 | SQL | `query.localSql` | `query.liveSql` |
 | Captured views | `view.open`, `view.query`, `view.events`, `view.release` | `view.changes` |
 | Application changes and events | `change.submit`, `events.read`, `operation.get` | `events.subscribe`, `operation.subscribe` |

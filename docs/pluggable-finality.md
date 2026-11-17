@@ -79,6 +79,13 @@ closures supply the same admission-completeness evidence through their verified
 feed prefixes. The execution core consumes the resulting frontier without a
 separate governance-finality shortcut.
 
+A custom peer membership resolver supplies this complete `admissionScopes()`
+history. A verified revision closure does not substitute for missing scope
+completeness. With complete scopes, closure evidence can establish progress
+without heartbeats, bounded by the authenticated floors of still-open scopes
+and requiring indexed admission prefixes. Each pending proposal's own policy
+and verified votes determine whether it can still be admitted.
+
 ## Live inclusion verifier interface and configuration
 
 `LiveInclusionFinalityProvider` is exported from `@chronolog/node-core/finality`.

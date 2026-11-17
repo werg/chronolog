@@ -21,8 +21,7 @@ import {
   type EventPayload,
   type EventBatch,
   type EventReadOptions,
-  type ViewChange,
-  type ViewChangeOptions,
+  type ViewChange, type ViewChangeOptions,
 } from '@chronolog/protocol'
 import {
   ChronologRpcError,
@@ -138,6 +137,16 @@ export type TransactionStatementInput = string | CompiledSqlStatement | SqlState
 /** One step of a transaction: SQL, an emitted event, or a platform operation. */
 export type TransactionStepInput = TransactionStatementInput | PlatformOp | EmitStep
 
+/** A current accepted/rejected result; it may still change through replay. */
+export type SettledTransactionOutcome = TransactionOutcome & {
+  readonly outcome: Exclude<TransactionOutcome['outcome'], { readonly type: 'pending' }>
+}
+/** The immutable accepted/rejected result applied on this replica. */
+export type FinalTransactionOutcome = SettledTransactionOutcome & { readonly final: true }
+export type AcceptedTransactionOutcome = FinalTransactionOutcome & {
+  readonly outcome: Extract<TransactionOutcome['outcome'], { readonly type: 'accepted' }>
+}
+
 export class TransactionHandle {
   readonly outcome: StreamResource<TransactionOutcome>
   readonly evidence: StreamResource<SettlementEvidence>
@@ -155,32 +164,31 @@ export class TransactionHandle {
   get proposalId(): string { return this.submission.transactionId }
 
   /** The current speculative result. Replay can change this until final() resolves. */
-  settled(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
-    return this.#waitForOutcome((value) => value.outcome.type !== 'pending', options.signal)
+  settled(options: { readonly signal?: AbortSignal } = {}): Promise<SettledTransactionOutcome> {
+    return this.#waitForOutcome((value): value is SettledTransactionOutcome => value.outcome.type !== 'pending', options.signal)
   }
 
   /** Resolves only when the accepted or rejected result is applied in the immutable prefix. */
-  final(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
-    return this.#waitForOutcome((value) => value.final && value.outcome.type !== 'pending', options.signal)
+  final(options: { readonly signal?: AbortSignal } = {}): Promise<FinalTransactionOutcome> {
+    return this.#waitForOutcome((value): value is FinalTransactionOutcome => value.final && value.outcome.type !== 'pending', options.signal)
   }
 
   /**
-   * Resolves once the transaction is accepted; throws `TransactionRejectedError`
-   * (with a parsed `reason`) if it is rejected. Like `settled()`, this is the
-   * outcome at the transaction's current position.
+   * Resolves only after immutable acceptance is applied locally. A final
+   * rejection throws `TransactionRejectedError` with a parsed `reason`.
    */
-  async accepted(options: { readonly signal?: AbortSignal } = {}): Promise<TransactionOutcome> {
-    const outcome = await this.settled(options)
+  async accepted(options: { readonly signal?: AbortSignal } = {}): Promise<AcceptedTransactionOutcome> {
+    const outcome = await this.final(options)
     if (outcome.outcome.type === 'rejected') throw new TransactionRejectedError(this.transactionId, outcome.outcome.rejection)
-    return outcome
+    return { ...outcome, outcome: outcome.outcome }
   }
 
-  #waitForOutcome(predicate: (value: TransactionOutcome) => boolean, signal?: AbortSignal): Promise<TransactionOutcome> {
+  #waitForOutcome<T extends TransactionOutcome>(predicate: (value: TransactionOutcome) => value is T, signal?: AbortSignal): Promise<T> {
     if (signal?.aborted === true) return Promise.reject(signal.reason)
     return new Promise((resolve, reject) => {
       let finished = false
       let unsubscribe = () => undefined as void
-      const finish = (value?: TransactionOutcome, error?: unknown) => {
+      const finish = (value?: T, error?: unknown) => {
         if (finished) return
         finished = true
         signal?.removeEventListener('abort', abort)
@@ -281,27 +289,45 @@ export class ChronologClient {
     return new TransactionHandle(this, submission)
   }
 
-  /** Current revision followed by coalesced invalidations. Reconnect reads current state; there is no replay cursor. */
+  /** Current applied view, then latest-state invalidations. Reconnects without a history cursor. */
   changes(options: ViewChangeOptions = {}): AsyncIterable<ViewChange> {
-    const view = options.view ?? 'final', externalSignal = options.signal, self = this
+    const self = this, view = options.view ?? 'final', external = options.signal
+    if (view !== 'local' && view !== 'final') throw new TypeError('view must be local or final')
     return { [Symbol.asyncIterator]() {
       if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
-      const request = { groupId: self.groupId, requestId: self._requestId(), view }
-      const resource = self.#revisionStream((_cursor, signal) => self.#transport.stream('view.changes', request, self.#callOptions(signal)), () => undefined)
-      const close = (): void => { externalSignal?.removeEventListener('abort', close); resource.dispose() }
-      externalSignal?.addEventListener('abort', close, { once: true })
-      if (externalSignal?.aborted === true) close()
+      const controller = new AbortController()
+      const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(external === undefined ? [] : [external])])
+      const resource = self.#track(new StreamResource<ViewChange>({
+        open: (_cursor, lifetime) => self.#transport.stream('view.changes', { groupId: self.groupId, view },
+          self.#callOptions(AbortSignal.any([signal, lifetime]))),
+        cursor: () => undefined,
+        ...(self.#streamRetryDelayMs === undefined ? {} : { retryDelayMs: self.#streamRetryDelayMs }),
+      }))
       const iterator = resource[Symbol.asyncIterator]()
+      const close = (): void => {
+        signal.removeEventListener('abort', close)
+        resource.dispose()
+        // Disposing wakes an idle next; return also releases a paused yield.
+        void iterator.return?.().catch(() => undefined)
+      }
+      signal.addEventListener('abort', close, { once: true })
+      if (signal.aborted) close()
       return {
         async next() {
+          if (signal.aborted) return { done: true as const, value: undefined }
           try {
             const result = await iterator.next()
-            if (result.done) close()
-            return result
-          } catch (error) { close(); throw error }
+            if (result.done) controller.abort()
+            return signal.aborted ? { done: true as const, value: undefined } : result
+          } catch (error) { controller.abort(error); throw error }
         },
-        async return() { close(); await iterator.return?.(); return { done: true as const, value: undefined } },
-        async throw(error: unknown) { close(); await iterator.return?.(); throw error },
+        async return() {
+          controller.abort(); close(); await iterator.return?.()
+          return { done: true as const, value: undefined }
+        },
+        async throw(error: unknown) {
+          controller.abort(error); close(); await iterator.return?.(); throw error
+        },
       }
     } }
   }

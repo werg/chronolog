@@ -312,10 +312,12 @@ Chronolog session above them.
 
 The live lane carries one original signed signal per datagram, up to 16 KiB.
 It has a separate 64 KiB SCTP buffered-amount budget and at most 64 queued
-received datagrams. A congested send rejects immediately with
-`SignalBackpressureError` before dispatch, preserving the authenticated session
-and its durable lane for later work. A slow receiver drops
-its oldest queued datagram and increments `live.stats.droppedPackets`. No history
+received datagrams. A congested low-level `live.send` immediately returns
+`{ refused: 'backpressure' }`, guaranteeing that it queued and dispatched no
+bytes for that attempt. The public `signals.send` rejects with
+`SIGNAL_BACKPRESSURE`; the authenticated session and reliable history remain
+usable, and a later fresh signal can succeed. A slow receiver drops its oldest
+queued datagram and increments `live.stats.droppedPackets`. No history
 credit, detached-body queue or reliable retransmission blocks this lane. This
 isolates application queues; both lanes still share the connection's network
 bandwidth and SCTP association, so it is not a reserved-bandwidth guarantee.
@@ -326,6 +328,15 @@ and expiry remain the signal channel's responsibility. Cancellation propagates
 to local live dispatch. A send already handed to SCTP cannot be recalled; its
 receiver still enforces expiry. There is no fallback that inserts a live signal
 into reliable history when the independent lane is absent.
+
+The authenticated reader admits at most eight concurrent live validations per
+peer. Extra datagrams are dropped before admission, and shared signal-channel
+receive capacity can also refuse admission without ending the peer session.
+These drops occur before local FIFO delivery, so they do not silently remove an
+already admitted subscriber message. Admitted malformed, invalid-signature or
+unauthorized frames still fail the session; transport failures and dispatched
+writes that ignore cancellation also retire it. Returning a live frame iterator
+wakes a pending idle read and closes its owned lane.
 
 `ready` requires the live lane to open and both local and remote reliable framing HELLO messages. Its 10-second
 HELLO deadline starts after the local channel opens, allowing ICE negotiation

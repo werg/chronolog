@@ -350,13 +350,37 @@ export class NativeFinalityService {
     })
   }
 
-  /** Re-publishing retained evidence is idempotent and never authors another proposal. */
-  async share(sink: EvidenceSink, options: { readonly after?: number; readonly limit?: number } = {}): Promise<OrderedRecordHead> {
-    const range = await this.certifiedRead(options)
-    for (const entry of range.entries) await sink.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
-    await sink.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: range.certificate }))
-    const last = range.entries.at(-1)
-    return last === undefined ? range.certificate : { historyId: last.historyId, position: last.position, root: last.root }
+  /**
+   * Publish one complete captured prefix in bounded pages, then its certificate.
+   * `after` is the last position already acknowledged by this sink. New appends
+   * belong to a later call; retries resend the same retained evidence bytes.
+   * Cancellation stops between acknowledged writes and never rolls one back.
+   */
+  async share(sink: EvidenceSink, options: { readonly after?: number; readonly signal?: AbortSignal } = {}): Promise<OrderedRecordHead> {
+    const signal = options.signal
+    signal?.throwIfAborted()
+    let after = options.after ?? 0
+    const first = await this.certifiedRead({ after, limit: 64 })
+    const certificate = first.certificate
+    let entries = first.entries
+    while (after < certificate.position) {
+      signal?.throwIfAborted()
+      if (entries.length === 0) throw new Error('AUTHORITY_RANGE_INCOMPLETE')
+      for (const entry of entries) {
+        signal?.throwIfAborted()
+        if (entry.position !== after + 1 || entry.position > certificate.position) throw new Error('AUTHORITY_RANGE_NOT_CONTIGUOUS')
+        await sink.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
+        after = entry.position
+      }
+      signal?.throwIfAborted()
+      if (after < certificate.position) {
+        entries = (await this.read({ after, limit: Math.min(64, certificate.position - after) })).entries
+      }
+    }
+    signal?.throwIfAborted()
+    await sink.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate }))
+    signal?.throwIfAborted()
+    return { historyId: certificate.historyId, position: certificate.position, root: certificate.root }
   }
 
   /**
@@ -387,16 +411,13 @@ export class NativeFinalityService {
       })
     }
     const publish = () => publication.run(async () => {
-      const certificate = await this.certify()
-      while (after < certificate.position && !running.aborted) {
-        const range = await this.read({ after })
-        for (const entry of range.entries) {
-          if (entry.position > certificate.position) break
-          await sink.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
-          after = entry.position
-        }
+      if (running.aborted) return
+      try {
+        after = (await this.share(sink, { after, signal: running })).position
+      } catch (error) {
+        // An explicit stop is normal; a sink failure must still stop the owner.
+        if (!running.aborted || error !== running.reason) throw error
       }
-      if (!running.aborted) await sink.putEvidence(encodeOrderingEvidence({ kind: 'prefix-certificate', certificate }))
     })
     // Include the already retained local backlog before the first new closure.
     // Replayed exact records still deduplicate to their original receipt.

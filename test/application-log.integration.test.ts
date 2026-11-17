@@ -110,26 +110,31 @@ describe('public application backend with native durable execution', () => {
       emit('tasks', { type: 'task.updated', taskId: 'one', value: 20 }),
       sqlStatement("SELECT chronolog_assert(0, 'claim_lost')"),
     )
-    const accepted = await backend.submit(acceptedProgram, { operationId: 'accepted' })
+    const accepted = await client.submit(acceptedProgram, { operationId: 'accepted' })
+    const finalAcceptance = accepted.accepted()
     const rejected = await backend.submit(rejectedProgram, { operationId: 'rejected' })
     expect((await terminal(client, accepted.proposalId)).outcome).toEqual({ type: 'accepted' })
     expect((await terminal(client, rejected.proposalId)).outcome).toEqual({ type: 'rejected', rejection: { code: 'assert:claim_lost', statementIndex: 2 } })
     await fixture.finalize()
+    expect(await finalAcceptance).toMatchObject({ final: true, outcome: { type: 'accepted' } })
+    accepted.dispose()
 
+    const core = node.candidateCore(new TextEncoder().encode(accepted.proposalId))!
+    const origin = { kind: 'chronolog', groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
+      operationId: core.operationId, membershipRevision: bytesToBase64Url(core.membershipRevision), writerCapability: null,
+      authorTimestampMs: core.authorTimestampMs.toString() }
     const view = await backend.readView({ view: 'final' })
     try {
       const rows = await view.query('SELECT value FROM tasks')
       const history = await view.readEvents()
       expect(rows).toMatchObject({ revision: view.revision, rows: [[10n]] })
       expect(history.revision).toBe(view.revision)
-      const core = node.candidateCore(new TextEncoder().encode(accepted.proposalId))!
-      const origin = { kind: 'chronolog', groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
-        operationId: core.operationId, authorTimestampMs: core.authorTimestampMs.toString(),
-        membershipRevision: bytesToBase64Url(core.membershipRevision), writerCapability: null }
       expect(history.transactions).toEqual([{ proposalId: accepted.proposalId, events: [
         { id: `${accepted.proposalId}:0`, proposalId: accepted.proposalId, eventOrdinal: 0, topic: 'tasks', payload: { type: 'task.updated', taskId: 'one', value: 10 }, origin },
         { id: `${accepted.proposalId}:1`, proposalId: accepted.proposalId, eventOrdinal: 1, topic: 'conversation', payload: { type: 'message.posted', messageId: 'm1', text: 'Updated' }, origin },
       ] }])
+      expect((await client.events.read()).transactions).toEqual(history.transactions)
+      expect((await node.events.read()).transactions).toEqual(history.transactions)
     } finally { await view.release() }
     // Rejection stays auditable even though it contributes no effective events.
     expect(node.candidateCore(new TextEncoder().encode(rejected.proposalId))?.program).toEqual(rejectedProgram)
@@ -162,22 +167,28 @@ describe('public application backend with native durable execution', () => {
     expect((await terminal(client, setup.proposalId)).outcome).toEqual({ type: 'accepted' })
     const setupTime = node.candidateCore(new TextEncoder().encode(setup.proposalId))!.authorTimestampMs
     fixture.clock.now += 20
-    const later = await backend.submit(program(
+    const later = await client.submit(program(
       sqlStatement("SELECT chronolog_assert((SELECT value FROM balances) = 100, 'balance_changed')"),
       sqlStatement('UPDATE balances SET value = 90'),
       emit('tasks', { value: 90 }),
     ), { operationId: 'later' })
+    let acceptanceFinished = false
+    const finalAcceptance = later.accepted().then(value => { acceptanceFinished = true; return { value } },
+      (error: unknown) => { acceptanceFinished = true; return { error } })
     await terminal(client, later.proposalId)
     const oldLocal = await backend.readView({ view: 'local' })
     const oldFinal = await backend.readView({ view: 'final' })
     const statuses = backend.operations.subscribe({ operationId: 'later', signal: AbortSignal.timeout(10_000) })[Symbol.asyncIterator]()
     try {
       expect((await statuses.next()).value).toMatchObject({ status: 'provisional', outcome: 'accepted' })
+      expect((await later.settled()).outcome).toEqual({ type: 'accepted' })
+      expect(acceptanceFinished).toBe(false)
       const afterRebase = statuses.next()
       const predecessor = await node.publish({ operationId: 'earlier-arrival', authorTimestampMs: setupTime + 1n,
         program: program(sqlStatement('UPDATE balances SET value = 80'), emit('tasks', { value: 80 })) })
       await terminal(client, predecessor.txIdText)
       expect((await afterRebase).value).toMatchObject({ status: 'provisional', outcome: 'rejected', error: 'assert:balance_changed' })
+      expect(acceptanceFinished).toBe(false)
       expect((await oldLocal.query('SELECT value FROM balances')).rows).toEqual([[90n]])
       expect((await oldLocal.readEvents()).transactions.map(transaction => transaction.proposalId)).toEqual([later.proposalId])
       expect((await oldLocal.readEvents()).revision).toBe(oldLocal.revision)
@@ -194,6 +205,8 @@ describe('public application backend with native durable execution', () => {
       const finalStatus = statuses.next()
       await fixture.finalize()
       expect((await finalStatus).value).toMatchObject({ status: 'final', outcome: 'rejected', error: 'assert:balance_changed' })
+      expect(await finalAcceptance).toMatchObject({ error: { name: 'TransactionRejectedError', code: 'assert:balance_changed',
+        reason: { kind: 'assert', code: 'balance_changed' } } })
       const confirmed = await backend.readView({ view: 'final' })
       try {
         expect((await confirmed.query('SELECT value FROM balances')).rows).toEqual([[80n]])
@@ -202,7 +215,7 @@ describe('public application backend with native durable execution', () => {
       // A previously captured final view cannot acquire later rows or events.
       expect((await oldFinal.readEvents()).transactions).toEqual([])
       expect((await oldFinal.query("SELECT name FROM sqlite_schema WHERE name = 'balances'")).rows).toEqual([])
-    } finally { await statuses.return?.(); await oldLocal.release(); await oldFinal.release() }
+    } finally { later.dispose(); await statuses.return?.(); await oldLocal.release(); await oldFinal.release() }
   })
 
   it('resumes complete event-only transactions after replica restart, including empty filtered progress', async () => {

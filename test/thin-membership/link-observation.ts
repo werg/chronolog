@@ -35,6 +35,8 @@ export function observeFeedLink(source: FeedLink) {
   }
   const link: FeedLink = {
     identity: source.identity,
+    head: feed => source.head(feed),
+    evidenceHead: () => source.evidenceHead(),
     read: (feed, after, limit) => read('feed', { feed, after: String(after), limit }, () => source.read(feed, after, limit)),
     readEvidence: (after, limit) => read('evidence', { after: String(after), limit }, () => source.readEvidence(after, limit)),
     readPayload: hash => read('payload', { limit: 1 }, () => source.readPayload(hash)),

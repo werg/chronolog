@@ -147,6 +147,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     membershipRevision: initial.revisionDigest, validationPolicy, identity: options.identity,
     transport: options.transport, materialization: options.materialization, membership, membershipState,
     operationStore: options.operationStore, envelopeCipher: governance.cipherRing,
+    authorClockPolicy: { maxFutureSkewMs: clock.maxFutureSkewMs },
     ...(options.controlStore === undefined ? {} : { controlStore: options.controlStore }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     ...(options.random === undefined ? {} : { random: options.random }),

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from './feed-codec.js'
 import { DurableFeedStore, type AtomicBytesStore } from './store.js'
@@ -8,7 +8,7 @@ import { payloadHash } from './payload.js'
 const peers: PortableFeedTransport[] = []
 afterEach(async () => { await Promise.all(peers.splice(0).map((peer) => peer.close())) })
 
-async function peer() {
+async function peer(observeStore?: (store: DurableFeedStore) => void) {
   const values = new Map<string, Uint8Array>()
   const bytes: AtomicBytesStore = {
     get: async (key) => values.get(key)?.slice() ?? null,
@@ -16,7 +16,9 @@ async function peer() {
   }
   const keys = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])
   const id = feedIdFromPublicKey(new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey)))
-  const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(bytes, webFeedCrypto), signer: webFeedSigner(id, keys.privateKey), crypto: webFeedCrypto })
+  const store = await DurableFeedStore.open(bytes, webFeedCrypto)
+  observeStore?.(store)
+  const transport = new PortableFeedTransport({ store, signer: webFeedSigner(id, keys.privateKey), crypto: webFeedCrypto })
   peers.push(transport)
   return transport
 }
@@ -44,7 +46,7 @@ describe('portable peer replication', () => {
     await author.publish(payload)
     const remote = author.asLink()
     let reads = 0
-    reader.connect({ ...remote, read: async () => [], readPayload: async (id) => { reads += 1; return remote.readPayload(id) } })
+    reader.connect({ ...remote, head: async () => 0n, read: async () => [], readPayload: async (id) => { reads += 1; return remote.readPayload(id) } })
     await reader.catchUp()
     expect(reads).toBe(0)
     expect(await reader.history()).toEqual([])
@@ -52,7 +54,7 @@ describe('portable peer replication', () => {
     expect(reads).toBe(1)
     reader.disconnect(author.identity)
     expect(await reader.getPayload(hash)).toEqual(payload)
-    relay.connect({ ...reader.asLink(), read: async () => [] })
+    relay.connect({ ...reader.asLink(), head: async () => 0n, read: async () => [] })
     await relay.catchUp()
     expect(await relay.getPayload(hash)).toEqual(payload)
     expect(await relay.history()).toEqual([])
@@ -111,10 +113,72 @@ describe('portable peer replication', () => {
     expect((await author.history()).length).toBe(10)
   })
 
+  it('rejects the captured catch-up when its connection is replaced by a healthy one', async () => {
+    const [author, reader] = await Promise.all([peer(), peer()])
+    let entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    reader.connect({ ...author.asLink(), async *watch() {}, async evidenceHead() { entered(); await gate; return 0n } })
+    await started
+    const caughtUp = reader.catchUp(), rejected = expect(caughtUp).rejects.toMatchObject({ name: 'AbortError' })
+    reader.connect({ ...author.asLink(), async *watch() {} })
+    await rejected
+    await reader.catchUp()
+    expect((await reader.status()).peers).toContain(author.identity)
+    expect((await reader.status()).lastCatchUpError).toBeUndefined()
+    release()
+  })
+
+  it('keeps a detached route’s pending durable append owned until transport close completes', async () => {
+    const author = await peer()
+    let store!: DurableFeedStore
+    const reader = await peer(value => { store = value })
+    await author.putEvidence(Uint8Array.of(7, 1))
+    let entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const putEvidence = store.putEvidence.bind(store)
+    vi.spyOn(store, 'putEvidence').mockImplementation(async bytes => { entered(); await gate; return putEvidence(bytes) })
+    const closeStore = vi.spyOn(store, 'close')
+    const detach = reader.connect({ ...author.asLink(), async *watch() {} })
+    await started
+    detach()
+    const closing = reader.close()
+    await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+    expect(closeStore).not.toHaveBeenCalled()
+    release(); await closing
+    expect(closeStore).toHaveBeenCalledTimes(1)
+    expect(store.evidenceHead()).toBe(1n)
+  })
+
+  it('freezes requested feeds for one catch-up while later requests get their own pass', async () => {
+    const [author, reader, later] = await Promise.all([peer(), peer(), peer()])
+    const passes: string[][] = []
+    let gate: Promise<void> | undefined, entered: (() => void) | undefined
+    reader.connect({ ...author.asLink(), async *watch() {}, async evidenceHead() {
+      passes.push([])
+      const current = gate; gate = undefined; entered?.(); entered = undefined
+      await current
+      return 0n
+    }, async head(feed) { passes.at(-1)!.push(feed); return 0n } })
+    await reader.catchUp()
+    let release!: () => void
+    gate = new Promise<void>(resolve => { release = resolve })
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const caughtUp = reader.catchUp()
+    await started
+    const captured = passes.at(-1)!
+    reader.requestFeed(later.identity)
+    release()
+    await caughtUp
+    expect(captured).toEqual([reader.identity, author.identity])
+    await reader.catchUp()
+    expect(passes.at(-1)).toContain(later.identity)
+  })
+
   it('does not accept another author as the requested feed', async () => {
     const [author, attacker, reader] = await Promise.all([peer(), peer(), peer()])
     await attacker.publish(Uint8Array.of(1))
-    reader.connect({ identity: author.identity, readEvidence: async () => [], readPayload: async () => null, read: (_feed, after, limit) => attacker.asLink().read(attacker.identity, after, limit), async *watch() {} })
+    reader.connect({ identity: author.identity, head: async () => 1n, evidenceHead: async () => 0n,
+      readEvidence: async () => [], readPayload: async () => null, read: (_feed, after, limit) => attacker.asLink().read(attacker.identity, after, limit), async *watch() {} })
     await expect(reader.catchUp()).rejects.toThrow('FEED_RANGE_AUTHOR_MISMATCH')
     expect(await reader.history()).toEqual([])
   })

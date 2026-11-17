@@ -68,7 +68,7 @@ it('delivers newly detected forks and replays them to later subscribers without 
   try {
     expect((await iterator.next()).value?.id).toBe(first.id)
     const conflict = iterator.next()
-    transport.connect({ identity: signer.identity, read: async () => [fork.raw],
+    transport.connect({ identity: signer.identity, head: async () => 2n, evidenceHead: async () => 0n, read: async () => [fork.raw],
       readEvidence: async () => [], readPayload: async () => null, async *watch() {} })
     await expect(transport.catchUp()).rejects.toThrow('FEED_RANGE_NO_PROGRESS')
     expect((await conflict).value?.id).toBe(fork.id)

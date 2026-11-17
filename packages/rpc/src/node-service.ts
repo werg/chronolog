@@ -61,7 +61,7 @@ import type {
   SendSignalRequest, SubscribeSignalsRequest,
   GetOperationRequest, OperationStatus, StreamOperationsRequest,
   OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
-  ViewChangesRequest, ViewChangesResponse,
+  ViewChangesRequest, ViewChange,
 } from './types.js'
 import { RPC_API_VERSION } from './types.js'
 import type {
@@ -215,13 +215,12 @@ export class NodeRpcService implements ChronologRpcService {
     }
   }
 
-  async *streamViewChanges(request: ViewChangesRequest, context: RpcCallContext): AsyncIterable<ViewChangesResponse> {
+  viewChanges(request: ViewChangesRequest, context: RpcCallContext): AsyncIterable<ViewChange> {
     this.#assertGroup(request.groupId)
-    if (Object.keys(request).some(key => !['groupId', 'requestId', 'view'].includes(key))) throw invalid('View changes have no replay cursor')
-    const signal = context.signal === undefined ? this.#signalLifetime.signal : AbortSignal.any([this.#signalLifetime.signal, context.signal])
-    signal.throwIfAborted()
-    if (this.#node.changes === undefined) throw failed('View change notifications are not enabled for this node')
-    yield* this.#node.changes({ view: request.view === undefined ? 'final' : sqlView(request.view), signal })
+    if (Object.keys(request).some(key => !['groupId', 'view'].includes(key))) throw invalid('View changes accept only a group and optional view; they have no replay cursor')
+    if (this.#node.changes === undefined) throw failed('Application view changes are not enabled for this node')
+    const view = request.view === undefined ? 'final' : sqlView(request.view)
+    return this.#node.changes({ view, signal: this.#liveSignal(context) })
   }
 
   async openReadView(request: OpenReadViewRequest, context: RpcCallContext): Promise<OpenReadViewResponse> {

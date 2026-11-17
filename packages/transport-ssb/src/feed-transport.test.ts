@@ -57,7 +57,10 @@ describe('signed feed records', () => {
     store = new FeedStore(path)
     try {
       expect(store.putEvidence(first.evidence.bytes)).toMatchObject({ kind: 'duplicate', index: 1n, evidence: first.evidence })
-      expect(store.evidenceAfter(0n, 10)).toEqual([{ index: 1n, evidence: first.evidence }])
+      expect(store.evidenceHead()).toBe(1n)
+      expect(store.putEvidence(Uint8Array.of(7, 8, 9)).index).toBe(2n)
+      expect(store.evidenceHead()).toBe(2n)
+      expect(store.evidenceAfter(0n, 1)).toEqual([{ index: 1n, evidence: first.evidence }])
       expect(store.count()).toBe(0)
     } finally { store.close() }
   })

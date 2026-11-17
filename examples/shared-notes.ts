@@ -2,6 +2,9 @@
 // Bob, each with its own ChronologClient. Rows belong to the key that wrote
 // them; Alice shares one row with Bob, they work in a team, and Alice hands
 // a note over to Bob. Run with `pnpm demo:ownership`.
+// This walkthrough explicitly inspects provisional local state. Applications
+// that depend on immutable success should await handle.accepted() instead.
+import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,7 +12,7 @@ import { join } from 'node:path'
 import {
   ChronologClient,
   OWNER_FOR_KEY_SQL,
-  TransactionRejectedError,
+  parseRejectionCode,
   ownerKeySql,
   ownershipQueries,
   type OwnershipQuery,
@@ -47,39 +50,36 @@ try {
     "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open') STRICT",
     "INSERT INTO notes (id, body) VALUES (1, 'Plan the offsite')",
   ])
-  await setup.accepted()
+  await expectLocalAcceptance(setup)
   await reached(bob, setup)
 
-  // Bob cannot change Alice's note. The whole transaction is rejected, with a reason.
-  try {
-    await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).accepted()
-  } catch (error) {
-    if (!(error instanceof TransactionRejectedError)) throw error
-    console.log('Bob editing Alice\'s note:', error.reason)
-  }
+  // Bob cannot change Alice's note at the current local position.
+  const denied = await (await bob.transaction(["UPDATE notes SET status = 'done' WHERE id = 1"])).settled()
+  assert.equal(denied.outcome.type, 'rejected')
+  if (denied.outcome.type === 'rejected') console.log('Bob editing Alice\'s note:', parseRejectionCode(denied.outcome.rejection.code))
 
   // Alice lets Bob update the status of that one note.
   const share = await alice.ownership.share({ table: 'notes', with: bobKey, operations: ['update'], row: [1n], columns: ['status'] })
-  await share.handle.accepted()
+  await expectLocalAcceptance(share.handle)
   await reached(bob, share.handle)
   console.log('Bob\'s grants:', (await list(bob, ownershipQueries.grantsReceived(bobKey))).map((grant) => `${grant.operations.join('+')} ${grant.table}[${grant.rowKey}] ${grant.columns?.join(',')}`))
-  await (await bob.transaction(["UPDATE notes SET status = 'in progress' WHERE id = 1"])).accepted()
+  await expectLocalAcceptance(await bob.transaction(["UPDATE notes SET status = 'in progress' WHERE id = 1"]))
 
   // A team: Alice creates it and invites Bob; Bob accepts and writes a team-owned note.
   const team = await alice.ownership.createTeam({ invite: [bobKey] })
-  await team.handle.accepted()
+  await expectLocalAcceptance(team.handle)
   await reached(bob, team.handle)
   console.log('Bob\'s invitations:', (await list(bob, ownershipQueries.invitations(bobKey))).length)
-  await (await bob.ownership.acceptInvitation(team.id)).handle.accepted()
-  await (await bob.transaction([{ sql: `INSERT INTO notes (id, body, chronolog_owner) VALUES (2, 'Book the venue', ${OWNER_FOR_KEY_SQL})`, params: [team.id] }])).accepted()
+  await expectLocalAcceptance((await bob.ownership.acceptInvitation(team.id)).handle)
+  await expectLocalAcceptance(await bob.transaction([{ sql: `INSERT INTO notes (id, body, chronolog_owner) VALUES (2, 'Book the venue', ${OWNER_FOR_KEY_SQL})`, params: [team.id] }]))
 
   // Alice hands note 1 over to Bob; it moves when he accepts.
   const offer = await alice.ownership.offerRow({ table: 'notes', row: [1n], to: bobKey })
-  await offer.handle.accepted()
+  await expectLocalAcceptance(offer.handle)
   await reached(bob, offer.handle)
   const [incoming] = await list(bob, ownershipQueries.incomingOffers(bobKey))
   const accept = await bob.ownership.acceptOffer(incoming!.offerId)
-  await accept.handle.accepted()
+  await expectLocalAcceptance(accept.handle)
   await reached(alice, accept.handle)
 
   for (const [id, body, status, owner] of (await alice.query(`SELECT id, body, status, ${ownerKeySql('n')} FROM notes AS n ORDER BY id`)).result.rows) {
@@ -94,6 +94,13 @@ try {
 
 async function list<T>(client: ChronologClient, query: OwnershipQuery<T>): Promise<readonly T[]> {
   return query.decode((await client.query(query.sql, query.parameters)).result)
+}
+
+/** The walkthrough has no closure service; each displayed result is tentative. */
+async function expectLocalAcceptance(handle: TransactionHandle): Promise<void> {
+  const result = await handle.settled()
+  assert.equal(result.outcome.type, 'accepted')
+  assert.equal(result.final, false)
 }
 
 /** Waits until `client`'s node has the outcome of a transaction submitted through another node. */

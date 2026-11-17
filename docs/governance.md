@@ -444,9 +444,10 @@ validator. The frontier accounts for each pending proposal's own policy and
 revision, every allowed admission policy, and complete indexed feed prefixes.
 Once the revoke is final, no later admission can be inserted before it.
 
-`TransactionHandle.accepted()` and `settled()` report the materialized outcome
-at the transaction's **current position**. Neither waits for finality. Use
-`handle.final()` to wait for its immutable accepted or rejected result. External
+`TransactionHandle.settled()` reports the materialized outcome at the
+transaction's **current position** and does not wait for finality.
+`accepted()` waits for locally applied immutable acceptance and throws on final
+rejection; `final()` returns either immutable outcome. External
 effects consume final events and retain their own dispatch checkpoint and
 idempotency key. Settlement evidence explains pending proof and admission
 blockers; a raw cutoff or an accepted speculative outcome does not establish

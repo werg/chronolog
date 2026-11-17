@@ -232,7 +232,7 @@ try {
       const row = document.querySelector(`[data-operation="${id}"]`); return row?.getAttribute('data-status') === 'final'
     }, claimIds[index]!)))
     const claimStates = await Promise.all(all.map((page, index) => page.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), claimIds[index]!)))
-    assert(claimStates.every(state => state?.status === 'final'))
+    assert.deepEqual(claimStates.map(state => state?.status), ['final', 'final'])
     assert.deepEqual(claimStates.map(state => state?.outcome).sort(), ['accepted', 'rejected'])
     assert.equal(claimStates.find(state => state?.outcome === 'rejected')?.error, 'assert:task_unavailable')
     await native.node.waitForIdle()
@@ -257,11 +257,14 @@ try {
     // operation frontier before applying the renderer's short DOM deadline.
     await waitFor(async () => {
       const operation = await loser.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), rejectedJobId)
-      if (operation?.status === 'final' && operation.outcome === 'rejected') assert.equal(operation.error, 'assert:claim_required')
-      return operation?.status === 'final' && operation.outcome === 'rejected'
+      if (operation?.status === 'final') {
+        assert.equal(operation.outcome, 'rejected'); assert.equal(operation.error, 'assert:claim_required')
+      }
+      return operation?.status === 'final'
     }, 'losing claimant final job rejection')
     report.timingsMs.browserRejectedJob = Date.now() - rejectedJobStarted
     await expect(loser.locator(`#operations > li[data-operation="${rejectedJobId}"]`)).toHaveAttribute('data-status', 'final')
+    await expect(loser.locator(`#operations > li[data-operation="${rejectedJobId}"]`)).toHaveAttribute('data-outcome', 'rejected')
     assert.equal(report.counts.effectDispatches, 0)
     const jobStarted = Date.now()
     const winningJob = await authorWithAdmission('winning claimant native job intent', () =>

@@ -83,7 +83,10 @@ const api = {
   },
   sync(id: string) { return peers.get(id)!.command('sync') },
   request(id: string, requestId: string, roles: readonly EnrollmentRole[]) {
-    return peers.get(id)!.client.enrollment.createRequest({ requestId, roles })
+    return peers.get(id)!.client.enrollment.createRequest({ requestId, roles,
+      // The claim fixture needs SQL/platform operations, but publishes no
+      // durable events or live signals. Reader-only enrollment grants neither.
+      ...(roles.includes('writer') ? { writerProgram: { sql: true, topics: [], signals: [] } } : {}) })
   },
   enrollmentStatus(id: string, requestId: string, signedApproval?: string) {
     return peers.get(id)!.client.enrollment.getStatus(requestId, signedApproval === undefined ? {} : { signedApproval })

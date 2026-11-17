@@ -80,7 +80,9 @@ export async function evaluatePeerLiveFinality(options: {
       if (await options.isValidAdmissionProof(candidate, core, proof)) verifiedAttestationIds.add(bytesToHex(proof.attestationId))
     }
   }
-  return { mode: 'live', ...options.control.admissionFrontier(scopes[0]!.policies[0]!, scopes[0]!.membershipRevision, {
+  // Complete scopes prove the global bound. Each unresolved proposal still
+  // uses its own verified policy; no representative policy supplies a fallback.
+  return { mode: 'live', ...options.control.admissionFrontier(null, undefined, {
     provenThroughMs, candidatePolicies, verifiedAttestationIds,
     verifiedHeartbeatIds: options.verifiedHeartbeatIds, closedMembershipRevisions,
   }) }

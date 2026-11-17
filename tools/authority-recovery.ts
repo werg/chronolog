@@ -75,9 +75,9 @@ const child = (action: string, directory: string, operation = 'accepted', point 
     ...(continuity === undefined ? [] : [continuity])]
   const started = Date.now()
   const result = spawnSync(process.execPath, args, { cwd: workspace, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 })
-  if (result.error !== undefined) throw result.error
-  const value = { status: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr }
+  const value = { status: result.status, signal: result.signal, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
   transcript.push({ command: [process.execPath, ...args], elapsedMs: Date.now() - started, result: value })
+  if (result.error !== undefined) throw result.error
   return value
 }
 const completed = (result: ChildResult): ChildResult => {

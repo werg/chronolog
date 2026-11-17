@@ -32,6 +32,7 @@ export interface FeedStorePort {
   heads(): Awaitable<ReadonlyMap<string, bigint>>
   count(): Awaitable<number>
   putEvidence(bytes: Uint8Array): Awaitable<{ readonly kind: 'appended' | 'duplicate'; readonly index: bigint; readonly evidence: ImmutableEvidence }>
+  evidenceHead(): Awaitable<bigint>
   evidenceAfter(index: bigint, limit: number): Awaitable<readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[]>
   close(): Awaitable<void>
 }
@@ -171,6 +172,8 @@ export class DurableFeedStore implements FeedStorePort {
     this.#pending = task.catch(() => undefined)
     return task
   }
+
+  evidenceHead(): bigint { return BigInt(this.#evidence.length) }
 
   evidenceAfter(index: bigint, limit: number): readonly { readonly index: bigint; readonly evidence: ImmutableEvidence }[] {
     assertRange(index, limit)

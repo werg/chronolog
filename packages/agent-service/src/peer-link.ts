@@ -4,9 +4,9 @@ import {
   assertCanonicalCbor, encodeCanonicalCbor, equalBytes,
 } from '@chronolog/protocol'
 import type { CborValue, Ed25519KeyPair } from '@chronolog/protocol'
-import { ChangeSignal } from '@chronolog/records'
+import { assertFeedPosition, ChangeSignal } from '@chronolog/records'
 import type { FeedLink } from '@chronolog/records'
-import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN, SignalBackpressureError } from '@chronolog/signals'
+import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN, type SignalDispatchResult } from '@chronolog/signals'
 
 import type { FramedPeerConnection } from './framing.js'
 
@@ -42,12 +42,13 @@ export interface AuthenticatedPeerLinkOptions {
 
 interface RemoteHello extends PeerAuthorization { readonly nonce: Uint8Array; readonly encoded: Uint8Array }
 interface PendingRequest {
+  readonly kind: 'range' | 'head'
   readonly limit: number
   readonly records: Uint8Array[]
   /** Non-null requests exactly one detached payload by content address. */
   readonly payloadHash: string | null
   bytes: number
-  readonly resolve: (values: readonly Uint8Array[]) => void
+  readonly resolve: (values: readonly Uint8Array[] | bigint) => void
   readonly reject: (error: unknown) => void
   responseStarted: boolean
   sendTimer: ReturnType<typeof setTimeout> | undefined
@@ -64,7 +65,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   readonly link: FeedLink
   readonly peer: PeerAuthorization
   readonly completion: Promise<void>
-  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<void>
+  sendSignal(frame: Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<SignalDispatchResult>
   close(): Promise<void>
 }> {
   for (const bytes of [options.groupId, options.identity.publicKeyBytes, options.grantId]) {
@@ -162,6 +163,17 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     } finally { inbound -= 1 }
   }
 
+  const serveHead = async (id: number, feed: string | null): Promise<void> => {
+    try {
+      if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
+      const through = feed === null ? await options.local.evidenceHead() : await options.local.head(feed)
+      assertFeedPosition(through)
+      await sendAuthorized(['head-result', BigInt(id), through])
+    } catch (error) {
+      if (!controller.signal.aborted) await send(['error', BigInt(id), error instanceof Error ? error.message.slice(0, 256) : 'PEER_HEAD_UNAVAILABLE'])
+    } finally { inbound -= 1 }
+  }
+
   const handle = async (bytes: Uint8Array): Promise<void> => {
     if (bytes.length > MAX_RECORD_FRAME) throw new Error('PEER_FRAME_TOO_LARGE')
     const frame = assertCanonicalCbor(bytes)
@@ -198,6 +210,17 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       if (frame.length !== 3) throw new Error('PEER_FRAME_INVALID')
       changes.notify(); return
     }
+    if (frame[2] === 'head') {
+      if (frame.length !== 5 || typeof frame[3] !== 'bigint' ||
+          (frame[4] !== null && (typeof frame[4] !== 'string' || frame[4].length === 0 || frame[4].length > 256))) {
+        throw new Error('PEER_HEAD_INVALID')
+      }
+      const id = Number(frame[3])
+      if (!Number.isSafeInteger(id) || id < 1 || inbound >= 4) throw new Error('PEER_REQUEST_LIMIT_EXCEEDED')
+      inbound += 1
+      void serveHead(id, frame[4] as string | null).catch(fail)
+      return
+    }
     if (frame[2] === 'range') {
       if (frame.length !== 7 || typeof frame[3] !== 'bigint' ||
           (frame[4] !== null && (typeof frame[4] !== 'string' || frame[4].length === 0 || frame[4].length > 256)) ||
@@ -220,6 +243,13 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     if (typeof frame[3] !== 'bigint') throw new Error('PEER_RESPONSE_INVALID')
     const id = Number(frame[3]), request = pending.get(id)
     if (!Number.isSafeInteger(id) || request === undefined) throw new Error('PEER_RESPONSE_UNEXPECTED')
+    if (frame[2] === 'head-result') {
+      if (request.kind !== 'head' || frame.length !== 5) throw new Error('PEER_RESPONSE_INVALID')
+      assertFeedPosition(frame[4])
+      clearRequestTimers(request); pending.delete(id); request.resolve(frame[4])
+      return
+    }
+    if (request.kind === 'head' && frame[2] !== 'error') throw new Error('PEER_RESPONSE_INVALID')
     if (frame[2] === 'record') {
       if (frame.length !== 5 || !(frame[4] instanceof Uint8Array) || request.records.length >= request.limit) throw new Error('PEER_RANGE_TOO_LARGE')
       if (request.payloadHash !== null && (frame[4].length < 1 || frame[4].length > MAX_LEDGER_PAYLOAD_BYTES ||
@@ -268,9 +298,9 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
           if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
           const frame = assertCanonicalCbor(bytes)
           if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
-          // Verification may suspend independently of the reliable history reader.
-          // Once admitted here, failures and overload retire this owned lifetime.
-          if (signalsInFlight >= 8) throw new Error('PEER_SIGNAL_BACKPRESSURE')
+          // The live lane is lossy. Drop before admission at capacity instead of
+          // interrupting reliable history; admitted validation failures still retire.
+          if (signalsInFlight >= 8) continue
           const incoming = bytes.slice()
           signalsInFlight += 1
           void (async () => {
@@ -303,13 +333,15 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   catch (error) { fail(error); throw failure ?? error }
   finally { clearTimeout(handshakeTimer); rejectOpening = undefined }
 
-  const request = (limit: number, payloadHash: string | null,
-    fields: (id: number) => readonly CborValue[]): Promise<readonly Uint8Array[]> => {
+  function request(kind: 'head', fields: (id: number) => readonly CborValue[]): Promise<bigint>
+  function request(kind: 'range', fields: (id: number) => readonly CborValue[], limit: number, payloadHash: string | null): Promise<readonly Uint8Array[]>
+  function request(kind: 'range' | 'head', fields: (id: number) => readonly CborValue[], limit = 0,
+    payloadHash: string | null = null): Promise<readonly Uint8Array[] | bigint> {
     if (controller.signal.aborted) return Promise.reject(failure ?? new Error('PEER_CONNECTION_CLOSED'))
     if (pending.size >= 4 || nextRequest >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error('PEER_REQUEST_LIMIT_EXCEEDED'))
     const id = ++nextRequest
     return new Promise((resolve, reject) => {
-      const state: PendingRequest = { limit, payloadHash, records: [], bytes: 0, resolve, reject, responseStarted: false,
+      const state: PendingRequest = { kind, limit, payloadHash, records: [], bytes: 0, resolve, reject, responseStarted: false,
         sendTimer: setTimeout(() => fail(new Error('PEER_REQUEST_SEND_TIMEOUT')), sendTimeoutMs), idleTimer: undefined,
         lifetimeTimer: setTimeout(() => fail(new Error('PEER_REQUEST_LIFETIME_TIMEOUT')), requestTimeoutMs) }
       pending.set(id, state)
@@ -322,18 +354,23 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   }
   const requestRange = (feed: string | null, after: bigint, limit: number): Promise<readonly Uint8Array[]> => {
     validateRange(after, limit)
-    return request(limit, null, id => ['range', BigInt(id), feed, after, BigInt(limit)])
+    return request('range', id => ['range', BigInt(id), feed, after, BigInt(limit)], limit, null)
+  }
+  const requestHead = (feed: string | null): Promise<bigint> => {
+    if (feed !== null && (typeof feed !== 'string' || feed.length === 0 || feed.length > 256)) throw new Error('PEER_HEAD_INVALID')
+    return request('head', id => ['head', BigInt(id), feed])
   }
   const requestPayload = async (hash: string): Promise<Uint8Array | null> => {
     if (!validPayloadHash(hash)) throw new Error('PEER_PAYLOAD_REQUEST_INVALID')
-    const values = await request(1, hash, id => ['payload', BigInt(id), hash])
+    const values = await request('range', id => ['payload', BigInt(id), hash], 1, hash)
     return values[0] ?? null
   }
   const peer = remote as RemoteHello | null
   if (peer === null) throw new Error('PEER_HELLO_MISSING')
   return {
     peer: { authorId: peer.authorId.slice(), grantId: peer.grantId.slice(), feedId: peer.feedId },
-    link: { identity: peer.feedId, read: (feed, after, limit) => requestRange(feed, after, limit),
+    link: { identity: peer.feedId, head: requestHead, evidenceHead: () => requestHead(null),
+      read: (feed, after, limit) => requestRange(feed, after, limit),
       readEvidence: (after, limit) => requestRange(null, after, limit), readPayload: requestPayload,
       watch: (signal) => changes.watch(signal) },
     completion,
@@ -356,10 +393,16 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       // Live transports must honor cancellation before dispatch. Bound a stuck
       // implementation too; data already handed to the network is not recallable.
       const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
-      try { await interruptible(live.send(outgoing, { signal }), signal) }
+      try {
+        const result = await interruptible(live.send(outgoing, { signal }), signal)
+        if (result !== undefined && (typeof result !== 'object' || result === null || result.refused !== 'backpressure')) {
+          throw new Error('PEER_SIGNAL_DISPATCH_RESULT_INVALID')
+        }
+        return result
+      }
       catch (error) {
         if (controller.signal.aborted) throw failure ?? controller.signal.reason
-        if (!signal.aborted && !(error instanceof SignalBackpressureError)) fail(error)
+        if (!signal.aborted) fail(error)
         throw error
       }
       finally { clearTimeout(timer) }

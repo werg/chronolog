@@ -82,6 +82,13 @@ otherwise valid, authorized expired message. Ordinary expiry neither relays a
 frame nor tears down its authenticated connection. Invalid signatures, malformed
 frames and failed current authorization remain errors.
 
+An attached route also returns `null` when the channel's shared receive-work
+capacity is full. This is a drop before admission: it does not authenticate,
+deliver, remember or relay that frame, and it does not close the route. The
+direct `channel.receive(frame)` port instead rejects with `SIGNAL_BACKPRESSURE`
+at capacity so its caller can choose its own admission policy. Neither port
+retains a frame for later replay.
+
 Start a subscription before the messages it should observe. A new subscriber
 receives no earlier value, and a channel does not echo its own outgoing messages
 to its subscriptions; use the result of `send()` for optimistic local display.
@@ -127,17 +134,20 @@ least one route accepted local dispatch; it does not acknowledge remote receipt
 or application processing. A healthy route can complete a send while another
 route remains busy; every route permits at most one unsettled dispatch and has
 its own deadline. Policy work that ignores cancellation stays counted against
-its work quota until it settles. Some
+its work quota until it settles. A low-level transport may return
+`{ refused: 'backpressure' }` only when that attempt queued and dispatched no
+frame. The application send rejects visibly while the route stays usable for a
+later fresh message; nothing retries the refused value. Normal dispatch returns
+`undefined`. Any other return value is a transport error. Some
 routes can receive a message even when the operation later rejects; cancellation
 cannot recall bytes already handed to a transport. A failed publication does not
 revoke healthy routes. A transport failure or a dispatched write that ignores
 cancellation retires that route and invokes its optional `close()` callback;
-the connection owner should close its underlying session there. A transport that
-rejects a frame before dispatch because its buffer is full throws
-`SignalBackpressureError` (code `SIGNAL_BACKPRESSURE`). That publication still
-rejects, but its healthy route remains attached for a later fresh intent. This
-error must never describe a partially dispatched frame or a closed or failed
-transport. Reconnect never resends prior messages.
+the connection owner should close its underlying session there. The public
+`signals.send()` reports refused capacity with `SignalBackpressureError` (code
+`SIGNAL_BACKPRESSURE`). Low-level transports return the explicit refusal above;
+throwing an exception does not establish that no dispatch occurred and retires
+the route. Reconnect never resends prior messages.
 
 ## Governed replicas
 

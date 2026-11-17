@@ -1,11 +1,10 @@
 import type { DataChannelStats } from './channel.js'
 import type { RtcDataChannel } from './types.js'
-import type { PeerFrameLane } from '@chronolog/agent-service/framing'
-import { SignalBackpressureError } from '@chronolog/signals'
+import type { PeerLiveLane } from '@chronolog/agent-service/framing'
 
 export const WEBRTC_LIVE_LIMITS = Object.freeze({ frameBytes: 16_384, queueFrames: 64, bufferedBytes: 65_536 })
 
-export interface LiveDataChannelConnection extends PeerFrameLane {
+export interface LiveDataChannelConnection extends PeerLiveLane {
   readonly ready: Promise<void>
   readonly signal: AbortSignal
   readonly stats: DataChannelStats & { readonly droppedPackets: number }
@@ -14,7 +13,7 @@ export interface LiveDataChannelConnection extends PeerFrameLane {
 /**
  * Disposable datagrams on an independent unordered, non-retransmitting SCTP
  * stream. There is no reliable credit window, fragmentation queue or retry.
- * Congestion rejects sends; a slow reader loses oldest pending datagrams.
+ * Congestion refuses dispatch; a slow reader loses oldest pending datagrams.
  */
 export function frameRtcLiveChannel(channel: RtcDataChannel): LiveDataChannelConnection {
   if (channel.ordered || channel.maxPacketLifeTime !== null || channel.maxRetransmits !== 0) throw new Error('WEBRTC_LIVE_CHANNEL_REQUIRED')
@@ -56,6 +55,24 @@ export function frameRtcLiveChannel(channel: RtcDataChannel): LiveDataChannelCon
   if (channel.readyState === 'open') resolveReady()
   else if (channel.readyState !== 'connecting') stop(new Error('WEBRTC_LIVE_CLOSED'))
 
+  async function* read(signal: AbortSignal): AsyncGenerator<Uint8Array, void> {
+    if (reading) throw new Error('WEBRTC_LIVE_READER_EXISTS')
+    reading = true
+    const abort = (): void => stop()
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      if (signal.aborted) return
+      for (;;) {
+        if (failure !== null) throw failure
+        if (closed) return
+        const bytes = queue.shift()
+        if (bytes === undefined) { await new Promise<void>(resolve => { waiters.add(resolve) }); continue }
+        queuedReceiveBytes -= bytes.length
+        yield bytes
+      }
+    } finally { signal.removeEventListener('abort', abort); stop() }
+  }
+
   return {
     ready, signal: lifetime.signal,
     get stats() { return { sentBytes, receivedBytes, sentPackets, receivedPackets, droppedPackets,
@@ -65,26 +82,18 @@ export function frameRtcLiveChannel(channel: RtcDataChannel): LiveDataChannelCon
       if (closed) throw failure ?? new Error('WEBRTC_LIVE_CLOSED')
       if (channel.readyState !== 'open') throw new Error('WEBRTC_LIVE_NOT_OPEN')
       if (!(input instanceof Uint8Array) || input.length < 1 || input.length > WEBRTC_LIVE_LIMITS.frameBytes) throw new Error('WEBRTC_LIVE_FRAME_TOO_LARGE')
-      if (channel.bufferedAmount + input.length > WEBRTC_LIVE_LIMITS.bufferedBytes) throw new SignalBackpressureError()
+      if (channel.bufferedAmount + input.length > WEBRTC_LIVE_LIMITS.bufferedBytes) return { refused: 'backpressure' }
       // No application queue or suspension can dispatch this frame after cancellation.
       channel.send(input.slice().buffer); sentBytes += input.length; sentPackets += 1
     },
-    async *frames(signal) {
-      if (reading) throw new Error('WEBRTC_LIVE_READER_EXISTS')
-      reading = true
-      const abort = (): void => stop()
-      signal?.addEventListener('abort', abort, { once: true })
-      try {
-        if (signal?.aborted === true) return
-        for (;;) {
-          if (failure !== null) throw failure
-          if (closed) return
-          const bytes = queue.shift()
-          if (bytes === undefined) { await new Promise<void>(resolve => { waiters.add(resolve) }); continue }
-          queuedReceiveBytes -= bytes.length
-          yield bytes
-        }
-      } finally { signal?.removeEventListener('abort', abort); stop() }
+    frames(signal) {
+      return { [Symbol.asyncIterator]() {
+        const controller = new AbortController()
+        const iterator = read(signal === undefined ? controller.signal : AbortSignal.any([controller.signal, signal]))
+        return { next: () => iterator.next(),
+          async return() { controller.abort(); return iterator.return() },
+          async throw(error: unknown) { controller.abort(); return iterator.throw(error) } }
+      } }
     },
     async close() { stop() },
   }

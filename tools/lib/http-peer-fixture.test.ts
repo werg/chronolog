@@ -9,7 +9,8 @@ import { createHttpPeerFixture } from './http-peer-fixture.js'
 
 function emptyLink(identity: string): FeedLink {
   const changes = new ChangeSignal()
-  return { identity, async read() { return [] }, async readEvidence() { return [] }, async readPayload() { return null },
+  return { identity, async head() { return 0n }, async evidenceHead() { return 0n },
+    async read() { return [] }, async readEvidence() { return [] }, async readPayload() { return null },
     watch: signal => changes.watch(signal) }
 }
 

@@ -42,7 +42,12 @@ class TestPeer {
   }
   async submit(steps: string[], operationId: string): Promise<string> {
     const handle = await this.client.transaction(steps, { idempotencyKey: operationId })
-    try { await handle.accepted(); return handle.transactionId } finally { handle.dispose() }
+    try {
+      // These crash/replay fixtures inspect local SQL before closing finality.
+      const result = await handle.settled()
+      if (result.outcome.type !== 'accepted') throw new Error(`BROWSER_FIXTURE_SQL_REJECTED: ${JSON.stringify(result.outcome)}`)
+      return handle.transactionId
+    } finally { handle.dispose() }
   }
   async query(sql: string, options: QueryOptions = {}) { return this.client.query(sql, [], options) }
   async change(value: string, operationId: string, reject = false) {

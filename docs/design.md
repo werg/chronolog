@@ -142,6 +142,12 @@ validator's clock by the group's `cutoff_lag_ms`. A candidate is **admitted**
 once the attestations a replica sees satisfy the pinned validation policy
 (at least N distinct validators). Admission is monotonic.
 
+Before admission, a locally authorized candidate may be selected provisionally
+for a preview. That selection can be removed if the candidate is excluded or
+loses authorization. An admitted candidate cannot be removed or replaced, but
+its application outcome can still change when the provisional suffix replays.
+Admission establishes inclusion, not successful SQL execution.
+
 Admitted transactions are ordered by the immutable key
 
 `(author_timestamp_ms, signing_public_key, proposal_id)`.
@@ -216,9 +222,13 @@ progress visibly. Neither Chronolog core nor Tendriller core imports the other.
 
 A group starts from a signed **genesis**; the root administrator then
 publishes signed **capability revisions** on the administration feed. The
-protocol represents writer, validator, reader and administrator roles; live
-enrollment grants ordinary reader/writer membership. The built-in signed
-configurations keep the root, administration feed, validator set and validation
+protocol has three grant roles: writer, validator and reader. Membership
+administration belongs to the root key and administration feed pinned in
+genesis; it is not a grantable role. Every writer grant declares explicit
+`program` rights for SQL, durable-event topics and ephemeral signal topics.
+Missing rights never imply SQL access, and one exact grant must cover the
+operation. Live enrollment grants ordinary reader/writer membership. The built-in
+signed configurations keep the root, administration feed, validator set and validation
 policy fixed. Their authoring APIs reject reconfiguration of those components.
 
 A joining device persists its own signing and reader keys and an exact signed
@@ -249,15 +259,18 @@ Dolt commit (`chronolog_head`, `chronolog_rev_*`); checkpoints
 only from the nearest checkpoint. Publication binds the durable SQL revision
 to its applied prefix and reconciles control metadata after interruption.
 
-Readers choose `local` or `final`. The local view contains admitted tentative
-work. The final view uses an actual separate immutable SQL revision of the
-locally applied final prefix; it is not a label on the tentative reader.
+Readers choose `local` or `final`. The local view includes the applied final
+prefix and its selected provisional suffix. An unadmitted preview can leave that
+suffix; an admitted candidate remains included while its application outcome
+may still change on replay. The final view uses an actual separate immutable SQL
+revision of the locally applied final prefix; it is not a label on the tentative reader.
 Queries and live queries report the selected view and revision. A replica's
 final view can still be behind another replica's.
 
 `transaction.final()` waits for final acceptance or rejection after local
-application. `settled()` and `accepted()` describe the current result, which
-can still change through peer-policy replay. See the
+application. `accepted()` waits for immutable acceptance and throws on final
+rejection. `settled()` describes the current result, which can still change
+through peer-policy replay. See the
 [client guide](../packages/client/README.md). The replicated
 log of outcomes is the table `chronolog_transactions`, readable by
 transactions.

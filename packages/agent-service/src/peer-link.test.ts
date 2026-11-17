@@ -133,7 +133,90 @@ async function signalSession(receive?: (frame: Uint8Array) => Promise<void>, opt
   } }
 }
 
+async function headSession(kind: 'records' | 'evidence', read: () => Promise<bigint>, invalidReply?: CborValue) {
+  const server = await portable(), client = await portable(), [outgoing, incoming] = connections()
+  const groupId = new Uint8Array(32).fill(41), grantId = new Uint8Array(32).fill(42), released: bigint[] = []
+  let active = true
+  const [serverLink, clientLink] = await Promise.all([
+    openAuthenticatedPeerLink({ connection: { ...outgoing, async send(bytes) {
+      const frame = assertCanonicalCbor(bytes)
+      if (Array.isArray(frame) && frame[2] === 'head-result') {
+        released.push(frame[4] as bigint)
+        if (invalidReply !== undefined) { const changed = [...frame]; changed[4] = invalidReply; bytes = encodeCanonicalCbor(changed) }
+      }
+      await outgoing.send(bytes)
+    } }, local: { ...server.transport.asLink(), ...(kind === 'records' ? { head: read } : { evidenceHead: read }) },
+    groupId, grantId, identity: server.identity, authorizePeer: () => active }),
+    openAuthenticatedPeerLink({ connection: incoming, local: client.transport.asLink(), groupId, grantId,
+      identity: client.identity, authorizePeer: () => true }),
+  ])
+  cleanup.push(async () => { await Promise.all([serverLink.close(), clientLink.close()]) })
+  return { released, revoke: () => { active = false }, close: () => clientLink.close(),
+    read: () => kind === 'records' ? clientLink.link.head(server.transport.identity) : clientLink.link.evidenceHead() }
+}
+
 describe('authenticated framed range synchronization', () => {
+  it('drops excess live frames before admission without disrupting history or later admitted frames', async () => {
+    let entered!: () => void, release!: () => void, admitted = 0
+    const full = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const session = await signalSession(async () => { if (++admitted === 8) entered(); await gate })
+    const frame = (value: number) => encodeCanonicalCbor([1n, SIGNAL_DOMAIN, BigInt(value)])
+    try {
+      for (let index = 0; index < 8; index++) await session.sender.sendSignal(frame(index))
+      await full
+      await session.sender.sendSignal(frame(8))
+      expect(await session.receiver.link.read(session.receiver.peer.feedId, 0n, 1)).toEqual([])
+      expect(admitted).toBe(8)
+      release()
+      await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+      await session.sender.sendSignal(frame(9))
+      await expect.poll(() => admitted).toBe(9)
+      expect(session.received).toEqual([...Array.from({ length: 8 }, (_, index) => frame(index)), frame(9)])
+      expect(await session.receiver.link.evidenceHead()).toBe(0n)
+    } finally { release() }
+  })
+
+  it.each(['records', 'evidence'] as const)('returns a bounded %s availability head and requires active reader access', async kind => {
+    const read = vi.fn(async () => 73n), session = await headSession(kind, read)
+    expect(await session.read()).toBe(73n)
+    expect(session.released).toEqual([73n])
+    session.revoke()
+    await expect(session.read()).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['records', 'evidence'] as const)('rechecks %s head authorization after the storage lookup', async kind => {
+    let entered!: () => void, release!: (head: bigint) => void
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<bigint>(resolve => { release = resolve })
+    const session = await headSession(kind, async () => { entered(); return gate })
+    const reading = session.read()
+    await started; session.revoke(); release(73n)
+    await expect(reading).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    expect(session.released).toEqual([])
+  })
+
+  it.each([-1n, BigInt(Number.MAX_SAFE_INTEGER) + 1n, '73', null])('rejects malformed head response %s', async value => {
+    const session = await headSession('evidence', async () => 0n, value)
+    await expect(session.read()).rejects.toThrow('FEED_POSITION_INVALID')
+  })
+
+  it('applies the existing request bounds and close cancellation to availability heads', async () => {
+    const session = await headSession('evidence', () => new Promise<bigint>(() => {}))
+    const pending = Array.from({ length: 4 }, () => session.read().catch((error: unknown) => error))
+    await expect(session.read()).rejects.toThrow('PEER_REQUEST_LIMIT_EXCEEDED')
+    await session.close()
+    expect(await Promise.all(pending)).toEqual(Array.from({ length: 4 }, () => new Error('PEER_CONNECTION_CLOSED')))
+  })
+
+  it('uses the existing response-idle deadline for an unavailable advertised head', async () => {
+    const session = await headSession('evidence', () => new Promise<bigint>(() => {}))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const reading = session.read().catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(await reading).toEqual(new Error('PEER_RESPONSE_IDLE_TIMEOUT'))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('rechecks reader access before releasing ephemeral messages after authentication', async () => {
     const session = await payloadSession(async () => null)
     const identity = await generateEd25519KeyPair(), frames: Uint8Array[] = []
@@ -187,6 +270,9 @@ describe('authenticated framed range synchronization', () => {
     const nativeRecord = await native.publish(utf8('native record'))
     const browserRecord = await browser.transport.publish(utf8('browser record'))
     await native.putEvidence(utf8('portable certificate bytes'))
+    expect(await browserSession.link.head(native.identity)).toBe(1n)
+    expect(await browserSession.link.evidenceHead()).toBe(1n)
+    expect(await nativeSession.link.head(browser.transport.identity)).toBe(1n)
     const detachNative = native.connectLink(nativeSession.link), detachBrowser = browser.transport.connect(browserSession.link)
     cleanup.push(async () => { detachNative(); detachBrowser()
       await Promise.all([nativeSession.close(), browserSession.close()]) })
@@ -195,8 +281,14 @@ describe('authenticated framed range synchronization', () => {
     expect((await browser.transport.get(nativeRecord.id))?.payload).toEqual(nativeRecord.payload)
     expect((await browser.transport.evidenceHistory()).map((evidence) => evidence.bytes)).toContainEqual(utf8('portable certificate bytes'))
     expect((await native.status()).peers).toContain(browser.transport.identity)
+    let entered!: () => void, release!: (through: bigint) => void
+    const waiting = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<bigint>(resolve => { release = resolve })
+    const detachWaiting = native.connectLink({ ...nativeSession.link, evidenceHead: async () => { entered(); return gate } })
+    await waiting
+    const canceled = expect(native.catchUpLinks()).rejects.toMatchObject({ name: 'AbortError' })
     const detachReplacement = native.connectLink(nativeSession.link)
-    detachNative()
+    await canceled
+    release(0n); detachWaiting(); detachNative()
     const afterReplacement = await browser.transport.publish(utf8('after native route replacement'))
     await native.catchUpLinks()
     expect((await native.get(afterReplacement.id))?.payload).toEqual(afterReplacement.payload)
@@ -311,20 +403,6 @@ describe('authenticated framed range synchronization', () => {
     const closed = expect(session.sender.completion).rejects.toThrow('PEER_SIGNAL_SEND_TIMEOUT')
     await vi.advanceTimersByTimeAsync(26)
     await failed; await closed
-  })
-
-  it('surfaces bounded signal ingress overload instead of silently dropping admitted work', async () => {
-    let release!: () => void
-    const blocked = new Promise<void>(resolve => { release = resolve })
-    const session = await signalSession(async () => blocked)
-    const failed = expect(session.receiver.completion).rejects.toThrow('PEER_SIGNAL_BACKPRESSURE')
-    try {
-      for (let index = 0; index < 9; index += 1) {
-        await session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, BigInt(index)])).catch(() => undefined)
-      }
-      await failed
-      expect(session.received.length).toBeLessThanOrEqual(8)
-    } finally { release() }
   })
 
   it('surfaces a failed signal verification through the owned peer completion', async () => {

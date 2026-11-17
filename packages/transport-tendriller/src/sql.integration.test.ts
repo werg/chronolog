@@ -151,15 +151,15 @@ describe('Tendriller coordinated SQL connection', () => {
       await alice.node.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes))
     }
     expect((await alice.client.getTransactionOutcome(created.transactionId)).outcome.type).toBe('pending')
-    await sync(); await created.accepted()
+    await sync(); expect((await created.accepted()).final).toBe(true)
     const team = await alice.client.ownership.createTeam({ invite: [bobKey.publicKeyBytes] })
-    await sync(); await team.handle.accepted()
+    await sync(); expect((await team.handle.accepted()).final).toBe(true)
     const joined = await bob.client.ownership.acceptInvitation(team.id)
-    await sync(); await joined.handle.accepted()
+    await sync(); expect((await joined.handle.accepted()).final).toBe(true)
     const inserted = await alice.client.transaction([{
       sql: `INSERT INTO tasks (id, chronolog_owner) VALUES (1, ${OWNER_FOR_KEY_SQL})`, params: [team.id],
     }])
-    await sync(); await inserted.accepted()
+    await sync(); expect((await inserted.accepted()).final).toBe(true)
 
     const claim = (name: string) => [
       "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",

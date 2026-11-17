@@ -171,6 +171,8 @@ export interface ChronologNodeOptions {
   readonly controlStore?: ControlStore
   readonly validator?: ValidatorOptions
   readonly clock?: Clock
+  /** Governed runtimes derive this automatic author-clock bound from signed genesis. */
+  readonly authorClockPolicy?: { readonly maxFutureSkewMs: number }
   readonly random?: RandomSource
   readonly envelopeCipher?: EnvelopeCipher | EnvelopeCipherResolver
   /** Maximum transiently failed records retained before history-backed recovery takes over. */
