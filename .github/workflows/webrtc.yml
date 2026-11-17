@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 114bc2709f5cbb15d96dff0481ded425ffa15384
+          ref: 1029c7cfb69a16a0f7b403a9e654b962b0304260
           path: artifacts/tendriller-contrib
           persist-credentials: false
       - name: Build the clean public peer-session RTC package
