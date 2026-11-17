@@ -202,6 +202,12 @@ heads rather than rewriting all bodies on each append. Its growth test measures
 body writes and head bytes. Native quota accounting scans once on reopen and
 updates incrementally under the exclusive storage owner.
 
+Capturing a view reuses the materializer's immutable indexed snapshot. Outcomes
+and original command bytes are read through `read.transactionAt(index)` only when
+requested; ordinary queries do not copy or scan an extra outcome array. Bounded
+history exports inspect selected segment boundaries and the requested records,
+including after recovery, instead of walking the entire selected history.
+
 Attachments use independently staged encrypted 64 KiB chunks, with a 128 MiB
 per-object limit and at most eight attached sources. Range reads fetch only needed
 chunks, and verified local chunks survive an interrupted fetch. A reference does

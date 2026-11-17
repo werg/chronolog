@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
-import { emit, executionManifestArtifacts, program } from '@chronolog/protocol'
+import { decodeTransactionCore, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryBytesStore, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
@@ -30,12 +30,13 @@ async function fixture() {
       requester: who.publicKey, controlRevision: 0, reason: base === null ? 'create' : 'takeover', base }, who))
   }
   await select(a, null, 'initial')
+  const materializers = new Map<PeerReplica, Awaited<ReturnType<typeof createEventMaterializationRuntime>>>()
   const open = async (identity: PeerIdentity, store: BytesStore = new MemoryBytesStore(), authority?: AuthorityBundle, storageId = identity.publicKey) => {
     const materializer = await createEventMaterializationRuntime({ store, namespace: 'test' })
     const peer = await createPeerReplica({ authority: authority ?? await registry.read(), device: identity, store, storageId, materializer, epochKeys: keys })
-    opened.push(peer); return peer
+    opened.push(peer); materializers.set(peer, materializer); return peer
   }
-  return { host, a, b, c, key, keys, control, registry, select, open }
+  return { host, a, b, c, key, keys, control, registry, select, open, materializers }
 }
 const event = (name: string) => program(emit('message', { name }))
 
@@ -52,15 +53,56 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     const av = await a.capture(), bv = await b.capture()
     try {
       expect(av.read.orderLength).toBe(2)
-      expect(av.outcomes).toEqual(bv.outcomes)
-      expect(av.outcomes.map(value => value.orderKey.authorTimestampMs)).toEqual([500n, 100n])
-      expect(av.read.transactionAt(0)).toEqual(bv.read.transactionAt(0))
+      const transactions = Array.from({ length: av.read.orderLength }, (_, index) => av.read.transactionAt(index)!)
+      expect(transactions).toEqual(Array.from({ length: bv.read.orderLength }, (_, index) => bv.read.transactionAt(index)))
+      expect(transactions.map(value => decodeTransactionCore(value.canonicalCandidate).authorTimestampMs)).toEqual([500n, 100n])
     } finally { av.release(); bv.release() }
     expect(await a.order(first)).toEqual((await a.exportCommands())[0])
     expect((await a.exportCommands()).length).toBe(2)
     await b.observeCoverage(await a.retainedCoverage())
     expect(b.shared()).toHaveLength(1)
   })
+  it('captures views and exports bounded ranges without scanning the growing selected history', async () => {
+    const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store)
+    const append = async (from: number, through: number) => {
+      for (let index = from; index < through; index++) await a.order(await a.prepare({ operationId: `event-${index}`, program: event(String(index)) }))
+    }
+    const measure = async (peer: PeerReplica, offset: number, limit: number) => {
+      const outcomes = vi.spyOn(f.materializers.get(peer)!.queries, 'outcome'), indexedReads = vi.spyOn(Map.prototype, 'get')
+      try {
+        const captured = await peer.capture()
+        try {
+          expect(outcomes).not.toHaveBeenCalled()
+          expect(indexedReads.mock.calls.filter(([key]) => typeof key === 'number')).toHaveLength(0)
+          expect(captured.read.transactionAt(offset)).not.toBeNull()
+        } finally { captured.release() }
+        indexedReads.mockClear()
+        const page = await peer.exportCommands({ offset, limit })
+        const scannedRecords = indexedReads.mock.calls.filter(([key]) => typeof key === 'number').length
+        return { page, scannedRecords }
+      } finally { outcomes.mockRestore(); indexedReads.mockRestore() }
+    }
+    await append(0, 8)
+    const base = await a.recoveryPoint(), small = await measure(a, 6, 2)
+    await append(8, 64)
+    const large = await measure(a, 62, 2), old = await a.capture()
+    expect(large.scannedRecords).toBe(small.scannedRecords)
+    expect(large.scannedRecords).toBeLessThanOrEqual(4)
+    expect(large.page.map(value => value.attempt.payload.header.operationId)).toEqual(['event-62', 'event-63'])
+    try {
+      await f.select(f.a, base, 'recover-short-prefix'); await a.adopt(await f.registry.read())
+      await append(64, 66)
+      const recovered = await measure(a, 7, 3)
+      expect(recovered.scannedRecords).toBeLessThanOrEqual(8)
+      expect(recovered.page.map(value => value.attempt.payload.header.operationId)).toEqual(['event-7', 'event-64', 'event-65'])
+      expect(old.read.orderLength).toBe(64)
+      expect(decodeTransactionCore(old.read.transactionAt(63)!.canonicalCandidate).operationId).toBe('event-63')
+      await a.close()
+      const reopened = await f.open(f.a, store), afterReopen = await measure(reopened, 7, 3)
+      expect(afterReopen.page).toEqual(recovered.page)
+      expect(afterReopen.scannedRecords).toBeLessThanOrEqual(8)
+    } finally { old.release() }
+  }, 30_000)
   it('adopts an older complete prefix, seeds a fresh peer and quarantines the returning suffix', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const one = await a.prepare({ operationId: 'one', program: event('one') })

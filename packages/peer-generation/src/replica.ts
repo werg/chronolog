@@ -19,6 +19,12 @@ import type {
 
 interface Head { readonly sequence: number; readonly root: string; readonly bytes: number }
 interface Retained { readonly command: OrderedCommand; readonly core: TransactionCore }
+interface SelectedRange {
+  readonly generation: string
+  readonly offset: number
+  readonly length: number
+  readonly records: ReadonlyMap<number, Retained>
+}
 interface PendingRecovery {
   readonly previousGeneration: string
   readonly generation: string
@@ -234,8 +240,10 @@ class Replica implements PeerReplica {
     this.#heads.set(generation.id, next); entries.set(next.sequence, { command: structuredClone(command), core })
     this.#remember(attempt); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += recordBytes.length + 2
   }
-  #selectedHistory(authority: PeerAuthority, complete = true): Retained[] {
-    const result: Retained[] = []
+  /** Describe retained selected segments without visiting their individual records. */
+  #selectedRanges(authority: PeerAuthority, complete = true): SelectedRange[] {
+    const ranges: SelectedRange[] = []
+    let offset = 0
     for (const segment of authority.selectedSegments()) {
       const head = this.#heads.get(segment.generation.id), records = this.#records.get(segment.generation.id)
       check(head !== undefined && records !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
@@ -246,12 +254,20 @@ class Replica implements PeerReplica {
         const root = through === 0 ? records.get(1)?.command.receipt.payload.previousRoot ?? head.root : records.get(through)?.command.receipt.root
         check(root === segment.cutoff.root, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
       }
-      for (let sequence = 1; sequence <= through; sequence++) {
-        const retained = records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); result.push(retained)
-      }
+      ranges.push({ generation: segment.generation.id, offset, length: through, records })
+      offset += through
       // Later generations cannot fill an earlier missing prefix. Export the
       // available evidence without publishing an incomplete application view.
       if (through < requested) break
+    }
+    return ranges
+  }
+  #selectedHistory(authority: PeerAuthority, complete = true): Retained[] {
+    const result: Retained[] = []
+    for (const range of this.#selectedRanges(authority, complete)) {
+      for (let sequence = 1; sequence <= range.length; sequence++) {
+        const retained = range.records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); result.push(retained)
+      }
     }
     return result
   }
@@ -483,8 +499,7 @@ class Replica implements PeerReplica {
     return this.#serial.run(async () => {
       this.#assertReady(); check(this.#options.materializer.queries.captureRead !== undefined, 'PEER_CAPTURE_UNSUPPORTED')
       const read = this.#options.materializer.queries.captureRead({ view: 'local' })
-      const outcomes = this.#selected.map(value => this.#options.materializer.queries.outcome(hexToBytes(value.command.attempt.id))!)
-      return { authority: this.authority, revision: this.revision, read, outcomes: structuredClone(outcomes), release: () => read.release() }
+      return { authority: this.authority, revision: this.revision, read, release: () => read.release() }
     })
   }
   async #proof(point: HistoryPoint): Promise<PrefixProof> {
@@ -501,8 +516,8 @@ class Replica implements PeerReplica {
     return this.#serial.run(async () => {
       this.#assertOpen()
       check(this.#authority.grant(this.device.publicKey)?.reader === true, 'PEER_READER_FORBIDDEN')
-      const selected = this.#selectedHistory(this.#authority, false)
-      let start = 0, end = selected.length
+      const ranges = this.#selectedRanges(this.#authority, false), last = ranges.at(-1)
+      let start = 0, end = last === undefined ? 0 : last.offset + last.length
       if (options.at !== undefined) {
         this.#assertReady()
         this.#checkView(options.at)
@@ -515,27 +530,25 @@ class Replica implements PeerReplica {
       }
       if (options.after !== undefined) {
         check(this.#pointAvailable(options.after), 'PEER_CURSOR_RECOVERY_REQUIRED')
-        if (options.after.sequence > 0) {
-          start = selected.findIndex(value => value.command.receipt.payload.generation === options.after!.generation && value.command.receipt.payload.sequence === options.after!.sequence) + 1
-          check(start > 0, 'PEER_CURSOR_RECOVERY_REQUIRED')
-        } else {
-          const segments = this.#authority.selectedSegments()
-          const cursorSegment = segments.findIndex(value => value.generation.id === options.after!.generation)
-          const remaining = new Set(segments.slice(cursorSegment).map(value => value.generation.id))
-          start = selected.findIndex(value => remaining.has(value.command.receipt.payload.generation))
-          if (start < 0) start = selected.length
-        }
+        const range = ranges.find(value => value.generation === options.after!.generation)
+        check(options.after.sequence === 0 || range !== undefined && options.after.sequence <= range.length, 'PEER_CURSOR_RECOVERY_REQUIRED')
+        start = range === undefined ? end : range.offset + options.after.sequence
       }
       const limit = options.limit ?? this.#maxRecords
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= this.#maxRecords, 'PEER_RANGE_LIMIT_INVALID')
       const maxBytes = options.maxBytes ?? Number.MAX_SAFE_INTEGER
       check(Number.isSafeInteger(maxBytes) && maxBytes > 0, 'PEER_RANGE_BYTES_INVALID')
       const result: OrderedCommand[] = []
+      const through = Math.min(end, start + limit)
       let bytes = 0
-      for (const value of selected.slice(start, Math.min(end, start + limit))) {
-        const size = encodePeerValue(value.command).byteLength
-        if (bytes + size > maxBytes) { check(result.length > 0, 'PEER_RANGE_RECORD_TOO_LARGE'); break }
-        bytes += size; result.push(structuredClone(value.command))
+      for (const range of ranges) {
+        const first = Math.max(1, start - range.offset + 1), last = Math.min(range.length, through - range.offset)
+        for (let sequence = first; sequence <= last; sequence++) {
+          const value = range.records.get(sequence); check(value !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
+          const size = encodePeerValue(value.command).byteLength
+          if (bytes + size > maxBytes) { check(result.length > 0, 'PEER_RANGE_RECORD_TOO_LARGE'); return result }
+          bytes += size; result.push(structuredClone(value.command))
+        }
       }
       return result
     })
