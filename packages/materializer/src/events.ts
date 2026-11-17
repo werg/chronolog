@@ -2,10 +2,10 @@ import { bytesToHex, sha256 } from '@chronolog/canonical'
 import {
   assertCanonicalCbor, assertValidChangeProgram, createExecutionManifest, decodeTransactionCore,
   encodeCanonicalCbor, encodeTransactionCore, equalBytes, executionManifestArtifacts,
-  isEmitStep, transactionDigest, transactionOrderKey, utf8,
+  isEmitStep, transactionDigest, transactionOrderKey, compareTransactionOrder, utf8,
 } from '@chronolog/protocol'
 import type { AdmittedTransaction } from './types.js'
-import { publicationRequestForRevision, type ChronologMaterializationRuntime, type MaterializedTransactionOutcome, type MaterializedRevisionSnapshot } from './runtime.js'
+import { publicationRequestForRevision, type ChronologMaterializationRuntime, type MaterializedTransactionOutcome, type MaterializedRevisionSnapshot, type MaterializationOutcomeChange } from './runtime.js'
 
 export interface EventExecutionStore {
   get(key: string): Promise<Uint8Array | null>
@@ -67,11 +67,15 @@ export async function createEventMaterializationRuntime(options: {
       if (transactions.has(transactionId)) throw new Error('EVENT_EXECUTION_DUPLICATE_TRANSACTION')
       if (proposals.has(proposalId)) throw new Error('EVENT_EXECUTION_DUPLICATE_PROPOSAL')
       transactions.add(transactionId); proposals.add(proposalId)
+      const orderKey = transactionOrderKey(core, entry)
+      if (index > 0 && compareTransactionOrder(result[index - 1]!.orderKey, orderKey) >= 0) {
+        throw new Error('EVENT_EXECUTION_ORDER_NOT_CHRONOLOGICAL')
+      }
       const operation = `${bytesToHex(core.authorId)}/${core.operationId}`
       const failing = core.program.steps.findIndex((step) => !isEmitStep(step))
       const code = operations.has(operation) ? 'operation_conflict' : failing >= 0 ? 'profile:sql-disabled' : null
       operations.add(operation)
-      result.push({ txId: entry.txId.slice(), orderKey: transactionOrderKey(core, entry), orderIndex: index,
+      result.push({ txId: entry.txId.slice(), orderKey, orderIndex: index,
         outcome: code === null ? 'accepted' : 'rejected', rejectionCode: code,
         failingStatementIndex: code === 'profile:sql-disabled' ? failing : null })
     }
@@ -112,19 +116,13 @@ export async function createEventMaterializationRuntime(options: {
         return serial(async () => {
           const nextOutcomes = await evaluate(next)
           for (let i = 0; i < finalLength; i++) if (next[i] === undefined || !sameIdentity(order[i]!, next[i]!)) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_CHANGED')
-          // Admission is a growing set. A late proposal may be inserted before
-          // the provisional suffix, but existing proposal identities and their
-          // relative order cannot disappear or be replaced during replay.
-          let previousIndex = 0
+          // A provisional preview may lose authorization before its timestamp
+          // closes. Selection may change; original proposal bytes never do.
           const previousById = new Map(order.map(entry => [bytesToHex(entry.txId), entry]))
           for (const entry of next) {
             const previous = previousById.get(bytesToHex(entry.txId))
-            if (previous === undefined) continue
-            if (!sameIdentity(previous, entry)) throw new Error('EVENT_EXECUTION_IDENTITY_CONFLICT')
-            if (order[previousIndex] !== previous) throw new Error('EVENT_EXECUTION_ADMISSION_SET_REMOVAL')
-            previousIndex++
+            if (previous !== undefined && !sameIdentity(previous, entry)) throw new Error('EVENT_EXECUTION_IDENTITY_CONFLICT')
           }
-          if (previousIndex !== order.length) throw new Error('EVENT_EXECUTION_ADMISSION_SET_REMOVAL')
           let difference = 0
           while (difference < order.length && difference < next.length && sameIdentity(order[difference]!, next[difference]!)) difference++
           if (difference === order.length && difference === next.length) return null
@@ -132,12 +130,17 @@ export async function createEventMaterializationRuntime(options: {
           const nextRevision = revision + 1n
           const bytes = encode(next, nextRevision, finalLength, finalRevision)
           const contentHash = bytesToHex(await sha256(bytes))
-          const changes = nextOutcomes.flatMap((current) => {
+          const changes: MaterializationOutcomeChange[] = nextOutcomes.flatMap((current) => {
             const before = outcomes.find((value) => equalBytes(value.txId, current.txId))
             return before?.outcome === current.outcome && before.rejectionCode === current.rejectionCode ? [] : [{
               txId: current.txId.slice(), previous: before?.outcome ?? null, current: current.outcome,
               previousRejectionCode: before?.rejectionCode ?? null, currentRejectionCode: current.rejectionCode,
             }]
+          })
+          const selected = new Set(next.map(entry => bytesToHex(entry.txId)))
+          for (const removed of outcomes) if (!selected.has(bytesToHex(removed.txId))) changes.push({
+            txId: removed.txId.slice(), previous: removed.outcome, current: null,
+            previousRejectionCode: removed.rejectionCode, currentRejectionCode: null,
           })
           // The applied anchor and outcomes share the atomic durable record.
           await persist(bytes)
@@ -160,6 +163,7 @@ export async function createEventMaterializationRuntime(options: {
       get revision() { return revision }, get orderLength() { return order.length },
       get finalRevision() { return finalRevision }, get finalOrderLength() { return finalLength },
       get executionManifestDigest() { return digest.slice() },
+      proposalIdAt(index) { return order[index]?.txId.slice() ?? null },
       localSql() { throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
       outcome(id) { return structuredClone(outcomes.find((entry) => equalBytes(entry.txId, id)) ?? null) },
       subscribe(subscriber) { subscribers.add(subscriber); return () => { subscribers.delete(subscriber) } },

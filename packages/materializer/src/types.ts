@@ -116,7 +116,7 @@ export interface ChronologMaterializationContinuation {
 export interface OutcomeChangeSummary {
   readonly txId: Uint8Array
   readonly previous: string | null
-  readonly current: string
+  readonly current: string | null
   readonly previousRejectionCode: string | null
   readonly currentRejectionCode: string | null
 }

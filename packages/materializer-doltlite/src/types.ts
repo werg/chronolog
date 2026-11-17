@@ -33,7 +33,7 @@ export interface TransactionLogRow extends TransactionOutcome {
 export interface OutcomeChange {
   readonly txId: Uint8Array
   readonly previous: TransactionOutcomeKind | null
-  readonly current: TransactionOutcomeKind
+  readonly current: TransactionOutcomeKind | null
   readonly previousRejectionCode: string | null
   readonly currentRejectionCode: string | null
 }

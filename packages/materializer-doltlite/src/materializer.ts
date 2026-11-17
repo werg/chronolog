@@ -211,6 +211,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   get checkpointError(): string | null { return this.#checkpointError }
   get databaseContentHash(): string { return this.#published.contentHash }
 
+  proposalIdAt(index: number): Uint8Array | null { return this.#order[index]?.slice() ?? null }
+
   transactionLogDigest(): Promise<Uint8Array> { return materializedLogDigest(this.#log) }
 
   checkpoints(): readonly MaterializerCheckpointInfo[] {
@@ -311,7 +313,6 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         }
       }
       verifyFinalTransactions(this.#finalLog, transactions)
-      ensureMonotonicSet(this.#order, transactions.map((transaction) => transaction.txId))
       validateExistingIdentities(this.#log, transactions)
       const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
       if (difference === null) return null
@@ -677,6 +678,9 @@ async function validateTransactionSet(
     const proposal = idKey(transaction.candidateDigest)
     if (proposals.has(proposal)) throw new MaterializerInputError('MATERIALIZER_DUPLICATE_PROPOSAL')
     proposals.add(proposal)
+    if (index > 0 && compareTransactionOrder(orderKeyOf(transactions[index - 1]!), orderKeyOf(transaction)) >= 0) {
+      throw new MaterializerInputError('MATERIALIZER_ORDER_NOT_CHRONOLOGICAL')
+    }
   }
 }
 
@@ -710,18 +714,9 @@ function validateExistingIdentities(
   const transactionsById = new Map(transactions.map((transaction) => [idKey(transaction.txId), transaction]))
   for (const row of existing) {
     const transaction = transactionsById.get(idKey(row.txId))
-    if (transaction === undefined || !sameIdentity(row, transaction)) {
+    if (transaction !== undefined && !sameIdentity(row, transaction)) {
       throw new MaterializerInputError('MATERIALIZER_TRANSACTION_IDENTITY_CONFLICT')
     }
-  }
-}
-
-function ensureMonotonicSet(previous: readonly Uint8Array[], next: readonly Uint8Array[]): void {
-  let nextIndex = 0
-  for (const previousId of previous) {
-    while (nextIndex < next.length && !bytesEqual(previousId, next[nextIndex]!)) nextIndex += 1
-    if (nextIndex === next.length) throw new MaterializerInputError('MATERIALIZER_ADMISSION_SET_REMOVAL')
-    nextIndex += 1
   }
 }
 
@@ -791,7 +786,12 @@ function calculateOutcomeChanges(previous: readonly TransactionLogRow[], current
         currentRejectionCode: row.rejectionCode,
       })
     }
+    previousById.delete(idKey(row.txId))
   }
+  for (const row of previousById.values()) changes.push({
+    txId: copyBytes(row.txId), previous: row.outcome, current: null,
+    previousRejectionCode: row.rejectionCode, currentRejectionCode: null,
+  })
   return changes
 }
 

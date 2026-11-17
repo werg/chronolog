@@ -16,7 +16,8 @@ export interface MaterializedTransactionOutcome {
 export interface MaterializationOutcomeChange {
   readonly txId: Uint8Array
   readonly previous: MaterializedTransactionOutcomeKind | null
-  readonly current: MaterializedTransactionOutcomeKind
+  /** Null when a previously selected provisional proposal leaves the replay. */
+  readonly current: MaterializedTransactionOutcomeKind | null
   readonly previousRejectionCode: string | null
   readonly currentRejectionCode: string | null
 }
@@ -95,6 +96,8 @@ export interface MaterializedQueryService {
   readonly finalRevision?: bigint
   readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
+  /** Original proposal identity at this position in the currently applied local order. */
+  proposalIdAt(index: number): Uint8Array | null
   localSql(
     sql: string,
     parameters?: readonly MaterializedLocalSqlValue[],
