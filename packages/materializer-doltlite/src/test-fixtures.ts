@@ -13,8 +13,8 @@ import {
   type TransactionCore,
 } from '@chronolog/protocol'
 
-import { createDoltLiteExecutionManifest } from './manifest.js'
-import { DeterministicMaterializer } from './native.js'
+import { createNativeSqlEngine } from './native.js'
+import { DeterministicMaterializer } from './materializer.js'
 import type { ReplayProposal, LocalSqlValue, MaterializerOptions } from './types.js'
 
 /** Test-only helpers for driving a real materializer with signed-looking transactions. */
@@ -36,10 +36,11 @@ export class MaterializerFixture {
     readonly path?: string
   } = {}): Promise<{ readonly materializer: DeterministicMaterializer; readonly path: string; readonly manifest: ExecutionManifest }> {
     const path = options.path ?? join(await this.directory(), 'application.db')
-    const manifest = createDoltLiteExecutionManifest(options.limits === undefined ? {} : { limits: options.limits })
+    const engine = createNativeSqlEngine(options.limits === undefined ? {} : { limits: options.limits })
+    const manifest = engine.executionManifest
     const materializerOptions: MaterializerOptions = {
       path,
-      executionManifest: manifest,
+      engine,
       rootAdministrator: options.rootAdministrator ?? ROOT_KEY,
       ...(options.forkSeeding === undefined ? {} : { forkSeeding: options.forkSeeding }),
       ...(options.checkpointEvery === undefined ? {} : { checkpointEvery: options.checkpointEvery }),

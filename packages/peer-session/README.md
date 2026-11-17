@@ -65,6 +65,67 @@ The session owns one signed attempt journal in the device store. A disconnected
 command remains `saved`; connecting resumes its exact original attempt.
 Cancelling `applied({ signal })` cancels that waiter only.
 
+## SQL as an explicit engine capability
+
+SQL uses the same application session, signed schema, commands, views and
+replication. The optional `/sql` entry owns schema verification and opening for
+both native and browser execution. Its `SqlEngine` supplies exactly an execution
+manifest and a database-opening function; it does not create another application
+runtime.
+
+```ts
+import { prepareSqlApplication, openSqlApplication } from '@chronolog/peer-session/sql'
+import { createNativeSqlEngine } from '@chronolog/peer-session/sql-native'
+
+const engine = createNativeSqlEngine()
+// First publication signs the literal schema and its application/engine binding.
+const prepared = await prepareSqlApplication({
+  engine, applicationId, definition, schemaAdministrator: device.identity,
+})
+// The control participant signs an authority descriptor containing prepared.binding.
+const session = await openSqlApplication({
+  engine, device, definition, authority, schema: prepared.schema,
+  databasePath: './application.sqlite',
+})
+```
+
+Normal reopening reuses the published signed schema and existing device. It does
+not sign a new schema. The common opening function claims device ownership before
+constructing a materializer, verifies the schema authority and definition, and
+requires the engine manifest to match the descriptor before opening a database.
+It captures engine/schema inputs before asynchronous work. Closing the session
+releases its SQL views and database handles through the same owned lifecycle as
+event execution.
+
+In an owning browser Worker, construct that same capability from verified WASM
+and an already owned SQLite VFS:
+
+```ts
+import { createBrowserSqlEngine, loadBrowserEngine } from '@chronolog/peer-session/sql-browser'
+
+const loaded = await loadBrowserEngine(engineAssetBaseUrl)
+const engine = createBrowserSqlEngine({ ...loaded, vfs: ownedSqlVfsName })
+const session = await openSqlApplication({
+  engine, device, definition, authority, schema,
+  databasePath: '/application.sqlite',
+})
+```
+
+The Worker owns the initialized VFS and its storage handles. It releases any
+OPFS SQL pool only after application database handles have closed, within the
+same storage-owner lifetime. The engine adapter does not establish a second
+ownership service. Native and browser factories produce the same SQL execution
+format and common manifest encoding from the qualified build identity; explicit
+execution limits are part of that manifest. There is no application-profile
+selector or platform-specific schema path.
+
+Build WASM assets with `tools/build-wasm-engine.mjs` and host its exact
+`sqlite3.mjs`, `sqlite3.wasm`, `sqlite3-opfs-async-proxy.js` and `manifest.json`
+together. The loader verifies the WASM digest and supported build identity before
+instantiation. These engine assets are a separately built artifact, not an
+implicit download from a package service. The native/WASM conformance suite
+compares replay, state, permissions and SQL security against the same reducer.
+
 ## The host as a control participant
 
 ```ts
@@ -374,3 +435,10 @@ browser entries share session classes and ownership state through those chunks.
 Use `--native-rtc` to include the optional native RTC entry. That archive declares
 the exact `werift@0.27.0` peer dependency; the default archive has no runtime
 package dependencies and remains SQL-free.
+
+`--sql-native` includes `/sql`, the thin native engine adapter and the exact
+compiled addon. `--sql-browser` includes `/sql` and the verified browser
+loader/factory without embedding an engine build. Both flags can be combined.
+The packager checks that the common SQL and browser entries import no native
+runtime even when the archive also contains the native adapter. Shared chunks
+retain one session and one materializer class across all entries.

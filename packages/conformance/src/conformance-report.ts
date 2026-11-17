@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   createDoltLiteMaterializationRuntime,
   DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
+  createNativeSqlEngine, type SqlEngine,
   type ReplayProposal,
 } from '@chronolog/materializer-doltlite'
 import {
@@ -17,7 +17,6 @@ import {
   sqlStatement,
   transactionDigest,
   utf8,
-  type ExecutionManifest,
   type ProgramStep,
   type TransactionCore,
 } from '@chronolog/protocol'
@@ -56,10 +55,11 @@ interface ReportOptions {
 const moduleDirectory = dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = resolve(moduleDirectory, '../../..')
 export async function generateConformanceReport(options: ReportOptions = {}): Promise<ConformanceReport> {
-  const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-portable-core-conformance-v1' })
+  const engine = createNativeSqlEngine()
+  const manifest = engine.executionManifest
   const manifestArtifacts = await executionManifestArtifacts(manifest)
-  const replay = await runReplayFixture(manifest, 'reference')
-  const productionReplay = await runReplayFixture(manifest, 'runtime')
+  const replay = await runReplayFixture(engine, 'reference')
+  const productionReplay = await runReplayFixture(engine, 'runtime')
   if (productionReplay.replayDigest !== replay.replayDigest) {
     throw new Error('CONFORMANCE_RUNTIME_REPLAY_MISMATCH')
   }
@@ -149,7 +149,7 @@ export function assertConformanceReport(value: unknown): asserts value is Confor
 }
 
 async function runReplayFixture(
-  manifest: ExecutionManifest,
+  engine: SqlEngine,
   pathKind: 'reference' | 'runtime',
 ): Promise<{
   readonly evidenceDigest: string
@@ -158,7 +158,7 @@ async function runReplayFixture(
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-conformance-'))
   const path = join(directory, 'application.db')
   try {
-    const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, rootAdministrator: AUTHOR, checkpointEvery: 1 })
+    const materializer = await DeterministicMaterializer.open({ path, engine, rootAdministrator: AUTHOR, checkpointEvery: 1 })
     const runtime = pathKind === 'runtime'
       ? createDoltLiteMaterializationRuntime(materializer)
       : null

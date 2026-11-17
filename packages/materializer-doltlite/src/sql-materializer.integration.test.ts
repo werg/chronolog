@@ -8,7 +8,8 @@ import {
 import { afterEach, describe, expect, it } from 'vitest'
 import type { MaterializedApplicationSnapshot } from '@chronolog/materializer'
 
-import { DeterministicMaterializer } from './native.js'
+import { createNativeSqlEngine } from './native.js'
+import { DeterministicMaterializer } from './materializer.js'
 import { createDoltLiteMaterializationRuntime } from './runtime-adapter.js'
 import { MaterializerFixture, ROOT_KEY, replayProposal, rows } from './test-fixtures.js'
 import type { ReplayProposal } from './types.js'
@@ -24,8 +25,8 @@ function snapshotData(snapshot: MaterializedApplicationSnapshot) {
 
 describe('replicated SQL materialization', () => {
   it('executes DDL and DML in order and keeps the state across reopen', async () => {
-    const { path, manifest } = await fixture()
-    let materializer = await open(path, manifest, 1)
+    const { path, engine } = await fixture()
+    let materializer = await open(path, engine, 1)
     const bootstrap = await transaction(1n, 'bootstrap', [
       sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT'),
       sqlStatement('INSERT INTO accounts (id, value) VALUES (?, ?) RETURNING id', [2n, 'two']),
@@ -35,14 +36,14 @@ describe('replicated SQL materialization', () => {
     expect(materializer.outcome(bootstrap.txId)).toMatchObject({ outcome: 'accepted', rejectionCode: null, failingStatementIndex: null })
     materializer.close()
 
-    materializer = await open(path, manifest, 1)
+    materializer = await open(path, engine, 1)
     expect(rows(materializer, 'SELECT id, value FROM accounts')).toEqual([['2', 'two']])
     materializer.close()
   })
 
   it('rejects with the assertion code, rolls back schema and data, and flips after a late predecessor', async () => {
-    const { path, manifest } = await fixture()
-    const materializer = await open(path, manifest, 1)
+    const { path, engine } = await fixture()
+    const materializer = await open(path, engine, 1)
     const digest = materializer.executionManifestDigest
     const setup = await transaction(1n, 'setup', [
       sqlStatement('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT'),
@@ -93,7 +94,7 @@ describe('replicated SQL materialization', () => {
     const final = runtime.queries.captureApplication({ view: 'final' })
     expect(final).toMatchObject({ view: 'final', revision: 1n, orderLength: 3, finalRevision: 1n, finalOrderLength: 3 })
     materializer.close()
-    const reopened = await open(path, manifest, 1)
+    const reopened = await open(path, engine, 1)
     try { expect(snapshotData(reopened.captureApplication({ view: 'final' }))).toEqual(snapshotData(final)) } finally { reopened.close() }
   })
 
@@ -102,8 +103,8 @@ describe('replicated SQL materialization', () => {
       sqlStatement(`INSERT INTO probes (tx, now, local, r, blob, last_rowid, changed) VALUES (:tx, datetime('now'), datetime('now', 'localtime'),
         random(), randomblob(8), last_insert_rowid(), changes())`, { tx: 'probe' }),
     ]
-    const { path: first, manifest } = await fixture()
-    const incremental = await open(first, manifest, 1)
+    const { path: first, engine } = await fixture()
+    const incremental = await open(first, engine, 1)
     const digest = incremental.executionManifestDigest
     const setup = await transaction(1n, 'setup', [
       sqlStatement('CREATE TABLE probes (tx TEXT PRIMARY KEY NOT NULL, now TEXT, local TEXT, r INTEGER, blob BLOB, last_rowid INTEGER, changed INTEGER)'),
@@ -117,7 +118,7 @@ describe('replicated SQL materialization', () => {
     await incremental.materialize([setup, late, probe])
 
     const { path: second } = await fixture()
-    const fresh = await open(second, manifest, 1)
+    const fresh = await open(second, engine, 1)
     await fresh.materialize([setup, late, probe])
 
     const probeRows = rows(incremental, 'SELECT now, local, r, hex(blob), last_rowid, changed FROM probes')
@@ -131,8 +132,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('accepts ordinary SQLite: aggregates, windows, NOCASE grouping, JSON, triggers, views and generated columns', async () => {
-    const { path, manifest } = await fixture()
-    const materializer = await open(path, manifest)
+    const { path, engine } = await fixture()
+    const materializer = await open(path, engine)
     const digest = materializer.executionManifestDigest
     const tx = await transaction(1n, 'ordinary', [
       sqlStatement('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, price REAL, doubled REAL GENERATED ALWAYS AS (price * 2))'),
@@ -155,8 +156,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('rejects denied, malformed, unbound, over-budget and constraint-violating statements', async () => {
-    const { path, manifest } = await fixture({ maxVmSteps: 5_000 })
-    const materializer = await open(path, manifest)
+    const { path, engine } = await fixture({ maxVmSteps: 5_000 })
+    const materializer = await open(path, engine)
     const digest = materializer.executionManifestDigest
     const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)')], digest)
     const cases: [string, ProgramStep, string][] = [
@@ -187,8 +188,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('lets a transaction depend on an earlier outcome through chronolog_transactions', async () => {
-    const { path, manifest } = await fixture()
-    const materializer = await open(path, manifest)
+    const { path, engine } = await fixture()
+    const materializer = await open(path, engine)
     const digest = materializer.executionManifestDigest
     const first = await transaction(1n, 'first', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)')], digest)
     const second = await transaction(2n, 'second', [
@@ -205,8 +206,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('binds REAL, empty BLOB and named parameters exactly', async () => {
-    const { path, manifest } = await fixture()
-    const materializer = await open(path, manifest)
+    const { path, engine } = await fixture()
+    const materializer = await open(path, engine)
     const tx = await transaction(1n, 'values', [
       sqlStatement('CREATE TABLE v (id INTEGER PRIMARY KEY, a ANY, b ANY, c ANY, d ANY) STRICT'),
       sqlStatement('INSERT INTO v (a, b, c, d) VALUES (:real, :int, :blob, :text)', {
@@ -219,8 +220,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('blocks an unavailable execution manifest without inventing a SQL rejection', async () => {
-    const { path, manifest } = await fixture()
-    const materializer = await open(path, manifest)
+    const { path, engine } = await fixture()
+    const materializer = await open(path, engine)
     const tx = await transaction(1n, 'foreign', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)')], new Uint8Array(32))
     await expect(materializer.materialize([tx])).rejects.toThrow('MATERIALIZER_EXECUTION_MANIFEST_UNAVAILABLE')
     expect(materializer.outcome(tx.txId)).toBeNull()
@@ -229,8 +230,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('executes the verified supplied order without rewriting original author timestamps', async () => {
-    const { path, manifest } = await fixture()
-    const materializer = await open(path, manifest)
+    const { path, engine } = await fixture()
+    const materializer = await open(path, engine)
     const digest = materializer.executionManifestDigest
     const create = await transaction(50n, 'create', [sqlStatement('CREATE TABLE ordered (id INTEGER PRIMARY KEY)')], digest)
     const insert = await transaction(1n, 'insert', [sqlStatement('INSERT INTO ordered (id) VALUES (1)')], digest)
@@ -247,8 +248,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('replays the selected order while preserving an explicitly settled prefix', async () => {
-    const { path, manifest } = await fixture()
-    let materializer = await open(path, manifest, 1)
+    const { path, engine } = await fixture()
+    let materializer = await open(path, engine, 1)
     const digest = materializer.executionManifestDigest
     const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE drafts (id INTEGER PRIMARY KEY, value TEXT)')], digest)
     const first = await transaction(2n, 'first', [sqlStatement("INSERT INTO drafts (id, value) VALUES (1, 'first')")], digest)
@@ -276,7 +277,7 @@ describe('replicated SQL materialization', () => {
     await materializer.materialize([setup, second])
     await materializer.publishFinal(2)
     materializer.close()
-    materializer = await open(path, manifest, 1)
+    materializer = await open(path, engine, 1)
     expect(materializer.finalOrderLength).toBe(2)
     expect(rows(materializer, 'SELECT value FROM drafts')).toEqual([['second']])
     await expect(materializer.materialize([setup])).rejects.toThrow('FINAL_PREFIX_CHANGED')
@@ -285,8 +286,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('publishes rollback to an exact retained checkpoint and reopens that revision', async () => {
-    const { path, manifest } = await fixture()
-    let materializer = await open(path, manifest, 1)
+    const { path, engine } = await fixture()
+    let materializer = await open(path, engine, 1)
     const runtime = createDoltLiteMaterializationRuntime(materializer)
     const digest = materializer.executionManifestDigest
     const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE rollback (id INTEGER PRIMARY KEY)')], digest)
@@ -310,7 +311,7 @@ describe('replicated SQL materialization', () => {
       expect(materializer.outcome(insert.txId)).toBeNull()
       expect(held.query('SELECT id FROM rollback').rows).toEqual([[{ kind: 'integer', value: '1' }]])
     } finally { held.release(); materializer.close() }
-    materializer = await open(path, manifest, 1)
+    materializer = await open(path, engine, 1)
     expect(materializer.revision).toBe(previousRevision + 1n)
     expect(materializer.finalOrderLength).toBe(1)
     expect(materializer.databaseContentHash).toBe(checkpointHash)
@@ -320,8 +321,8 @@ describe('replicated SQL materialization', () => {
   })
 
   it('reads a real final SQL prefix, keeps tentative work local, and reopens both views', async () => {
-    const { path, manifest } = await fixture()
-    let materializer = await open(path, manifest, 100)
+    const { path, engine } = await fixture()
+    let materializer = await open(path, engine, 100)
     const digest = materializer.executionManifestDigest
     const create = await transaction(1n, 'create', [sqlStatement('CREATE TABLE views (id INTEGER PRIMARY KEY)')], digest)
     const first = await transaction(2n, 'first', [sqlStatement('INSERT INTO views (id) VALUES (1)')], digest)
@@ -334,7 +335,7 @@ describe('replicated SQL materialization', () => {
     })
     expect(() => materializer.localSql('DELETE FROM views', [], { view: 'final' })).toThrow()
     materializer.close()
-    materializer = await open(path, manifest, 100)
+    materializer = await open(path, engine, 100)
     expect(materializer.finalOrderLength).toBe(2)
     expect(materializer.localSql('SELECT id FROM views ORDER BY id', [], { view: 'final' }).rows).toEqual([[{ kind: 'integer', value: '1' }]])
     const late = await transaction(0n, 'late', [sqlStatement('SELECT 1')], digest)
@@ -347,13 +348,12 @@ describe('replicated SQL materialization', () => {
 
 async function fixture(limits: Partial<ExecutionLimits> = {}) {
   const directory = await fixtures.directory()
-  const { createDoltLiteExecutionManifest } = await import('./manifest.js')
-  return { path: `${directory}/application.db`, manifest: createDoltLiteExecutionManifest({ limits }) }
+  return { path: `${directory}/application.db`, engine: createNativeSqlEngine({ limits }) }
 }
 
-function open(path: string, manifest: Awaited<ReturnType<typeof fixture>>['manifest'], checkpointEvery?: number): Promise<DeterministicMaterializer> {
+function open(path: string, engine: Awaited<ReturnType<typeof fixture>>['engine'], checkpointEvery?: number): Promise<DeterministicMaterializer> {
   return DeterministicMaterializer.open({
-    path, executionManifest: manifest, rootAdministrator: ROOT_KEY, ...(checkpointEvery === undefined ? {} : { checkpointEvery }),
+    path, engine, rootAdministrator: ROOT_KEY, ...(checkpointEvery === undefined ? {} : { checkpointEvery }),
   })
 }
 

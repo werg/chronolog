@@ -8,9 +8,10 @@ import {
   MemoryBytesStore, participantGrant, program, signApplicationDescriptor, signControlRevision, signTransitionRequest, sqlStatement,
 } from '@chronolog/peer-session';
 import { openNativeDevice } from '@chronolog/peer-session/native';
-import { openNativeSqlApplication, prepareNativeSqlApplication } from '@chronolog/peer-session/sql-native';
+import { openSqlApplication, prepareSqlApplication } from '@chronolog/peer-session/sql';
+import { createNativeSqlEngine } from '@chronolog/peer-session/sql-native';
 
-const directory = process.argv[2], sessions = [], links = [];
+const directory = process.argv[2], sessions = [], links = [], engine = createNativeSqlEngine();
 const team = bytesToHex(APPLICATION_COLLECTIVE_ID);
 const definition = defineApplication({ id: 'packed-shared-board', version: '1',
   schema: program('CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE)'),
@@ -28,7 +29,7 @@ try {
   const host = await createPeerIdentity(), aDevice = await openNativeDevice({ path: join(directory, 'a.sqlite'), create: true });
   const bDevice = await openNativeDevice({ path: join(directory, 'b.sqlite'), create: true });
   const applicationId = 'db'.repeat(32), key = crypto.getRandomValues(new Uint8Array(32));
-  const prepared = await prepareNativeSqlApplication({ applicationId, definition, schemaAdministrator: aDevice.identity });
+  const prepared = await prepareSqlApplication({ engine, applicationId, definition, schemaAdministrator: aDevice.identity });
   const descriptor = await signApplicationDescriptor({ applicationId, historyId: 'packed-sql', profile: 'peer-generation-v1', policy: 'eligible-members-v1',
     controlPublicKey: host.publicKey, ...prepared.binding }, host);
   const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
@@ -39,7 +40,7 @@ try {
     expectedGeneration: null, requester: aDevice.identity.publicKey, coordinator: aDevice.identity.publicKey,
     controlRevision: 0, base: null, reason: 'create', transitionId: 'initial' }, aDevice.identity));
   const open = async (device, name) => {
-    const app = await openNativeSqlApplication({ device, databasePath: join(directory, `${name}-materialized.sqlite`), definition,
+    const app = await openSqlApplication({ engine, device, databasePath: join(directory, `${name}-materialized.sqlite`), definition,
       authority: await registry.read(), epochKeys: new Map([[0, key]]), schema: prepared.schema });
     sessions.push(app); return app;
   };

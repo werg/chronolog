@@ -10,7 +10,9 @@
     "./sql-native": "./src/sql-native.ts",
     "./webrtc": "./src/webrtc.ts",
     "./webrtc-native": "./src/webrtc-native.ts",
-    "./tendriller": "./src/tendriller.ts"
+    "./tendriller": "./src/tendriller.ts",
+    "./sql": "./src/sql.ts",
+    "./sql-browser": "./src/sql-browser.ts"
   },
   "dependencies": {
     "@chronolog/peer-generation": "workspace:*",

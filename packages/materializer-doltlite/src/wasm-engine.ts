@@ -1,13 +1,14 @@
 import { digestEngineManifest, normalizeEngineManifest } from './engine-manifest.js'
+import { createDoltLiteExecutionManifest } from './manifest.js'
+import type { ExecutionLimits } from '@chronolog/protocol'
 import { bytesToHex, sha256Sync, utf8 } from '@chronolog/canonical'
-import { assertNativeSecurityConfiguration, configureSqliteLimits } from './sql-profile.js'
+import { configureSqlDatabase } from './database.js'
 import type {
-  DatabaseLike, DoltBranchInfoLike, MaterializerBackendInfo, EngineBuildManifest,
-  NativeSecurityConfiguration, MaterializerOptions, StatementLike,
+  DatabaseLike, DoltBranchInfoLike, EngineBuildManifest,
+  NativeSecurityConfiguration, SqlEngine, StatementLike,
 } from './types.js'
 
 type Authorizer = Parameters<DatabaseLike['setAuthorizer']>[0]
-type OpenedDatabase = ReturnType<NonNullable<MaterializerOptions['openDatabase']>>
 interface WasmApi {
   alloc(bytes: number): number
   dealloc(pointer: number): void
@@ -99,7 +100,13 @@ export function verifyWasmBuild(bytes: Uint8Array, manifest: WasmBuildManifest):
 }
 
 /** Create a synchronous engine factory after the Worker has loaded its one WASM instance. */
-export function createWasmEngineFactory(module: ChronologWasmModule, manifest: WasmBuildManifest, vfs: string): (options: { path?: string }) => OpenedDatabase {
+export function createBrowserSqlEngine(options: {
+  readonly module: ChronologWasmModule
+  readonly manifest: WasmBuildManifest
+  readonly vfs: string
+  readonly limits?: Partial<ExecutionLimits>
+}): SqlEngine {
+  const { module, manifest, vfs, limits } = options
   const nativeManifest = normalizeEngineManifest(manifest.nativeManifest)
   const engineDigest = digestEngineManifest(nativeManifest)
   const runtimeVersions = { ...manifest.runtimeVersions }
@@ -107,26 +114,17 @@ export function createWasmEngineFactory(module: ChronologWasmModule, manifest: W
     const rc = module.wasm.xCall('chronolog_wasm_init', pointer)
     if (rc !== 0) throw new Error(`WASM_ENGINE_VFS_UNAVAILABLE:${vfs}:${rc}`)
   })
-  return (options) => {
-    if (options.path === undefined || options.path === ':memory:') throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
-    const database = new WasmDatabase(module, options.path)
+  const openDatabase: SqlEngine['openDatabase'] = (options) => {
+    if (typeof options.path !== 'string' || options.path.length === 0 || options.path === ':memory:') throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
+    const opened = configureSqlDatabase(new WasmDatabase(module, options.path), nativeManifest)
     try {
-      const security = database.configureSecurity()
-      assertNativeSecurityConfiguration(security)
-      configureSqliteLimits(database)
-      database.exec('PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON; PRAGMA trusted_schema = OFF')
-      if (Number(database.scalar('PRAGMA recursive_triggers')) !== 1) throw new Error('MATERIALIZER_RECURSIVE_TRIGGERS_UNAVAILABLE')
-      const backend: MaterializerBackendInfo = {
-        engine: 'doltlite', version: database.doltVersion(),
-        sqliteVersion: String(database.scalar('SELECT sqlite_version()')),
-        vecVersion: String(database.scalar('SELECT vec_version()')),
-        nativeManifest: structuredClone(nativeManifest), engineDigest: engineDigest.slice(), securityConfigured: true,
-      }
-      if (backend.version !== runtimeVersions.doltlite || backend.sqliteVersion !== runtimeVersions.sqlite ||
-          backend.vecVersion !== runtimeVersions.vec) throw new Error('WASM_ENGINE_VERSION_MISMATCH')
-      return { database, backend, security }
-    } catch (error) { database.close(); throw error }
+      if (opened.backend.version !== runtimeVersions.doltlite || opened.backend.sqliteVersion !== runtimeVersions.sqlite ||
+          opened.backend.vecVersion !== runtimeVersions.vec) throw new Error('WASM_ENGINE_VERSION_MISMATCH')
+      return opened
+    } catch (error) { opened.database.close(); throw error }
   }
+  return Object.freeze({ openDatabase, executionManifest: createDoltLiteExecutionManifest({ engineDigest,
+    ...(limits === undefined ? {} : { limits }) }) })
 }
 
 export class WasmDatabase implements DatabaseLike {

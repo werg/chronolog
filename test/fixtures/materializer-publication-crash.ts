@@ -1,6 +1,6 @@
 import {
   DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
+  createNativeSqlEngine,
   type ReplayProposal,
   type MaterializerPublicationFaultPoint,
 } from '@chronolog/materializer-doltlite'
@@ -14,10 +14,10 @@ import {
 const [path, requestedPoint] = process.argv.slice(2)
 if (path === undefined || requestedPoint === undefined) throw new Error('CRASH_FIXTURE_ARGUMENTS_REQUIRED')
 const point = requestedPoint as MaterializerPublicationFaultPoint
-const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-native-production-v1' })
+const engine = createNativeSqlEngine()
 const materializer = await DeterministicMaterializer.open({
   path,
-  executionManifest: manifest,
+  engine,
   // The probe's author is the root administrator, so it may create the table.
   rootAdministrator: bytes32(4),
   checkpointEvery: 1,

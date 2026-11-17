@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path'
 
 import {
   DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
+  createNativeSqlEngine,
   type MaterializerPublicationFaultPoint,
 } from '@chronolog/materializer-doltlite'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -43,10 +43,10 @@ describe('native publication crash recovery', () => {
         `${result.stdout}\n${result.stderr}`,
       ).toBe(true)
 
-      const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-native-production-v1' })
+      const engine = createNativeSqlEngine()
       const reopened = await DeterministicMaterializer.open({
         path,
-        executionManifest: manifest,
+        engine,
         rootAdministrator: Uint8Array.from({ length: 32 }, (_value, index) => (4 + index) & 0xff),
         checkpointEvery: 1,
       })

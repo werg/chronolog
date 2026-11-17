@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { expect, it } from 'vitest'
 import {
-  DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime,
+  DeterministicMaterializer, createNativeSqlEngine, createDoltLiteMaterializationRuntime,
 } from '@chronolog/materializer-doltlite'
 import { APPLICATION_COLLECTIVE_ID, emit, encodeChangeProgram, executionManifestArtifacts, program } from '@chronolog/protocol'
 import {
@@ -18,8 +18,8 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
   const peers: PeerReplica[] = []
   try {
     const host = await createPeerIdentity(), a = await createPeerIdentity(), b = await createPeerIdentity()
-    const key = crypto.getRandomValues(new Uint8Array(32)), manifest = createDoltLiteExecutionManifest()
-    const { executionManifestDigest } = await executionManifestArtifacts(manifest), applicationId = 'aa'.repeat(32), definitionDigest = 'bb'.repeat(32)
+    const key = crypto.getRandomValues(new Uint8Array(32)), engine = createNativeSqlEngine()
+    const { executionManifestDigest } = await executionManifestArtifacts(engine.executionManifest), applicationId = 'aa'.repeat(32), definitionDigest = 'bb'.repeat(32)
     const schema = await signApplicationSchema({ applicationId, definitionDigest, executionManifestDigest: bytesToHex(executionManifestDigest),
       program: bytesToHex(encodeChangeProgram(program('CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE)'))) }, a)
     const descriptor = await signApplicationDescriptor({ applicationId, historyId: 'sql-recovery', profile: 'peer-generation-v1', policy: 'eligible-members-v1',
@@ -33,7 +33,7 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
     await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       transitionId: 'initial', expectedGeneration: null, requester: a.publicKey, coordinator: a.publicKey, controlRevision: 0, reason: 'create', base: null }, a))
     const open = async (identity: PeerIdentity, name: string, store = new MemoryBytesStore(), databaseName = name) => {
-      const materializer = await DeterministicMaterializer.open({ path: join(directory, `${databaseName}.db`), executionManifest: manifest,
+      const materializer = await DeterministicMaterializer.open({ path: join(directory, `${databaseName}.db`), engine,
         rootAdministrator: hexToBytes(a.publicKey),
         bootstrapGroupId: hexToBytes(applicationId), bootstrapProgram: await verifyApplicationSchema(schema, descriptor.payload), checkpointEvery: 1 })
       const runtime = createDoltLiteMaterializationRuntime(materializer)

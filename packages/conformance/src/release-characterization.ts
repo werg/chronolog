@@ -7,7 +7,7 @@ import { performance } from 'node:perf_hooks'
 
 import {
   DeterministicMaterializer,
-  createDoltLiteExecutionManifest,
+  createNativeSqlEngine,
   type ReplayProposal,
 } from '@chronolog/materializer-doltlite'
 import {
@@ -59,12 +59,12 @@ export async function characterizeNativeRecovery(
   validateOptions(options)
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-release-characterization-'))
   const path = join(directory, 'application.db')
-  const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-native-release-characterization-v1' })
+  const engine = createNativeSqlEngine()
   const started = performance.now()
   let peakRssBytes = process.memoryUsage.rss()
   let materializer = await DeterministicMaterializer.open({
     path,
-    executionManifest: manifest,
+    engine,
     rootAdministrator: AUTHOR,
     checkpointEvery: Math.max(1, options.reopenEvery),
   })
@@ -102,7 +102,7 @@ export async function characterizeNativeRecovery(
         materializer.close()
         materializer = await DeterministicMaterializer.open({
           path,
-          executionManifest: manifest,
+          engine,
           rootAdministrator: AUTHOR,
           checkpointEvery: Math.max(1, options.reopenEvery),
         })

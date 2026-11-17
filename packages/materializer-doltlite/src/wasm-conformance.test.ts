@@ -4,23 +4,21 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { DeterministicMaterializer as NativeMaterializer, createDoltLiteExecutionManifest } from '@chronolog/materializer-doltlite'
-import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/browser'
+import { DeterministicMaterializer, createNativeSqlEngine, type SqlEngine } from '@chronolog/materializer-doltlite'
 import { emit, encodeRowKey, encodeSealedEnvelope, platformObjectId, sealedOp, sqlStatement, sqlValue, utf8 } from '@chronolog/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { replayProposal, ROOT_KEY } from './test-fixtures.js'
 import { generateX25519KeyPair, sealSealedValue } from '../../crypto/src/index.js'
-import { openDatabase as openNativeDatabase } from './driver.js'
 import { CONSENSUS_DENIED_FUNCTIONS } from './sql-profile.js'
-import { createWasmEngineFactory, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
+import { createBrowserSqlEngine, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
 
 const directory = resolve(process.env.CHRONOLOG_WASM_DIRECTORY ?? 'artifacts/wasm')
 const built = existsSync(join(directory, 'manifest.json'))
 if (process.env.CHRONOLOG_REQUIRE_WASM === '1' && !built) throw new Error('Build the pinned engine with tools/build-wasm-engine.mjs first')
 
 describe.skipIf(!built)('native/WASM deterministic engine qualification', () => {
-  let factory: ReturnType<typeof createWasmEngineFactory>
+  let browserEngine: SqlEngine
   let nativeDirectory: string
   beforeAll(async () => {
     const bytes = new Uint8Array(readFileSync(join(directory, 'sqlite3.wasm')))
@@ -38,16 +36,17 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       },
       printErr() { /* OPFS is qualified separately in a real Worker. */ },
     })
-    factory = createWasmEngineFactory(module, build, 'unix-none')
+    browserEngine = createBrowserSqlEngine({ module, manifest: build, vfs: 'unix-none' })
+    expect(browserEngine.executionManifest).toEqual(createNativeSqlEngine().executionManifest)
     nativeDirectory = await mkdtemp(join(tmpdir(), 'chronolog-wasm-'))
   })
   afterAll(async () => { if (nativeDirectory !== undefined) await rm(nativeDirectory, { recursive: true, force: true }) })
 
   it('executes identical histories, rejects assertions, replays a late predecessor, and reopens exact state', async () => {
-    const executionManifest = createDoltLiteExecutionManifest()
-    const options = { executionManifest, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
-    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'replay.db') })
-    let browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', openDatabase: factory })
+    const engine = createNativeSqlEngine()
+    const options = { engine, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
+    const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'replay.db') })
+    let browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {
       const digest = native.executionManifestDigest
       const setup = await replayProposal(1n, 'setup', [
@@ -78,17 +77,17 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
       }
       const hash = browser.databaseContentHash
       browser.close()
-      browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', openDatabase: factory })
+      browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
       expect(browser.databaseContentHash).toBe(hash)
       expect(browser.transactionLog()).toEqual(native.transactionLog())
     } finally { native.close(); browser.close() }
   })
 
   it('enforces the same ownership, denied SQL, budgets, trigger lint, and extension behavior', async () => {
-    const executionManifest = createDoltLiteExecutionManifest({ limits: { maxVmSteps: 5_000 } })
-    const options = { executionManifest, rootAdministrator: ROOT_KEY }
-    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'enforcement.db') })
-    const browser = await DeterministicMaterializer.open({ ...options, path: '/enforcement.db', openDatabase: factory })
+    const engine = createNativeSqlEngine({ limits: { maxVmSteps: 5_000 } })
+    const options = { engine, rootAdministrator: ROOT_KEY }
+    const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'enforcement.db') })
+    const browser = await DeterministicMaterializer.open({ ...options, path: '/enforcement.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {
       const digest = native.executionManifestDigest
       const other = new Uint8Array(32).fill(9)
@@ -127,8 +126,8 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
   })
 
   it('matches the pinned native FTS5, JSON1, integer RTree and sqlite-vec diagnostics', () => {
-    const native = openNativeDatabase({ path: join(nativeDirectory, 'extensions.db') }).database
-    const browser = factory({ path: '/extensions.db' }).database
+    const native = createNativeSqlEngine().openDatabase({ path: join(nativeDirectory, 'extensions.db') }).database
+    const browser = browserEngine.openDatabase({ path: '/extensions.db' }).database
     const schema = `
       CREATE VIRTUAL TABLE docs USING fts5(body);
       INSERT INTO docs(rowid,body) VALUES(1,'hello world'),(2,'unrelated');
@@ -170,8 +169,8 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
   })
 
   it('preserves exact row keys, storage-class comparisons and transaction context across engines', () => {
-    const native = openNativeDatabase({ path: join(nativeDirectory, 'row-keys.db') }).database
-    const browser = factory({ path: '/row-keys.db' }).database
+    const native = createNativeSqlEngine().openDatabase({ path: join(nativeDirectory, 'row-keys.db') }).database
+    const browser = browserEngine.openDatabase({ path: '/row-keys.db' }).database
     try {
       for (const database of [native, browser]) {
         const key = database.prepare('SELECT chronolog_row_key(?) AS value')
@@ -200,10 +199,10 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
   })
 
   it('enforces sealed writes and closes a deleted row policy identically across engines', async () => {
-    const executionManifest = createDoltLiteExecutionManifest()
-    const options = { executionManifest, rootAdministrator: ROOT_KEY }
-    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'sealed-lifecycle.db') })
-    const browser = await DeterministicMaterializer.open({ ...options, path: '/sealed-lifecycle.db', openDatabase: factory })
+    const engine = createNativeSqlEngine()
+    const options = { engine, rootAdministrator: ROOT_KEY }
+    const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'sealed-lifecycle.db') })
+    const browser = await DeterministicMaterializer.open({ ...options, path: '/sealed-lifecycle.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {
       const digest = native.executionManifestDigest
       const reader = await generateX25519KeyPair()
@@ -255,10 +254,10 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
   })
 
   it('executes mixed SQL/events atomically and retains a read view across later accepted changes', async () => {
-    const executionManifest = createDoltLiteExecutionManifest()
-    const options = { executionManifest, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
-    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'events.db') })
-    const browser = await DeterministicMaterializer.open({ ...options, path: '/events.db', openDatabase: factory })
+    const engine = createNativeSqlEngine()
+    const options = { engine, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
+    const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'events.db') })
+    const browser = await DeterministicMaterializer.open({ ...options, path: '/events.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {
       const digest = native.executionManifestDigest
       const setup = await replayProposal(1n, 'events-schema', [

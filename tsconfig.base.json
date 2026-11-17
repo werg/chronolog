@@ -81,6 +81,12 @@
       ],
       "@chronolog/peer-session/tendriller": [
         "packages/peer-session/src/tendriller.ts"
+      ],
+      "@chronolog/peer-session/sql": [
+        "packages/peer-session/src/sql.ts"
+      ],
+      "@chronolog/peer-session/sql-browser": [
+        "packages/peer-session/src/sql-browser.ts"
       ]
     }
   }

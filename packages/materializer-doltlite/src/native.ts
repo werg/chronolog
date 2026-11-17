@@ -1,13 +1,13 @@
-import { openDatabase } from './driver.js'
-import { DeterministicMaterializer as PortableMaterializer } from './materializer.js'
-import type { MaterializerOptions } from './types.js'
+import type { ExecutionLimits } from '@chronolog/protocol'
+import { openDatabase, readNativeEngineInfo } from './driver.js'
+import { createDoltLiteExecutionManifest } from './manifest.js'
+import type { SqlEngine } from './types.js'
 
-export { MaterializerInputError } from './materializer.js'
-export type DeterministicMaterializer = PortableMaterializer
-
-/** Native convenience entry point. The portable reducer owns no native imports. */
-export const DeterministicMaterializer = {
-  open(options: MaterializerOptions): Promise<PortableMaterializer> {
-    return PortableMaterializer.open({ ...options, openDatabase: options.openDatabase ?? openDatabase })
-  },
+/** The native adapter constructs an engine capability; the common class owns replay. */
+export function createNativeSqlEngine(options: { readonly limits?: Partial<ExecutionLimits> } = {}): SqlEngine {
+  return Object.freeze({
+    executionManifest: createDoltLiteExecutionManifest({ engineDigest: readNativeEngineInfo().digest,
+      ...(options.limits === undefined ? {} : { limits: options.limits }) }),
+    openDatabase,
+  })
 }

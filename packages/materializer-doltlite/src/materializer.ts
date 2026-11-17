@@ -129,14 +129,19 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     }
   }
 
-  static async open(options: MaterializerOptions): Promise<DeterministicMaterializer> {
-    if (!(options.rootAdministrator instanceof Uint8Array) || options.rootAdministrator.length !== 32) {
+  static async open(input: MaterializerOptions): Promise<DeterministicMaterializer> {
+    if (!(input.rootAdministrator instanceof Uint8Array) || input.rootAdministrator.length !== 32) {
       throw new MaterializerInputError('MATERIALIZER_ROOT_ADMINISTRATOR_INVALID')
     }
-    if (!bytesEqual(options.executionManifest.platformDigest, PLATFORM_DIGEST)) {
+    if (typeof input.engine?.openDatabase !== 'function') throw new MaterializerInputError('MATERIALIZER_ENGINE_FACTORY_REQUIRED')
+    const options: MaterializerOptions = { ...input, rootAdministrator: input.rootAdministrator.slice(),
+      engine: { executionManifest: structuredClone(input.engine.executionManifest), openDatabase: input.engine.openDatabase.bind(input.engine) },
+      ...(input.bootstrapProgram === undefined ? {} : { bootstrapProgram: structuredClone(input.bootstrapProgram) }),
+      ...(input.bootstrapGroupId === undefined ? {} : { bootstrapGroupId: input.bootstrapGroupId.slice() }) }
+    if (!bytesEqual(options.engine.executionManifest.platformDigest, PLATFORM_DIGEST)) {
       throw new MaterializerInputError('MATERIALIZER_PLATFORM_DIGEST_MISMATCH')
     }
-    const artifacts = await executionManifestArtifacts(options.executionManifest)
+    const artifacts = await executionManifestArtifacts(options.engine.executionManifest)
     const bootstrapProgram = bootstrapBytes(options)
     const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator, bootstrapProgram }
     const bootstrapIdentity = await hashDomain(DOMAINS.peerSchema, bootstrapProgram)
@@ -144,7 +149,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     let reader: DatabaseLike | null = null
     let finalReader: DatabaseLike | null = null
     try {
-      if (!bytesEqual(opened.backend.engineDigest, options.executionManifest.engineDigest)) {
+      if (!bytesEqual(opened.backend.engineDigest, options.engine.executionManifest.engineDigest)) {
         throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
       }
       let published = discoverPublishedRef(opened.database)
@@ -167,7 +172,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
       const readerOpened = openDatabase(options)
       reader = readerOpened.database
-      if (!bytesEqual(readerOpened.backend.engineDigest, options.executionManifest.engineDigest)) {
+      if (!bytesEqual(readerOpened.backend.engineDigest, options.engine.executionManifest.engineDigest)) {
         throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
       }
       reader.doltCheckout(published.branchRef)
@@ -191,7 +196,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         reader,
         options,
         opened.backend,
-        options.executionManifest,
+        options.engine.executionManifest,
         artifacts,
         published,
         checkpoints,
@@ -617,7 +622,7 @@ function initializeRepository(
     if (options.bootstrapProgram !== undefined) {
       if (options.bootstrapGroupId?.length !== 32) throw new Error('MATERIALIZER_BOOTSTRAP_GROUP_REQUIRED')
       executeTransactionProgram(database, options.bootstrapProgram, { authorTimestampMs: 0n, txId: bootstrapIdentity,
-        actor: expected.rootAdministrator, groupId: options.bootstrapGroupId }, options.executionManifest.limits)
+        actor: expected.rootAdministrator, groupId: options.bootstrapGroupId }, options.engine.executionManifest.limits)
     }
     verifyDatabaseState(database, expected)
     database.exec('COMMIT')
@@ -723,9 +728,8 @@ async function validateTransactionSet(
   }
 }
 
-function openDatabase(options: MaterializerOptions): ReturnType<NonNullable<MaterializerOptions['openDatabase']>> {
-  if (options.openDatabase === undefined) throw new Error('MATERIALIZER_ENGINE_FACTORY_REQUIRED')
-  return options.openDatabase(options)
+function openDatabase(options: MaterializerOptions): ReturnType<MaterializerOptions['engine']['openDatabase']> {
+  return options.engine.openDatabase({ path: options.path })
 }
 
 function verifyFinalTransactions(final: readonly TransactionLogRow[], transactions: readonly ReplayProposal[]): void {

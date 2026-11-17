@@ -194,18 +194,23 @@ export interface DatabaseLike {
   doltActiveBranch(): string
 }
 
-export interface MaterializerOptions {
-  /** Verified schema-author program, executed once before the genesis checkpoint. */
-  readonly bootstrapProgram?: ChangeProgram
-  readonly bootstrapGroupId?: Uint8Array
-  /** Runtime-owned engine factory; browser and native use the same reducer. */
-  readonly openDatabase?: (options: Pick<MaterializerOptions, 'path'>) => {
+/** Explicit execution capability; adapters supply an engine without owning an application. */
+export interface SqlEngine {
+  readonly executionManifest: ExecutionManifest
+  openDatabase(options: { readonly path: string }): {
     readonly database: DatabaseLike
     readonly backend: MaterializerBackendInfo
     readonly security: SecurityConfiguration
   }
-  readonly path?: string
-  readonly executionManifest: ExecutionManifest
+}
+
+export interface MaterializerOptions {
+  /** Verified schema-author program, executed once before the genesis checkpoint. */
+  readonly bootstrapProgram?: ChangeProgram
+  readonly bootstrapGroupId?: Uint8Array
+  /** Native and browser supply the same explicit capability to the sole reducer. */
+  readonly engine: SqlEngine
+  readonly path: string
   /**
    * The genesis schemaAdminPublicKey: the first SQL admin of the
    * `group` collective, and the only key that may seed rows into a fork.
