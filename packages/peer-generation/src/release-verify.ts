@@ -149,17 +149,41 @@ export function assertReleaseStateExtension(previous: ReleaseState, next: Releas
   }
 }
 /** Incremental verification limits memory to one source chunk and one hash state. */
-export async function verifyReleaseContent(manifest: SignedReleaseManifest, content: ReleaseContentSource): Promise<void> {
+export async function verifyReleaseContent(manifest: SignedReleaseManifest, content: ReleaseContentSource,
+  options: { readonly signal?: AbortSignal } = {}): Promise<void> {
   validateReleaseManifest(manifest.payload)
-  const verified = new Set<string>()
-  for (const asset of manifest.payload.assets) {
-    if (verified.has(asset.digest)) continue
-    const hash = createSha256(); let bytes = 0
-    for await (const chunk of content.read(structuredClone(asset))) {
-      check(chunk instanceof Uint8Array && chunk.byteLength > 0 && chunk.byteLength <= RELEASE_LIMITS.chunkBytes, 'RELEASE_CONTENT_CHUNK_INVALID')
-      bytes += chunk.byteLength; check(bytes <= asset.bytes, 'RELEASE_CONTENT_LENGTH_MISMATCH'); hash.update(chunk)
+  const lifetime = new AbortController(), timer = setTimeout(() => lifetime.abort(new Error('RELEASE_CONTENT_TIMEOUT')), RELEASE_LIMITS.verificationMs)
+  const signal = options.signal === undefined ? lifetime.signal : AbortSignal.any([lifetime.signal, options.signal])
+  try {
+    signal.throwIfAborted()
+    const verified = new Set<string>()
+    for (const asset of manifest.payload.assets) {
+      if (verified.has(asset.digest)) continue
+      const hash = createSha256(); let bytes = 0, done = false
+      const iterator = content.read(structuredClone(asset), { signal })[Symbol.asyncIterator]()
+      try {
+        for (;;) {
+          signal.throwIfAborted()
+          const next = await interruptedRead(iterator.next(), signal)
+          if (next.done) { done = true; break }
+          const chunk = next.value
+          check(chunk instanceof Uint8Array && chunk.byteLength > 0 && chunk.byteLength <= RELEASE_LIMITS.chunkBytes, 'RELEASE_CONTENT_CHUNK_INVALID')
+          bytes += chunk.byteLength; check(bytes <= asset.bytes, 'RELEASE_CONTENT_LENGTH_MISMATCH'); hash.update(chunk)
+        }
+      } finally {
+        // A broken source must not make cancellation wait for its pending read.
+        if (!done) { try { void Promise.resolve(iterator.return?.()).catch(() => undefined) } catch { /* Best effort source cancellation. */ } }
+      }
+      check(bytes === asset.bytes, 'RELEASE_CONTENT_INCOMPLETE')
+      check(bytesToHex(hash.digest()) === asset.digest, 'RELEASE_CONTENT_DIGEST_MISMATCH'); verified.add(asset.digest)
     }
-    check(bytes === asset.bytes, 'RELEASE_CONTENT_INCOMPLETE')
-    check(bytesToHex(hash.digest()) === asset.digest, 'RELEASE_CONTENT_DIGEST_MISMATCH'); verified.add(asset.digest)
-  }
+  } finally { clearTimeout(timer) }
+}
+function interruptedRead<T>(value: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) { void value.catch(() => undefined); return Promise.reject(signal.reason) }
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+    void value.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+  })
 }

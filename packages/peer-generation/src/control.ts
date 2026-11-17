@@ -18,6 +18,7 @@ export * from './participant.js'
 export * from './publication.js'
 export * from './release-types.js'
 export * from './release-verify.js'
+export * from './release-registry.js'
 export { createPeerIdentity, exportPeerIdentity, importPeerIdentity, PeerGenerationError, encodePeerValue, decodePeerValue, peerDigest, bytesDigest } from './codec.js'
 
 /** Monotonic learned authority: a signed older state or a divergent chain cannot replace it. */
