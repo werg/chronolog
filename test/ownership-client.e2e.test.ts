@@ -142,7 +142,8 @@ describe('ownership client API', () => {
     // This fixture has no policy watermark. Production defaults refuse to encrypt
     // until the policy is final; the override is explicit for this development fixture.
     await expect(alice.sealed.put(readers.id, 'body', utf8('first secret')))
-      .rejects.toThrow('SEALED_POLICY_UNAVAILABLE')
+      .rejects.toMatchObject({ code: 'SEALED_POLICY_NOT_FINAL', transactionId: readers.handle.transactionId })
+    expect(await alice.sealed.get(readers.id, 'body', { view: 'local' })).toBeNull()
     const first = await alice.sealed.put(readers.id, 'body', utf8('first secret'), {
       allowProvisionalPolicy: true, expectedPolicyVersion: 1n, expectedDataVersion: 0n,
     })

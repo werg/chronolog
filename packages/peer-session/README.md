@@ -260,16 +260,20 @@ and connections before closing its durable store.
 
 ## Page facade
 
-The Worker opens the device, owns the application and installs the application
-bridge alongside the transport bridge:
+The Worker opens the device and owns the application. For RTC connections,
+install both owners before announcing that the Worker is ready:
 
 ```ts
 import { serveApplicationWorker } from '@chronolog/peer-session/browser'
 import { installApplicationWorkerTransport } from '@chronolog/peer-session/webrtc'
 
-serveApplicationWorker(session, self, { host })
 installApplicationWorkerTransport(session, self)
+serveApplicationWorker(session, self, { host })
 ```
+
+The page facade and RTC transport use separate message namespaces. Serving the
+facade alone does not receive transferred RTC channels; the transport owner is
+optional when the application does not use RTC.
 
 The page connects through a dedicated message port:
 
