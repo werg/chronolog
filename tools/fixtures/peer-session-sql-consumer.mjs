@@ -47,6 +47,8 @@ try {
   const a = await open(aDevice, 'a'), b = await open(bDevice, 'b');
   const link = await connectApplications(a, b); links.push(link);
   assert.equal((await (await a.command('create', { id: 1, title: 'retained' }, { operationId: 'create-once' })).applied()).outcome, 'accepted');
+  assert.equal(b.status.database, 'idle');
+  assert.deepEqual((await b.query('tasks', null)).value.rows, [[1, 'retained']]);
   await link.synchronize(); link.close();
   const rejected = await (await a.command('create', { id: 2, title: 'retained' }, { operationId: 'duplicate' })).applied();
   assert.equal(rejected.outcome, 'rejected');
