@@ -377,6 +377,9 @@ importers:
       '@chronolog/materializer':
         specifier: workspace:*
         version: link:../materializer
+      '@chronolog/materializer-doltlite':
+        specifier: workspace:*
+        version: link:../materializer-doltlite
       '@chronolog/peer-generation':
         specifier: workspace:*
         version: link:../peer-generation
@@ -389,6 +392,10 @@ importers:
       '@chronolog/signals':
         specifier: workspace:*
         version: link:../signals
+
+      '@chronolog/transport-webrtc':
+        specifier: workspace:*
+        version: link:../transport-webrtc
 
   packages/protocol:
     dependencies:
@@ -554,9 +561,9 @@ importers:
 
   packages/transport-webrtc:
     dependencies:
-      '@chronolog/agent-service':
+      '@chronolog/records':
         specifier: workspace:*
-        version: link:../agent-service
+        version: link:../records
     optionalDependencies:
       werift:
         specifier: 0.27.0

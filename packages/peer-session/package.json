@@ -7,7 +7,9 @@
     ".": "./src/index.ts",
     "./native": "./src/native.ts",
     "./browser": "./src/browser.ts",
-    "./sql-native": "./src/sql-native.ts"
+    "./sql-native": "./src/sql-native.ts",
+    "./webrtc": "./src/webrtc.ts",
+    "./webrtc-native": "./src/webrtc-native.ts"
   },
   "dependencies": {
     "@chronolog/peer-generation": "workspace:*",
@@ -15,6 +17,7 @@
     "@chronolog/materializer": "workspace:*",
     "@chronolog/records": "workspace:*",
     "@chronolog/signals": "workspace:*",
-    "@chronolog/materializer-doltlite": "workspace:*"
+    "@chronolog/materializer-doltlite": "workspace:*",
+    "@chronolog/transport-webrtc": "workspace:*"
   }
 }

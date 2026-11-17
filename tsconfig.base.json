@@ -139,6 +139,12 @@
       "@chronolog/peer-session/browser": [
         "packages/peer-session/src/browser.ts"
       ],
+      "@chronolog/peer-session/webrtc": [
+        "packages/peer-session/src/webrtc.ts"
+      ],
+      "@chronolog/peer-session/webrtc-native": [
+        "packages/peer-session/src/webrtc-native.ts"
+      ],
       "@chronolog/records/native": [
         "packages/records/src/native.ts"
       ],

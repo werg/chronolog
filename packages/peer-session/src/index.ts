@@ -5,3 +5,5 @@ export * from './runtime.js'
 export * from '@chronolog/peer-generation'
 export { eventExecutionManifest } from '@chronolog/materializer'
 export { emit, program, sqlStatement, executionManifestArtifacts, bytesToHex, hexToBytes } from '@chronolog/protocol'
+
+export * from './network.js'

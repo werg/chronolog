@@ -1,3 +1,4 @@
+import { sessionInternals as internals } from './internals.js'
 import {
   PEER_GENERATION_CAPABILITIES, type PeerReplica, type PeerRevision, type AppliedResult,
   type OperationState, type AuthorityBundle, type RecoveryNotice, type SignedAttempt,
@@ -42,7 +43,7 @@ export interface ApplicationReadView {
 export interface CommandOptions { readonly operationId: string; readonly basedOn?: PeerRevision }
 export interface ApplicationChange { readonly kind: 'applied' | 'recovery'; readonly revision: PeerRevision; readonly recovery: RecoveryNotice | null }
 export interface SessionStatus {
-  readonly phase: 'ready' | 'waiting' | 'closed'
+  readonly phase: 'ready' | 'waiting' | 'recovering' | 'closed'
   readonly role: 'coordinator' | 'follower'
   readonly generation: string
   readonly coordinator: string
@@ -75,9 +76,8 @@ export class ApplicationOperation {
 type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
 type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
 type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
-interface PeerEndpoint { readonly session: ApplicationSession; submit(attempt: SignedAttempt): Promise<void> }
-interface SessionInternals { readonly replica: PeerReplica; readonly signals: SignalChannel }
-const internals = new WeakMap<ApplicationSession, SessionInternals>()
+interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void> }
+
 
 /** The application-facing owner: one peer journal, coherent views and explicit recovery. */
 export class ApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
@@ -114,11 +114,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       wait: (operationId: string, waitOptions: { readonly signal?: AbortSignal } = {}) => this.waitFor(operationId, waitOptions) })
   }
 
+  get signal(): AbortSignal { return this.#lifetime.signal }
   get revision(): PeerRevision { return this.#replica.revision }
   get deviceId(): string { return this.#replica.device.publicKey }
   get status(): SessionStatus {
     const coordinator = this.#replica.generation.payload.coordinator
-    return { phase: this.#closed ? 'closed' : this.#replica.isCoordinator || this.#peers.has(coordinator) ? 'ready' : 'waiting',
+    return { phase: this.#closed ? 'closed' : revisionKeySafe(this.#replica).endsWith('/recovering') ? 'recovering' : this.#replica.isCoordinator || this.#peers.has(coordinator) ? 'ready' : 'waiting',
       role: this.#replica.isCoordinator ? 'coordinator' : 'follower', generation: this.#replica.generation.id,
       coordinator, connectedPeers: this.#peers.size }
   }
@@ -237,13 +238,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   /** Runtime-owned attachment. Discovery hints never invoke this without peer authentication. */
-  attachPeer(peer: ApplicationSession, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): void }): () => void {
+  attachPeer(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): void }): () => void {
     this.#assertOpen()
-    if (!currentReader(this.#replica, peer.deviceId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
-    if (this.#peers.size >= 8 && !this.#peers.has(peer.deviceId)) throw new Error('APPLICATION_PEER_LIMIT')
-    const endpoint = { session: peer, submit }
-    this.#peers.set(peer.deviceId, endpoint); this.#links.add(link)
-    return () => { if (this.#peers.get(peer.deviceId) === endpoint) this.#peers.delete(peer.deviceId); this.#links.delete(link) }
+    if (!currentReader(this.#replica, peerId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
+    if (this.#peers.size >= 8 && !this.#peers.has(peerId)) throw new Error('APPLICATION_PEER_LIMIT')
+    const endpoint = { submit }
+    this.#peers.set(peerId, endpoint); this.#links.add(link)
+    return () => { if (this.#peers.get(peerId) === endpoint) this.#peers.delete(peerId); this.#links.delete(link) }
   }
 
   async close(): Promise<void> {
@@ -324,18 +325,18 @@ export async function connectApplications(left: ApplicationSession, right: Appli
     await source.synchronize(coordinator.authority, commands)
   }
   try {
-    detachA = left.attachPeer(right, submit(a.replica, b.replica), link)
-    detachB = right.attachPeer(left, submit(b.replica, a.replica), link)
+    detachA = left.attachPeer(right.deviceId, submit(a.replica, b.replica), link)
+    detachB = right.attachPeer(left.deviceId, submit(b.replica, a.replica), link)
     signalA = a.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalB!.receive(frame); return true } })
     signalB = b.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalA!.receive(frame); return true } })
-    let priorA = revisionKey(a.replica.revision), priorB = revisionKey(b.replica.revision)
+    let priorA = revisionKeySafe(a.replica), priorB = revisionKeySafe(b.replica)
     unsubscribeA = a.replica.subscribe(() => {
-      const current = revisionKey(a.replica.revision)
-      if (current !== priorA) { priorA = current; void synchronize().catch(() => undefined) }
+      const current = revisionKeySafe(a.replica)
+      if (current !== priorA) { priorA = current; void synchronize().catch(() => { link.close() }) }
     })
     unsubscribeB = b.replica.subscribe(() => {
-      const current = revisionKey(b.replica.revision)
-      if (current !== priorB) { priorB = current; void synchronize().catch(() => undefined) }
+      const current = revisionKeySafe(b.replica)
+      if (current !== priorB) { priorB = current; void synchronize().catch(() => { link.close() }) }
     })
     await synchronize()
     await Promise.all([left.resume(), right.resume()])
@@ -453,4 +454,9 @@ function coalescedChanges(replica: PeerReplica, lifetime: AbortSignal, signal?: 
       async return() { return close() },
     }
   } }
+}
+
+function revisionKeySafe(replica: PeerReplica): string {
+  try { return revisionKey(replica.revision) }
+  catch (error) { if (error instanceof Error && error.message === 'PEER_RECOVERING') return `${replica.generation.id}/recovering`; throw error }
 }

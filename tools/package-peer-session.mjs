@@ -11,26 +11,27 @@ import ts from 'typescript';
 
 const root = resolve(import.meta.dirname, '..');
 const { values } = parseArgs({ options: { output: { type: 'string', default: 'artifacts/peer-session' },
-  'allow-dirty': { type: 'boolean', default: false } } });
+  'allow-dirty': { type: 'boolean', default: false }, 'native-rtc': { type: 'boolean', default: false } } });
 const output = resolve(values.output), packageRoot = join(output, 'package');
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
-const entries = Object.fromEntries(['index', 'native', 'browser'].map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
+const entries = Object.fromEntries(['index', 'native', 'browser', 'webrtc', ...(values['native-rtc'] ? ['webrtc-native'] : [])]
+  .map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
   // Shared chunks preserve class identity and session ownership across all entrypoints.
   splitting: true, platform: 'neutral', conditions: ['import', 'default'], mainFields: ['module', 'main'],
-  format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root, external: ['node:*'],
+  format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root, external: ['node:*', ...(values['native-rtc'] ? ['werift'] : [])],
   outExtension: { '.js': '.mjs' }, chunkNames: 'chunks/[name]-[hash]' });
 const runtimeInputs = Object.keys(bundled.metafile.inputs).sort();
 assert(runtimeInputs.every(path => !/(?:materializer-doltlite|transport-ssb|agent-service|control-store|runtime-browser|testkit)\//u.test(path)),
   'The default session artifact must not contain SQL, legacy native services or fixtures');
-assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).every(value => !value.external || value.path.startsWith('node:')),
+assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).every(value => !value.external || value.path.startsWith('node:') || values['native-rtc'] && value.path === 'werift'),
   'The session artifact must not fetch external runtime dependencies');
 const declaration = declarations(Object.values(entries));
 const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
   'packages/peer-session/package.json', 'packages/peer-session/README.md', 'tools/package-peer-session.mjs'])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('PEER_SESSION_PACKAGE_REQUIRES_CLEAN_INPUTS');
-const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}`, version = `0.0.0-g${suffix}`;
+const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}${values['native-rtc'] ? '-rtc' : ''}`, version = `0.0.0-g${suffix}`;
 await rm(packageRoot, { force: true, recursive: true });
 await mkdir(packageRoot, { recursive: true });
 const files = new Map();
@@ -42,6 +43,7 @@ files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', vers
   description: 'Authenticated movable-peer application sessions with explicit recovery and applied outcomes',
   exports: Object.fromEntries(Object.keys(entries).map(name => [name === 'index' ? '.' : `./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
   files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json'], dependencies: {}, engines: { node: '>=22.15' },
+  ...(values['native-rtc'] ? { peerDependencies: { werift: '0.27.0' }, peerDependenciesMeta: { werift: { optional: true } } } : {}),
 }, null, 2) + '\n');
 for (const [path, content] of files) { await mkdir(dirname(join(packageRoot, path)), { recursive: true }); await writeFile(join(packageRoot, path), content); }
 assert.equal(git(['rev-parse', 'HEAD']).trim(), source, 'Source commit changed during packaging');
@@ -49,7 +51,7 @@ assert.equal(git(['status', '--porcelain', '--untracked-files=all', '--', ...inp
 const sha256 = Object.fromEntries([...files].map(([path, content]) => [path, hash(content)]));
 await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: 'chronolog-peer-session-package/v1',
   repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
-  inputs, runtimeInputs, sha256 }, null, 2) + '\n');
+  inputs, runtimeInputs, optionalNativeRtc: values['native-rtc'], sha256 }, null, 2) + '\n');
 const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 }))[0];
@@ -82,7 +84,7 @@ function declarations(entryPoints) {
       return `${quote}${local}${quote}`;
     });
     const imports = ts.preProcessFile(rewritten, true).importedFiles.map(value => value.fileName);
-    assert(imports.every(name => name.startsWith('.')), `Declarations must be self-contained: ${relative(root, path)} -> ${imports}`);
+    assert(imports.every(name => name.startsWith('.') || values['native-rtc'] && name === 'werift'), `Declarations must be self-contained: ${relative(root, path)} -> ${imports}`);
     files.set(relative(packageRoot, path).replaceAll('\\', '/'), rewritten);
   });
   assert(!result.emitSkipped, 'Peer session declaration emit failed');
