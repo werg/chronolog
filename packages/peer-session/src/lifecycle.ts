@@ -149,10 +149,11 @@ function maintain(owner: NetworkOwner, options: ApplicationNetworkOptions): Appl
     if (pending.size >= 4 || peers.size >= 4 || peers.has(invitation.requesterPeerId) || pending.has(invitation.requesterPeerId)) return
     if (!/^[0-9a-f]{64}$/u.test(invitation.requesterPeerId) || invitation.requesterPeerId === session.deviceId) return
     pending.add(invitation.requesterPeerId)
-    signal.throwIfAborted()
-    const signaling = host.rendezvous(invitation.channel, session.deviceId, { signal: lifetime.signal, timeoutMs })
-    try { add(await negotiated(invitation.requesterPeerId, signaling, lifetime.signal)) }
-    finally { pending.delete(invitation.requesterPeerId) }
+    try {
+      signal.throwIfAborted()
+      const signaling = host.rendezvous(invitation.channel, session.deviceId, { signal: lifetime.signal, timeoutMs })
+      add(await negotiated(invitation.requesterPeerId, signaling, lifetime.signal))
+    } finally { pending.delete(invitation.requesterPeerId) }
   }
 
   const openAvailability = () => supervisePeerSession({ readiness: 'transport', signal: lifetime.signal, retry,

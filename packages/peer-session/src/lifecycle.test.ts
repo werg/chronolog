@@ -123,6 +123,23 @@ const options = {
 } satisfies Omit<Parameters<typeof maintainNativeApplicationWebRtc>[1], 'host'>
 
 describe('managed application peer lifecycle', () => {
+  it('releases invitation admission when constructing rendezvous fails', async () => {
+    const f = await fixture(), a = await f.open(0), b = await f.open(1)
+    let attempts = 0
+    const host: ApplicationPeerHost = { ...f.client(), rendezvous() {
+      attempts++; throw new Error('INVITATION_NETWORK_DOWN')
+    } }
+    const network = maintainNativeApplicationWebRtc(a, { ...options, host, recovery: false })
+    cleanup.push(() => network.close())
+    await until(() => network.status.invitationListener === 'listening')
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await host.invite(a.deviceId, { channel: `retry-${attempt}`, requesterPeerId: b.deviceId })
+      await until(() => attempts === attempt, 1000)
+    }
+    expect(network.status.activePeers).toBe(0)
+    expect(a.status.phase).toBe('ready')
+  })
+
   it('owns late invitations, host-independent commands, bounded availability retry and an eligible automatic successor', async () => {
     const f = await fixture(), a = await f.open(0)
     const netA = maintainNativeApplicationWebRtc(a, { ...options, host: f.client() })
