@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { access, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
@@ -13,7 +13,7 @@ import { openApplicationDevice } from './device.js'
 import { createNativeSqlManifest, openNativeSqlApplication } from './sql-native.js'
 import type { ApplicationSession } from './session.js'
 
-it('claims the SQL session before opening a second materializer or disturbing an existing read lease', async () => {
+it('rejects mismatched engines and duplicate owners before creating or disturbing durable SQL', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'peer-sql-owner-'))
   const device = await openApplicationDevice({ store: new MemoryPeerStore(), create: true })
   let session: ApplicationSession | undefined
@@ -32,11 +32,26 @@ it('claims the SQL session before opening a second materializer or disturbing an
       revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
       grants: [participantGrant(device.identity.publicKey, { administrator: true })] }, host)
     const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
-    await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
+    const initialRequest = await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       transitionId: 'initial', expectedGeneration: null, requester: device.identity.publicKey, coordinator: device.identity.publicKey,
-      controlRevision: 0, reason: 'create', base: null }, device.identity))
+      controlRevision: 0, reason: 'create', base: null }, device.identity)
+    await registry.select(initialRequest)
     const options = { device, authority: await registry.read(), definition, epochKeys: new Map([[0, key]]),
       databasePath: join(directory, 'application.db'), schema }
+    const incompatibleSchema = await signApplicationSchema({ ...schema.payload, executionManifestDigest: 'ab'.repeat(32) }, device.identity)
+    const incompatibleDescriptor = await signApplicationDescriptor({ ...descriptor.payload,
+      executionManifestDigest: incompatibleSchema.payload.executionManifestDigest, schemaDigest: await peerDigest(incompatibleSchema) }, host)
+    const incompatibleRegistry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor: incompatibleDescriptor, controls: [control], signer: host })
+    await incompatibleRegistry.select(initialRequest)
+    const openingIncompatible = vi.spyOn(DeterministicMaterializer, 'open')
+    try {
+      await expect(openNativeSqlApplication({ ...options, schema: incompatibleSchema,
+        authority: await incompatibleRegistry.read() })).rejects.toThrow('PEER_EXECUTION_MANIFEST_MISMATCH')
+      expect(openingIncompatible).not.toHaveBeenCalled()
+      await expect(access(options.databasePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { openingIncompatible.mockRestore() }
+    // A corrected open can use the retained device identity and a pristine database path.
+    options.device = await openApplicationDevice({ store: device.store })
     session = await openNativeSqlApplication(options)
     const captured = await session.readView()
     const opening = vi.spyOn(DeterministicMaterializer, 'open')

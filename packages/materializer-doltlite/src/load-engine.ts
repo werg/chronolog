@@ -7,7 +7,8 @@ export interface LoadedBrowserEngine {
 
 /** Load the reproducible build, validate exact WASM bytes, and instantiate once in the owner Worker. */
 export async function loadBrowserEngine(baseUrl: string | URL): Promise<LoadedBrowserEngine> {
-  const base = new URL('./', new URL(baseUrl, globalThis.location.href))
+  const base = new URL(baseUrl, globalThis.location.href)
+  if (!base.pathname.endsWith('/')) base.pathname += '/'
   const [manifestResponse, wasmResponse] = await Promise.all([
     fetch(new URL('manifest.json', base)), fetch(new URL('sqlite3.wasm', base)),
   ])

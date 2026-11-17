@@ -3,7 +3,7 @@ import {
 } from '@chronolog/materializer-doltlite/browser'
 import { loadBrowserEngine, createWasmEngineFactory, wasmEngineDigest, type WasmBuildManifest } from '@chronolog/materializer-doltlite/wasm'
 import { bytesDigest, verifyApplicationSchema, type SignedApplicationSchema } from '@chronolog/peer-generation'
-import { bytesToHex, createExecutionManifest, encodeChangeProgram, hexToBytes, utf8 } from '@chronolog/protocol'
+import { bytesToHex, createExecutionManifest, encodeChangeProgram, executionManifestArtifacts, hexToBytes, utf8 } from '@chronolog/protocol'
 
 import type { ApplicationDefinition } from './definition.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
@@ -28,13 +28,17 @@ export async function openBrowserSqlApplication<const D extends ApplicationDefin
       throw new Error('APPLICATION_SCHEMA_DEFINITION_MISMATCH')
     }
     const engine = await loadBrowserEngine(options.engineUrl)
+    const executionManifest = createBrowserSqlManifest(engine.manifest)
+    if (bytesToHex((await executionManifestArtifacts(executionManifest)).executionManifestDigest) !== descriptor.executionManifestDigest) {
+      throw new Error('PEER_EXECUTION_MANIFEST_MISMATCH')
+    }
     if (engine.module.installOpfsSAHPoolVfs === undefined) throw new Error('BROWSER_SQLITE_OPFS_POOL_UNAVAILABLE')
     const owner = await bytesDigest(utf8(options.device.storageId))
     const directory = `/chronolog-peer-sql/${owner}/${descriptor.applicationId}`
     const pool = await engine.module.installOpfsSAHPoolVfs({ name: `chronolog-peer-${descriptor.applicationId}`, directory, initialCapacity: 16 })
     try {
       const materializer = await DeterministicMaterializer.open({ path: `${directory}/application.db`,
-        executionManifest: createBrowserSqlManifest(engine.manifest), historyProfile: 'peer-generation-v1',
+        executionManifest, historyProfile: 'peer-generation-v1',
         rootAdministrator: hexToBytes(descriptor.schemaAdministrator), bootstrapGroupId: hexToBytes(descriptor.applicationId),
         bootstrapProgram, openDatabase: createWasmEngineFactory(engine.module, engine.manifest, pool.vfsName) })
       const runtime = createDoltLiteMaterializationRuntime(materializer)
