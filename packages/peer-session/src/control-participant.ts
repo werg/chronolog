@@ -117,7 +117,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
         return publication
       }
       const current = await this.#readPublication(), authority = await verifyAuthorityBundle(this.#replica.authority)
-      if (authority.grant(this.#replica.device.publicKey)?.administrator !== true) throw new Error('PEER_PUBLICATION_FORBIDDEN')
+      if (authority.grant(this.#replica.device.publicKey)?.publisher !== true) throw new Error('PEER_PUBLICATION_FORBIDDEN')
       const descriptor = authority.descriptor
       const publication = await signPublicationManifest({ applicationId: descriptor.applicationId, historyId: descriptor.historyId,
         profile: descriptor.profile, controlRevision: authority.control.payload.revision, author: this.#replica.device.publicKey,

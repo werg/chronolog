@@ -76,10 +76,13 @@ no creator or native process has an implicit permanent role.
 
 The supported shared policy is `participantGrant`: reader, writer, coordinator and
 recovery rights are explicit; shared-data membership defaults to `member`.
+Administration and publication are independent opt-in rights. A code/page release
+requires `publisher: true`; neither administration nor data access implies it.
 `controlParticipantGrant` gives the host explicit administration and recovery
-rights while leaving reader, writer, coordinator and data membership disabled.
+rights while leaving reader, writer, coordinator, publisher and data membership disabled.
 Account ownership can therefore authorize recovery without possessing a creator's
-device key or becoming an application-data peer.
+device key or becoming an application-data peer. Serving a selected release does
+not require permission to sign a new one.
 
 The reserved `APPLICATION_COLLECTIVE_ID` is the durable shared SQL owner. Its
 members come from signed `dataRole` grants. Inherited commands replay against
@@ -109,7 +112,7 @@ declared interests before delivery. A session attaches the host with
 not register the host as a reader or an application-data peer.
 
 Signed publication manifests select immutable code and page assets. The control
-participant verifies the current administrator, exact operation identity, bounded
+participant verifies the explicit current publisher grant, exact operation identity, bounded
 asset hashes and predecessor before atomically projecting a selected version into
 Tendriller's serving store. The session journals signed publication intent before
 dispatch, verifies skipped predecessors and durably rejects a regressed head.

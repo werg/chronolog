@@ -48,8 +48,8 @@ function validateControl(value: ControlRevision): void {
   check(isArray(value.grants) && value.grants.length > 0 && value.grants.length <= 1024, 'PEER_GRANTS_INVALID')
   const keys = new Set<string>()
   for (const grant of value.grants) {
-    object(grant, ['publicKey', 'reader', 'writer', 'coordinator', 'recovery', 'administrator', 'dataRole']); hex(grant.publicKey)
-    for (const key of ['reader', 'writer', 'coordinator', 'recovery', 'administrator'] as const) check(typeof grant[key] === 'boolean', 'PEER_GRANT_INVALID')
+    object(grant, ['publicKey', 'reader', 'writer', 'coordinator', 'recovery', 'administrator', 'publisher', 'dataRole']); hex(grant.publicKey)
+    for (const key of ['reader', 'writer', 'coordinator', 'recovery', 'administrator', 'publisher'] as const) check(typeof grant[key] === 'boolean', 'PEER_GRANT_INVALID')
     check(!keys.has(grant.publicKey), 'PEER_DUPLICATE_GRANT'); keys.add(grant.publicKey)
     check(!grant.coordinator || grant.reader, 'PEER_COORDINATOR_MUST_READ')
     check(grant.dataRole === null || grant.dataRole === 'member' || grant.dataRole === 'admin', 'PEER_DATA_ROLE_INVALID')
@@ -79,15 +79,16 @@ export async function signApplicationDescriptor(payload: ApplicationDescriptor, 
   return signPeerValue(DOMAINS.peerDescriptor, payload, signer)
 }
 /** The supported shared-application policy; every granted power remains explicit on the wire. */
-export function participantGrant(publicKey: string, options: { readonly administrator?: boolean; readonly dataRole?: 'member' | 'admin' | null } = {}): PeerGrant {
+export function participantGrant(publicKey: string, options: { readonly administrator?: boolean; readonly publisher?: boolean; readonly dataRole?: 'member' | 'admin' | null } = {}): PeerGrant {
   hex(publicKey)
   return { publicKey, reader: true, writer: true, coordinator: true, recovery: true,
-    administrator: options.administrator ?? false, dataRole: options.dataRole === undefined ? 'member' : options.dataRole }
+    administrator: options.administrator ?? false, publisher: options.publisher ?? false,
+    dataRole: options.dataRole === undefined ? 'member' : options.dataRole }
 }
 /** Explicit control-only host role, enabling account ownership recovery without a creator device. */
 export function controlParticipantGrant(publicKey: string): PeerGrant {
   hex(publicKey)
-  return { publicKey, reader: false, writer: false, coordinator: false, recovery: true, administrator: true, dataRole: null }
+  return { publicKey, reader: false, writer: false, coordinator: false, recovery: true, administrator: true, publisher: false, dataRole: null }
 }
 export async function signControlRevision(payload: ControlRevision, signer: PeerIdentity): Promise<SignedControlRevision> {
   validateControl(payload); return signPeerValue(DOMAINS.peerControl, payload, signer)

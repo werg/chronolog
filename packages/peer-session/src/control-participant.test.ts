@@ -28,7 +28,7 @@ async function fixture() {
     executionManifestDigest: bytesToHex(manifest.executionManifestDigest), schemaDigest: null }, signer)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: devices.map(device => participantGrant(device.identity.publicKey, { administrator: true })) }, signer)
+    grants: devices.map(device => participantGrant(device.identity.publicKey, { administrator: true, publisher: true })) }, signer)
   const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null, coordinator: devices[0]!.identity.publicKey,

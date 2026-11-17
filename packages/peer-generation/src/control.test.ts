@@ -17,7 +17,7 @@ async function fixture() {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: digest, recoveryFloor: null,
     grants: [a, b, c, writer].map(key => ({ publicKey: key.publicKey, reader: true, writer: true,
-      coordinator: key !== writer, recovery: key !== writer, administrator: key === a, dataRole: 'member' as const })) }, host)
+      coordinator: key !== writer, recovery: key !== writer, administrator: key === a, publisher: false, dataRole: 'member' as const })) }, host)
   const store = new MemoryBytesStore()
   const registry = await createGenerationRegistry({ store, descriptor, controls: [control], signer: host })
   const transition = async (who: PeerIdentity, coordinator: PeerIdentity, expected: string | null, base: PrefixProof | null, id: string, reason: 'create' | 'takeover' | 'control-change' = 'takeover', revision = 0) => signTransitionRequest({
@@ -47,6 +47,17 @@ function proof(receipt: OrderReceipt, bridge: readonly OrderReceipt[] = []): Pre
 }
 
 describe('portable peer generation authority', () => {
+  it('requires an explicit publisher grant independently of every other role', async () => {
+    const f = await fixture()
+    expect(participantGrant(f.a.publicKey, { administrator: true })).toMatchObject({ administrator: true, publisher: false })
+    expect(participantGrant(f.a.publicKey, { publisher: true })).toMatchObject({ administrator: false, publisher: true })
+    expect(controlParticipantGrant(f.host.publicKey)).toMatchObject({ administrator: true, publisher: false, reader: false, writer: false })
+    const missing = structuredClone(f.control.payload)
+    delete (missing.grants[0] as { publisher?: boolean }).publisher
+    await expect(signControlRevision(missing, f.host)).rejects.toThrow('PEER_RECORD_FIELDS_INVALID')
+    const malformed = { ...f.control.payload, grants: f.control.payload.grants.map(grant => ({ ...grant, publisher: 1 as unknown as boolean })) }
+    await expect(signControlRevision(malformed, f.host)).rejects.toThrow('PEER_GRANT_INVALID')
+  })
   it('recovers through an explicit control participant without creator or data authority', async () => {
     const f = await fixture()
     const control = await signControlRevision({ ...f.control.payload,
@@ -58,7 +69,7 @@ describe('portable peer generation authority', () => {
     const next = await registry.select(await f.transition(f.host, f.b, first.id, proof(head), 'owner-recovery'))
     expect(next.payload.coordinator).toBe(f.b.publicKey)
     expect((await verifyAuthorityBundle(await registry.read())).grant(f.host.publicKey)).toMatchObject({
-      reader: false, writer: false, coordinator: false, recovery: true, administrator: true, dataRole: null,
+      reader: false, writer: false, coordinator: false, recovery: true, administrator: true, publisher: false, dataRole: null,
     })
     await expect(registry.select(await f.transition(f.host, f.host, next.id, proof(head), 'host-is-not-a-peer'))).rejects.toThrow('PEER_COORDINATOR_FORBIDDEN')
   })

@@ -12,20 +12,22 @@ import {
 } from './publication.js'
 
 async function fixture() {
-  const host = await createPeerIdentity(), admin = await createPeerIdentity(), writer = await createPeerIdentity()
+  const host = await createPeerIdentity(), admin = await createPeerIdentity(), writer = await createPeerIdentity(), publisher = await createPeerIdentity()
   const descriptor = await signApplicationDescriptor({ applicationId: '22'.repeat(32), historyId: 'publication-test',
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey,
     schemaAdministrator: admin.publicKey, executionManifestDigest: '33'.repeat(32), definitionDigest: '44'.repeat(32), schemaDigest: null }, host)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: '55'.repeat(32), recoveryFloor: null,
-    grants: [controlParticipantGrant(host.publicKey), participantGrant(admin.publicKey, { administrator: true }), participantGrant(writer.publicKey)] }, host)
+    grants: [controlParticipantGrant(host.publicKey), participantGrant(admin.publicKey, { administrator: true }), participantGrant(writer.publicKey),
+      { publicKey: publisher.publicKey, reader: false, writer: false, coordinator: false, recovery: false,
+        administrator: false, publisher: true, dataRole: null }] }, host)
   const generations = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   const first = await generations.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
     profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
     requester: admin.publicKey, coordinator: admin.publicKey, controlRevision: 0, reason: 'create', base: null }, admin))
   const authority = () => generations.read(), store = new MemoryBytesStore(), publications = await createPublicationRegistry({ store, authority })
   const bytes = new TextEncoder().encode('<!doctype html><title>A</title>')
-  const manifest = async (operationId: string, previous: SignedPublication | null = null, signer: PeerIdentity = admin,
+  const manifest = async (operationId: string, previous: SignedPublication | null = null, signer: PeerIdentity = publisher,
     changes: Partial<PublicationManifest> = {}) => signPublicationManifest({ applicationId: descriptor.payload.applicationId,
     historyId: descriptor.payload.historyId, profile: descriptor.payload.profile, controlRevision: 0, author: signer.publicKey, operationId,
     revision: previous === null ? 0 : previous.payload.revision + 1, previous: previous?.id ?? null,
@@ -33,26 +35,36 @@ async function fixture() {
     entry: 'index.html', files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }], ...changes }, signer)
   const revoke = async () => {
     const next = await signControlRevision({ ...control.payload, revision: 1, previous: await peerDigest(control),
-      grants: control.payload.grants.map(grant => grant.publicKey === admin.publicKey ? { ...grant, administrator: false } : grant) }, host)
+      grants: control.payload.grants.map(grant => grant.publicKey === publisher.publicKey ? { ...grant, publisher: false }
+        : grant.publicKey === writer.publicKey ? { ...grant, publisher: true } : grant) }, host)
     const transition = await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
-      policy: descriptor.payload.policy, transitionId: 'revoke-admin', expectedGeneration: first.id, requester: host.publicKey,
+      policy: descriptor.payload.policy, transitionId: 'revoke-publisher', expectedGeneration: first.id, requester: host.publicKey,
       coordinator: admin.publicKey, controlRevision: 1, reason: 'control-change', base: {
         point: { generation: first.id, sequence: 0, root: await generationStartRoot(first) }, receipt: null, bridge: [],
       } }, host)
     await generations.select(transition, { control: next })
   }
-  return { host, admin, writer, descriptor, authority, store, publications, bytes, manifest, revoke }
+  const recover = async () => {
+    const current = await generations.read()
+    return generations.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
+      policy: descriptor.payload.policy, transitionId: 'recover-older-history', expectedGeneration: current.generations.at(-1)!.id,
+      requester: admin.publicKey, coordinator: writer.publicKey, controlRevision: current.controls.at(-1)!.payload.revision,
+      reason: 'takeover', base: { point: { generation: first.id, sequence: 0, root: await generationStartRoot(first) }, receipt: null, bridge: [] } }, admin))
+  }
+  return { host, admin, writer, publisher, descriptor, authority, store, publications, bytes, manifest, revoke, recover }
 }
 
 describe('signed code publication independent of lossy database history', () => {
-  it('requires publication administration separately from writing, sequencing and data access', async () => {
+  it('requires publisher authority independently of administration, writing, sequencing and data access', async () => {
     const f = await fixture(), authority = await verifyAuthorityBundle(await f.authority())
-    const authorized = await f.manifest('admin-release')
+    const authorized = await f.manifest('publisher-release')
     await expect(authorizePublication(authorized, authority, null)).resolves.toBeUndefined()
     await expect(authorizePublication(await f.manifest('writer-release', null, f.writer), authority, null)).rejects.toThrow('PEER_PUBLICATION_FORBIDDEN')
-    // A host granted only administration/recovery can publish without reader keys or SQL rights.
-    await expect(authorizePublication(await f.manifest('host-release', null, f.host), authority, null)).resolves.toBeUndefined()
-    expect(authority.grant(f.host.publicKey)).toMatchObject({ reader: false, writer: false, coordinator: false, administrator: true })
+    await expect(authorizePublication(await f.manifest('admin-release', null, f.admin), authority, null)).rejects.toThrow('PEER_PUBLICATION_FORBIDDEN')
+    await expect(authorizePublication(await f.manifest('host-release', null, f.host), authority, null)).rejects.toThrow('PEER_PUBLICATION_FORBIDDEN')
+    expect(authority.grant(f.publisher.publicKey)).toMatchObject({ publisher: true, reader: false, writer: false, coordinator: false,
+      recovery: false, administrator: false, dataRole: null })
+    expect(authority.grant(f.host.publicKey)).toMatchObject({ publisher: false, reader: false, writer: false, coordinator: false, administrator: true })
   })
   it('authenticates code bytes and binds definition, execution, history and exact publisher', async () => {
     const f = await fixture(), authority = await verifyAuthorityBundle(await f.authority()), publication = await f.manifest('release')
@@ -60,9 +72,9 @@ describe('signed code publication independent of lossy database history', () => 
     await expect(verifyPublicationAsset(publication.payload.files[0]!, new TextEncoder().encode('changed'))).rejects.toThrow('PEER_PUBLICATION_ASSET_MISMATCH')
     await expect(verifyPublicationManifest({ ...publication, signature: '00'.repeat(64) }, authority)).rejects.toThrow('PEER_SIGNATURE_INVALID')
     for (const changes of [{ definitionDigest: 'aa'.repeat(32) }, { executionManifestDigest: 'bb'.repeat(32) }]) {
-      await expect(verifyPublicationManifest(await f.manifest('changed', null, f.admin, changes), authority)).rejects.toThrow('PEER_PUBLICATION_SEMANTICS_MISMATCH')
+      await expect(verifyPublicationManifest(await f.manifest('changed', null, f.publisher, changes), authority)).rejects.toThrow('PEER_PUBLICATION_SEMANTICS_MISMATCH')
     }
-    await expect(verifyPublicationManifest(await f.manifest('wrong-history', null, f.admin, { historyId: 'another' }), authority))
+    await expect(verifyPublicationManifest(await f.manifest('wrong-history', null, f.publisher, { historyId: 'another' }), authority))
       .rejects.toThrow('PEER_PUBLICATION_SCOPE_MISMATCH')
     expect(() => validatePublicationManifest({ ...publication.payload, files: [{ ...publication.payload.files[0]!, path: '../index.html' }] }))
       .toThrow('PEER_PUBLICATION_PATH_INVALID')
@@ -87,9 +99,23 @@ describe('signed code publication independent of lossy database history', () => 
     await expect(verifyPublicationManifest(first, authority)).resolves.toBeUndefined()
     expect(await f.publications.publish(first)).toEqual(first)
     await expect(f.publications.publish(await f.manifest('stale', first))).rejects.toThrow('PEER_PUBLICATION_CONTROL_CHANGED')
-    await expect(f.publications.publish(await f.manifest('revoked', first, f.admin, { controlRevision: 1 }))).rejects.toThrow('PEER_PUBLICATION_FORBIDDEN')
-    const second = await f.publications.publish(await f.manifest('host-successor', first, f.host, { controlRevision: 1 }))
+    await expect(f.publications.publish(await f.manifest('revoked', first, f.publisher, { controlRevision: 1 }))).rejects.toThrow('PEER_PUBLICATION_FORBIDDEN')
+    const second = await f.publications.publish(await f.manifest('publisher-successor', first, f.writer, { controlRevision: 1 }))
     expect((await f.publications.read()).map(value => value.id)).toEqual([first.id, second.id])
+  })
+  it('preserves publication selection and publisher revocation when application history recovers to an older ancestor', async () => {
+    const f = await fixture(), first = await f.publications.publish(await f.manifest('first'))
+    await f.revoke()
+    const second = await f.publications.publish(await f.manifest('second', first, f.writer, { controlRevision: 1 }))
+    const recovered = await f.recover(), authority = await verifyAuthorityBundle(await f.authority())
+    expect(recovered.payload.adopted?.generation).toBe(authority.bundle.generations[0]!.id)
+    expect(authority.grant(f.publisher.publicKey)?.publisher).toBe(false)
+    expect(await f.publications.read()).toEqual([first, second])
+    expect(await f.publications.publish(first)).toEqual(first)
+    await expect(f.publications.publish(await f.manifest('revoked-after-recovery', second, f.publisher, { controlRevision: 1 })))
+      .rejects.toThrow('PEER_PUBLICATION_FORBIDDEN')
+    await expect(f.publications.publish(await f.manifest('admin-after-recovery', second, f.admin, { controlRevision: 1 })))
+      .rejects.toThrow('PEER_PUBLICATION_FORBIDDEN')
   })
   it('recovers a durable publication whose storage acknowledgment was lost', async () => {
     const f = await fixture(), backing = new MemoryBytesStore()
@@ -104,7 +130,7 @@ describe('signed code publication independent of lossy database history', () => 
     expect(await registry.publish(first)).toEqual(first)
     expect(await registry.read()).toHaveLength(1)
   })
-  it('rechecks authority after asynchronous preparation and rejects a newly revoked administrator', async () => {
+  it('rechecks authority after asynchronous preparation and rejects a newly revoked publisher', async () => {
     const f = await fixture(), stale = await f.authority(), publication = await f.manifest('racing')
     await f.revoke()
     const current = await f.authority()

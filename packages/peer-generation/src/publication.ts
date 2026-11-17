@@ -69,7 +69,7 @@ export async function signPublicationManifest(input: PublicationManifest, signer
   return { ...signed, id: await peerDigest(['chronolog/publication/v1', signed.payload]) }
 }
 
-/** Historical validity survives a later administrator change; acceptance uses authorizePublication. */
+/** Historical validity survives a later publisher revocation; acceptance uses authorizePublication. */
 export async function verifyPublicationManifest(input: SignedPublication, authority: PeerAuthority): Promise<void> {
   const publication = structuredClone(input)
   object(publication, ['payload', 'signature', 'id']); hex(publication.id)
@@ -78,7 +78,7 @@ export async function verifyPublicationManifest(input: SignedPublication, author
     value.profile === descriptor.profile, 'PEER_PUBLICATION_SCOPE_MISMATCH')
   check(value.definitionDigest === descriptor.definitionDigest && value.executionManifestDigest === descriptor.executionManifestDigest,
     'PEER_PUBLICATION_SEMANTICS_MISMATCH')
-  check(authority.grant(value.author, value.controlRevision)?.administrator === true, 'PEER_PUBLICATION_FORBIDDEN')
+  check(authority.grant(value.author, value.controlRevision)?.publisher === true, 'PEER_PUBLICATION_FORBIDDEN')
   check(publication.id === await peerDigest(['chronolog/publication/v1', value]), 'PEER_PUBLICATION_ID_INVALID')
   await verifyPeerValue(DOMAINS.peerPublication, { payload: value, signature: publication.signature }, value.author)
 }
@@ -87,7 +87,7 @@ export async function verifyPublicationManifest(input: SignedPublication, author
 export async function authorizePublication(input: SignedPublication, authority: PeerAuthority, previous: SignedPublication | null): Promise<void> {
   const publication = structuredClone(input), head = structuredClone(previous)
   await verifyPublicationManifest(publication, authority)
-  check(publication.payload.controlRevision === authority.control.payload.revision && authority.grant(publication.payload.author)?.administrator === true,
+  check(publication.payload.controlRevision === authority.control.payload.revision && authority.grant(publication.payload.author)?.publisher === true,
     'PEER_PUBLICATION_CONTROL_CHANGED')
   if (head !== null) await verifyPublicationManifest(head, authority)
   check(publication.payload.previous === (head?.id ?? null) && publication.payload.revision === (head === null ? 0 : head.payload.revision + 1),

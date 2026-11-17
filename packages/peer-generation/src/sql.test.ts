@@ -27,7 +27,7 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
       schemaDigest: await peerDigest(schema) }, host)
     const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-      grants: [controlParticipantGrant(host.publicKey), ...[a, b].map(identity => ({ publicKey: identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: identity === a,
+      grants: [controlParticipantGrant(host.publicKey), ...[a, b].map(identity => ({ publicKey: identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: identity === a, publisher: false,
         dataRole: identity === a ? 'admin' as const : 'member' as const }))] }, host)
     const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
     await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
