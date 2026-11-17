@@ -123,6 +123,12 @@
       ],
       "@chronolog/transport-webrtc/resident": [
         "packages/transport-webrtc/src/resident.ts"
+      ],
+      "@chronolog/peer-generation": [
+        "packages/peer-generation/src/index.ts"
+      ],
+      "@chronolog/peer-generation/control": [
+        "packages/peer-generation/src/control.ts"
       ]
     }
   }

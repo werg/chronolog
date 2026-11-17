@@ -1,0 +1,125 @@
+import type { ChangeProgram } from '@chronolog/protocol'
+import type { ChronologMaterializationRuntime, MaterializedReadHandle, MaterializedTransactionOutcome } from '@chronolog/materializer'
+import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerIdentity, PeerStore, PrefixProof, Signed, SignedGeneration } from './control-types.js'
+import { PEER_GENERATION_PROFILE } from './control-types.js'
+export * from './control-types.js'
+
+export interface AttemptHeader {
+  readonly applicationId: string
+  readonly profile: typeof PEER_GENERATION_PROFILE
+  readonly generation: string
+  readonly controlRevision: number
+  readonly epoch: number
+  readonly author: string
+  readonly operationId: string
+  readonly definitionDigest: string
+  readonly command: string
+  readonly commandVersion: string
+  readonly basedOn: PeerRevision | null
+  readonly reapplyOf: string | null
+  readonly coreDigest: string
+}
+/** The signature authenticates the original encrypted body and all admission metadata. */
+export interface AttemptEnvelope {
+  readonly header: AttemptHeader
+  readonly nonce: string
+  readonly ciphertext: string
+}
+export interface SignedAttempt extends Signed<AttemptEnvelope> { readonly id: string }
+export interface OrderedCommand { readonly receipt: OrderReceipt; readonly attempt: SignedAttempt }
+export interface PeerRevision {
+  readonly applicationId: string
+  readonly historyId: string
+  readonly generation: string
+  readonly point: HistoryPoint
+  readonly controlRevision: number
+  readonly materializationRevision: string
+}
+export interface AppliedResult {
+  readonly status: 'applied'
+  readonly attemptId: string
+  readonly operationId: string
+  readonly author: string
+  readonly generation: string
+  readonly sequence: number
+  readonly outcome: 'accepted' | 'rejected'
+  readonly rejectionCode: string | null
+}
+export type OperationState =
+  | { readonly status: 'saved'; readonly attemptId: string; readonly operationId: string; readonly generation: string }
+  | AppliedResult
+  | { readonly status: 'abandoned' | 'needsReapply'; readonly attemptId: string; readonly operationId: string; readonly generation: string; readonly selectedGeneration: string; readonly previous: AppliedResult | null }
+
+export interface RecoveryNotice {
+  readonly previousGeneration: string
+  readonly generation: string
+  readonly adopted: HistoryPoint | null
+  readonly revision: PeerRevision
+  readonly abandoned: readonly OperationState[]
+  readonly unknownLoss: boolean
+}
+export interface RetainedCoverage {
+  readonly applicationId: string
+  readonly generation: string
+  readonly point: HistoryPoint
+  readonly peer: string
+  readonly storageId: string
+  readonly retainedAt: number
+}
+export type SignedRetainedCoverage = Signed<RetainedCoverage>
+
+export interface PeerReplicaOptions {
+  readonly authority: AuthorityBundle
+  readonly device: PeerIdentity
+  readonly store: PeerStore
+  readonly storageId: string
+  readonly materializer: ChronologMaterializationRuntime
+  readonly epochKeys: ReadonlyMap<number, Uint8Array>
+  readonly now?: () => number
+  readonly maxRecords?: number
+  readonly maxHistoryBytes?: number
+}
+export interface PrepareCommand {
+  readonly operationId: string
+  readonly program: ChangeProgram
+  readonly command?: string
+  readonly commandVersion?: string
+  readonly basedOn?: PeerRevision
+  readonly reapplyOf?: string
+  readonly authorTimestampMs?: bigint
+}
+export interface CapturedPeerView {
+  readonly revision: PeerRevision
+  readonly read: MaterializedReadHandle
+  readonly outcomes: readonly MaterializedTransactionOutcome[]
+  release(): void
+}
+
+/** All replication is peer-to-peer. Authority refresh is an explicit lifecycle action. */
+export interface PeerReplica {
+  readonly descriptor: ApplicationDescriptor
+  readonly device: PeerIdentity
+  readonly authority: AuthorityBundle
+  readonly generation: SignedGeneration
+  readonly revision: PeerRevision
+  readonly isCoordinator: boolean
+  prepare(input: PrepareCommand): Promise<SignedAttempt>
+  order(attempt: SignedAttempt): Promise<OrderedCommand>
+  ingest(commands: readonly OrderedCommand[]): Promise<void>
+  adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null>
+  synchronize(authority: AuthorityBundle, commands: readonly OrderedCommand[]): Promise<RecoveryNotice | null>
+  operation(operationId: string, author?: string): Promise<OperationState | null>
+  attempt(operationId: string, author?: string): Promise<SignedAttempt | null>
+  capture(): Promise<CapturedPeerView>
+  recoveryPoint(): Promise<PrefixProof>
+  prefixProof(point: HistoryPoint): Promise<PrefixProof>
+  exportCommands(options?: { readonly after?: HistoryPoint; readonly limit?: number }): Promise<readonly OrderedCommand[]>
+  pendingAttempts(): Promise<readonly SignedAttempt[]>
+  retainedCoverage(): Promise<SignedRetainedCoverage>
+  observeCoverage(coverage: SignedRetainedCoverage): Promise<void>
+  shared(point?: HistoryPoint): readonly SignedRetainedCoverage[]
+  subscribe(listener: () => void): () => void
+  onRecovery(listener: (notice: RecoveryNotice) => void): () => void
+  inspectRecovery(): readonly RecoveryNotice[]
+  close(): Promise<void>
+}

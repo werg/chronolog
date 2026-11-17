@@ -1,0 +1,117 @@
+# Peer generations: selected history with tolerant recovery
+
+Status: implementation and executable qualification. This is an authenticated
+history profile, `peer-generation-v1`, with the bounded `eligible-members-v1`
+authority policy. It is not a mode of chronological inclusion finality.
+
+## Decision
+
+One replaceable peer sequences ordinary application commands. Every peer verifies
+the author's original signed, encrypted attempt, the selected coordinator's order,
+and the execution manifest, then independently executes that order. Author time is
+provenance, not the order comparator. Local persistence precedes acknowledgment.
+No command requires a host request, second-copy acknowledgment or finality service.
+
+The host is a control participant. It retains the signed application descriptor,
+monotonic controls and generation selections and atomically chooses successors.
+It sees prefix proofs and delegated order headers at transitions, not application
+bodies or SQL. Existing generations continue while all host endpoints are blocked.
+If both host and coordinator are unavailable, attempts stay saved locally until a
+valid successor can be selected. No peer creates an authoritative generation alone.
+
+The default trusts the control service not to equivocate and the selected peer to
+sequence consistently. Peers detect conflicting signed orders and fence their
+session. This is not Byzantine consensus. Cached delegations have no heartbeat
+renewal requirement; an isolated old coordinator can temporarily produce a branch.
+
+## Four separate authority concerns
+
+| Concern | Contract |
+| --- | --- |
+| Authorship and authorization | The actual signing device and its reader/writer grant remain visible. SQL ownership and schema rights are separate. |
+| Sequencing | A signed generation delegates ordering to one eligible reader. It grants no author or SQL administrator impersonation rights. |
+| Recovery | The requester needs explicit recovery permission; the candidate separately needs coordinator eligibility. A stored replica or writer grant alone is insufficient. |
+| Retention and settlement | A durable retained-prefix acknowledgment reports a copy. It grants no authority and makes no global-finality promise. |
+
+The application descriptor pins the control key, policy, definition, execution
+manifest and schema authority. Account login and directory advertisements are
+routing/enrollment inputs, never generation or author authority. Applications can
+grant ordinary participants both recovery and coordinator eligibility explicitly;
+no creator or native process has an implicit permanent role.
+
+## Selection and ancestry
+
+A signed transition binds an exact transition identity, expected selected
+generation, requester, candidate, control revision, reason and complete adopted
+prefix. Compare-and-swap selects one successor. Exact retries recover the same
+selection even when subsequent generations exist. Reusing the identity for a
+different request fails.
+
+Each successor adopts a prefix of the *currently selected history*. A prefix in an
+inherited generation carries a chain of signed order headers connecting it to that
+generation's exclusion cutoff. If G2 adopts G1 through 80, G3 can never inherit
+G1's positions 81–100. A valid old signature does not erase this cutoff. All
+three consumers—native, browser, and hosted registry—use `PeerAuthority` for these
+checks. They cannot replace its decisions with application callbacks.
+
+Recovery preserves original bytes and operation identities in the adopted prefix.
+Available excluded history is quarantined. There is no automatic branch merge or
+automatic resubmission. Deliberate reapplication creates a newly signed attempt,
+linked to the old intent, under current controls and freshly selected domain guards.
+
+## Honest application results
+
+An operation can be saved, applied (accepted or rejected), shared, abandoned, or
+need reapplication. `applied` includes its generation and position. It remains
+stable while that history is selected; it is not irreversible across recovery.
+This profile has no `final()` operation and cannot supply a `FinalEventSource`.
+Wait cancellation does not cancel or reject the saved command. An exact retry
+retains the original bytes, identity, guards, and result.
+
+SQL, effective events, outcomes and view revisions switch together at recovery.
+A view from an excluded suffix produces an explicit reread/reset condition. An
+inherited view remains an ordering barrier; business assertions still determine
+whether an intervening edit invalidates a command.
+
+## Controls, keys and protected work
+
+Controls are a separate signed monotonic chain, activated with a generation.
+Revoking a reader requires a fresh encryption epoch and key commitment. Inherited
+commands use historical grants; successor commands use the successor revision.
+Timestamps cannot regain revoked permissions. Retained plaintext cannot be revoked.
+
+Ordinary lossy commands cannot change SQL ownership, permissions, schema or policy.
+These require protected administrative handling. A protected recovery floor cannot
+regress or disappear; a candidate missing its prefix is unavailable. Introducing a
+new floor binds it to the exact adopted base. Control-state loss never silently
+creates a replacement signing root or empty registry.
+
+Irreversible external actions are excluded from automatic applied-event dispatch.
+An explicitly selected stronger service must preserve the business preconditions,
+effect identity, provider idempotency and reconciliation boundary. Such a service
+does not gate ordinary collaboration. Existing stronger profiles remain distinct
+supported choices with their original guarantees.
+
+## Storage and qualification
+
+Retain complete replayable history initially. Peer recovery requires verified
+original bodies, contiguous order evidence, controls, keys and operation identity;
+metadata or a SQL cache alone is insufficient. A remote database image is never
+accepted merely because a peer signed it. Recovery replays retained evidence.
+
+Replication is prompt and asynchronous. Aim for a second independently stored
+complete prefix when another peer is available. Five minutes is the initial
+freshness qualification target under a declared two-peer workload, not a universal
+loss bound. Reports name the adopted point, known abandoned work and unknown loss.
+Do not convert last-seen directory timestamps into an invented loss estimate.
+
+Qualify signed/encrypted model traces, actual deterministic SQL/events replay,
+host-blocked commands, lost replies, crashes, incomplete tails, competing successors,
+three-generation exclusion, restrictive controls, reopened independent stores and
+packed external consumers. Loopback tests do not establish Internet connectivity,
+provider savings, deployment authentication, browser suspension behavior or a
+production operating envelope. Those require separately recorded deployment runs.
+
+There is no migration or backward-compatibility layer in this prerelease change.
+History profiles are authenticated and immutable; old histories are never silently
+reinterpreted as peer-generation histories.
