@@ -141,6 +141,12 @@ Approving a release and executing its JavaScript are separate decisions. An
 application-data recovery must not silently downgrade its code or restore a
 revoked publisher.
 
+Release content also needs its own visibility and key scope. The current
+attachment API authorizes application readers; granting a publishing host that
+right merely to serve page assets would also grant access to application
+content. Public releases or a separate release collective can reuse the content
+machinery while keeping private application epoch keys out of the host.
+
 The current descriptor pins the application definition and execution profile.
 Changing either requires an explicit supported history/version boundary; a page
 cannot reinterpret retained commands with arbitrary new code. The initial
