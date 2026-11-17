@@ -1,52 +1,51 @@
 import { createRecordLogClient, decodeRecord, recordGenesisRoot, type RecordLogClient } from '@tendriller/core/records'
 import {
   createPrefixAuthority, decodeOrderingEvidence, encodeOrderingEvidence,
-  type CoordinatedHistoryConfiguration, type OrderedRecordEntry, type OrderedRecordHead, type PrefixCertificate,
+  type OrderedRecordEntry, type OrderedRecordHead, type PrefixCertificate,
 } from '@chronolog/node-core/history'
-import { createFinalityClosureRecord, evaluateFinalitySnapshot, extendFinalityControlCommitment, type SignedInclusionSnapshot } from '@chronolog/node-core/finality'
+import { createFinalityClosureRecord, evaluateFinalitySnapshot, extendFinalityControlCommitment, resolveFinalityClockPolicy, type SignedInclusionSnapshot } from '@chronolog/node-core/finality'
+import { verifyEnrollmentDescriptor, type EnrollmentDescriptor } from '@chronolog/node-core/browser'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
 
-export interface AuthorityRequest {
+export interface FinalityRequest {
   readonly url: string
   readonly method: string
   readonly body: unknown
   readonly headers: { forEach(callback: (value: string, key: string) => void): void }
 }
 
-export interface AuthorityResponse {
+export interface FinalityResponse {
   readonly status: number
   arrayBuffer(): Promise<ArrayBuffer>
 }
 
-export interface AuthorityHttp<HostRequest extends AuthorityRequest, HostResponse extends AuthorityResponse> {
+export interface FinalityHttp<HostRequest extends FinalityRequest, HostResponse extends FinalityResponse> {
   request(url: string, init: { readonly method: 'GET'; readonly headers: Record<string, string> }): HostRequest
   response(body: string | ArrayBuffer, init: { readonly status?: number; readonly headers?: Record<string, string> }): HostResponse
 }
 
-export interface EngineHandler<Env, Context, HostRequest extends AuthorityRequest = Request, HostResponse extends AuthorityResponse = Response> {
+export interface EngineHandler<Env, Context, HostRequest extends FinalityRequest = Request, HostResponse extends FinalityResponse = Response> {
   fetch(request: HostRequest, env: Env, context: Context): HostResponse | Promise<HostResponse>
 }
 
-export interface TendrillerAuthorityOptions<Env, Context, HostRequest extends AuthorityRequest = Request, HostResponse extends AuthorityResponse = Response> {
-  readonly configuration: CoordinatedHistoryConfiguration
+export interface TendrillerFinalityOptions<Env, Context, HostRequest extends FinalityRequest = Request, HostResponse extends FinalityResponse = Response> {
+  /** Authenticated history, signer, execution profile and clock policy. */
+  readonly descriptor: EnrollmentDescriptor
   /** Stable deployment key; never generated per request or stored in Tendriller core. */
   readonly identity: Ed25519KeyPair
   readonly records: RecordLogClient
   readonly now?: () => number
-  readonly cutoffLagMs?: number
-  /** Must equal signed genesis maxFutureSkewMs + cutoffLagMs; defaults to 31,000. */
-  readonly futureAdmissionWindowMs?: number
   /** The host's Web API constructors keep Worker and DOM declarations distinct. */
-  readonly http: AuthorityHttp<HostRequest, HostResponse>
+  readonly http: FinalityHttp<HostRequest, HostResponse>
   readonly path?: string
   /** Reuse the deployment's owner/agent authentication. Omitted authorization denies all. */
   readonly authorize?: (request: HostRequest, env: Env, context: Context) => boolean | Promise<boolean>
 }
 
 /** Reuse the public record route's existing owner/agent authorization in-process. */
-export function authorizeThroughRecordLog<Env, Context, HostRequest extends AuthorityRequest, HostResponse extends AuthorityResponse>(
+export function authorizeThroughRecordLog<Env, Context, HostRequest extends FinalityRequest, HostResponse extends FinalityResponse>(
   engine: EngineHandler<Env, Context, HostRequest, HostResponse>,
-  options: { readonly base: string; readonly historyId: string; readonly http: AuthorityHttp<HostRequest, HostResponse> },
+  options: { readonly base: string; readonly historyId: string; readonly http: FinalityHttp<HostRequest, HostResponse> },
 ): (request: HostRequest, env: Env, context: Context) => Promise<boolean> {
   return async (request, env, context) => {
     const headers: Record<string, string> = {}
@@ -70,20 +69,24 @@ export function authorizeThroughRecordLog<Env, Context, HostRequest extends Auth
 }
 
 /** Compose around the public engine; ordinary requests and scheduled work stay with it. */
-export function withTendrillerAuthority<Env, Context, HostRequest extends AuthorityRequest, HostResponse extends AuthorityResponse,
+export async function withTendrillerFinality<Env, Context, HostRequest extends FinalityRequest, HostResponse extends FinalityResponse,
   Handler extends EngineHandler<Env, Context, HostRequest, HostResponse>>(
   engine: Handler,
-  options: TendrillerAuthorityOptions<Env, Context, HostRequest, HostResponse>,
-): Handler {
+  options: TendrillerFinalityOptions<Env, Context, HostRequest, HostResponse>,
+): Promise<Handler> {
+  options = { ...options, descriptor: structuredClone(options.descriptor),
+    identity: { ...options.identity, publicKeyBytes: new Uint8Array(options.identity.publicKeyBytes) } }
+  await verifyEnrollmentDescriptor(options.descriptor)
+  const configuration = options.descriptor.history
+  if (configuration.kind !== 'coordinated' || (configuration.providerId ?? 'signed-inclusion-v2') !== 'signed-inclusion-v2') {
+    throw new Error('FINALITY_SERVICE_PROVIDER_MISMATCH')
+  }
   const path = options.path ?? '/_chronolog/certificate'
   if (!path.startsWith('/') || path.includes('?') || path.includes('#')) throw new Error('AUTHORITY_PATH_INVALID')
-  const configuration = structuredClone(options.configuration)
   const identity = { ...options.identity, publicKeyBytes: new Uint8Array(options.identity.publicKeyBytes) }
   const historyId = configuration.historyId
-  const now = options.now ?? Date.now, cutoffLagMs = options.cutoffLagMs ?? 1_000
-  const futureAdmissionWindowMs = options.futureAdmissionWindowMs ?? 31_000
-  if (!Number.isSafeInteger(cutoffLagMs) || cutoffLagMs < 0 ||
-      !Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0) throw new Error('AUTHORITY_CLOCK_CONFIGURATION_INVALID')
+  const now = options.now ?? Date.now
+  const { cutoffLagMs, futureAdmissionWindowMs } = resolveFinalityClockPolicy(options.descriptor.genesis.manifest.clockPolicy)
   let committedHead: OrderedRecordHead | null = null
   let cachedSnapshot: SignedInclusionSnapshot | null = null
   const authority = createPrefixAuthority({
@@ -97,6 +100,10 @@ export function withTendrillerAuthority<Env, Context, HostRequest extends Author
   const certify = (): Promise<PrefixCertificate> => {
     const operation = pending.then(async () => {
       for (let attempt = 0; attempt < 64; attempt += 1) {
+        // Close time observed before asynchronous head/proof reads. A slow
+        // verification must not spend another proposal's admission window.
+        const observed = Math.trunc(now())
+        if (!Number.isSafeInteger(observed) || observed < 0) throw new Error('AUTHORITY_CLOCK_INVALID')
         const head = structuredClone((await options.records.info({ historyId })).head)
         let snapshot = cachedSnapshot
         if (snapshot === null || snapshot.includedThrough !== head.position || snapshot.checkpointId !== head.root) {
@@ -116,8 +123,6 @@ export function withTendrillerAuthority<Env, Context, HostRequest extends Author
           snapshot = await evaluateFinalitySnapshot(configuration, entries)
           cachedSnapshot = snapshot
         }
-        const observed = Math.trunc(now())
-        if (!Number.isSafeInteger(observed) || observed < 0) throw new Error('AUTHORITY_CLOCK_INVALID')
         const cutoff = BigInt(observed) - BigInt(cutoffLagMs)
         const uncovered = snapshot.records.some((record) => record.closureBoundary === null)
         let coveredDemand = -1n
@@ -129,7 +134,8 @@ export function withTendrillerAuthority<Env, Context, HostRequest extends Author
         const requestedCutoff = uncovered || cutoff < coveredDemand ? cutoff : coveredDemand
         const closedThroughMs = requestedCutoff > snapshot.closedThroughMs ? requestedCutoff : snapshot.closedThroughMs
         if (closedThroughMs >= 0n && (closedThroughMs > snapshot.closedThroughMs || uncovered)) {
-          const marker = await createFinalityClosureRecord({ configuration, identity, includedHead: head, closedThroughMs, control: await extendFinalityControlCommitment(snapshot, closedThroughMs) })
+          const marker = await createFinalityClosureRecord({ configuration, identity, includedHead: head, closedThroughMs,
+            control: await extendFinalityControlCommitment(snapshot, closedThroughMs) })
           try {
             // The generic conditional append prevents a concurrent submission
             // from separating this signed closure from its exact predecessor.

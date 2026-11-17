@@ -13,7 +13,7 @@ import { parseArgs } from 'node:util'
 
 import type { AgentApplicationContext } from '@chronolog/agent-service'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
-import { isCapabilityActive } from '@chronolog/capabilities'
+import { createCapabilitySignals, isCapabilityActive } from '@chronolog/capabilities'
 import { loadOrCreateEnrollmentIdentity, MemoryOperationStore } from '@chronolog/node-core'
 import { bytesToBase64Url, bytesToHex, equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
@@ -68,6 +68,7 @@ let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
 let local: PortableFeedTransport | undefined
 let rtc: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
 let session: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined
+let signals: ReturnType<typeof createCapabilitySignals> | undefined
 let task: ResidentTask | undefined, running: Promise<void> | undefined, detach: (() => void) | undefined
 const lifetime = new AbortController(), errors: string[] = []
 try {
@@ -81,6 +82,8 @@ try {
     signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey) })
   native = await createNativeBrowserFixture({ directory: join(directory, 'native'), topics: ['chat'], browsers: [{
     identity: bytesToBase64Url(identity.signing.publicKeyBytes), readerKey: bytesToBase64Url(identity.reader.publicKeyBytes), transportAuthor: local.identity }] })
+  signals = createCapabilitySignals({ groupId: native.node.groupId, identity: identity.signing,
+    current: () => native!.governed.activeSnapshot })
   const token = crypto.randomUUID(), nativeOptions = { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }
   let authorizations = 0
   const options = { context: native.agent.context, endpoint, listen: { host: '127.0.0.1', port }, tls: { key, cert },
@@ -125,12 +128,15 @@ try {
   rtc = await openWebRtcConnection({ role: 'offerer', signaling, configuration: { iceServers: [] },
     createPeerConnection: configuration => createNativePeerConnection(configuration, nativeOptions) })
   session = await openAuthenticatedPeerLink({ connection: rtc, local: local.asLink(), groupId: snapshot.groupId, identity: identity.signing, grantId: grant.id,
+    receiveSignal: async frame => { await signals!.receive(frame) },
     authorizePeer: ({ authorId, grantId }) => {
       const current = native!.governed.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
       return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
         equalBytes(capability.grant.signingPublicKey, authorId) && equalBytes(authorId, native!.identity.signing.publicKeyBytes)
     } })
-  detach = local.connect(session.link)
+  const detachFeed = local.connect(session.link), detachSignals = signals.attach(frame => session!.sendSignal(frame))
+  detach = () => { detachSignals(); detachFeed() }
+  void session.completion.finally(detach).catch(() => undefined)
   await waitFor(async () => task!.stats?.active === 1)
   assert.equal(signaling.stats.closed, true); assert.equal(signaling.stats.requests, 1)
   passed('a cold native client completes one direct HTTPS offer and authenticates through the actual resident context')
@@ -149,6 +155,20 @@ try {
   native.assertHealthy()
   passed('the authenticated RTC channel retains original native signed records without more HTTPS introduction work')
 
+  const nativeMessages = native.client.signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(10_000) })[Symbol.asyncIterator]()
+  const clientMessages = signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(10_000) })[Symbol.asyncIterator]()
+  const nativeMessage = nativeMessages.next(), clientMessage = clientMessages.next()
+  try {
+    const sentByClient = await signals.send('typing', { typing: true, from: 'rtc-client' })
+    assert.deepEqual((await nativeMessage).value, sentByClient)
+    const sentByNative = await native.client.signals.send('typing', { typing: false, from: 'native-client' })
+    assert.deepEqual((await clientMessage).value, sentByNative)
+    assert.deepEqual((await native.transport.history()).map(record => record.id), nativeRecords.map(record => record.id))
+    assert.deepEqual((await local.history()).map(record => record.id), localRecords.map(record => record.id))
+    assert.deepEqual(task.stats, before)
+  } finally { await nativeMessages.return?.(); await clientMessages.return?.() }
+  passed('public signal channels and native RPC exchange authenticated live values over real RTC without records or more HTTPS introduction requests')
+
   report.metrics = { signaling: signaling.stats, beforeApplication: before, afterApplication: task.stats,
     logicalPeerFrames: rtc.stats, records: nativeRecords.length, recordIds: nativeRecords.map(record => record.id).sort(), originalOutcome: outcome,
     certificateSha256: hash(cert), byteBoundary: 'Logical peer frame payload bytes exclude RTC headers, credits and IP/UDP/DTLS/SCTP overhead.',
@@ -157,6 +177,8 @@ try {
   lifetime.abort()
   await bounded(running, 5_000)
   await bounded(session.completion.catch(() => undefined), 5_000)
+  await assert.rejects(native.client.signals.send('typing', { typing: false }), /SIGNAL_DISCONNECTED/u)
+  await assert.rejects(signals.send('typing', { typing: false }), /SIGNAL_DISCONNECTED/u)
   assert.equal(task.stats?.closed, true); assert.equal(task.stats?.active, 0); assert.equal(task.stats?.pending, 0)
   assert.equal(getEventListeners(lifetime.signal, 'abort').length, 0)
   await assert.rejects(fetch(endpoint))
@@ -182,6 +204,7 @@ try {
 } catch (error) { report.error = error instanceof Error ? error.stack ?? error.message : String(error); throw error }
 finally {
   lifetime.abort(); detach?.()
+  signals?.close()
   await Promise.allSettled([running, session?.close(), rtc?.close()])
   await local?.close(); await native?.close()
   await writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')

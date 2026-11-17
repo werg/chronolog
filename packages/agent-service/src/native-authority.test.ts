@@ -3,14 +3,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence,
+import { signGenesis, type ClockPolicy } from '@chronolog/capabilities'
+import { CoordinatedHistoryPolicy, MemoryOperationStore, createLedgerRecord, decodeLedgerRecord, decodeOrderingEvidence, membershipDescriptor,
   encodeOrderingEvidence, evaluateFinalitySnapshot, verifyPrefixCertificate } from '@chronolog/node-core'
-import type { CoordinatedHistoryConfiguration, DurableOperationStore } from '@chronolog/node-core'
-import { encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, utf8 } from '@chronolog/protocol'
+import type { DurableOperationStore } from '@chronolog/node-core'
+import { encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { NativeAuthority } from './authority.js'
+import { NativeFinalityService } from './finality-service.js'
 import { NativeAgentStore } from './native-store.js'
 
 const envelope = (text: string) => encodeEnvelope({ groupRoute: new Uint8Array(32).fill(1),
@@ -19,28 +20,37 @@ const envelope = (text: string) => encodeEnvelope({ groupRoute: new Uint8Array(3
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-async function credentials() {
-  const identity = await generateEd25519KeyPair()
-  const configuration: CoordinatedHistoryConfiguration = {
-    kind: 'coordinated', historyId: 'h_0123456789abcdef0123456789abcdef', authorityPublicKey: identity.publicKeyBytes,
-    groupId: new Uint8Array(32).fill(1), genesisDigest: new Uint8Array(32).fill(2), executionManifestDigest: new Uint8Array(32).fill(3),
-  }
-  return { configuration, identity }
+async function credentials(options: { readonly clockPolicy?: ClockPolicy; readonly identity?: Ed25519KeyPair;
+  readonly executionManifestDigest?: Uint8Array } = {}) {
+  const identity = options.identity ?? await generateEd25519KeyPair()
+  const groupId = new Uint8Array(32).fill(1), schemaId = options.executionManifestDigest ?? new Uint8Array(32).fill(3)
+  const genesis = await signGenesis({ groupId, schemaId, rootAdminPublicKey: identity.publicKeyBytes,
+    schemaAdminPublicKey: identity.publicKeyBytes, capabilityLogFeed: utf8(feedIdFromPublicKey(identity.publicKeyBytes)),
+    historyPolicy: { kind: 'coordinated', historyId: 'h_0123456789abcdef0123456789abcdef',
+      authorityPublicKey: identity.publicKeyBytes, executionManifestDigest: schemaId },
+    initialCapabilities: [], validationPolicies: [{ version: 1n, minimumValidators: 1n }],
+    clockPolicy: options.clockPolicy ?? { cutoffLagMs: 0n, maxFutureSkewMs: 31_000n, heartbeatIntervalMs: 1_000n },
+    resourcePolicy: { maxCandidateBytes: 1_000_000n, maxProgramNodes: 1_000n, maxPreconditions: 100n, maxMutations: 100n },
+    encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM', createdAtMs: 1n,
+  }, identity.privateKey)
+  const descriptor = await membershipDescriptor(genesis, groupId)
+  if (descriptor.history.kind !== 'coordinated') throw new Error('SIGNED_INCLUSION_REQUIRED')
+  return { descriptor, configuration: descriptor.history, identity }
 }
 
-async function fixture() {
-  const { configuration, identity } = await credentials()
+async function fixture(clockPolicy?: ClockPolicy) {
+  const credentialsValue = await credentials(clockPolicy === undefined ? {} : { clockPolicy })
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-agent-authority-'))
   cleanup.push(() => rm(directory, { recursive: true, force: true }))
   const path = join(directory, 'agent.sqlite')
   const store = new NativeAgentStore(path)
   cleanup.push(() => store.close())
   const clock = { now: 1_000 }
-  return { configuration, identity, store, path, clock, now: () => clock.now, cutoffLagMs: 0 }
+  return { ...credentialsValue, store, path, clock, now: () => clock.now }
 }
 
 async function metadataFixture() {
-  const { configuration, identity } = await credentials()
+  const { descriptor, configuration, identity } = await credentials()
   const values = new Map<string, Uint8Array>()
   const store: DurableOperationStore = {
     get: async (key) => values.get(key)?.slice() ?? null,
@@ -48,14 +58,38 @@ async function metadataFixture() {
   }
   const prefix = `agent/authority/${configuration.historyId}/`
   const clock = { now: 1_000 }
-  return { configuration, identity, store, values, logKey: `record-log/${configuration.historyId}`,
+  return { descriptor, configuration, identity, store, values, logKey: `record-log/${configuration.historyId}`,
     configurationKey: `${prefix}configuration`, certificateKey: `${prefix}certificate`,
-    clock, now: () => clock.now, cutoffLagMs: 0 }
+    payloadIndexKey: `${prefix}payload-reservations`,
+    clock, now: () => clock.now }
 }
 
-describe('native fixed authority', () => {
+describe('native signed-inclusion finality service', () => {
+  it('authenticates timing and history before touching storage', async () => {
+    const f = await metadataFixture()
+    const tampered = structuredClone(f.descriptor)
+    const changed = { ...tampered, genesis: { ...tampered.genesis,
+      manifest: { ...tampered.genesis.manifest, clockPolicy: { ...tampered.genesis.manifest.clockPolicy, cutoffLagMs: 500n } } } }
+    await expect(NativeFinalityService.open({ ...f, descriptor: changed })).rejects.toThrow('ENROLLMENT_DESCRIPTOR_INVALID')
+    expect(f.values.size).toBe(0)
+    const invalid = await credentials({ identity: f.identity,
+      clockPolicy: { cutoffLagMs: 0n, maxFutureSkewMs: 10n, heartbeatIntervalMs: 0n } })
+    await expect(NativeFinalityService.open({ ...f, descriptor: invalid.descriptor })).rejects.toThrow('FINALITY_CLOCK_POLICY_INVALID')
+    expect(f.values.size).toBe(0)
+  })
+
+  it('does not sign for a different provider selected by genesis', async () => {
+    const f = await metadataFixture()
+    const genesis = await signGenesis({ ...f.descriptor.genesis.manifest,
+      historyPolicy: { ...f.descriptor.genesis.manifest.historyPolicy!, providerId: 'different-provider-v1' },
+    }, f.identity.privateKey)
+    const descriptor = await membershipDescriptor(genesis, f.descriptor.groupRoute)
+    await expect(NativeFinalityService.open({ ...f, descriptor })).rejects.toThrow('FINALITY_SERVICE_PROVIDER_MISMATCH')
+    expect(f.values.size).toBe(0)
+  })
+
   it('certifies only small descriptors while retaining exact detached payloads before commitment', async () => {
-    const f = await fixture(), authority = await NativeAuthority.open(f)
+    const f = await fixture(), authority = await NativeFinalityService.open(f)
     const payload = envelope('large-content'.repeat(40_000)), entry = await authority.append(payload)
     const descriptor = decodeLedgerRecord(entry.bytes)
     expect(entry.bytes.length).toBeLessThan(256)
@@ -66,13 +100,13 @@ describe('native fixed authority', () => {
     const missing = await createLedgerRecord(envelope('unavailable'))
     await expect(authority.appendLedgerRecord(missing.recordBytes)).rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
     expect((await authority.head()).position).toBe(1)
-    const reopened = await NativeAuthority.open(f)
+    const reopened = await NativeFinalityService.open(f)
     expect(await reopened.getPayload(descriptor.payloadHash)).toEqual(payload)
   })
 
   it('fences another process and durably reopens exact retry identities, closures and receipt head', async () => {
     const f = await fixture()
-    const authority = await NativeAuthority.open(f)
+    const authority = await NativeFinalityService.open(f)
     const entry = await authority.append(envelope('one'))
     const certificate = await authority.certify()
     expect(() => new NativeAgentStore(f.path)).toThrow('AGENT_STORE_IN_USE')
@@ -87,7 +121,7 @@ describe('native fixed authority', () => {
     f.store.close()
     const reopenedStore = new NativeAgentStore(f.path)
     cleanup.push(() => reopenedStore.close())
-    const reopened = await NativeAuthority.open({ ...f, store: reopenedStore, continuity: certificate })
+    const reopened = await NativeFinalityService.open({ ...f, store: reopenedStore, continuity: certificate })
     expect(await reopened.append(envelope('one'))).toEqual(entry)
     expect(await reopened.head()).toEqual({ historyId: certificate.historyId, position: 2, root: certificate.root })
     await verifyPrefixCertificate(await reopened.certify(), f.configuration)
@@ -97,7 +131,7 @@ describe('native fixed authority', () => {
   it('atomically refuses exhausted quotas without consuming a position', async () => {
     const f = await fixture()
     const quotaBytes = (await createLedgerRecord(envelope('one'))).recordBytes.length
-    const authority = await NativeAuthority.open({ ...f, quotaBytes })
+    const authority = await NativeFinalityService.open({ ...f, recordQuotaBytes: quotaBytes })
     const original = await authority.append(envelope('one'))
     await expect(authority.append(envelope('two'))).rejects.toThrow('RECORD_LOG_QUOTA_EXCEEDED')
     expect((await authority.head()).position).toBe(1)
@@ -111,6 +145,56 @@ describe('native fixed authority', () => {
     expect(isolated.usageBytes()).toBe(2)
   })
 
+  it('bounds detached bodies separately, including across exact retries and reopen', async () => {
+    const f = await metadataFixture(), body = envelope('one')
+    const authority = await NativeFinalityService.open({ ...f, payloadQuotaBytes: body.length })
+    const entry = await authority.append(body)
+    await expect(authority.append(envelope('two'))).rejects.toThrow('FINALITY_PAYLOAD_QUOTA_EXCEEDED')
+    expect((await authority.head()).position).toBe(1)
+    expect(await authority.storageUsage()).toMatchObject({ reservedPayloadBytes: body.length, payloadQuotaBytes: body.length })
+    const reopened = await NativeFinalityService.open({ ...f, payloadQuotaBytes: body.length })
+    expect(await reopened.append(body)).toEqual(entry)
+    expect(await reopened.storageUsage()).toEqual(await authority.storageUsage())
+    const before = structuredClone(f.values)
+    await expect(NativeFinalityService.open({ ...f, payloadQuotaBytes: body.length - 1 })).rejects.toThrow('FINALITY_PAYLOAD_QUOTA_EXCEEDED')
+    expect(f.values).toEqual(before)
+  })
+
+  it('retains a bounded reservation after a lost body reply and reuses it on retry', async () => {
+    const f = await metadataFixture(), body = envelope('reserved')
+    let fail = true
+    const store: DurableOperationStore = { get: key => f.store.get(key), async put(key, bytes) {
+      await f.store.put(key, bytes)
+      if (key.includes('/payload/') && fail) { fail = false; throw new Error('lost body acknowledgment') }
+    } }
+    const authority = await NativeFinalityService.open({ ...f, store, payloadQuotaBytes: body.length })
+    await expect(authority.append(body)).rejects.toThrow('lost body acknowledgment')
+    expect((await authority.head()).position).toBe(0)
+    const reopened = await NativeFinalityService.open({ ...f, payloadQuotaBytes: body.length })
+    await expect(reopened.append(envelope('another-body'))).rejects.toThrow('FINALITY_PAYLOAD_QUOTA_EXCEEDED')
+    expect((await reopened.append(body)).position).toBe(1)
+    expect((await reopened.storageUsage()).reservedPayloadBytes).toBe(body.length)
+  })
+
+  it('does not store a new body when the retained record quota is already full', async () => {
+    const f = await metadataFixture(), one = envelope('one'), two = envelope('two')
+    const descriptor = await createLedgerRecord(one)
+    const authority = await NativeFinalityService.open({ ...f, recordQuotaBytes: descriptor.recordBytes.length })
+    await authority.append(one)
+    const before = structuredClone(f.values)
+    await expect(authority.append(two)).rejects.toThrow('RECORD_LOG_QUOTA_EXCEEDED')
+    expect(f.values).toEqual(before)
+  })
+
+  it('refuses missing body accounting instead of silently resetting its budget', async () => {
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
+    await authority.append(envelope('one'))
+    f.values.delete(f.payloadIndexKey)
+    const before = structuredClone(f.values)
+    await expect(NativeFinalityService.open(f)).rejects.toThrow('FINALITY_PAYLOAD_STATE_MISSING')
+    expect(f.values).toEqual(before)
+  })
+
   it('recovers a commit whose acknowledgment was lost and leaves failed writes unapplied', async () => {
     const f = await fixture()
     let loseResponse = false, failBeforeWrite = false
@@ -122,10 +206,10 @@ describe('native fixed authority', () => {
         if (key.startsWith('record-log/') && loseResponse) { loseResponse = false; throw new Error('lost acknowledgment') }
       },
     }
-    const authority = await NativeAuthority.open({ ...f, store })
+    const authority = await NativeFinalityService.open({ ...f, store })
     loseResponse = true
     await expect(authority.append(envelope('one'))).rejects.toThrow('lost acknowledgment')
-    const reopened = await NativeAuthority.open({ ...f, store })
+    const reopened = await NativeFinalityService.open({ ...f, store })
     const recovered = await reopened.append(envelope('one'))
     expect(recovered.position).toBe(1)
     failBeforeWrite = true
@@ -137,14 +221,15 @@ describe('native fixed authority', () => {
 
   it('pins configuration and refuses a recovery checkpoint newer than the retained volume', async () => {
     const f = await fixture()
-    const authority = await NativeAuthority.open(f)
+    const authority = await NativeFinalityService.open(f)
     await authority.append(envelope('one'))
     const checkpoint = await authority.certify()
-    await expect(NativeAuthority.open({ ...f, configuration: { ...f.configuration, executionManifestDigest: new Uint8Array(32).fill(9) } }))
+    const different = await credentials({ identity: f.identity, executionManifestDigest: new Uint8Array(32).fill(9) })
+    await expect(NativeFinalityService.open({ ...f, descriptor: different.descriptor }))
       .rejects.toThrow('AUTHORITY_CONFIGURATION_MISMATCH')
-    await expect(NativeAuthority.open({ ...f, store: new MemoryOperationStore(), continuity: checkpoint }))
+    await expect(NativeFinalityService.open({ ...f, store: new MemoryOperationStore(), continuity: checkpoint }))
       .rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
-    await expect(NativeAuthority.open({ ...f, continuity: { ...checkpoint, root: '0'.repeat(64) } }))
+    await expect(NativeFinalityService.open({ ...f, continuity: { ...checkpoint, root: '0'.repeat(64) } }))
       .rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
   })
 
@@ -161,22 +246,22 @@ describe('native fixed authority', () => {
           if (key === target && boundary.startsWith('after-')) throw new Error('setup interrupted')
         },
       }
-      await expect(NativeAuthority.open({ ...f, store })).rejects.toThrow('setup interrupted')
-      expect(writes).toEqual(boundary.endsWith('log') ? [f.logKey] : [f.logKey, f.configurationKey])
+      await expect(NativeFinalityService.open({ ...f, store })).rejects.toThrow('setup interrupted')
+      expect(writes).toEqual(boundary.endsWith('log') ? [f.logKey] : [f.logKey, f.payloadIndexKey, f.configurationKey])
       expect(f.values.has(f.configurationKey)).toBe(boundary === 'after-configuration')
       expect(f.values.has(f.logKey)).toBe(boundary !== 'before-log')
-      const recovered = await NativeAuthority.open(f)
+      const recovered = await NativeFinalityService.open(f)
       expect((await recovered.head()).position).toBe(0)
       expect((await recovered.append(envelope('one'))).position).toBe(1)
     },
   )
 
   it.each([false, true])('refuses a missing established log without modifying surviving metadata (certified: %s)', async (certified) => {
-    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
     if (certified) { await authority.append(envelope('one')); await authority.certify() }
     f.values.delete(f.logKey)
     const before = structuredClone(f.values)
-    await expect(NativeAuthority.open(f)).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+    await expect(NativeFinalityService.open(f)).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
     expect(f.values).toEqual(before)
     // A still-live owner cannot recreate the missing prefix either.
     await expect(authority.certify()).rejects.toThrow('RECORD_LOG_MISSING')
@@ -184,11 +269,11 @@ describe('native fixed authority', () => {
   })
 
   it.each(['empty', 'conflicting'] as const)('enforces a surviving certificate against a %s replacement log', async (damage) => {
-    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
     await authority.append(envelope('one'))
     await authority.certify()
     const replacement = new MemoryOperationStore()
-    const other = await NativeAuthority.open({ ...f, store: replacement })
+    const other = await NativeFinalityService.open({ ...f, store: replacement })
     if (damage === 'conflicting') {
       await other.append(envelope('replacement'))
       await other.certify()
@@ -196,12 +281,12 @@ describe('native fixed authority', () => {
     }
     f.values.set(f.logKey, (await replacement.get(f.logKey))!)
     const before = structuredClone(f.values)
-    await expect(NativeAuthority.open(f)).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+    await expect(NativeFinalityService.open(f)).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
     expect(f.values).toEqual(before)
   })
 
   it.each(['encoding', 'kind', 'signature', 'configuration'] as const)('refuses a retained certificate with invalid %s before changing storage', async (damage) => {
-    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
     const entry = await authority.append(envelope('one'))
     const certificate = await authority.certify()
     let bytes: Uint8Array
@@ -211,8 +296,8 @@ describe('native fixed authority', () => {
       certificate.signature[0]! ^= 1
       bytes = encodeOrderingEvidence({ kind: 'prefix-certificate', certificate })
     } else {
-      const other = await NativeAuthority.open({ ...f, store: new MemoryOperationStore(),
-        configuration: { ...f.configuration, executionManifestDigest: new Uint8Array(32).fill(9) } })
+      const different = await credentials({ identity: f.identity, executionManifestDigest: new Uint8Array(32).fill(9) })
+      const other = await NativeFinalityService.open({ ...f, store: new MemoryOperationStore(), descriptor: different.descriptor })
       await other.append(envelope('one'))
       bytes = encodeOrderingEvidence({ kind: 'prefix-certificate', certificate: await other.certify() })
     }
@@ -222,16 +307,16 @@ describe('native fixed authority', () => {
     f.values.delete(f.configurationKey)
     f.values.delete(f.logKey)
     const before = structuredClone(f.values)
-    await expect(NativeAuthority.open(f)).rejects.toThrow('AUTHORITY_RETAINED_CERTIFICATE_INVALID')
+    await expect(NativeFinalityService.open(f)).rejects.toThrow('AUTHORITY_RETAINED_CERTIFICATE_INVALID')
     expect(f.values).toEqual(before)
   })
 
   it('reopens committed appends ahead of the retained certificate and preserves their retry positions', async () => {
-    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
     const first = await authority.append(envelope('one'))
     await authority.certify()
     const second = await authority.append(envelope('two'))
-    const reopened = await NativeAuthority.open(f)
+    const reopened = await NativeFinalityService.open(f)
     expect(await reopened.append(envelope('one'))).toEqual(first)
     expect(await reopened.append(envelope('two'))).toEqual(second)
     const certificate = await reopened.certify()
@@ -242,7 +327,7 @@ describe('native fixed authority', () => {
   })
 
   it('requires an independent continuity floor to detect a self-consistent whole-volume rollback', async () => {
-    const f = await metadataFixture(), authority = await NativeAuthority.open(f)
+    const f = await metadataFixture(), authority = await NativeFinalityService.open(f)
     await authority.append(envelope('one'))
     await authority.certify()
     const backup = structuredClone(f.values)
@@ -250,13 +335,13 @@ describe('native fixed authority', () => {
     const latest = await authority.certify()
     f.values.clear()
     for (const [key, bytes] of backup) f.values.set(key, bytes)
-    await expect(NativeAuthority.open({ ...f, continuity: latest })).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
+    await expect(NativeFinalityService.open({ ...f, continuity: latest })).rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
     expect(f.values).toEqual(backup)
   })
 
   it('supplies portable range evidence that peers can relay without the authority', async () => {
     const f = await fixture()
-    const authority = await NativeAuthority.open(f)
+    const authority = await NativeFinalityService.open(f)
     await Promise.all(['one', 'two', 'three'].map((text) => authority.append(envelope(text))))
     const captured: Uint8Array[] = []
     const sink = { putEvidence: async (bytes: Uint8Array) => { captured.push(bytes) } }
@@ -283,13 +368,13 @@ describe('native fixed authority', () => {
         await f.store.put(key, bytes)
       },
     }
-    const authority = await NativeAuthority.open({ ...f, store })
+    const authority = await NativeFinalityService.open({ ...f, store })
     const original = await authority.append(envelope('one'))
     await expect(authority.certify()).rejects.toThrow('certificate response lost')
     expect((await authority.head()).position).toBe(2)
     failCertificate = false
     f.clock.now = 500
-    const reopened = await NativeAuthority.open({ ...f, store })
+    const reopened = await NativeFinalityService.open({ ...f, store })
     expect(await reopened.append(envelope('one'))).toEqual(original)
     const proof = await reopened.certifiedRead()
     expect(proof.certificate.position).toBe(2)
@@ -298,8 +383,8 @@ describe('native fixed authority', () => {
   })
 
   it('publishes complete closure evidence while the application receipt head is idle', async () => {
-    const f = await fixture(), authority = await NativeAuthority.open({ ...f, cutoffLagMs: 100,
-      futureAdmissionWindowMs: 200, closureIntervalMs: 5 })
+    const f = await fixture({ cutoffLagMs: 100n, maxFutureSkewMs: 100n, heartbeatIntervalMs: 5n })
+    const authority = await NativeFinalityService.open(f)
     await authority.certify()
     expect((await authority.head()).position).toBe(0)
     const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(new MemoryOperationStore(), webFeedCrypto),
@@ -324,13 +409,13 @@ describe('native fixed authority', () => {
         f.clock.now += 1_000
         expect(await authority.certify()).toMatchObject(closedHead)
       }
-      const reopened = await NativeAuthority.open({ ...f, cutoffLagMs: 100, futureAdmissionWindowMs: 200 })
+      const reopened = await NativeFinalityService.open(f)
       expect(await reopened.certify()).toMatchObject(closedHead)
       expect((await evaluateFinalitySnapshot(f.configuration, (await reopened.read()).entries)).closedThroughMs).toBe(1_100n)
     } finally { stopped.abort(); await running }
   })
 
-  it('does not advance a closure clock while asynchronous verification blocks queued appenders', async () => {
+  it.each(['certify', 'certifiedRead'] as const)('does not advance the %s clock while asynchronous reads block queued appenders', async (method) => {
     const f = await metadataFixture()
     let advanceDuringRead = false
     const store: DurableOperationStore = {
@@ -340,10 +425,10 @@ describe('native fixed authority', () => {
       },
       put: (key, bytes) => f.store.put(key, bytes),
     }
-    const authority = await NativeAuthority.open({ ...f, store })
+    const authority = await NativeFinalityService.open({ ...f, store })
     await authority.append(envelope('previously-included'))
     advanceDuringRead = true
-    const closing = authority.certify()
+    const closing = authority[method]()
     const pending = authority.append(envelope('published-while-closure-was-verifying'))
     await closing
     const entry = await pending
@@ -356,8 +441,8 @@ describe('native fixed authority', () => {
   })
 
   it('does not close additional author time merely to replay exact retained submissions', async () => {
-    const f = await fixture(), authority = await NativeAuthority.open({ ...f,
-      now: () => f.clock.now++, closureIntervalMs: 60_000 })
+    const f = await fixture({ cutoffLagMs: 0n, maxFutureSkewMs: 31_000n, heartbeatIntervalMs: 60_000n })
+    const authority = await NativeFinalityService.open({ ...f, now: () => f.clock.now++ })
     const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(new MemoryOperationStore(), webFeedCrypto),
       signer: webFeedSigner(feedIdFromPublicKey(f.identity.publicKeyBytes), f.identity.privateKey), crypto: webFeedCrypto })
     cleanup.push(() => transport.close())

@@ -8,7 +8,7 @@ import {
 } from '@chronolog/node-core/membership'
 import { equalBytes } from '@chronolog/protocol'
 
-import type { EvidenceSink, NativeAuthority } from './authority.js'
+import type { EvidenceSink, NativeFinalityService } from './finality-service.js'
 
 export const MEMBERSHIP_LEDGER_PATH = '/_chronolog/membership'
 /** The encoded entry budget leaves room for the certificate and response framing. */
@@ -21,19 +21,19 @@ export const MAX_MEMBERSHIP_PAGE_ENTRY_BYTES = 1024 * 1024
  * detached payloads stay with the native peer.
  */
 export function createMembershipLedgerHandler(options: {
-  readonly authority: NativeAuthority
+  readonly finality: NativeFinalityService
   readonly descriptor: EnrollmentDescriptor
   readonly sink?: EvidenceSink
   readonly now?: () => number
   readonly bodyTimeoutMs?: number
 }): (request: Request) => Promise<Response> {
   const descriptor = structuredClone(options.descriptor)
-  const { authority, sink } = options
+  const { finality, sink } = options
   const now = options.now ?? Date.now
   const bodyTimeoutMs = options.bodyTimeoutMs ?? MEMBERSHIP_IO_TIMEOUT_MS
   if (!Number.isSafeInteger(bodyTimeoutMs) || bodyTimeoutMs < 1 || bodyTimeoutMs > 120_000) throw new Error('MEMBERSHIP_TIMEOUT_INVALID')
   if (descriptor.history.kind !== 'coordinated' ||
-      !equalBytes(encodeHistoryConfiguration(descriptor.history), encodeHistoryConfiguration(authority.configuration))) {
+      !equalBytes(encodeHistoryConfiguration(descriptor.history), encodeHistoryConfiguration(finality.configuration))) {
     throw new Error('MEMBERSHIP_AUTHORITY_CONFIGURATION_MISMATCH')
   }
   const configured = verifyEnrollmentDescriptor(descriptor)
@@ -46,7 +46,7 @@ export function createMembershipLedgerHandler(options: {
   const mirror = (certificate: PrefixCertificate): Promise<void> => delivery.run(async () => {
     if (sink === undefined) return
     while (mirroredThrough < certificate.position) {
-      const range = await authority.read({ after: mirroredThrough, limit: 128 })
+      const range = await finality.read({ after: mirroredThrough, limit: 128 })
       for (const entry of range.entries) {
         if (entry.position > certificate.position) break
         await sink.putEvidence(encodeOrderingEvidence({ kind: 'ordered-entry', entry }))
@@ -82,12 +82,12 @@ export function createMembershipLedgerHandler(options: {
       if (operation.kind === 'append') {
         // A failed response or evidence delivery does not undo a durable append.
         // Retrying these exact bytes returns the original position and root.
-        const entry = await authority.appendLedgerRecord(operation.recordBytes)
-        const proof = await authority.certifiedRead({ after: entry.position - 1, limit: 128 })
+        const entry = await finality.appendLedgerRecord(operation.recordBytes)
+        const proof = await finality.certifiedRead({ after: entry.position - 1, limit: 128 })
         await mirror(proof.certificate)
         encoded = encodeMembershipLedgerResponse(entry)
       } else {
-        const page = await authority.certifiedControlRead({ after: operation.after, limit: operation.limit })
+        const page = await finality.certifiedControlRead({ after: operation.after, limit: operation.limit })
         // Local evidence delivery heals a previous interrupted administrative
         // append. None of these application descriptors enter the HTTP response.
         await mirror(page.certificate)

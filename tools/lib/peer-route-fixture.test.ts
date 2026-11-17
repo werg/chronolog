@@ -36,7 +36,7 @@ it('introduces through the packaged host then replicates signed records over RTC
   try {
     const engine = join(directory, 'engine')
     await mkdir(engine)
-    execFileSync('tar', ['-xzf', new URL('../../test/artifacts/tendriller-engine-9dd7a897.tgz', import.meta.url).pathname,
+    execFileSync('tar', ['-xzf', new URL('../../test/artifacts/tendriller-engine-b8db8dcd.tgz', import.meta.url).pathname,
       '-C', engine, '--strip-components=1'])
     native = await createNativeBrowserFixture({ directory: join(directory, 'native'), browsers: [{
       identity: bytesToBase64Url(identity.signing.publicKeyBytes), readerKey: bytesToBase64Url(identity.reader.publicKeyBytes), transportAuthor: transport.identity,

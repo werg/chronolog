@@ -10,10 +10,34 @@ import {
   type OrderedRecordEntry, type OrderedRecordHead,
 } from './history-policy.js'
 
+/** Runtime timers are derived from the authenticated genesis, never local defaults. */
+export function resolveFinalityClockPolicy(policy: {
+  readonly maxFutureSkewMs: bigint
+  readonly cutoffLagMs: bigint
+  readonly heartbeatIntervalMs: bigint
+}): {
+  readonly maxFutureSkewMs: number
+  readonly cutoffLagMs: number
+  readonly heartbeatIntervalMs: number
+  readonly futureAdmissionWindowMs: number
+} {
+  const maxFutureSkewMs = Number(policy.maxFutureSkewMs)
+  const cutoffLagMs = Number(policy.cutoffLagMs)
+  const heartbeatIntervalMs = Number(policy.heartbeatIntervalMs)
+  const futureAdmissionWindowMs = Number(policy.maxFutureSkewMs + policy.cutoffLagMs)
+  if (![maxFutureSkewMs, cutoffLagMs, futureAdmissionWindowMs].every(value => Number.isSafeInteger(value) && value >= 0) ||
+      !Number.isSafeInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1 || heartbeatIntervalMs > 60_000) {
+    throw new Error('FINALITY_CLOCK_POLICY_INVALID')
+  }
+  return { maxFutureSkewMs, cutoffLagMs, heartbeatIntervalMs, futureAdmissionWindowMs }
+}
+
 /**
  * A provider proves inclusion and closes author time. It never chooses the
  * application execution order: every replica uses the protocol comparator.
  * Provider evidence is deliberately opaque to the node and its SQL reducer.
+ * This port currently normalizes a signed-inclusion receipt/closure history;
+ * it does not define arbitrary consensus or dynamic signer reconfiguration.
  */
 export interface FinalityProvider {
   readonly configuration: HistoryConfiguration

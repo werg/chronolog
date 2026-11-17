@@ -30,7 +30,7 @@ export async function qualifyApplicationScope(modulePath: string) {
     // Pause automatic inclusion/closure, retaining the same fenced service.
     // This lets an original offline edit arrive after the reset's time closes.
     await native.agent.close()
-    const authority = native.agent.authority
+    const authority = native.agent.finality
     assert(authority !== null)
     // Finalize the retained genesis key controls before submitting application work.
     for (const record of await native.transport.history()) {

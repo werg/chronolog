@@ -3,14 +3,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { ChronologClient, OWNER_FOR_KEY_SQL } from '@chronolog/client'
+import { signGenesis } from '@chronolog/capabilities'
 import {
   createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer,
 } from '@chronolog/materializer-doltlite'
-import { ChronologNode, Mutex } from '@chronolog/node-core'
+import { ChronologNode, Mutex, membershipDescriptor, provisionMembership } from '@chronolog/node-core'
 import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
 import {
   CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog,
-  type CoordinatedHistoryConfiguration,
 } from '@chronolog/node-core/history'
 import { digestExecutionManifest, equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
@@ -22,8 +22,8 @@ import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { createRecordLogClient, decodeRecord, encodeRecord, RECORD_LOG_FORMAT, RECORD_LOG_LIMITS } from '@tendriller/core/records'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createCertificateFetcher, withTendrillerAuthority } from './authority.js'
-import type { AuthorityHttp } from './authority.js'
+import { createCertificateFetcher, withTendrillerFinality } from './finality-service.js'
+import type { FinalityHttp } from './finality-service.js'
 import { TendrillerTransport } from './transport.js'
 
 const cleanup: Array<() => Promise<void>> = []
@@ -37,10 +37,14 @@ function storage(): AtomicBytesStore {
 /** An independent durable log speaks the packed Tendriller SDK's public HTTP format. */
 async function hub(executionManifestDigest: Uint8Array) {
   const identity = await generateEd25519KeyPair()
-  const configuration: CoordinatedHistoryConfiguration = {
-    kind: 'coordinated', historyId: 'h_ffeeddccbbaa99887766554433221100',
-    groupId: bytes32(11), genesisDigest: bytes32(12), executionManifestDigest, authorityPublicKey: identity.publicKeyBytes,
-  }
+  const provisioned = await provisionMembership({ store: storage(),
+    nativeAuthority: { historyId: 'h_ffeeddccbbaa99887766554433221100', publicKey: identity.publicKeyBytes },
+    groupId: bytes32(11), groupRoute: bytes32(11), executionManifestDigest, schemaAdministratorPublicKey: identity.publicKeyBytes })
+  const genesis = await signGenesis({ ...provisioned.descriptor.genesis.manifest,
+    clockPolicy: { cutoffLagMs: 0n, maxFutureSkewMs: 31_000n, heartbeatIntervalMs: 1_000n },
+  }, provisioned.identity.privateKey)
+  const descriptor = await membershipDescriptor(genesis, bytes32(11)), configuration = descriptor.history
+  if (configuration.kind !== 'coordinated') throw new Error('SIGNED_INCLUSION_REQUIRED')
   const log = await ReferenceRecordLog.open(configuration.historyId, storage())
   const writes = new Mutex(), clock = { now: 1_000 }
   let online = true
@@ -78,11 +82,11 @@ async function hub(executionManifestDigest: Uint8Array) {
   }
   const records = createRecordLogClient({ base: 'https://hub.test', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => serve(new Request(input, init)) })
-  const http: AuthorityHttp<Request, Response> = {
+  const http: FinalityHttp<Request, Response> = {
     request: (url, init) => new Request(url, init), response: (body, init) => new Response(body, init),
   }
-  const handler = withTendrillerAuthority({ fetch: (request: Request, _env: object, _context: object) => serve(request) }, {
-    configuration, identity, records, http, now: () => clock.now, cutoffLagMs: 0,
+  const handler = await withTendrillerFinality({ fetch: (request: Request, _env: object, _context: object) => serve(request) }, {
+    descriptor, identity, records, http, now: () => clock.now,
     authorize: (request) => request.headers.get('Authorization') === 'Bearer owner',
   })
   const certificate = createCertificateFetcher({ url: 'https://hub.test/_chronolog/certificate', headers: () => ({ Authorization: 'Bearer owner' }),

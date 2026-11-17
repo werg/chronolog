@@ -13,7 +13,7 @@ import {
   type DurableOperationStore, type OrderedRecordHead,
 } from '@chronolog/node-core'
 import {
-  assertCanonicalCbor, bytesToBase64Url, bytesToHex, decodeEnvelope, emit, executionManifestArtifacts, program, sqlStatement,
+  assertCanonicalCbor, bytesToBase64Url, bytesToHex, decodeEnvelope, emit, encodeCanonicalCbor, executionManifestArtifacts, program, sqlStatement,
 } from '@chronolog/protocol'
 import { DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 
@@ -97,55 +97,80 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
       await store.put('recovery-drill/bootstrap', privateBootstrap)
     }
     assert.equal(privateBootstrap.length, 96)
+    // This fixture isolates crash durability from CPU/scheduler latency. Both
+    // author and finality clocks are durable and advance only after the local
+    // retained backlog is included, so a slow test host cannot turn a recovery
+    // scenario into an unrelated late-admission rejection.
+    const clockKey = 'recovery-drill/clock'
+    const encodedClock = await store.get(clockKey)
+    assert(encodedClock !== null || options.create === true, 'RECOVERY_CLOCK_MISSING')
+    const storedClock = encodedClock === null ? BigInt(Date.now()) : assertCanonicalCbor(encodedClock)
+    assert(typeof storedClock === 'bigint' && storedClock >= 0n && storedClock <= BigInt(Number.MAX_SAFE_INTEGER), 'RECOVERY_CLOCK_INVALID')
+    let clockNow = Number(storedClock)
+    if (encodedClock === null) await store.put(clockKey, encodeCanonicalCbor(storedClock))
     const groupId = privateBootstrap.slice(0, 32), groupRoute = privateBootstrap.slice(32, 64)
     const executionManifest = createDoltLiteExecutionManifest()
     const { executionManifestDigest } = await executionManifestArtifacts(executionManifest)
     transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
       signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey) })
     const bootstrap = await loadOrCreateGovernanceBootstrap({ dataDirectory: directory, groupId, schemaId: executionManifestDigest,
-      identity: identity.signing, transportAuthor: transport.identity, historyPolicy: 'coordinated' })
+      identity: identity.signing, transportAuthor: transport.identity, historyPolicy: 'coordinated',
+      clockPolicy: { cutoffLagMs: 250n, maxFutureSkewMs: 30_000n, heartbeatIntervalMs: 25n } })
     materializer = await DeterministicMaterializer.open({ path: join(directory, 'application.db'), executionManifest,
       rootAdministrator: bootstrap.genesis.manifest.schemaAdminPublicKey })
     governed = await createGovernedNode({ genesis: bootstrap.genesis, groupRoute, identity: identity.signing, transport,
+      clock: { now: () => clockNow },
       operationStore: store, controlStore: new ControlStore(new SqliteControlStorePersistence(control), { orderPolicy: 'coordinated' }),
       materialization: createDoltLiteMaterializationRuntime(materializer),
       recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
       initialEpochContentKey: privateBootstrap.slice(64) })
     // Validate an independently retained continuity floor before starting any ordering loop.
     agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing,
-      history: governed.descriptor.history, store: authorityStore, transport,
+      descriptor: governed.descriptor, store: authorityStore, transport,
       activeMembership: () => governed!.activeSnapshot,
-      // Keep an explicit author-time window open while a real process signs,
-      // persists and delivers a proposal. Idle closures remain exercised.
-      cutoffLagMs: 250, closureIntervalMs: 25,
+      finalityClock: () => clockNow,
       ...(options.continuity === undefined ? {} : { continuity: options.continuity }) })
-    assert(agent.authority !== null)
-    const authority = agent.authority, node = governed.node, activeTransport = transport
+    assert(agent.finality !== null)
+    const authority = agent.finality, node = governed.node, activeTransport = transport
     await governed.start()
     let serviceFailure: Error | undefined
     const running = agent.run()
     void running.catch((error: unknown) => { serviceFailure = error instanceof Error ? error : new Error('RECOVERY_SERVICE_FAILED', { cause: error }) })
     const healthy = () => { if (serviceFailure !== undefined) throw serviceFailure }
+    const backlogIncluded = async () => {
+      const eligible = (await activeTransport.history()).filter(record => ['candidate', 'capability', 'epoch-manifest'].includes(decodeEnvelope(record.payload).messageType))
+      const range = await authority.read({ limit: 256 })
+      assert(!range.hasMore, 'RECOVERY_FIXTURE_RECEIPT_LIMIT')
+      return range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes)).length === eligible.length
+    }
+    const advanceClock = async () => {
+      const next = clockNow + Number(bootstrap.genesis.manifest.clockPolicy.cutoffLagMs) + 1
+      assert(Number.isSafeInteger(next), 'RECOVERY_CLOCK_EXHAUSTED')
+      await store.put(clockKey, encodeCanonicalCbor(BigInt(next)))
+      clockNow = next
+    }
     const settle = async () => {
       await eventually(async () => {
         healthy()
-        const eligible = (await activeTransport.history()).filter(record => ['candidate', 'capability', 'epoch-manifest'].includes(decodeEnvelope(record.payload).messageType))
-        const range = await authority.read({ limit: 256 })
-        assert(!range.hasMore, 'RECOVERY_FIXTURE_RECEIPT_LIMIT')
-        const applicationRecords = range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes))
-        if (applicationRecords.length !== eligible.length) return false
+        if (!await backlogIncluded()) return false
         await node.waitForIdle()
-        if (!governed!.governance.hasFinalizedEpoch(governed!.governance.cipherRing.current().epochId)) return false
+        let pending = !governed!.governance.hasFinalizedEpoch(governed!.governance.cipherRing.current().epochId)
         for (const kind of ['schema', 'accepted', 'rejected', 'after-backup', 'authority-offline'] as const) {
           const operation = await node.operation(`recovery-${kind}`)
-          if (operation !== null && !operation.final) return false
+          if (operation !== null && !operation.final) pending = true
         }
+        if (pending) { await advanceClock(); return false }
         return true
       }, 'RECOVERY_FIXTURE_NOT_SETTLED')
     }
     await settle()
     const terminal = async (operationId: string) => {
-      await eventually(async () => { healthy(); return (await node.operation(operationId))?.final === true }, 'RECOVERY_OPERATION_NOT_FINAL')
+      await eventually(async () => {
+        healthy()
+        if ((await node.operation(operationId))?.final === true) return true
+        if (await backlogIncluded()) await advanceClock()
+        return false
+      }, 'RECOVERY_OPERATION_NOT_FINAL')
       const operation = await node.operation(operationId)
       assert(operation !== null && operation.final)
       return operation

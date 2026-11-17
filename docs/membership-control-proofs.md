@@ -49,7 +49,7 @@ with the projection commitment made explicit.
 
 ## Compact pages and independent cursors
 
-`NativeAuthority.certifiedControlRead({ after, limit })` returns at most 128
+`NativeFinalityService.certifiedControlRead({ after, limit })` returns at most 128
 controls and at most 1 MiB of encoded control entries, with:
 
 - `entries`: consecutive `FinalizedControl` values.

@@ -25,8 +25,8 @@ import {
 import { DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import {
-  authorizeThroughRecordLog, createCertificateFetcher, TendrillerTransport, withTendrillerAuthority,
-  type AuthorityHttp,
+  authorizeThroughRecordLog, createCertificateFetcher, TendrillerTransport, withTendrillerFinality,
+  type FinalityHttp,
 } from '@chronolog/transport-tendriller'
 import {
   createRecordLogClient, decodeRecord, encodeRecord, RECORD_LOG_FORMAT, RECORD_LOG_LIMITS, recordGenesisRoot,
@@ -230,12 +230,10 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       groupId: genesis.manifest.groupId, executionManifestDigest,
       genesisDigest: await hashDomain(DOMAINS.genesis, encodeGenesisManifest(genesis.manifest)),
     }
-    const http: AuthorityHttp<Request, Response> = {
+    const http: FinalityHttp<Request, Response> = {
       request: (url, init) => new Request(url, init), response: (body, init) => new Response(body, init),
     }
-    const handler = withTendrillerAuthority(engine, { configuration, identity: authority.signing, records, http,
-      cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
-      futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
+    const handler = await withTendrillerFinality(engine, { descriptor: { genesis, groupRoute, history: configuration }, identity: authority.signing, records, http,
       authorize: authorizeThroughRecordLog(engine, { base: hubUrl, historyId: log.historyId, http }) })
     dispatch = (request) => handler.fetch(request, {}, {})
     const adapter = new TendrillerTransport({ local, records, configuration, groupRoute, watch: false,

@@ -10,7 +10,9 @@ import {
   type GenesisManifest,
   type SignedGenesis,
   type ValidationPolicy,
+  type ClockPolicy,
 } from '@chronolog/capabilities'
+import { resolveFinalityClockPolicy } from '@chronolog/node-core/finality'
 import {
   exportX25519PrivateKey,
   generateX25519KeyPair,
@@ -59,6 +61,8 @@ export async function loadOrCreateGovernanceBootstrap(options: {
   readonly secretStore?: DaemonSecretStore
   /** Immutable selection for a new group; changing an existing group is rejected. */
   readonly historyPolicy?: 'peer' | 'coordinated'
+  /** Signed once at creation; a continuing group's clock policy cannot be overridden. */
+  readonly clockPolicy?: ClockPolicy
   /**
    * Used only when `governance.json` does not exist yet. By default a new
    * genesis is created with this node as root. `adopt` joins an existing
@@ -100,6 +104,11 @@ export async function loadOrCreateGovernanceBootstrap(options: {
   if (options.historyPolicy !== undefined && genesis.manifest.historyPolicy?.kind !== options.historyPolicy) {
     throw new Error('GOVERNANCE_HISTORY_POLICY_MISMATCH')
   }
+  resolveFinalityClockPolicy(genesis.manifest.clockPolicy)
+  if (options.clockPolicy !== undefined && (['cutoffLagMs', 'maxFutureSkewMs', 'heartbeatIntervalMs'] as const)
+    .some(key => options.clockPolicy![key] !== genesis.manifest.clockPolicy[key])) {
+    throw new Error('GOVERNANCE_CLOCK_POLICY_MISMATCH')
+  }
   if (!sameBytes(genesis.manifest.historyPolicy?.executionManifestDigest ?? genesis.manifest.schemaId, options.schemaId)) {
     throw new Error('GOVERNANCE_EXECUTION_PROFILE_MISMATCH')
   }
@@ -120,6 +129,7 @@ async function createGenesis(
     readonly transportAuthor: string
     readonly now?: () => number
     readonly historyPolicy?: 'peer' | 'coordinated'
+    readonly clockPolicy?: ClockPolicy
   },
   recipientPublicKey: Uint8Array,
   forkedFrom: ForkOrigin | undefined,
@@ -154,12 +164,13 @@ async function createGenesis(
       { ...common, role: 'reader', hpkePublicKey: recipientPublicKey },
     ],
     validationPolicies: [policy],
-    clockPolicy: { maxFutureSkewMs: 30_000n, cutoffLagMs: 60_000n, heartbeatIntervalMs: 30_000n },
+    clockPolicy: options.clockPolicy ?? { maxFutureSkewMs: 30_000n, cutoffLagMs: 60_000n, heartbeatIntervalMs: 30_000n },
     resourcePolicy: { maxCandidateBytes: 16_000_000n, maxProgramNodes: 10_000n, maxPreconditions: 1_000n, maxMutations: 1_000n },
     encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM',
     createdAtMs: BigInt(Math.trunc(options.now?.() ?? Date.now())),
     ...(forkedFrom === undefined ? {} : { forkedFrom }),
   }
+  resolveFinalityClockPolicy(manifest.clockPolicy)
   return signGenesis(manifest, options.identity.privateKey)
 }
 

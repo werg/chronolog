@@ -24,6 +24,31 @@ operation retries use the same public APIs as SQL/events peers. Execution profil
 selection belongs to the signed group, so an event-only node cannot silently
 interpret a SQL group's history.
 
+## Live signals and peer connections
+
+Both governed browser profiles expose `peer.signals` and
+`peer.connectPeer({ connection, peerIdentity? })`. Supply a ready framed connection,
+for example `frameRtcDataChannel(channel)` after its `ready` promise resolves.
+The runtime selects the local reader grant, verifies the remote current reader,
+attaches replication and signals, and returns `{ completion, close }`. An optional
+`peerIdentity` pins a particular endpoint in addition to its group capability.
+The owning Worker retains all keys and signs outgoing messages there.
+
+The page uses `client.signals.send(...)` and `client.signals.subscribe(...)`
+through the ordinary `WorkerRpcTransport`. There is no application-specific
+Worker message protocol to implement. Signals have no operation IDs, SQL,
+retention, finality waits or reconnect replay. Their default subscription keeps
+accepted messages in a bounded FIFO; choose `mode: 'latest'` for values replaceable
+per author, session and topic. Signal rights are independent from SQL/durable
+publication rights, and a read-only member can subscribe.
+
+Connection close detaches its exact replication and signal route, including
+failed attachment and late handshake completion during shutdown. Browser peer
+close aborts the live channel and pending connection setup before releasing OPFS.
+A low-level composition may provide `configuration.signals` with its own policy;
+standalone [`SignalChannel`](../signals/README.md) works without any browser peer,
+OPFS store, SQL engine or database grant.
+
 ## Build and qualify
 
 Use Node 24, pnpm 10.12.4, a C/C++ compiler, make, Python, Tcl and zlib development headers. Install the workspace dependencies first; the pinned DoltLite package builds the patched native engine and retains its checksum-verified source tree.

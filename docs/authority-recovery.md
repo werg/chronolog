@@ -49,11 +49,18 @@ pnpm exec vitest run test/authority-recovery.integration.test.ts
 
 ### What actually runs
 
-Each fixture uses the actual `NativeAgentStore`, `NativeAuthority`, governed
+Each fixture uses the actual `NativeAgentStore`, `NativeFinalityService`, governed
 node, native DoltLite SQL materializer, durable original-operation journal,
 control database and signed portable feed transport. Separate Node child
 processes open the stores. The store is SQLite WAL with `synchronous=FULL` and
 an exclusive connection fence. There is no simulated storage acknowledgment.
+
+The fixture uses a durable controlled clock for authoring and finality. It advances
+only after the already published local backlog is included, so host CPU load and
+process startup cannot convert a crash-recovery case into an unrelated expired
+admission window. Idle closure publication, real SQLite commits, process kills
+and exact accepted/rejected recovery still run. This is a crash durability test;
+real network and wall-clock admission latency require separate deployment tests.
 
 Twelve scenarios send **SIGKILL**, without graceful cleanup, at six observed
 boundaries for both an accepted SQL/event operation and an operation whose final
@@ -62,7 +69,7 @@ SQL assertion rejects the whole transaction:
 | Kill boundary | Required recovered order before replay |
 | --- | --- |
 | Before detached payload commit | Previous complete prefix |
-| After detached payload commit | Previous complete prefix; an unreferenced payload may exist |
+| After detached payload commit | Previous complete prefix; an unreferenced payload may exist within its durable reservation |
 | Before ordered record commit | Previous complete prefix |
 | After ordered record commit | Prefix includes the original new descriptor |
 | After prefix certificate commit | Prefix includes the original new descriptor and its certificate |
@@ -136,7 +143,10 @@ it is insufficient as a complete authority backup.
 
 ## Partial metadata loss and the independent recovery floor
 
-The native authority creates its durable empty log before saving configuration.
+The native finality service creates its durable empty log and payload reservation
+index before saving configuration. Body reservations survive interrupted appends
+and must be preserved with the bodies; an absent index on an established service
+fails with `FINALITY_PAYLOAD_STATE_MISSING` instead of resetting its budget.
 On reopening an established configuration, an absent log is a continuity failure,
 not permission to restart the sequence. A surviving prefix certificate must
 authenticate under that configuration and match the log at its certified
@@ -178,10 +188,10 @@ not establish freshness.
    copied from the same backup cannot reveal its own staleness. A peer's failure
    to show a newer certificate is not proof that none was acknowledged.
 5. Restore only after fencing the old owner. Supply the trusted floor through
-   `CHRONOLOG_AUTHORITY_CONTINUITY_FILE`, containing exactly the public
+   `CHRONOLOG_FINALITY_CONTINUITY_FILE`, containing exactly the public
    `{ "historyId": "h_…", "position": N, "root": "…" }` fields. Obtain the
    floor from verified independent evidence; the JSON input itself is not an
-   authentication mechanism. `NativeAuthority.open({ continuity })` checks
+   authentication mechanism. `NativeFinalityService.open`'s `continuity` option checks
    that the restored prefix includes the same head at that position.
 6. Verify the pinned configuration, certificates, exact retry outcomes,
    original-operation journals, feed continuity, roster/epoch activation, final

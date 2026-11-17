@@ -15,7 +15,7 @@ import type { FeedForkRegistry } from './feed-forks.js'
 import { GovernanceActivationIndex } from './governance-activation.js'
 import { GovernanceControlPlane, GovernanceRecordPendingError, isInvalidGovernanceRecord, orderFinalizedGovernanceRecords } from './governance.js'
 import { SignedInclusionFinalityProvider, encodeHistoryConfiguration, type CoordinatedHistoryConfiguration, type OrderedRecordEntry } from './history-policy.js'
-import type { FinalityProvider } from './finality.js'
+import { resolveFinalityClockPolicy, type FinalityProvider } from './finality.js'
 import { ChronologNode } from './node.js'
 import type { DurableOperationStore } from './operations.js'
 import { PeerGovernanceController } from './peer-governance.js'
@@ -33,7 +33,8 @@ export interface GovernedNodeOptions {
   readonly operationStore: DurableOperationStore
   readonly recipient?: { readonly id: Uint8Array; readonly privateKey: CryptoKey }
   readonly controlStore?: ControlStore
-  readonly validator?: Omit<ValidatorOptions, 'capabilityId'>
+  /** Recovery floor only; validator timing and policy come from signed genesis. */
+  readonly validator?: Pick<ValidatorOptions, 'initialAcceptedAboveMs'>
   readonly initialEpochContentKey?: Uint8Array
   readonly clock?: Clock
   readonly random?: RandomSource
@@ -42,6 +43,9 @@ export interface GovernedNodeOptions {
 
 /** The same governance, history and enrollment composition on native and browser peers. */
 export async function createGovernedNode(options: GovernedNodeOptions) {
+  // Verification and all derived runtime policy must observe one owned input,
+  // even when a caller changes its configuration while crypto is awaited.
+  options = { ...options, genesis: structuredClone(options.genesis), groupRoute: options.groupRoute.slice() }
   const { genesis } = options
   const configured = genesis.manifest.historyPolicy
   if (configured === undefined) throw new Error('GENESIS_HISTORY_POLICY_REQUIRED')
@@ -61,10 +65,7 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     },
   }
   await verifyEnrollmentDescriptor(descriptor)
-  const futureAdmissionWindowMs = Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs)
-  if (configured.kind === 'coordinated' && (!Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0)) {
-    throw new Error('FINALITY_FUTURE_ADMISSION_WINDOW_INVALID')
-  }
+  const clock = resolveFinalityClockPolicy(genesis.manifest.clockPolicy)
   const governance = await GovernanceControlPlane.create({
     genesis, groupRoute: options.groupRoute, transport: options.transport,
     identity: options.identity, operationStore: options.operationStore,
@@ -151,10 +152,12 @@ export async function createGovernedNode(options: GovernedNodeOptions) {
     ...(options.feedForkRegistry === undefined ? {} : { feedForkRegistry: options.feedForkRegistry }),
     ...(peer === undefined ? {} : { peerGovernance: peer }),
     ...(peer === undefined || validatorCapability === undefined ? {} : {
-      validator: { ...options.validator, capabilityId: validatorCapability },
+      validator: { ...options.validator, capabilityId: validatorCapability,
+        cutoffLagMs: clock.cutoffLagMs, maxFutureSkewMs: clock.maxFutureSkewMs,
+        heartbeatIntervalMs: clock.heartbeatIntervalMs },
     }),
     historyPolicy: coordinated === undefined ? { kind: 'peer' } : {
-      kind: 'coordinated', policy: coordinated, futureAdmissionWindowMs,
+      kind: 'coordinated', policy: coordinated, futureAdmissionWindowMs: clock.futureAdmissionWindowMs,
       applyGovernanceRecord: applyControl,
       hasEncryptionEpoch: (epochId, includedThrough) => governance.hasFinalizedEpoch(epochId, includedThrough),
       encryptionEpochStatusAt: (timestamp, epochId) => governance.finalizedEpochStatusAt(timestamp, epochId),

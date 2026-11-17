@@ -13,6 +13,7 @@
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
     "@chronolog/protocol": "workspace:*",
-    "@chronolog/node-core": "workspace:*"
+    "@chronolog/node-core": "workspace:*",
+    "@chronolog/signals": "workspace:*"
   }
 }

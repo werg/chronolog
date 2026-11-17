@@ -13,7 +13,7 @@ import {
   MembershipAdministrator, createMembershipLedgerClient, encodeSignedEnrollmentApproval, loadOrCreateEnrollmentIdentity,
   prepareEnrollmentRequest, provisionMembership, verifyEnrollmentApproval,
 } from '@chronolog/node-core/membership'
-import { bytesToBase64Url, equalBytes } from '@chronolog/protocol'
+import { bytesToBase64Url, decodeEnvelope, equalBytes } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { createHttpWebRtcSignaling, openWebRtcConnection } from '@chronolog/transport-webrtc'
@@ -48,7 +48,12 @@ describe('thin membership qualification native boundary', () => {
     })
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-thin-membership-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true }))
-    const native = await createThinMembershipNative({ directory: join(directory, 'native') })
+    // This test qualifies membership and retained transport, independently of
+    // host scheduling. Each operation's exact retained inclusion is the
+    // barrier for advancing author/finality time under the signed policy.
+    let clockNow = Date.now()
+    const clock = { now: () => clockNow, advanceTo: (timestampMs: number) => { clockNow = timestampMs } }
+    const native = await createThinMembershipNative({ directory: join(directory, 'native'), clock })
     failureDiagnostic = () => native.diagnostics()
     cleanup.push(() => native.close())
     let store = new NativeAgentStore(join(directory, 'administrator.sqlite'))
@@ -126,7 +131,7 @@ describe('thin membership qualification native boundary', () => {
     const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(deviceStore, webFeedCrypto), crypto: webFeedCrypto,
       signer: webFeedSigner(feedIdFromPublicKey(device.signing.publicKeyBytes), device.signing.privateKey) })
     const replica = await createGovernedNode({ genesis: provisioned.descriptor.genesis, groupRoute: provisioned.descriptor.groupRoute,
-      identity: device.signing, transport, operationStore: deviceStore,
+      identity: device.signing, transport, operationStore: deviceStore, clock,
       recipient: { id: device.signing.publicKeyBytes, privateKey: device.reader.privateKey },
       materialization: createDoltLiteMaterializationRuntime(await DeterministicMaterializer.open({
         path: join(directory, 'device-application.sqlite'), executionManifest: createDoltLiteExecutionManifest(),
@@ -188,10 +193,21 @@ describe('thin membership qualification native boundary', () => {
     await connect()
     await expect.poll(async () => (await client.enrollment.getStatus(request.request.requestId)).state, { timeout: 10_000 }).toBe('ready')
     expect((await client.events.read({ topics: ['qualification'] })).transactions).toHaveLength(8)
+    let deviceCandidates = 0
+    const closeDeviceCandidate = async (signal: AbortSignal) => {
+      const candidates = (await transport.history()).filter(record => record.author === transport.identity &&
+        decodeEnvelope(record.payload).messageType === 'candidate')
+      expect(candidates).toHaveLength(++deviceCandidates)
+      await native.advanceAfterInclusion(candidates.at(-1)!.payload, signal)
+    }
 
     observe('original accepted device operation')
     const first = await client.events.publish('qualification', { text: 'before writer removal' }, { operationId: 'device-before-removal' })
-    try { expect((await first.final({ signal: AbortSignal.timeout(10_000) })).outcome.type).toBe('accepted') }
+    try {
+      const signal = AbortSignal.timeout(10_000)
+      await closeDeviceCandidate(signal)
+      expect((await first.final({ signal })).outcome.type).toBe('accepted')
+    }
     finally { first.dispose() }
     await session!.close(); session = undefined
     const writer = activeDevice.find(capability => capability.grant.role === 'writer')!
@@ -200,7 +216,11 @@ describe('thin membership qualification native boundary', () => {
     const rejected = await client.events.publish('qualification', { text: 'after writer removal' }, { operationId: 'device-after-removal' })
     observe('RTC reconnect and rejected writer operation')
     await connect()
-    try { expect((await rejected.final({ signal: AbortSignal.timeout(10_000) })).outcome.type).toBe('rejected') }
+    try {
+      const signal = AbortSignal.timeout(10_000)
+      await closeDeviceCandidate(signal)
+      expect((await rejected.final({ signal })).outcome.type).toBe('rejected')
+    }
     finally { rejected.dispose() }
     observe('original accepted operation retry')
     const retry = await client.events.publish('qualification', { text: 'before writer removal' }, { operationId: 'device-before-removal' })

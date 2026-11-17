@@ -1,1 +1,11 @@
-{"name":"@chronolog/capabilities","version":"0.0.0","private":true,"type":"module","exports":"./src/index.ts","dependencies":{"@chronolog/protocol":"workspace:*"}}
+{
+  "name": "@chronolog/capabilities",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/signals": "workspace:*"
+  }
+}

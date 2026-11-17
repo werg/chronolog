@@ -5,6 +5,10 @@ timers, and peer connections alongside an application agent. The loops do not
 depend on model turns. Provider calls stay in trusted application modules;
 Chronolog's execution and UI replay never call them.
 
+Start with the [application primitives guide](../../docs/application-primitives.md)
+for the choice between signals, durable events and SQL, and for the separate
+membership, finality and external-effect roles.
+
 ## Run the native profile
 
 For a new durable native history:
@@ -30,22 +34,45 @@ records one history ID and the daemon's persistent signing key as finality
 authority. Another enrolled node does not become that authority
 unless its key is the one that genesis explicitly names. The daemon uses its
 existing fenced data directory and FULL-synchronous SQLite operation store.
-`CHRONOLOG_AUTHORITY_QUOTA_BYTES` bounds retained proposal bytes (64 MiB by
-default). Exhaustion is a visible refusal; no record is silently trimmed.
+`CHRONOLOG_FINALITY_RECORD_QUOTA_BYTES` bounds retained descriptors and closure records;
+`CHRONOLOG_FINALITY_PAYLOAD_QUOTA_BYTES` separately bounds detached application
+bodies. Each defaults to 64 MiB. Exhaustion is a visible refusal; no record is
+silently trimmed. These are service budgets, not a limit on the entire node's
+database, which also holds replica state and application checkpoints.
 
 The daemon's ready output includes the selected policy, execution profile,
-resident task IDs, and whether it hosts the native authority. Task failures stop
+resident task IDs, and whether it hosts the native finality service. Task failures stop
 the resident service and are reported as `chronologd.agent_failed`.
 
-## Authority storage and recovery
+## Finality service storage and recovery
 
-`NativeFinalityService` (also exported as `NativeAuthority`) composes the public
+`NativeFinalityService` composes the public
 `ReferenceRecordLog`, signed closure markers and prefix certificates. Exact bytes,
 deduplication, receipt entries and the rolling head are one atomic record-store
 update before append acknowledgment. Receipt positions enumerate inclusion;
 replicas independently derive chronological execution order.
 
-`certify()` uses the provider clock and configured `cutoffLagMs` to close author
+Opening the service requires the authenticated enrollment descriptor. It verifies
+the descriptor, the pinned signer, the signed-inclusion provider and the signed
+clock policy before accepting work. Persist the identity first, sign a genesis
+that names its public key and the reserved history ID, then open the service:
+
+```ts
+const finality = await NativeFinalityService.open({
+  descriptor,
+  identity: persistentSigningKey,
+  store: durableStore,
+  recordQuotaBytes: 64 * 1024 * 1024,
+  payloadQuotaBytes: 64 * 1024 * 1024,
+})
+```
+
+`FinalityProvider` is the replica's proof-verification port; the service above
+produces those proofs. An agent can consume final events without hosting either
+the signing key or this service. The default daemon co-locates these roles as an
+explicit deployment choice, and exposes the optional service as `context.finality`.
+
+`certify()` uses the provider clock and signed `cutoffLagMs` to close author
 time. It signs a marker naming the exact preceding receipt head, commits that
 marker, then returns a certificate for the committed prefix. Every earlier
 closure stays in retained history, so a fresh peer can reject a proposal first
@@ -54,13 +81,13 @@ their original receipt. Prefix certificates remain outside the log they certify.
 
 `serve(transport)` includes retained local records before its first new closure,
 then follows durable submissions and advances the frontier on the
-`closureIntervalMs` timer even while the application is quiet. `now` is injectable
-for deterministic fixtures. The daemon supplies the signed genesis clock policy;
-direct callers default to a one-second cutoff lag and one-second closure interval.
+signed `heartbeatIntervalMs` timer even while the application is quiet. `now` is
+injectable for deterministic fixtures. Timing has one source: the authenticated
+genesis. There are no independently configurable service timing defaults.
 Retained exact retries do not trigger extra closures.
 
-`futureAdmissionWindowMs` **must equal the signed genesis sum of
-`maxFutureSkewMs + cutoffLagMs`**; its direct-call default is 31,000. A proposal's
+The service derives its future-admission window from signed
+`maxFutureSkewMs + cutoffLagMs`. A proposal's
 author time must be at most its first covering closure plus that window. Replicas
 reject a later timestamp deterministically. Without inspecting encrypted bodies,
 the service therefore knows when all covered proposals could have become final.
@@ -74,8 +101,18 @@ one append lock, and `share()` forwards the selected entries and their covering
 certificate. A receiver waits for every retained entry needed to verify the
 complete prefix, including its closure markers.
 
-First setup durably creates an empty record log before saving the authority's
-configuration. A later open with saved configuration requires that log; a missing
+Before storing a detached body, the service durably reserves its exact hash and
+length against `payloadQuotaBytes`. Exact retries reuse that reservation, including
+after a lost write acknowledgment. A failure between reservation, body storage
+and receipt append leaves accounted capacity; it cannot accumulate unbounded
+orphan bodies. Reservations are retained because this service has no pruning.
+`storageUsage()` reports retained record bytes and reserved body bytes with their
+separate limits. Missing reservation state on an established history is a visible
+`FINALITY_PAYLOAD_STATE_MISSING` refusal, not an empty replacement budget.
+
+First setup durably creates an empty record log and payload reservation index
+before saving the service's configuration. A later open with saved configuration
+requires that log; a missing
 log fails with `AUTHORITY_CONTINUITY_NOT_ESTABLISHED`. Any retained certificate is
 authenticated against the pinned configuration and must match the retained log
 at its certified position. Invalid retained proof fails with
@@ -86,17 +123,17 @@ keep their original positions.
 
 `NativeAgentStore` supplies the same atomic bytes port for embedded native hosts.
 It holds SQLite's exclusive owner fence for the lifetime of the connection and
-can back `DurableFeedStore`, authoring state, the authority, and checkpoints.
+can back `DurableFeedStore`, authoring state, the finality service, and checkpoints.
 The existing daemon instead shares its already fenced node-state database.
 
 A persistent volume is required. A certificate proves inclusion, not a second
-durable copy or an external backup. An unavailable authority pauses new finality;
+durable copy or an external backup. An unavailable service pauses new finality;
 peers retain local reads and already certified history. There is no automatic
-authority or policy failover.
+signer or policy failover.
 
 After restoring a volume, establish continuity independently before continuing
-the same authority/history. `NativeFinalityService.open({ continuity })` and
-`CHRONOLOG_AUTHORITY_CONTINUITY_FILE` accept a trusted `{historyId, position,
+the same signer/history. The `continuity` option to `NativeFinalityService.open` and
+`CHRONOLOG_FINALITY_CONTINUITY_FILE` accept a trusted `{historyId, position,
 root}` checkpoint and refuse an older or conflicting retained prefix. A
 checkpoint copied from the same old backup cannot detect rollback. The automatic
 local certificate check detects partial loss or contradiction; it cannot detect
@@ -151,7 +188,7 @@ stable request event in `originEventId`. Browser grants allow `job-requests`;
 only the designated native worker receives `job-results` publication rights.
 
 The context supplies the public node, atomic private store, final event
-publisher, optional authority, grant-checked signal setup, and authenticated
+publisher, optional finality service, live `context.signals`, and authenticated
 peer connection setup. The module is trusted native code. Keep credentials,
 private model context, and private workflow state in its local store or another
 explicitly authorized group; topic filtering is not confidentiality.
@@ -319,9 +356,10 @@ explicit `disconnect(identity)` / `disconnectLink(identity)` methods deliberatel
 remove whichever connection currently owns that identity.
 
 Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
-use `chronolog/ephemeral/v1`. The session multiplexes bounded range responses,
-content-addressed payload responses, change hints, and replaceable signals. Signals cannot hold up retained range
-handling. There are at most four pending requests in either direction and each
+use `chronolog/signal/v1`. The session multiplexes bounded range responses,
+content-addressed payload responses, change hints, and best-effort signals. Signals
+cannot hold up retained range handling. At most eight signal callbacks run per
+connection; overload drops incoming signals before application acceptance. There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement
 before making direct-connect, relay-bandwidth, or cost claims.
@@ -349,15 +387,39 @@ expiry fails the session and rejects its pending requests. Completion, remote
 errors, cancellation and session failure clear every request timer. Reconnection
 resumes from retained verified history with the original operation identities.
 
-`EphemeralChannel` signs group/topic/grant/session/sequence/expiry and checks the
-receiver's current capabilities. It bounds active replay sessions, send/receive
-work, and subscriber queues. Slow subscribers receive latest replaceable values.
-No signal advances a durable event cursor. An offline receiver cannot know about
-a revocation it has not received.
+## Live signals
+
+Native application modules use `context.signals.send(topic, payload, { ttlMs })`
+and `context.signals.subscribe({ topics, mode, signal })`. The public
+`ChronologClient.signals` uses the same interface through native or Worker RPC.
+`context.connectPeer()` automatically attaches signal routes and the resident
+forwards verified original frames to its other current readers. Application code
+no longer constructs a separate channel or hand-wires forwarding. Connection
+completion and shutdown detach the exact route that owns the session.
+
+The default `mode: 'all'` preserves accepted messages in a bounded FIFO and raises
+`SIGNAL_SUBSCRIPTION_OVERFLOW` when a subscriber falls behind. Choose
+`mode: 'latest'` for replaceable presence/cursor values per author, session and
+topic. Messages expire, have no catch-up history, and never advance a durable
+cursor or trigger a finality wait. TTL begins at the original `send()` call,
+including queued work. No route means immediate `SIGNAL_DISCONNECTED`; the client
+never retries sends or reconnects subscriptions behind the application's back.
+
+The group adapter checks independent current `program.signals` rights; a
+signal-only grant may set `sql: false` and `topics: []`. Reading alone does not
+allow sending. A reader needs no writer grant to subscribe. Peer links recheck
+recipient reader access before signal release, including after asynchronous
+work. An offline peer cannot know a revocation it has not received.
+
+The standalone [`@chronolog/signals`](../signals/README.md) package provides
+`SignalChannel` for applications without a database. Its caller supplies scope,
+identity, byte transport and an explicit authorization callback. Credentials are
+optional and opaque; there is no SQL, membership, log, finality or authority
+prerequisite. The group integration is one policy adapter over that core.
 
 ## Signed membership ledger endpoint
 
-`createMembershipLedgerHandler({ authority, descriptor, sink? })`, exported from
+`createMembershipLedgerHandler({ finality, descriptor, sink? })`, exported from
 `@chronolog/agent-service/membership-http`, serves exact `POST /_chronolog/membership`
 requests as raw canonical CBOR. Each request is signed by the genesis roster root
 and binds the group, exact history configuration, request, nonce and short expiry.

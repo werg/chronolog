@@ -132,7 +132,7 @@ try {
       await accepted(await native.client.submit(program(sqlStatement(`INSERT INTO tasks (id, title, claimed_by, status, chronolog_owner) VALUES (?, ?, NULL, 'open', ${OWNER_FOR_KEY_SQL})`,
         ['task-1', 'Review the shared inspection evidence', team.id])), { operationId: 'pilot-task' }))
       routes = await createPeerRouteFixture({ native, directory: join(nativeDirectory, 'routes'), engine: resolve(values['tendriller-engine']!) })
-      const { peerUrl: _httpFixtureUrl, peerToken: _httpFixtureToken, connection: _legacyConnection, ...peer } = native.bootstrap
+      const { peerUrl: _httpFixtureUrl, peerToken: _httpFixtureToken, ...peer } = native.bootstrap
       return { peer, hostBase: routes.hostBase, teamId: bytesToBase64Url(team.id), applicationId: `inspection-${bytesToBase64Url(native.node.groupId)}` }
     }
     const files = await staticFiles(pages)

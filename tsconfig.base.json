@@ -94,9 +94,6 @@
       "@chronolog/agent-service": [
         "packages/agent-service/src/index.ts"
       ],
-      "@chronolog/agent-service/signals": [
-        "packages/agent-service/src/signals.ts"
-      ],
       "@chronolog/agent-service/framing": [
         "packages/agent-service/src/framing.ts"
       ],
@@ -120,6 +117,9 @@
       ],
       "@chronolog/transport-webrtc/resident": [
         "packages/transport-webrtc/src/resident.ts"
+      ],
+      "@chronolog/signals": [
+        "packages/signals/src/index.ts"
       ]
     }
   }

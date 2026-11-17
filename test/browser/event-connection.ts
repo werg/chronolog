@@ -4,8 +4,6 @@ import { isCapabilityActive, type CapabilitySnapshot } from '@chronolog/capabili
 import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToHex, equalBytes } from '@chronolog/protocol'
 import type { PortableFeedTransport } from '@chronolog/records'
-import { frameTendrillerPeer } from '@chronolog/transport-tendriller'
-import { connectPeer } from '@tendriller/core/peers'
 
 import type { BrowserEventBootstrap } from './event-contract.js'
 
@@ -36,7 +34,7 @@ export async function openHttpPeerConnection(base: string, token: string): Promi
 }
 
 export async function connectGovernedBrowserPeer(options: {
-  readonly bootstrap: Pick<BrowserEventBootstrap, 'peerUrl' | 'peerToken' | 'nativeIdentity' | 'connection'>
+  readonly bootstrap: Pick<BrowserEventBootstrap, 'peerUrl' | 'peerToken' | 'nativeIdentity'>
   readonly identity: EnrollmentIdentity
   readonly transport: PortableFeedTransport
   readonly activeMembership: () => CapabilitySnapshot
@@ -47,9 +45,7 @@ export async function connectGovernedBrowserPeer(options: {
     isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, options.identity.signing.publicKeyBytes))
   if (reader === undefined) throw new Error('BROWSER_READER_GRANT_MISSING')
   const started = performance.now()
-  const publicPeer = options.bootstrap.connection === undefined ? undefined : connectPeer({ url: options.bootstrap.connection.url, route: options.bootstrap.connection.route })
-  const connection = publicPeer === undefined
-    ? await openHttpPeerConnection(options.bootstrap.peerUrl, options.bootstrap.peerToken) : frameTendrillerPeer(publicPeer)
+  const connection = await openHttpPeerConnection(options.bootstrap.peerUrl, options.bootstrap.peerToken)
   const session = await openAuthenticatedPeerLink({
     connection,
     local: options.transport.asLink(), identity: options.identity.signing, groupId: snapshot.groupId, grantId: reader.id,
@@ -64,6 +60,6 @@ export async function connectGovernedBrowserPeer(options: {
   void session.completion.finally(detach).catch(() => undefined)
   const authenticatedMs = performance.now() - started
   return { completion: session.completion, sendSignal: (bytes: Uint8Array) => session.sendSignal(bytes),
-    stats: () => publicPeer === undefined ? { route: 'http-fixture', authenticatedMs } : { route: publicPeer.route, authenticatedMs, ...publicPeer.stats },
+    stats: () => ({ route: 'http-fixture', authenticatedMs }),
     async close() { detach(); await session.close() } }
 }

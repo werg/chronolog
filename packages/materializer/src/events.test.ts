@@ -35,16 +35,145 @@ describe('SQL-free durable event execution', () => {
     await expect(reopened.coordinator.materialize([conflict, one, sql])).rejects.toThrow('FINAL_PREFIX_CHANGED')
   })
   it('never exposes an outcome or final cursor ahead of a failed durable write', async () => {
-    const bytes = store(), runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
+    const bytes = store()
+    let runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
     const entry = await admitted(runtime.queries.executionManifestDigest, 1, program(emit('chat', 'one')))
     bytes.fail = true
     await expect(runtime.coordinator.materialize([entry])).rejects.toThrow('power loss')
     expect(runtime.queries.orderLength).toBe(0)
     expect(runtime.queries.outcome(entry.txId)).toBeNull()
     bytes.fail = false
+    await expect(runtime.coordinator.materialize([entry])).rejects.toThrow('EVENT_EXECUTION_CLOSED')
+    runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })
     await runtime.coordinator.materialize([entry])
     bytes.fail = true
     await expect(runtime.coordinator.publishFinal!(1)).rejects.toThrow('power loss')
     expect(runtime.queries.finalOrderLength).toBe(0)
+  })
+
+  it('cannot overwrite a committed durable final prefix after its reply was lost', async () => {
+    const bytes = store()
+    let loseReply = false
+    const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
+      await bytes.put(key, value)
+      if (loseReply) { loseReply = false; throw new Error('lost write acknowledgment') }
+    } }
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'lost-final-reply' })
+    const digest = runtime.queries.executionManifestDigest
+    const late = await admitted(digest, 20, program(emit('chat', 'later')))
+    const early = await admitted(digest, 10, program(emit('chat', 'earlier')))
+    await runtime.coordinator.materialize([late])
+    loseReply = true
+    await expect(runtime.coordinator.publishFinal!(1)).rejects.toThrow('lost write acknowledgment')
+    expect(runtime.queries.finalOrderLength).toBe(0)
+    await expect(runtime.coordinator.materialize([early, late])).rejects.toThrow('EVENT_EXECUTION_CLOSED')
+    const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'lost-final-reply' })
+    expect(reopened.queries.finalOrderLength).toBe(1)
+    expect(reopened.queries.orderLength).toBe(1)
+    await expect(reopened.coordinator.materialize([early, late])).rejects.toThrow('FINAL_PREFIX_CHANGED')
+  })
+
+  it('recovers admitted identities before retrying after a lost materialization reply', async () => {
+    const bytes = store()
+    let loseReply = true
+    const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
+      await bytes.put(key, value)
+      if (loseReply) { loseReply = false; throw new Error('lost write acknowledgment') }
+    } }
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'lost-order-reply' })
+    const digest = runtime.queries.executionManifestDigest
+    const one = await admitted(digest, 10, program(emit('chat', 'one')))
+    const two = await admitted(digest, 20, program(emit('chat', 'two')))
+    await expect(runtime.coordinator.materialize([one])).rejects.toThrow('lost write acknowledgment')
+    await expect(runtime.coordinator.materialize([two])).rejects.toThrow('EVENT_EXECUTION_CLOSED')
+    const reopened = await createEventMaterializationRuntime({ store: storage, namespace: 'lost-order-reply' })
+    expect(reopened.queries.orderLength).toBe(1)
+    await expect(reopened.coordinator.materialize([two])).rejects.toThrow('ADMISSION_SET_REMOVAL')
+    await expect(reopened.coordinator.materialize([one])).resolves.toBeNull()
+    await reopened.coordinator.materialize([one, two])
+    expect(reopened.queries.orderLength).toBe(2)
+  })
+
+  it('replays a provisional suffix on late insertion and retains its exact outcomes after reopen', async () => {
+    const bytes = store(), runtime = await createEventMaterializationRuntime({ store: bytes, namespace: 'replay' })
+    const digest = runtime.queries.executionManifestDigest
+    const late = await admitted(digest, 20, program(emit('chat', 'later')), 'same-operation')
+    const early = await admitted(digest, 10, program(emit('chat', 'earlier')), 'same-operation')
+    await runtime.coordinator.materialize([late])
+    expect(runtime.queries.outcome(late.txId)?.outcome).toBe('accepted')
+    const changed = await runtime.coordinator.materialize([early, late])
+    expect(changed?.revision.replayFromIndex).toBe(0)
+    expect(changed?.revision.outcomeChanges).toContainEqual({ txId: late.txId, previous: 'accepted', current: 'rejected',
+      previousRejectionCode: null, currentRejectionCode: 'operation_conflict' })
+    await runtime.coordinator.publishFinal!(2)
+    await runtime.close()
+    const reopened = await createEventMaterializationRuntime({ store: bytes, namespace: 'replay' })
+    expect(reopened.queries.outcome(early.txId)?.outcome).toBe('accepted')
+    expect(reopened.queries.outcome(late.txId)?.rejectionCode).toBe('operation_conflict')
+    expect(reopened.queries.finalOrderLength).toBe(2)
+  })
+
+  it('owns queued inputs and keeps returned outcome identities detached from internal state', async () => {
+    const bytes = store()
+    let unblock!: () => void, didBlock!: () => void
+    const blocked = new Promise<void>(resolve => { didBlock = resolve })
+    const gate = new Promise<void>(resolve => { unblock = resolve })
+    let delay = true
+    const storage = { get: (key: string) => bytes.get(key), async put(key: string, value: Uint8Array) {
+      if (delay) { delay = false; didBlock(); await gate }
+      await bytes.put(key, value)
+    } }
+    const runtime = await createEventMaterializationRuntime({ store: storage, namespace: 'owned-inputs' })
+    const digest = runtime.queries.executionManifestDigest
+    const one = await admitted(digest, 10, program(emit('chat', 'one')))
+    const two = await admitted(digest, 20, program(emit('chat', 'two')))
+    const originalTwoId = two.txId.slice()
+    const first = runtime.coordinator.materialize([one])
+    await blocked
+    const second = runtime.coordinator.materialize([one, two])
+    two.txId.fill(0)
+    unblock()
+    await first
+    const result = await second
+    expect(runtime.queries.outcome(originalTwoId)?.outcome).toBe('accepted')
+    result!.revision.outcomeChanges[0]!.txId.fill(0)
+    expect(runtime.queries.outcome(originalTwoId)?.outcome).toBe('accepted')
+    expect(runtime.queries.outcome(two.txId)).toBeNull()
+  })
+
+  it('cannot remove admitted history or change a provisional proposal identity', async () => {
+    const runtime = await createEventMaterializationRuntime({ store: store(), namespace: 'identity' })
+    const digest = runtime.queries.executionManifestDigest
+    const one = await admitted(digest, 1, program(emit('chat', 'one')))
+    const two = await admitted(digest, 2, program(emit('chat', 'two')))
+    await runtime.coordinator.materialize([one, two])
+    const revision = runtime.queries.revision
+    await expect(runtime.coordinator.materialize([two])).rejects.toThrow('ADMISSION_SET_REMOVAL')
+    await expect(runtime.coordinator.materialize([two, one])).rejects.toThrow('ADMISSION_SET_REMOVAL')
+    await expect(runtime.coordinator.materialize([{ ...one, authorFeedSequence: 99n }, two])).rejects.toThrow('IDENTITY_CONFLICT')
+    expect(runtime.queries.revision).toBe(revision)
+    expect(runtime.queries.outcome(one.txId)?.outcome).toBe('accepted')
+  })
+
+  it('binds finality to complete proposal identities, including their event IDs', async () => {
+    const runtime = await createEventMaterializationRuntime({ store: store(), namespace: 'final-identity' })
+    const digest = runtime.queries.executionManifestDigest
+    const one = await admitted(digest, 1, program(emit('chat', 'one')))
+    const two = await admitted(digest, 2, program(emit('chat', 'two')))
+    await runtime.coordinator.materialize([one])
+    await runtime.coordinator.publishFinal!(1)
+    await expect(runtime.coordinator.materialize([{ ...one, txId: utf8('replacement-id') }, two]))
+      .rejects.toThrow('FINAL_PREFIX_CHANGED')
+    expect(runtime.queries.orderLength).toBe(1)
+    expect(runtime.queries.finalOrderLength).toBe(1)
+    expect(runtime.queries.outcome(one.txId)?.outcome).toBe('accepted')
+  })
+
+  it('rejects the same signed proposal under two transaction IDs', async () => {
+    const runtime = await createEventMaterializationRuntime({ store: store(), namespace: 'duplicate' })
+    const one = await admitted(runtime.queries.executionManifestDigest, 1, program(emit('chat', 'one')))
+    await expect(runtime.coordinator.materialize([one, { ...one, txId: utf8('duplicate-id') }]))
+      .rejects.toThrow('DUPLICATE_PROPOSAL')
+    expect(runtime.queries.orderLength).toBe(0)
   })
 })

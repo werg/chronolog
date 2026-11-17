@@ -93,7 +93,7 @@ export async function createPeerRouteFixture(options: {
 
   const measurements: SessionMeasurement[] = [], trace: unknown[] = [], failures: string[] = []
   const traceStarted = performance.now()
-  const connections = new Map<number, { sample(): void; sendSignal(bytes: Uint8Array): Promise<void>; close(): Promise<void> }>()
+  const connections = new Map<number, { sample(): void; close(): Promise<void> }>()
   const bridges = new Set<WebSocket>()
   let sequence = 0, closed = false, rendezvousAvailable = true, unexpectedHostRequests = 0
   const signaling = { opened: 0, sentMessages: 0, receivedMessages: 0, sentBytes: 0, receivedBytes: 0 }
@@ -107,11 +107,6 @@ export async function createPeerRouteFixture(options: {
     unexpectedHostRequests++; response.writeHead(503); response.end('Host application services are unavailable')
   })
   const sockets = new WebSocketServer({ noServer: true, maxPayload: PEER_RENDEZVOUS_LIMITS.messageBytes, perMessageDeflate: false })
-  const signals = await options.native.agent.context.createSignals({
-    grantId: [...options.native.governed.activeSnapshot.capabilities.values()].find(value =>
-      value.grant.role === 'writer' && Buffer.from(value.grant.signingPublicKey).equals(options.native.identity.signing.publicKeyBytes))!.id,
-    send: async () => undefined,
-  })
   const appendTrace = (event: Record<string, unknown>) => {
     if (trace.length >= 100_000) throw new Error('ROUTE_TRACE_LIMIT')
     trace.push({ elapsedMs: Math.round(performance.now() - traceStarted), ...event })
@@ -138,7 +133,7 @@ export async function createPeerRouteFixture(options: {
       await authenticated?.close(); await rtc?.close()
       appendTrace({ session: id, event: 'closed', sentBytes: measurement.sentBytes, receivedBytes: measurement.receivedBytes })
     }
-    connections.set(id, { sample, async sendSignal(bytes) { await authenticated?.sendSignal(bytes) }, close })
+    connections.set(id, { sample, close })
     try {
       const { role } = await rendezvous.ready
       rtc = await openWebRtcConnection({ role, signaling: rendezvous, signal: abort.signal, configuration: { iceServers: [] },
@@ -153,11 +148,7 @@ export async function createPeerRouteFixture(options: {
           return peer
         } })
       measurement.readyMs = performance.now() - started
-      authenticated = await options.native.agent.context.connectPeer({ connection: rtc, signals: { async receive(bytes) {
-        const verified = await signals.receive(bytes)
-        await Promise.allSettled([...connections.entries()].filter(([other]) => other !== id).map(([, other]) => other.sendSignal(bytes)))
-        return verified
-      } } })
+      authenticated = await options.native.agent.context.connectPeer({ connection: rtc })
       measurement.authenticatedMs = performance.now() - started; sample()
       appendTrace({ session: id, event: 'authenticated', authenticatedMs: Math.round(measurement.authenticatedMs) })
       if (measurement.closed) { await authenticated.close(); await rtc.close(); return }
@@ -254,7 +245,7 @@ export async function createPeerRouteFixture(options: {
       closed = true
       await Promise.all([...connections.values()].map(value => value.close()))
       for (const bridge of bridges) bridge.terminate()
-      signals.close(); sockets.close(); server.closeAllConnections()
+      sockets.close(); server.closeAllConnections()
       if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error)))
       await mf.dispose()
       if (restrictedInterfaceEnumeration) { os.networkInterfaces = originalInterfaces; syncBuiltinESMExports() }

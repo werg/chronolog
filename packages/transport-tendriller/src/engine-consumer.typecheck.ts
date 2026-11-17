@@ -2,22 +2,23 @@
 // cloudflare:workers runtime into a Node test process.
 import type engine from '@tendriller/engine'
 
-import { authorizeThroughRecordLog, withTendrillerAuthority } from './authority.js'
-import type { AuthorityHttp, TendrillerAuthorityOptions } from './authority.js'
+import { authorizeThroughRecordLog, withTendrillerFinality } from './finality-service.js'
+import type { FinalityHttp, TendrillerFinalityOptions } from './finality-service.js'
 
 type WorkerRequest = Parameters<typeof engine.fetch>[0]
 type WorkerResponse = Awaited<ReturnType<typeof engine.fetch>>
 type WorkerContext = Parameters<typeof engine.fetch>[2]
 
-export function typedEngineConsumer(
+export async function typedEngineConsumer(
   handler: typeof engine,
-  http: AuthorityHttp<WorkerRequest, WorkerResponse>,
-  options: TendrillerAuthorityOptions<unknown, WorkerContext, WorkerRequest, WorkerResponse>,
-): typeof engine {
-  return withTendrillerAuthority(handler, {
+  http: FinalityHttp<WorkerRequest, WorkerResponse>,
+  options: TendrillerFinalityOptions<unknown, WorkerContext, WorkerRequest, WorkerResponse>,
+): Promise<typeof engine> {
+  if (options.descriptor.history.kind !== 'coordinated') throw new Error('SIGNED_INCLUSION_REQUIRED')
+  return withTendrillerFinality(handler, {
     ...options, http,
     authorize: authorizeThroughRecordLog(handler, {
-      base: 'https://tendril.example/api/t/fixed', historyId: options.configuration.historyId, http,
+      base: 'https://tendril.example/api/t/fixed', historyId: options.descriptor.history.historyId, http,
     }),
   })
 }

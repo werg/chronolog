@@ -36,6 +36,33 @@ The Worker owns its signer, durable records, control state and SQL engine. The
 client forwards calls to that local replica; the browser runtime handles peer
 synchronization and history verification.
 
+## Send live signals
+
+```ts
+await client.signals.send('typing', { active: true }, { ttlMs: 2_500 })
+
+for await (const message of client.signals.subscribe({
+  topics: ['typing'], mode: 'latest', signal,
+})) {
+  // Keep independent authors/sessions separate and expire rendered state.
+  showTyping(message.authorId, message.sessionId, message.payload, message.expiresAtMs)
+}
+```
+
+Signals are best-effort live messages, separate from retained events and atomic
+programs. `send()` has no operation ID and never waits for finality; it confirms
+local dispatch only. `subscribe()` defaults to `mode: 'all'`, preserving accepted
+unexpired messages in a bounded FIFO; overflow fails that subscription explicitly.
+Choose `latest` for replaceable values. The client does not retry sends or silently
+reconnect a subscription: reconnect and send fresh state deliberately.
+
+Governed browser peers and the native daemon supply this interface directly.
+Subscribers need no writer grant; publication requires a current signal topic
+right. A signal-only writer grant need not permit SQL or durable events. Without
+an attached live route, sending fails immediately rather than saving an outbox.
+For standalone use without any Chronolog database, use
+[`SignalChannel`](../signals/README.md) with your own transport and authorization.
+
 ## Submit SQL and wait for the result you need
 
 ```ts

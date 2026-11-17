@@ -281,7 +281,24 @@ describe('signed provider selection', () => {
     const genesis = await signGenesis({ ...options.genesis.manifest,
       clockPolicy: { ...options.genesis.manifest.clockPolicy, maxFutureSkewMs: BigInt(Number.MAX_SAFE_INTEGER), cutoffLagMs: 1n },
     }, options.identity.privateKey)
-    await expect(createGovernedNode({ ...options, genesis })).rejects.toThrow('FINALITY_FUTURE_ADMISSION_WINDOW_INVALID')
+    await expect(createGovernedNode({ ...options, genesis })).rejects.toThrow('FINALITY_CLOCK_POLICY_INVALID')
+  })
+
+  it('owns the signed genesis and route before asynchronous verification begins', async () => {
+    const options = await configured()
+    const genesis = structuredClone(options.genesis), groupRoute = options.groupRoute.slice()
+    const creating = createGovernedNode({ ...options, genesis, groupRoute, finalityProviders: {
+      'custom-inclusion-v1': async configuration => ({ configuration,
+        snapshot: () => ({ checkpointId: 'owned-genesis', receivedThrough: 0, includedThrough: 0,
+          closedReceiptThrough: 0, closedThroughMs: -1n, records: [], closures: [] }),
+        ingestEvidence: async () => undefined, evidenceBytes: () => [] }),
+    } })
+    Object.assign(genesis.manifest.clockPolicy, { cutoffLagMs: 99_999n })
+    groupRoute.fill(0)
+    const governed = await creating
+    cleanup.push(() => governed.close())
+    expect(governed.descriptor.genesis.manifest.clockPolicy).toEqual(options.genesis.manifest.clockPolicy)
+    expect(governed.descriptor.groupRoute).toEqual(options.groupRoute)
   })
 
   it('refuses signing a peer history with an unsupported provider', async () => {

@@ -1,9 +1,8 @@
 import { ChronologClient } from '@chronolog/client'
-import { base64UrlToBytes, type EventPayload } from '@chronolog/protocol'
+import { base64UrlToBytes } from '@chronolog/protocol'
 import type { RpcTransport, RpcCallOptions, UnaryRpcMethod, UnaryRequest, UnaryResponse } from '@chronolog/rpc/browser'
 import { WorkerRpcTransport } from '@chronolog/runtime-browser'
 import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
-import type { EphemeralSignal } from '@chronolog/agent-service/signals'
 import { supervisePeerSession, type WebRtcSession } from '@chronolog/transport-webrtc'
 
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
@@ -127,23 +126,8 @@ try {
 } finally { membership.handle.dispose() }
 const backend = createChronologApplicationBackend({ id: bootstrap.applicationId, replica: client, sql: true })
 target.tendril.application.install(backend)
+target.tendril.signals.install(client.signals)
 
-export const signals = {
-  publish: (topic: string, payload: EventPayload, options: { ttlMs?: number } = {}) => command('signalPublish', { topic, payload, ...options }),
-  async *subscribe(options: { topics?: readonly string[]; signal?: AbortSignal } = {}): AsyncIterable<EphemeralSignal> {
-    const subscriptionId = crypto.randomUUID()
-    const cancel = () => { void command('signalCancel', { subscriptionId }).catch(() => undefined) }
-    options.signal?.addEventListener('abort', cancel, { once: true })
-    try {
-      while (options.signal?.aborted !== true) {
-        const result = await command('signalNext', { subscriptionId, topics: options.topics }, 0) as IteratorResult<EphemeralSignal>
-        if (result.done) return
-        options.signal?.throwIfAborted()
-        yield result.value
-      }
-    } finally { options.signal?.removeEventListener('abort', cancel); cancel() }
-  },
-}
 let closed = false
 target.applicationPilot = {
   identity: opened.identity, connectionErrors,

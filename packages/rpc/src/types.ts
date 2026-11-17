@@ -1,4 +1,5 @@
 import type { EventBatch, EventPayload, EventReadOptions } from '@chronolog/protocol'
+import type { SignalPayload } from '@chronolog/signals'
 
 /** Chronolog's local RPC API. Consensus codecs are versioned separately. */
 export const RPC_API_VERSION = 'chronolog.rpc' as const
@@ -64,6 +65,17 @@ export interface SubmitSignedRequest {
 }
 export interface EventReadRequest extends EventReadOptions { readonly groupId: GroupId; readonly requestId: RequestId }
 export type EventReadResponse = EventBatch
+export interface SendSignalRequest {
+  readonly groupId: GroupId
+  readonly topic: string
+  readonly payload: SignalPayload
+  readonly ttlMs?: number
+}
+export interface SubscribeSignalsRequest {
+  readonly groupId: GroupId
+  readonly topics?: readonly string[]
+  readonly mode?: 'all' | 'latest'
+}
 export interface OperationStatus {
   readonly operationId: string
   readonly proposalId: string

@@ -7,6 +7,8 @@ import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, 
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createNativeBrowserFixture } from '../tools/browser-event-fixture.js'
+import { observeIncludedProposals } from '../tools/lib/application-admission.js'
+import { waitFor } from '../tools/lib/wait-for.js'
 
 const configurationTopic = 'timers.configured', occurrenceTopic = 'timers.fired'
 const cleanup: Array<() => void | Promise<void>> = []
@@ -15,12 +17,31 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-native-sql-timers-'))
   cleanup.push(() => rm(directory, { recursive: true, force: true }))
+  let clockNow = Date.now()
   const native = await createNativeBrowserFixture({ directory, browsers: [], manifest: createDoltLiteExecutionManifest(),
+    authorClock: () => clockNow, finalityClock: () => clockNow,
     materialization: async ({ identity, executionManifest }) => createDoltLiteMaterializationRuntime(await DeterministicMaterializer.open({
       path: join(directory, 'application.db'), executionManifest, rootAdministrator: identity.signing.publicKeyBytes, checkpointEvery: 1,
     })) })
   cleanup.push(() => native.close())
-  const publisher = createSqlTimerPublisher({ node: native.node, configurationTopic, occurrenceTopic })
+  const included = observeIncludedProposals(native)
+  const publisherNode: Parameters<typeof createSqlTimerPublisher>[0]['node'] = {
+    async publish(input) {
+      const receipt = await native.node.publish(input)
+      // Timer semantics do not depend on test-host signing/SQL latency or on
+      // the resident closure timer. Advance author time only after the original
+      // signed proposal has its real inclusion receipt, then publish ordinary
+      // signed closure evidence. No proposal is replaced or authored again.
+      await waitFor(async () => (await included()).has(receipt.txIdText), `timer inclusion: ${input.operationId}`, 10_000)
+      clockNow += Number(native.governed.descriptor.genesis.manifest.clockPolicy.cutoffLagMs) + 1
+      await native.agent.finality!.share(native.transport)
+      return receipt
+    },
+    operation: operationId => native.node.operation(operationId),
+    revisions: (after, signal) => native.node.revisions(after, signal),
+    get revision() { return native.node.revision },
+  }
+  const publisher = createSqlTimerPublisher({ node: publisherNode, configurationTopic, occurrenceTopic })
   await publisher.initialize({ operationId: 'timer-schema', signal: AbortSignal.timeout(10_000) })
   return { native, publisher,
     options: { id: 'native-scheduler', sourceId: 'native-fixture/history', configurationTopic, store: native.store,

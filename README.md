@@ -17,9 +17,11 @@ receipt positions never order SQL or effective events. Newly included backdated
 proposals cannot reopen a closed prefix. Custom verifiers are selected by the
 provider ID and parameters signed in genesis.
 Both expose separate local and final SQL revisions, durable submission identity,
-and live scoped reader/writer enrollment. See the [application-log roadmap and
-evidence](docs/plans/application-log.md), [resident agent](packages/agent-service/README.md),
-and [pluggable finality](docs/pluggable-finality.md) for the architecture and tests.
+and live scoped reader/writer enrollment. Start with the
+[application primitives guide](docs/application-primitives.md) for choosing APIs,
+finality, replay and role boundaries. The [resident agent](packages/agent-service/README.md)
+and [pluggable finality](docs/pluggable-finality.md) explain the architecture;
+the [application-log report](docs/plans/application-log.md) tracks qualification.
 
 - **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
   dialect or migration system. Assumptions are SQL statements, usually
@@ -30,6 +32,11 @@ and [pluggable finality](docs/pluggable-finality.md) for the architecture and te
   use bounded pull delivery and history/filter-bound cursors, including progress
   across nonmatching records. Local projections atomically checkpoint state and
   processed progress outside the consensus core.
+- **Ephemeral signals.** `client.signals` carries typing, presence, cursors and
+  replaceable progress without retained history, transactional execution or a
+  finality provider. The standalone `@chronolog/signals` package also works
+  without a database or Chronolog membership. Group adapters add explicit
+  signal rights; durable topic rights do not implicitly grant them.
 - **Coherent views.** A bounded read lease pins SQL and effective events to one
   view. Provisional rebases replace that view; finality and operation status can
   advance even when rows stay equal.
@@ -59,9 +66,11 @@ and [pluggable finality](docs/pluggable-finality.md) for the architecture and te
   activate at verified policy boundaries. Epoch keys are wrapped to readers.
   SQL, durable topic and ephemeral signal rights are distinct. Limited
   publishers use original-signer ingress without reader keys or a local replica.
-- **Resident work.** A fenced native store owns the authority, final-intent
-  workers, timer generations and durable dispatch checkpoints. External effects
-  require provider idempotency/reconciliation or an explicit uncertain state.
+- **Resident work.** Final-intent workers own timer generations and durable
+  dispatch checkpoints in a fenced native store. A native finality service can
+  run alongside them, or a replica can consume proofs from another provider.
+  External effects require provider idempotency/reconciliation or an explicit
+  uncertain state.
 
 Read [the design](docs/design.md) for how it works,
 [Specification 10](docs/implementation-specs/10-deterministic-sql-transactions.md)
@@ -166,8 +175,15 @@ try {
 The schema/row grants and topic rights must authorize this program. Durable
 workers consume `client.events` or `node.events`; use `DurableProjection` with
 an atomic store for replayable frontend caches. Received cursors are not durable
-processed checkpoints. Typing and replaceable progress use the separate signed
-ephemeral channel, ending in a durable result when persistence matters.
+processed checkpoints. Typing and replaceable progress use `client.signals`:
+
+```ts
+await client.signals.send('presence/typing', { active: true }, { ttlMs: 3_000 })
+```
+
+Signals are best-effort and have no replay or final outcome. Publish a durable
+result when persistence matters. See the [signals contract](packages/signals/README.md)
+for bounded subscriptions, expiration and standalone use.
 
 `@chronolog/runtime-browser/events` opens the SQL-free OPFS Worker profile and
 exports `WorkerRpcTransport`. Its exclusive owner, synchronous private control
@@ -235,9 +251,11 @@ See the [chaos testing guide](docs/chaos-testing.md) and the
 | `crypto` | HPKE, signed epochs, content encryption |
 | `records` | Portable original signed records, immutable evidence, durable storage and shared range/stream synchronization |
 | `transport-ssb` | Native SQLite record/evidence storage and authenticated SSB connections |
-| `transport-tendriller` | Optional public retained-log adapter and on-demand prefix authority |
+| `transport-tendriller` | Optional public retained-log adapter and on-demand finality service |
 | `control-store` | Candidates, attestations, order, heartbeats, settlement evidence |
 | `node-core` | Governed peer composition, two history policies, durable operations, live enrollment, admission and finality |
+| `signals` | Standalone bounded ephemeral messages and transport adapters, independent of history and finality |
+| `agent-service` | Native finality service, final-event effect workers, timers and authenticated peer sessions |
 | `materializer-doltlite` | Deterministic SQL execution, owner-controlled rows (platform operations, generated triggers), Dolt checkpoints, suffix replay, local SQL |
 | `materializer` | Portable materialization contracts shared with the workerd path |
 | `runtime-browser` | Owning Worker, OPFS, Web Lock, patched DoltLite WASM and shared client RPC |

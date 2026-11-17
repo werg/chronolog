@@ -1,4 +1,5 @@
 import { sha256, utf8 } from '@chronolog/canonical'
+import type { EphemeralSignal, Signals } from '@chronolog/signals'
 import {
   assertValidChangeProgram,
   bytesToBase64Url as toBase64Url,
@@ -13,7 +14,7 @@ import {
 } from '@chronolog/protocol'
 
 import type { ChronologRpcService, RpcCallContext } from './contract.js'
-import { ChronologRpcError } from './errors.js'
+import { ChronologRpcError, type RpcErrorCode } from './errors.js'
 import type {
   ApproveEnrollmentRequest,
   ApproveEnrollmentResponse,
@@ -59,6 +60,7 @@ import type {
   SubmitChangeRequest, SubmitChangeResponse, SubmitSignedRequest, EventReadRequest, EventReadResponse,
   GetOperationRequest, OperationStatus, StreamOperationsRequest,
   OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
+  SendSignalRequest, SubscribeSignalsRequest,
 } from './types.js'
 import { RPC_API_VERSION } from './types.js'
 import type {
@@ -82,6 +84,7 @@ export type {
 
 export interface NodeRpcServiceOptions {
   readonly node: ChronologRpcNodeService
+  readonly signals?: Signals
   readonly governanceAdmin?: GovernanceRpcAdmin
   readonly enrollment?: EnrollmentRpcService
   readonly maxLocalSqlRows?: number
@@ -101,6 +104,7 @@ interface ReadLease {
 /** RPC facade over a node: local reads, transaction submission, outcomes and evidence. */
 export class NodeRpcService implements ChronologRpcService {
   readonly #node: ChronologRpcNodeService
+  readonly #signals: Signals | undefined
   readonly #governanceAdmin: GovernanceRpcAdmin | undefined
   readonly #enrollmentService: EnrollmentRpcService | undefined
   readonly #maxLocalSqlRows: number
@@ -113,6 +117,7 @@ export class NodeRpcService implements ChronologRpcService {
 
   constructor(options: NodeRpcServiceOptions) {
     this.#node = options.node
+    this.#signals = options.signals
     this.#governanceAdmin = options.governanceAdmin
     this.#enrollmentService = options.enrollment
     this.#maxLocalSqlRows = nonnegative(options.maxLocalSqlRows ?? 10_000, 'maxLocalSqlRows')
@@ -131,6 +136,30 @@ export class NodeRpcService implements ChronologRpcService {
     } catch (error) { throw new ChronologRpcError('invalid_argument', 'Invalid canonical change program', { cause: error }) }
     const submission = await this.#publish(program, request.operationId, request.groupId, context)
     return { ...submission, operationId: request.operationId, proposalId: submission.transactionId }
+  }
+
+  async sendSignal(request: SendSignalRequest, context: RpcCallContext): Promise<EphemeralSignal> {
+    this.#assertGroup(request.groupId)
+    context.signal?.throwIfAborted()
+    if (this.#signals === undefined) throw failed('Ephemeral signals are not configured for this node')
+    try {
+      return await this.#signals.send(request.topic, request.payload, {
+        ...(request.ttlMs === undefined ? {} : { ttlMs: request.ttlMs }),
+        ...(context.signal === undefined ? {} : { signal: context.signal }),
+      })
+    } catch (error) { throw signalRpcError(error, context.signal) }
+  }
+
+  async *subscribeSignals(request: SubscribeSignalsRequest, context: RpcCallContext): AsyncIterable<EphemeralSignal> {
+    this.#assertGroup(request.groupId)
+    if (this.#signals === undefined) throw failed('Ephemeral signals are not configured for this node')
+    try {
+      yield* this.#signals.subscribe({
+        ...(request.topics === undefined ? {} : { topics: request.topics }),
+        ...(request.mode === undefined ? {} : { mode: request.mode }),
+        ...(context.signal === undefined ? {} : { signal: context.signal }),
+      })
+    } catch (error) { throw signalRpcError(error, context.signal) }
   }
 
   async submitSigned(request: SubmitSignedRequest, context: RpcCallContext): Promise<SubmitTransactionResponse> {
@@ -731,4 +760,19 @@ function stableFingerprint(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableFingerprint).join(',')}]`
   if (typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableFingerprint(item)}`).join(',')}}`
   throw new TypeError('Unsupported RPC value')
+}
+
+/** Live messages must never acquire the ordinary durable RPC retry policy. */
+function signalRpcError(error: unknown, signal?: AbortSignal): ChronologRpcError {
+  const message = error instanceof Error ? error.message : 'Signal operation failed'
+  let code: RpcErrorCode = 'internal'
+  if (signal?.aborted === true || (error instanceof DOMException && error.name === 'AbortError')) code = 'cancelled'
+  else if (error instanceof DOMException && error.name === 'TimeoutError') code = 'deadline_exceeded'
+  else if (message === 'SIGNAL_UNAUTHORIZED') code = 'permission_denied'
+  else if (message === 'SIGNAL_DISCONNECTED' || message === 'SIGNAL_CHANNEL_CLOSED' || message === 'SIGNAL_SEND_FAILED') code = 'transport_unavailable'
+  else if (message === 'SIGNAL_BACKPRESSURE' || message === 'SIGNAL_SUBSCRIPTION_OVERFLOW' || message.endsWith('_QUOTA_EXCEEDED')) code = 'resource_exhausted'
+  else if (message === 'SIGNAL_EXPIRED') code = 'deadline_exceeded'
+  else if (message.startsWith('SIGNAL_') && (message.endsWith('_INVALID') || message.endsWith('_TOO_LARGE') || message.endsWith('_TOO_COMPLEX'))) code = 'invalid_argument'
+  else if (error instanceof ChronologRpcError) code = error.code
+  return new ChronologRpcError(code, message, { cause: error, retryable: false })
 }

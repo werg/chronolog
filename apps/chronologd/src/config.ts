@@ -62,8 +62,9 @@ export interface DaemonRuntimeConfig {
   readonly historyPolicy?: 'peer' | 'coordinated'
   readonly executionProfile: 'sql' | 'events'
   readonly agentModule?: string
-  readonly authorityQuotaBytes: number
-  readonly authorityContinuityFile?: string
+  readonly finalityRecordQuotaBytes: number
+  readonly finalityPayloadQuotaBytes: number
+  readonly finalityContinuityFile?: string
 }
 
 export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): DaemonRuntimeConfig {
@@ -110,9 +111,10 @@ export function parseDaemonRuntimeConfig(environment: NodeJS.ProcessEnv): Daemon
     ...(historyPolicy === undefined ? {} : { historyPolicy }),
     executionProfile,
     ...(environment.CHRONOLOG_AGENT_MODULE === undefined ? {} : { agentModule: nonempty(environment.CHRONOLOG_AGENT_MODULE, 'CHRONOLOG_AGENT_MODULE') }),
-    authorityQuotaBytes: integer(environment.CHRONOLOG_AUTHORITY_QUOTA_BYTES ?? '67108864', 1024, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_AUTHORITY_QUOTA_BYTES'),
-    ...(environment.CHRONOLOG_AUTHORITY_CONTINUITY_FILE === undefined ? {} : {
-      authorityContinuityFile: nonempty(environment.CHRONOLOG_AUTHORITY_CONTINUITY_FILE, 'CHRONOLOG_AUTHORITY_CONTINUITY_FILE'),
+    finalityRecordQuotaBytes: integer(environment.CHRONOLOG_FINALITY_RECORD_QUOTA_BYTES ?? '67108864', 1024, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_FINALITY_RECORD_QUOTA_BYTES'),
+    finalityPayloadQuotaBytes: integer(environment.CHRONOLOG_FINALITY_PAYLOAD_QUOTA_BYTES ?? '67108864', 1024, Number.MAX_SAFE_INTEGER, 'CHRONOLOG_FINALITY_PAYLOAD_QUOTA_BYTES'),
+    ...(environment.CHRONOLOG_FINALITY_CONTINUITY_FILE === undefined ? {} : {
+      finalityContinuityFile: nonempty(environment.CHRONOLOG_FINALITY_CONTINUITY_FILE, 'CHRONOLOG_FINALITY_CONTINUITY_FILE'),
     }),
   }
 }

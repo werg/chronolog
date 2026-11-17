@@ -9,6 +9,7 @@ import { MAX_LEDGER_PAYLOAD_BYTES } from '@chronolog/node-core/ledger'
 import { assertCanonicalCbor, encodeCanonicalCbor, equalBytes, generateEd25519KeyPair, utf8, type CborValue } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type FeedLink } from '@chronolog/records'
 import { FeedTransport } from '@chronolog/transport-ssb'
+import { SignalChannel, SIGNAL_DOMAIN } from '@chronolog/signals'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { framePeerStream } from './framing.js'
@@ -105,7 +106,7 @@ async function signalSession() {
   const [sender, receiver] = await Promise.all([
     openAuthenticatedPeerLink({ connection: { ...outgoing, async send(bytes) {
       const frame = assertCanonicalCbor(bytes)
-      if (Array.isArray(frame) && frame[1] === 'chronolog/ephemeral/v1') sent.push(bytes.slice())
+      if (Array.isArray(frame) && frame[1] === SIGNAL_DOMAIN) sent.push(bytes.slice())
       await outgoing.send(bytes)
     } }, local: server.transport.asLink(), identity: server.identity, groupId, grantId,
       async authorizePeer() { await guard?.(); return active } }),
@@ -181,6 +182,18 @@ describe('authenticated framed range synchronization', () => {
     await Promise.all([leftConnection.close(), rightConnection.close()])
   })
 
+  it('rechecks reader access before releasing ephemeral messages after authentication', async () => {
+    const session = await payloadSession(async () => null)
+    const identity = await generateEd25519KeyPair(), frames: Uint8Array[] = []
+    const signals = new SignalChannel({ scope: 'room', identity, authorize: () => true, send: async frame => { frames.push(frame) } })
+    try {
+      await signals.send('progress', 1)
+      await session.server.sendSignal(frames[0]!)
+      session.revoke()
+      await expect(session.server.sendSignal(frames[0]!)).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    } finally { signals.close() }
+  })
+
   it('fetches a detached payload only on demand and rechecks reader rights', async () => {
     const body = new Uint8Array(256 * 1024 + 17).fill(53), hash = bytesToHex(await sha256(body))
     const provider = vi.fn(async (requested: string) => requested === hash ? body : null)
@@ -209,7 +222,7 @@ describe('authenticated framed range synchronization', () => {
   })
 
   it('stops sending application signals to an established peer after reader revocation', async () => {
-    const session = await signalSession(), signal = encodeCanonicalCbor([1n, 'chronolog/ephemeral/v1', 'private presence'])
+    const session = await signalSession(), signal = encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'private presence'])
     await session.sender.sendSignal(signal)
     expect(session.sent).toEqual([signal])
     session.revoke()
@@ -219,7 +232,7 @@ describe('authenticated framed range synchronization', () => {
 
   it.each(['revocation', 'close'] as const)('does not release a signal after %s during asynchronous reader authorization', async ending => {
     const session = await signalSession(), gate = session.block()
-    const sending = session.sender.sendSignal(encodeCanonicalCbor([1n, 'chronolog/ephemeral/v1', 'private presence']))
+    const sending = session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'private presence']))
     const rejected = expect(sending).rejects.toThrow(ending === 'revocation' ? 'PEER_READ_UNAUTHORIZED' : 'PEER_CONNECTION_CLOSED')
     await gate.blocked
     if (ending === 'revocation') session.revoke()

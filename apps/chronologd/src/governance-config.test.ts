@@ -12,6 +12,21 @@ const directories: string[] = []
 afterEach(async () => Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))))
 
 describe('daemon governance bootstrap', () => {
+  it('pins the signed clock policy and rejects a local override on reopen', async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), 'chronolog-governance-clock-'))
+    directories.push(dataDirectory)
+    const options = { dataDirectory, groupId: bytes32(61), schemaId: bytes32(62),
+      identity: await generateEd25519KeyPair(), transportAuthor: '@root.ed25519',
+      clockPolicy: { cutoffLagMs: 250n, maxFutureSkewMs: 5_000n, heartbeatIntervalMs: 25n } }
+    const first = await loadOrCreateGovernanceBootstrap(options)
+    expect(first.genesis.manifest.clockPolicy).toEqual(options.clockPolicy)
+    const { clockPolicy: _clockPolicy, ...reopen } = options
+    expect((await loadOrCreateGovernanceBootstrap(reopen)).genesis).toEqual(first.genesis)
+    await expect(loadOrCreateGovernanceBootstrap({ ...options,
+      clockPolicy: { ...options.clockPolicy, cutoffLagMs: 251n } })).rejects.toThrow('GOVERNANCE_CLOCK_POLICY_MISMATCH')
+    expect((await loadOrCreateGovernanceBootstrap(options)).genesis).toEqual(first.genesis)
+  })
+
   it('persists one private bootstrap and reloads its signed genesis exactly', async () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), 'chronolog-governance-config-'))
     directories.push(dataDirectory)

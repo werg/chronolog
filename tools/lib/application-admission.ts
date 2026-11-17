@@ -57,7 +57,7 @@ export function observeIncludedProposals(native: NativeBrowserFixture) {
   const observed = new Set<string>()
   const decoded = new Set<string>()
   return async () => {
-    const authority = native.agent.authority
+    const authority = native.agent.finality
     if (authority === null) throw new Error('PILOT_NATIVE_AUTHORITY_REQUIRED')
     const range = await authority.read({ limit: 256 })
     if (range.hasMore) throw new Error('PILOT_INCLUSION_HISTORY_TRUNCATED')

@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/werg/tendriller",
+  "sourceCommit": "b8db8dcdd1d3730876f1346550ef04f7a6cbdeb6",
+  "sourceTree": "a938521d880d0c4291dad84b647f34a9e216b376",
+  "sourceDirty": false,
+  "buildCommand": "npm run build",
+  "dependencyInstallCommand": "npm ci --no-audit --no-fund",
+  "membershipSource": "89aee742709d33af5dcbc27241b1e241ab6c063b",
+  "purpose": "Public independent signal port, quiet peer runtime, HTTPS introduction snapshots and compact membership proofs; no hosted application-frame relay.",
+  "package": "@tendriller/engine",
+  "version": "0.3.0-rc.9",
+  "artifact": "tendriller-engine-b8db8dcd.tgz",
+  "sha256": "cb2eef47cc61154f9728ad751d8fc3a4069aa8d48b93802fe4e194f61c6f3645"
+}

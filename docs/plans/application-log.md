@@ -336,12 +336,16 @@ read/query/enrollment/admin/local-signing routes remain protected.
 credentials and rejects redirects. The owner bearer must never be given to a
 limited publisher. Cross-origin allowlists belong to the deployment gateway.
 
-`EphemeralChannel` signs a separate group/topic/grant/session/sequence/expiry
-domain, validates the receiver's known active membership and bounds replay
-state, pending work and coalescing queues. It never persists signals or advances
-a durable cursor. The fixture forwards verified original bytes; typing ends at
-its signed expiry. An offline receiver cannot know of revocations it has not
-received.
+The current [`@chronolog/signals`](../../packages/signals/README.md) core is a
+standalone signed, expiring message channel with explicit application policy and
+no database prerequisite. `client.signals` and native `context.signals` are public
+surfaces; production peer attachment handles routing and resident forwarding.
+The default subscription preserves accepted messages in a bounded FIFO, with
+explicit overflow; `latest` coalesces per author/session/topic only when chosen.
+Signals never persist, advance a durable cursor, or wait for finality. The group
+adapter supplies current signal rights without imposing SQL/event rights. TTL
+starts at the call, and typing UI removes each session at its signed expiry.
+An offline receiver cannot know of revocations it has not received.
 
 ## Executable public-runtime pilot
 
@@ -419,7 +423,7 @@ earlier administration/record format, not the new thin-membership gate.
 | Original records/certificates across authenticated byte streams | [Link tests](../../packages/agent-service/src/peer-link.test.ts), [HTTP fixture integration](../../test/browser/event-fixture.test.ts) | No home/mobile/corporate direct byte-route claim. |
 | Final intent, uncertain effects, exact result retry and deadlines | [Worker tests](../../packages/agent-service/src/effect-worker.test.ts), daemon composition | Controlled provider fixtures cannot establish a real provider promise. |
 | Timer race, replacement generation and accepted retry after cancellation | [Scheduler tests](../../packages/agent-service/src/timers.test.ts), [real SQL integration](../../test/sql-timers.integration.test.ts) | External action cancellation remains a provider contract. |
-| Ephemeral expiry/replay and backpressure | [Signals](../../packages/agent-service/src/signals.test.ts), [framing](../../packages/agent-service/src/framing.test.ts), pilot | Known membership is local; no instantaneous offline revocation knowledge. |
+| Ephemeral expiry/replay and backpressure | [Signals](../../packages/signals/src/signals.test.ts), [framing](../../packages/agent-service/src/framing.test.ts), pilot | Known membership is local; no instantaneous offline revocation knowledge. |
 | Public consumption and peer-only page behavior | Tendriller release consumers, [adapter tests](../../packages/transport-tendriller/src/application.test.ts), pilot | Runtime is packaged; production network qualification stays open. |
 
 Contrib's [complete scenario matrix](https://github.com/werg/tendriller-contrib/blob/feat/chronolog-application-log/cookbooks/run-a-peer-application/notes/implementation-and-qualification.md)

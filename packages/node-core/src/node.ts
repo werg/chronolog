@@ -1060,7 +1060,7 @@ export class ChronologNode {
     // is persisted just before signing. Persisting here for every candidate
     // fsynced once per record during history replay (seconds per restart).
     this.#advanceValidatorCutoff(now)
-    const futureLimit = BigInt(Math.trunc(now + (validator.maxFutureSkewMs ?? 30_000)))
+    const futureLimit = BigInt(Math.trunc(now)) + BigInt(validator.maxFutureSkewMs ?? 30_000)
     if (core.authorTimestampMs > futureLimit || core.authorTimestampMs <= this.#acceptedAboveMs) return
     const context = {
       groupId: core.groupId,

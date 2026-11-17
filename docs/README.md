@@ -19,8 +19,9 @@ resolves.
 
 - **Developer:** [README](../README.md), [portable peers](portable-peers.md), then [design](design.md) and
   [Specification 10](implementation-specs/10-deterministic-sql-transactions.md).
-- **Application/agent author:** [Application-log implementation and evidence](plans/application-log.md),
-  [resident service](../packages/agent-service/README.md) and [browser runtimes](../packages/runtime-browser/README.md).
+- **Application/agent author:** [Application primitives](application-primitives.md),
+  [signals](../packages/signals/README.md), [resident service](../packages/agent-service/README.md)
+  and [browser runtimes](../packages/runtime-browser/README.md).
 - **Operator:** [Pilot runbook](pilot-runbook.md), then
   [governance](governance.md), [snapshot recovery](snapshot-recovery.md) and
   [release hardening](release-hardening.md).
@@ -40,7 +41,9 @@ resolves.
 
 | Document | Status | Contents |
 | --- | --- | --- |
-| [plans/application-log.md](plans/application-log.md) | Implementation and qualification | Durable events, native authority, signed ingress, coherent projections, worker/timer recovery and the public contrib pilot. |
+| [application-primitives.md](application-primitives.md) | Application guide | Signals, durable events, SQL, finality, replay, retries, authority roles and external effects. |
+| [pluggable-finality.md](pluggable-finality.md) | Architecture and integration | Deterministic author-time order, inclusion, signed closure promises and the provider extension boundary. |
+| [plans/application-log.md](plans/application-log.md) | Implementation and qualification | Durable events, native finality, signed ingress, coherent projections, worker/timer recovery and the public contrib pilot. |
 | [portable-peers.md](portable-peers.md) | Architecture and integration | Two history policies, portable records, durable proposals, actual final SQL and live enrollment. |
 | [implementation-status.md](implementation-status.md) | Status | What works end to end and what remains. |
 | [../upcoming.md](../upcoming.md) | Status (ordered roadmap) | Project queue and acceptance checks. |

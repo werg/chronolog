@@ -4,12 +4,12 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { join } from 'node:path'
 
 import { NativeAgentStore, framePeerStream, type AgentApplicationModule } from '@chronolog/agent-service'
-import { encodeSignedGenesis, isCapabilityActive, signGenesis, type CapabilityGrant } from '@chronolog/capabilities'
+import { encodeSignedGenesis, signGenesis, type CapabilityGrant } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import { createEventMaterializationRuntime, eventExecutionManifest, type ChronologMaterializationRuntime } from '@chronolog/materializer'
 import { createGovernedNode, loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core'
-import { base64UrlToBytes, bytesToBase64Url, encodeExecutionManifest, equalBytes, executionManifestArtifacts, utf8, type ExecutionManifest } from '@chronolog/protocol'
+import { base64UrlToBytes, bytesToBase64Url, encodeExecutionManifest, executionManifestArtifacts, utf8, type ExecutionManifest } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 
@@ -25,6 +25,8 @@ export async function createNativeBrowserFixture(options: {
   readonly directory: string
   readonly browsers: readonly BrowserEventIdentity[]
   readonly topics?: readonly string[]
+  /** Semantic tests may supply one controlled author/finality clock; browser gates use wall time. */
+  readonly authorClock?: () => number
   /** Qualification-only clock control; signed proposal timestamps are unchanged. */
   readonly finalityClock?: () => number
   readonly manifest?: ExecutionManifest
@@ -67,14 +69,12 @@ export async function createNativeBrowserFixture(options: {
     encryptionSuite: 'HPKE-X25519-HKDF-SHA256-AES-256-GCM', createdAtMs: 1n,
   }, identity.signing.privateKey)
   const governed = await createGovernedNode({ genesis, groupRoute, identity: identity.signing, transport, operationStore: store,
+    ...(options.authorClock === undefined ? {} : { clock: { now: options.authorClock } }),
     controlStore: new ControlStore(new SqliteControlStorePersistence(control), { orderPolicy: 'coordinated' }), materialization,
     recipient: { id: identity.signing.publicKeyBytes, privateKey: identity.reader.privateKey }, initialEpochContentKey: epochContentKey })
   await governed.start()
-  const agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, history: governed.descriptor.history,
+  const agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, descriptor: governed.descriptor,
     store, transport, activeMembership: () => governed.activeSnapshot,
-    cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
-    futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
-    closureIntervalMs: Number(genesis.manifest.clockPolicy.heartbeatIntervalMs),
     ...(options.finalityClock === undefined ? {} : { finalityClock: options.finalityClock }),
     ...(options.application === undefined ? {} : { application: options.application }),
     peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
@@ -82,13 +82,10 @@ export async function createNativeBrowserFixture(options: {
   let serviceFailure: Error | undefined
   void running.catch((error: unknown) => { serviceFailure = error instanceof Error ? error : new Error('NATIVE_AGENT_FAILED', { cause: error }) })
   const client = new ChronologClient({ groupId: bytesToBase64Url(groupId),
-    transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node })), unaryRetryAttempts: 1 })
+    transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node, signals: agent.context.signals })), unaryRetryAttempts: 1 })
   const token = crypto.randomUUID()
   const sessions = new Map<string, { readonly writer: WritableStreamDefaultWriter<Uint8Array>;
-    sendSignal(bytes: Uint8Array): Promise<void>; close(): Promise<void> }>()
-  const nativeWriter = [...governed.activeSnapshot.capabilities.values()].find((capability) => capability.grant.role === 'writer' &&
-    isCapabilityActive(capability, governed.activeSnapshot.revision) && equalBytes(capability.grant.signingPublicKey, identity.signing.publicKeyBytes))!
-  const signals = await agent.context.createSignals({ grantId: nativeWriter.id, send: async () => { /* This fixture only forwards original signed signals. */ } })
+    close(): Promise<void> }>()
   const failures: string[] = []
   const server = createServer((request, response) => {
     response.setHeader('Access-Control-Allow-Origin', '*')
@@ -117,15 +114,9 @@ export async function createNativeBrowserFixture(options: {
           sessions.delete(id)
           await Promise.allSettled([connection.close(), writer.abort(), session?.close()])
         }
-        sessions.set(id, { writer, close, async sendSignal(bytes) { await session?.sendSignal(bytes) } })
+        sessions.set(id, { writer, close })
         response.on('close', () => { void close() })
-        void agent.context.connectPeer({ connection, signals: { async receive(bytes) {
-          const verified = await signals.receive(bytes)
-          // Host send queues and receive concurrency are bounded. Expired or
-          // congested replaceable signals may be dropped, never persisted.
-          await Promise.allSettled([...sessions.entries()].filter(([other]) => other !== id).map(([, other]) => other.sendSignal(bytes)))
-          return verified
-        } } }).then((value) => {
+        void agent.context.connectPeer({ connection }).then((value) => {
           session = value
           if (closed) { void value.close(); return }
           void value.completion.catch((error: unknown) => {

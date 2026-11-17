@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 15053301742f617f8b07c4b403d495c8b57a6ea1
+          ref: bf09a7948f9bb504f2ac5d6e3903daec4d0ca774
           path: artifacts/tendriller-contrib
           persist-credentials: false
       - name: Qualify the native HTTPS resident task and current reader authorization

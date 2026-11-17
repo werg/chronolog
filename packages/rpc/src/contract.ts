@@ -1,3 +1,4 @@
+import type { EphemeralSignal } from '@chronolog/signals'
 import type {
   ApproveEnrollmentRequest,
   ApproveEnrollmentResponse,
@@ -39,12 +40,14 @@ import type {
   EventReadRequest, EventReadResponse,
   GetOperationRequest, OperationStatus, StreamOperationsRequest,
   OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
+  SendSignalRequest, SubscribeSignalsRequest,
 } from './types.js'
 
 export interface RpcCallOptions { readonly signal?: AbortSignal; readonly token?: string; readonly timeoutMs?: number; readonly metadata?: Readonly<Record<string, string>> }
 export interface RpcCallContext extends RpcCallOptions { readonly method: RpcMethod; readonly peer?: string }
 
 export interface UnaryRpcMethods {
+  'signals.send': { request: SendSignalRequest; response: EphemeralSignal }
   'change.submit': { request: SubmitChangeRequest; response: SubmitChangeResponse }
   'ingress.submit': { request: SubmitSignedRequest; response: SubmitTransactionResponse }
   'events.read': { request: EventReadRequest; response: EventReadResponse }
@@ -70,6 +73,7 @@ export interface UnaryRpcMethods {
   'enrollment.getStatus': { request: GetEnrollmentStatusRequest; response: EnrollmentStatus }
 }
 export interface StreamRpcMethods {
+  'signals.subscribe': { request: SubscribeSignalsRequest; response: EphemeralSignal }
   'events.subscribe': { request: EventReadRequest; response: EventReadResponse }
   'operation.subscribe': { request: StreamOperationsRequest; response: OperationStatus }
   'node.streamStatus': { request: StreamStatusRequest; response: NodeStatus }
@@ -91,6 +95,8 @@ export interface RpcTransport {
   close?(): Promise<void>
 }
 export interface ChronologRpcService {
+  sendSignal(request: SendSignalRequest, context: RpcCallContext): Promise<EphemeralSignal>
+  subscribeSignals(request: SubscribeSignalsRequest, context: RpcCallContext): AsyncIterable<EphemeralSignal>
   submitChange(request: SubmitChangeRequest, context: RpcCallContext): Promise<SubmitChangeResponse>
   submitSigned(request: SubmitSignedRequest, context: RpcCallContext): Promise<SubmitTransactionResponse>
   readEvents(request: EventReadRequest, context: RpcCallContext): Promise<EventReadResponse>

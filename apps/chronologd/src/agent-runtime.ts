@@ -3,16 +3,17 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
-  DurableEffectWorker, DurableTimerScheduler, EphemeralChannel, NativeAuthority, ResidentAgentService, openAuthenticatedPeerLink,
+  DurableEffectWorker, DurableTimerScheduler, NativeFinalityService, ResidentAgentService, openAuthenticatedPeerLink,
 } from '@chronolog/agent-service'
 import type {
   AgentApplicationContext, AgentApplicationModule, FinalEventPublisher, ResidentTask,
 } from '@chronolog/agent-service'
-import { isCapabilityActive } from '@chronolog/capabilities'
+import { createCapabilitySignals, isCapabilityActive } from '@chronolog/capabilities'
 import type { CapabilitySnapshot } from '@chronolog/capabilities'
 import type {
-  ChronologNode, DurableOperationStore, HistoryConfiguration, OrderedRecordHead,
+  ChronologNode, DurableOperationStore, EnrollmentDescriptor, OrderedRecordHead,
 } from '@chronolog/node-core'
+import { verifyEnrollmentDescriptor } from '@chronolog/node-core'
 import { bytesToHex, equalBytes } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
 import type { ChronologTransport, FeedLink } from '@chronolog/records'
@@ -22,13 +23,11 @@ export interface DaemonAgentRuntimeOptions {
   readonly transport: ChronologTransport
   readonly store: DurableOperationStore
   readonly identity: Ed25519KeyPair
-  readonly history: HistoryConfiguration
+  readonly descriptor: EnrollmentDescriptor
   readonly activeMembership?: () => CapabilitySnapshot
-  readonly authorityQuotaBytes?: number
+  readonly finalityRecordQuotaBytes?: number
+  readonly finalityPayloadQuotaBytes?: number
   readonly finalityClock?: () => number
-  readonly cutoffLagMs?: number
-  readonly futureAdmissionWindowMs?: number
-  readonly closureIntervalMs?: number
   readonly continuity?: OrderedRecordHead
   readonly modulePath?: string
   /** Dependency injection for native integration tests and embedded deployments. */
@@ -37,22 +36,30 @@ export interface DaemonAgentRuntimeOptions {
 }
 
 export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOptions) {
-  const sourceId = `${bytesToHex(options.history.groupId)}/${options.history.kind === 'coordinated'
-    ? options.history.historyId : bytesToHex(options.history.genesisDigest)}`
-  const authority = options.history.kind === 'coordinated' &&
-    (options.history.providerId ?? 'signed-inclusion-v2') === 'signed-inclusion-v2' &&
-    equalBytes(options.history.authorityPublicKey, options.identity.publicKeyBytes)
-    ? await NativeAuthority.open({ configuration: options.history, identity: options.identity, store: options.store,
+  const descriptor = structuredClone(options.descriptor)
+  await verifyEnrollmentDescriptor(descriptor)
+  if (!equalBytes(options.node.groupId, descriptor.history.groupId) ||
+      !equalBytes(options.node.executionManifestDigest, descriptor.history.executionManifestDigest)) throw new Error('AGENT_DESCRIPTOR_MISMATCH')
+  const history = descriptor.history
+  const sourceId = `${bytesToHex(history.groupId)}/${history.kind === 'coordinated'
+    ? history.historyId : bytesToHex(history.genesisDigest)}`
+  const finality = history.kind === 'coordinated' &&
+    (history.providerId ?? 'signed-inclusion-v2') === 'signed-inclusion-v2' &&
+    equalBytes(history.authorityPublicKey, options.identity.publicKeyBytes)
+    ? await NativeFinalityService.open({ descriptor, identity: options.identity, store: options.store,
       ...(options.finalityClock === undefined ? {} : { now: options.finalityClock }),
-      ...(options.cutoffLagMs === undefined ? {} : { cutoffLagMs: options.cutoffLagMs }),
-      ...(options.futureAdmissionWindowMs === undefined ? {} : { futureAdmissionWindowMs: options.futureAdmissionWindowMs }),
-      ...(options.closureIntervalMs === undefined ? {} : { closureIntervalMs: options.closureIntervalMs }),
-      ...(options.authorityQuotaBytes === undefined ? {} : { quotaBytes: options.authorityQuotaBytes }),
+      ...(options.finalityRecordQuotaBytes === undefined ? {} : { recordQuotaBytes: options.finalityRecordQuotaBytes }),
+      ...(options.finalityPayloadQuotaBytes === undefined ? {} : { payloadQuotaBytes: options.finalityPayloadQuotaBytes }),
       ...(options.continuity === undefined ? {} : { continuity: options.continuity }) })
     : null
-  if (authority === null && options.continuity !== undefined) throw new Error('AUTHORITY_CONTINUITY_WITHOUT_LOCAL_AUTHORITY')
+  if (finality === null && options.continuity !== undefined) throw new Error('AUTHORITY_CONTINUITY_WITHOUT_LOCAL_AUTHORITY')
   const controller = new AbortController()
-  const channels = new Set<EphemeralChannel>()
+  const signals = createCapabilitySignals({ groupId: history.groupId, identity: options.identity, relay: true,
+    current() {
+      if (options.activeMembership === undefined) throw new Error('SIGNAL_GOVERNANCE_REQUIRED')
+      return options.activeMembership()
+    },
+  })
   const peerClosers = new Set<() => Promise<void>>()
   const publisher: FinalEventPublisher = {
     publishFinal: async (topic, payload, input) => {
@@ -65,83 +72,84 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
     },
   }
   const context: AgentApplicationContext = {
-    node: options.node, store: options.store, authority, publisher, sourceId,
-    createSignals: async (input) => {
-      if (options.activeMembership === undefined) throw new Error('SIGNAL_GOVERNANCE_REQUIRED')
-      const channel = await EphemeralChannel.open({ groupId: options.history.groupId, identity: options.identity,
-        grantId: input.grantId, send: input.send,
-        authorize: ({ authorId, grantId, topic }) => {
-          const snapshot = options.activeMembership!()
-          if (!equalBytes(snapshot.groupId, options.history.groupId)) return false
-          const capability = snapshot.capabilities.get(bytesToHex(grantId))
-          const topics = capability?.grant.program?.signals
-          return capability !== undefined && capability.grant.role === 'writer' &&
-            isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, authorId) &&
-            topics !== undefined && (topics.includes('*') || topics.includes(topic))
-        },
-      })
-      channels.add(channel)
-      return channel
-    },
+    node: options.node, store: options.store, finality, publisher, sourceId, signals,
     connectPeer: async (input) => {
-      if (options.activeMembership === undefined || options.peerLinks === undefined) throw new Error('PEER_GOVERNANCE_TRANSPORT_REQUIRED')
-      const current = options.activeMembership()
-      const reader = input.grantId ?? [...current.capabilities.values()].find((capability) => capability.grant.role === 'reader' &&
-        isCapabilityActive(capability, current.revision) && equalBytes(capability.grant.signingPublicKey, options.identity.publicKeyBytes))?.id
-      if (reader === undefined) throw new Error('PEER_LOCAL_READER_GRANT_REQUIRED')
-      const session = await openAuthenticatedPeerLink({ connection: input.connection, local: options.peerLinks.local,
-        identity: options.identity, groupId: options.history.groupId, grantId: reader,
-        authorizePeer: ({ authorId, grantId }) => {
-          const snapshot = options.activeMembership!(), capability = snapshot.capabilities.get(bytesToHex(grantId))
-          return equalBytes(snapshot.groupId, options.history.groupId) && capability !== undefined &&
-            capability.grant.role === 'reader' && isCapabilityActive(capability, snapshot.revision) &&
-            equalBytes(capability.grant.signingPublicKey, authorId)
-        },
-        ...(input.signals === undefined ? {} : { receiveSignal: async (frame: Uint8Array) => { await input.signals!.receive(frame) } }),
-      })
-      const detach = options.peerLinks.attach(session.link)
-      const close = async (): Promise<void> => { detach(); await session.close(); peerClosers.delete(close) }
-      peerClosers.add(close)
-      void session.completion.finally(() => { detach(); peerClosers.delete(close) }).catch(() => undefined)
-      return { completion: session.completion, sendSignal: (bytes) => session.sendSignal(bytes), close }
+      const closeOpening = async (): Promise<void> => { await input.connection.close() }
+      peerClosers.add(closeOpening)
+      try {
+        controller.signal.throwIfAborted()
+        if (options.activeMembership === undefined || options.peerLinks === undefined) throw new Error('PEER_GOVERNANCE_TRANSPORT_REQUIRED')
+        const current = options.activeMembership()
+        const reader = input.grantId ?? [...current.capabilities.values()].find((capability) => capability.grant.role === 'reader' &&
+          isCapabilityActive(capability, current.revision) && equalBytes(capability.grant.signingPublicKey, options.identity.publicKeyBytes))?.id
+        if (reader === undefined) throw new Error('PEER_LOCAL_READER_GRANT_REQUIRED')
+        const session = await openAuthenticatedPeerLink({ connection: input.connection, local: options.peerLinks.local,
+          identity: options.identity, groupId: history.groupId, grantId: reader,
+          authorizePeer: ({ authorId, grantId }) => {
+            const snapshot = options.activeMembership!(), capability = snapshot.capabilities.get(bytesToHex(grantId))
+            return equalBytes(snapshot.groupId, history.groupId) && capability !== undefined &&
+              capability.grant.role === 'reader' && isCapabilityActive(capability, snapshot.revision) &&
+              equalBytes(capability.grant.signingPublicKey, authorId)
+          },
+          receiveSignal: async (frame: Uint8Array) => { await signals.receive(frame) },
+        })
+        let detach: (() => void) | undefined, detachSignals: (() => void) | undefined
+        try {
+          controller.signal.throwIfAborted()
+          detach = options.peerLinks.attach(session.link)
+          detachSignals = signals.attach((bytes) => session.sendSignal(bytes))
+          const cleanup = (): void => { detachSignals?.(); detach?.(); peerClosers.delete(close) }
+          const close = async (): Promise<void> => { cleanup(); await session.close() }
+          peerClosers.add(close)
+          void session.completion.finally(cleanup).catch(() => undefined)
+          return { completion: session.completion, close }
+        } catch (error) { detachSignals?.(); detach?.(); await session.close(); throw error }
+      } catch (error) { await input.connection.close(); throw error }
+      finally { peerClosers.delete(closeOpening) }
     },
   }
-  if (options.application !== undefined && options.modulePath !== undefined) throw new Error('AGENT_MODULE_DUPLICATE')
-  const application = options.application ?? (options.modulePath === undefined ? undefined : await loadApplicationModule(options.modulePath))
-  const definition = application === undefined ? {} : await application.createAgent(context)
-  const tasks: ResidentTask[] = authority === null ? [] : [{ id: 'authority', run: (signal) => authority.serve(options.transport, signal) }]
-  const effects: DurableEffectWorker[] = [], timers: DurableTimerScheduler[] = []
-  for (const entry of definition.effects ?? []) {
-    const worker = await DurableEffectWorker.open({ sourceId, store: options.store, source: options.node.events,
-      publisher, handler: entry.handler, resultTopic: entry.resultTopic })
-    effects.push(worker)
-    tasks.push({ id: `effect:${entry.handler.id}`, run: (signal) => worker.run(signal) })
-  }
-  for (const entry of definition.timers ?? []) {
-    const timer = await DurableTimerScheduler.open({ sourceId, store: options.store, source: options.node.events,
-      id: entry.id, configurationTopic: entry.configurationTopic, publisher: entry.publisher })
-    timers.push(timer)
-    tasks.push({ id: `timer:${entry.id}`, run: (signal) => timer.run(signal) })
-  }
-  tasks.push(...definition.tasks ?? [])
-  const service = tasks.length === 0 ? null : new ResidentAgentService(tasks)
-  let running: Promise<void> | null = null
-  return {
-    authority, effects, timers, context,
-    get taskIds() { return tasks.map((task) => task.id) },
-    get status() { return service?.status ?? { running: false, failedTask: null } },
-    run(): Promise<void> {
-      if (running !== null) throw new Error('AGENT_SERVICE_ALREADY_RUNNING')
-      if (controller.signal.aborted) throw new Error('AGENT_SERVICE_STOPPED')
-      running = service?.run(controller.signal) ?? Promise.resolve()
-      return running
-    },
-    async close(): Promise<void> {
-      controller.abort()
-      for (const channel of channels) channel.close()
-      await Promise.all([...peerClosers].map((close) => close()))
-      if (running !== null) await running.catch(() => undefined)
-    },
+  try {
+    if (options.application !== undefined && options.modulePath !== undefined) throw new Error('AGENT_MODULE_DUPLICATE')
+    const application = options.application ?? (options.modulePath === undefined ? undefined : await loadApplicationModule(options.modulePath))
+    const definition = application === undefined ? {} : await application.createAgent(context)
+    const tasks: ResidentTask[] = finality === null ? [] : [{ id: 'finality', run: (signal) => finality.serve(options.transport, signal) }]
+    const effects: DurableEffectWorker[] = [], timers: DurableTimerScheduler[] = []
+    for (const entry of definition.effects ?? []) {
+      const worker = await DurableEffectWorker.open({ sourceId, store: options.store, source: options.node.events,
+        publisher, handler: entry.handler, resultTopic: entry.resultTopic })
+      effects.push(worker)
+      tasks.push({ id: `effect:${entry.handler.id}`, run: (signal) => worker.run(signal) })
+    }
+    for (const entry of definition.timers ?? []) {
+      const timer = await DurableTimerScheduler.open({ sourceId, store: options.store, source: options.node.events,
+        id: entry.id, configurationTopic: entry.configurationTopic, publisher: entry.publisher })
+      timers.push(timer)
+      tasks.push({ id: `timer:${entry.id}`, run: (signal) => timer.run(signal) })
+    }
+    tasks.push(...definition.tasks ?? [])
+    const service = tasks.length === 0 ? null : new ResidentAgentService(tasks)
+    let running: Promise<void> | null = null
+    return {
+      finality, effects, timers, context,
+      get taskIds() { return tasks.map((task) => task.id) },
+      get status() { return service?.status ?? { running: false, failedTask: null } },
+      run(): Promise<void> {
+        if (running !== null) throw new Error('AGENT_SERVICE_ALREADY_RUNNING')
+        if (controller.signal.aborted) throw new Error('AGENT_SERVICE_STOPPED')
+        running = service?.run(controller.signal) ?? Promise.resolve()
+        return running
+      },
+      async close(): Promise<void> {
+        controller.abort()
+        signals.close()
+        await Promise.all([...peerClosers].map((close) => close()))
+        if (running !== null) await running.catch(() => undefined)
+      },
+    }
+  } catch (error) {
+    controller.abort(); signals.close()
+    await Promise.allSettled([...peerClosers].map(close => close()))
+    throw error
   }
 }
 

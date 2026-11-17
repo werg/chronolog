@@ -1,3 +1,7 @@
+import { execFile } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+
 import * as sealedCrypto from '@chronolog/crypto'
 import { generateX25519KeyPair } from '@chronolog/crypto'
 import { encodeSealedEnvelope, utf8, type SealedEnvelope, type SealedPlatformOp } from '@chronolog/protocol'
@@ -10,8 +14,9 @@ import { SealedDataActions, SealedPolicyNotFinalError, SealedVersionConflictErro
 
 const bytes = (seed: number): Uint8Array => new Uint8Array(32).fill(seed)
 const GROUP = Buffer.from(bytes(1)).toString('base64url')
+const execFileAsync = promisify(execFile)
 
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { vi.restoreAllMocks() })
 
 function result(rows: readonly (readonly DecodedLocalSqlValue[])[]): LocalSqlQueryResponse {
   return {
@@ -83,15 +88,12 @@ describe('sealed client helpers', () => {
   })
 
   it('encrypts and decrypts using browser globals without Node Buffer', async () => {
-    const reader = await generateX25519KeyPair()
-    const { actions, state, client } = fixture(reader.publicKeyBytes)
-    vi.stubGlobal('Buffer', undefined)
-    const change = await actions.put(bytes(2), 'body', utf8('browser secret'))
-    const step = client.transaction.mock.calls[0]![0][0] as SealedPlatformOp
-    if (step.op !== 'sealed_put') throw new Error('Expected sealed put')
-    state.envelope = step.envelope
-    const stored = await actions.get(bytes(2), 'body')
-    expect(await actions.decrypt(stored!, reader.privateKey, bytes(4), change.context)).toEqual(utf8('browser secret'))
+    // Vitest's concurrent IPC also uses Buffer. Remove it only in an isolated
+    // process, where the real client and crypto calls run without the runner.
+    const { stdout } = await execFileAsync(process.execPath, ['--import', 'tsx',
+      fileURLToPath(new URL('../../../test/fixtures/sealed-browser-globals.ts', import.meta.url)),
+    ], { timeout: 20_000 })
+    expect(stdout.trim()).toBe('sealed-browser-globals-ok')
   })
 
   it('submits explicit key registration and versioned reader policy changes', async () => {

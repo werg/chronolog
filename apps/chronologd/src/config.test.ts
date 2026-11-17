@@ -85,16 +85,20 @@ describe('daemon configuration', () => {
       .toMatchObject({ natVerificationUrl: 'https://probe.example/ssb' })
   })
 
-  it('selects explicit resident authority and SQL-absent profiles without implicit failover', () => {
+  it('selects explicit finality and SQL-absent profiles with separate storage budgets', () => {
     expect(parseDaemonRuntimeConfig({ CHRONOLOG_HISTORY_POLICY: 'coordinated', CHRONOLOG_EXECUTION_PROFILE: 'events',
-      CHRONOLOG_AGENT_MODULE: './agent.mjs', CHRONOLOG_AUTHORITY_QUOTA_BYTES: '4096' })).toMatchObject({
-      historyPolicy: 'coordinated', executionProfile: 'events', agentModule: './agent.mjs', authorityQuotaBytes: 4096,
+      CHRONOLOG_AGENT_MODULE: './agent.mjs', CHRONOLOG_FINALITY_RECORD_QUOTA_BYTES: '4096',
+      CHRONOLOG_FINALITY_PAYLOAD_QUOTA_BYTES: '8192' })).toMatchObject({
+      historyPolicy: 'coordinated', executionProfile: 'events', agentModule: './agent.mjs', finalityRecordQuotaBytes: 4096,
+      finalityPayloadQuotaBytes: 8192,
     })
     expect(parseDaemonRuntimeConfig({}).historyPolicy).toBeUndefined()
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_HISTORY_POLICY: 'automatic' })).toThrow('CHRONOLOG_HISTORY_POLICY_INVALID')
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_EXECUTION_PROFILE: 'guess' })).toThrow('CHRONOLOG_EXECUTION_PROFILE_INVALID')
     expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_AGENT_MODULE: '' })).toThrow('CHRONOLOG_AGENT_MODULE_INVALID')
-    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_AUTHORITY_QUOTA_BYTES: '0' })).toThrow('CHRONOLOG_AUTHORITY_QUOTA_BYTES_INVALID')
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_FINALITY_RECORD_QUOTA_BYTES: '0' })).toThrow('CHRONOLOG_FINALITY_RECORD_QUOTA_BYTES_INVALID')
+    expect(parseDaemonRuntimeConfig({}).finalityPayloadQuotaBytes).toBe(64 * 1024 * 1024)
+    expect(() => parseDaemonRuntimeConfig({ CHRONOLOG_FINALITY_PAYLOAD_QUOTA_BYTES: '0' })).toThrow('CHRONOLOG_FINALITY_PAYLOAD_QUOTA_BYTES_INVALID')
   })
 
   it('enables only explicitly configured publisher ingress while retaining remote owner authentication', () => {

@@ -26,6 +26,7 @@ const unaryDispatch: {
   'change.submit': 'submitChange',
   'ingress.submit': 'submitSigned',
   'events.read': 'readEvents',
+  'signals.send': 'sendSignal',
   'operation.get': 'getOperation',
   'view.open': 'openReadView',
   'view.query': 'queryReadView',
@@ -52,6 +53,7 @@ const streamDispatch: {
   [M in StreamRpcMethod]: keyof ChronologRpcService
 } = {
   'events.subscribe': 'subscribeEvents',
+  'signals.subscribe': 'subscribeSignals',
   'operation.subscribe': 'subscribeOperations',
   'node.streamStatus': 'streamStatus',
   'query.liveSql': 'liveSql',

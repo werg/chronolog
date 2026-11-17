@@ -13,5 +13,4 @@ export interface BrowserEventBootstrap {
   readonly nativeIdentity: string
   readonly peerUrl: string
   readonly peerToken: string
-  readonly connection?: { readonly url: string; readonly route: 'direct' | 'relay' }
 }

@@ -69,8 +69,8 @@ process.stdout.write(`${JSON.stringify({
   executionProfile: runtime.executionProfile,
   publisherIngress: runtime.publisherIngress,
   agentTasks: agent?.taskIds ?? [],
-  nativeAuthority: agent?.authority !== null && agent?.authority !== undefined,
-  membershipLedgerUrl: agent?.authority == null ? null : `${address.url}${MEMBERSHIP_LEDGER_PATH}`,
+  nativeFinalityService: agent?.finality !== null && agent?.finality !== undefined,
+  membershipLedgerUrl: agent?.finality == null ? null : `${address.url}${MEMBERSHIP_LEDGER_PATH}`,
 })}\n`)
 
 let stopping = false
@@ -176,6 +176,11 @@ async function startRuntime() {
     } else {
       const bootstrap = await loadOrCreateGovernanceBootstrap({
         dataDirectory, groupId, schemaId: executionManifestDigest, identity, transportAuthor: transport.identity,
+        ...(['CHRONOLOG_CUTOFF_LAG_MS', 'CHRONOLOG_MAX_FUTURE_SKEW_MS', 'CHRONOLOG_HEARTBEAT_INTERVAL_MS']
+          .some(name => process.env[name] !== undefined) ? { clockPolicy: {
+            cutoffLagMs: BigInt(runtime.cutoffLagMs), maxFutureSkewMs: BigInt(runtime.maxFutureSkewMs),
+            heartbeatIntervalMs: BigInt(runtime.heartbeatIntervalMs),
+          } } : {}),
         ...(secretStore === undefined ? {} : { secretStore }),
         ...(runtime.historyPolicy === undefined ? {} : { historyPolicy: runtime.historyPolicy }),
       })
@@ -187,8 +192,6 @@ async function startRuntime() {
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
         materialization: materialization!, operationStore,
         controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState), { orderPolicy }),
-        validator: { cutoffLagMs: runtime.cutoffLagMs, maxFutureSkewMs: runtime.maxFutureSkewMs,
-          heartbeatIntervalMs: runtime.heartbeatIntervalMs },
         initialEpochContentKey: fromBase64(config.epochContentKey),
         feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
       })
@@ -208,18 +211,17 @@ async function startRuntime() {
         isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
       })
       agent = await createDaemonAgentRuntime({ node, transport, store: operationStore, identity,
-        history: governed.descriptor.history, activeMembership: () => governed!.activeSnapshot,
+        descriptor: governed.descriptor, activeMembership: () => governed!.activeSnapshot,
         peerLinks: { local: transport.asLink(), attach: (link) => transport.connectLink(link) },
-        authorityQuotaBytes: runtime.authorityQuotaBytes,
-        cutoffLagMs: Number(bootstrap.genesis.manifest.clockPolicy.cutoffLagMs),
-        futureAdmissionWindowMs: Number(bootstrap.genesis.manifest.clockPolicy.maxFutureSkewMs + bootstrap.genesis.manifest.clockPolicy.cutoffLagMs),
-        closureIntervalMs: Number(bootstrap.genesis.manifest.clockPolicy.heartbeatIntervalMs),
+        finalityRecordQuotaBytes: runtime.finalityRecordQuotaBytes,
+        finalityPayloadQuotaBytes: runtime.finalityPayloadQuotaBytes,
         ...(runtime.agentModule === undefined ? {} : { modulePath: runtime.agentModule }),
-        ...(runtime.authorityContinuityFile === undefined ? {} : { continuity: await readAuthorityContinuity(runtime.authorityContinuityFile) }),
+        ...(runtime.finalityContinuityFile === undefined ? {} : { continuity: await readAuthorityContinuity(runtime.finalityContinuityFile) }),
       })
     }
     server = new HttpRpcServer({
       service: new NodeRpcService({
+        ...(agent === undefined ? {} : { signals: agent.context.signals }),
         node,
         ...(enrollment === undefined ? {} : { enrollment }),
         ...(governance === undefined ? {} : {
@@ -230,8 +232,8 @@ async function startRuntime() {
       port: runtime.port,
       ...(runtime.token === undefined ? {} : { token: runtime.token }),
       publisherIngress: runtime.publisherIngress,
-      ...(agent?.authority == null || governed === undefined ? {} : {
-        membershipLedger: createMembershipLedgerHandler({ authority: agent.authority, descriptor: governed.descriptor, sink: transport }),
+      ...(agent?.finality == null || governed === undefined ? {} : {
+        membershipLedger: createMembershipLedgerHandler({ finality: agent.finality, descriptor: governed.descriptor, sink: transport }),
       }),
       health: async () => daemonHealth(await node!.status(), stopping, traversalError(runtime.ssbScope, reachability)),
       metrics: async () => prometheusMetrics(await node!.status(), traversalError(runtime.ssbScope, reachability)),

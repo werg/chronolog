@@ -8,8 +8,7 @@
     "@chronolog/node-core": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",
-    "@chronolog/client": "workspace:*",
-    "@chronolog/agent-service": "workspace:*"
+    "@chronolog/client": "workspace:*"
   },
   "peerDependencies": {
     "@tendriller/core": "0.3.0-rc.9"
@@ -17,7 +16,7 @@
   "devDependencies": {
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/rpc": "workspace:*",
-    "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-9dd7a897.tgz",
-    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-9dd7a897.tgz"
+    "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-b8db8dcd.tgz",
+    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-b8db8dcd.tgz"
   }
 }

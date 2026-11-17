@@ -9,7 +9,7 @@ import {
 import { assertCanonicalCbor, encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
 
-import { NativeAuthority } from './authority.js'
+import { NativeFinalityService } from './finality-service.js'
 import { createMembershipLedgerHandler, MAX_MEMBERSHIP_PAGE_ENTRY_BYTES } from './membership-http.js'
 
 async function setup() {
@@ -19,7 +19,7 @@ async function setup() {
     schemaAdministratorPublicKey: native.publicKeyBytes }
   const { descriptor, identity } = await provisionMembership(provision)
   if (descriptor.history.kind !== 'coordinated') throw new Error('COORDINATED_FIXTURE_REQUIRED')
-  const authority = await NativeAuthority.open({ configuration: descriptor.history, identity: native, store, now: () => 1_000, cutoffLagMs: 0 })
+  const authority = await NativeFinalityService.open({ descriptor, identity: native, store, now: () => 2_000 })
   const control = (value: number, size = 8) => createLedgerRecord(encodeEnvelope({ groupRoute: descriptor.groupRoute,
     messageType: 'capability', encryptionEpoch: null, payload: new Uint8Array(size).fill(value) }))
   const signed = async (request: MembershipLedgerRequest, now = 1_000) => signMembershipLedgerRequest({ descriptor, identity, request, now })
@@ -34,7 +34,7 @@ function request(bytes: Uint8Array, suffix = ''): Request {
 describe('signed native membership HTTP handler', () => {
   it('times out incomplete request bodies without blocking later participant operations', async () => {
     const f = await setup(), cancel = vi.fn(() => new Promise<void>(() => undefined))
-    const handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, now: () => 1_000, bodyTimeoutMs: 20 })
+    const handler = createMembershipLedgerHandler({ finality: f.authority, descriptor: f.descriptor, now: () => 1_000, bodyTimeoutMs: 20 })
     const body = new ReadableStream<Uint8Array>({ start(stream) { stream.enqueue(Uint8Array.of(1)) }, cancel })
     const input = new Request('http://localhost/_chronolog/membership', { method: 'POST', headers: { 'Content-Type': 'application/cbor' },
       ...{ body, duplex: 'half' } })
@@ -50,7 +50,7 @@ describe('signed native membership HTTP handler', () => {
       encryptionEpoch: encodeCanonicalCbor(0n), payload: new Uint8Array(768 * 1024).fill(42) })
     await f.authority.append(body)
     const fetchPayload = vi.spyOn(f.authority, 'getPayload')
-    const handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, now: () => 1_000,
+    const handler = createMembershipLedgerHandler({ finality: f.authority, descriptor: f.descriptor, now: () => 1_000,
       sink: { putEvidence: async bytes => { mirrored.push(bytes) } } })
     const response = await handler(request(await f.signed({ kind: 'read', after: 0, limit: 128 })))
     expect(response.status).toBe(200)
@@ -73,12 +73,12 @@ describe('signed native membership HTTP handler', () => {
       if (fail) { fail = false; throw new Error('delivery interrupted') }
       mirrored.push(bytes)
     } }
-    let handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, sink, now: () => 1_000 })
+    let handler = createMembershipLedgerHandler({ finality: f.authority, descriptor: f.descriptor, sink, now: () => 1_000 })
     const control = await f.control(1), append = await f.signed({ kind: 'append', recordBytes: control.recordBytes })
     expect((await handler(request(append))).status).toBe(503)
     expect((await f.authority.head()).position).toBe(2)
-    const reopened = await NativeAuthority.open({ configuration: f.authority.configuration, identity: f.native, store: f.store, now: () => 1_000, cutoffLagMs: 0 })
-    handler = createMembershipLedgerHandler({ authority: reopened, descriptor: f.descriptor, sink, now: () => 1_000 })
+    const reopened = await NativeFinalityService.open({ descriptor: f.descriptor, identity: f.native, store: f.store, now: () => 2_000 })
+    handler = createMembershipLedgerHandler({ finality: reopened, descriptor: f.descriptor, sink, now: () => 1_000 })
     const retry = await handler(request(append))
     const entry = decodeMembershipLedgerResponse(new Uint8Array(await retry.arrayBuffer()), 'append')
     expect(entry.position).toBe(1)
@@ -99,17 +99,17 @@ describe('signed native membership HTTP handler', () => {
 
   it('requires the pinned root signature, configuration, expiry and inline control classification', async () => {
     const f = await setup()
-    const handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, now: () => 1_000 })
+    const handler = createMembershipLedgerHandler({ finality: f.authority, descriptor: f.descriptor, now: () => 1_000 })
     const read = await f.signed({ kind: 'read', after: 0, limit: 1 }), value = assertCanonicalCbor(read)
     if (!Array.isArray(value) || !(value[0] instanceof Uint8Array) || !(value[1] instanceof Uint8Array)) throw new Error('INVALID_TEST_WIRE')
     value[1][0] = value[1][0]! ^ 1
     expect((await handler(request(encodeCanonicalCbor(value)))).status).toBe(403)
-    const expired = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, now: () => 61_001 })
+    const expired = createMembershipLedgerHandler({ finality: f.authority, descriptor: f.descriptor, now: () => 61_001 })
     expect((await expired(request(read))).status).toBe(403)
     const other = structuredClone(f.descriptor)
     if (other.history.kind !== 'coordinated') throw new Error('COORDINATED_FIXTURE_REQUIRED')
     other.history.executionManifestDigest[0] = 9
-    expect(() => createMembershipLedgerHandler({ authority: f.authority, descriptor: other })).toThrow('MEMBERSHIP_AUTHORITY_CONFIGURATION_MISMATCH')
+    expect(() => createMembershipLedgerHandler({ finality: f.authority, descriptor: other })).toThrow('MEMBERSHIP_AUTHORITY_CONFIGURATION_MISMATCH')
     const wrongConfig = await signMembershipLedgerRequest({ descriptor: other, identity: f.identity,
       request: { kind: 'read', after: 0, limit: 1 }, now: 1_000 })
     expect((await handler(request(wrongConfig))).status).toBe(403)
@@ -130,7 +130,7 @@ describe('signed native membership HTTP handler', () => {
   it('bounds large control pages while keeping a complete resumable range', async () => {
     const f = await setup()
     for (let i = 0; i < 5; i++) await f.authority.appendLedgerRecord((await f.control(i, 240 * 1024)).recordBytes)
-    const handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor, now: () => 1_000 })
+    const handler = createMembershipLedgerHandler({ finality: f.authority, descriptor: f.descriptor, now: () => 1_000 })
     const response = await handler(request(await f.signed({ kind: 'read', after: 0, limit: 128 })))
     const bytes = new Uint8Array(await response.arrayBuffer()), first = decodeMembershipLedgerResponse(bytes, 'read')
     expect(bytes.length).toBeLessThan(MAX_MEMBERSHIP_LEDGER_BYTES)
@@ -146,7 +146,7 @@ describe('signed native membership HTTP handler', () => {
   })
 
   it('rejects route aliases, non-CBOR and oversized bodies before any append', async () => {
-    const f = await setup(), handler = createMembershipLedgerHandler({ authority: f.authority, descriptor: f.descriptor })
+    const f = await setup(), handler = createMembershipLedgerHandler({ finality: f.authority, descriptor: f.descriptor })
     expect((await handler(request(new Uint8Array([1]), '?alias=1'))).status).toBe(404)
     expect((await handler(new Request('http://localhost/_chronolog/membership'))).status).toBe(405)
     expect((await handler(new Request('http://localhost/_chronolog/membership', { method: 'POST', body: '{}' }))).status).toBe(415)

@@ -96,6 +96,38 @@ try {
   await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sql('owner')), /SQL_DISABLED_FOR_EVENT_PROFILE/u)
   passed('real OPFS Worker opens without cross-origin isolation or a SQL engine; exclusive ownership and SQL refusal hold')
 
+  const signalRecordsBefore = (await native.transport.history()).map(record => record.id)
+  const signalEventsBefore = await native.client.events.read()
+  const nativeSignals = native.client.signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(30_000) })[Symbol.asyncIterator]()
+  let nextNativeSignal = nativeSignals.next()
+  void nextNativeSignal.catch(() => undefined)
+  await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.subscribeSignals('owner', 'live'))
+  try {
+    const browserSignal = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: true, from: 'browser' }))
+    assert.deepEqual((await nextNativeSignal).value, browserSignal)
+    nextNativeSignal = nativeSignals.next()
+    void nextNativeSignal.catch(() => undefined)
+    const nativeSignal = await native.client.signals.send('typing', { typing: true, from: 'native' })
+    assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.nextSignal('owner', 'live')), nativeSignal)
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.unsubscribeSignals('owner', 'live'))
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.disconnect('owner'))
+    await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: true, from: 'disconnected' })), /SIGNAL_DISCONNECTED/u)
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.connect('owner'))
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.subscribeSignals('owner', 'reconnected'))
+    const reconnectedBrowserSignal = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: false, from: 'reconnected-browser' }))
+    assert.deepEqual((await nextNativeSignal).value, reconnectedBrowserSignal, 'a disconnected send must never be queued or retried on reconnection')
+    const reconnectedNativeSignal = await native.client.signals.send('typing', { typing: false, from: 'reconnected-native' })
+    assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.nextSignal('owner', 'reconnected')), reconnectedNativeSignal,
+      'a newly opened subscription must not replay the previous live value')
+  } finally {
+    await nativeSignals.return?.()
+    await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.unsubscribeSignals('owner', 'reconnected'))
+  }
+  assert.deepEqual((await native.transport.history()).map(record => record.id), signalRecordsBefore)
+  assert.deepEqual(await native.client.events.read(), signalEventsBefore)
+  assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.read('owner')), signalEventsBefore)
+  passed('public Worker client and native client exchange authenticated live signals in both directions without records, retained events, disconnected retries or subscription replay')
+
   const events = [{ topic: 'chat', payload: { message: 'first' } }, { topic: 'tasks', payload: { task: 'same atomic proposal' } }]
   const published = await page.evaluate(({ events }) => (globalThis as unknown as TestWindow).chronologEventTest.publish('owner', events, 'browser-atomic-1'), { events })
   assert.equal(published.outcome.outcome.type, 'accepted')

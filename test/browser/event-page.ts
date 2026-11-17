@@ -1,6 +1,7 @@
 import { ChronologClient, type ClientReadView } from '@chronolog/client'
 import { emit, program, type EventPayload, type EventReadOptions } from '@chronolog/protocol'
 import { WorkerRpcTransport } from '@chronolog/runtime-browser/events'
+import type { EphemeralSignal, SignalPayload } from '@chronolog/signals'
 
 import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contract.js'
 import type { qualifyStorageQuota } from './storage-quota.js'
@@ -9,6 +10,7 @@ class EventPeer {
   readonly worker = new Worker('/event-worker.js', { type: 'module' })
   readonly rpc = new WorkerRpcTransport(this.worker)
   readonly views = new Map<string, ClientReadView>()
+  readonly signals = new Map<string, { readonly iterator: AsyncIterator<EphemeralSignal>; next: Promise<IteratorResult<EphemeralSignal>> }>()
   readonly #pending = new Map<number, { resolve(value: unknown): void; reject(error: unknown): void }>()
   readonly #pauses: Array<(value: unknown) => void> = []
   #next = 1
@@ -43,6 +45,28 @@ class EventPeer {
     const handle = await this.client.submit(program(...events.map((event) => emit(event.topic, event.payload))), { operationId })
     try { return { proposalId: handle.proposalId, outcome: await handle.final({ signal: AbortSignal.timeout(20_000) }) } }
     finally { handle.dispose() }
+  }
+  async subscribeSignals(subscription: string) {
+    const iterator = this.client.signals.subscribe({ topics: ['typing'], signal: AbortSignal.timeout(30_000) })[Symbol.asyncIterator]()
+    const next = iterator.next()
+    void next.catch(() => undefined)
+    this.signals.set(subscription, { iterator, next })
+    // The Worker stream opens and then pulls in two message turns. These public
+    // RPC round trips fence both turns before the native test sends live data.
+    await this.client.events.read(); await this.client.events.read()
+  }
+  async nextSignal(subscription: string) {
+    const state = this.signals.get(subscription)!
+    const result = await state.next
+    if (result.done) throw new Error('EVENT_BROWSER_SIGNAL_SUBSCRIPTION_ENDED')
+    state.next = state.iterator.next()
+    void state.next.catch(() => undefined)
+    return result.value
+  }
+  async unsubscribeSignals(subscription: string) {
+    const state = this.signals.get(subscription)
+    this.signals.delete(subscription)
+    await state?.iterator.return?.()
   }
   async crash(fixture: string, fields: Record<string, unknown>) {
     let timeout: ReturnType<typeof setTimeout> | undefined
@@ -90,6 +114,12 @@ const api = {
   publish(id: string, events: readonly { topic: string; payload: EventPayload }[], operationId: string) { return peers.get(id)!.publish(events, operationId) },
   read(id: string, options: EventReadOptions = {}) { return peers.get(id)!.client.events.read(options) },
   operation(id: string, operationId: string) { return peers.get(id)!.client.operations.get(operationId) },
+  sendSignal(id: string, payload: SignalPayload) { return peers.get(id)!.client.signals.send('typing', payload, { ttlMs: 5_000 }) },
+  subscribeSignals(id: string, subscription: string) { return peers.get(id)!.subscribeSignals(subscription) },
+  nextSignal(id: string, subscription: string) { return peers.get(id)!.nextSignal(subscription) },
+  unsubscribeSignals(id: string, subscription: string) { return peers.get(id)!.unsubscribeSignals(subscription) },
+  connect(id: string) { return peers.get(id)!.command('connect') },
+  disconnect(id: string) { return peers.get(id)!.command('disconnect') },
   privateValue(id: string, value?: string) { return peers.get(id)!.command('privateValue', value === undefined ? {} : { state: value }) },
   quota(id: string) { return peers.get(id)!.command('quota') as ReturnType<typeof qualifyStorageQuota> },
   async readNext(id: string, options: EventReadOptions) {

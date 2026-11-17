@@ -1,3 +1,4 @@
+import type { Signals, SignalPayload, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
 import {
   base64UrlToBytes,
   bytesToBase64Url as toBase64Url,
@@ -227,6 +228,34 @@ export class ChronologClient {
   /** Sharing, teams and transfers of owned rows; each call submits one transaction. */
   readonly ownership: OwnershipActions = new OwnershipActions(this)
   readonly enrollment: EnrollmentActions = new EnrollmentActions(this)
+  /** Best-effort live messages: no operation IDs, automatic resend or reconnect replay. */
+  readonly signals: Signals = {
+    send: (topic: string, payload: SignalPayload, options: SignalSendOptions = {}) => {
+      const signal = AbortSignal.any([this.#abort.signal, ...(options.signal === undefined ? [] : [options.signal])])
+      return this.#transport.unary('signals.send', { groupId: this.groupId, topic, payload,
+        ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }) }, this.#callOptions(signal))
+    },
+    subscribe: (options: SignalSubscribeOptions = {}) => {
+      const self = this
+      return {
+        [Symbol.asyncIterator]() {
+          const controller = new AbortController()
+          const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(options.signal === undefined ? [] : [options.signal])])
+          const iterator = self.#transport.stream('signals.subscribe', { groupId: self.groupId,
+            ...(options.topics === undefined ? {} : { topics: options.topics }),
+            ...(options.mode === undefined ? {} : { mode: options.mode }) }, self.#callOptions(signal))[Symbol.asyncIterator]()
+          return {
+            async next() {
+              try { return await iterator.next() }
+              catch (error) { if (controller.signal.aborted) return { done: true as const, value: undefined }; throw error }
+            },
+            async return() { controller.abort(); await iterator.return?.(); return { done: true as const, value: undefined } },
+            async throw(error: unknown) { controller.abort(error); await iterator.return?.(); throw error },
+          }
+        },
+      }
+    },
+  }
   /** At-least-once final batches; never coalesced into snapshot notifications. */
   readonly events = {
     publish: (topic: string, payload: EventPayload, options: ChangeOptions): Promise<TransactionHandle> => this.submit(program(emit(topic, payload)), options),

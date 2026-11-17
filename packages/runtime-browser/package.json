@@ -15,6 +15,9 @@
     "@chronolog/control-store": "workspace:*",
     "@chronolog/canonical": "workspace:*",
     "@chronolog/records": "workspace:*",
-    "@chronolog/materializer": "workspace:*"
+    "@chronolog/materializer": "workspace:*",
+    "@chronolog/signals": "workspace:*",
+    "@chronolog/capabilities": "workspace:*",
+    "@chronolog/agent-service": "workspace:*"
   }
 }

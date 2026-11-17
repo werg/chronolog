@@ -23,3 +23,25 @@ because only a CAS/export host can assign generic immutable output refs.
 
 The package does not define mutable publication. Reduction returns immutable
 candidates; a coordinator publishes those candidates separately.
+
+## SQL-free event execution
+
+`createEventMaterializationRuntime` implements the ordinary materialization port
+for groups whose programs contain only literal durable events. It persists the
+ordered proposals, local revision and immutable final prefix in one bounded
+atomic storage value. Duplicate operations have deterministic outcomes; a SQL
+step receives `profile:sql-disabled` rather than loading an engine.
+
+The admitted set only grows. A newly admitted earlier proposal can change the
+provisional suffix, but existing proposal identities and relative order cannot
+disappear or change. Finalized identities and their event IDs are immutable.
+Inputs are copied before waiting for queued work, and returned outcomes cannot
+mutate the runtime's retained state.
+
+If an atomic storage write throws, it may have committed before its reply was
+lost. The runtime closes its mutation and publication ports immediately. Reopen
+from the authoritative stored value before continuing; retrying from the old
+in-memory prefix could overwrite a newer durable finality promise. Existing read
+snapshots retain their last acknowledged coherent view. The regression suite
+covers failures before a write and lost replies after both admission and finality
+commits.

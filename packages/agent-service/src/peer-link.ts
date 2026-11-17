@@ -8,7 +8,7 @@ import { ChangeSignal } from '@chronolog/records'
 import type { FeedLink } from '@chronolog/records'
 
 import type { FramedPeerConnection } from './framing.js'
-import { MAX_SIGNAL_BYTES } from './signals.js'
+import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN } from '@chronolog/signals'
 
 const PEER_DOMAIN = 'chronolog/peer/v1'
 const MAX_RANGE = 64
@@ -166,12 +166,15 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     if (bytes.length > MAX_RECORD_FRAME) throw new Error('PEER_FRAME_TOO_LARGE')
     const frame = assertCanonicalCbor(bytes)
     if (!Array.isArray(frame) || frame[0] !== 1n) throw new Error('PEER_FRAME_INVALID')
-    if (frame[1] === 'chronolog/ephemeral/v1') {
+    if (frame[1] === SIGNAL_DOMAIN) {
       if (!authenticated || bytes.length > MAX_SIGNAL_BYTES) throw new Error('PEER_SIGNAL_BEFORE_AUTHENTICATION')
-      // Signals are replaceable and cannot block durable range processing.
+      // Best-effort signals cannot block durable range processing. The channel
+      // bounds its queues and owns replay checks, including async reordering.
       if (options.receiveSignal !== undefined && signalsInFlight < 8) {
         signalsInFlight += 1
-        void Promise.resolve().then(() => options.receiveSignal!(bytes.slice())).catch(() => undefined)
+        void Promise.resolve().then(async () => {
+          if (await authorized() && !controller.signal.aborted) await options.receiveSignal!(bytes.slice())
+        }).catch(() => undefined)
           .finally(() => { signalsInFlight -= 1 })
       }
       return
@@ -318,7 +321,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       if (controller.signal.aborted) throw failure ?? new Error('PEER_CONNECTION_CLOSED')
       if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
       const frame = assertCanonicalCbor(bytes)
-      if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== 'chronolog/ephemeral/v1') throw new Error('SIGNAL_FRAME_INVALID')
+      if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
       // Signals contain application data too. A completed handshake is not a
       // permanent reader grant, and writer authorization at the signal layer
       // does not authorize this recipient after its read grant is revoked.

@@ -2,31 +2,31 @@ import {
   Mutex, ReferenceRecordLog, createPrefixAuthority, encodeHistoryConfiguration, encodeOrderingEvidence, orderedGenesisRoot,
   createFinalityClosureRecord, evaluateFinalitySnapshot, extendFinalityControlCommitment, createLedgerRecord, decodeLedgerRecord, verifyLedgerPayload,
   decodeOrderingEvidence, verifyPrefixCertificate, encodeFinalizedControl,
+  verifyEnrollmentDescriptor, resolveFinalityClockPolicy,
+  MAX_RETAINED_HISTORY_ENTRIES, orderedRecordId,
 } from '@chronolog/node-core'
 import type {
-  CoordinatedHistoryConfiguration, DurableOperationStore, OrderedRecordEntry, OrderedRecordHead, PrefixCertificate,
+  CoordinatedHistoryConfiguration, DurableOperationStore, EnrollmentDescriptor, OrderedRecordEntry, OrderedRecordHead, PrefixCertificate,
   MembershipLedgerPage,
 } from '@chronolog/node-core'
-import { decodeEnvelope, equalBytes } from '@chronolog/protocol'
+import { assertCanonicalCbor, decodeEnvelope, encodeCanonicalCbor, equalBytes } from '@chronolog/protocol'
 import type { Ed25519KeyPair } from '@chronolog/protocol'
 import { validatePayloadHash, verifyPayloadHash, type ChronologTransport } from '@chronolog/records'
 
 export interface EvidenceSink { putEvidence(bytes: Uint8Array): Promise<unknown> }
 
-export interface NativeAuthorityOptions {
-  readonly configuration: CoordinatedHistoryConfiguration
+export interface NativeFinalityServiceOptions {
+  /** Signed genesis pins the signer, history, execution profile and clock policy. */
+  readonly descriptor: EnrollmentDescriptor
   readonly identity: Ed25519KeyPair
   /** Must have one fenced storage owner, e.g. NativeAgentStore. */
   readonly store: DurableOperationStore
-  readonly quotaBytes?: number
+  /** Retained ledger descriptors and closure records. Defaults to 64 MiB. */
+  readonly recordQuotaBytes?: number
+  /** Detached application bodies, including unfinished durable reservations. Defaults to 64 MiB. */
+  readonly payloadQuotaBytes?: number
   /** Provider clock; application execution order never uses receipt time. */
   readonly now?: () => number
-  /** Hold this author-time window open before issuing a closure. */
-  readonly cutoffLagMs?: number
-  /** Must equal signed genesis maxFutureSkewMs + cutoffLagMs; defaults to 31,000. */
-  readonly futureAdmissionWindowMs?: number
-  /** Close time while the retained application head is idle. */
-  readonly closureIntervalMs?: number
   /**
    * An independently trusted continuity checkpoint when recovering a volume.
    * Reading this from the same restored backup cannot detect rollback. An
@@ -46,7 +46,7 @@ function authorityState(store: DurableOperationStore, historyId: string): Author
 }
 
 /** Certifies inclusion and closed author time; replicas always derive execution order. */
-export class NativeAuthority {
+export class NativeFinalityService {
   readonly #configuration: CoordinatedHistoryConfiguration
   readonly #log: ReferenceRecordLog
   readonly #signer: ReturnType<typeof createPrefixAuthority>
@@ -58,39 +58,43 @@ export class NativeAuthority {
   readonly #cutoffLagMs: number
   readonly #futureAdmissionWindowMs: bigint
   readonly #closureIntervalMs: number
+  readonly #payloadQuotaBytes: number
 
-  private constructor(options: NativeAuthorityOptions, log: ReferenceRecordLog) {
-    this.#configuration = structuredClone(options.configuration)
+  private constructor(options: NativeFinalityServiceOptions, configuration: CoordinatedHistoryConfiguration, log: ReferenceRecordLog) {
+    this.#configuration = structuredClone(configuration)
     this.#log = log
     this.#store = options.store
-    this.#serviceState = authorityState(options.store, options.configuration.historyId)
+    this.#payloadQuotaBytes = payloadQuota(options.payloadQuotaBytes)
+    this.#serviceState = authorityState(options.store, configuration.historyId)
     this.#mutex = this.#serviceState.mutex
     this.#identity = { ...options.identity, publicKeyBytes: new Uint8Array(options.identity.publicKeyBytes) }
     this.#now = options.now ?? Date.now
-    this.#cutoffLagMs = options.cutoffLagMs ?? 1_000
-    const futureAdmissionWindowMs = options.futureAdmissionWindowMs ?? 31_000
-    this.#closureIntervalMs = options.closureIntervalMs ?? 1_000
-    if (!Number.isSafeInteger(this.#cutoffLagMs) || this.#cutoffLagMs < 0 ||
-        !Number.isSafeInteger(futureAdmissionWindowMs) || futureAdmissionWindowMs < 0 ||
-        !Number.isSafeInteger(this.#closureIntervalMs) || this.#closureIntervalMs < 1 || this.#closureIntervalMs > 60_000) {
-      throw new Error('AUTHORITY_CLOCK_CONFIGURATION_INVALID')
-    }
-    this.#futureAdmissionWindowMs = BigInt(futureAdmissionWindowMs)
+    const clock = resolveFinalityClockPolicy(options.descriptor.genesis.manifest.clockPolicy)
+    this.#cutoffLagMs = clock.cutoffLagMs
+    this.#closureIntervalMs = clock.heartbeatIntervalMs
+    this.#futureAdmissionWindowMs = BigInt(clock.futureAdmissionWindowMs)
     this.#signer = createPrefixAuthority({ configuration: this.#configuration, identity: this.#identity, readHead: () => log.head() })
   }
 
-  static async open(options: NativeAuthorityOptions): Promise<NativeAuthority> {
-    options = { ...options, configuration: structuredClone(options.configuration),
+  static async open(options: NativeFinalityServiceOptions): Promise<NativeFinalityService> {
+    options = { ...options, descriptor: structuredClone(options.descriptor),
       identity: { ...options.identity, publicKeyBytes: new Uint8Array(options.identity.publicKeyBytes) },
       ...(options.continuity === undefined ? {} : { continuity: structuredClone(options.continuity) }) }
-    return authorityState(options.store, options.configuration.historyId).mutex.run(async () => {
-      const configuration = encodeHistoryConfiguration(options.configuration)
-      const prefix = `agent/authority/${options.configuration.historyId}/`
+    await verifyEnrollmentDescriptor(options.descriptor)
+    const history = options.descriptor.history
+    if (history.kind !== 'coordinated' || (history.providerId ?? 'signed-inclusion-v2') !== 'signed-inclusion-v2') {
+      throw new Error('FINALITY_SERVICE_PROVIDER_MISMATCH')
+    }
+    resolveFinalityClockPolicy(options.descriptor.genesis.manifest.clockPolicy)
+    const payloadQuotaBytes = payloadQuota(options.payloadQuotaBytes)
+    return authorityState(options.store, history.historyId).mutex.run(async () => {
+      const configuration = encodeHistoryConfiguration(history)
+      const prefix = `agent/authority/${history.historyId}/`
       const key = `${prefix}configuration`, saved = await options.store.get(key)
       if (saved !== null && !equalBytes(saved, configuration)) throw new Error('AUTHORITY_CONFIGURATION_MISMATCH')
       // Validate key ownership and any surviving certificate before creating or
       // replacing durable state. A damaged local proof must never be overwritten.
-      createPrefixAuthority({ configuration: options.configuration, identity: options.identity,
+      createPrefixAuthority({ configuration: history, identity: options.identity,
         readHead: async () => { throw new Error('AUTHORITY_NOT_OPEN') } })
       const savedCertificate = await options.store.get(`${prefix}certificate`)
       let retained: PrefixCertificate | undefined
@@ -98,14 +102,14 @@ export class NativeAuthority {
         try {
           const evidence = decodeOrderingEvidence(savedCertificate)
           if (evidence.kind !== 'prefix-certificate') throw new Error('AUTHORITY_CERTIFICATE_KIND_INVALID')
-          await verifyPrefixCertificate(evidence.certificate, options.configuration)
+          await verifyPrefixCertificate(evidence.certificate, history)
           retained = evidence.certificate
         } catch (error) { throw new Error('AUTHORITY_RETAINED_CERTIFICATE_INVALID', { cause: error }) }
       }
       let log: ReferenceRecordLog
       try {
-        log = await ReferenceRecordLog.open(options.configuration.historyId, options.store, {
-          ...(options.quotaBytes === undefined ? {} : { quotaBytes: options.quotaBytes }),
+        log = await ReferenceRecordLog.open(history.historyId, options.store, {
+          ...(options.recordQuotaBytes === undefined ? {} : { quotaBytes: options.recordQuotaBytes }),
           requireExisting: saved !== null || retained !== undefined || (options.continuity?.position ?? 0) > 0,
         })
       } catch (error) {
@@ -117,7 +121,7 @@ export class NativeAuthority {
       const entries = await log.read()
       // Reopen the complete closure history, including a marker committed before
       // the process lost its certificate reply. Never reset a closed frontier.
-      await evaluateFinalitySnapshot(options.configuration, entries)
+      await evaluateFinalitySnapshot(history, entries)
       const genesisRoot = await orderedGenesisRoot(log.historyId)
       for (const expected of [retained, options.continuity]) {
         if (expected === undefined) continue
@@ -127,10 +131,27 @@ export class NativeAuthority {
           throw new Error('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
         }
       }
+      const payloadIndexKey = `${prefix}payload-reservations`
+      const encodedPayloads = await options.store.get(payloadIndexKey)
+      if (encodedPayloads === null && (saved !== null || retained !== undefined || entries.length !== 0)) {
+        throw new Error('FINALITY_PAYLOAD_STATE_MISSING')
+      }
+      const payloads = encodedPayloads === null ? new Map<string, number>() : decodePayloadReservations(encodedPayloads)
+      if (payloadBytes(payloads) > payloadQuotaBytes) throw new Error('FINALITY_PAYLOAD_QUOTA_EXCEEDED')
+      // An acknowledged descriptor must have consumed its body budget before
+      // it was committed. Missing accounting cannot silently reopen capacity.
+      for (const entry of entries) {
+        let record
+        try { record = decodeLedgerRecord(entry.bytes) } catch { continue }
+        if (record.kind === 'candidate' && payloads.get(record.payloadHash) !== record.payloadLength) {
+          throw new Error('FINALITY_PAYLOAD_STATE_MISSING')
+        }
+      }
+      if (encodedPayloads === null) await options.store.put(payloadIndexKey, encodePayloadReservations(payloads))
       // ReferenceRecordLog has already durably initialized even an empty log.
       // Thus a saved configuration always requires that log on a later open.
       if (saved === null) await options.store.put(key, configuration)
-      return new NativeAuthority(options, log)
+      return new NativeFinalityService(options, history, log)
     })
   }
 
@@ -145,7 +166,9 @@ export class NativeAuthority {
 
   async #appendLocked(bytes: Uint8Array): Promise<OrderedRecordEntry> {
     const prepared = await createLedgerRecord(bytes)
+    await this.#checkRecordCapacity(prepared.recordBytes)
     if (prepared.detachedPayload !== null) {
+      await this.#reservePayload(prepared.record.payloadHash, prepared.detachedPayload.length)
       await this.#store.put(this.#payloadKey(prepared.record.payloadHash), prepared.detachedPayload)
     }
     const entry = await this.#log.append(prepared.recordBytes)
@@ -161,6 +184,8 @@ export class NativeAuthority {
       const payload = record.inlinePayload ?? await this.getPayload(record.payloadHash)
       if (payload === null) throw new Error('LEDGER_PAYLOAD_UNAVAILABLE')
       await verifyLedgerPayload(record, payload)
+      await this.#checkRecordCapacity(exact)
+      if (record.kind === 'candidate') await this.#reservePayload(record.payloadHash, record.payloadLength)
       const entry = await this.#log.append(exact)
       this.#serviceState.idleClosurePending = true
       return entry
@@ -178,17 +203,61 @@ export class NativeAuthority {
     return `agent/authority/${this.#configuration.historyId}/payload/${hash}`
   }
 
+  /** Logical retained-byte budgets; reservations also count interrupted appends. */
+  storageUsage(): Promise<{ readonly recordBytes: number; readonly recordQuotaBytes: number;
+    readonly reservedPayloadBytes: number; readonly payloadQuotaBytes: number }> {
+    return this.#mutex.run(async () => ({
+      recordBytes: (await this.#log.read()).reduce((sum, entry) => sum + entry.bytes.length, 0),
+      recordQuotaBytes: this.#log.quotaBytes,
+      reservedPayloadBytes: payloadBytes(await this.#payloadReservations()), payloadQuotaBytes: this.#payloadQuotaBytes,
+    }))
+  }
+
+  async #checkRecordCapacity(bytes: Uint8Array): Promise<void> {
+    const entries = await this.#log.read(), id = await orderedRecordId(bytes)
+    if (entries.some(entry => entry.recordId === id)) return
+    if (entries.length >= MAX_RETAINED_HISTORY_ENTRIES ||
+        entries.reduce((sum, entry) => sum + entry.bytes.length, 0) + bytes.length > this.#log.quotaBytes) {
+      throw new Error('RECORD_LOG_QUOTA_EXCEEDED')
+    }
+  }
+
+  async #payloadReservations(): Promise<Map<string, number>> {
+    const bytes = await this.#store.get(`agent/authority/${this.#configuration.historyId}/payload-reservations`)
+    if (bytes === null) throw new Error('FINALITY_PAYLOAD_STATE_MISSING')
+    return decodePayloadReservations(bytes)
+  }
+
+  async #reservePayload(hash: string, length: number): Promise<void> {
+    const reservations = await this.#payloadReservations(), previous = reservations.get(hash)
+    if (previous !== undefined) {
+      if (previous !== length) throw new Error('FINALITY_PAYLOAD_STATE_INVALID')
+      return
+    }
+    if (reservations.size >= MAX_RETAINED_HISTORY_ENTRIES || payloadBytes(reservations) + length > this.#payloadQuotaBytes) {
+      throw new Error('FINALITY_PAYLOAD_QUOTA_EXCEEDED')
+    }
+    reservations.set(hash, length)
+    // Reserve before storing a body. A crash or a lost body/record reply leaves
+    // a bounded reservation that an exact retry reuses; it cannot leak quota.
+    await this.#store.put(`agent/authority/${this.#configuration.historyId}/payload-reservations`, encodePayloadReservations(reservations))
+  }
+
   /** Persist the closure marker before certifying this authority's own committed head. */
   certify(): Promise<PrefixCertificate> {
     return this.#mutex.run(() => this.#certifyLocked())
   }
 
-  async #certifyLocked(): Promise<PrefixCertificate> {
-    // Snapshot time at the same boundary that excludes new appenders. Awaited
-    // storage and proof verification must not close additional author time
-    // while already published proposals wait for this authority's mutex.
+  #observeClock(): number {
     const observed = Math.trunc(this.#now())
     if (!Number.isSafeInteger(observed) || observed < 0) throw new Error('AUTHORITY_CLOCK_INVALID')
+    return observed
+  }
+
+  async #certifyLocked(observed = this.#observeClock()): Promise<PrefixCertificate> {
+    // Snapshot time at the same boundary that excludes new appenders. Awaited
+    // storage and proof verification must not close additional author time
+    // while already published proposals wait for this service's mutex.
     const entries = await this.#log.read()
     const snapshot = await evaluateFinalitySnapshot(this.#configuration, entries)
     const observedCutoff = BigInt(observed) - BigInt(this.#cutoffLagMs)
@@ -231,8 +300,9 @@ export class NativeAuthority {
       throw new Error('AUTHORITY_RANGE_INVALID')
     }
     return this.#mutex.run(async () => {
+      const observed = this.#observeClock()
       if (after > (await this.#log.head()).position) throw new Error('AUTHORITY_RANGE_AHEAD')
-      const certificate = await this.#certifyLocked()
+      const certificate = await this.#certifyLocked(observed)
       const entries = (await this.#log.read()).slice(after, after + limit)
       return { entries, certificate, hasMore: after + entries.length < certificate.position }
     })
@@ -355,9 +425,36 @@ export class NativeAuthority {
   }
 }
 
-/** Public name for the native inclusion and author-time closure service. */
-export { NativeAuthority as NativeFinalityService }
-export type NativeFinalityServiceOptions = NativeAuthorityOptions
+function payloadQuota(value = 64 * 1024 * 1024): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error('FINALITY_PAYLOAD_QUOTA_INVALID')
+  return value
+}
+
+function payloadBytes(reservations: ReadonlyMap<string, number>): number {
+  let bytes = 0
+  for (const length of reservations.values()) bytes += length
+  return bytes
+}
+
+function encodePayloadReservations(reservations: ReadonlyMap<string, number>): Uint8Array {
+  return encodeCanonicalCbor([1n, [...reservations].map(([hash, length]) => [hash, BigInt(length)])])
+}
+
+function decodePayloadReservations(bytes: Uint8Array): Map<string, number> {
+  const value = assertCanonicalCbor(bytes, { maxBytes: MAX_RETAINED_HISTORY_ENTRIES * 80 + 1024,
+    maxItems: MAX_RETAINED_HISTORY_ENTRIES * 3 + 4, maxDepth: 3, maxTextBytes: 64 })
+  if (!Array.isArray(value) || value.length !== 2 || value[0] !== 1n || !Array.isArray(value[1]) ||
+      value[1].length > MAX_RETAINED_HISTORY_ENTRIES) throw new Error('FINALITY_PAYLOAD_STATE_INVALID')
+  const reservations = new Map<string, number>()
+  for (const item of value[1]) {
+    if (!Array.isArray(item) || item.length !== 2 || typeof item[0] !== 'string' || !/^[0-9a-f]{64}$/u.test(item[0]) ||
+        typeof item[1] !== 'bigint' || item[1] < 1n || item[1] > 1_048_576n || reservations.has(item[0])) {
+      throw new Error('FINALITY_PAYLOAD_STATE_INVALID')
+    }
+    reservations.set(item[0], Number(item[1]))
+  }
+  return reservations
+}
 
 function waitForClosure(delay: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve()

@@ -39,6 +39,12 @@ snapshot with admission floors and closed-time boundaries. It has no comparator
 or application ordering callback. `evidenceBytes` retains the proof inputs for
 durable replay and peer transfer.
 
+This extension point currently normalizes a signed-inclusion history: a pinned
+history ID and signer, a retained receipt prefix and closed author-time boundaries.
+It is not a generic consensus framework. A threshold or dynamically reconfigured
+protocol would need its own authenticated configuration and proof rules. Merely
+registering a different factory does not supply those guarantees.
+
 `createGovernedNode` accepts a `finalityProviders` registry of asynchronous
 factories. The registry key is the `providerId` authenticated by signed genesis.
 `providerParameters` are bounded opaque configuration bytes, also authenticated.
@@ -78,16 +84,20 @@ membership eligibility final. The signed genesis clock policy bounds this wait:
 the maximum allowed timestamp is the proposal's first covering cutoff plus
 `maxFutureSkewMs + cutoffLagMs`. Beyond that bound, `FINALITY_TIMESTAMP_FUTURE`
 is a final rejection without waiting for the impossible timestamp. The exact
-bound is accepted. The service's `futureAdmissionWindowMs` must use that same
-signed sum; daemon and fixture compositions supply it explicitly.
+bound is accepted. `NativeFinalityService.open` and `withTendrillerFinality` require
+a verified enrollment descriptor and derive timing directly from its signed clock
+policy. Governed validators do the same. There is no separate local override for
+the cutoff lag, skew allowance or heartbeat interval.
 
-The service chooses a cutoff using its configured clock and lag, independently
+The service chooses a cutoff using its clock and signed lag, independently
 of encrypted application contents. After all included records' possible time
 windows have closed, idle ticks add no markers. New receipts restart closure
 progress. Thus an empty or quiescent group does not consume its retained-history
 quota indefinitely. The service needs neither decryption nor SQL sorting to
 make these promises. Retained data still has the existing finite quota; history
-pruning and compaction are not introduced here.
+pruning and compaction are not introduced here. The native service separately
+budgets retained descriptor/closure bytes and detached application bodies, with
+durable body reservations surviving lost replies and interrupted appends.
 
 The hosted opaque log offers conditional append against an expected head, so a
 concurrent writer cannot slip between a closure's signed head and its append.

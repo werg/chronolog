@@ -11,7 +11,7 @@ export function createAgent(context: AgentApplicationContext): AgentApplication 
       resultTopic: 'job-results',
       handler: {
         id: 'summarize-task', version: '1', topics: ['job-requests'], recovery: 'idempotent',
-        async dispatch({ event }) {
+        async dispatch({ event, signal }) {
           const request = event.payload
           if (request === null || typeof request !== 'object' || !('type' in request) ||
               request.type !== 'job.requested' || request.version !== 1 || request.kind !== 'summarize-task' ||
@@ -19,6 +19,10 @@ export function createAgent(context: AgentApplicationContext): AgentApplication 
               request.jobId.length === 0 || request.jobId.length > 128 || request.taskId.length === 0 || request.taskId.length > 128) {
             return { type: 'job.ignored', version: 1, reason: 'Unsupported task-summary intent' }
           }
+          // Progress is expendable live UI state. A disconnected reader must
+          // never delay the durable job or cause a second provider dispatch.
+          void context.signals.send('job-progress', { jobId: request.jobId, phase: 'reading-task' },
+            { ttlMs: 5_000, signal }).catch(() => undefined)
           // This provider-free example reads shared final data and formats a
           // result. Repeating this read has no external effect to duplicate.
           const view = await context.node.readView({ view: 'final' })

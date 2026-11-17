@@ -1,4 +1,6 @@
 import { ControlStore } from '@chronolog/control-store/browser'
+import { createCapabilitySignals } from '@chronolog/capabilities'
+import type { SignalChannel } from '@chronolog/signals'
 import {
   DeterministicMaterializer, createDoltLiteMaterializationRuntime,
   type MaterializerOptions,
@@ -19,6 +21,7 @@ import { acquireBrowserStorage } from './opfs.js'
 import { loadBrowserEngine, type LoadedBrowserEngine } from './load-engine.js'
 import { createWasmEngineFactory, type OpfsSqlitePool } from './wasm-engine.js'
 import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'
+import { browserPeerConnections, type BrowserPeerConnection, type BrowserPeerConnectionOptions } from './peer-connections.js'
 
 export interface BrowserPeerContext {
   /** Private keys stay in the owner Worker and its private OPFS store. */
@@ -29,6 +32,8 @@ export interface BrowserPeerContext {
 }
 
 interface BrowserPeerConfigurationBase {
+  /** Custom live messaging policy for a low-level composition. Governed peers configure this automatically. */
+  readonly signals?: SignalChannel
   readonly materializer: Pick<MaterializerOptions, 'executionManifest' | 'rootAdministrator'> &
     Pick<Partial<MaterializerOptions>, 'checkpointEvery' | 'forkSeeding' | 'publicationFaultInjector'>
   /** Optional connection adapter wraps the same durable local signed feed. */
@@ -54,6 +59,8 @@ export interface BrowserPeer {
   readonly materializer: DeterministicMaterializer
   readonly governed?: Awaited<ReturnType<typeof createGovernedNode>>
   readonly rpc: InProcessRpcTransport
+  readonly signals?: SignalChannel
+  connectPeer(options: BrowserPeerConnectionOptions): Promise<BrowserPeerConnection>
   close(): Promise<void>
 }
 
@@ -78,6 +85,8 @@ export async function openBrowserPeer(options: {
   let governed: Awaited<ReturnType<typeof createGovernedNode>> | undefined
   let configuration: BrowserPeerConfiguration | undefined
   let sqlStorage: OpfsSqlitePool | undefined
+  let signals: SignalChannel | undefined
+  let connections: ReturnType<typeof browserPeerConnections> | undefined
   try {
     const { identity, records } = await openBrowserDeviceRecords(storage.bytes, options.createIdentity)
     transport = new PortableFeedTransport({ store: records, signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey), crypto: webFeedCrypto })
@@ -122,22 +131,31 @@ export async function openBrowserPeer(options: {
       executionManifestDigest: node.executionManifestDigest,
       isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
     })
+    signals = configuration.signals ?? (governed === undefined ? undefined : createCapabilitySignals({
+      groupId: node.groupId, identity: identity.signing, current: () => governed!.activeSnapshot,
+    }))
+    connections = browserPeerConnections({ identity: identity.signing, groupId: node.groupId, transport,
+      ...(governed === undefined ? {} : { current: () => governed!.activeSnapshot }), ...(signals === undefined ? {} : { signals }) })
     const rpc = new InProcessRpcTransport(new NodeRpcService({
       node, ...(enrollment === undefined ? {} : { enrollment }),
+      ...(signals === undefined ? {} : { signals }),
       ...(configuration.governanceAdmin === undefined ? {} : { governanceAdmin: configuration.governanceAdmin }),
     }))
     let closed = false
     return {
       node, transport, materializer, rpc, ...(governed === undefined ? {} : { governed }),
+      ...(signals === undefined ? {} : { signals }), connectPeer: (input) => connections!.connectPeer(input),
       async close() {
         if (closed) return
         closed = true
+        signals?.close(); await connections!.close()
         await rpc.close()
         try { await configuration!.close?.(); if (governed === undefined) await node!.close(); else await governed.close() }
         finally { try { control!.close(); sqlStorage!.pauseVfs() } finally { await storage.close() } }
       },
     }
   } catch (error) {
+    signals?.close(); await connections?.close()
     try { await configuration?.close?.() } catch { /* Keep the startup error. */ }
     if (governed !== undefined) { try { await governed.close() } catch { /* Keep the startup error. */ } }
     else if (node !== undefined) { try { await node.close() } catch { /* Keep the startup error. */ } }

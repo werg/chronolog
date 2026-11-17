@@ -32,6 +32,7 @@ describe('live native governed peer', () => {
       const path = join(directory, name)
       const bootstrap = await loadOrCreateGovernanceBootstrap({
         dataDirectory: path, groupId, schemaId: executionManifestDigest, identity, transportAuthor: transport.identity,
+        clockPolicy: { cutoffLagMs: 10n, maxFutureSkewMs: 30_000n, heartbeatIntervalMs: 30_000n },
         ...(adopt === undefined ? {} : { bootstrap: { adopt } }),
       })
       const state = new NodeStateDatabase(join(path, 'state.sqlite'))
@@ -43,7 +44,7 @@ describe('live native governed peer', () => {
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
         operationStore: store, materialization: createDoltLiteMaterializationRuntime(materializer),
         controlStore: new ControlStore(new SqliteControlStorePersistence(state)),
-        clock: { now: () => now }, validator: { cutoffLagMs: 10, maxFutureSkewMs: 30_000 },
+        clock: { now: () => now },
       })
       cleanup.push(async () => { await runtime.close(); state.close() })
       const enrollment = createEnrollmentService({

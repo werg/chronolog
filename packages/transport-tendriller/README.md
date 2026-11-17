@@ -86,7 +86,7 @@ retry even if the committed head has not changed. With `watch: true`,
 (one second by default). Set `watch: false` when the host
 owns scheduling. Relay failures are exposed through `status().lastCatchUpError`.
 
-## Compose the authority with the public engine
+## Compose the finality service with the public engine
 
 Use Tendriller's public engine handler in the trusted host deployment. Keep one
 stable authority signing key and one fixed group-to-history configuration. This
@@ -96,42 +96,42 @@ package does not modify Tendriller core or access its private SQL tables.
 import engine from '@tendriller/engine'
 import {
   authorizeThroughRecordLog,
-  withTendrillerAuthority,
-  type AuthorityHttp,
+  withTendrillerFinality,
+  type FinalityHttp,
 } from '@chronolog/transport-tendriller'
 
 // Use this deployment's Worker Request/Response globals and declarations.
-const http: AuthorityHttp<Request, Response> = {
+const http: FinalityHttp<Request, Response> = {
   request: (url, init) => new Request(url, init),
   response: (body, init) => new Response(body, init),
 }
 
-export default withTendrillerAuthority(engine, {
-  configuration,
+export default await withTendrillerFinality(engine, {
+  descriptor,
   identity: stableAuthorityKey,
   records: authenticatedRecordsClient,
-  cutoffLagMs: Number(genesis.manifest.clockPolicy.cutoffLagMs),
-  futureAdmissionWindowMs: Number(genesis.manifest.clockPolicy.maxFutureSkewMs + genesis.manifest.clockPolicy.cutoffLagMs),
   http,
   authorize: authorizeThroughRecordLog(engine, {
     base: fixedTendrilRecordApiBase,
-    historyId: configuration.historyId,
+    historyId: descriptor.history.historyId,
     http,
   }),
 })
 ```
 
-The host must supply `authorize`. Omission fails closed. The helper dispatches an
+The descriptor must select the signed-inclusion provider. Initialization verifies
+its genesis and derives cutoff lag and the future-admission window from that
+signed policy; no local timing override can disagree with replicas. The host
+must supply `authorize`. Omission fails closed. The helper dispatches an
 authenticated read to the fixed public record route using the original request's
 credentials, so the existing owner/agent checks decide access. It does not create
 another identity registry. The small `http` port preserves the deployment's own
 Web API types, including Cloudflare-specific request/response properties, without
 casting them to browser DOM types. Authorization runs before
 reading the head or signing. The default endpoint is `POST /_chronolog/certificate`
-with no request body; a caller cannot supply a root to sign. The authority reads
+with no request body; a caller cannot supply a root to sign. The service reads
 its own configured log's committed prefix through the public record API. It
-derives a monotone timestamp cutoff from `now` and `cutoffLagMs` (one second by
-default; deployments should use their signed genesis clock policy), signs a closure
+derives a monotone timestamp cutoff from `now` and signed `cutoffLagMs`, signs a closure
 marker for that exact predecessor and appends it using the public generic
 `expectedHead` condition. A concurrent append causes a reread and retry, without
 retaining a marker for the wrong predecessor. The marker is durable before the
@@ -141,8 +141,8 @@ such as scheduled work remain delegated to the supplied engine. Signing does not
 execute SQL. Prefix certificates stay outside the log; closure markers are
 ordinary retained opaque bytes. Receipt positions never select SQL order.
 
-`futureAdmissionWindowMs` defaults to 31,000 and **must equal signed genesis
-`maxFutureSkewMs + cutoffLagMs`** on both provider and replicas. Replicas reject
+Both the service and replicas derive the future-admission window from signed
+genesis `maxFutureSkewMs + cutoffLagMs`. Replicas reject
 author timestamps beyond the first covering closure plus that window. The provider
 can then stop idle closure markers after that bounded horizon, without reading
 application bodies. Empty histories add no marker. Restart recovers the bound

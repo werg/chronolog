@@ -74,7 +74,7 @@ endpoint.addEventListener('message', (event) => {
                 },
               },
               governed: { genesis, groupRoute: new Uint8Array(32).fill(72), clock: { now: () => now },
-                validator: { cutoffLagMs: 10, maxFutureSkewMs: 30_000 }, initialEpochContentKey: new Uint8Array(32).fill(73) },
+                initialEpochContentKey: new Uint8Array(32).fill(73) },
             }
           },
         })

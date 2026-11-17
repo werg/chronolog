@@ -1,17 +1,18 @@
 import { createLedgerRecord } from '@chronolog/node-core/ledger'
-import { Mutex } from '@chronolog/node-core/browser'
+import { Mutex, membershipDescriptor, provisionMembership } from '@chronolog/node-core/browser'
+import { signGenesis } from '@chronolog/capabilities'
 import { evaluateFinalitySnapshot } from '@chronolog/node-core/finality'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createRecordLogClient, decodeRecord, encodeRecord, RECORD_LOG_FORMAT, RECORD_LOG_LIMITS,
   type RecordLogEntry,
 } from '@tendriller/core/records'
 import {
   CoordinatedHistoryPolicy, decodeOrderingEvidence, ReferenceRecordLog, verifyPrefixCertificate,
-  type CoordinatedHistoryConfiguration, type OrderedRecordEntry,
+  type OrderedRecordEntry,
 } from '@chronolog/node-core/history'
 import { encodeEnvelope, generateEd25519KeyPair, type EnvelopeMessageType } from '@chronolog/protocol'
 import {
@@ -19,16 +20,19 @@ import {
   type AtomicBytesStore,
 } from '@chronolog/records'
 
-import { authorizeThroughRecordLog, createCertificateFetcher, withTendrillerAuthority, type AuthorityHttp } from './authority.js'
+import { authorizeThroughRecordLog, createCertificateFetcher, withTendrillerFinality, type FinalityHttp } from './finality-service.js'
 import { TendrillerTransport } from './transport.js'
 
 const historyId = 'h_00112233445566778899aabbccddeeff'
 const groupRoute = new Uint8Array(32).fill(7)
-const http: AuthorityHttp<Request, Response> = {
+const http: FinalityHttp<Request, Response> = {
   request: (url, init) => new Request(url, init), response: (body, init) => new Response(body, init),
 }
 const closers: Array<() => Promise<void>> = []
-afterEach(async () => { for (const close of closers.splice(0).reverse()) await close() })
+afterEach(async () => {
+  vi.useRealTimers()
+  for (const close of closers.splice(0).reverse()) await close()
+})
 function storage(): AtomicBytesStore {
   const values = new Map<string, Uint8Array>()
   return { get: async (key) => values.get(key)?.slice() ?? null, put: async (key, bytes) => { values.set(key, bytes.slice()) } }
@@ -51,10 +55,14 @@ const wireEntry = (entry: OrderedRecordEntry): RecordLogEntry => ({
 
 async function fixture(futureAdmissionWindowMs = 31_000) {
   const identity = await generateEd25519KeyPair()
-  const configuration: CoordinatedHistoryConfiguration = {
-    kind: 'coordinated', historyId, authorityPublicKey: identity.publicKeyBytes,
-    groupId: new Uint8Array(32).fill(1), genesisDigest: new Uint8Array(32).fill(2), executionManifestDigest: new Uint8Array(32).fill(3),
-  }
+  const provisioned = await provisionMembership({ store: storage(), nativeAuthority: { historyId, publicKey: identity.publicKeyBytes },
+    groupId: new Uint8Array(32).fill(1), groupRoute, executionManifestDigest: new Uint8Array(32).fill(3),
+    schemaAdministratorPublicKey: identity.publicKeyBytes })
+  const genesis = await signGenesis({ ...provisioned.descriptor.genesis.manifest,
+    clockPolicy: { cutoffLagMs: 0n, maxFutureSkewMs: BigInt(futureAdmissionWindowMs), heartbeatIntervalMs: 1_000n },
+  }, provisioned.identity.privateKey)
+  const descriptor = await membershipDescriptor(genesis, groupRoute), configuration = descriptor.history
+  if (configuration.kind !== 'coordinated') throw new Error('SIGNED_INCLUSION_REQUIRED')
   const log = await ReferenceRecordLog.open(historyId, storage())
   const writes = new Mutex(), clock = { now: 1_000 }
   let online = true, loseAppendReply = false, headReads = 0, scheduled = 0, raceClosure = false
@@ -97,8 +105,7 @@ async function fixture(futureAdmissionWindowMs = 31_000) {
   const records = createRecordLogClient({ base: 'https://hub.test', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => serve(new Request(input, init)) })
   const engine = { fetch: (request: Request, _env: object, _context: object) => serve(request), scheduled: () => { scheduled += 1 } }
-  const handler = withTendrillerAuthority(engine, { configuration, identity, records, http, now: () => clock.now, cutoffLagMs: 0,
-    futureAdmissionWindowMs,
+  const handler = await withTendrillerFinality(engine, { descriptor, identity, records, http, now: () => clock.now,
     authorize: (request) => request.headers.get('Authorization') === 'Bearer owner' })
   const certificate = createCertificateFetcher({ url: 'https://hub.test/_chronolog/certificate', headers: () => ({ Authorization: 'Bearer owner' }),
     fetch: (input, init) => handler.fetch(new Request(input, init), {}, {}) })
@@ -107,18 +114,28 @@ async function fixture(futureAdmissionWindowMs = 31_000) {
     closers.push(() => transport.close())
     return transport
   }
-  return { configuration, identity, log, records, certificate, handler, engine, adapter, clock,
+  return { descriptor, configuration, identity, log, records, certificate, handler, engine, adapter, clock,
     offline: () => { online = false }, online: () => { online = true }, loseReply: () => { loseAppendReply = true },
     headReads: () => headReads, scheduled: () => scheduled, raceClosure: () => { raceClosure = true } }
 }
 
 describe('public Tendriller adapter', () => {
+  it('authenticates the signed clock policy before serving or accessing retained state', async () => {
+    const f = await fixture(), descriptor = structuredClone(f.descriptor)
+    const changed = { ...descriptor, genesis: { ...descriptor.genesis,
+      manifest: { ...descriptor.genesis.manifest, clockPolicy: { ...descriptor.genesis.manifest.clockPolicy, cutoffLagMs: 500n } } } }
+    await expect(withTendrillerFinality(f.engine, { descriptor: changed, identity: f.identity, records: f.records, http }))
+      .rejects.toThrow('ENROLLMENT_DESCRIPTOR_INVALID')
+    expect(f.headReads()).toBe(0)
+    expect((await f.log.head()).position).toBe(0)
+  })
+
   it('pins the built public SDK/engine artifacts and provenance', async () => {
     for (const name of ['sdk', 'engine']) {
-      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-9dd7a897.tgz`, import.meta.url)
-      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-9dd7a897.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
+      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-b8db8dcd.tgz`, import.meta.url)
+      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-b8db8dcd.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
       expect(createHash('sha256').update(await readFile(artifact)).digest('hex')).toBe(provenance.sha256)
-      expect(provenance.sourceCommit).toBe('9dd7a89765767bcef6229f8fe8d29f6c66b8af2b')
+      expect(provenance.sourceCommit).toBe('b8db8dcdd1d3730876f1346550ef04f7a6cbdeb6')
     }
     expect(RECORD_LOG_FORMAT).toBe('record-log/v1')
   })
@@ -198,18 +215,38 @@ describe('public Tendriller adapter', () => {
   it('retries a lost certificate response even when no new head hint arrives', async () => {
     const f = await fixture(), author = await peer()
     await author.transport.publish(envelope('candidate'))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     let attempts = 0
+    let failed!: () => void
+    const firstFailure = new Promise<void>(resolve => { failed = resolve })
     const adapter = new TendrillerTransport({ local: author.transport, configuration: f.configuration, groupRoute,
       records: { ...f.records, watch: () => () => undefined },
       certificate: async () => {
         const certificate = await f.certificate()
-        if (++attempts === 1) throw new Error('CERTIFICATE_REPLY_LOST')
+        if (++attempts === 1) { failed(); throw new Error('CERTIFICATE_REPLY_LOST') }
         return certificate
       },
     })
     closers.push(() => adapter.close())
-    await expect.poll(async () => (await adapter.evidenceHistory()).some((item) =>
-      decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate'), { timeout: 3_000 }).toBe(true)
+    const stopped = new AbortController()
+    const observed = (async () => {
+      for await (const item of adapter.subscribeEvidence(stopped.signal)) {
+        if (decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate') return
+      }
+      throw new Error('CERTIFICATE_NOT_RETAINED')
+    })()
+    // Mark rejection handled immediately; a failing assertion still cleans up
+    // the subscription without an unrelated unhandled promise rejection.
+    void observed.catch(() => undefined)
+    closers.push(async () => { stopped.abort(); await observed.catch(() => undefined) })
+    await firstFailure
+    await vi.advanceTimersByTimeAsync(0)
+    expect((await adapter.status()).lastCatchUpError).toBe('CERTIFICATE_REPLY_LOST')
+    expect((await adapter.evidenceHistory()).some(item => decodeOrderingEvidence(item.bytes).kind === 'prefix-certificate')).toBe(false)
+    await vi.advanceTimersByTimeAsync(999)
+    expect(attempts).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await observed
     expect(attempts).toBe(2)
     expect((await f.log.head()).position).toBe(2)
   })
@@ -243,6 +280,20 @@ describe('public Tendriller adapter', () => {
     expect(policy.snapshot().records).toHaveLength(1)
   })
 
+  it('uses the cutoff observed before asynchronous head and proof verification', async () => {
+    const f = await fixture()
+    await f.records.append((await createLedgerRecord(envelope('candidate'))).recordBytes, { historyId })
+    const handler = await withTendrillerFinality(f.engine, { descriptor: f.descriptor, identity: f.identity,
+      records: { ...f.records, info: async options => {
+        const head = await f.records.info(options)
+        f.clock.now = 5_000
+        return head
+      } }, http, now: () => f.clock.now, authorize: () => true })
+    const response = await handler.fetch(new Request('https://hub.test/_chronolog/certificate', { method: 'POST' }), {}, {})
+    expect(response.status).toBe(200)
+    expect((await evaluateFinalitySnapshot(f.configuration, await f.log.read())).closedThroughMs).toBe(1_000n)
+  })
+
   it('bounds idle closures by the first closure window and restores that bound from retained history', async () => {
     const f = await fixture(100)
     expect((await f.certificate()).position).toBe(0)
@@ -259,8 +310,8 @@ describe('public Tendriller adapter', () => {
       f.clock.now += 1_000
       expect(await f.certificate()).toMatchObject(head)
     }
-    const reopened = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity,
-      records: f.records, http, now: () => f.clock.now, cutoffLagMs: 0, futureAdmissionWindowMs: 100,
+    const reopened = await withTendrillerFinality(f.engine, { descriptor: f.descriptor, identity: f.identity,
+      records: f.records, http, now: () => f.clock.now,
       authorize: () => true })
     const response = await reopened.fetch(new Request('https://hub.test/_chronolog/certificate', { method: 'POST' }), {}, {})
     expect(response.status).toBe(200)
@@ -294,7 +345,7 @@ describe('public Tendriller adapter', () => {
 
   it('fails closed before reading/signing and composes ordinary engine requests and scheduling', async () => {
     const f = await fixture()
-    const denied = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity, records: f.records, http })
+    const denied = await withTendrillerFinality(f.engine, { descriptor: f.descriptor, identity: f.identity, records: f.records, http })
     expect((await denied.fetch(new Request('https://hub.test/_chronolog/certificate', { method: 'POST' }), {}, {})).status).toBe(403)
     expect(f.headReads()).toBe(0)
     expect((await f.handler.fetch(new Request('https://hub.test/_chronolog/certificate', { method: 'POST',
@@ -310,7 +361,7 @@ describe('public Tendriller adapter', () => {
 
   it('can authorize through the configured public engine record route with the original credentials', async () => {
     const f = await fixture()
-    const handler = withTendrillerAuthority(f.engine, { configuration: f.configuration, identity: f.identity, records: f.records, http,
+    const handler = await withTendrillerFinality(f.engine, { descriptor: f.descriptor, identity: f.identity, records: f.records, http,
       authorize: authorizeThroughRecordLog(f.engine, { base: 'https://hub.test', historyId, http }),
     })
     const request = (token: string) => new Request('https://hub.test/_chronolog/certificate', {
