@@ -1,4 +1,5 @@
 import type { AuthorityBundle, AppliedResult, OperationState, PeerRevision, PrefixProof, RecoveryNotice, SignedAttempt, SignedRetainedCoverage } from '@chronolog/peer-generation'
+import { validateApplicationDescription } from '@chronolog/peer-generation'
 import type { EphemeralSignal, SignalPayload, SignalSendOptions, Signals, SignalSubscribeOptions } from '@chronolog/signals'
 
 import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from './definition.js'
@@ -20,6 +21,7 @@ type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I
 type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
 interface Snapshot { readonly status: SessionStatus; readonly revision: PeerRevision | null }
 interface Metadata extends Snapshot {
+  readonly protocol: typeof PROTOCOL
   readonly applicationId: string; readonly historyId: string; readonly deviceId: string; readonly storageId: string
   readonly description: Description
 }
@@ -40,7 +42,7 @@ export interface WorkerApplicationReadView {
 /**
  * Serve one page facade beside the owned application. A dedicated port isolates
  * application RPC from RTC handoff and application-owned UI messages. The same
- * pull/cancel pattern as the maintained browser RPC keeps streams bounded.
+ * pull/cancel contract keeps streams bounded within that one owner.
  */
 export function serveApplicationWorker(session: ApplicationSession, endpoint: Endpoint, options: {
   readonly host?: ApplicationControlHost
@@ -189,7 +191,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     }
     port = input.port
     port.addEventListener('message', receive); port.addEventListener('messageerror', messageError); port.start()
-    try { send({ ready: { ...snapshot(session), applicationId: session.applicationId, historyId: session.historyId,
+    try { send({ ready: { ...snapshot(session), protocol: PROTOCOL, applicationId: session.applicationId, historyId: session.historyId,
       deviceId: session.deviceId, storageId: session.storageId, description: session.describe() } satisfies Metadata }) }
     catch (error) { void stop(error).catch(() => undefined) }
   }
@@ -441,10 +443,12 @@ export function connectApplicationWorker<D extends ApplicationDefinition = Appli
         const value = event.data as { ready?: Metadata; ended?: WireError }
         if (value.ended !== undefined) { fail(fromError(value.ended)); return }
         const metadata = value.ready
-        if (metadata === undefined || !/^[0-9a-f]{64}$/u.test(metadata.applicationId) || !/^[0-9a-f]{64}$/u.test(metadata.deviceId) ||
-            typeof metadata.storageId !== 'string' || typeof metadata.historyId !== 'string' || metadata.description.profile !== 'peer-generation-v1') {
+        if (metadata === undefined || metadata.protocol !== PROTOCOL || !/^[0-9a-f]{64}$/u.test(metadata.applicationId) || !/^[0-9a-f]{64}$/u.test(metadata.deviceId) ||
+            typeof metadata.storageId !== 'string' || typeof metadata.historyId !== 'string') {
           throw new Error('APPLICATION_WORKER_METADATA_INVALID')
         }
+        const { capabilities: _capabilities, ...description } = metadata.description
+        validateApplicationDescription(description)
         clean(); resolve(new WorkerApplicationSession<D>(port, metadata, timeoutMs, options.signal))
       } catch (error) { fail(error) }
     }

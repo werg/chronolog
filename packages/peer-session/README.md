@@ -151,7 +151,7 @@ lane. The existing `openWebRtcConnection()` and `frameRtcPeerChannels()` results
 implement this structural interface directly, in a native process or an owning
 browser Worker. A discovery result identifies a possible route; the session
 independently verifies a fresh signed challenge bound to both identities, the
-application descriptor, and the generation profile before attaching that route.
+application descriptor, and the signed record format before attaching that route.
 An optional `peerIdentity` pins the discovered identity. A control-only host
 identity cannot attach without an explicit reader grant.
 The hello can carry a newer signed authority bundle, so an existing reader can

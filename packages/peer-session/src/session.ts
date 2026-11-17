@@ -154,7 +154,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       role: this.#replica.isCoordinator ? 'coordinator' : 'follower', generation: this.#replica.generation.id,
       coordinator, connectedPeers: this.#peers.size }
   }
-  describe() { return { ...describeApplication(this.#definition), profile: 'peer-generation-v1' as const, capabilities: this.capabilities } }
+  describe() { return { ...describeApplication(this.#definition), capabilities: this.capabilities } }
   onStatus(listener: (status: SessionStatus) => void): () => void {
     this.#statusListeners.add(listener)
     try { listener(this.status) } catch { /* Observation never changes peer lifetime. */ }
