@@ -1,7 +1,8 @@
+import { digestEngineManifest, normalizeEngineManifest } from './engine-manifest.js'
 import { bytesToHex, sha256Sync, utf8 } from '@chronolog/canonical'
 import { assertNativeSecurityConfiguration, configureSqliteLimits } from './sql-profile.js'
 import type {
-  DatabaseLike, DoltBranchInfoLike, MaterializerBackendInfo, NativeEngineManifest,
+  DatabaseLike, DoltBranchInfoLike, MaterializerBackendInfo, EngineBuildManifest,
   NativeSecurityConfiguration, MaterializerOptions, StatementLike,
 } from './types.js'
 
@@ -67,7 +68,7 @@ export interface OpfsSqlitePool {
 export interface WasmBuildManifest {
   readonly format: 1
   readonly toolchain: 'emscripten-4.0.20'
-  readonly nativeManifest: NativeEngineManifest
+  readonly nativeManifest: EngineBuildManifest
   readonly runtimeVersions: { readonly doltlite: string; readonly sqlite: string; readonly vec: string }
   readonly portabilityPatches: readonly ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1']
   readonly deterministicSourceSha256: string
@@ -92,18 +93,20 @@ export function verifyWasmBuild(bytes: Uint8Array, manifest: WasmBuildManifest):
       manifest.portabilityPatches[1] !== 'chunk-store-optional-has-moved-v1' || manifest.portabilityPatches[2] !== 'vfs-identity-forwarding-v1') {
     throw new Error('WASM_ENGINE_PORTABILITY_PROFILE_UNSUPPORTED')
   }
-  if (manifest.nativeManifest.doltliteVersion !== '0.11.29' || manifest.nativeManifest.sqliteVecVersion !== '0.1.9' ||
-      manifest.nativeManifest.chronologPatchProfile !== PATCH_PROFILE) throw new Error('WASM_ENGINE_PROFILE_UNSUPPORTED')
+  const nativeManifest = normalizeEngineManifest(manifest.nativeManifest)
+  if (nativeManifest.doltliteVersion !== '0.11.29' || nativeManifest.sqliteVecVersion !== '0.1.9' ||
+      nativeManifest.chronologPatchProfile !== PATCH_PROFILE) throw new Error('WASM_ENGINE_PROFILE_UNSUPPORTED')
 }
 
 /** Create a synchronous engine factory after the Worker has loaded its one WASM instance. */
 export function createWasmEngineFactory(module: ChronologWasmModule, manifest: WasmBuildManifest, vfs: string): (options: { path?: string }) => OpenedDatabase {
+  const nativeManifest = normalizeEngineManifest(manifest.nativeManifest)
+  const engineDigest = digestEngineManifest(nativeManifest)
+  const runtimeVersions = { ...manifest.runtimeVersions }
   withBytes(module.wasm, utf8(vfs), (pointer) => {
     const rc = module.wasm.xCall('chronolog_wasm_init', pointer)
     if (rc !== 0) throw new Error(`WASM_ENGINE_VFS_UNAVAILABLE:${vfs}:${rc}`)
   })
-  const descriptor = `chronolog-engine-manifest-v1\n${stableJson(manifest.nativeManifest)}`
-  const engineDigest = sha256Sync(utf8(descriptor))
   return (options) => {
     if (options.path === undefined || options.path === ':memory:') throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
     const database = new WasmDatabase(module, options.path)
@@ -117,10 +120,10 @@ export function createWasmEngineFactory(module: ChronologWasmModule, manifest: W
         engine: 'doltlite', version: database.doltVersion(),
         sqliteVersion: String(database.scalar('SELECT sqlite_version()')),
         vecVersion: String(database.scalar('SELECT vec_version()')),
-        nativeManifest: structuredClone(manifest.nativeManifest), engineDigest: engineDigest.slice(), securityConfigured: true,
+        nativeManifest: structuredClone(nativeManifest), engineDigest: engineDigest.slice(), securityConfigured: true,
       }
-      if (backend.version !== manifest.runtimeVersions.doltlite || backend.sqliteVersion !== manifest.runtimeVersions.sqlite ||
-          backend.vecVersion !== manifest.runtimeVersions.vec) throw new Error('WASM_ENGINE_VERSION_MISMATCH')
+      if (backend.version !== runtimeVersions.doltlite || backend.sqliteVersion !== runtimeVersions.sqlite ||
+          backend.vecVersion !== runtimeVersions.vec) throw new Error('WASM_ENGINE_VERSION_MISMATCH')
       return { database, backend, security }
     } catch (error) { database.close(); throw error }
   }
@@ -349,14 +352,4 @@ function withBytes<T>(wasm: WasmApi, bytes: Uint8Array, operation: (pointer: num
   const pointer = wasm.alloc(bytes.length + 1)
   try { wasm.heap8u().set(bytes, pointer); wasm.heap8u()[pointer + bytes.length] = 0; return operation(pointer) }
   finally { wasm.dealloc(pointer) }
-}
-
-function stableJson(value: unknown): string {
-  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
-  if (typeof value === 'object') {
-    const record = value as Record<string, unknown>
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`
-  }
-  throw new Error('WASM_ENGINE_MANIFEST_INVALID')
 }

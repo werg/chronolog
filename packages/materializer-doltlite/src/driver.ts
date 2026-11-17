@@ -1,12 +1,11 @@
-import { createHash } from 'node:crypto'
-
+import { digestEngineManifest, engineManifestDescriptor, normalizeEngineManifest } from './engine-manifest.js'
 import { DatabaseSync, chronologNativeManifest, chronologTriggerUsesIgnore } from '@dolthub/doltlite'
 
 import type {
   DatabaseLike,
   MaterializerBackendInfo,
   MaterializerOptions,
-  NativeEngineManifest,
+  EngineBuildManifest,
   SecurityConfiguration,
 } from './types.js'
 import { discoverPublishedRef } from './checkpoints.js'
@@ -20,18 +19,18 @@ export interface OpenedDatabase {
 }
 
 export interface NativeEngineInfo {
-  readonly manifest: NativeEngineManifest
+  readonly manifest: EngineBuildManifest
   readonly descriptor: string
   readonly digest: Uint8Array
 }
 
 /** Read the linked native build identity before a database is opened. */
 export function readNativeEngineInfo(): NativeEngineInfo {
-  const manifest = normalizeNativeManifest(chronologNativeManifest())
+  const manifest = normalizeEngineManifest(chronologNativeManifest())
   return {
     manifest,
-    descriptor: nativeEngineDescriptor(manifest),
-    digest: digestNativeEngineManifest(manifest),
+    descriptor: engineManifestDescriptor(manifest),
+    digest: digestEngineManifest(manifest),
   }
 }
 
@@ -100,20 +99,6 @@ export function openDatabase(options: Pick<MaterializerOptions, 'path'>): Opened
   }
 }
 
-/**
- * SHA-256 over a versioned, recursively key-sorted JSON descriptor. Object
- * keys are sorted by Unicode code point, arrays retain order, and JSON is
- * emitted without whitespace.
- */
-export function digestNativeEngineManifest(manifest: NativeEngineManifest): Uint8Array {
-  const descriptor = `chronolog-engine-manifest-v1\n${stableJson(manifest)}`
-  return Uint8Array.from(createHash('sha256').update(descriptor, 'utf8').digest())
-}
-
-export function nativeEngineDescriptor(manifest: NativeEngineManifest): string {
-  return `chronolog-engine-manifest-v1\n${stableJson(manifest)}`
-}
-
 function readPragma(database: DatabaseLike, name: 'recursive_triggers'): number {
   const row = database.prepare(`PRAGMA ${name}`).get()
   if (row === undefined || Array.isArray(row)) throw new Error('MATERIALIZER_PRAGMA_UNAVAILABLE')
@@ -161,33 +146,6 @@ function assertNativeContract(database: DatabaseLike): void {
       throw new Error(`MATERIALIZER_NATIVE_API_MISSING:${method}`)
     }
   }
-}
-
-function normalizeNativeManifest(value: unknown): NativeEngineManifest {
-  if (typeof value !== 'object' || value === null) throw new Error('MATERIALIZER_NATIVE_MANIFEST_INVALID')
-  const manifest = value as Record<string, unknown>
-  for (const key of [
-    'doltliteVersion', 'doltliteSourceSha256', 'sqliteVecVersion',
-    'sqliteVecSourceSha256', 'chronologPatchProfile',
-  ]) {
-    if (typeof manifest[key] !== 'string' || manifest[key] === '') {
-      throw new Error('MATERIALIZER_NATIVE_MANIFEST_INVALID')
-    }
-  }
-  for (const key of ['fts5', 'json1', 'rtree', 'dynamicExtensions']) {
-    if (typeof manifest[key] !== 'boolean') throw new Error('MATERIALIZER_NATIVE_MANIFEST_INVALID')
-  }
-  return structuredClone(value) as NativeEngineManifest
-}
-
-function stableJson(value: unknown): string {
-  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
-  if (typeof value === 'object') {
-    const record = value as Record<string, unknown>
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`
-  }
-  throw new Error('MATERIALIZER_NATIVE_MANIFEST_INVALID')
 }
 
 function nativeDatabase(path: string, readOnly = false): DatabaseLike {

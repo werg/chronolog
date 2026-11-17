@@ -56,12 +56,12 @@ export interface MaterializerBackendInfo {
   readonly version: string
   readonly sqliteVersion: string
   readonly vecVersion: string | null
-  readonly nativeManifest: NativeEngineManifest
+  readonly nativeManifest: EngineBuildManifest
   readonly engineDigest: Uint8Array
   readonly securityConfigured: boolean
 }
 
-export interface NativeEngineManifest {
+export interface EngineBuildManifest {
   readonly doltliteVersion: string
   readonly doltliteSourceSha256: string
   readonly sqliteVecVersion: string

@@ -1,9 +1,6 @@
 export * from './native.js'
 export * from './runtime-adapter.js'
-export * from './portable.js'
 export {
-  digestNativeEngineManifest,
-  nativeEngineDescriptor,
   openReadOnlyDatabase,
   readNativeEngineInfo,
   type NativeEngineInfo,
@@ -20,3 +17,4 @@ export { OWNER_COLUMN_SQL, platformTriggerName, platformTriggers, rowKeyExpressi
 export { executeTransactionProgram, SqlRejection, type DeterministicContext } from './sql-executor.js'
 export { SEEDABLE_PLATFORM_TABLES } from './platform/session.js'
 export { readMaterializedRootAdministrator } from './driver.js'
+export * from './engine-manifest.js'

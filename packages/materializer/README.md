@@ -1,61 +1,54 @@
 # `@chronolog/materializer`
 
-This package is the portable boundary between Chronolog coordination and a
-database materialization host. It intentionally has no workerd, Node, DoltLite,
-filesystem, transport, clock, or random-source dependency.
+This package defines the execution boundary used by every Chronolog application
+session. The verified history owner supplies an ordered list of `ReplayProposal`
+values and its current signed execution controls. A materializer validates the
+original proposal bytes, executes that supplied order and exposes one coherent
+revision with command outcomes, events and optional SQL queries.
 
-It owns:
+The same boundary serves native and browser storage, ordinary participants and
+explicit transport roles. Ordering belongs to the history owner. A materializer
+does not sort a second history or infer settlement from a participant role.
 
-- exact object, artifact, and immutable database reference shapes;
-- canonical CBOR codecs for invocation, replay suffix, continuation, outcome,
-  differential observation, and self-contained differential fixture values;
-- resolution through an exact-reference-only object reader;
-- an explicit pure context in which logical time and caller entropy are null in
-  version 1; and
-- a backend-neutral kernel and differential harness usable by both Node and
-  workerd implementations.
+## Execution and publication
 
-Chronolog transaction timestamps and nonce-derived entropy remain inside each
-signed transaction. A materializer host must not substitute ambient time or
-randomness. The existing DoltLite implementation exposes a temporary oracle
-adapter in `@chronolog/materializer-doltlite`; its output projector is injected
-because only a CAS/export host can assign generic immutable output refs.
+`ChronologMaterializationRuntime` separates the coordinator's replay/publication
+port from application reads. A replay produces a candidate revision; publication
+makes that revision visible atomically. Captured views retain the exact revision
+and must be released. Changed outcomes are reported with the revision that made
+them visible, including removal of outcomes excluded by explicit recovery.
 
-The package does not define mutable publication. Reduction returns immutable
-candidates; a coordinator publishes those candidates separately.
+`ReplayProposal` preserves the original canonical proposal, its signed digest,
+transaction ID and decoded transaction. Author timestamps and deterministic
+entropy remain those original transaction inputs. The runtime never substitutes
+ambient time or randomness.
 
-`ReplayProposal` is the shared input for event and SQL replay. It carries the
-original canonical proposal, its digest and its stable ID. It asserts neither
-admission nor finality; the caller selects which verified proposals to replay.
-`ChronologReplaySuffix` carries a chronological suffix of these inputs through
-the portable kernel. Application ordering uses only signed author timestamp,
-signing public key and stable proposal ID. Transport sequences never enter
-replay inputs or the protected SQL transaction log.
+Protected schema and collective permissions arrive as explicit verified
+`PeerExecutionControls`. The SQL materializer retains their authenticated
+projection across replay and refuses to erase it through an omitted control
+argument. Event and SQL execution use this same runtime contract.
 
-## SQL-free event execution
+An optional `coordinator.publishFinal()` capability allows an explicit settlement
+owner to protect a prefix. Its presence is observable; ordinary replay does not
+claim it has settled history. Default application reads observe the current
+applied revision. A caller requesting a final view must choose it explicitly.
 
-`createEventMaterializationRuntime` implements the ordinary materialization port
-for groups whose programs contain only literal durable events. It persists the
-ordered proposals, local revision and immutable final prefix in one bounded
-atomic storage value. Duplicate operations have deterministic outcomes; a SQL
-step receives `profile:sql-disabled` rather than loading an engine.
+## Event execution without SQL
 
-The coordinator supplies a chronological selection of already verified proposals.
-A newly eligible earlier proposal can change the provisional suffix; a proposal
-that loses eligibility can leave that suffix and later reenter with its original
-identity. Removing a provisional outcome emits a change with `current: null`.
-The final prefix, its complete proposal identities and its event IDs are immutable.
-The direct materializer port trusts its caller to supply immutable proposal IDs;
-the shipped node derives each ID from the canonical proposal hash. It does not
-maintain a second historical identity registry for proposals outside its current
-selection.
-Inputs are copied before waiting for queued work, and returned outcomes cannot
-mutate the runtime's retained state.
+`createEventMaterializationRuntime({ store, namespace })` executes literal durable
+events through the common runtime. `store` implements the shared `BytesStore`
+contract. The runtime writes immutable ordered records before an atomic durable
+head selects the current history. It bounds record count and retained bytes and
+verifies the complete linked history on reopen.
 
-If an atomic storage write throws, it may have committed before its reply was
-lost. The runtime closes its mutation and publication ports immediately. Reopen
-from the authoritative stored value before continuing; retrying from the old
-in-memory prefix could overwrite a newer durable finality promise. Existing read
-snapshots retain their last acknowledged coherent view. The regression suite
-covers failures before a write and lost replies after both replay and finality
-commits.
+Duplicate operations have deterministic outcomes. A SQL step reports
+`profile:sql-disabled`; the event runtime has no SQL engine dependency. Inputs
+are copied before queued work begins, and returned outcomes cannot mutate the
+retained history. One `eventExecutionManifest()` identifies this execution
+capability independently of ordering or transport roles.
+
+A failed storage acknowledgment may follow a successful durable write. The
+runtime therefore closes its mutation/publication ports and requires reopen
+from the durable head. Existing read snapshots retain their last acknowledged
+coherent view. Tests cover failures before publication and lost acknowledgments
+after both replay and explicit settlement.
