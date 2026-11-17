@@ -1,6 +1,28 @@
 # Chronolog DB
 
-Chronolog DB is a TypeScript prototype of a decentralized, permissioned
+New shared applications use the default
+[peer-generation architecture](docs/peer-application-architecture.md). Start with
+the [owned `@chronolog/peer-session` API](packages/peer-session/README.md) for native
+and browser setup, declared commands and queries, live signals, SQL and recovery.
+The session owns device identity and the original command and recovery journals.
+The current executable preview waits for an ordered, locally applied result with
+`operation.applied()`. Explicit exceptional recovery can abandon a recent suffix;
+available abandoned work remains inspectable and requires deliberate reapplication.
+See the [selected-history contract](docs/peer-generation-v1.md) for its guarantees.
+
+For transient messages alone, use the independent
+[`@chronolog/signals` package](packages/signals/README.md#build-and-consume-the-standalone-package).
+It needs no database, retained application history or ordering/finality provider.
+
+## Existing chronological components
+
+The descriptions, quickstart and `@chronolog/client` examples below document the
+existing chronological implementation. Its `local()` and `final()` methods are
+implemented APIs with an immutable final prefix. That guarantee belongs to this
+implementation; the default generation architecture has the explicit recovery
+semantics described above.
+
+The chronological engine is a TypeScript prototype of a decentralized, permissioned
 application log. One signed change program combines **ordinary SQLite
 transactions**, platform operations, and bounded durable events. Native and
 browser peers verify the same original records; SQL profiles execute the same
@@ -86,7 +108,7 @@ Read [the design](docs/design.md) for how it works,
 for the transaction contract, and [the documentation index](docs/README.md) for
 everything else.
 
-## Quick start
+## Chronological quick start
 
 For the workspace and native SQL runtime, use Node.js 22 or newer, the pinned
 pnpm 10.12.4, Python 3 and a C/C++ toolchain for
