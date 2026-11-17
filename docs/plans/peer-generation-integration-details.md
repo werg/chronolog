@@ -1,7 +1,7 @@
 # Integration details for the unified peer-generation model
 
-These notes carry implementation findings into the adopted peer-generation
-refactor. They describe code reviewed through `3187d9df` and supporting fixes.
+These notes describe the adopted peer-generation architecture and its maintained
+application surfaces.
 The generation implementation owns the public session API. Its
 [selected-history contract](../peer-generation-v1.md) already implements signed
 prefix adoption, exclusion of abandoned suffixes, immutable exact retries,
@@ -13,18 +13,46 @@ The session also supplies an owned Worker facade and a network owner for discove
 invitations, reconnect and permitted takeover, plus its Tendriller backend binding,
 encrypted epoch enrollment and opt-in native and browser SQL packaging. The browser
 archive includes verified compiled WASM assets whose source identity, deterministic
-hooks and runtime versions match the pinned native engine. The remaining integration
-work below concerns reset-aware consumers and deployment evidence; those
-implemented mechanisms do not by themselves qualify a deployment.
+hooks and runtime versions match the pinned native engine. Projections and
+external-effect workers have explicit generation-reset contracts. Signed page
+releases use an independent control history and the same owned device identity.
+These implemented mechanisms do not by themselves qualify a deployment.
+
+## The host is a selective protocol participant
+
+Chronolog owns record verification, current authority, exact retry identities,
+and recovery semantics. Tendriller supplies authenticated account policy,
+durable storage, discovery and the HTTP/WebSocket transport for the facets its
+host role accepts. The host needs no application SQL materializer or private
+reader key.
+
+| Facet | Participant behavior | Authority and retention |
+| --- | --- | --- |
+| Application commands and SQL/events | Peers exchange signed attempts and encrypted selected history. | Current grants and deterministic domain guards govern execution; explicit recovery may abandon a suffix. |
+| Live signals | Available peer routes carry bounded disposable observations. | Current signal permission applies; reconnect does not replay an outbox. |
+| Membership and generation selection | The host accepts authenticated control changes and signed selection requests. | Independently retained signed control history governs membership, key epochs and recovery selection. |
+| Private content | Authorized readers transfer verified encrypted chunks. | A content reference is not a credential; current access is checked on fetch. |
+| Page releases | Authorized publishers stage exact authored bytes and sign immutable asset manifests; the host verifies and selects them. | Publisher policy and activation history are separate from data membership and data recovery. |
+
+A transport restricts accepted facets and resource use. The signed records and
+their current policy establish authority. This keeps the same protocol rules
+usable over a different transport without turning a routing decision into a
+permission grant.
+
+Publication stages content before activation. The activation request names the
+expected preceding selection, so racing publishers cannot both win. A lost
+response reuses the durably saved request. Selecting an older page is a new
+authorized activation; restoring an older data prefix cannot restore old
+publisher authority. Authored assets remain distinct from the trusted runtime
+the host injects into a served page. See
+[signed page releases](../../packages/peer-session/releases.md).
 
 ## Completion and recovery
 
 The implemented application waits are `applied()` for accepted or rejected
 execution in the selected history, and `shared()` for independently retained
 coverage. Explicit recovery may abandon recent work after either observation.
-A proposed vocabulary using `local()` and `final()` remains an unimplemented
-API design question; application code and current documentation use the public
-methods above. A method name alone cannot supply an across-recovery guarantee.
+Neither observation supplies an across-recovery guarantee by itself.
 
 Do not add an extra execution stage just to make two wait methods differ. A
 completion wait still returns an accepted or rejected result. An exact retry
@@ -64,14 +92,16 @@ read view stays internally coherent; subsequent captures use the selected
 history. Ambiguous storage acknowledgements require reopening the committed
 state before another publication can overwrite it.
 
-The current `DurableProjection`, `DurableTimerScheduler` and `DurableEffectWorker`
-assume an append-only source. Their checkpoints have no reset protocol. Merely
-matching the structural `read`/`subscribe` interface does not adapt them to
-generation recovery. The simple starting point for derived application state
-is rebuilding it from the recovered history rather than reusing an unrelated
-cursor or inventing another command outbox.
+`ApplicationProjection` rebuilds from one coherent captured view when the
+selected generation changes, then atomically replaces its state and cursor.
+It advances incrementally within a generation. The owned consumer journal binds
+its application, history, consumer ID, explicit semantic version and
+configuration. Reopening an ambiguous checkpoint reloads the durable record.
+The older `DurableProjection`, `DurableTimerScheduler` and `DurableEffectWorker`
+belong to the chronological profile; irreversible consumers explicitly refuse
+an incompatible source history contract.
 
-Dispatch journals record external facts and need a different recovery rule.
+`ApplicationEffectWorker` records external facts under a different recovery rule.
 Retain the original effect identity, authenticated requester, provider retry key
 and uncertain/completed dispatch state. Before starting an undispatched action,
 check that its intent is still applicable and currently authorized. A provider
@@ -85,9 +115,19 @@ and caller provenance for an occurrence already dispatched. A scheduler's
 signature attests its derived event; copying an origin-shaped payload does not
 authenticate the original request.
 
-See [consumer contracts](../../packages/agent-service/src/event-source.ts),
-[effect checkpoints](../../packages/agent-service/src/effect-worker.ts),
-[timer checkpoints](../../packages/agent-service/src/timers.ts), and
+The consumer and publisher lifetimes are registered before initial storage IO.
+Session shutdown cancels remote observations and waits for active durable writes
+before closing the device store. They share the application's command journal
+for result commands and explicit reapplication.
+
+SQL captures lease the already verified immutable published reader. Capturing
+and querying it create no database connection or branch. Publication replaces
+the current reader while held leases retain their old SQL/event view; the last
+lease releases a retired reader. This removes database writes caused by ordinary
+reads. It does not perform physical WAL compaction or prune retained history.
+
+See [generation-aware consumers](../../packages/peer-session/src/consumers/index.ts),
+[effect checkpoints](../../packages/peer-session/src/consumers/effects.ts), and
 [applied SQL publication](../../packages/materializer-doltlite/src/materializer.ts).
 
 ## Account for SQL permissions during recovery
@@ -142,11 +182,11 @@ Relevant implementation: [platform tables](../../packages/materializer-doltlite/
 
 ## Package and qualification boundaries
 
-Capability revision wire v2 removes mutable validator policy fields and changes
-the epoch field's encoding. A membership archive built from the earlier wire
-cannot approve/revoke members for a v2 core. Rebuild the portable membership
-archive and its Tendriller engine consumer as a pair. Genesis/configuration
-success alone cannot establish that later approvals and revocations interoperate.
+Build and qualify the portable control archive, public application archive and
+Tendriller engine consumer as an exact source pair. Genesis/configuration
+success alone does not establish later approvals, revocations, release
+activation or recovery. Pre-release contracts have no compatibility decoder or
+migration path.
 
 Useful acceptance checks for the refactor are:
 
