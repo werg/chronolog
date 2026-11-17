@@ -21,7 +21,7 @@ export interface ApplicationTool {
 export function createApplicationTools(session: ApplicationSession, options: { readonly host?: ApplicationControlHost } = {}) {
   const description = session.describe(), operationId = { type: 'string', minLength: 1, maxLength: 256 }
   const object = (properties: Record<string, unknown>, required: readonly string[] = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false })
-  const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>, optional: Record<string, unknown> = {}) => ({ oneOf: description[kind].map(entry => object({
+  const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>, optional: Record<string, unknown> = {}) => ({ type: 'object', oneOf: description[kind].map(entry => object({
     name: { type: 'string', const: entry.name, description: entry.description }, input: entry.input, ...fields, ...optional,
   }, ['name', 'input', ...Object.keys(fields)])) })
   const tools: readonly ApplicationTool[] = [
