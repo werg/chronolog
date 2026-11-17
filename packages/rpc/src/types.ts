@@ -181,7 +181,6 @@ export interface SubmitTransactionResponse {
   readonly publishedAt: string
 }
 
-export type TransactionPhase = 'candidate_published' | 'collecting_attestations' | 'validation_threshold_met' | 'admissible' | 'replicated' | 'accepted' | 'rejected'
 export interface TransactionRejection {
   /** `assert:<code>`, `policy:<table>:<command>`, `platform:<reason>`, `constraint`, `denied`, … */
   readonly code: string
@@ -194,7 +193,6 @@ export type TransactionResult =
   | { readonly type: 'rejected'; readonly rejection: TransactionRejection }
 export interface TransactionOutcome {
   readonly transactionId: TransactionId
-  readonly phase: TransactionPhase
   readonly outcome: TransactionResult
   readonly eventSetRevision: Revision
   readonly materializedRevision: Revision

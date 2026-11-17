@@ -110,10 +110,12 @@ describe('pluggable inclusion finality with one chronological execution order', 
     expect(right.current.node.finalOrderLength).toBe(5)
   })
 
-  it('keeps certified inclusion pending until a closure covers author time', async () => {
+  it('previews certified inclusion until a closure covers author time', async () => {
     const f = await replica(), first = await proposal(f.configuration, f.identity, 'first', 10n)
     await f.include(first); await f.certify()
     expect(f.current.node.isFinal(first.txId)).toBe(false)
+    expect(f.current.node.outcome(first.txId)?.outcome).toBe('accepted')
+    expect(f.current.node.candidate(first.txId)?.state).toBe('provisional')
     expect(await eventNames(f.current.node)).toEqual([])
     await f.closeThrough(20n)
     expect(f.current.node.isFinal(first.txId)).toBe(true)
@@ -143,9 +145,9 @@ describe('pluggable inclusion finality with one chronological execution order', 
   it('leaves future-dated inclusion pending until a later idle closure', async () => {
     const f = await replica(), future = await proposal(f.configuration, f.identity, 'future', 100n)
     await f.include(future); await f.closeThrough(50n)
-    expect(f.current.node.candidate(future.txId)?.state).toBe('pending_validation')
+    expect(f.current.node.candidate(future.txId)?.state).toBe('provisional')
     expect(f.current.node.isFinal(future.txId)).toBe(false)
-    expect(f.current.node.outcome(future.txId)).toBeNull()
+    expect(f.current.node.outcome(future.txId)?.outcome).toBe('accepted')
     await f.closeThrough(100n)
     expect(f.current.node.isFinal(future.txId)).toBe(true)
     expect(await eventNames(f.current.node)).toEqual(['future'])
@@ -175,7 +177,7 @@ describe('pluggable inclusion finality with one chronological execution order', 
     const beyond = await proposal(f.configuration, f.identity, 'one-millisecond-beyond', 71n)
     await f.include(boundary); await f.include(beyond); await f.closeThrough(50n)
     expect(f.current.node.isFinal(boundary.txId)).toBe(false)
-    expect(f.current.node.outcome(boundary.txId)).toBeNull()
+    expect(f.current.node.outcome(boundary.txId)?.outcome).toBe('accepted')
     expect(f.current.node.isFinal(beyond.txId)).toBe(true)
     expect(f.current.node.outcome(beyond.txId)).toMatchObject({ outcome: 'rejected', rejectionCode: 'FINALITY_TIMESTAMP_FUTURE' })
     await f.closeThrough(70n)
@@ -193,6 +195,25 @@ describe('pluggable inclusion finality with one chronological execution order', 
     await f.certify()
     expect(f.current.node.isFinal(first.txId)).toBe(true)
     expect(await eventNames(f.current.node)).toEqual(['missing'])
+  })
+
+  it('continues local replay while an independent missing body holds the next final frontier', async () => {
+    const f = await replica(), first = await proposal(f.configuration, f.identity, 'final-before-gap', 10n)
+    await f.include(first); await f.closeThrough(20n)
+    const missing = await proposal(f.configuration, f.identity, 'body-in-flight', 30n)
+    await f.include(missing, false); await f.certify()
+    expect(f.current.node.finalOrderLength).toBe(1)
+    const preview = await proposal(f.configuration, f.identity, 'available-preview', 40n)
+    await f.current.node.ingest(await f.current.transport.publish(preview.envelope))
+    await f.include(preview); await f.certify()
+    expect(f.current.node.outcome(preview.txId)?.outcome).toBe('accepted')
+    expect(f.current.node.isFinal(preview.txId)).toBe(false)
+    await expect(f.closeThrough(50n)).rejects.toThrow('LEDGER_PAYLOAD_UNAVAILABLE')
+    expect(f.current.node.outcome(preview.txId)?.outcome).toBe('accepted')
+    expect(await eventNames(f.current.node)).toEqual(['final-before-gap'])
+    f.bodies.set(missing.descriptor.record.payloadHash, missing.envelope)
+    await f.certify()
+    expect(await eventNames(f.current.node)).toEqual(['final-before-gap', 'body-in-flight', 'available-preview'])
   })
 
   it('lets an alternative proof gate change finality without providing an execution sorter', async () => {

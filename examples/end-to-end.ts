@@ -1,13 +1,11 @@
-// Two nodes share one group. Alice is the root administrator and the
-// validator; Bob is a writer. Alice creates and registers a table, Bob's
-// attempt to change Alice's row is rejected by the owner check, Alice grants
-// Bob access to that row, and a late predecessor flips a later transaction
-// during replay.
+// Two peers share one timestamp-ordered live group. Alice is its schema
+// administrator and validator. Final setup authorizes Bob's guarded update;
+// partitioned edits execute locally, then replay in signed timestamp order.
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { ChronologClient, platformOp } from '@chronolog/client'
+import { ChronologClient, platformOp, TransactionRejectedError, type TransactionHandle } from '@chronolog/client'
 import {
   DeterministicMaterializer,
   createDoltLiteExecutionManifest,
@@ -22,7 +20,7 @@ import {
   type Ed25519KeyPair,
   type ChangeProgram,
 } from '@chronolog/protocol'
-import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
+import { InProcessRpcTransport, NodeRpcService, type TransactionOutcome } from '@chronolog/rpc'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 
 const directory = await mkdtemp(join(tmpdir(), 'chronolog-example-'))
@@ -30,11 +28,16 @@ const [alice, bob] = await Promise.all([generateEd25519KeyPair(), generateEd2551
 const capability = Uint8Array.of(7)
 const groupId = bytes32(1)
 const network = new MemoryTransportNetwork()
+// Drive a genuine finite live policy with a controlled monotone clock, so the
+// example can show exactly when local results become final without wall sleeps.
+const clock = { now: Date.now() }, cutoffLagMs = 100
 const membership: MembershipResolver = {
   canWrite: ({ writerId }) => equalBytes(writerId, alice.publicKeyBytes) || equalBytes(writerId, bob.publicKeyBytes),
   canValidate: ({ validatorId, validatorCapability }) =>
     equalBytes(validatorId, alice.publicKeyBytes) && equalBytes(validatorCapability, capability),
   threshold: () => 1,
+  watermarkPolicy: () => ({ kind: 'threshold', policyId: 'alice-validator', validatorIds: [alice.publicKeyBytes], threshold: 1 }),
+  liveFinalityPolicies: () => [{ kind: 'threshold', policyId: 'alice-validator', validatorIds: [alice.publicKeyBytes], threshold: 1 }],
   // Each signing key may only publish through its own node's feed.
   canUseTransportAuthor: ({ role, signingId, transportAuthor }) =>
     (equalBytes(signingId, alice.publicKeyBytes) && transportAuthor === 'alice') ||
@@ -43,40 +46,52 @@ const membership: MembershipResolver = {
 const aliceNode = await startNode('alice', alice, true)
 const bobNode = await startNode('bob', bob, false)
 network.connectAll()
+const keepAlive = setInterval(() => undefined, 1_000)
 
-const client = new ChronologClient({
-  groupId: Buffer.from(groupId).toString('base64url'),
-  transport: new InProcessRpcTransport(new NodeRpcService({ node: aliceNode.node })),
-})
 try {
-  // Alice (the root administrator) creates the table and registers it: rows
-  // now belong to the key that signed their insert.
-  await settled(aliceNode.node, await aliceNode.node.publish({ authorTimestampMs: 1n, program: bootstrapProgram() }), 'accepted')
+  const setup = await aliceNode.client.submit(bootstrapProgram(), { operationId: 'create-accounts' })
+  await requireFinalAcceptance(setup)
+  await eventually(async () => (await bobNode.client.getTransactionOutcome(setup.transactionId).catch(() => undefined))?.final === true)
   console.log('owner of account 1 is Alice:',
-    equalBytes((await client.query('SELECT p.key FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner WHERE a.id = 1')).result.rows[0]![0] as Uint8Array, alice.publicKeyBytes))
+    equalBytes((await aliceNode.client.query('SELECT p.key FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner WHERE a.id = 1', [], { view: 'final' })).result.rows[0]![0] as Uint8Array, alice.publicKeyBytes))
 
-  // Bob may write, but not Alice's row.
-  const theft = await bobNode.node.publish({ authorTimestampMs: 2n, program: program('UPDATE accounts SET balance = 0 WHERE id = 1') })
-  console.log('Bob updating Alice\'s row:', await settled(aliceNode.node, theft))
+  // Bob may publish SQL, but the owner check still rejects changing Alice's row.
+  const theft = await bobNode.client.transaction(['UPDATE accounts SET balance = 0 WHERE id = 1'])
+  console.log('Bob updating Alice\'s row:', (await finalOutcome(theft)).outcome)
 
-  // Alice grants Bob updates of the balance column of that one row.
-  await settled(aliceNode.node, await aliceNode.node.publish({
-    authorTimestampMs: 3n,
-    program: program(platformOp.grant({ table: 'accounts', grantee: bob.publicKeyBytes, operations: ['update'], rowKey: [1n], columns: ['balance'] })),
-  }), 'accepted')
-  const granted = await bobNode.node.publish({ authorTimestampMs: 10n, program: updateProgram(100n, 95n) })
-  console.log('Bob updating the balance with a grant:', await settled(aliceNode.node, granted))
+  // Dependent work waits for a final grant and its final view on the other peer.
+  const grant = await aliceNode.client.transaction([
+    platformOp.grant({ table: 'accounts', grantee: bob.publicKeyBytes, operations: ['update'], rowKey: [1n], columns: ['balance'] }),
+  ])
+  await requireFinalAcceptance(grant)
+  await eventually(async () => (await bobNode.client.getTransactionOutcome(grant.transactionId).catch(() => undefined))?.final === true)
 
-  // A late predecessor: Alice's update at time 5 sorts before Bob's at time
-  // 10, so Bob's guarded update is replayed after it and now rejected.
-  const predecessor = await aliceNode.node.publish({ authorTimestampMs: 5n, program: updateProgram(100n, 50n) })
-  await settled(aliceNode.node, predecessor, 'accepted')
-  await eventually(() => aliceNode.node.outcome(granted.txId)?.rejectionCode === 'assert:balance_changed')
-  console.log('Bob\'s update after replay:', aliceNode.node.outcome(granted.txId)?.rejectionCode)
-  console.log('balance', (await client.query('SELECT balance FROM accounts WHERE id = ?', [1n])).result.rows)
+  // Alice authors the earlier edit while the peers are disconnected. Bob can
+  // still execute a later edit locally without a validator or a finality service.
+  network.disconnect('alice', 'bob')
+  clock.now += 1
+  const predecessor = await aliceNode.client.submit(updateProgram(100n, 50n), { operationId: 'alice-edit' })
+  const earlierLocal = await predecessor.local()
+  if (earlierLocal.outcome.type !== 'accepted') throw new Error('Expected Alice\'s local edit to succeed')
+  clock.now += 1
+  const granted = await bobNode.client.submit(updateProgram(100n, 95n), { operationId: 'bob-edit' })
+  const preview = await granted.local()
+  if (preview.outcome.type !== 'accepted' || preview.final) throw new Error('Expected Bob\'s provisional success')
+  console.log('Bob\'s disconnected local result:', preview.outcome)
+
+  // Reconnection brings the signed predecessor. Replay replaces Bob's success
+  // with a rejection; no external effect was dispatched from that local result.
+  network.connectAll()
+  await eventually(async () => (await bobNode.client.getTransactionOutcome(granted.transactionId)).outcome.type === 'rejected')
+  await requireFinalAcceptance(predecessor)
+  const final = await granted.final({ signal: AbortSignal.timeout(10_000) })
+  if (final.outcome.type !== 'rejected') throw new Error('Expected the final guarded update to reject')
+  console.log('Bob\'s final result:', final.outcome)
+  console.log('final balance', (await aliceNode.client.query('SELECT balance FROM accounts WHERE id = ?', [1n], { view: 'final' })).result.rows)
   console.log('checkpoints', aliceNode.materializer.checkpoints().length)
 } finally {
-  await client.close()
+  clearInterval(keepAlive)
+  await Promise.all([aliceNode.client.close(), bobNode.client.close()])
   await bobNode.node.close()
   await aliceNode.node.close()
   await rm(directory, { recursive: true, force: true })
@@ -86,7 +101,6 @@ async function startNode(name: string, identity: Ed25519KeyPair, validator: bool
   const materializer = await DeterministicMaterializer.open({
     path: join(directory, `${name}.db`),
     executionManifest: createDoltLiteExecutionManifest(),
-    // Every replica of the group names the same genesis root administrator.
     rootAdministrator: alice.publicKeyBytes,
     checkpointEvery: 1,
   })
@@ -98,10 +112,13 @@ async function startNode(name: string, identity: Ed25519KeyPair, validator: bool
     transport: network.createNode(name),
     materialization: createDoltLiteMaterializationRuntime(materializer),
     membership,
-    ...(validator ? { validator: { capabilityId: capability, cutoffLagMs: Number.MAX_SAFE_INTEGER } } : {}),
+    clock: { now: () => clock.now },
+    ...(validator ? { validator: { capabilityId: capability, cutoffLagMs } } : {}),
   })
   await node.start()
-  return { node, materializer }
+  const client = new ChronologClient({ groupId: Buffer.from(groupId).toString('base64url'),
+    transport: new InProcessRpcTransport(new NodeRpcService({ node })) })
+  return { node, materializer, client }
 }
 
 function bootstrapProgram(): ChangeProgram {
@@ -119,25 +136,26 @@ function updateProgram(expected: bigint, next: bigint): ChangeProgram {
   )
 }
 
-async function eventually(predicate: () => boolean): Promise<void> {
+async function eventually(predicate: () => boolean | Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 10_000
-  while (!predicate()) {
+  while (!await predicate()) {
     if (Date.now() >= deadline) throw new Error('condition did not become true')
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
 }
 
-/** Waits until the transaction has an outcome on `node`; returns `accepted` or the rejection code. */
-async function settled(node: ChronologNode, published: { readonly txId: Uint8Array }, expected?: string): Promise<string> {
-  const deadline = Date.now() + 10_000
-  while (node.outcome(published.txId) === null) {
-    if (Date.now() >= deadline) throw new Error('transaction did not settle')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
-  const outcome = node.outcome(published.txId)!
-  const result = outcome.rejectionCode ?? outcome.outcome
-  if (expected !== undefined && result !== expected) throw new Error(`expected ${expected}, got ${result}`)
-  return result
+/** Demo runtime: close time only after the validator has ingested the proposal. */
+async function finalOutcome(handle: TransactionHandle): Promise<TransactionOutcome> {
+  await eventually(async () => (await aliceNode.client.getTransactionOutcome(handle.transactionId).catch(() => undefined))?.admissible === true)
+  await aliceNode.node.waitForIdle()
+  clock.now = Math.max(clock.now, Number(handle.submission.authorTimestampMs)) + cutoffLagMs + 1
+  await aliceNode.node.publishHeartbeat()
+  return handle.final({ signal: AbortSignal.timeout(10_000) })
+}
+
+async function requireFinalAcceptance(handle: TransactionHandle): Promise<void> {
+  const result = await finalOutcome(handle)
+  if (result.outcome.type === 'rejected') throw new TransactionRejectedError(handle.transactionId, result.outcome.rejection)
 }
 
 function bytes32(seed: number): Uint8Array { return Uint8Array.from({ length: 32 }, (_value, index) => (seed + index) & 0xff) }

@@ -81,20 +81,26 @@ with a visible error.
 ## Local and final SQL are different readers
 
 ```ts
+import { TransactionRejectedError } from '@chronolog/client'
+
 const handle = await client.transaction([
   { sql: "SELECT chronolog_assert((SELECT claimed_by FROM tasks WHERE id = ?) IS NULL, 'already_claimed')", params: [taskId] },
   { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = ?', params: [workerName, taskId] },
 ], { idempotencyKey: operationId })
 
-const provisional = await handle.settled()
+const provisional = await handle.local()
 const finalOutcome = await handle.final({ signal })
+if (finalOutcome.outcome.type === 'rejected') {
+  throw new TransactionRejectedError(handle.transactionId, finalOutcome.outcome.rejection)
+}
 const finalRows = await client.query('SELECT * FROM tasks ORDER BY id', [], {
   view: 'final',
 })
 ```
 
-`settled()` and `accepted()` describe the current local order. Under peer
-chronological history, later evidence can change a tentative outcome.
+`local()` returns the executed result at its current position in the local order.
+Both live proof providers allow provisional execution before inclusion; later
+eligible history can change that tentative outcome.
 `final()` waits for the transaction's actual locally applied final position.
 `query(..., { view: 'final' })` reads a separately pinned SQL revision; it does
 not read tentative rows and attach final metadata to them. Live queries include

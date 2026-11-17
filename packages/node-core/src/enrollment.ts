@@ -344,8 +344,8 @@ export class EnrollmentIssuer {
         state = { ...state, revision }
         await this.#options.store.put(key, encodeApprovalState(state))
       }
-      if (this.#options.governance.currentEpoch === null) {
-        await this.#options.governance.rotateEpoch(this.#options.rootPrivateKey, undefined, { operationId: `${operationId}:initial-epoch` })
+      if (!this.#options.governance.hasEpochKey(0n) && this.#options.governance.currentEpoch === 0n) {
+        await this.#options.governance.initializeEpochKey(this.#options.rootPrivateKey, undefined, { operationId: `${operationId}:initial-epoch` })
       }
       if (decision.grantFullHistory) {
         await this.#options.governance.grantHistoricalAccess(request.signingPublicKey, this.#options.rootPrivateKey, { operationId: `${operationId}:history` })
@@ -353,8 +353,7 @@ export class EnrollmentIssuer {
       if (state.target === null) {
         const captured = structuredClone(await this.#options.captureFinalTarget())
         if (!equalBytes(captured.executionManifestDigest, request.executionManifestDigest)) throw new Error('ENROLLMENT_ENGINE_MISMATCH')
-        const target = { ...captured, requiredEpochs: uniqueEpochs([...captured.requiredEpochs, ...this.#options.governance.knownEpochs]) }
-        state = { ...state, target }
+        state = { ...state, target: { ...captured, requiredEpochs: uniqueEpochs(captured.requiredEpochs) } }
         await this.#options.store.put(key, encodeApprovalState(state))
       }
       const revision = state.revision!
@@ -416,7 +415,8 @@ export async function enrollmentProgress(options: {
   if (!options.connected) return progress('authorized-disconnected', [], approval.roles)
   if (!equalBytes(options.executionManifestDigest, approval.target.executionManifestDigest)) return progress('unsupported-engine', [], approval.roles)
   const available = new Set(options.availableEpochs.map(String))
-  const missing = approval.target.requiredEpochs.filter((epoch) => !available.has(String(epoch)))
+  const requiredEpochs = uniqueEpochs([...approval.target.requiredEpochs, options.activeMembership.encryptionEpoch])
+  const missing = requiredEpochs.filter(epoch => !available.has(String(epoch)))
   if (!approval.fullHistoryGranted || missing.length > 0) return progress('awaiting-keys', missing, approval.roles)
   if (!await options.isFinalTargetApplied(approval.target)) return progress('awaiting-history', [], approval.roles)
   return progress('ready', [], approval.roles)

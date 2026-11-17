@@ -88,7 +88,7 @@ async function advance(
   snapshot: CapabilitySnapshot,
   revision: Partial<CapabilityRevision>,
 ): Promise<CapabilitySnapshot> {
-  const signed = await signCapabilityRevision({
+  const signed = await signCapabilityRevision({ encryptionEpoch: 0n,
     groupId: snapshot.groupId, revision: snapshot.revision + 1n, previousRevisionDigest: snapshot.revisionDigest,
     issuerRootPublicKey: genesisFixture.root.publicKeyBytes, grants: [], revocations: [], validationPolicies: [],
     ...revision,

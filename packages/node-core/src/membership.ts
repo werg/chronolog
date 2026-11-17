@@ -220,7 +220,9 @@ export class MembershipAdministrator {
     try {
       await governance.start()
       await administrator.#revocations.recover(bytes => administrator.#applyRevocation(bytes))
-      if (governance.currentEpoch === null) await governance.rotateEpoch(identity.privateKey, undefined, { operationId: 'membership-bootstrap-epoch' })
+      if (!governance.hasEpochKey(0n) && governance.currentEpoch === 0n) {
+        await governance.initializeEpochKey(identity.privateKey, undefined, { operationId: 'membership-bootstrap-epoch' })
+      }
       await administrator.#sync()
       return administrator
     } catch (error) { await administrator.close(); throw error }
@@ -333,19 +335,19 @@ export class MembershipAdministrator {
     const closure = this.#policy.closure
     if (closure === null || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
     return { frontier: encodeMembershipFinalTarget(this.#descriptor, closure.includedHead.position, closure.includedHead.root, closure.closedThroughMs),
-      requiredEpochs: this.#governance.knownEpochs, executionManifestDigest: this.#descriptor.history.executionManifestDigest.slice() }
+      requiredEpochs: this.#governance.knownEpochs.filter(epoch => epoch <= this.#activation.activeSnapshot.encryptionEpoch),
+      executionManifestDigest: this.#descriptor.history.executionManifestDigest.slice() }
   }
 
   async #applyRevocation(bytes: Uint8Array): Promise<void> {
     const { key, ids } = revocationInput(bytes), resultKey = `membership/revocation-result/${key}`
     if (await this.#store.get(resultKey) !== null) return
     const revision = await this.#governance.revoke(ids, this.#identity.privateKey, { operationId: `revoke:${key}` })
-    const epoch = await this.#governance.rotateEpoch(this.#identity.privateKey, undefined, { operationId: `rotate:${key}` })
     await this.#sync()
     if (this.#policy.progress.receiptThrough < this.#published || this.#pendingControls) throw new Error('MEMBERSHIP_PREFIX_PENDING')
     const target = this.#target()
     await this.#store.put(resultKey, encodeCanonicalCbor([1n, await capabilityRevisionDigest(revision.revision),
-      epoch.manifest.epoch, target.frontier, target.requiredEpochs, target.executionManifestDigest]))
+      revision.revision.encryptionEpoch, target.frontier, target.requiredEpochs, target.executionManifestDigest]))
   }
 }
 

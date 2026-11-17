@@ -25,6 +25,7 @@ export const DOMAINS = {
   snapshotManifest: 'chronolog/snapshot-manifest/v1',
   materializedLog: 'chronolog/materialized-log/v1',
   epochManifest: 'chronolog/epoch-manifest/v1',
+  epochKey: 'chronolog/epoch-key/v1',
   epochWrap: 'chronolog/epoch-wrap/v1',
   epochPayload: 'chronolog/epoch-payload/v1',
   drillEvidence: 'chronolog/drill-evidence/v1',

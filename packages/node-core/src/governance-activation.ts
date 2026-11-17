@@ -1,5 +1,5 @@
 import { isCapabilityActive, type CapabilitySnapshot, type EffectiveCapability } from '@chronolog/capabilities'
-import { bytesToHex, equalBytes } from '@chronolog/protocol'
+import { assertCanonicalCbor, bytesToHex, equalBytes } from '@chronolog/protocol'
 
 import type { WriterAuthorizationContext } from './capability-membership.js'
 
@@ -37,6 +37,26 @@ export class GovernanceActivationIndex {
 
   get activeSnapshot(): CapabilitySnapshot { return structuredClone(this.#activations[this.#activations.length - 1]!.snapshot) }
   get activationBoundary(): bigint { return this.#activations[this.#activations.length - 1]!.after }
+
+  /** Envelope authority follows the same timestamp-selected state as writer grants. */
+  encryptionEpochStatusAt(authorTimestampMs: bigint, epochId: Uint8Array | null): 'active' | 'closed' | 'unissued' {
+    const epoch = decodeEpochId(epochId)
+    if (epoch === null || authorTimestampMs < 0n) return 'unissued'
+    const activation = this.#activations.findLast(item => authorTimestampMs > item.after)
+    if (activation === undefined || epoch > activation.snapshot.encryptionEpoch) return 'unissued'
+    return epoch === activation.snapshot.encryptionEpoch ? 'active' : 'closed'
+  }
+
+  /** Could this epoch authorize any timestamp through this bound? The caller proves its closure. */
+  encryptionEpochIssuedAt(closedThroughMs: bigint, epochId: Uint8Array | null): boolean {
+    const epoch = decodeEpochId(epochId)
+    if (epoch === null || closedThroughMs < 0n) return false
+    return this.#activations.some((activation, index) => {
+      const next = this.#activations[index + 1]
+      return activation.snapshot.encryptionEpoch === epoch && activation.after < closedThroughMs &&
+        (next === undefined || activation.after < next.after)
+    })
+  }
 
   /** The provider proved inclusion and closed this author-time boundary. */
   activateFinalized(snapshot: CapabilitySnapshot, cutoffMs: bigint): void {
@@ -88,4 +108,12 @@ function activeValidators(snapshot: CapabilitySnapshot): EffectiveCapability[] {
   return [...snapshot.capabilities.values()]
     .filter((item) => item.grant.role === 'validator' && isCapabilityActive(item, snapshot.revision))
     .sort((left, right) => bytesToHex(left.id).localeCompare(bytesToHex(right.id)))
+}
+
+function decodeEpochId(epochId: Uint8Array | null): bigint | null {
+  if (epochId === null) return null
+  try {
+    const value = assertCanonicalCbor(epochId)
+    return typeof value === 'bigint' && value >= 0n ? value : null
+  } catch { return null }
 }

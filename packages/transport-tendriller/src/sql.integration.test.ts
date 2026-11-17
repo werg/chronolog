@@ -144,22 +144,22 @@ describe('Tendriller coordinated SQL connection', () => {
       }
     }
     const created = await alice.client.transaction(['CREATE TABLE tasks (id INTEGER PRIMARY KEY, claimed_by TEXT) STRICT'])
-    // The proposal is two milliseconds ahead of the first closure. It stays
-    // pending until time advances, without another application submission.
+    // The proposal is two milliseconds ahead of the first closure. It executes
+    // provisionally, then becomes final when time advances without a new write.
     await alice.adapter!.catchUp()
     for (const item of await alice.transport.evidenceHistory()) {
       await alice.node.ingestOrderingEvidence(decodeOrderingEvidence(item.bytes))
     }
-    expect((await alice.client.getTransactionOutcome(created.transactionId)).outcome.type).toBe('pending')
-    await sync(); await created.accepted()
+    expect(await created.local()).toMatchObject({ final: false, outcome: { type: 'accepted' } })
+    await sync(); expect(await created.final()).toMatchObject({ final: true, outcome: { type: 'accepted' } })
     const team = await alice.client.ownership.createTeam({ invite: [bobKey.publicKeyBytes] })
-    await sync(); await team.handle.accepted()
+    await sync(); expect(await team.handle.final()).toMatchObject({ final: true, outcome: { type: 'accepted' } })
     const joined = await bob.client.ownership.acceptInvitation(team.id)
-    await sync(); await joined.handle.accepted()
+    await sync(); expect(await joined.handle.final()).toMatchObject({ final: true, outcome: { type: 'accepted' } })
     const inserted = await alice.client.transaction([{
       sql: `INSERT INTO tasks (id, chronolog_owner) VALUES (1, ${OWNER_FOR_KEY_SQL})`, params: [team.id],
     }])
-    await sync(); await inserted.accepted()
+    await sync(); expect(await inserted.final()).toMatchObject({ final: true, outcome: { type: 'accepted' } })
 
     const claim = (name: string) => [
       "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",
@@ -169,11 +169,11 @@ describe('Tendriller coordinated SQL connection', () => {
     // so every replica must execute Bob's claim first after the shared closure.
     const aliceClaim = await alice.client.transaction(claim('alice'))
     const bobClaim = await bob.client.transaction(claim('bob'))
-    // A stored append is not finality: both claims are still pending locally.
-    expect((await alice.client.getTransactionOutcome(aliceClaim.transactionId)).outcome.type).toBe('pending')
-    expect((await bob.client.getTransactionOutcome(bobClaim.transactionId)).outcome.type).toBe('pending')
+    // Both have local results, but a stored append does not make either final.
+    expect((await aliceClaim.local()).final).toBe(false)
+    expect((await bobClaim.local()).final).toBe(false)
     await sync()
-    const outcomes = await Promise.all([aliceClaim.settled(), bobClaim.settled()])
+    const outcomes = await Promise.all([aliceClaim.final(), bobClaim.final()])
     expect(outcomes.map((outcome) => outcome.outcome.type)).toEqual(['rejected', 'accepted'])
     const losing = outcomes.find((outcome) => outcome.outcome.type === 'rejected')!
     expect(losing.outcome).toMatchObject({ type: 'rejected', rejection: { code: 'assert:already_claimed' } })

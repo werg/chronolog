@@ -12,7 +12,7 @@ afterEach(() => vi.restoreAllMocks())
 
 async function fixture() {
   const identity = await generateEd25519KeyPair(), groupId = new Uint8Array(32).fill(1), grantId = new Uint8Array(32).fill(2)
-  const snapshot: CapabilitySnapshot = { groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
+  const snapshot: CapabilitySnapshot = { encryptionEpoch: 0n, groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
     capabilityLogFeed: new Uint8Array(32), policies: new Map(), validatorFloorMs: 0n,
     capabilities: new Map([[bytesToHex(grantId), { id: grantId, grantedAtRevision: 0n,
       grant: { role: 'reader', transportAuthor: 'local', subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes,

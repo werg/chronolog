@@ -29,7 +29,8 @@ snapshots the registered keys of its selected readers.
 
 The current app API still submits transactions as the node's signing key.
 Consequently a reader registering a key needs permission to publish a
-transaction, including the group's writer capability. This feature does not
+transaction, including a writer grant with `program.sql: true` for these platform
+operations. This feature does not
 introduce independently authenticated users behind a shared node.
 
 Private key creation and persistence remain the application's responsibility.
@@ -46,39 +47,47 @@ column's declared name exactly for the `slot` argument.
 
 ```ts
 import { generateX25519KeyPair } from '@chronolog/crypto'
-import { SealedPolicyNotFinalError } from '@chronolog/client'
+import { SealedPolicyNotFinalError, TransactionRejectedError, type TransactionHandle } from '@chronolog/client'
+
+// The application chooses to stop this workflow on a final rejection.
+async function requireFinalAcceptance(handle: TransactionHandle): Promise<void> {
+  const result = await handle.final()
+  if (result.outcome.type === 'rejected') {
+    throw new TransactionRejectedError(handle.transactionId, result.outcome.rejection)
+  }
+}
 
 // These private keys stay in their respective reader applications.
 const aliceHpke = await generateX25519KeyPair(false)
 const bobHpke = await generateX25519KeyPair(false)
-await (await alice.sealed.registerKey(aliceHpke.publicKeyBytes)).accepted()
-await (await bob.sealed.registerKey(bobHpke.publicKeyBytes)).accepted()
+await requireFinalAcceptance(await alice.sealed.registerKey(aliceHpke.publicKeyBytes))
+await requireFinalAcceptance(await bob.sealed.registerKey(bobHpke.publicKeyBytes))
 
-await (await alice.transaction([
+await requireFinalAcceptance(await alice.transaction([
   'CREATE TABLE notes (id INTEGER PRIMARY KEY, body BLOB) STRICT',
   'INSERT INTO notes (id) VALUES (1)',
-])).accepted()
+]))
 
 // Include Alice explicitly if she should be able to decrypt her own writes.
 const readers = [await alice.identity(), await bob.identity()]
 const created = await alice.sealed.setReaders({
   table: 'notes', row: [1n], readers, expectedVersion: 0n,
 })
-await created.handle.accepted()
+await requireFinalAcceptance(created.handle)
 
-// put() additionally requires the policy update's accepted outcome to be below
-// a resolved policy watermark. accepted() alone is not that finality condition.
-// If necessary, observe created.handle.evidence until the condition is met.
+// The selected policy must be final before encrypting for its readers.
+// put() rechecks its current policy snapshot: a concurrent audience change may
+// require waiting for that newer policy and reviewing the intended audience.
 try {
   const change = await alice.sealed.put(
     created.id, 'body', new TextEncoder().encode('A private note'),
     { expectedPolicyVersion: 1n, expectedDataVersion: 0n },
   )
-  await change.handle.accepted()
+  await requireFinalAcceptance(change.handle)
 } catch (error) {
   if (error instanceof SealedPolicyNotFinalError) {
-    // Wait for policy_watermark_reached, no unresolved references, and an
-    // accepted outcome, then explicitly retry the operation.
+    // Review the newer policy, wait for its final accepted outcome, then
+    // explicitly retry encryption for that audience.
   } else {
     throw error
   }
@@ -129,8 +138,8 @@ const changed = await alice.sealed.setReaders({
   expectedPolicyId: current.policyId,
   expectedVersion: current.version,
 })
-await changed.handle.accepted()
-// Wait for policy settlement before the next put(), which checks it by default.
+await requireFinalAcceptance(changed.handle)
+// put() checks the selected policy again before disclosing the next value.
 ```
 
 Every `put` generates a fresh random AES-256-GCM content key. It wraps that key

@@ -270,12 +270,11 @@ export function decodeSignedGenesis(bytes: Uint8Array): SignedGenesis {
 function revisionToCbor(value: CapabilityRevision): CborValue {
   protocolInvariant(value.revision > 0n, 'SCHEMA_INVALID', 'Capability revision must be positive')
   protocolInvariant(value.issuerRootPublicKey.length === 32, 'SCHEMA_INVALID', 'Revision issuer key must contain 32 bytes')
-  protocolInvariant((value.successorRootPublicKey === undefined) === (value.successorCapabilityLogFeed === undefined), 'SCHEMA_INVALID', 'Root and feed succession must be declared together')
+  protocolInvariant(typeof value.encryptionEpoch === 'bigint' && value.encryptionEpoch >= 0n, 'SCHEMA_INVALID', 'Revision requires an encryption epoch')
   return integerMap([
     [0, 1n], [1, value.groupId], [2, value.revision], [3, value.previousRevisionDigest],
     [4, value.issuerRootPublicKey], [5, value.grants.map(grantToCbor)], [6, value.revocations],
-    [7, value.validationPolicies.map(policyToCbor)], [8, value.successorRootPublicKey],
-    [9, value.successorCapabilityLogFeed],
+    [7, value.validationPolicies.map(policyToCbor)], [8, value.encryptionEpoch],
   ])
 }
 
@@ -285,10 +284,8 @@ export function encodeCapabilityRevision(value: CapabilityRevision): Uint8Array 
 
 export function decodeCapabilityRevision(bytes: Uint8Array): CapabilityRevision {
   const map = expectMap(assertCanonicalCbor(bytes), 'capability_revision')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 'capability_revision')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8], 'capability_revision')
   expectVersion(map, 1n, 'capability_revision')
-  const successorRoot = optional(map, 8)
-  const successorFeed = optional(map, 9)
   const revision: CapabilityRevision = {
     groupId: expectBytes(required(map, 1, 'revision.group_id'), 'revision.group_id'),
     revision: expectUint64(required(map, 2, 'revision.number'), 'revision.number'),
@@ -297,8 +294,7 @@ export function decodeCapabilityRevision(bytes: Uint8Array): CapabilityRevision 
     grants: expectArray(required(map, 5, 'revision.grants'), 'revision.grants').map((item, index) => grantFromCbor(item, `revision.grants[${index}]`)),
     revocations: expectArray(required(map, 6, 'revision.revocations'), 'revision.revocations').map((item, index) => expectBytes(item, `revision.revocations[${index}]`, 32)),
     validationPolicies: expectArray(required(map, 7, 'revision.policies'), 'revision.policies').map((item, index) => policyFromCbor(item, `revision.policies[${index}]`)),
-    ...(successorRoot === undefined ? {} : { successorRootPublicKey: expectBytes(successorRoot, 'revision.successor_root', 32) }),
-    ...(successorFeed === undefined ? {} : { successorCapabilityLogFeed: expectBytes(successorFeed, 'revision.successor_feed') }),
+    encryptionEpoch: expectUint64(required(map, 8, 'revision.encryption_epoch'), 'revision.encryption_epoch'),
   }
   revisionToCbor(revision)
   return revision

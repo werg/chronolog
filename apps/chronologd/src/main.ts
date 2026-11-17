@@ -165,10 +165,10 @@ async function startRuntime() {
       node = new ChronologNode({
         groupId, groupRoute: fromBase64(config.groupRoute), identity, transport, membership,
         membershipRevision: configuredMembershipRevision, validationPolicy: configuredValidationPolicy,
-        materialization: materialization!, operationStore,
+        materialization: materialization!, operationStore, live: { maxFutureSkewMs: runtime.maxFutureSkewMs },
         controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState)),
         validator: { capabilityId: configuredValidatorCapability, cutoffLagMs: runtime.cutoffLagMs,
-          maxFutureSkewMs: runtime.maxFutureSkewMs, heartbeatIntervalMs: runtime.heartbeatIntervalMs },
+          heartbeatIntervalMs: runtime.heartbeatIntervalMs },
         envelopeCipher: createEpochEnvelopeCipher(fromBase64(config.epochContentKey), BigInt(config.epoch)),
         feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
       })

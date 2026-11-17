@@ -73,9 +73,9 @@ async function fixture(mode: FixtureMode) {
   const ring = new EpochCipherRing(), writerRing = new EpochCipherRing()
   writerRing.install(bytes(91), 0n, true)
   const node = new ChronologNode({ identity, groupId, membershipRevision, validationPolicy, operationStore: store, transport,
-    historyPolicy: { kind: 'coordinated', policy,
-      // This fixture has one issued epoch; local key availability is separate.
-      ...(mode === 'missing-key' ? { hasEncryptionEpoch: () => true, encryptionEpochStatusAt: () => 'active' as const } : {}) },
+    historyPolicy: { kind: 'coordinated', policy },
+    // This fixture has one issued epoch; local key availability is separate.
+    ...(mode === 'missing-key' ? { encryptionEpochIssuedAt: () => true, encryptionEpochStatusAt: () => 'active' as const } : {}),
     materialization, membership: { canWrite: () => true, canValidate: () => false, threshold: () => 1 },
     ...(mode === 'missing-key' ? { envelopeCipher: ring } : {}),
   })
@@ -119,7 +119,8 @@ describe('application reconciliation after finality evidence', () => {
     const f = await fixture(mode)
     const message = { 'missing-body': 'LEDGER_PAYLOAD_UNAVAILABLE', 'missing-key': 'WIRE_ENCRYPTION_EPOCH_UNAVAILABLE',
       'failed-reconcile': 'RECONCILIATION_FAILED' }[mode]
-    await expect(f.node.ingestFinalityEvidence(f.proof)).rejects.toThrow(message)
+    await f.node.ingestFinalityEvidence(f.proof)
+    await expect(f.node.waitForIdle()).rejects.toThrow(message)
     const before = await f.state()
     expect(before).toMatchObject({ pending: true, finalOrderLength: 0, appliedThrough: 0, closedReceiptThrough: 1 })
     f.restore(); f.reset()

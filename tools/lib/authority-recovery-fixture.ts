@@ -155,7 +155,8 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
         healthy()
         if (!await backlogIncluded()) return false
         await node.waitForIdle()
-        let pending = !governed!.governance.hasFinalizedEpoch(governed!.governance.cipherRing.current().epochId)
+        let pending = (await node.liveFinality()).closedThroughMs === null ||
+          !governed!.governance.hasEpochKey(governed!.activeSnapshot.encryptionEpoch)
         for (const kind of ['schema', 'accepted', 'rejected', 'after-backup', 'authority-offline'] as const) {
           const operation = await node.operation(`recovery-${kind}`)
           if (operation !== null && !operation.final) pending = true

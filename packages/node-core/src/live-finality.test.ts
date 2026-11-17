@@ -138,7 +138,7 @@ describe('live chronological finality', () => {
     f.retain(delayed)
     await f.vote(0, b); await f.vote(1, b); await f.heartbeat(0); await f.heartbeat(1); await f.node.waitForIdle()
     expect(f.node.finalOrderLength).toBe(0)
-    expect(f.node.candidate(a.txId)?.state).toBe('pending_validation')
+    expect(f.node.candidate(a.txId)?.state).toBe('provisional')
     expect((await f.node.settlementEvidence(b.txId))?.belowWatermark).toBe(false)
     await f.ingest(delayed); await f.node.waitForIdle()
     expect(f.node.finalOrderLength).toBe(0)

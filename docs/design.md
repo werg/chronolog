@@ -216,8 +216,9 @@ progress visibly. Neither Chronolog core nor Tendriller core imports the other.
 
 A group starts from a signed **genesis**; the root administrator then
 publishes signed **capability revisions** on the administration feed. The
-protocol represents writer, validator, reader and administrator roles; live
-enrollment grants ordinary reader/writer membership. The built-in signed
+protocol represents writer, validator and reader grants. Administration is
+authenticated by the fixed genesis root and administration feed; live
+enrollment grants ordinary reader/writer membership with explicit program rights. The built-in signed
 configurations keep the root, administration feed, validator set and validation
 policy fixed. Their authoring APIs reject reconfiguration of those components.
 
@@ -233,9 +234,12 @@ boundaries determine when a new revision takes effect. Revocation is
 prospective in that order: earlier final outcomes remain unchanged, and a later
 regrant does not revive a revoked capability or a previously rejected proposal.
 
-Records are encrypted with per-epoch keys. The administrator rotates epochs
-and wraps each epoch key to every reader's HPKE key; historical epochs are
-given to a reader only by an explicit administrator action. A replica can
+The signed governance state also declares the encryption epoch, starting at
+zero in genesis. Reader revocation and epoch advance share one revision and one
+author-time activation boundary. Signed key distributions bind that revision
+and one content-key commitment; they provide key availability without choosing
+activation. The administrator wraps each key to the remaining readers, and
+historical keys reach new readers only through an explicit administrator action. A replica can
 receive verified governance and historical keys from a complete certified
 prefix before replaying its earlier encrypted SQL. Membership activation still
 follows its signed causal chain and proved author-time closure boundary.
@@ -249,15 +253,16 @@ Dolt commit (`chronolog_head`, `chronolog_rev_*`); checkpoints
 only from the nearest checkpoint. Publication binds the durable SQL revision
 to its applied prefix and reconciles control metadata after interruption.
 
-Readers choose `local` or `final`. The local view contains admitted tentative
-work. The final view uses an actual separate immutable SQL revision of the
+Readers choose `local` or `final`. The local view executes authorized proposals
+before inclusion or validator quorum when their required inputs are available.
+The final view uses an actual separate immutable SQL revision of the
 locally applied final prefix; it is not a label on the tentative reader.
 Queries and live queries report the selected view and revision. A replica's
 final view can still be behind another replica's.
 
-`transaction.final()` waits for final acceptance or rejection after local
-application. `settled()` and `accepted()` describe the current result, which
-can still change through peer-policy replay. See the
+`handle.final()` waits for final acceptance or rejection after local
+application. `local()` returns the current executed result, which
+can still change through live-history replay. See the
 [client guide](../packages/client/README.md). The replicated
 log of outcomes is the table `chronolog_transactions`, readable by
 transactions.

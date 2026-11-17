@@ -183,7 +183,7 @@ export function createAgent(): AgentApplication {
         topics: ['job-requests'],
         recovery: 'idempotent',
         async dispatch({ event, idempotencyKey, signal }) {
-          if (!policy.canRun(event.origin.authorId, event.origin.writerCapability, event.topic, event.payload)) {
+          if (!await policy.canRun(event.origin.authorId, event.origin.writerCapability, event.topic, event.payload)) {
             return { denied: true, reason: 'Caller is not authorized for this action' }
           }
           return provider.perform(event.payload, { idempotencyKey, signal })

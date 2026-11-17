@@ -481,12 +481,8 @@ export class NodeRpcService implements ChronologRpcService {
     // Awaiting transport status between them could label an earlier speculative
     // result final after a replay changed the transaction while we waited.
     const outcome = this.#node.outcome(txId)
-    const phase = outcome === null
-      ? candidate.state === 'admissible' ? 'admissible' : 'collecting_attestations'
-      : outcome.outcome === 'accepted' ? 'accepted' : 'rejected'
     return {
       transactionId: request.transactionId,
-      phase,
       outcome: outcome === null
         ? { type: 'pending' }
         : outcome.outcome === 'accepted'

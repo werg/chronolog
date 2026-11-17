@@ -9,7 +9,7 @@ const submission: SubmitTransactionResponse = {
 }
 
 function outcome(revision: number, final: boolean, rejected = false): TransactionOutcome {
-  return { transactionId: 'tx-1', phase: rejected ? 'rejected' : 'accepted',
+  return { transactionId: 'tx-1',
     outcome: rejected ? { type: 'rejected', rejection: { code: 'constraint', statementIndex: 0 } } : { type: 'accepted' },
     eventSetRevision: String(revision), materializedRevision: String(revision),
     changedByReplay: rejected, admissible: true, final, observedAt: new Date(revision).toISOString() }
@@ -51,13 +51,14 @@ describe('TransactionHandle finality', () => {
     const handle = await fixture_.client.transaction(['SELECT 1'])
     let finished = false
     const final = handle.final().then((value) => { finished = true; return value })
-    const speculative = handle.settled()
+    const speculative = handle.local()
     await waitFor(() => fixture_.opened === 1)
     fixture_.values.push(outcome(1, false))
     await expect(speculative).resolves.toMatchObject({ final: false, outcome: { type: 'accepted' } })
     expect(finished).toBe(false)
     fixture_.values.push(outcome(2, false, true))
     await waitFor(() => handle.outcome.getSnapshot().value?.eventSetRevision === '2')
+    await expect(handle.local()).resolves.toMatchObject({ final: false, outcome: { type: 'rejected' } })
     expect(finished).toBe(false)
     fixture_.values.push(outcome(3, true, true))
     await expect(final).resolves.toMatchObject({ final: true, outcome: { type: 'rejected' } })
