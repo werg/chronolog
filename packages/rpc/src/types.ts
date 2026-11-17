@@ -1,5 +1,7 @@
 import type { EventBatch, EventPayload, EventReadOptions, ViewChange } from '@chronolog/protocol'
 import type { SignalPayload } from '@chronolog/signals'
+import type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
+export type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
 
 /** Chronolog's local RPC API. Consensus codecs are versioned separately. */
 export const RPC_API_VERSION = 'chronolog.rpc' as const
@@ -231,23 +233,21 @@ export interface ReplicationStatus { readonly groupId: GroupId; readonly revisio
 export interface GetReplicationStatusRequest { readonly groupId: GroupId; readonly requestId: RequestId }
 export interface StreamReplicationStatusRequest extends GetReplicationStatusRequest { readonly resumeAfterEventSetRevision?: Revision }
 
-export type GovernanceCapabilityRole =
-  | 'reader'
-  | 'writer'
-  | 'validator'
-  | 'administrator'
-
-export interface GovernanceCapabilityStatus {
+interface GovernanceCapabilityDetails {
   readonly capabilityId: string
   readonly subjectId: string
   readonly signingPublicKey: string
   readonly transportAuthor?: string
-  readonly role: GovernanceCapabilityRole
   readonly validFromRevision: string
   readonly revokedAtRevision?: string
   readonly active: boolean
   readonly hpkePublicKey?: string
+  readonly minimumAuthorTimestampMs?: string
 }
+export type GovernanceCapabilityStatus = GovernanceCapabilityDetails & (
+  | { readonly role: 'writer'; readonly program: ProgramRights }
+  | { readonly role: Exclude<CapabilityRole, 'writer'>; readonly program?: never }
+)
 
 export interface GetGovernanceStatusRequest { readonly groupId: GroupId; readonly requestId: RequestId }
 export interface GovernanceStatus {
@@ -260,14 +260,18 @@ export interface GovernanceStatus {
   readonly capabilities: readonly GovernanceCapabilityStatus[]
 }
 
-export interface GrantCapabilityRequest extends GetGovernanceStatusRequest {
+interface GrantCapabilityIdentity {
   readonly subjectId: string
   readonly signingPublicKey: string
   readonly transportAuthor?: string
-  readonly role: GovernanceCapabilityRole
   readonly minimumAuthorTimestampMs?: string
   readonly hpkePublicKey?: string
 }
+export type GrantCapabilityInput = GrantCapabilityIdentity & (
+  | { readonly role: 'writer'; readonly program: ProgramRights }
+  | { readonly role: Exclude<CapabilityRole, 'writer'>; readonly program?: never }
+)
+export type GrantCapabilityRequest = GetGovernanceStatusRequest & GrantCapabilityInput
 export interface GrantCapabilityResponse { readonly revision: string; readonly capabilityId: string }
 export interface RevokeCapabilitiesRequest extends GetGovernanceStatusRequest { readonly capabilityIds: readonly string[] }
 export interface RevokeCapabilitiesResponse { readonly revision: string; readonly revokedCapabilityIds: readonly string[] }
@@ -277,19 +281,13 @@ export interface GrantHistoricalAccessRequest extends GetGovernanceStatusRequest
 export interface GrantHistoricalAccessResponse { readonly epochManifestsPublished: number }
 
 export type EnrollmentRole = 'reader' | 'writer'
-export interface EnrollmentWriterProgram {
-  readonly sql: boolean
-  readonly topics: readonly string[]
-  readonly signals: readonly string[]
-  readonly forwarded?: boolean
-}
 export type EnrollmentState = 'requested' | 'approved' | 'authorized-disconnected' | 'awaiting-keys' | 'awaiting-history' | 'unsupported-engine' | 'revoked' | 'ready'
 export interface CreateEnrollmentRequest {
   readonly groupId: GroupId
   /** Stable device-local request identity; persist it before retrying enrollment. */
   readonly requestId: RequestId
   readonly roles: readonly EnrollmentRole[]
-  readonly writerProgram?: EnrollmentWriterProgram
+  readonly writerProgram?: ProgramRights
 }
 export interface CreateEnrollmentResponse { readonly signedRequest: CanonicalBytes }
 export interface ApproveEnrollmentRequest {
@@ -298,7 +296,7 @@ export interface ApproveEnrollmentRequest {
   readonly requestId: RequestId
   readonly signedRequest: CanonicalBytes
   readonly roles: readonly EnrollmentRole[]
-  readonly writerProgram?: EnrollmentWriterProgram
+  readonly writerProgram?: ProgramRights
   readonly grantFullHistory: boolean
 }
 export interface ApproveEnrollmentResponse { readonly signedApproval: CanonicalBytes }

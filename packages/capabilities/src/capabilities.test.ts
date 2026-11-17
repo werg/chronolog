@@ -37,7 +37,7 @@ const policy: ValidationPolicy = {
 async function fixture() {
   const root = await generateEd25519KeyPair()
   const writer: CapabilityGrant = {
-    subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', validFromRevision: 0n,
+    subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', program: { sql: true, topics: [], signals: [], forwarded: false }, validFromRevision: 0n,
   }
   const initialValidator = validator(21, 0n, 1_000n)
   const manifest: GenesisManifest = {
@@ -52,6 +52,18 @@ async function fixture() {
 }
 
 describe('capability chain', () => {
+  it('rejects implicit SQL authority and nonexistent administration grants at the signed boundary', async () => {
+    const f = await fixture()
+    const missing = structuredClone(f.writer)
+    Reflect.deleteProperty(missing, 'program')
+    await expect(signGenesis({ ...f.signedGenesis.manifest, initialCapabilities: [missing] }, f.root.privateKey))
+      .rejects.toThrow('Writer grants require explicit program rights')
+    const phantom = { subjectId: bytes(20), signingPublicKey: bytes(20), role: 'administrator', validFromRevision: 0n }
+    await expect(signGenesis({ ...f.signedGenesis.manifest,
+      initialCapabilities: [phantom as unknown as CapabilityGrant] }, f.root.privateKey))
+      .rejects.toThrow('Unknown capability role')
+  })
+
   it('reduces grants, prospective revocation and root succession deterministically', async () => {
     const f = await fixture()
     expect(decodeSignedGenesis(encodeSignedGenesis(f.signedGenesis))).toEqual(f.signedGenesis)

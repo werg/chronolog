@@ -50,7 +50,7 @@ endpoint.addEventListener('message', (event) => {
                 rootAdminPublicKey: context.identity.signing.publicKeyBytes, schemaAdminPublicKey: context.identity.signing.publicKeyBytes,
                 capabilityLogFeed: new TextEncoder().encode(context.transport.identity),
                 initialCapabilities: [
-                  { ...common, role: 'administrator' }, { ...common, role: 'writer',
+                  { ...common, role: 'writer',
                     program: { sql: true, topics: ['notes.changed'], signals: [] } },
                   { ...common, role: 'validator', minimumAuthorTimestampMs: 0n },
                   { ...common, role: 'reader', hpkePublicKey: context.identity.reader.publicKeyBytes },

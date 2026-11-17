@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { CapabilitySnapshot, SignedCapabilityRevision } from '@chronolog/capabilities'
 import type { CapabilityChange, GovernanceControlPlane } from '@chronolog/node-core'
+import type { GrantCapabilityRequest } from '@chronolog/rpc'
 
 import { createGovernanceRpcAdmin } from './governance-admin.js'
 
@@ -29,7 +30,8 @@ describe('governance admin RPC adapter', () => {
 
     const status = await admin.getStatus({ groupId: b64(snapshot.groupId), requestId: 'status' })
     expect(status).toMatchObject({ revision: '3', currentEpoch: '7' })
-    expect(status.capabilities).toEqual([expect.objectContaining({ role: 'administrator', active: true })])
+    expect(status.capabilities).toEqual([expect.objectContaining({ role: 'writer', active: true,
+      program: { sql: false, topics: ['requests'], signals: ['progress'], forwarded: false } })])
 
     const response = await admin.grantCapability({
       groupId: b64(snapshot.groupId),
@@ -37,13 +39,14 @@ describe('governance admin RPC adapter', () => {
       subjectId: b64(bytes(20)),
       signingPublicKey: b64(bytes(21)),
       transportAuthor: 'new-node-feed',
-      role: 'validator',
+      role: 'writer',
+      program: { sql: false, topics: ['jobs'], signals: ['progress'] },
     })
     expect(response.revision).toBe('4')
     expect(Buffer.from(response.capabilityId, 'base64url')).toHaveLength(32)
     expect(publishCapabilityChange).toHaveBeenCalledWith({ grants: [expect.objectContaining({
-      role: 'validator',
-      minimumAuthorTimestampMs: 12_345n,
+      role: 'writer',
+      program: { sql: false, topics: ['jobs'], signals: ['progress'], forwarded: false },
     })] }, expect.anything(), { operationId: 'grant' })
   })
 
@@ -54,8 +57,13 @@ describe('governance admin RPC adapter', () => {
     const common = { ...base, subjectId: b64(bytes(20)), signingPublicKey: b64(bytes(21)) }
 
     await expect(admin.grantCapability({ ...common, role: 'reader' })).rejects.toMatchObject({ code: 'invalid_argument' })
-    await expect(admin.grantCapability({ ...common, role: 'writer', signingPublicKey: 'not base64!' })).rejects.toMatchObject({ code: 'invalid_argument' })
-    await expect(admin.grantCapability({ ...common, role: 'writer', hpkePublicKey: b64(bytes(22)) })).rejects.toMatchObject({ code: 'invalid_argument' })
+    const writer = { ...common, role: 'writer' as const, program: { sql: true, topics: [], signals: [] } }
+    await expect(admin.grantCapability({ ...writer, signingPublicKey: 'not base64!' })).rejects.toMatchObject({ code: 'invalid_argument' })
+    await expect(admin.grantCapability({ ...writer, hpkePublicKey: b64(bytes(22)) })).rejects.toMatchObject({ code: 'invalid_argument' })
+    await expect(admin.grantCapability({ ...common, role: 'writer' } as unknown as GrantCapabilityRequest))
+      .rejects.toMatchObject({ code: 'invalid_argument' })
+    await expect(admin.grantCapability({ ...common, role: 'administrator' } as unknown as GrantCapabilityRequest))
+      .rejects.toMatchObject({ code: 'invalid_argument' })
   })
 })
 
@@ -73,7 +81,8 @@ function capabilitySnapshot(): CapabilitySnapshot {
         subjectId: bytes(4),
         signingPublicKey: bytes(4),
         transportAuthor: 'admin-feed',
-        role: 'administrator',
+        role: 'writer',
+        program: { sql: false, topics: ['requests'], signals: ['progress'] },
         validFromRevision: 0n,
       },
       grantedAtRevision: 0n,

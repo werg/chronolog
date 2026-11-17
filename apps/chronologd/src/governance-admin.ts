@@ -1,7 +1,9 @@
 import {
   capabilityId,
   isCapabilityActive,
-  type CapabilityGrant,
+  normalizeProgramRights,
+  type CapabilityGrantInput,
+  type ProgramRights,
 } from '@chronolog/capabilities'
 import type { GovernanceControlPlane } from '@chronolog/node-core'
 import {
@@ -20,17 +22,22 @@ export function createGovernanceRpcAdmin(options: {
     async getStatus() {
       const snapshot = options.governance.snapshot
       const capabilities: GovernanceCapabilityStatus[] = [...snapshot.capabilities.values()]
-        .map((item) => ({
+        .map((item): GovernanceCapabilityStatus => {
+          const details = {
           capabilityId: base64url(item.id),
           subjectId: base64url(item.grant.subjectId),
           signingPublicKey: base64url(item.grant.signingPublicKey),
           ...(item.grant.transportAuthor === undefined ? {} : { transportAuthor: item.grant.transportAuthor }),
-          role: item.grant.role,
           validFromRevision: item.grant.validFromRevision.toString(10),
           ...(item.revokedAtRevision === undefined ? {} : { revokedAtRevision: item.revokedAtRevision.toString(10) }),
           active: isCapabilityActive(item, snapshot.revision),
           ...(item.grant.hpkePublicKey === undefined ? {} : { hpkePublicKey: base64url(item.grant.hpkePublicKey) }),
-        }))
+          ...(item.grant.minimumAuthorTimestampMs === undefined ? {} : { minimumAuthorTimestampMs: item.grant.minimumAuthorTimestampMs.toString(10) }),
+          }
+          return item.grant.role === 'writer'
+            ? { ...details, role: 'writer', program: normalizeProgramRights(item.grant.program) }
+            : { ...details, role: item.grant.role }
+        })
         .sort((left, right) => left.role.localeCompare(right.role) || left.capabilityId.localeCompare(right.capabilityId))
       return {
         groupId: base64url(snapshot.groupId),
@@ -44,16 +51,20 @@ export function createGovernanceRpcAdmin(options: {
     },
 
     async grantCapability(request) {
-      const grant: Omit<CapabilityGrant, 'validFromRevision'> = {
+      if (!['reader', 'writer', 'validator'].includes(request.role)) throw invalid('Unknown capability role')
+      if (request.role !== 'writer' && request.program !== undefined) throw invalid('program is valid only for writer grants')
+      const identity = {
         subjectId: publicKey(request.subjectId, 'subjectId'),
         signingPublicKey: publicKey(request.signingPublicKey, 'signingPublicKey'),
-        role: request.role,
         ...(request.transportAuthor === undefined ? {} : { transportAuthor: boundedText(request.transportAuthor, 'transportAuthor') }),
         ...(request.minimumAuthorTimestampMs === undefined
           ? request.role === 'validator' ? { minimumAuthorTimestampMs: BigInt(Math.trunc(now())) } : {}
           : { minimumAuthorTimestampMs: decimal(request.minimumAuthorTimestampMs, 'minimumAuthorTimestampMs') }),
         ...(request.hpkePublicKey === undefined ? {} : { hpkePublicKey: publicKey(request.hpkePublicKey, 'hpkePublicKey') }),
       }
+      const grant: CapabilityGrantInput = request.role === 'writer'
+        ? { ...identity, role: 'writer', program: programRights(request.program) }
+        : { ...identity, role: request.role }
       if (grant.role === 'reader' && grant.hpkePublicKey === undefined) {
         throw invalid('reader grants require hpkePublicKey')
       }
@@ -101,6 +112,11 @@ async function operation<T>(run: () => Promise<T>): Promise<T> {
 function boundedText(value: string, label: string): string {
   if (value.length === 0 || value.length > 512) throw invalid(`${label} must contain 1 to 512 characters`)
   return value
+}
+
+function programRights(value: ProgramRights): ProgramRights {
+  try { return normalizeProgramRights(value) }
+  catch (error) { throw invalid('writer grants require explicit valid program rights', error) }
 }
 
 function decimal(value: string, label: string): bigint {

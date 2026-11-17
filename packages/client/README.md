@@ -202,6 +202,7 @@ The joining device creates a durable signed request with its existing keys:
 const { signedRequest } = await joiningDevice.enrollment.createRequest({
   requestId: durableDeviceJoinId,
   roles: ['reader', 'writer'],
+  writerProgram: { sql: true, topics: ['tasks/changed'], signals: ['presence'] },
 })
 ```
 
@@ -215,6 +216,7 @@ const { signedApproval } = await issuer.enrollment.approveRequest({
   signedRequest,
   roles: ['reader', 'writer'],
   grantFullHistory: true,
+  writerProgram: { sql: true, topics: ['tasks/changed'], signals: ['presence'] },
 })
 ```
 
@@ -237,6 +239,13 @@ engine, connection and applied final target. Earlier states expose missing
 keys/history, disconnection, unsupported engines or revoked grants. The issuer
 can go offline once the signed records and receipt have been retained for the
 joining device to synchronize.
+
+Writer requests and approvals require explicit `writerProgram` rights. Use
+`sql: false` with empty durable topics for a signal-only sender, or empty signals
+for a durable-event-only publisher. Missing rights never imply SQL permission.
+An approval may narrow the requested SQL, topic, signal and forwarding rights;
+it cannot widen them. `ProgramRights` is the shared exported type. Membership
+administration belongs to the genesis root key, independently of these grants.
 
 `client.ownership` handles row grants, teams and ownership transfers. Those are
 application transactions, separate from group enrollment. Their handles offer

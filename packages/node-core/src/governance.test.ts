@@ -3,7 +3,7 @@ import {
   signCapabilityRevision,
   signGenesis,
   validationPolicyId,
-  type CapabilityGrant,
+  type CapabilityGrantInput,
   type CapabilityRevision,
   type GenesisManifest,
   type ValidationPolicy,
@@ -60,7 +60,7 @@ describe('replicated governance control plane', () => {
       expect(isInvalidGovernanceRecord(canonicalError)).toBe(true)
       expect(received.snapshot).toEqual(initial)
       expect(canonical.snapshot).toEqual(initial)
-      const valid = await publish({ grants: [{ ...grant(bytes32(103), 'writer'), validFromRevision: 1n }] })
+      const valid = await publish({ grants: [{ ...sqlWriter(bytes32(103)), validFromRevision: 1n }] })
       expect(await received.ingest(valid.record)).toBe(true)
       const next = await canonical.ingestFinalized(valid.entry, activation.activeSnapshot, 100n)
       expect(next?.revision).toBe(1n)
@@ -89,7 +89,7 @@ describe('replicated governance control plane', () => {
     await expect(participant.ingestFinalized(forged, active, 100n)).rejects.toThrow('GOVERNANCE_REVISION_CONFLICT')
     const misplaced = await appendControl('capability', encodeSignedCapabilityRevision(await signCapabilityRevision(future, fixture.root.privateKey)))
     await expect(participant.ingestFinalized(misplaced, active, 100n)).rejects.toThrow('GOVERNANCE_PREDECESSOR_PENDING')
-    const capability = await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(44), 'writer')] }, fixture.root.privateKey)
+    const capability = await fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(44))] }, fixture.root.privateKey)
     const accepted = await appendControl('capability', encodeSignedCapabilityRevision(capability))
     active = (await participant.ingestFinalized(accepted, active, 100n))!
     expect(active.revision).toBe(1n)
@@ -109,8 +109,8 @@ describe('replicated governance control plane', () => {
 
   it('resolves reversed included membership and epoch events by signed causality', async () => {
     const f = await governanceFixture()
-    await f.admin.publishCapabilityChange({ grants: [grant(bytes32(71), 'writer')] }, f.root.privateKey)
-    await f.admin.publishCapabilityChange({ grants: [grant(bytes32(72), 'writer')] }, f.root.privateKey)
+    await f.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(71))] }, f.root.privateKey)
+    await f.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(72))] }, f.root.privateKey)
     await f.admin.rotateEpoch(f.root.privateKey)
     await f.admin.rotateEpoch(f.root.privateKey)
     const authored = await f.adminTransport.history()
@@ -159,8 +159,8 @@ describe('replicated governance control plane', () => {
 
   it('selects finalized causal predecessors and author-time epoch boundaries when received state is ahead', async () => {
     const f = await governanceFixture()
-    await f.admin.publishCapabilityChange({ grants: [grant(bytes32(45), 'writer')] }, f.root.privateKey)
-    await f.admin.publishCapabilityChange({ grants: [grant(bytes32(46), 'writer')] }, f.root.privateKey)
+    await f.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(45))] }, f.root.privateKey)
+    await f.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(46))] }, f.root.privateKey)
     await f.admin.rotateEpoch(f.root.privateKey)
     await f.admin.rotateEpoch(f.root.privateKey)
     const transport = f.network.createNode('canonical-ahead-reader')
@@ -190,8 +190,8 @@ describe('replicated governance control plane', () => {
 
   it('keeps a relayed governance successor pending until its authenticated predecessor arrives', async () => {
     const fixture = await governanceFixture()
-    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(31), 'writer')] }, fixture.root.privateKey)
-    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(32), 'writer')] }, fixture.root.privateKey)
+    await fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(31))] }, fixture.root.privateKey)
+    await fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(32))] }, fixture.root.privateKey)
     const records = await fixture.adminTransport.history()
     const transport = fixture.network.createNode('late-reader')
     transport.receive(records[1]!)
@@ -216,10 +216,10 @@ describe('replicated governance control plane', () => {
       transport, identity: await generateEd25519KeyPair() })
     controllers.push(participant)
     await participant.start()
-    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(33), 'writer')] }, fixture.root.privateKey)
+    await fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(33))] }, fixture.root.privateKey)
     await waitFor(() => participant.snapshot.revision === 1n)
     await attacker.publish((await fixture.adminTransport.history())[0]!.payload)
-    await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(34), 'writer')] }, fixture.root.privateKey)
+    await fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(34))] }, fixture.root.privateKey)
     await waitFor(() => participant.snapshot.revision === 2n)
   })
 
@@ -229,13 +229,13 @@ describe('replicated governance control plane', () => {
     Object.assign(fixture.adminTransport, {
       ensurePublished: async () => { if (!relayAvailable) throw new Error('relay offline') },
     })
-    await expect(fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(40), 'writer')] }, fixture.root.privateKey, { operationId: 'first' }))
+    await expect(fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(40))] }, fixture.root.privateKey, { operationId: 'first' }))
       .rejects.toThrow('relay offline')
-    await expect(fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(41), 'writer')] }, fixture.root.privateKey, { operationId: 'second' }))
+    await expect(fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(41))] }, fixture.root.privateKey, { operationId: 'second' }))
       .rejects.toThrow('relay offline')
     expect(await fixture.adminTransport.history()).toHaveLength(1)
     relayAvailable = true
-    const successor = await fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(41), 'writer')] }, fixture.root.privateKey, { operationId: 'second' })
+    const successor = await fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(41))] }, fixture.root.privateKey, { operationId: 'second' })
     expect(successor.revision.revision).toBe(2n)
     expect(await fixture.adminTransport.history()).toHaveLength(2)
   })
@@ -250,7 +250,7 @@ describe('replicated governance control plane', () => {
       if (loseResponse) { loseResponse = false; throw new Error('lost append response') }
       return record
     })
-    const change = { grants: [grant(bytes32(45), 'writer')] }
+    const change = { grants: [sqlWriter(bytes32(45))] }
     await expect(fixture.admin.publishCapabilityChange(change, fixture.root.privateKey, { operationId: 'approval-1' }))
       .rejects.toThrow('lost append response')
     await fixture.admin.close()
@@ -265,15 +265,15 @@ describe('replicated governance control plane', () => {
     expect(original.revision.revision).toBe(1n)
     expect(reopened.snapshot.revision).toBe(1n)
     expect(await fixture.adminTransport.history()).toHaveLength(1)
-    await expect(reopened.publishCapabilityChange({ grants: [grant(bytes32(46), 'writer')] }, fixture.root.privateKey, { operationId: 'approval-1' }))
+    await expect(reopened.publishCapabilityChange({ grants: [sqlWriter(bytes32(46))] }, fixture.root.privateKey, { operationId: 'approval-1' }))
       .rejects.toThrow('OPERATION_ID_CONFLICT')
   })
 
   it('serializes concurrent authoring across signing and durable publication', async () => {
     const fixture = await governanceFixture()
     const [first, second] = await Promise.all([
-      fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(40), 'writer')] }, fixture.root.privateKey),
-      fixture.admin.publishCapabilityChange({ grants: [grant(bytes32(41), 'writer')] }, fixture.root.privateKey),
+      fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(40))] }, fixture.root.privateKey),
+      fixture.admin.publishCapabilityChange({ grants: [sqlWriter(bytes32(41))] }, fixture.root.privateKey),
     ])
     expect([first.revision.revision, second.revision.revision]).toEqual([1n, 2n])
     expect(fixture.admin.snapshot.revision).toBe(2n)
@@ -303,7 +303,7 @@ describe('replicated governance control plane', () => {
 
     await fixture.admin.publishCapabilityChange({ grants: [
       grant(participantSigning.publicKeyBytes, 'reader', { hpkePublicKey: participantHpke.publicKeyBytes, transportAuthor: 'participant' }),
-      grant(participantSigning.publicKeyBytes, 'writer', { transportAuthor: 'participant' }),
+      sqlWriter(participantSigning.publicKeyBytes, { transportAuthor: 'participant' }),
       grant(participantSigning.publicKeyBytes, 'validator', { minimumAuthorTimestampMs: 0n, transportAuthor: 'participant' }),
     ] }, fixture.root.privateKey)
     await waitFor(() => participant.snapshot.revision === 1n)
@@ -390,8 +390,7 @@ async function governanceFixture(operationStore?: DurableOperationStore, fixedHi
     rootAdminPublicKey: root.publicKeyBytes, schemaAdminPublicKey: root.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode('admin'),
     initialCapabilities: [
-      { ...grant(root.publicKeyBytes, 'administrator', { transportAuthor: 'admin' }), validFromRevision: 0n },
-      { ...grant(root.publicKeyBytes, 'writer', { transportAuthor: 'admin' }), validFromRevision: 0n },
+      { ...sqlWriter(root.publicKeyBytes, { transportAuthor: 'admin' }), validFromRevision: 0n },
       { ...grant(root.publicKeyBytes, 'validator', { minimumAuthorTimestampMs: 0n, transportAuthor: 'admin' }), validFromRevision: 0n },
       { ...grant(root.publicKeyBytes, 'reader', { hpkePublicKey: rootHpke.publicKeyBytes, transportAuthor: 'admin' }), validFromRevision: 0n },
     ],
@@ -419,15 +418,15 @@ async function governanceFixture(operationStore?: DurableOperationStore, fixedHi
 
 function grant(
   signingPublicKey: Uint8Array,
-  role: CapabilityGrant['role'],
-  options: Partial<CapabilityGrant> = {},
-): Omit<CapabilityGrant, 'validFromRevision'> & { readonly validFromRevision?: bigint } {
-  return {
-    subjectId: signingPublicKey,
-    signingPublicKey,
-    role,
-    ...options,
-  }
+  role: 'reader' | 'validator',
+  options: { readonly transportAuthor?: string; readonly minimumAuthorTimestampMs?: bigint; readonly hpkePublicKey?: Uint8Array } = {},
+): CapabilityGrantInput {
+  return { subjectId: signingPublicKey, signingPublicKey, role, ...options }
+}
+
+function sqlWriter(signingPublicKey: Uint8Array, options: { readonly transportAuthor?: string } = {}): CapabilityGrantInput {
+  return { subjectId: signingPublicKey, signingPublicKey, role: 'writer',
+    program: { sql: true, topics: [], signals: [] }, ...options }
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {

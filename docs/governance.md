@@ -80,6 +80,7 @@ using a stable request ID:
 const { signedRequest } = await joiningDevice.enrollment.createRequest({
   requestId: durableJoinRequestId,
   roles: ['reader', 'writer'],
+  writerProgram: { sql: true, topics: ['tasks/changed'], signals: ['presence'] },
 })
 ```
 
@@ -93,6 +94,7 @@ const { signedApproval } = await issuer.enrollment.approveRequest({
   signedRequest,
   roles: ['reader', 'writer'],
   grantFullHistory: true,
+  writerProgram: { sql: true, topics: ['tasks/changed'], signals: ['presence'] },
 })
 ```
 
@@ -134,8 +136,9 @@ operations described below. See the complete
 ## Bootstrap and key storage
 
 On first start, `chronologd` writes `governance.json` with mode `0600`. It
-contains the signed genesis and the local HPKE reader key. The genesis gives the local identity administrator,
-writer, validator, and reader capabilities and binds those protocol keys to
+contains the signed genesis and the local HPKE reader key. The genesis pins the
+local membership issuer and initial SQL schema administrator, grants explicit
+writer, validator and reader capabilities, and binds those protocol keys to
 the daemon's feed for the default single-participant peer configuration. The
 genesis also authenticates the selected history policy and execution-manifest
 digest. A coordinated group instead supplies its fixed history ID and authority
@@ -330,11 +333,22 @@ A grant file contains public material only. For example:
 }
 ```
 
-The protocol represents `writer`, `validator`, `reader` and `administrator`
-roles. Reader grants require an HPKE public key. Live enrollment selects
-reader/writer grants; the fixed validators are established in the signed
-genesis. Epoch keys are generated inside the replica and are never returned
-as plaintext by RPC.
+The protocol has three grant roles: `writer`, `validator` and `reader`.
+Membership administration is authenticated by the root key and administration
+feed pinned in genesis; there is no grantable administrator role. Reader grants
+require an HPKE public key. Every writer grant requires an explicit `program`
+object containing `sql`, allowed durable-event `topics` and allowed ephemeral
+`signals`. Omitting it is invalid and never grants SQL access. Forwarding through
+another enrolled feed requires `forwarded: true`; its default is denied.
+`grantCapability` accepts these rights and governance status returns the same
+rights for each writer, so an agent can inspect the permission it is requesting.
+One exact grant must cover a program; rights from several grants are not pooled.
+
+Live enrollment selects reader/writer grants with explicit `writerProgram`
+rights in both the signed request and approval. An approval may narrow those
+requested rights. The fixed validators are established in signed genesis.
+Epoch keys are generated inside the replica and are never returned as
+plaintext by RPC.
 
 `GovernanceControlPlane` in `@chronolog/node-core` backs that surface:
 

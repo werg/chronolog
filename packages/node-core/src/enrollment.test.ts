@@ -38,7 +38,7 @@ describe('live durable group enrollment', () => {
     const fixture = await setup(), store = new MemoryOperationStore(), identity = await loadOrCreateEnrollmentIdentity(store, 'captured-request')
     const signingKey = identity.signing.publicKeyBytes.slice(), readerKey = identity.reader.publicKeyBytes.slice()
     const input = { descriptor: fixture.descriptor, store, requestId: 'original-request', identity: identity.signing,
-      readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'original-feed', requestedRoles: ['reader', 'writer'] as const }
+      readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'original-feed', requestedRoles: ['reader', 'writer'] as const, writerProgram: { sql: true, topics: [], signals: [] } }
     const pending = prepareEnrollmentRequest(input)
     input.requestId = 'changed-request'; input.transportAuthor = 'changed-feed'
     identity.signing.publicKeyBytes.fill(0); identity.reader.publicKeyBytes.fill(0)
@@ -97,6 +97,22 @@ describe('live durable group enrollment', () => {
     await expect(fixture.issuer.approve(request, { operationId: 'overbroad', roles: ['reader', 'writer'], grantFullHistory: true,
       writerProgram: { ...writerProgram, topics: ['*'] } })).rejects.toThrow('UNAUTHORIZED')
   })
+  it('requires an explicit writer scope before requesting or granting publication authority', async () => {
+    const fixture = await setup(), store = new MemoryOperationStore()
+    const identity = await loadOrCreateEnrollmentIdentity(store, 'signal-device')
+    const input = { descriptor: fixture.descriptor, store, requestId: 'join', identity: identity.signing,
+      readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'signal-feed', requestedRoles: ['reader', 'writer'] as const }
+    await expect(prepareEnrollmentRequest(input)).rejects.toThrow('ENROLLMENT_PROGRAM_REQUIRED')
+    const writerProgram = { sql: false, topics: [], signals: ['presence'] }
+    const request = await prepareEnrollmentRequest({ ...input, writerProgram })
+    const decision = { operationId: 'approve', roles: ['reader', 'writer'] as const, grantFullHistory: false }
+    await expect(fixture.issuer.approve(request, decision)).rejects.toThrow('ENROLLMENT_PROGRAM_REQUIRED')
+    expect(fixture.governance.snapshot.revision).toBe(0n)
+    const approval = await fixture.issuer.approve(request, { ...decision, writerProgram })
+    const grant = fixture.governance.snapshot.capabilities.get(Buffer.from(approval.approval.capabilityIds[1]!).toString('hex'))!.grant
+    expect(grant).toMatchObject({ role: 'writer', program: { ...writerProgram, forwarded: false } })
+  })
+
   it('reopens one device identity and exact signed request and rejects changed request identities', async () => {
     const fixture = await setup()
     const store = new MemoryOperationStore()
@@ -106,13 +122,13 @@ describe('live durable group enrollment', () => {
     expect(reopened.reader.publicKeyBytes).toEqual(identity.reader.publicKeyBytes)
     const options = { descriptor: fixture.descriptor, store, identity: identity.signing,
       readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: 'joining',
-      requestId: 'join-1', requestedRoles: ['reader', 'writer'] as const }
+      requestId: 'join-1', requestedRoles: ['reader', 'writer'] as const, writerProgram: { sql: true, topics: [], signals: [] } }
     const request = await prepareEnrollmentRequest(options)
     const retry = await prepareEnrollmentRequest({ ...options, identity: reopened.signing })
     expect(encodeSignedEnrollmentRequest(retry)).toEqual(encodeSignedEnrollmentRequest(request))
     expect(await verifySignedEnrollmentRequest(decodeSignedEnrollmentRequest(encodeSignedEnrollmentRequest(request)))).toBe(true)
     expect(await verifySignedEnrollmentRequest({ ...request, request: { ...request.request, transportAuthor: 'attacker' } })).toBe(false)
-    await expect(prepareEnrollmentRequest({ ...options, requestedRoles: ['reader'] })).rejects.toThrow('ENROLLMENT_REQUEST_ID_CONFLICT')
+    await expect(prepareEnrollmentRequest({ ...options, writerProgram: { sql: false, topics: [], signals: [] } })).rejects.toThrow('ENROLLMENT_REQUEST_ID_CONFLICT')
   })
 
   it('approves a fresh peer live and obtains all historical keys through another peer while the issuer is disconnected', async () => {
@@ -125,8 +141,8 @@ describe('live durable group enrollment', () => {
     const identity = await loadOrCreateEnrollmentIdentity(store, 'new-device')
     const request = await prepareEnrollmentRequest({ descriptor: fixture.descriptor, store,
       requestId: 'new-peer', identity: identity.signing, readerPublicKey: identity.reader.publicKeyBytes,
-      transportAuthor: 'new-peer', requestedRoles: ['reader', 'writer'] })
-    const approval = await fixture.issuer.approve(request, { operationId: 'approve-new-peer', roles: ['reader', 'writer'], grantFullHistory: true })
+      transportAuthor: 'new-peer', requestedRoles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })
+    const approval = await fixture.issuer.approve(request, { operationId: 'approve-new-peer', roles: ['reader', 'writer'], grantFullHistory: true, writerProgram: { sql: true, topics: [], signals: [] } })
     fixture.network.disconnect(fixture.transport, relay)
     const transport = fixture.network.createNode('new-peer')
     fixture.network.connect(relay, transport)
@@ -158,7 +174,7 @@ describe('live durable group enrollment', () => {
     const identity = await loadOrCreateEnrollmentIdentity(store, 'device')
     const request = await prepareEnrollmentRequest({ descriptor: fixture.descriptor, store,
       requestId: 'interrupted', identity: identity.signing, readerPublicKey: identity.reader.publicKeyBytes,
-      transportAuthor: 'interrupted', requestedRoles: ['reader', 'writer'] })
+      transportAuthor: 'interrupted', requestedRoles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })
     const interrupted = new EnrollmentIssuer({ ...fixture.issuerOptions, captureFinalTarget: async () => { throw new Error('interrupted before target') } })
     const decision = { operationId: 'approve-1', roles: ['reader'] as const, grantFullHistory: true }
     await expect(interrupted.approve(request, decision)).rejects.toThrow('interrupted before target')
@@ -168,7 +184,7 @@ describe('live durable group enrollment', () => {
     expect(resumed.approval.grantedRevision).toBe(1n)
     expect(fixture.governance.snapshot.revision).toBe(1n)
     expect(await fixture.transport.history()).toHaveLength(records)
-    await expect(fixture.issuer.approve(request, { ...decision, roles: ['reader', 'writer'] })).rejects.toThrow('OPERATION_ID_CONFLICT')
+    await expect(fixture.issuer.approve(request, { ...decision, roles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })).rejects.toThrow('OPERATION_ID_CONFLICT')
   })
 
   it('serializes applicants with the same device-local request ID and rejects changes by the same applicant', async () => {
@@ -237,7 +253,7 @@ async function setup() {
   const network = new MemoryTransportNetwork()
   const transport = network.createNode('admin')
   const initialCapabilities: CapabilityGrant[] = [
-    { subjectId: identity.signing.publicKeyBytes, signingPublicKey: identity.signing.publicKeyBytes, role: 'writer', transportAuthor: 'admin', validFromRevision: 0n },
+    { subjectId: identity.signing.publicKeyBytes, signingPublicKey: identity.signing.publicKeyBytes, role: 'writer', program: { sql: true, topics: [], signals: [] }, transportAuthor: 'admin', validFromRevision: 0n },
     { subjectId: identity.signing.publicKeyBytes, signingPublicKey: identity.signing.publicKeyBytes, role: 'reader', transportAuthor: 'admin', hpkePublicKey: identity.reader.publicKeyBytes, validFromRevision: 0n },
     { subjectId: identity.signing.publicKeyBytes, signingPublicKey: identity.signing.publicKeyBytes, role: 'validator', transportAuthor: 'admin', minimumAuthorTimestampMs: 0n, validFromRevision: 0n },
   ]

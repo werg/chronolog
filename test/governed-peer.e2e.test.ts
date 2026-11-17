@@ -83,10 +83,10 @@ describe('live native governed peer', () => {
     network.connect(root.transport, newcomer.transport)
     await newcomer.runtime.start()
     expect(await newcomer.runtime.node.isWritable()).toBe(false)
-    const request = await newcomer.enrollment.createRequest({ requestId: 'join-device', roles: ['reader', 'writer'] })
-    expect(await newcomer.enrollment.createRequest({ requestId: 'join-device', roles: ['reader', 'writer'] })).toEqual(request)
+    const request = await newcomer.enrollment.createRequest({ requestId: 'join-device', roles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })
+    expect(await newcomer.enrollment.createRequest({ requestId: 'join-device', roles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })).toEqual(request)
     const decision = { requestId: 'approve-device', signedRequest: request.signedRequest,
-      roles: ['reader', 'writer'] as const, grantFullHistory: true }
+      roles: ['reader', 'writer'] as const, grantFullHistory: true, writerProgram: { sql: true, topics: [], signals: [] } }
     const approval = await root.enrollment.approveRequest(decision)
     expect(await root.enrollment.approveRequest(decision)).toEqual(approval)
     await eventually(async () => {

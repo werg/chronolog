@@ -12,10 +12,12 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 const bytes = (value: number): Uint8Array => new Uint8Array(32).fill(value)
 function capability(identity: Ed25519KeyPair, role: 'reader' | 'writer', id: number): EffectiveCapability {
-  return { id: bytes(id), grantedAtRevision: 0n, grant: { role, signingPublicKey: identity.publicKeyBytes,
+  const common = { signingPublicKey: identity.publicKeyBytes,
     transportAuthor: feedIdFromPublicKey(identity.publicKeyBytes),
-    subjectId: identity.publicKeyBytes, validFromRevision: 0n,
-    ...(role === 'writer' ? { program: { sql: false, topics: [], signals: ['typing'] } } : {}) } }
+    subjectId: identity.publicKeyBytes, validFromRevision: 0n }
+  return { id: bytes(id), grantedAtRevision: 0n, grant: role === 'writer'
+    ? { ...common, role, program: { sql: false, topics: [], signals: ['typing'] } }
+    : { ...common, role } }
 }
 async function replicas(writer = true) {
   const identities = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])

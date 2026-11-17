@@ -23,7 +23,7 @@ afterEach(async () => { await Promise.all([...open].map(administrator => adminis
 describe('portable thin membership administrator', () => {
   it('creates one durable root-only group and empty-reader epoch without a reader key or SQL engine', async () => {
     const fixture = await setup(false)
-    expect([...fixture.administrator.snapshot.capabilities.values()].map(value => value.grant.role)).toEqual(['administrator'])
+    expect([...fixture.administrator.snapshot.capabilities.values()].map(value => value.grant.role)).toEqual([])
     expect(fixture.administrator.epochs).toEqual([0n])
     const entries = await fixture.log.read(), record = decodeLedgerRecord(entries[0]!.bytes)
     expect(record.kind).toBe('epoch-manifest')

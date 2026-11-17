@@ -20,7 +20,7 @@ describe('live peer governance activation controller', () => {
     const f = await fixture()
     const first = f.controller(0)
     await first.start()
-    await f.governance[0]!.publishCapabilityChange({ grants: [{ subjectId: bytes(60), signingPublicKey: bytes(60), role: 'writer' }] }, f.identities[0].privateKey)
+    await f.governance[0]!.publishCapabilityChange({ grants: [{ subjectId: bytes(60), signingPublicKey: bytes(60), role: 'writer', program: { sql: true, topics: [], signals: [] } }] }, f.identities[0].privateKey)
     await first.refresh()
     expect(first.activeSnapshot.revision).toBe(0n)
     expect(first.closedAdmissionRevisions().some(item => equalBytes(item.membershipRevision, f.initial.revisionDigest))).toBe(false)
@@ -45,7 +45,7 @@ describe('live peer governance activation controller', () => {
       txId, validatorId: f.identities[1].publicKeyBytes, authorTimestampMs: 900n,
       acceptedAboveMs: 100n, candidateDigest: bytes(90), decision: 'admit', policyVersion: 1n,
     }), f.identities[1]))
-    await f.governance[0]!.publishCapabilityChange({ grants: [{ subjectId: bytes(61), signingPublicKey: bytes(61), role: 'writer' }] }, f.identities[0].privateKey)
+    await f.governance[0]!.publishCapabilityChange({ grants: [{ subjectId: bytes(61), signingPublicKey: bytes(61), role: 'writer', program: { sql: true, topics: [], signals: [] } }] }, f.identities[0].privateKey)
     await waitFor(() => f.governance[1]!.snapshot.revision === 1n)
     const a = f.controller(0), b = f.controller(1)
     await a.start(); await b.start(); await a.refresh()
@@ -69,7 +69,7 @@ describe('live peer governance activation controller', () => {
 
   it('blocks an incomplete restore instead of reopening already closed membership', async () => {
     const f = await fixture()
-    await f.governance[0]!.publishCapabilityChange({ grants: [{ subjectId: bytes(62), signingPublicKey: bytes(62), role: 'writer' }] }, f.identities[0].privateKey)
+    await f.governance[0]!.publishCapabilityChange({ grants: [{ subjectId: bytes(62), signingPublicKey: bytes(62), role: 'writer', program: { sql: true, topics: [], signals: [] } }] }, f.identities[0].privateKey)
     await waitFor(() => f.governance[1]!.snapshot.revision === 1n)
     const a = f.controller(0), b = f.controller(1)
     await a.start(); await b.start(); await a.refresh()
@@ -99,7 +99,7 @@ async function fixture() {
   const transports = [network.createNode('admin'), network.createNode('validator')]
   network.connectAll()
   const initialCapabilities: CapabilityGrant[] = identities.flatMap((identity, i) => [
-    { subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes, role: 'writer', validFromRevision: 0n, transportAuthor: transports[i]!.identity },
+    { subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes, role: 'writer', program: { sql: true, topics: [], signals: [] }, validFromRevision: 0n, transportAuthor: transports[i]!.identity },
     { subjectId: identity.publicKeyBytes, signingPublicKey: identity.publicKeyBytes, role: 'validator', validFromRevision: 0n, transportAuthor: transports[i]!.identity, minimumAuthorTimestampMs: 0n },
   ])
   const manifest: GenesisManifest = {

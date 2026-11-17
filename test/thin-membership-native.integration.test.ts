@@ -73,7 +73,7 @@ describe('thin membership qualification native boundary', () => {
     let administrator = await open()
     cleanup.push(() => administrator.close())
     expect([...administrator.snapshot.capabilities.values()].filter(capability =>
-      equalBytes(capability.grant.signingPublicKey, provisioned.identity.publicKeyBytes)).map(capability => capability.grant.role)).toEqual(['administrator'])
+      equalBytes(capability.grant.signingPublicKey, provisioned.identity.publicKeyBytes)).map(capability => capability.grant.role)).toEqual([])
 
     observe('small native workload')
     const small = await native.publishWorkload({ namespace: 'small', count: 4, payloadBytes: 16 })

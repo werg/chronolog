@@ -57,7 +57,7 @@ it('bootstraps the public retained-log bridge before fetching SQL bodies from it
   await replica.start()
   const request = await prepareEnrollmentRequest({ descriptor: native.descriptor, store, requestId: 'bridge-join',
     identity: identity.signing, readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: transport.identity,
-    requestedRoles: ['reader', 'writer'] })
+    requestedRoles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })
   observe('approve and hydrate reader grants')
   await native.approveEnrollment(bytesToBase64Url(encodeSignedEnrollmentRequest(request)), 'bridge-approve')
   await relay.catchUp()

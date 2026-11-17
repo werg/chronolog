@@ -28,8 +28,7 @@ import type {
   ValidationPolicy,
 } from './types.js'
 
-// Wire codes are positions in this list; code 4 (formerly 'schema-administrator') is retired.
-const ROLES = ['reader', 'writer', 'validator', 'administrator'] as const
+const ROLES = ['reader', 'writer', 'validator'] as const
 
 function roleIndex(role: CapabilityGrant['role']): bigint {
   const index = ROLES.indexOf(role)
@@ -38,6 +37,8 @@ function roleIndex(role: CapabilityGrant['role']): bigint {
 }
 
 function grantToCbor(grant: CapabilityGrant): CborValue {
+  protocolInvariant(grant.role !== 'writer' || grant.program !== undefined,
+    'SCHEMA_INVALID', 'Writer grants require explicit program rights')
   if (grant.program !== undefined) {
     protocolInvariant(grant.role === 'writer' && typeof grant.program.sql === 'boolean', 'SCHEMA_INVALID', 'Only writer grants carry program rights')
     for (const topics of [grant.program.topics, grant.program.signals]) {
@@ -83,17 +84,18 @@ function grantFromCbor(value: CborValue, field: string): CapabilityGrant {
   const hpkeKey = optional(map, 9)
   const transportAuthor = optional(map, 10)
   const programValue = optional(map, 11)
-  const program = programValue === undefined ? undefined : decodeProgramRights(programValue)
-  const grant: CapabilityGrant = {
+  protocolInvariant(role === 'writer' || programValue === undefined, 'SCHEMA_INVALID', 'Only writer grants carry program rights')
+  const common = {
     subjectId: expectBytes(required(map, 0, `${field}.subject_id`), `${field}.subject_id`),
     signingPublicKey: expectBytes(required(map, 1, `${field}.signing_key`), `${field}.signing_key`, 32),
-    role,
     validFromRevision: expectUint64(required(map, 3, `${field}.valid_from`), `${field}.valid_from`),
-    ...(program === undefined ? {} : { program }),
     ...(floor === undefined ? {} : { minimumAuthorTimestampMs: expectUint64(floor, `${field}.minimum_timestamp`) }),
     ...(hpkeKey === undefined ? {} : { hpkePublicKey: expectBytes(hpkeKey, `${field}.hpke_key`, 32) }),
     ...(transportAuthor === undefined ? {} : { transportAuthor: expectString(transportAuthor, `${field}.transport_author`) }),
   }
+  const grant: CapabilityGrant = role === 'writer'
+    ? { ...common, role, program: decodeProgramRights(required(map, 11, `${field}.program`)) }
+    : { ...common, role }
   grantToCbor(grant)
   return grant
 }

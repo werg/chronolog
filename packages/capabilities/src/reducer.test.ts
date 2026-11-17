@@ -22,7 +22,7 @@ import {
 const bytes = (value: number, length = 32) => new Uint8Array(length).fill(value)
 
 const policy: ValidationPolicy = { version: 1n, minimumValidators: 1n }
-const writer: CapabilityGrant = { subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', validFromRevision: 0n }
+const writer: CapabilityGrant = { subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', program: { sql: true, topics: [], signals: [] }, validFromRevision: 0n }
 const validatorAt = (subject: number, revision: bigint, floor: bigint): CapabilityGrant => ({
   subjectId: bytes(subject), signingPublicKey: bytes(subject), role: 'validator', validFromRevision: revision,
   minimumAuthorTimestampMs: floor,

@@ -155,6 +155,13 @@ Co-location is a deployment choice. These are separate permissions and roles:
 | Designated effect worker | One handler's durable processed checkpoint and provider dispatch/recovery | Distributed exactly-once execution merely because peers share a log |
 | Page host / introduction service | Assets, account access and bounded connection introductions | Database membership, execution order or application finality |
 
+Membership administration is pinned by genesis's `rootAdminPublicKey` and
+`capabilityLogFeed`; it is not a grantable capability role. Reader, writer and
+validator grants have separate jobs. Every writer declares its exact `program`
+rights: SQL permission, durable topics and ephemeral signal topics. Missing
+rights never imply SQL permission, and one exact grant must cover the operation.
+RPC grant requests and status expose those same rights for agents to review.
+
 The convenience native bootstrap explicitly grants several roles to its owner.
 That is visible bootstrap policy, not an implication of being a resident process.
 A separately provisioned membership host may pin a different finality key and

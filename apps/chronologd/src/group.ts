@@ -178,9 +178,7 @@ async function initialize(
     ...(secretStore === undefined ? {} : { secretStore }),
   })
   const subject = b64(identity.publicKeyBytes)
-  const grant = (role: string, extra: Record<string, string> = {}) => ({
-    subjectId: subject, signingPublicKey: subject, transportAuthor, role, ...extra,
-  })
+  const grantIdentity = { subjectId: subject, signingPublicKey: subject, transportAuthor }
   if (!root) {
     output({
       joined: true,
@@ -191,8 +189,8 @@ async function initialize(
       // on the administrator node, then `chronolog governance rotate` so the new
       // reader receives the current epoch key. Validators stay fixed at genesis.
       suggestedGrants: {
-        reader: grant('reader', { hpkePublicKey: b64(loaded.recipientPublicKey) }),
-        writer: grant('writer'),
+        reader: { ...grantIdentity, role: 'reader', hpkePublicKey: b64(loaded.recipientPublicKey) },
+        writer: { ...grantIdentity, role: 'writer', program: { sql: true, topics: [], signals: [] } },
       },
       next: 'Add the administrator node to CHRONOLOG_SSB_PEERS, then start chronologd.',
     })

@@ -60,7 +60,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       groupId: crypto.getRandomValues(new Uint8Array(32)), schemaId: executionManifestDigest,
       rootAdminPublicKey: administrator.signing.publicKeyBytes, schemaAdminPublicKey: administrator.signing.publicKeyBytes, capabilityLogFeed: utf8(administratorFeed),
       initialCapabilities: [
-        { ...common, role: 'administrator' }, { ...common, role: 'writer' },
+        { ...common, role: 'writer', program: { sql: true, topics: [], signals: [] } },
         { ...common, role: 'reader', hpkePublicKey: administrator.reader.publicKeyBytes },
       ],
       historyPolicy: { kind: 'coordinated', executionManifestDigest,
@@ -301,7 +301,8 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       bootstrap, descriptor: root.descriptor,
       async approveEnrollment(signedRequest: string, operationId: string, roles: readonly EnrollmentRole[] = ['reader', 'writer']) {
         await syncEvidence()
-        const approval = await native.enrollment.approveRequest({ operationId, signedRequest, roles, grantFullHistory: true })
+        const approval = await native.enrollment.approveRequest({ operationId, signedRequest, roles, grantFullHistory: true,
+          ...(roles.includes('writer') ? { writerProgram: { sql: true, topics: [], signals: [] } } : {}) })
         await syncEvidence()
         return approval
       },

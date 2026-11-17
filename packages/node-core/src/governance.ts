@@ -8,7 +8,7 @@ import {
   isCapabilityActive,
   reduceCapabilityLog,
   signCapabilityRevision,
-  type CapabilityGrant,
+  type CapabilityGrantInput,
   type CapabilityRevision,
   type CapabilitySnapshot,
   type SignedCapabilityRevision,
@@ -96,7 +96,7 @@ export interface GovernanceControlPlaneOptions {
 export interface GovernanceOperationOptions { readonly operationId?: string }
 
 export interface CapabilityChange {
-  readonly grants?: readonly Omit<CapabilityGrant, 'validFromRevision'>[]
+  readonly grants?: readonly CapabilityGrantInput[]
   readonly revocations?: readonly Uint8Array[]
   readonly validationPolicies?: readonly ValidationPolicy[]
   readonly successorRootPublicKey?: Uint8Array

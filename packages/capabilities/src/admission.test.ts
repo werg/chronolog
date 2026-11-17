@@ -43,7 +43,7 @@ function validator(subject: number, _label: string, floor = 1_000n): CapabilityG
   }
 }
 
-const writer: CapabilityGrant = { subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', validFromRevision: 0n }
+const writer: CapabilityGrant = { subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', program: { sql: true, topics: [], signals: [] }, validFromRevision: 0n }
 
 async function fixture(extraGrants: readonly CapabilityGrant[] = []) {
   const root = await generateEd25519KeyPair()
@@ -119,7 +119,7 @@ describe('writer authorization', () => {
     expect(canAuthorTransaction(f.snapshot, coreFor(f.snapshot, f.policyId, { program: program(emit('chat', null)) }))).toBe(false)
     const scoped = await advance(f, f.snapshot, { grants: [{ ...writer, validFromRevision: 1n,
       program: { sql: false, topics: ['chat'], signals: ['typing'], forwarded: true } }] })
-    const id = [...scoped.capabilities.values()].find((entry) => entry.grant.program !== undefined)!.id
+    const id = [...scoped.capabilities.values()].find((entry) => entry.grantedAtRevision === 1n)!.id
     expect(canAuthorTransaction(scoped, coreFor(scoped, f.policyId, { writerCapability: id, program: program(emit('chat', null)) }))).toBe(true)
     expect(canAuthorTransaction(scoped, coreFor(scoped, f.policyId, { writerCapability: id, program: program(emit('chat', null), 'SELECT 1') }))).toBe(false)
     expect(canAuthorTransaction(scoped, coreFor(scoped, f.policyId, { writerCapability: id, program: program(emit('typing', null)) }))).toBe(false)

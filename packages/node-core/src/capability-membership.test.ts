@@ -30,7 +30,10 @@ const outsiderKey = bytes(0x50)
 
 function capability(
   idFill: number,
-  grant: Partial<CapabilityGrant> & Pick<CapabilityGrant, 'role' | 'signingPublicKey'>,
+  grant: Partial<CapabilityGrant> & Pick<CapabilityGrant, 'signingPublicKey'> & (
+    | { readonly role: 'writer'; readonly program: NonNullable<CapabilityGrant['program']> }
+    | { readonly role: 'reader' | 'validator'; readonly program?: never }
+  ),
   options: { readonly revokedAtRevision?: bigint } = {},
 ): EffectiveCapability {
   return {
@@ -42,9 +45,9 @@ function capability(
 }
 
 const capabilities = {
-  writer: capability(0x60, { role: 'writer', signingPublicKey: writerKey, transportAuthor: '@writer.feed' }),
-  revokedWriter: capability(0x61, { role: 'writer', signingPublicKey: revokedWriterKey, transportAuthor: '@revoked.feed' }, { revokedAtRevision: REVISION }),
-  futureWriter: capability(0x63, { role: 'writer', signingPublicKey: futureWriterKey, validFromRevision: REVISION + 1n }),
+  writer: capability(0x60, { role: 'writer', program: { sql: true, topics: [], signals: [] }, signingPublicKey: writerKey, transportAuthor: '@writer.feed' }),
+  revokedWriter: capability(0x61, { role: 'writer', program: { sql: true, topics: [], signals: [] }, signingPublicKey: revokedWriterKey, transportAuthor: '@revoked.feed' }, { revokedAtRevision: REVISION }),
+  futureWriter: capability(0x63, { role: 'writer', program: { sql: true, topics: [], signals: [] }, signingPublicKey: futureWriterKey, validFromRevision: REVISION + 1n }),
   validator0: capability(0x70, { role: 'validator', signingPublicKey: validatorKeys[0], transportAuthor: '@v0.feed' }),
   validator1: capability(0x71, { role: 'validator', signingPublicKey: validatorKeys[1], minimumAuthorTimestampMs: 1_000n }),
   validator2: capability(0x72, { role: 'validator', signingPublicKey: validatorKeys[2] }),
@@ -179,7 +182,7 @@ describe('CapabilityMembershipResolver writer authority', () => {
   it('does not revive an old grant when the same key is regranted', async () => {
     const old = snapshot()
     const revoked = { ...capabilities.writer, revokedAtRevision: REVISION + 1n }
-    const regrant = capability(0x64, { role: 'writer', signingPublicKey: writerKey, validFromRevision: REVISION + 2n })
+    const regrant = capability(0x64, { role: 'writer', program: { sql: true, topics: [], signals: [] }, signingPublicKey: writerKey, validFromRevision: REVISION + 2n })
     const current = snapshot(policy(), [regrant], {
       revision: REVISION + 2n,
       revisionDigest: otherRevisionDigest,

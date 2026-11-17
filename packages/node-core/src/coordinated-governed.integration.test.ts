@@ -66,7 +66,7 @@ describe('governed chronological native replicas with a finality provider', () =
     const historyId = 'h_0123456789abcdef0123456789abcdef'
     const initialCapabilities: CapabilityGrant[] = [
       { subjectId: administrator.signing.publicKeyBytes, signingPublicKey: administrator.signing.publicKeyBytes,
-        transportAuthor: administratorFeed, role: 'writer', validFromRevision: 0n },
+        transportAuthor: administratorFeed, role: 'writer', program: { sql: true, topics: [], signals: [] }, validFromRevision: 0n },
       { subjectId: administrator.signing.publicKeyBytes, signingPublicKey: administrator.signing.publicKeyBytes,
         transportAuthor: administratorFeed, role: 'reader', hpkePublicKey: administrator.reader.publicKeyBytes, validFromRevision: 0n },
     ]
@@ -131,9 +131,9 @@ describe('governed chronological native replicas with a finality provider', () =
     cleanup.push(async () => { disconnect() })
     const request = await prepareEnrollmentRequest({ descriptor: admin.descriptor, store: joiningStore,
       identity: joining.signing, readerPublicKey: joining.reader.publicKeyBytes, transportAuthor: newcomer.transport.identity,
-      requestId: 'live-writer', requestedRoles: ['reader', 'writer'] })
+      requestId: 'live-writer', requestedRoles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })
     const approval = await admin.enrollmentIssuer!.approve(request, {
-      operationId: 'approve-live-writer', roles: ['reader', 'writer'], grantFullHistory: true,
+      operationId: 'approve-live-writer', roles: ['reader', 'writer'], grantFullHistory: true, writerProgram: { sql: true, topics: [], signals: [] },
     })
     await newcomer.transport.catchUp()
     for (const record of await newcomer.transport.history()) await newcomer.governance.ingest(record)
@@ -201,7 +201,7 @@ describe('governed chronological native replicas with a finality provider', () =
     expect((await progress()).state).toBe('revoked')
 
     await admin.governance.publishCapabilityChange({ grants: [{ subjectId: joining.signing.publicKeyBytes,
-      signingPublicKey: joining.signing.publicKeyBytes, transportAuthor: newcomer.transport.identity, role: 'writer' }] },
+      signingPublicKey: joining.signing.publicKeyBytes, transportAuthor: newcomer.transport.identity, role: 'writer', program: { sql: true, topics: [], signals: [] } }] },
     administrator.signing.privateKey, { operationId: 'regrant-same-key' })
     await certify()
     const staleAgain = await staleProposal(24, program('INSERT INTO notes (id, value) VALUES (3, 999)'))

@@ -1,10 +1,9 @@
 import { assertEventTopic, assertValidChangeProgram, bytesToHex, equalBytes, isEmitStep, type ChangeProgram } from '@chronolog/protocol'
 import { isCapabilityActive } from './reducer.js'
-import type { CapabilityGrant, CapabilitySnapshot } from './types.js'
+import type { CapabilityGrant, CapabilitySnapshot, ProgramRights } from './types.js'
 
-export type ProgramRights = NonNullable<CapabilityGrant['program']>
-export function normalizeProgramRights(value?: ProgramRights): Required<ProgramRights> {
-  if (value === undefined) return { sql: true, topics: [], signals: [], forwarded: false }
+export function normalizeProgramRights(value: ProgramRights): Required<ProgramRights> {
+  if (value === undefined || value === null) throw new Error('PROGRAM_RIGHTS_REQUIRED')
   if (typeof value.sql !== 'boolean' || (value.forwarded !== undefined && typeof value.forwarded !== 'boolean')) throw new Error('PROGRAM_RIGHTS_INVALID')
   const topics = (items: readonly string[]): readonly string[] => {
     const input: unknown = items
@@ -14,7 +13,7 @@ export function normalizeProgramRights(value?: ProgramRights): Required<ProgramR
   }
   return { sql: value.sql, topics: topics(value.topics), signals: topics(value.signals), forwarded: value.forwarded ?? false }
 }
-export function programRightsSubset(granted?: ProgramRights, requested?: ProgramRights): boolean {
+export function programRightsSubset(granted: ProgramRights, requested: ProgramRights): boolean {
   const next = normalizeProgramRights(granted), allowed = normalizeProgramRights(requested)
   return (!next.sql || allowed.sql) && (!next.forwarded || allowed.forwarded) &&
     next.topics.every((topic) => allowed.topics.includes('*') || allowed.topics.includes(topic)) &&
@@ -23,12 +22,12 @@ export function programRightsSubset(granted?: ProgramRights, requested?: Program
 
 /** Every step must fit one exact writer grant; rights are never pooled. */
 export function programAllowed(grant: CapabilityGrant, program: ChangeProgram): boolean {
-  if (grant.role !== 'writer') return false
+  if (grant.role !== 'writer' || grant.program === undefined) return false
   assertValidChangeProgram(program)
   const rights = grant.program
   return program.steps.every((step) => isEmitStep(step)
-    ? rights !== undefined && (rights.topics.includes('*') || rights.topics.includes(step.topic))
-    : rights?.sql !== false)
+    ? rights.topics.includes('*') || rights.topics.includes(step.topic)
+    : rights.sql)
 }
 
 /** Signals use the active grant, independent of SQL and durable event rights. */

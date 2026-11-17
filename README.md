@@ -206,8 +206,9 @@ non-default daemon. RPC refuses a non-loopback bind without a token.
 
 ## Running a group
 
-The daemon creates a signed governance genesis on first start; the local
-identity is administrator, writer, validator and reader. New devices adopt the
+The daemon creates a signed governance genesis on first start. It pins the local
+identity as membership issuer and initial SQL schema administrator, and gives
+it explicit writer, validator and reader grants. New devices adopt the
 public descriptor, then use the live `client.enrollment` request/approval/status
 flow with explicit full-history access. The fixed validator set does not change.
 See the [governance guide](docs/governance.md) and [client API](packages/client/README.md).

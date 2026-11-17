@@ -15,7 +15,7 @@ import {
   type SqlValue,
   type TransactionStepInput,
 } from '@chronolog/client'
-import { HttpRpcTransport } from '@chronolog/rpc'
+import { HttpRpcTransport, type GrantCapabilityInput } from '@chronolog/rpc'
 
 interface SqlSpec {
   readonly sql: string
@@ -63,14 +63,6 @@ interface SeedPlan {
 }
 /** Rejection code of a seed batch whose guard found it already applied. */
 const FORK_SEED_APPLIED_REJECTION = 'assert:fork_seed_applied'
-interface CapabilitySpec {
-  readonly subjectId: string
-  readonly signingPublicKey: string
-  readonly transportAuthor?: string
-  readonly role: 'reader' | 'writer' | 'validator' | 'administrator'
-  readonly minimumAuthorTimestampMs?: string
-  readonly hpkePublicKey?: string
-}
 
 const args = process.argv.slice(2)
 const command = args.shift()
@@ -143,7 +135,7 @@ try {
       const base = { groupId, requestId: randomUUID() }
       if (operation === 'status') output(await transport.unary('governance.getStatus', base))
       else if (operation === 'grant') {
-        const spec = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'governance grant SPEC_JSON_OR_@FILE'))) as CapabilitySpec
+        const spec = JSON.parse(await inlineOrFile(requiredArg(args.shift(), 'governance grant SPEC_JSON_OR_@FILE'))) as GrantCapabilityInput
         output(await transport.unary('governance.grantCapability', { ...base, ...spec }))
       } else if (operation === 'revoke') {
         if (args.length === 0) throw new Error('Usage: chronolog governance revoke CAPABILITY_ID [...]')

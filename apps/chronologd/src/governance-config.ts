@@ -156,7 +156,6 @@ async function createGenesis(
     schemaAdminPublicKey: options.identity.publicKeyBytes,
     capabilityLogFeed: new TextEncoder().encode(options.transportAuthor),
     initialCapabilities: [
-      { ...common, role: 'administrator' },
       // This is an explicit trusted owner grant. Other devices receive only the
       // SQL, event-topic and ephemeral rights selected during their enrollment.
       { ...common, role: 'writer', program: { sql: true, topics: ['*'], signals: ['*'] } },

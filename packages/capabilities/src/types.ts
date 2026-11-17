@@ -2,26 +2,32 @@ export type CapabilityRole =
   | 'reader'
   | 'writer'
   | 'validator'
-  | 'administrator'
 
-export interface CapabilityGrant {
+/** The complete publication authority of one writer grant. */
+export interface ProgramRights {
+  readonly sql: boolean
+  readonly topics: readonly string[]
+  readonly signals: readonly string[]
+  /** Permit this original signer to submit through another enrolled feed. */
+  readonly forwarded?: boolean
+}
+
+interface CapabilityIdentity {
   readonly subjectId: Uint8Array
   readonly signingPublicKey: Uint8Array
   /** Authenticated outer replication feed authorized for this capability. */
   readonly transportAuthor?: string
-  readonly role: CapabilityRole
-  /** SQL and event/signal publication are distinct rights on a writer grant. */
-  readonly program?: {
-    readonly sql: boolean
-    readonly topics: readonly string[]
-    readonly signals: readonly string[]
-    /** Permit this original signer to submit through another enrolled feed. */
-    readonly forwarded?: boolean
-  }
-  readonly validFromRevision: bigint
   readonly minimumAuthorTimestampMs?: bigint
   readonly hpkePublicKey?: Uint8Array
 }
+
+/** Membership administration belongs to the signed root key, not a grant role. */
+export type CapabilityGrantInput = CapabilityIdentity & (
+  | { readonly role: 'writer'; readonly program: ProgramRights }
+  | { readonly role: 'reader' | 'validator'; readonly program?: never }
+)
+
+export type CapabilityGrant = CapabilityGrantInput & { readonly validFromRevision: bigint }
 
 export interface ValidationPolicy {
   readonly version: bigint

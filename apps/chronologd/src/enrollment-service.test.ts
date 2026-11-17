@@ -12,8 +12,8 @@ describe('live daemon enrollment service', () => {
   it('requests membership using the running replica identity and recovers the exact request', async () => {
     const fixture = await setup()
     const service = createEnrollmentService(fixture.options)
-    const first = await service.createRequest({ requestId: 'join', roles: ['reader', 'writer'] })
-    const retry = await service.createRequest({ requestId: 'join', roles: ['reader', 'writer'] })
+    const first = await service.createRequest({ requestId: 'join', roles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })
+    const retry = await service.createRequest({ requestId: 'join', roles: ['reader', 'writer'], writerProgram: { sql: true, topics: [], signals: [] } })
     expect(first).toEqual(retry)
     const signed = decodeSignedEnrollmentRequest(Uint8Array.from(Buffer.from(first.signedRequest, 'base64url')))
     expect(signed.request.signingPublicKey).toEqual(fixture.options.identity.publicKeyBytes)
