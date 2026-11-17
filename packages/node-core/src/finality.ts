@@ -9,6 +9,18 @@ import {
   type CoordinatedHistoryConfiguration, type HistoryConfiguration,
   type OrderedRecordEntry, type OrderedRecordHead,
 } from './history-policy.js'
+import type { AdmissionFrontier } from '@chronolog/control-store/browser'
+
+/**
+ * Live history closes an irrevocable chronological prefix. The proof mechanism
+ * may be a validator set or an inclusion signer; neither chooses execution
+ * order. Asynchronous branching has no finality; it shares proposal identity,
+ * chronological ordering and replay without implementing this live-only port.
+ */
+export interface LiveFinalityFrontier extends AdmissionFrontier {
+  readonly mode: 'live'
+  readonly checkpointId?: string
+}
 
 /** Runtime timers are derived from the authenticated genesis, never local defaults. */
 export function resolveFinalityClockPolicy(policy: {

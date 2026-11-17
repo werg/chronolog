@@ -152,6 +152,144 @@ describe('ControlStore', () => {
     expect(evidence.unresolvedAttestationIds).toEqual([bytes(99)])
   })
 
+  it('does not finalize past a known partial quorum whose remaining vote can arrive late', () => {
+    const store = new ControlStore()
+    store.putCandidate(candidate(1, 50n))
+    store.putCandidate(candidate(2, 100n))
+    store.setCandidateState(bytes(2), 'admissible')
+    store.putAttestation({ ...attestation(10, 1, 1), authorTimestampMs: 50n })
+    store.recordHeartbeat(heartbeat(1, 100n))
+    store.recordHeartbeat(heartbeat(2, 100n))
+
+    // V1 and V2 form a blocking set, but V3's already signed vote for proposal
+    // 1 can still be in transit. Knowing its payload does not resolve admission.
+    const evidence = store.settlementEvidence(bytes(2), {
+      kind: 'threshold', policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2,
+    }, bytes(1))
+    expect(evidence.belowWatermark && evidence.unresolvedAttestationIds.length === 0).toBe(false)
+    expect(evidence.frontier).toMatchObject({ provenThroughMs: 100n, closedThroughMs: 49n,
+      blockers: [{ proposalId: bytes(1), authorTimestampMs: 50n, reason: 'pending-admission' }] })
+
+    store.putAttestation({ ...attestation(11, 1, 3), authorTimestampMs: 50n })
+    store.setCandidateState(bytes(1), 'admissible')
+    expect(store.orderedTransactionIds()).toEqual([bytes(1), bytes(2)])
+    expect(store.settlementEvidence(bytes(2), {
+      kind: 'threshold', policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2,
+    }, bytes(1)).unresolvedAttestationIds).toEqual([])
+  })
+
+  it('advances once complete cutoffs prove a partial quorum cannot finish', () => {
+    const persistence = new MemoryControlStorePersistence()
+    const store = new ControlStore(persistence)
+    store.putCandidate(candidate(1, 50n))
+    store.putAttestation({ ...attestation(10, 1, 1), authorTimestampMs: 50n })
+    const policy = { kind: 'threshold' as const, policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2 }
+    store.recordHeartbeat(heartbeat(1, 100n))
+    store.recordHeartbeat(heartbeat(2, 100n))
+    expect(store.admissionFrontier(policy, bytes(1)).closedThroughMs).toBe(49n)
+
+    // V3's complete feed now proves it never signed the missing vote.
+    store.recordHeartbeat(heartbeat(3, 100n))
+    expect(store.admissionFrontier(policy, bytes(1))).toEqual({
+      provenThroughMs: 100n, closedThroughMs: 100n, blockers: [], excludedProposalIds: [bytes(1)],
+    })
+    store.setCandidateState(bytes(1), 'inadmissible', { reason: 'ADMISSION_CLOSED' })
+    const reopened = new ControlStore(persistence)
+    expect(reopened.getCandidate(bytes(1))).toMatchObject({ state: 'inadmissible', stateReason: 'ADMISSION_CLOSED' })
+    expect(() => reopened.setCandidateState(bytes(1), 'admissible')).toThrow('CONTROL_STORE_TERMINAL_STATE')
+  })
+
+  it('uses each pending proposal policy, including proposals with no local votes', () => {
+    const store = new ControlStore()
+    store.putCandidate(candidate(1, 50n))
+    store.recordHeartbeat(heartbeat(1, 100n))
+    store.recordHeartbeat(heartbeat(2, 100n))
+    const target = { kind: 'threshold' as const, policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2 }
+    const candidatePolicies = new Map([['01', { policy: { ...target, policyId: 'one-of-three', threshold: 1 }, membershipRevision: bytes(1) }]])
+    const frontier = store.admissionFrontier(target, bytes(1), { candidatePolicies })
+    // V3 can still provide this easier proposal's entire proof.
+    expect(frontier.closedThroughMs).toBe(49n)
+    expect(frontier.excludedProposalIds).toEqual([])
+    expect(frontier.blockers[0]).toMatchObject({ proposalId: bytes(1), attestationIds: [] })
+  })
+
+  it('does not use a newer membership revision to close an older partial admission', () => {
+    const store = new ControlStore()
+    store.putCandidate(candidate(1, 50n))
+    store.putAttestation({ ...attestation(10, 1, 1), authorTimestampMs: 50n })
+    store.recordHeartbeat(heartbeat(1, 100n))
+    store.recordHeartbeat(heartbeat(2, 100n))
+    for (const validator of [1, 2, 3]) store.recordHeartbeat({ ...heartbeat(validator, 200n), membershipRevision: bytes(2) })
+    const policy = { kind: 'threshold' as const, policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2 }
+    const frontier = store.admissionFrontier(policy, bytes(2), {
+      candidatePolicies: new Map([['01', { policy, membershipRevision: bytes(1) }]]),
+      verifiedAttestationIds: new Set(['0a']),
+    })
+    expect(frontier.provenThroughMs).toBe(200n)
+    expect(frontier.closedThroughMs).toBe(49n)
+    expect(frontier.excludedProposalIds).toEqual([])
+  })
+
+  it('retains unknown-payload blockers without stalling before their timestamp', () => {
+    const store = new ControlStore()
+    store.putCandidate(candidate(1, 80n))
+    store.setCandidateState(bytes(1), 'admissible')
+    store.recordHeartbeat(heartbeat(1, 100n))
+    store.putAttestation({ ...attestation(10, 9, 1), authorTimestampMs: 200n, membershipRevision: bytes(2) })
+    const policy = { kind: 'threshold' as const, policyId: 'one', validatorIds: [bytes(1)], threshold: 1 }
+    const evidence = store.settlementEvidence(bytes(1), policy, bytes(1), { verifiedAttestationIds: new Set() })
+    expect(evidence.frontier.closedThroughMs).toBe(100n)
+    expect(evidence.frontier.blockers).toMatchObject([{ proposalId: bytes(9), authorTimestampMs: 200n, reason: 'missing-proposal' }])
+    expect(evidence.belowWatermark).toBe(true)
+    expect(evidence.unresolvedAttestationIds).toEqual([])
+  })
+
+  it('uses the verified all-policy cutoff rather than a target-only watermark', () => {
+    const store = new ControlStore()
+    store.putCandidate(candidate(1, 80n))
+    store.setCandidateState(bytes(1), 'admissible')
+    store.recordHeartbeat(heartbeat(1, 100n))
+    store.recordHeartbeat(heartbeat(2, 90n))
+    store.recordHeartbeat(heartbeat(3, 40n))
+    const policy = { kind: 'threshold' as const, policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2 }
+    const evidence = store.settlementEvidence(bytes(1), policy, bytes(1), { provenThroughMs: 40n })
+    expect(evidence.watermark.cutoffMs).toBe(90n)
+    expect(evidence.frontier.closedThroughMs).toBe(40n)
+    expect(evidence.belowWatermark).toBe(false)
+  })
+
+  it('resolves incomplete admission after an indexed governance revision closure', () => {
+    const store = new ControlStore()
+    store.putCandidate(candidate(1, 50n))
+    store.putAttestation({ ...attestation(10, 1, 1), authorTimestampMs: 50n })
+    const policy = { kind: 'threshold' as const, policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2 }
+    const context = { provenThroughMs: 100n,
+      candidatePolicies: new Map([['01', { policy, membershipRevision: bytes(1) }]]) }
+    expect(store.admissionFrontier(policy, bytes(1), context).closedThroughMs).toBe(49n)
+    expect(store.admissionFrontier(policy, bytes(1), {
+      ...context, closedMembershipRevisions: new Set(['01']),
+    })).toEqual({ provenThroughMs: 100n, closedThroughMs: 100n, blockers: [], excludedProposalIds: [bytes(1)] })
+  })
+
+  it('never treats duplicate validator votes as a possible additional quorum member', () => {
+    const store = new ControlStore()
+    store.putCandidate(candidate(1, 50n))
+    store.putAttestation({ ...attestation(10, 1, 1), authorTimestampMs: 50n })
+    store.putAttestation({ ...attestation(11, 1, 1), authorTimestampMs: 50n })
+    for (const validator of [1, 2, 3]) store.recordHeartbeat(heartbeat(validator, 100n))
+    const frontier = store.admissionFrontier({ kind: 'threshold', policyId: 'two-of-three',
+      validatorIds: [bytes(1), bytes(2), bytes(3)], threshold: 2 }, bytes(1))
+    expect(frontier.blockers).toEqual([])
+    expect(frontier.excludedProposalIds).toEqual([bytes(1)])
+  })
+
   it('persists exact bigint/byte state and returns defensive copies', () => {
     const persistence = new MemoryControlStorePersistence()
     const first = new ControlStore(persistence)

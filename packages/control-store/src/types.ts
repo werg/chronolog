@@ -6,6 +6,7 @@ export type CandidateState =
   | 'admissible'
   | 'invalid_protocol'
   | 'unauthorized'
+  | 'inadmissible'
   | 'quarantined'
 
 export interface StoredCandidate {
@@ -78,6 +79,39 @@ export interface SettlementEvidence {
   readonly watermark: WatermarkEvidence
   readonly belowWatermark: boolean
   readonly unresolvedAttestationIds: readonly Uint8Array[]
+  readonly frontier: AdmissionFrontier
+}
+
+/** An authentic admission promise whose eventual effect is not yet resolved. */
+export interface AdmissionBlocker {
+  readonly proposalId: Uint8Array
+  readonly authorTimestampMs: bigint
+  readonly reason: 'missing-proposal' | 'pending-admission'
+  readonly attestationIds: readonly Uint8Array[]
+}
+
+/** A closed timestamp range, reduced by every still possible earlier admission. */
+export interface AdmissionFrontier {
+  readonly provenThroughMs: bigint | null
+  /** A blocker at T limits this safe chronological frontier to T - 1. */
+  readonly closedThroughMs: bigint | null
+  readonly blockers: readonly AdmissionBlocker[]
+  /** Known proposals whose remaining eligible validators cannot satisfy their policy. */
+  readonly excludedProposalIds: readonly Uint8Array[]
+}
+
+export interface AdmissionFrontierOptions {
+  /** The adapter's frontier across every permitted policy, when not a single-policy store. */
+  readonly provenThroughMs?: bigint | null
+  /** Fully verified revision closures, after every preceding admission was evaluated. */
+  readonly closedMembershipRevisions?: ReadonlySet<string>
+  /** Fully verified proof IDs, encoded as lowercase hexadecimal, for known payloads. */
+  readonly verifiedAttestationIds?: ReadonlySet<string>
+  /** Every known pending proposal's own policy and signed membership revision. */
+  readonly candidatePolicies?: ReadonlyMap<string, {
+    readonly policy: WatermarkPolicy
+    readonly membershipRevision: Uint8Array
+  }>
 }
 
 export interface MaterializedHead {

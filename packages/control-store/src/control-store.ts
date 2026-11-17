@@ -3,6 +3,9 @@ import { bytesToHex, hexToBytes, compareTransactionOrder } from '@chronolog/prot
 import type {
   AdmissionEvaluation,
   AdmissionEvaluator,
+  AdmissionBlocker,
+  AdmissionFrontier,
+  AdmissionFrontierOptions,
   CandidateState,
   ControlStoreDelta,
   ControlStoreJournalEntry,
@@ -24,6 +27,7 @@ import type {
 const TERMINAL_INVALID_STATES = new Set<CandidateState>([
   'invalid_protocol',
   'unauthorized',
+  'inadmissible',
   'quarantined',
 ])
 
@@ -392,10 +396,12 @@ export class ControlStore {
     txId: Uint8Array,
     policy: WatermarkPolicy,
     membershipRevision?: Uint8Array,
+    options: AdmissionFrontierOptions = {},
   ): SettlementEvidence {
     const candidate = this.#requiredCandidate(txId)
     const watermark = this.watermark(policy, membershipRevision)
-    const unresolved = this.#unresolvedAttestations()
+    const frontier = this.admissionFrontier(policy, membershipRevision, options)
+    const unresolved = frontier.blockers.filter(item => item.authorTimestampMs <= candidate.orderKey.authorTimestampMs)
     return {
       txId: copyBytes(txId),
       candidateState: candidate.state,
@@ -403,9 +409,86 @@ export class ControlStore {
       proofAttestationIds: candidate.proofAttestationIds.map(copyBytes),
       watermark,
       belowWatermark:
-        watermark.cutoffMs !== null && candidate.orderKey.authorTimestampMs <= watermark.cutoffMs,
-      unresolvedAttestationIds: unresolved.map((attestation) => copyBytes(attestation.attestationId)),
+        frontier.closedThroughMs !== null && candidate.orderKey.authorTimestampMs <= frontier.closedThroughMs,
+      unresolvedAttestationIds: unresolved.flatMap(item => item.attestationIds.map(copyBytes)),
+      frontier,
     }
+  }
+
+  /**
+   * A blocking set prevents wholly new admissions before its cutoff. Existing
+   * partial votes can still complete through delayed records from another
+   * validator, so every such proposal must also be admitted or excluded.
+   * Callers verify proof eligibility and consume complete heartbeat feed
+   * prefixes before using this result to publish application finality.
+   */
+  admissionFrontier(policy: WatermarkPolicy, membershipRevision?: Uint8Array,
+    options: AdmissionFrontierOptions = {}): AdmissionFrontier {
+    const provenThroughMs = options.provenThroughMs === undefined ? this.watermark(policy, membershipRevision).cutoffMs : options.provenThroughMs
+    const blockers: AdmissionBlocker[] = [], excludedProposalIds: Uint8Array[] = []
+    const proposals = new Map<string, StoredAttestation[]>()
+    for (const attestation of this.#attestations.values()) {
+      if (attestation.authorTimestampMs <= attestation.acceptedAboveMs) continue
+      const key = idKey(attestation.txId), known = this.#candidates.get(key)
+      if (known?.state === 'admissible' || known !== undefined && TERMINAL_INVALID_STATES.has(known.state)) continue
+      const context = options.candidatePolicies?.get(key)
+      const revision = context?.membershipRevision ?? (options.candidatePolicies === undefined ? membershipRevision : undefined)
+      if (known !== undefined && known.state !== 'waiting_for_payload' && (revision !== undefined && idKey(attestation.membershipRevision) !== idKey(revision) ||
+          attestation.authorTimestampMs !== known.orderKey.authorTimestampMs ||
+          idKey(attestation.candidateDigest) !== idKey(known.candidateDigest) ||
+          options.verifiedAttestationIds !== undefined && !options.verifiedAttestationIds.has(idKey(attestation.attestationId)))) continue
+      const values = proposals.get(key) ?? []
+      values.push(attestation); proposals.set(key, values)
+    }
+    // Payload arrival and proof arrival are independent. A known proposal with
+    // no local vote may still have admissible votes in flight under its policy.
+    for (const [key, candidate] of this.#candidates) {
+      if (candidate.state === 'pending_validation' && !proposals.has(key)) proposals.set(key, [])
+    }
+    for (const [key, attestations] of proposals) {
+      const candidate = this.#candidates.get(key)
+      if (candidate === undefined || candidate.state === 'waiting_for_payload') {
+        // Until the payload arrives its own policy and signed timestamp cannot
+        // be checked. Authentic metadata blocks; it never proves rejection.
+        for (const attestation of attestations) blockers.push({ proposalId: copyBytes(attestation.txId),
+          authorTimestampMs: attestation.authorTimestampMs, reason: 'missing-proposal',
+          attestationIds: [copyBytes(attestation.attestationId)] })
+        continue
+      }
+      const context = options.candidatePolicies?.get(key)
+      if (options.candidatePolicies !== undefined && context === undefined) {
+        blockers.push({ proposalId: copyBytes(candidate.txId), authorTimestampMs: candidate.orderKey.authorTimestampMs,
+          reason: 'pending-admission', attestationIds: attestations.map(value => copyBytes(value.attestationId)) })
+        continue
+      }
+      const candidatePolicy = context?.policy ?? policy
+      const validators = new Set(candidatePolicy.validatorIds.map(idKey))
+      const votes = attestations.filter(value => validators.has(idKey(value.validatorId)))
+      const possible = new Set(votes.map(value => idKey(value.validatorId)))
+      const timestamp = candidate.orderKey.authorTimestampMs
+      const revision = context?.membershipRevision ?? membershipRevision
+      const revisionClosed = revision !== undefined && options.closedMembershipRevisions?.has(idKey(revision)) === true
+      for (const validator of revisionClosed ? [] : candidatePolicy.validatorIds) {
+        const heartbeat = this.#heartbeatFor(validator, revision)
+        if (heartbeat?.feedContiguous !== true || heartbeat.acceptanceCutoffMs < timestamp) possible.add(idKey(validator))
+      }
+      // A complete revision closure also proves the current evaluated vote set
+      // cannot change. It resolves stricter custom admission policies as well.
+      if (revisionClosed || Number.isSafeInteger(candidatePolicy.threshold) && candidatePolicy.threshold > 0 &&
+          candidatePolicy.threshold <= validators.size && possible.size < candidatePolicy.threshold) {
+        excludedProposalIds.push(copyBytes(candidate.txId))
+      } else {
+        blockers.push({ proposalId: copyBytes(candidate.txId), authorTimestampMs: timestamp,
+          reason: 'pending-admission', attestationIds: votes.map(value => copyBytes(value.attestationId)) })
+      }
+    }
+    blockers.sort((left, right) => left.authorTimestampMs < right.authorTimestampMs ? -1
+      : left.authorTimestampMs > right.authorTimestampMs ? 1 : idKey(left.proposalId).localeCompare(idKey(right.proposalId)))
+    let closedThroughMs = provenThroughMs
+    if (closedThroughMs !== null) for (const blocker of blockers) {
+      if (blocker.authorTimestampMs <= closedThroughMs) closedThroughMs = blocker.authorTimestampMs - 1n
+    }
+    return { provenThroughMs, closedThroughMs, blockers, excludedProposalIds }
   }
 
   publishMaterializedHead(head: MaterializedHead): ControlStoreDelta | null {
@@ -527,12 +610,6 @@ export class ControlStore {
     this.#deltas.push(sequenced)
     this.#trimDeltas()
     return sequenced
-  }
-
-  #unresolvedAttestations(): StoredAttestation[] {
-    return [...this.#attestations.values()].filter(
-      (attestation) => !this.#candidates.has(idKey(attestation.txId)),
-    )
   }
 
   #persist(operation: ControlStoreOperation): void {
