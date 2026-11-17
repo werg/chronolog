@@ -1,9 +1,9 @@
+import type { BytesStore } from '@chronolog/records'
 import {
   createParticipantTransport, decodePeerValue, encodePeerValue, peerDigest,
   verifyAuthorityBundle, verifyPublicationManifest, signPublicationManifest,
   validateApplicationDescription, applicationDescriptionDigest, verifyApplicationSchema, PUBLICATION_LIMITS,
-  type ApplicationDescription, type AuthorityBundle, type PeerReplica, type PeerStore,
-  type ParticipantRequest, type ParticipantExchangeOptions, type ParticipantTransport,
+  type ApplicationDescription, type AuthorityBundle, type PeerReplica, type ParticipantRequest, type ParticipantExchangeOptions, type ParticipantTransport,
   type SignedApplicationDescriptor, type SignedApplicationSchema, type SignedGeneration, type SignedTransitionRequest,
   type SignedPublication, type PublicationFile,
 } from '@chronolog/peer-generation'
@@ -29,7 +29,7 @@ export interface PublishedApplicationDefinition {
 export class ApplicationControlParticipant implements ApplicationControlHost {
   readonly role = 'control' as const
   readonly #replica: PeerReplica
-  readonly #store: PeerStore
+  readonly #store: BytesStore
   readonly #transport: ParticipantTransport
   readonly #lifetime = new AbortController()
   readonly #signal: AbortSignal
@@ -38,7 +38,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
   readonly #publicationAttempts: string
   #tail: Promise<unknown> = Promise.resolve()
 
-  constructor(replica: PeerReplica, store: PeerStore, signal: AbortSignal, options: ControlParticipantOptions) {
+  constructor(replica: PeerReplica, store: BytesStore, signal: AbortSignal, options: ControlParticipantOptions) {
     const timeoutMs = options.timeoutMs ?? 30_000
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error('APPLICATION_CONTROL_TIMEOUT_INVALID')
     this.#replica = replica; this.#store = store; this.#timeoutMs = timeoutMs

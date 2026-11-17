@@ -5,7 +5,7 @@ import {
   type AuthorityBundle, type PeerIdentity,
 } from './control.js'
 import { bytesDigest } from './codec.js'
-import { MemoryPeerStore } from './memory.js'
+import { MemoryBytesStore } from '@chronolog/records'
 import {
   authorizePublication, createPublicationRegistry, signPublicationManifest, validatePublicationManifest,
   verifyPublicationAsset, verifyPublicationManifest, type PublicationManifest, type SignedPublication,
@@ -19,11 +19,11 @@ async function fixture() {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: '55'.repeat(32), recoveryFloor: null,
     grants: [controlParticipantGrant(host.publicKey), participantGrant(admin.publicKey, { administrator: true }), participantGrant(writer.publicKey)] }, host)
-  const generations = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const generations = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   const first = await generations.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
     profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
     requester: admin.publicKey, coordinator: admin.publicKey, controlRevision: 0, reason: 'create', base: null }, admin))
-  const authority = () => generations.read(), store = new MemoryPeerStore(), publications = await createPublicationRegistry({ store, authority })
+  const authority = () => generations.read(), store = new MemoryBytesStore(), publications = await createPublicationRegistry({ store, authority })
   const bytes = new TextEncoder().encode('<!doctype html><title>A</title>')
   const manifest = async (operationId: string, previous: SignedPublication | null = null, signer: PeerIdentity = admin,
     changes: Partial<PublicationManifest> = {}) => signPublicationManifest({ applicationId: descriptor.payload.applicationId,
@@ -78,7 +78,7 @@ describe('signed code publication independent of lossy database history', () => 
     expect(await reopened.publish(selected)).toEqual(selected)
     expect(await reopened.read()).toEqual([selected, second])
     await expect(reopened.publish(await f.manifest(selected.payload.operationId, selected))).rejects.toThrow('PEER_PUBLICATION_OPERATION_REUSED')
-    await expect(createPublicationRegistry({ store: new MemoryPeerStore(), authority: f.authority, requireExisting: true })).rejects.toThrow('PEER_PUBLICATION_STATE_MISSING')
+    await expect(createPublicationRegistry({ store: new MemoryBytesStore(), authority: f.authority, requireExisting: true })).rejects.toThrow('PEER_PUBLICATION_STATE_MISSING')
   })
   it('retains historical signatures after revocation but rejects new releases under stale controls', async () => {
     const f = await fixture(), first = await f.publications.publish(await f.manifest('first'))
@@ -92,7 +92,7 @@ describe('signed code publication independent of lossy database history', () => 
     expect((await f.publications.read()).map(value => value.id)).toEqual([first.id, second.id])
   })
   it('recovers a durable publication whose storage acknowledgment was lost', async () => {
-    const f = await fixture(), backing = new MemoryPeerStore()
+    const f = await fixture(), backing = new MemoryBytesStore()
     let loseReply = false
     const store = { get: backing.get.bind(backing), async put(key: string, value: Uint8Array) {
       await backing.put(key, value)
@@ -109,7 +109,7 @@ describe('signed code publication independent of lossy database history', () => 
     await f.revoke()
     const current = await f.authority()
     let calls = 0
-    const registry = await createPublicationRegistry({ store: new MemoryPeerStore(), authority: async (): Promise<AuthorityBundle> => {
+    const registry = await createPublicationRegistry({ store: new MemoryBytesStore(), authority: async (): Promise<AuthorityBundle> => {
       calls++; return calls <= 3 ? stale : current
     } })
     await expect(registry.publish(publication)).rejects.toThrow('PEER_PUBLICATION_CONTROL_CHANGED')

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, decodePeerValue, encodePeerValue,
-  MemoryPeerStore, participantGrant, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  MemoryBytesStore, participantGrant, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest,
   type OrderedCommand, type ParticipantRequest,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
@@ -19,8 +19,8 @@ const definition = defineApplication({ id: 'network', version: '1', commands: {
 const closing: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of closing.splice(0).reverse()) await close() })
 async function fixture(options: { readerOnly?: boolean } = {}) {
-  const host = await createPeerIdentity(), a = await openApplicationDevice({ store: new MemoryPeerStore(), create: true }),
-    b = await openApplicationDevice({ store: new MemoryPeerStore(), create: true })
+  const host = await createPeerIdentity(), a = await openApplicationDevice({ store: new MemoryBytesStore(), create: true }),
+    b = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
   const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: 'cc'.repeat(32), historyId: 'network',
@@ -31,7 +31,7 @@ async function fixture(options: { readerOnly?: boolean } = {}) {
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: [controlParticipantGrant(host.publicKey), participantGrant(a.identity.publicKey, { dataRole: 'admin' }),
       { ...participantGrant(b.identity.publicKey), ...(options.readerOnly === true ? { writer: false, coordinator: false, recovery: false } : {}) }] }, host)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
     profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
     coordinator: a.identity.publicKey, requester: a.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, a.identity))
@@ -131,7 +131,7 @@ describe('authenticated peer application connections', () => {
 
   it('keeps control ownership separate from reader and writer access', async () => {
     const f = await fixture({ readerOnly: true }), a = await f.open(f.a), b = await f.open(f.b)
-    const host = await f.open({ identity: f.host, storageId: 'control-only', store: new MemoryPeerStore(), close: async () => {} })
+    const host = await f.open({ identity: f.host, storageId: 'control-only', store: new MemoryBytesStore(), close: async () => {} })
     const [forbidden, unused] = createFramedPeerConnectionPair()
     await expect(host.connectPeer({ connection: forbidden, peerIdentity: a.deviceId })).rejects.toThrow('APPLICATION_PEER_NOT_AUTHORIZED')
     await unused.close()

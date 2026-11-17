@@ -2,7 +2,7 @@ import { expect, it } from 'vitest'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, participantGrant, peerDigest,
+  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryBytesStore, participantGrant, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, verifyAuthorityBundle,
   type OrderedCommand, type PeerIdentity, type PeerReplica, type PrefixProof,
 } from './index.js'
@@ -25,7 +25,7 @@ it.each([7, 29, 101, 997])('matches the independent prefix model across bounded 
   const choose = random(seed), model = new HistoryModel(), opened: PeerReplica[] = []
   const host = await createPeerIdentity(), identities = await Promise.all([0, 1, 2].map(() => createPeerIdentity()))
   const [a, b, c] = identities as [PeerIdentity, PeerIdentity, PeerIdentity]
-  const stores = identities.map(() => new MemoryPeerStore()), key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
+  const stores = identities.map(() => new MemoryBytesStore()), key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
   const artifacts = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: seed.toString(16).padStart(64, '0'), historyId: `model-${seed}`,
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: a.publicKey,
@@ -33,7 +33,7 @@ it.each([7, 29, 101, 997])('matches the independent prefix model across bounded 
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: identities.map(identity => participantGrant(identity.publicKey, { administrator: identity === a })) }, host)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   const request = (identity: PeerIdentity, expectedGeneration: string | null, base: PrefixProof | null, transitionId: string,
     controlRevision = 0, reason: 'create' | 'takeover' | 'control-change' = 'takeover') => signTransitionRequest({
     applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,

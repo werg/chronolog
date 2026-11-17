@@ -1,5 +1,5 @@
 import { assertCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, equalBytes, sha256, utf8 } from '@chronolog/canonical'
-import type { AtomicBytesStore } from './store.js'
+import type { BytesStore } from './bytes-store.js'
 
 export interface OpfsWriter {
   write(bytes: ArrayBuffer): Promise<void>
@@ -19,7 +19,7 @@ export interface OpfsDirectory {
  * writes leave the previous file visible. The envelope detects wrong keys and
  * damaged bytes. This store is local/private, never a peer export interface.
  */
-export class OpfsBytesStore implements AtomicBytesStore {
+export class OpfsBytesStore implements BytesStore {
   readonly #directory: OpfsDirectory
   #pending: Promise<unknown> = Promise.resolve()
   #closed = false

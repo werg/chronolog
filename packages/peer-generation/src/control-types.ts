@@ -118,8 +118,4 @@ export interface AuthorityBundle {
 }
 
 
-/** One exclusive durable owner; put is atomic and durable on acknowledgment. */
-export interface PeerStore {
-  get(key: string): Promise<Uint8Array | null>
-  put(key: string, value: Uint8Array): Promise<void>
-}
+export type { BytesStore } from '@chronolog/records'

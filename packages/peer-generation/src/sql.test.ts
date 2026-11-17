@@ -7,7 +7,7 @@ import {
 } from '@chronolog/materializer-doltlite'
 import { APPLICATION_COLLECTIVE_ID, emit, encodeChangeProgram, executionManifestArtifacts, program } from '@chronolog/protocol'
 import {
-  bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, peerDigest,
+  bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryBytesStore, peerDigest,
   signApplicationDescriptor, signApplicationSchema, signControlRevision, signTransitionRequest, verifyApplicationSchema,
   type PeerIdentity, type PeerReplica,
 } from './index.js'
@@ -29,10 +29,10 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
       revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
       grants: [controlParticipantGrant(host.publicKey), ...[a, b].map(identity => ({ publicKey: identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: identity === a,
         dataRole: identity === a ? 'admin' as const : 'member' as const }))] }, host)
-    const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+    const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
     await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       transitionId: 'initial', expectedGeneration: null, requester: a.publicKey, coordinator: a.publicKey, controlRevision: 0, reason: 'create', base: null }, a))
-    const open = async (identity: PeerIdentity, name: string, store = new MemoryPeerStore(), databaseName = name) => {
+    const open = async (identity: PeerIdentity, name: string, store = new MemoryBytesStore(), databaseName = name) => {
       const materializer = await DeterministicMaterializer.open({ path: join(directory, `${databaseName}.db`), executionManifest: manifest,
         rootAdministrator: hexToBytes(a.publicKey),
         bootstrapGroupId: hexToBytes(applicationId), bootstrapProgram: await verifyApplicationSchema(schema, descriptor.payload), checkpointEvery: 1 })

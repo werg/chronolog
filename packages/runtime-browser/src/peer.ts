@@ -11,7 +11,7 @@ import {
 } from '@chronolog/node-core/browser'
 import {
   PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner,
-  type AtomicBytesStore, type ChronologTransport,
+  type BytesStore, type ChronologTransport,
 } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService, type GovernanceRpcAdmin } from '@chronolog/rpc/browser'
 
@@ -25,7 +25,7 @@ import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'
 export interface BrowserPeerContext {
   /** Private keys stay in the owner Worker and its private OPFS store. */
   readonly identity: EnrollmentIdentity
-  readonly operations: AtomicBytesStore
+  readonly operations: BytesStore
   readonly transport: PortableFeedTransport
   readonly engine: LoadedBrowserEngine
 }

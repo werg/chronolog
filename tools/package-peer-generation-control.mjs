@@ -26,7 +26,7 @@ const version = `0.0.0-${source.slice(0, 8)}${changed ? '-dirty' : ''}`;
 for (const [name, entry] of Object.entries(entries)) {
   execFileSync('npm', ['exec', '--yes', '--package=dts-bundle-generator@9.5.1', '--package=typescript@5.8.3', '--',
     'dts-bundle-generator', '--project', join(root, 'tsconfig.base.json'), '--out-file', join(output, `${name}.d.ts`),
-    '--external-inlines', '@chronolog/canonical', '@chronolog/crypto', '@chronolog/protocol', '@chronolog/peer-generation', '--', entry],
+    '--external-inlines', '@chronolog/canonical', '@chronolog/crypto', '@chronolog/protocol', '@chronolog/peer-generation', '@chronolog/records', '--', entry],
   { cwd: root, stdio: 'inherit' });
   const declarations = await readFile(join(output, `${name}.d.ts`), 'utf8');
   if (/from\s+['"](?:node:|@chronolog\/)|reference\s+types=/u.test(declarations))

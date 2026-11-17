@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createFeedRecord, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from './feed-codec.js'
-import { DurableFeedStore, type AtomicBytesStore } from './store.js'
+import { DurableFeedStore } from './store.js'
+import type { BytesStore } from './bytes-store.js'
 import { payloadHash } from './payload.js'
 
 const directories: string[] = []
@@ -15,7 +16,7 @@ async function fixture() {
   const path = await mkdtemp(join(tmpdir(), 'chronolog-records-'))
   directories.push(path)
   let failManifest = false
-  const bytes: AtomicBytesStore = {
+  const bytes: BytesStore = {
     async get(key) {
       try { return new Uint8Array(await readFile(join(path, encodeURIComponent(key)))) } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null

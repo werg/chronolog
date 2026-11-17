@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant, peerDigest,
+  bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant, peerDigest,
   signApplicationDescriptor, signApplicationSchema, signControlRevision, signTransitionRequest,
 } from '@chronolog/peer-generation'
 import { bytesToHex, encodeChangeProgram, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -15,7 +15,7 @@ import type { ApplicationSession } from './session.js'
 
 it('claims the SQL session before opening a second materializer or disturbing an existing read lease', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'peer-sql-owner-'))
-  const device = await openApplicationDevice({ store: new MemoryPeerStore(), create: true })
+  const device = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
   let session: ApplicationSession | undefined
   try {
     const host = await createPeerIdentity(), key = crypto.getRandomValues(new Uint8Array(32))
@@ -31,7 +31,7 @@ it('claims the SQL session before opening a second materializer or disturbing an
     const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
       grants: [participantGrant(device.identity.publicKey, { administrator: true })] }, host)
-    const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+    const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
     await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
       transitionId: 'initial', expectedGeneration: null, requester: device.identity.publicKey, coordinator: device.identity.publicKey,
       controlRevision: 0, reason: 'create', base: null }, device.identity))

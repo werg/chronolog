@@ -1,3 +1,4 @@
+import type { BytesStore } from '@chronolog/records'
 import { DOMAINS } from '@chronolog/protocol'
 import {
   boundedText, check, isArray, decodePeerValue, encodePeerValue, hex, object, peerDigest,
@@ -6,8 +7,7 @@ import {
 import {
   PEER_GENERATION_POLICY, PEER_GENERATION_PROFILE,
   type ApplicationDescriptor, type AuthorityBundle, type ControlRevision, type GenerationRecord,
-  type HistoryPoint, type OrderReceipt, type PeerGrant, type PeerIdentity, type PeerStore,
-  type PrefixProof, type SignedApplicationDescriptor, type SignedControlRevision,
+  type HistoryPoint, type OrderReceipt, type PeerGrant, type PeerIdentity, type PrefixProof, type SignedApplicationDescriptor, type SignedControlRevision,
   type SignedGeneration, type SignedTransitionRequest, type TransitionRequest,
 } from './control-types.js'
 
@@ -266,8 +266,8 @@ export interface GenerationRegistry {
   read(): Promise<AuthorityBundle>
   select(request: SignedTransitionRequest, options?: { readonly control?: SignedControlRevision }): Promise<SignedGeneration>
 }
-const registryLocks = new WeakMap<PeerStore, Map<string, Serial>>()
-function registryLock(store: PeerStore, key: string): Serial {
+const registryLocks = new WeakMap<BytesStore, Map<string, Serial>>()
+function registryLock(store: BytesStore, key: string): Serial {
   let keys = registryLocks.get(store)
   if (keys === undefined) { keys = new Map(); registryLocks.set(store, keys) }
   let lock = keys.get(key)
@@ -276,7 +276,7 @@ function registryLock(store: PeerStore, key: string): Serial {
 }
 /** The host owns an exclusive durable store; no command body is accepted by this service. */
 export async function createGenerationRegistry(options: {
-  readonly store: PeerStore
+  readonly store: BytesStore
   readonly descriptor: SignedApplicationDescriptor
   readonly controls: readonly SignedControlRevision[]
   readonly signer: PeerIdentity

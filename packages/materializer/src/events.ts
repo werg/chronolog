@@ -1,3 +1,4 @@
+import type { BytesStore } from '@chronolog/records'
 import { bytesToHex, sha256 } from '@chronolog/canonical'
 import {
   assertValidChangeProgram, createExecutionManifest,
@@ -10,8 +11,8 @@ import {
   type MaterializedApplicationSnapshot, type MaterializedRevisionSnapshot, type MaterializedTransactionOutcome,
 } from './runtime.js'
 
-import { EventHistoryStore, type EventExecutionStore, type EventHistoryState } from './event-store.js'
-export type { EventExecutionStore } from './event-store.js'
+import { EventHistoryStore, type EventHistoryState } from './event-store.js'
+export type { BytesStore } from '@chronolog/records'
 
 /** A pinned SQL-absent execution profile; importing it never loads an SQL engine. */
 export async function eventExecutionManifest() {
@@ -23,7 +24,7 @@ export async function eventExecutionManifest() {
 }
 
 export async function createEventMaterializationRuntime(options: {
-  readonly store: EventExecutionStore
+  readonly store: BytesStore
   readonly namespace: string
   readonly maxHistoryBytes?: number
 }): Promise<ChronologMaterializationRuntime> {

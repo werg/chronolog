@@ -17,7 +17,7 @@ import {
 import { encodeEnvelope, generateEd25519KeyPair, type EnvelopeMessageType } from '@chronolog/protocol'
 import {
   connectInProcess, DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner,
-  type AtomicBytesStore,
+  type BytesStore,
 } from '@chronolog/records'
 
 import { authorizeThroughRecordLog, createCertificateFetcher, withTendrillerFinality, type FinalityHttp } from './finality-service.js'
@@ -33,7 +33,7 @@ afterEach(async () => {
   vi.useRealTimers()
   for (const close of closers.splice(0).reverse()) await close()
 })
-function storage(): AtomicBytesStore {
+function storage(): BytesStore {
   const values = new Map<string, Uint8Array>()
   return { get: async (key) => values.get(key)?.slice() ?? null, put: async (key, bytes) => { values.set(key, bytes.slice()) } }
 }

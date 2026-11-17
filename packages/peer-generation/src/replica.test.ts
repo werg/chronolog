@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, peerDigest,
+  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryBytesStore, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
-  type AuthorityBundle, type PeerIdentity, type PeerReplica, type PeerStore, type PrefixProof,
+  type AuthorityBundle, type PeerIdentity, type PeerReplica, type BytesStore, type PrefixProof,
 } from './index.js'
 import { bytesToHex, encodePeerValue, signPeerValue } from './codec.js'
 
@@ -21,7 +21,7 @@ async function fixture() {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: [a, b, c].map(identity => ({ publicKey: identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: identity === a, dataRole: 'member' as const })) }, host)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   const select = async (who: PeerIdentity, base: PrefixProof | null, id: string) => {
     const authority = await registry.read()
     return registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
@@ -30,7 +30,7 @@ async function fixture() {
       requester: who.publicKey, controlRevision: 0, reason: base === null ? 'create' : 'takeover', base }, who))
   }
   await select(a, null, 'initial')
-  const open = async (identity: PeerIdentity, store: PeerStore = new MemoryPeerStore(), authority?: AuthorityBundle, storageId = identity.publicKey) => {
+  const open = async (identity: PeerIdentity, store: BytesStore = new MemoryBytesStore(), authority?: AuthorityBundle, storageId = identity.publicKey) => {
     const materializer = await createEventMaterializationRuntime({ store, namespace: 'test' })
     const peer = await createPeerReplica({ authority: authority ?? await registry.read(), device: identity, store, storageId, materializer, epochKeys: keys })
     opened.push(peer); return peer
@@ -96,9 +96,9 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect(before).not.toContain(two.id); expect(before).toContain(reapplied.id)
   })
   it('reopens a locally committed receipt after its acknowledgment is lost', async () => {
-    const f = await fixture(), retained = new MemoryPeerStore()
+    const f = await fixture(), retained = new MemoryBytesStore()
     let fail = false
-    const store: PeerStore = { get: key => retained.get(key), async put(key, value) { await retained.put(key, value); if (fail && key.includes('/head/')) { fail = false; throw new Error('LOST_STORAGE_ACK') } } }
+    const store: BytesStore = { get: key => retained.get(key), async put(key, value) { await retained.put(key, value); if (fail && key.includes('/head/')) { fail = false; throw new Error('LOST_STORAGE_ACK') } } }
     const a = await f.open(f.a, store), attempt = await a.prepare({ operationId: 'once', program: event('once') })
     fail = true
     await expect(a.order(attempt)).rejects.toThrow('LOST_STORAGE_ACK')
@@ -111,7 +111,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect(await reopened.exportCommands()).toHaveLength(1)
   })
   it('durably fences learned restrictive controls while the replacement prefix is incomplete', async () => {
-    const f = await fixture(), oldAuthority = await f.registry.read(), retained = new MemoryPeerStore()
+    const f = await fixture(), oldAuthority = await f.registry.read(), retained = new MemoryBytesStore()
     const a = await f.open(f.a), b = await f.open(f.b); let c = await f.open(f.c, retained)
     for (let index = 0; index < 3; index++) await a.order(await a.prepare({ operationId: `before-${index}`, program: event(`before-${index}`) }))
     await b.ingest(await a.exportCommands()); await c.ingest(await a.exportCommands({ limit: 1 }))
@@ -223,7 +223,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect(a.shared()).toHaveLength(0)
   })
   it('persists an incomplete selection and its abandoned-operation recovery across reopen', async () => {
-    const f = await fixture(), store = new MemoryPeerStore(), a = await f.open(f.a, store), b = await f.open(f.b)
+    const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store), b = await f.open(f.b)
     const inherited = await a.prepare({ operationId: 'inherited', program: event('inherited') })
     await a.order(inherited); await b.ingest(await a.exportCommands())
     const tail = await a.prepare({ operationId: 'tail', program: event('tail') })
@@ -270,9 +270,9 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect(await b.exportCommands({ after: empty.point, limit: 1 })).toEqual([command])
   })
   it('does not duplicate a durable recovery notice after its storage acknowledgement is lost', async () => {
-    const f = await fixture(), durable = new MemoryPeerStore()
+    const f = await fixture(), durable = new MemoryBytesStore()
     let loseAck = false
-    const store: PeerStore = { get: key => durable.get(key), async put(key, value) {
+    const store: BytesStore = { get: key => durable.get(key), async put(key, value) {
       await durable.put(key, value)
       if (loseAck && key.endsWith('/recoveries')) { loseAck = false; throw new Error('LOST_RECOVERY_ACK') }
     } }

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, executionManifestArtifacts } from '@chronolog/protocol'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, participantGrant, peerDigest,
+  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryBytesStore, participantGrant, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, type PeerReplica,
 } from '@chronolog/peer-generation'
 import { ApplicationContent, CONTENT_CHUNK_BYTES, type ContentReference } from './content.js'
@@ -19,11 +19,11 @@ async function fixture() {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: [participantGrant(a.publicKey, { administrator: true }), participantGrant(b.publicKey)] }, host)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null, coordinator: a.publicKey,
     requester: a.publicKey, controlRevision: 0, reason: 'create', base: null }, a))
-  const stores = [new MemoryPeerStore(), new MemoryPeerStore()]
+  const stores = [new MemoryBytesStore(), new MemoryBytesStore()]
   const opened = await Promise.all([a, b].map(async (device, index) => {
     const store = stores[index]!, materializer = await createEventMaterializationRuntime({ store, namespace: 'content' })
     const peer = await createPeerReplica({ authority: await registry.read(), device, store, storageId: device.publicKey, materializer, epochKeys: keys })

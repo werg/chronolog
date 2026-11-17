@@ -2,9 +2,9 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { frameLivePeerStream, framePeerStream } from '@chronolog/agent-service/framing'
+import { frameLivePeerStream, framePeerStream } from '@chronolog/records'
 import { eventExecutionManifest } from '@chronolog/materializer'
-import { bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant,
+import { bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
   decodePeerValue, encodePeerValue, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest, type HistoryPoint, type PeerIdentity, type PrefixProof, type ParticipantRequest } from '@chronolog/peer-generation'
 import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program } from '@chronolog/protocol'
 import type { FramedPeerConnection } from '@chronolog/records'
@@ -34,7 +34,7 @@ async function fixture(initialMembers = [0, 1, 2]) {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: devices.filter((_device, index) => initialMembers.includes(index)).map((device, index) => participantGrant(device.identity.publicKey, { administrator: index === 0 })) }, host)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   const select = async (identity: PeerIdentity, base: PrefixProof | null, transitionId: string) => {
     const bundle = await registry.read()
     return registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,

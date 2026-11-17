@@ -6,3 +6,6 @@ export * from './transport.js'
 export * from './payload.js'
 
 export type * from './connection.js'
+
+export * from './bytes-store.js'
+export * from './stream.js'

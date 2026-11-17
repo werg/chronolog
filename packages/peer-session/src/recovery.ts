@@ -1,6 +1,7 @@
+import type { BytesStore } from '@chronolog/records'
 import {
   decodePeerValue, encodePeerValue, signTransitionRequest, verifyAuthorityBundle,
-  type AuthorityBundle, type PeerReplica, type PeerStore, type RecoveryNotice,
+  type AuthorityBundle, type PeerReplica, type RecoveryNotice,
   type SignedGeneration, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
 import { awaitOwnedTask } from './lifetime.js'
@@ -36,13 +37,13 @@ export interface ApplicationTransition {
 /** Exact transition retries use the same durable device journal as ordinary work. */
 export class ApplicationRecovery {
   readonly #replica: PeerReplica
-  readonly #store: PeerStore
+  readonly #store: BytesStore
   readonly #signal: AbortSignal
   readonly #lifetime = new AbortController()
   readonly #key: string
   #tail: Promise<unknown> = Promise.resolve()
 
-  constructor(options: { readonly replica: PeerReplica; readonly store: PeerStore; readonly signal: AbortSignal }) {
+  constructor(options: { readonly replica: PeerReplica; readonly store: BytesStore; readonly signal: AbortSignal }) {
     this.#replica = options.replica; this.#store = options.store; this.#signal = AbortSignal.any([options.signal, this.#lifetime.signal])
     this.#key = `peer-session/transitions/v1/${options.replica.descriptor.applicationId}`
   }

@@ -6,7 +6,7 @@ import {
   type AuthorityBundle, type OrderReceipt, type PeerIdentity, type PrefixProof, type SignedGeneration,
 } from './control.js'
 import { signPeerValue } from './codec.js'
-import { MemoryPeerStore } from './memory.js'
+import { MemoryBytesStore } from '@chronolog/records'
 
 const digest = '11'.repeat(32)
 async function fixture() {
@@ -18,7 +18,7 @@ async function fixture() {
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: digest, recoveryFloor: null,
     grants: [a, b, c, writer].map(key => ({ publicKey: key.publicKey, reader: true, writer: true,
       coordinator: key !== writer, recovery: key !== writer, administrator: key === a, dataRole: 'member' as const })) }, host)
-  const store = new MemoryPeerStore()
+  const store = new MemoryBytesStore()
   const registry = await createGenerationRegistry({ store, descriptor, controls: [control], signer: host })
   const transition = async (who: PeerIdentity, coordinator: PeerIdentity, expected: string | null, base: PrefixProof | null, id: string, reason: 'create' | 'takeover' | 'control-change' = 'takeover', revision = 0) => signTransitionRequest({
     applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
@@ -52,7 +52,7 @@ describe('portable peer generation authority', () => {
     const control = await signControlRevision({ ...f.control.payload,
       grants: [controlParticipantGrant(f.host.publicKey), participantGrant(f.a.publicKey), participantGrant(f.b.publicKey)],
     }, f.host)
-    const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor: f.descriptor, controls: [control], signer: f.host })
+    const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor: f.descriptor, controls: [control], signer: f.host })
     const first = await registry.select(f.request)
     const head = (await receipts(first, f.a, 1))[0]!
     const next = await registry.select(await f.transition(f.host, f.b, first.id, proof(head), 'owner-recovery'))
@@ -126,6 +126,6 @@ describe('portable peer generation authority', () => {
   })
   it('refuses to recreate lost established control state', async () => {
     const f = await fixture()
-    await expect(createGenerationRegistry({ store: new MemoryPeerStore(), descriptor: f.descriptor, controls: [f.control], signer: f.host, requireExisting: true })).rejects.toThrow('PEER_CONTROL_STATE_MISSING')
+    await expect(createGenerationRegistry({ store: new MemoryBytesStore(), descriptor: f.descriptor, controls: [f.control], signer: f.host, requireExisting: true })).rejects.toThrow('PEER_CONTROL_STATE_MISSING')
   })
 })

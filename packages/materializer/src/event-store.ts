@@ -1,11 +1,8 @@
+import type { BytesStore } from '@chronolog/records'
 import { bytesToHex, hexToBytes, sha256 } from '@chronolog/canonical'
 import { assertCanonicalCbor, decodeTransactionCore, encodeCanonicalCbor, equalBytes } from '@chronolog/protocol'
 import type { ReplayProposal } from './types.js'
 
-export interface EventExecutionStore {
-  get(key: string): Promise<Uint8Array | null>
-  put(key: string, value: Uint8Array): Promise<void>
-}
 export interface EventHistoryState {
   readonly order: readonly ReplayProposal[]
   readonly revision: bigint
@@ -17,7 +14,7 @@ export interface EventHistoryState {
 export class EventHistoryStore {
   #anchors: string[] = []
   #prefixBytes: number[] = []
-  constructor(readonly store: EventExecutionStore, readonly key: string, readonly digest: Uint8Array, readonly quota: number) {}
+  constructor(readonly store: BytesStore, readonly key: string, readonly digest: Uint8Array, readonly quota: number) {}
 
   async load(): Promise<EventHistoryState | null> {
     const bytes = await this.store.get(this.key)

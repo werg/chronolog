@@ -1,11 +1,11 @@
 import { loadEnrollmentIdentity, loadOrCreateEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { encodeCanonicalCbor, equalBytes } from '@chronolog/protocol'
-import { DurableFeedStore, webFeedCrypto, type AtomicBytesStore } from '@chronolog/records'
+import { DurableFeedStore, webFeedCrypto, type BytesStore } from '@chronolog/records'
 
 import { acquireBrowserStorage } from '@chronolog/records/browser'
 
 /** Existing keys always require their feed. First setup persists an empty feed before keys. */
-export async function openBrowserDeviceRecords(bytes: AtomicBytesStore, createIdentity?: true) {
+export async function openBrowserDeviceRecords(bytes: BytesStore, createIdentity?: true) {
   let identity: EnrollmentIdentity | undefined
   try { identity = await loadEnrollmentIdentity(bytes, 'peer') }
   catch (error) {

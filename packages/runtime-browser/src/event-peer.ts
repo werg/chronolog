@@ -6,7 +6,7 @@ import {
   ChronologNode, createGovernedNode, createEnrollmentService,
   type ChronologNodeOptions, type EnrollmentIdentity, type GovernedNodeOptions,
 } from '@chronolog/node-core/browser'
-import { PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type AtomicBytesStore, type ChronologTransport } from '@chronolog/records'
+import { PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner, type BytesStore, type ChronologTransport } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService, type GovernanceRpcAdmin } from '@chronolog/rpc/browser'
 import { acquireBrowserStorage } from '@chronolog/records/browser'
 import { openBrowserDeviceRecords } from './device-records.js'
@@ -17,7 +17,7 @@ export { prepareBrowserIdentity } from './device-records.js'
 
 export interface BrowserEventPeerContext {
   readonly identity: EnrollmentIdentity
-  readonly operations: AtomicBytesStore
+  readonly operations: BytesStore
   readonly transport: PortableFeedTransport
   readonly executionManifestDigest: Uint8Array
 }

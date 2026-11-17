@@ -1,5 +1,6 @@
+import type { BytesStore } from '@chronolog/records'
 import {
-  bytesDigest, type PeerReplica, type PeerStore, type Signed,
+  bytesDigest, type PeerReplica, type Signed,
 } from '@chronolog/peer-generation'
 import { bytesToHex, canonicalJson, hexToBytes, importEd25519PublicKey, type EventPayload } from '@chronolog/protocol'
 import { awaitOwnedTask } from './lifetime.js'
@@ -63,7 +64,7 @@ export interface ContentUpload {
  */
 export class ApplicationContent {
   readonly #replica: PeerReplica
-  readonly #store: PeerStore
+  readonly #store: BytesStore
   readonly #storageId: string
   readonly #keys: ReadonlyMap<number, Uint8Array>
   readonly #acquireKey: ((epoch: number) => Promise<void>) | undefined
@@ -73,7 +74,7 @@ export class ApplicationContent {
   #pending: Promise<unknown> = Promise.resolve()
   #sourceRequests = 0
 
-  constructor(options: { readonly replica: PeerReplica; readonly store: PeerStore; readonly storageId: string; readonly epochKeys: ReadonlyMap<number, Uint8Array>; readonly acquireKey?: (epoch: number) => Promise<void> }) {
+  constructor(options: { readonly replica: PeerReplica; readonly store: BytesStore; readonly storageId: string; readonly epochKeys: ReadonlyMap<number, Uint8Array>; readonly acquireKey?: (epoch: number) => Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#storageId = options.storageId
     this.#keys = options.epochKeys
     this.#acquireKey = options.acquireKey

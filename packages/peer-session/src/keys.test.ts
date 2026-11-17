@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, participantGrant, peerDigest,
-  signApplicationDescriptor, signControlRevision, signTransitionRequest, type PeerReplica, type PeerStore,
+  bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryBytesStore, participantGrant, peerDigest,
+  signApplicationDescriptor, signControlRevision, signTransitionRequest, type PeerReplica, type BytesStore,
 } from '@chronolog/peer-generation'
 import { openApplicationDevice } from './device.js'
 import { ApplicationKeyring } from './keys.js'
@@ -11,7 +11,7 @@ import { ApplicationKeyring } from './keys.js'
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 async function fixture(options: { loseKeyReply?: boolean; beforeKeyRead?: () => Promise<void> } = {}) {
-  const host = await createPeerIdentity(), stores: PeerStore[] = [new MemoryPeerStore(), new MemoryPeerStore(), new MemoryPeerStore()]
+  const host = await createPeerIdentity(), stores: BytesStore[] = [new MemoryBytesStore(), new MemoryBytesStore(), new MemoryBytesStore()]
   let loseReply = options.loseKeyReply ?? false
   if (loseReply || options.beforeKeyRead !== undefined) {
     const saved = stores[1]!
@@ -31,7 +31,7 @@ async function fixture(options: { loseKeyReply?: boolean; beforeKeyRead?: () => 
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: devices.slice(0, 2).map((device, index) => participantGrant(device.identity.publicKey, { administrator: index === 0 })) }, host)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null, requester: devices[0]!.identity.publicKey,
     coordinator: devices[0]!.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, devices[0]!.identity))

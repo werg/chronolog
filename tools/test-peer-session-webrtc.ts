@@ -10,7 +10,7 @@ import { parseArgs } from 'node:util'
 
 import {
   applicationDefinitionDigest, bytesDigest, bytesToHex, controlParticipantGrant, createGenerationRegistry,
-  createPeerIdentity, eventExecutionManifest, executionManifestArtifacts, MemoryPeerStore, participantGrant,
+  createPeerIdentity, eventExecutionManifest, executionManifestArtifacts, MemoryBytesStore, participantGrant,
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
   type ApplicationDevice, type ApplicationPeerLink, type ApplicationSession,
 } from '@chronolog/peer-session'
@@ -120,7 +120,7 @@ try {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: [controlParticipantGrant(owner.publicKey), participantGrant(nativeDevice.identity.publicKey, { dataRole: 'admin' }), participantGrant(identity.publicKey)] }, owner)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: owner })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: owner })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     transitionId: 'initial', expectedGeneration: null, coordinator: nativeDevice.identity.publicKey, requester: nativeDevice.identity.publicKey,
     controlRevision: 0, reason: 'create', base: null }, nativeDevice.identity))

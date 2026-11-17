@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from './feed-codec.js'
-import { DurableFeedStore, type AtomicBytesStore } from './store.js'
+import { DurableFeedStore } from './store.js'
+import type { BytesStore } from './bytes-store.js'
 import { connectInProcess, PortableFeedTransport } from './transport.js'
 import { payloadHash } from './payload.js'
 
@@ -10,7 +11,7 @@ afterEach(async () => { await Promise.all(peers.splice(0).map((peer) => peer.clo
 
 async function peer(observeStore?: (store: DurableFeedStore) => void) {
   const values = new Map<string, Uint8Array>()
-  const bytes: AtomicBytesStore = {
+  const bytes: BytesStore = {
     get: async (key) => values.get(key)?.slice() ?? null,
     put: async (key, value) => { values.set(key, value.slice()) },
   }

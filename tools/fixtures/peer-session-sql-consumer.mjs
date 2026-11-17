@@ -5,7 +5,7 @@ import { webcrypto as crypto } from 'node:crypto';
 import {
   APPLICATION_COLLECTIVE_ID, bytesDigest, bytesToHex, connectApplications, controlParticipantGrant,
   createGenerationRegistry, createPeerIdentity, defineApplication, defineCommand, defineQuery, emit,
-  MemoryPeerStore, participantGrant, program, signApplicationDescriptor, signControlRevision, signTransitionRequest, sqlStatement,
+  MemoryBytesStore, participantGrant, program, signApplicationDescriptor, signControlRevision, signTransitionRequest, sqlStatement,
 } from '@chronolog/peer-session';
 import { openNativeDevice } from '@chronolog/peer-session/native';
 import { openNativeSqlApplication, prepareNativeSqlApplication } from '@chronolog/peer-session/sql-native';
@@ -34,7 +34,7 @@ try {
   const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: [controlParticipantGrant(host.publicKey), participantGrant(aDevice.identity.publicKey), participantGrant(bDevice.identity.publicKey)] }, host);
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host });
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host });
   await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     expectedGeneration: null, requester: aDevice.identity.publicKey, coordinator: aDevice.identity.publicKey,
     controlRevision: 0, base: null, reason: 'create', transitionId: 'initial' }, aDevice.identity));

@@ -18,7 +18,7 @@ import type { Ed25519KeyPair } from '@chronolog/protocol'
 import {
   connectInProcess, DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner,
 } from '@chronolog/records'
-import type { AtomicBytesStore } from '@chronolog/records'
+import type { BytesStore } from '@chronolog/records'
 import { InProcessRpcTransport, NodeRpcService } from '@chronolog/rpc'
 import { createRecordLogClient, decodeRecord, encodeRecord, RECORD_LOG_FORMAT, RECORD_LOG_LIMITS } from '@tendriller/core/records'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -30,7 +30,7 @@ import { TendrillerTransport } from './transport.js'
 const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 const bytes32 = (value: number) => new Uint8Array(32).fill(value)
-function storage(): AtomicBytesStore {
+function storage(): BytesStore {
   const values = new Map<string, Uint8Array>()
   return { get: async (key) => values.get(key)?.slice() ?? null, put: async (key, bytes) => { values.set(key, bytes.slice()) } }
 }

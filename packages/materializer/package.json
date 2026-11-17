@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
-    "@chronolog/protocol": "workspace:*"
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/records": "workspace:*"
   }
 }

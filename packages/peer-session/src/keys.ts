@@ -1,7 +1,8 @@
+import type { BytesStore } from '@chronolog/records'
 import { generateX25519KeyPair, hpkeOpenBase, hpkeSealBase } from '@chronolog/crypto'
 import {
   bytesDigest, decodePeerValue, encodePeerValue, peerDigest, verifyAuthorityBundle,
-  type AuthorityBundle, type PeerIdentity, type PeerReplica, type PeerStore, type Signed,
+  type AuthorityBundle, type PeerIdentity, type PeerReplica, type Signed,
 } from '@chronolog/peer-generation'
 import { bytesToHex, hexToBytes, importEd25519PublicKey } from '@chronolog/protocol'
 import type { ApplicationDevice } from './device.js'
@@ -30,7 +31,7 @@ interface KeySource { readonly offer: (request: ApplicationKeyRequest) => Promis
 /** Durable enrolled keys, with peer exchange independent of command retry and host storage. */
 export class ApplicationKeyring {
   readonly #identity: PeerIdentity
-  readonly #store: PeerStore
+  readonly #store: BytesStore
   readonly #key: string
   readonly #initial: AuthorityBundle
   readonly #keys = new Map<number, Uint8Array>()

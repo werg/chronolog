@@ -12,6 +12,7 @@
     "@chronolog/canonical": "workspace:*",
     "@chronolog/crypto": "workspace:*",
     "@chronolog/materializer": "workspace:*",
-    "@chronolog/protocol": "workspace:*"
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/records": "workspace:*"
   }
 }

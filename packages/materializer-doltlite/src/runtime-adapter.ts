@@ -61,13 +61,11 @@ export function createDoltLiteMaterializationRuntime(
     status: MaterializationPublicationResult['status'],
     publicationKey: string | null,
   ): MaterializationPublicationResult => ({ status, publicationKey, ...snapshot() })
+  const publishFinal = materializer.publishFinal?.bind(materializer)
 
   return {
     coordinator: {
-      async publishFinal(prefixLength, controls) {
-        if (materializer.publishFinal === undefined) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
-        await materializer.publishFinal(prefixLength, controls)
-      },
+      ...(publishFinal === undefined ? {} : { publishFinal }),
       async materialize(orderedTransactions, controls) {
         const revision = await materializer.materialize(orderedTransactions, controls)
         if (revision === null) return null

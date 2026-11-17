@@ -1,10 +1,11 @@
+import type { BytesStore } from '@chronolog/records'
 import { DOMAINS } from '@chronolog/protocol'
 import {
   boundedText, bytesDigest, check, decodePeerValue, encodePeerValue, hex, isArray, object,
   peerDigest, samePeerValue, Serial, signPeerValue, uint, verifyPeerValue,
 } from './codec.js'
 import { assertAuthorityExtension, verifyAuthorityBundle, type PeerAuthority } from './control.js'
-import { PEER_GENERATION_PROFILE, type AuthorityBundle, type PeerIdentity, type PeerStore, type Signed } from './control-types.js'
+import { PEER_GENERATION_PROFILE, type AuthorityBundle, type PeerIdentity, type Signed } from './control-types.js'
 
 export const PUBLICATION_LIMITS = Object.freeze({ files: 128, bytes: 8 * 1024 * 1024, manifestBytes: 256 * 1024,
   revisions: 256, historyBytes: 16 * 1024 * 1024 })
@@ -104,8 +105,8 @@ export interface PublicationRegistry {
   read(): Promise<readonly SignedPublication[]>
   publish(publication: SignedPublication): Promise<SignedPublication>
 }
-const locks = new WeakMap<PeerStore, Map<string, Serial>>()
-function publicationLock(store: PeerStore, key: string): Serial {
+const locks = new WeakMap<BytesStore, Map<string, Serial>>()
+function publicationLock(store: BytesStore, key: string): Serial {
   let keys = locks.get(store)
   if (keys === undefined) { keys = new Map(); locks.set(store, keys) }
   let lock = keys.get(key)
@@ -115,7 +116,7 @@ function publicationLock(store: PeerStore, key: string): Serial {
 
 /** An exclusive control store publishes occasional metadata atomically; asset storage is a transport concern. */
 export async function createPublicationRegistry(options: {
-  readonly store: PeerStore
+  readonly store: BytesStore
   readonly authority: () => Promise<AuthorityBundle>
   readonly requireExisting?: boolean
 }): Promise<PublicationRegistry> {

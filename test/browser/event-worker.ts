@@ -2,7 +2,7 @@ import { CheckpointStore } from '@chronolog/agent-service/workers'
 import { decodeSignedGenesis } from '@chronolog/capabilities'
 import { loadEnrollmentIdentity, type EnrollmentIdentity } from '@chronolog/node-core/browser'
 import { base64UrlToBytes, bytesToBase64Url, bytesToHex, utf8 } from '@chronolog/protocol'
-import { feedIdFromPublicKey, type AtomicBytesStore } from '@chronolog/records'
+import { feedIdFromPublicKey, type BytesStore } from '@chronolog/records'
 import { openBrowserEventPeer, prepareBrowserIdentity, serveBrowserEventPeer, type BrowserEventPeer } from '@chronolog/runtime-browser/events'
 
 import { acquireBrowserStorage } from '@chronolog/records/browser'
@@ -13,7 +13,7 @@ import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contra
 import { qualifyStorageQuota } from './storage-quota.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
-let peer: BrowserEventPeer | undefined, identity: EnrollmentIdentity | undefined, operations: AtomicBytesStore | undefined
+let peer: BrowserEventPeer | undefined, identity: EnrollmentIdentity | undefined, operations: BytesStore | undefined
 let name = ''
 let connection: Awaited<ReturnType<BrowserEventPeer['connectPeer']>> | undefined
 let bootstrap: BrowserEventBootstrap | undefined

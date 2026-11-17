@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant,
+  bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, type RecoveryNotice,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
@@ -24,8 +24,8 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 
 async function fixture(options: { readonly closeA?: () => Promise<void> } = {}) {
   const host = await createPeerIdentity()
-  const a = await openApplicationDevice({ store: new MemoryPeerStore(), create: true, ...(options.closeA === undefined ? {} : { close: options.closeA }) })
-  const b = await openApplicationDevice({ store: new MemoryPeerStore(), create: true })
+  const a = await openApplicationDevice({ store: new MemoryBytesStore(), create: true, ...(options.closeA === undefined ? {} : { close: options.closeA }) })
+  const b = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
   const execution = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '91'.repeat(32), historyId: 'worker-test',
@@ -37,7 +37,7 @@ async function fixture(options: { readonly closeA?: () => Promise<void> } = {}) 
     epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: [a, b].map(device => participantGrant(device.identity.publicKey, { administrator: true })),
   }, host)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
     profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
     requester: a.identity.publicKey, coordinator: a.identity.publicKey, controlRevision: 0, reason: 'create', base: null,

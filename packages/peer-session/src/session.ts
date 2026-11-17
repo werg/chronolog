@@ -1,8 +1,8 @@
+import type { BytesStore } from '@chronolog/records'
 import {
   PEER_GENERATION_CAPABILITIES, type PeerReplica, type PeerRevision, type AppliedResult,
   type OperationState, type AuthorityBundle, type RecoveryNotice, type SignedAttempt,
-  type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView, type PeerStore,
-} from '@chronolog/peer-generation'
+  type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView, } from '@chronolog/peer-generation'
 import {
   bytesToHex, hexToBytes, decodeTransactionCore, isEmitStep,
   type EventPayload,
@@ -100,7 +100,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     wait(operationId: string, options?: { readonly signal?: AbortSignal }): Promise<AppliedResult>
   }
   readonly #replica: PeerReplica
-  readonly #store: PeerStore
+  readonly #store: BytesStore
   readonly #definition: D
   readonly #peers = new Map<string, PeerEndpoint>()
   readonly #lifetime = new AbortController()
@@ -116,7 +116,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #closeTask: Promise<void> | undefined
   #control: ApplicationControlParticipant | undefined
 
-  constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: PeerStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void> }) {
+  constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: BytesStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#definition = options.definition; this.#closing = options.close
     const replica = this.#replica
     const signals = new SignalChannel({ scope: replica.descriptor.applicationId,
@@ -340,7 +340,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 }
 
 export async function openApplication<const D extends ApplicationDefinition>(options: {
-  readonly replica: PeerReplica; readonly definition: D; readonly store: PeerStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void>
+  readonly replica: PeerReplica; readonly definition: D; readonly store: BytesStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void>
 }): Promise<ApplicationSession<D>> {
   if (await applicationDefinitionDigest(options.definition) !== options.replica.descriptor.definitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
   const session = new ApplicationSession(options)

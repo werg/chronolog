@@ -1,3 +1,4 @@
+import type { BytesStore } from '@chronolog/records'
 import {
   DOMAINS, encodeChangeProgram, encodeTransactionCore, transactionDigest,
   type TransactionCore,
@@ -12,7 +13,7 @@ import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, vali
 import { PEER_MAX_RECORDS, PEER_MAX_HISTORY_BYTES } from './control-types.js'
 import type {
   AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, HistoryReceiveResult, OperationState, OrderedCommand,
-  PeerGrant, PeerReplica, PeerReplicaOptions, PeerRevision, PeerStore, PrefixProof, PrepareCommand,
+  PeerGrant, PeerReplica, PeerReplicaOptions, PeerRevision, PrefixProof, PrepareCommand,
   RecoveryNotice, SignedAttempt, SignedGeneration, SignedRetainedCoverage,
 } from './types.js'
 
@@ -24,7 +25,7 @@ interface PendingRecovery {
   readonly knownAttemptId: string | null
 }
 interface StoredSelection { readonly authority: AuthorityBundle; readonly recovery: PendingRecovery | null }
-const activeOwners = new WeakMap<PeerStore, Set<string>>()
+const activeOwners = new WeakMap<BytesStore, Set<string>>()
 const operationKey = (author: string, operationId: string): string => `${author}\u0000${operationId}`
 
 /** One durable history/journal owner shared by browser and native sessions. */

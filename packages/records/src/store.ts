@@ -1,3 +1,4 @@
+import type { BytesStore } from './bytes-store.js'
 import { assertCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, type CborValue } from '@chronolog/canonical'
 
 import { feedRecordId, type FeedCrypto, type FeedRecord, verifyFeedRecord } from './feed-codec.js'
@@ -5,12 +6,6 @@ import type { ImmutableEvidence, TransportRecord } from './types.js'
 import { payloadHash, validatePayloadHash, verifyPayloadHash } from './payload.js'
 
 export type Awaitable<T> = T | Promise<T>
-
-/** Private local state, never part of peer replication. Resolve put only after durable replacement. */
-export interface AtomicBytesStore {
-  get(key: string): Promise<Uint8Array | null>
-  put(key: string, bytes: Uint8Array): Promise<void>
-}
 
 export type FeedAppendResult =
   | { readonly kind: 'appended'; readonly record: TransportRecord }
@@ -60,7 +55,7 @@ interface StoredRecord { readonly record: FeedRecord; readonly receivedAtMs: num
  * Each runtime must hold exclusive ownership of the backing bytes store.
  */
 export class DurableFeedStore implements FeedStorePort {
-  readonly #bytes: AtomicBytesStore
+  readonly #bytes: BytesStore
   readonly #crypto: FeedCrypto
   readonly #records: StoredRecord[] = []
   readonly #forks: StoredRecord[] = []
@@ -74,16 +69,16 @@ export class DurableFeedStore implements FeedStorePort {
   #writeFailed = false
   #writeFailure: unknown
 
-  private constructor(bytes: AtomicBytesStore, crypto: FeedCrypto) { this.#bytes = bytes; this.#crypto = crypto }
+  private constructor(bytes: BytesStore, crypto: FeedCrypto) { this.#bytes = bytes; this.#crypto = crypto }
 
   /** Explicit first setup; durable empty history precedes creation of its signer. */
-  static async create(bytes: AtomicBytesStore, crypto: FeedCrypto): Promise<DurableFeedStore> {
+  static async create(bytes: BytesStore, crypto: FeedCrypto): Promise<DurableFeedStore> {
     if (await bytes.get('feed/manifest') !== null) throw new Error('FEED_STORE_ALREADY_EXISTS')
     await bytes.put('feed/manifest', encodeCanonicalCbor([1n, [], [], []]))
     return new DurableFeedStore(bytes, crypto)
   }
 
-  static async open(bytes: AtomicBytesStore, crypto: FeedCrypto): Promise<DurableFeedStore> {
+  static async open(bytes: BytesStore, crypto: FeedCrypto): Promise<DurableFeedStore> {
     const store = new DurableFeedStore(bytes, crypto)
     const manifest = await bytes.get('feed/manifest')
     if (manifest === null) return store

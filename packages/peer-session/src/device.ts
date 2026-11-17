@@ -1,10 +1,11 @@
-import { createPeerIdentity, type PeerIdentity, type PeerStore } from '@chronolog/peer-generation'
+import type { BytesStore } from '@chronolog/records'
+import { createPeerIdentity, type PeerIdentity, } from '@chronolog/peer-generation'
 import { assertCanonicalCbor, encodeCanonicalCbor, exportEd25519PrivateKey, hexToBytes, importEd25519PrivateKey, importEd25519PublicKey } from '@chronolog/protocol'
 
 export interface ApplicationDevice {
   readonly identity: PeerIdentity
   readonly storageId: string
-  readonly store: PeerStore
+  readonly store: BytesStore
   close(): void | Promise<void>
 }
 const DEVICE_KEY = 'peer-session/device/v1'
@@ -13,7 +14,7 @@ const claimed = new WeakSet<ApplicationDevice>()
 
 /** Explicit setup can create once. Resume never replaces a missing or inconsistent signer. */
 export async function openApplicationDevice(options: {
-  readonly store: PeerStore
+  readonly store: BytesStore
   readonly create?: true
   readonly close?: () => void | Promise<void>
 }): Promise<ApplicationDevice> {

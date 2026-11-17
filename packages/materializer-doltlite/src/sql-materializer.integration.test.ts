@@ -237,7 +237,7 @@ describe('replicated SQL materialization', () => {
     await materializer.materialize([create, insert])
     expect(materializer.outcome(create.txId)?.outcome).toBe('accepted')
     expect(materializer.outcome(insert.txId)?.outcome).toBe('accepted')
-    expect(rows(materializer, 'SELECT id FROM ordered')).toEqual([[{ kind: 'integer', value: '1' }]])
+    expect(rows(materializer, 'SELECT id FROM ordered')).toEqual([['1']])
     expect([create.core.authorTimestampMs, insert.core.authorTimestampMs]).toEqual([50n, 1n])
     await materializer.materialize([insert, create])
     expect(materializer.outcome(insert.txId)?.outcome).toBe('rejected')

@@ -306,6 +306,9 @@ importers:
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
 
   packages/materializer-doltlite:
     dependencies:
@@ -371,6 +374,9 @@ importers:
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
 
   packages/peer-session:
     dependencies:

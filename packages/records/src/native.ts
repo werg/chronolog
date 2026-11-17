@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import type { AtomicBytesStore } from './store.js'
+import type { BytesStore } from './bytes-store.js'
 
 export interface NativeBytesStoreOptions {
   readonly quotaBytes?: number
@@ -11,11 +11,11 @@ export interface NativeBytesStoreOptions {
 
 /**
  * One native storage owner for records, authority state, outboxes and local
- * consumer checkpoints. This implements the same atomic bytes port used by
- * DurableFeedStore. SQLite holds the exclusive writer fence until close (also
+ * consumer checkpoints. Each durable atomic key replacement shares the
+ * same BytesStore contract. SQLite holds the exclusive writer fence until close (also
  * across processes); a process crash releases it without a stale lock file.
  */
-export class NativeBytesStore implements AtomicBytesStore {
+export class NativeBytesStore implements BytesStore {
   readonly #database: DatabaseSync
   readonly #quotaBytes: number
   readonly #maxValueBytes: number
@@ -32,8 +32,8 @@ export class NativeBytesStore implements AtomicBytesStore {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
     this.#database = new DatabaseSync(path)
     try {
-      // Match the native FeedStore durability/fencing contract. In WAL mode an
-      // exclusive connection retains its file lock after the initial commit.
+      // In WAL mode an exclusive connection retains its file lock after the
+      // initial commit, fencing every process until the owner closes.
       this.#database.exec('PRAGMA busy_timeout = 0')
       this.#database.exec('PRAGMA locking_mode = EXCLUSIVE')
       this.#database.exec('PRAGMA journal_mode = WAL')

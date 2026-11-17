@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createParticipantResponse, createPeerIdentity, createPublicationRegistry,
-  MemoryPeerStore, participantGrant, signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  MemoryBytesStore, participantGrant, signApplicationDescriptor, signControlRevision, signTransitionRequest,
   type AuthorityBundle, type ParticipantRequest, type SignedPublication, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
@@ -18,7 +18,7 @@ const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 async function fixture() {
-  const signer = await createPeerIdentity(), stores = [new MemoryPeerStore(), new MemoryPeerStore()]
+  const signer = await createPeerIdentity(), stores = [new MemoryBytesStore(), new MemoryBytesStore()]
   const devices = await Promise.all(stores.map(store => openApplicationDevice({ store, create: true })))
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
   const manifest = await executionManifestArtifacts(await eventExecutionManifest())
@@ -29,11 +29,11 @@ async function fixture() {
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: devices.map(device => participantGrant(device.identity.publicKey, { administrator: true })) }, signer)
-  const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer })
+  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null, coordinator: devices[0]!.identity.publicKey,
     requester: devices[0]!.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, devices[0]!.identity))
-  const publications = await createPublicationRegistry({ store: new MemoryPeerStore(), authority: () => registry.read() })
+  const publications = await createPublicationRegistry({ store: new MemoryBytesStore(), authority: () => registry.read() })
   const traffic: ParticipantRequest[] = []
   const faults: { offline?: boolean; losePublication?: boolean; stalePublication?: SignedPublication; staleAuthority?: AuthorityBundle } = {}
   const exchange = async (request: ParticipantRequest) => {
