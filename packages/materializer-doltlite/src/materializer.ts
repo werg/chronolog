@@ -470,6 +470,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     if (this.#materializing) throw new Error('MATERIALIZER_REENTRANT_CALL')
     this.#materializing = true
     let replayBranch: string | null = null
+    let replayBaseRef: string | null = null
+    let replayCommitted = false
     let reader: DatabaseLike | null = null
     try {
       const prefix = this.#log.slice(0, prefixLength)
@@ -484,17 +486,27 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       } else {
         const checkpoint = this.#checkpointAtOrBefore(prefixLength)
         if (checkpoint === null) throw new Error('MATERIALIZER_GENESIS_CHECKPOINT_MISSING')
-        replayBranch = createReplayBranch(this.#writer, this.revision, checkpoint.doltCommitHash)
+        // A published final prefix is an immutable verified replay base. During
+        // catch-up the local view can be far ahead of finality; rebuilding each
+        // successive final prefix from an older checkpoint repeats settled SQL.
+        const base = this.#finalPublished.prefixLength >= checkpoint.prefixLength ? this.#finalPublished : checkpoint
+        replayBaseRef = base.doltCommitHash
+        replayBranch = createReplayBranch(this.#writer, this.revision, replayBaseRef)
         this.#writer.doltCheckout(replayBranch)
         verifyDatabaseState(this.#writer, this.#expected)
-        for (let index = checkpoint.prefixLength; index < prefixLength; index += 1) {
+        const baseLog = readSystemLog(this.#writer)
+        verifyReplayBase(baseLog, transactions, base.prefixLength)
+        verifyFinalPrefix(this.#finalLog, baseLog)
+        for (let index = base.prefixLength; index < prefixLength; index += 1) {
           const transaction = transactions[index]!
           if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, peerControlFor(controls, transaction))
           this.#applyTransaction(transaction, index)
         }
         if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, controls.revisions[controls.currentRevision]!)
         verifyFinalPrefix(prefix, readSystemLog(this.#writer))
-        commitHash = this.#writer.doltCommit(`chronolog final prefix ${prefixLength}`)
+        commitHash = this.#writer.prepare('SELECT * FROM dolt_status').all().length === 0
+          ? replayBaseRef : this.#writer.doltCommit(`chronolog final prefix ${prefixLength}`)
+        replayCommitted = true
       }
       // Read and validate the exact SQL commit before publishing its final ref.
       const temporary = replayBranch ?? this.#published.branchRef
@@ -513,11 +525,17 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       this.#finalLog = log
       oldReader.close()
     } finally {
-      reader?.close()
-      rollbackIfActive(this.#writer)
-      this.#writer.doltCheckout(HEAD_BRANCH)
-      if (replayBranch !== null) removeBranchIfPresent(this.#writer, replayBranch)
-      this.#materializing = false
+      try {
+        reader?.close()
+        rollbackIfActive(this.#writer)
+        // Successful SQL transactions can precede a failed candidate commit.
+        // Discard that private working set before returning to the local head.
+        if (!replayCommitted && replayBaseRef !== null && this.#writer.doltActiveBranch() === replayBranch) {
+          this.#writer.doltResetHard(replayBaseRef)
+        }
+        this.#writer.doltCheckout(HEAD_BRANCH)
+        if (replayBranch !== null) removeBranchIfPresent(this.#writer, replayBranch)
+      } finally { this.#materializing = false }
     }
   }
 
