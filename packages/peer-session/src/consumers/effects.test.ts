@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { defineApplication, defineCommand } from '../definition.js'
 import { ApplicationEffectUncertainError, ApplicationEffectWorker, type ApplicationEffectOptions } from './effects.js'
+import type { ApplicationConsumerSession } from './source.js'
 import { consumerSqlFixture } from './sql-test-support.js'
 import { consumerFixture, publish } from './test-support.js'
 
@@ -21,6 +22,16 @@ async function setup() {
 }
 
 describe('retained application effects', () => {
+  it('rejects a facade snapshot before touching the external dispatch journal', async () => {
+    const f = await setup(); let accesses = 0
+    const facade: ApplicationConsumerSession = { applicationId: f.a.applicationId, historyId: f.a.historyId, revision: f.a.revision, signal: f.a.signal,
+      readView: () => f.a.readView(), changes: options => f.a.changes(options), operations: f.a.operations }
+    const store: PeerStore = { async get() { accesses++; return null }, async put() { accesses++ } }
+    // @ts-expect-error A structural page facade is not the owner of current state.
+    await expect(ApplicationEffectWorker.open({ ...f.options, session: facade, store })).rejects.toThrow('APPLICATION_EFFECT_OWNER_REQUIRED')
+    expect(accesses).toBe(0); expect(f.calls).toEqual([])
+  })
+
   it.each(['authorization', 'dispatch journal'] as const)('rechecks SQL permission after awaiting %s in the same generation', async boundary => {
     const f = await consumerSqlFixture(defineApplication({ id: 'effect-permission', version: '1',
       schema: program('CREATE TABLE permission (id INTEGER PRIMARY KEY, allowed INTEGER NOT NULL)', 'INSERT INTO permission(id,allowed) VALUES(1,1)'),

@@ -1,7 +1,8 @@
 import { peerDigest, type PeerRevision } from '@chronolog/peer-generation'
 import { canonicalEventPayload, type EventPayload } from '@chronolog/protocol'
 
-import type { ApplicationEvent } from '../session.js'
+import type { ApplicationEvent, ApplicationSession } from '../session.js'
+import { sessionInternals } from '../internals.js'
 import { ConsumerJournal, assertCurrent, assertCurrentHead, bounded, clonePayload, consumerId, event, readBatch, record, revision, sameSelection, selected, topics,
   type ApplicationConsumerOperation, type ApplicationConsumerOptions, type ApplicationConsumerView } from './source.js'
 
@@ -32,6 +33,8 @@ export interface ApplicationEffectEntry {
   readonly publications: readonly ApplicationEffectPublication[]
 }
 export interface ApplicationEffectOptions extends ApplicationConsumerOptions {
+  /** External dispatch runs beside the owner; a remote facade has a lagging revision snapshot. */
+  readonly session: ApplicationSession
   readonly topics: readonly string[]
   /** Explicit business identity across reapplication; scoped to the verified original author. */
   readonly intentKey?: (event: ApplicationEvent) => string
@@ -71,6 +74,7 @@ export class ApplicationEffectWorker {
   #running = false
 
   private constructor(options: ApplicationEffectOptions) {
+    if (!sessionInternals.has(options.session)) throw new Error('APPLICATION_EFFECT_OWNER_REQUIRED')
     this.#options = options; this.#topics = topics(options.topics)!
     this.#maximum = bounded(options.maxEntries ?? 1024, 1, 16_384)
     this.#limit = bounded(options.batchTransactions ?? 8, 1, 64)
@@ -167,7 +171,7 @@ export class ApplicationEffectWorker {
       batch = await readBatch(view, { topics: this.#topics, limit: this.#limit,
         ...(state.cursor === null || reset ? {} : { cursor: state.cursor }) })
       assertCurrent(this.#options.session, view)
-    } finally { await view.release() }
+    } finally { view.release() }
     let handled = 0
     for (const value of batch.events) {
       signal.throwIfAborted()
@@ -209,7 +213,7 @@ export class ApplicationEffectWorker {
         authorized = await this.#provider(entry, signal, async context => this.#options.authorize({ event: structuredClone(current), view, signal: context.signal }))
       }
       signal.throwIfAborted(); assertCurrentHead(this.#options.session, view)
-    } finally { await view.release() }
+    } finally { view.release() }
     if (selectedEvent === undefined || !authorized) {
       if (entry.stage === 'dispatching') throw new ApplicationEffectUncertainError(entry.effectId)
       const denied: ApplicationEffectEntry = { ...entry, stage: 'denied', reason: selectedEvent === undefined ? 'abandoned' : 'unauthorized' }
