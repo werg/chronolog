@@ -76,10 +76,16 @@ logical RTC frame bytes. Build-only output is not passing runtime evidence.
 Both layouts initially connect through the bounded workerd SDP introduction.
 They independently catch up, author competing task claims while disconnected,
 retain one final acceptance and one final rejection, deliver expiring typing
-signals, and process the winning final agent intent once. The fixture holds the
-native closure clock only while both competing proposals are authored and
-included; it does not assert that an arbitrary old offline write remains
-admissible after its timestamp has closed.
+signals, and process the winning final agent intent once. The fixture holds its
+injected native closure clock through fresh authoring and exact original proposal
+inclusion for the competing claims, job guard/intent, delayed reply, abrupt reload
+and host-outage chat scenarios. Each hold is bounded to 25 seconds, below the
+genesis future-time window, and ends before waiting for finality. The report
+records every interval and original proposal ID. Browser clocks, signatures,
+timestamps and operation IDs remain unchanged; no proposal is retried or
+re-authored. This controls admission for the behavior being tested and does not
+assert general acceptance of an old offline write after its timestamp has closed.
+The separate closed-cutoff rejection tests remain in force.
 
 Delayed replies and abrupt page/Worker replacement preserve each device's
 original operation and draft. Both replicas must expose identical effective

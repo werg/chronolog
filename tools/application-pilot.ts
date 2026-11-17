@@ -11,7 +11,6 @@ import { parseArgs } from 'node:util'
 import type { AgentApplicationModule } from '@chronolog/agent-service'
 import { OWNER_FOR_KEY_SQL, type TransactionHandle } from '@chronolog/client'
 import { DeterministicMaterializer, createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite'
-import { decodeLedgerRecord, isFinalityClosureRecord } from '@chronolog/node-core'
 import { base64UrlToBytes, bytesToBase64Url, compareTransactionOrder, emit, program, sqlStatement, utf8, type EffectiveEvent, type EventBatch } from '@chronolog/protocol'
 import { chromium, expect, type Browser, type Page } from '@playwright/test'
 import { build } from 'esbuild'
@@ -23,6 +22,7 @@ import { qualifyApplicationScope } from './lib/application-scope.js'
 import { createPeerRouteFixture } from './lib/peer-route-fixture.js'
 import { routeState } from '../test/application-pilot/route-state.js'
 import { waitFor } from './lib/wait-for.js'
+import { createAdmissionClock, observeIncludedProposals } from './lib/application-admission.js'
 
 /** Real public runtime + independent OPFS replicas + native final-intent worker. */
 const workspace = resolve(import.meta.dirname, '..')
@@ -49,7 +49,16 @@ const report = { format: 'chronolog-application-pilot/v2', status: 'building', p
 const record = async () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
 const passed = (check: string) => { report.checks.push(check); process.stdout.write(`Passed: ${check}\n`) }
 let native: NativeBrowserFixture | undefined, browser: Browser | undefined, directory: string | undefined
-let heldFinalityClock: number | undefined
+const admission = createAdmissionClock()
+report.diagnostics.admissionWindows = admission.windows
+let readInclusions: ReturnType<typeof observeIncludedProposals> | undefined
+const included = async (ids: readonly string[]) => {
+  native!.assertHealthy()
+  const observed = await readInclusions!()
+  return ids.every(id => observed.has(id))
+}
+const authorWithAdmission = <T extends { readonly proposalId: string }>(scenario: string, author: () => Promise<T>) =>
+  admission.include(scenario, async () => { const value = await author(); return { value, proposalIds: [value.proposalId] } }, included)
 let routes: Awaited<ReturnType<typeof createPeerRouteFixture>> | undefined
 let closeServer: (() => Promise<void>) | undefined
 let deadline: ReturnType<typeof setTimeout> | undefined
@@ -112,10 +121,11 @@ try {
     const startNative = async (): Promise<PilotBootstrap> => {
       const executionManifest = createDoltLiteExecutionManifest()
       native = await createNativeBrowserFixture({ directory: nativeDirectory, browsers: [...registrations.values()].map(value => value.identity),
-        manifest: executionManifest, application, finalityClock: () => heldFinalityClock ?? Date.now(),
+        manifest: executionManifest, application, finalityClock: admission.now,
         materialization: async ({ identity }) => createDoltLiteMaterializationRuntime(await DeterministicMaterializer.open({
           path: join(nativeDirectory, 'application.db'), executionManifest, rootAdministrator: identity.signing.publicKeyBytes,
         })) })
+      readInclusions = observeIncludedProposals(native)
       await accepted(await native.client.submit(program(sqlStatement("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL CHECK(status IN ('open','done'))) STRICT")), { operationId: 'pilot-schema' }))
       const team = await native.client.ownership.createTeam({ invite: [...registrations.values()].map(value => base64UrlToBytes(value.identity.identity)) }, { idempotencyKey: 'pilot-team' })
       await accepted(team.handle)
@@ -202,30 +212,21 @@ try {
     // Keep the timestamp window open while deliberately disconnected clients
     // prepare their conflicting writes. An ordinary offline write arriving
     // after its timestamp has closed must instead be finally rejected.
-    heldFinalityClock = Date.now()
-    const clockHeldAt = heldFinalityClock
-    const authority = native.agent.authority
-    assert(authority !== null)
-    const includedCandidates = async () => {
-      const range = await authority.read({ limit: 256 })
-      assert.equal(range.hasMore, false, 'pilot inclusion inspection must cover its complete small history')
-      return range.entries.filter(entry => !isFinalityClosureRecord(entry.bytes) && decodeLedgerRecord(entry.bytes).kind === 'candidate')
-    }
-    const beforeClaims = (await includedCandidates()).length
-    let claimIds: Array<string | null> = []
-    try {
+    const claimIds = await admission.include('disconnected competing task claims', async () => {
       await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.disconnect())))
       await Promise.all(all.map(page => page.locator('#tasks [data-action="claim"]').click()))
       await Promise.all(all.map(page => page.waitForFunction(() => {
         const row = document.querySelector('#operations li'); return row !== null && row.getAttribute('data-status') !== 'unknown'
       })))
-      claimIds = await Promise.all(all.map(page => page.locator('#operations > li').first().getAttribute('data-operation')))
-      assert(claimIds.every(id => id !== null))
+      const ids = await Promise.all(all.map(page => page.locator('#operations > li').first().getAttribute('data-operation')))
+      assert(ids.every(id => id !== null))
+      const proposals = await Promise.all(all.map((page, index) => authoredOperation(page, ids[index]!)))
       await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.reconnect())))
-      await waitFor(async () => (await includedCandidates()).length === beforeClaims + 2, 'both conflicting proposals included before releasing the timestamp closure')
-    } finally { heldFinalityClock = undefined }
+      return { value: ids, proposalIds: proposals.map(value => value.proposalId) }
+    }, included)
+    const claimWindow = admission.windows.at(-1)!
     report.diagnostics.concurrentClaims = { clock: 'native finality clock held only through disconnected authoring and inclusion of both claims',
-      heldAtMs: clockHeldAt, heldForMs: Date.now() - clockHeldAt, proposalTimestamps: 'unchanged browser clocks',
+      heldAtMs: claimWindow.heldAtMs, heldForMs: claimWindow.heldForMs, proposalTimestamps: 'unchanged browser clocks',
       arbitraryOfflineAdmissionClaim: false }
     await Promise.all(all.map((page, index) => page.waitForFunction(id => {
       const row = document.querySelector(`[data-operation="${id}"]`); return ['final', 'rejected'].includes(row?.getAttribute('data-status') ?? '')
@@ -248,25 +249,22 @@ try {
     passed('with the finality clock held through inclusion, disconnected competing claims resolve by deterministic author order to one acceptance and one SQL rejection')
 
     const rejectedJobStarted = Date.now()
-    const previousLoserOperation = await loser.locator('#operations > li').first().getAttribute('data-operation')
-    await loser.locator('#tasks [data-action="job"]').click()
-    await loser.waitForFunction(previous => {
-      const id = document.querySelector('#operations > li')?.getAttribute('data-operation')
-      return id !== null && id !== undefined && id !== previous
-    }, previousLoserOperation)
-    const rejectedJobId = await loser.locator('#operations > li').first().getAttribute('data-operation')
-    assert(rejectedJobId !== null)
+    const rejectedJob = await authorWithAdmission('losing claimant job SQL guard', () =>
+      submitUiOperation(loser, () => loser.locator('#tasks [data-action="job"]').click()))
+    const rejectedJobId = rejectedJob.operationId
     // Rejected proposals produce no durable event. Observe their public
     // operation frontier before applying the renderer's short DOM deadline.
-    await waitFor(() => loser.evaluate(async id => {
-      const operation = await (globalThis as unknown as PilotWindow).applicationPilot.operation(id)
-      return operation?.status === 'rejected' && operation.error === 'assert:claim_required'
-    }, rejectedJobId), 'losing claimant final job rejection')
+    await waitFor(async () => {
+      const operation = await loser.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), rejectedJobId)
+      if (operation?.status === 'rejected') assert.equal(operation.error, 'assert:claim_required')
+      return operation?.status === 'rejected'
+    }, 'losing claimant final job rejection')
     report.timingsMs.browserRejectedJob = Date.now() - rejectedJobStarted
     await expect(loser.locator(`#operations > li[data-operation="${rejectedJobId}"]`)).toHaveAttribute('data-status', 'rejected')
     assert.equal(report.counts.effectDispatches, 0)
     const jobStarted = Date.now()
-    await winner.locator('#tasks [data-action="job"]').click()
+    const winningJob = await authorWithAdmission('winning claimant native job intent', () =>
+      submitUiOperation(winner, () => winner.locator('#tasks [data-action="job"]').click()))
     // Native execution and each real WASM replica have separate applied
     // frontiers. Observe those before testing the UI renderer's short deadline.
     // In the first CI run the preceding two claims needed 8s to apply, while
@@ -274,6 +272,7 @@ try {
     let resultEvent: EffectiveEvent | undefined
     await waitFor(async () => {
       native!.assertHealthy()
+      assertNotFinallyRejected(winningJob.proposalId)
       resultEvent = (await native!.client.events.read()).transactions.flatMap(transaction => transaction.events).find(event => event.topic === 'job-results')
       return resultEvent !== undefined
     }, 'native final worker result')
@@ -290,12 +289,15 @@ try {
       { type: 'forged-result', version: 1 }, { operationId: 'forged-pilot-result' })), /authoriz|capabilit|scope|permission|PROGRAM|cannot write/iu)
     passed('a failed SQL guard emits no intent; the final winning intent runs the native worker once and records a correlated result that browser scope cannot forge')
 
-    await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.holdNextSubmission())
-    await board.locator('#message').fill('A note whose append reply is delayed')
-    await board.locator('#send').click()
-    await board.waitForFunction(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission() !== null)
-    const delayed = await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission())
-    assert(delayed !== null)
+    const delayed = await authorWithAdmission('delayed durable reply', async () => {
+      await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.holdNextSubmission())
+      await board.locator('#message').fill('A note whose append reply is delayed')
+      await board.locator('#send').click()
+      await board.waitForFunction(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission() !== null)
+      const receipt = await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission())
+      assert(receipt !== null)
+      return receipt
+    })
     await Promise.all(all.map(page => browserHasProposal(page, delayed.proposalId)))
     await expect(compact.locator('#conversation')).toContainText('A note whose append reply is delayed')
     await expect(board.locator(`#operations > li[data-operation="${delayed.operationId}"]`)).toHaveAttribute('data-status', 'final')
@@ -306,12 +308,15 @@ try {
     await expect(board.locator(`#operations > li[data-operation="${delayed.operationId}"]`)).toHaveAttribute('data-status', 'final')
     passed('a delayed durable append reply preserves newer typing and cannot regress the already observed final receipt')
 
-    await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.holdNextSubmission())
-    await board.locator('#message').fill('One original intent across abrupt reload')
-    await board.locator('#send').click()
-    await board.waitForFunction(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission() !== null)
-    const interrupted = await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission())
-    assert(interrupted !== null)
+    const interrupted = await authorWithAdmission('abrupt reload before reply delivery', async () => {
+      await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.holdNextSubmission())
+      await board.locator('#message').fill('One original intent across abrupt reload')
+      await board.locator('#send').click()
+      await board.waitForFunction(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission() !== null)
+      const receipt = await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.heldSubmission())
+      assert(receipt !== null)
+      return receipt
+    })
     await board.reload()
     await ready(board)
     assert.equal(await board.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.identity), identities[0])
@@ -352,13 +357,16 @@ try {
       const signalingBefore = { host: routes.snapshot().signaling,
         browsers: await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.signalingStats()))) }
       const bytesBefore = routes.snapshot().sessions.reduce((total, session) => total + session.sentBytes + session.receivedBytes, 0)
-      await board.locator('#message').fill('Warm WebRTC session with the host unavailable')
-      await board.locator('#send').click()
+      const warm = await authorWithAdmission('chat while the host listener is stopped', () => submitUiOperation(board, async () => {
+        await board.locator('#message').fill('Warm WebRTC session with the host unavailable')
+        await board.locator('#send').click()
+      }))
       await expect(compact.locator('#conversation')).toContainText('Warm WebRTC session with the host unavailable', { timeout: 40_000 })
       const warmHistory = await native.client.events.read()
       const warmProposal = warmHistory.transactions.find(transaction => transaction.events.some(event =>
         JSON.stringify(event.payload).includes('Warm WebRTC session with the host unavailable')))?.proposalId
       assert(warmProposal !== undefined)
+      assert.equal(warmProposal, warm.proposalId)
       await Promise.all(all.map(page => browserHasProposal(page, warmProposal)))
       const signalingAfter = { host: routes.snapshot().signaling,
         browsers: await Promise.all(all.map(page => page.evaluate(() => (globalThis as unknown as PilotWindow).applicationPilot.signalingStats()))) }
@@ -505,10 +513,39 @@ async function ready(page: Page) {
   await expect(page.locator('#status')).toHaveAttribute('data-failure', 'false')
 }
 async function browserHasProposal(page: Page, proposalId: string) {
-  await waitFor(() => page.evaluate(async id => {
-    const events = await (globalThis as unknown as PilotWindow).applicationPilot.events()
-    return events.transactions.some(transaction => transaction.proposalId === id)
-  }, proposalId), `browser final proposal ${proposalId}`)
+  await waitFor(async () => {
+    assertNotFinallyRejected(proposalId)
+    return page.evaluate(async id => {
+      const events = await (globalThis as unknown as PilotWindow).applicationPilot.events()
+      return events.transactions.some(transaction => transaction.proposalId === id)
+    }, proposalId)
+  }, `browser final proposal ${proposalId}`)
+}
+function assertNotFinallyRejected(proposalId: string): void {
+  const id = utf8(proposalId), outcome = native!.node.outcome(id)
+  if (native!.node.isFinal(id) && outcome?.outcome === 'rejected') {
+    throw new Error(`PILOT_FINAL_PROPOSAL_REJECTED: ${proposalId}: ${outcome.rejectionCode}`)
+  }
+}
+async function authoredOperation(page: Page, operationId: string): Promise<{ operationId: string; proposalId: string }> {
+  let receipt: { operationId: string; proposalId: string } | null = null
+  await waitFor(async () => {
+    receipt = await page.evaluate(id => (globalThis as unknown as PilotWindow).applicationPilot.operation(id), operationId)
+    return receipt !== null
+  }, `durably authored operation ${operationId}`, 25_000)
+  assert(receipt !== null)
+  return receipt
+}
+async function submitUiOperation(page: Page, submit: () => Promise<unknown>): Promise<{ operationId: string; proposalId: string }> {
+  const previous = await page.locator('#operations > li').first().getAttribute('data-operation')
+  await submit()
+  await page.waitForFunction(before => {
+    const current = document.querySelector('#operations > li')?.getAttribute('data-operation')
+    return current !== null && current !== undefined && current !== before
+  }, previous)
+  const operationId = await page.locator('#operations > li').first().getAttribute('data-operation')
+  assert(operationId !== null)
+  return authoredOperation(page, operationId)
 }
 async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
