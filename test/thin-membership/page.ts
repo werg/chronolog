@@ -4,7 +4,9 @@ import type { ThinMembershipBootstrap } from '../../tools/thin-membership-native
 
 const pending = new Map<number, { resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout> }>()
 const introductions: Array<{ requests: number; requestBytes: number; responseBytes: number; closed: boolean }> = []
+const commandTimeoutMs = 75_000
 let worker: Worker, sequence = 0, connectionSequence = 0, activeConnection = 0, bootstrap: ThinMembershipBootstrap | undefined
+let storageName: string | undefined
 let owner = new AbortController()
 let supervisor: ReturnType<typeof supervisePeerSession<WebRtcSession>> | undefined
 function open(): void {
@@ -32,7 +34,7 @@ function command(value: Record<string, unknown>, transfer: Transferable[] = [], 
     const id = ++sequence
     const clear = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
     const abort = () => { clear(); pending.delete(id); reject(signal?.reason) }
-    const timer = setTimeout(() => { clear(); pending.delete(id); reject(new Error(`Device command timed out: ${String(value.method)}`)) }, 75_000)
+    const timer = setTimeout(() => { clear(); pending.delete(id); reject(new Error(`Device command timed out: ${String(value.method)}`)) }, commandTimeoutMs)
     pending.set(id, { resolve(value) { clear(); resolve(value) }, reject(error) { clear(); reject(error) }, timer })
     signal?.addEventListener('abort', abort, { once: true })
     try { worker.postMessage({ ...value, id }, transfer) }
@@ -76,6 +78,7 @@ async function connect(): Promise<unknown> {
 open()
 Object.assign(globalThis, { thinMembership: {
   async call(value: Record<string, unknown>): Promise<unknown> {
+    if ((value.method === 'prepare' || value.method === 'open') && typeof value.name === 'string') storageName = value.name
     if (value.method === 'open') bootstrap = value.bootstrap as ThinMembershipBootstrap
     if (value.method === 'connect') {
       return connect()
@@ -89,9 +92,15 @@ Object.assign(globalThis, { thinMembership: {
     // Abrupt storage-owner replacement remains abrupt; no Worker close RPC.
     owner.abort(new Error('THIN_PAGE_WORKER_REPLACED'))
     const previous = supervisor; supervisor = undefined; bootstrap = undefined
+    const previousStorageName = storageName; storageName = undefined
     worker.terminate()
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new Error('Worker replaced')) }
-    pending.clear(); await previous?.close(); owner = new AbortController(); open()
+    pending.clear(); await previous?.close()
+    // terminate() has no completion promise. Observe release of the actual
+    // ownership lock before asking a replacement Worker to claim it.
+    if (previousStorageName !== undefined) await navigator.locks.request(`chronolog:${previousStorageName}`,
+      { mode: 'exclusive', signal: AbortSignal.timeout(commandTimeoutMs) }, () => undefined)
+    owner = new AbortController(); open()
   },
 } })
 
