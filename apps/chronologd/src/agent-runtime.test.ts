@@ -177,10 +177,17 @@ describe('native agent composition', () => {
     expect(subscriber.finality).toBeNull()
     expect(subscriber.taskIds).toEqual([])
     expect(subscriber.context).not.toHaveProperty('createSignals')
-    const toOwner = new TransformStream<Uint8Array, Uint8Array>(), toReader = new TransformStream<Uint8Array, Uint8Array>()
+    const lane = () => {
+      const toOwner = new TransformStream<Uint8Array, Uint8Array>(), toReader = new TransformStream<Uint8Array, Uint8Array>()
+      return [framePeerStream({ readable: toOwner.readable, writable: toReader.writable }),
+        framePeerStream({ readable: toReader.readable, writable: toOwner.writable })] as const
+    }
+    const reliable = lane(), live = lane()
+    const connections = reliable.map((connection, index) => ({ ...connection, live: live[index]!,
+      async close() { await Promise.all([connection.close(), live[index]!.close()]) } }))
     const sessions = await Promise.all([
-      publisher.context.connectPeer({ connection: framePeerStream({ readable: toOwner.readable, writable: toReader.writable }), peerIdentity: reader.publicKeyBytes }),
-      subscriber.context.connectPeer({ connection: framePeerStream({ readable: toReader.readable, writable: toOwner.writable }), peerIdentity: owner.publicKeyBytes }),
+      publisher.context.connectPeer({ connection: connections[0]!, peerIdentity: reader.publicKeyBytes }),
+      subscriber.context.connectPeer({ connection: connections[1]!, peerIdentity: owner.publicKeyBytes }),
     ])
     const before = await publisher.finality!.head()
     const iterator = subscriber.context.signals.subscribe({ topics: ['presence'], signal: AbortSignal.timeout(2_000) })[Symbol.asyncIterator]()

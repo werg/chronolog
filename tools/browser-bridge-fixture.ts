@@ -34,7 +34,7 @@ import {
 
 import { SqliteOperationStore } from '../apps/chronologd/src/operation-store.js'
 import type { BrowserBridgeBootstrap } from '../test/browser/bridge-contract.js'
-import { createPeerHttpFixture } from './lib/peer-http-fixture.js'
+import { createHttpPeerFixture } from './lib/http-peer-fixture.js'
 
 /**
  * Native half of the browser acceptance gate. All proposals, capabilities and
@@ -83,11 +83,11 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
   const token = crypto.randomUUID()
   let governed: GovernedNode | undefined
   let peers: GovernedPeerService | undefined
-  const peerToken = crypto.randomUUID()
-  const peerHttp = createPeerHttpFixture({ token: peerToken, async connect(connection) {
+  let peerFailure: Error | undefined
+  const peerHttp = await createHttpPeerFixture({ async accept(connection) {
     if (peers === undefined) { await connection.close(); throw new Error('BRIDGE_NATIVE_NOT_STARTED') }
     return peers.connectPeer({ connection })
-  } })
+  }, onError(error) { peerFailure ??= error instanceof Error ? error : new Error('BRIDGE_PEER_FAILED', { cause: error }) } })
   let online = true
   let loseAppendResponse = false
   let lostAppend: { readonly position: number; readonly recordId: string } | undefined
@@ -162,7 +162,6 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
     outgoing.setHeader('Cache-Control', 'no-store')
     if (incoming.method === 'OPTIONS') { outgoing.writeHead(204); outgoing.end(); return }
     const respond = async () => {
-      if (await peerHttp.handle(incoming, outgoing)) return
       const request = await webRequest(incoming)
       const path = new URL(request.url).pathname
       if (path === '/_chronolog/certificate') requests.certificates += 1
@@ -245,7 +244,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       const throughMs = BigInt(Date.now())
       const deadline = Date.now() + 10_000
       for (;;) {
-        peerHttp.assertHealthy()
+        if (peerFailure !== undefined) throw peerFailure
         await adapter.catchUp()
         for (const evidence of await local.evidenceHistory()) await root.node.ingestOrderingEvidence(decodeOrderingEvidence(evidence.bytes))
         await root.node.waitForIdle()
@@ -285,7 +284,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       hubUrl, token, genesis: bytesToBase64Url(savedGenesis), groupRoute: bytesToBase64Url(groupRoute),
       executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
       rootIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes),
-      nativeIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes), peerUrl: `${hubUrl}/peer`, peerToken,
+      nativeIdentity: bytesToBase64Url(administrator.signing.publicKeyBytes), peerUrl: peerHttp.url, peerToken: peerHttp.token,
     }
     const snapshot = async (transactionIds: readonly string[] = []) => {
       await root.node.waitForIdle()
