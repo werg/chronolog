@@ -11,6 +11,8 @@ import {
   generateX25519KeyPair,
   hpkeOpenBase,
   hpkeSealBase,
+  hpkeSendExportBase,
+  hpkeReceiveExportBase,
   importX25519PrivateKey,
   unwrapEpochKey,
   verifyEpochManifest,
@@ -53,6 +55,37 @@ describe('RFC 9180 base-mode adapter', () => {
       hex('436f756e742d30'),
     )
     expect(plaintext).toEqual(hex('4265617574792069732074727574682c20747275746820626561757479'))
+  })
+
+  it('matches all published CFRG AES-256-GCM exported-secret vectors', async () => {
+    // https://github.com/cfrg/draft-irtf-cfrg-hpke/blob/master/test-vectors.json
+    const privateKey = await importX25519PrivateKey(hex('302e020100300506032b656e04220420' +
+      '497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d'))
+    for (const [context, expected] of [
+      ['', 'ded6cffafaea6b812cbf3e241e88332adbc077aca81512914213810ee291770a'],
+      ['00', '04d3cb6cc116b28ffd22ad5bc276c60d31fec71ceb87ae24db811c64b7507339'],
+      ['54657374436f6e74657874', '7c5ded445732c14fe09727d29b4251c0fd38455fe8440571e687f0886aac94d2'],
+    ]) {
+      expect(await hpkeReceiveExportBase(privateKey,
+        hex('430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c'),
+        hex('6c93e09869df3402d7bf231bf540fadd35cd56be14f97178f0954db94b7fc256'),
+        hex('4f6465206f6e2061204772656369616e2055726e'), hex(context!), 32)).toEqual(hex(expected!))
+    }
+  })
+
+  it('exports matching application secrets bound to context, recipient and fresh encapsulation', async () => {
+    const recipient = await generateX25519KeyPair(false), other = await generateX25519KeyPair(false)
+    const info = utf8('signed peer transcript'), label = utf8('independent reliable/live keys')
+    const sent = await hpkeSendExportBase(recipient.publicKeyBytes, info, label, 88)
+    const receive = (context = label, transcript = info, key = recipient) => hpkeReceiveExportBase(
+      key.privateKey, key.publicKeyBytes, sent.encapsulatedKey, transcript, context, 88)
+    expect(await receive()).toEqual(sent.exportedSecret)
+    expect(await receive(utf8('another purpose'))).not.toEqual(sent.exportedSecret)
+    expect(await receive(label, utf8('another connection'))).not.toEqual(sent.exportedSecret)
+    expect(await receive(label, info, other)).not.toEqual(sent.exportedSecret)
+    expect((await hpkeSendExportBase(recipient.publicKeyBytes, info, label, 88)).exportedSecret).not.toEqual(sent.exportedSecret)
+    await expect(hpkeSendExportBase(recipient.publicKeyBytes, info, label, 8161)).rejects.toThrow('HKDF output is too long')
+    await expect(hpkeReceiveExportBase(recipient.privateKey, recipient.publicKeyBytes, new Uint8Array(32), info, label, 88)).rejects.toThrow('X25519')
   })
 
   it('seals to an X25519 recipient and authenticates info and AAD', async () => {

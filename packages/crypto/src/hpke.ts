@@ -131,7 +131,9 @@ async function extractAndExpand(dhValue: Uint8Array, kemContext: Uint8Array): Pr
   return labeledExpand(KEM_SUITE_ID, eaePrk, 'shared_secret', kemContext, HASH_SIZE)
 }
 
-async function keySchedule(sharedSecret: Uint8Array, info: Uint8Array): Promise<{ key: Uint8Array; nonce: Uint8Array }> {
+interface HpkeKeySchedule { readonly key: Uint8Array; readonly nonce: Uint8Array; readonly exporterSecret: Uint8Array }
+
+async function keySchedule(sharedSecret: Uint8Array, info: Uint8Array): Promise<HpkeKeySchedule> {
   const pskIdHash = await labeledExtract(HPKE_SUITE_ID, new Uint8Array(), 'psk_id_hash', new Uint8Array())
   const infoHash = await labeledExtract(HPKE_SUITE_ID, new Uint8Array(), 'info_hash', info)
   const keyScheduleContext = concatBytes(Uint8Array.of(0), pskIdHash, infoHash)
@@ -139,6 +141,7 @@ async function keySchedule(sharedSecret: Uint8Array, info: Uint8Array): Promise<
   return {
     key: await labeledExpand(HPKE_SUITE_ID, secret, 'key', keyScheduleContext, 32),
     nonce: await labeledExpand(HPKE_SUITE_ID, secret, 'base_nonce', keyScheduleContext, 12),
+    exporterSecret: await labeledExpand(HPKE_SUITE_ID, secret, 'exp', keyScheduleContext, HASH_SIZE),
   }
 }
 
@@ -160,23 +163,43 @@ async function aesGcmOpen(keyBytes: Uint8Array, nonce: Uint8Array, ciphertext: U
   }
 }
 
-export async function hpkeSealBase(
-  recipientPublicKeyBytes: Uint8Array,
-  plaintext: Uint8Array,
-  info: Uint8Array,
-  aad: Uint8Array,
-): Promise<HpkeCiphertext> {
+async function senderContext(recipientPublicKeyBytes: Uint8Array, info: Uint8Array): Promise<{ encapsulatedKey: Uint8Array; context: HpkeKeySchedule }> {
   const recipientPublicKey = await importX25519PublicKey(recipientPublicKeyBytes)
   const ephemeral = await generateX25519KeyPair(false)
   const sharedSecret = await extractAndExpand(
     await dh(ephemeral.privateKey, recipientPublicKey),
     concatBytes(ephemeral.publicKeyBytes, recipientPublicKeyBytes),
   )
-  const context = await keySchedule(sharedSecret, info)
-  return {
-    encapsulatedKey: ephemeral.publicKeyBytes,
-    ciphertext: await aesGcmSeal(context.key, context.nonce, plaintext, aad),
-  }
+  try { return { encapsulatedKey: ephemeral.publicKeyBytes, context: await keySchedule(sharedSecret, info) } }
+  finally { sharedSecret.fill(0) }
+}
+
+async function recipientContext(
+  recipientPrivateKey: CryptoKey, recipientPublicKeyBytes: Uint8Array, encapsulatedKey: Uint8Array, info: Uint8Array,
+): Promise<HpkeKeySchedule> {
+  protocolInvariant(recipientPublicKeyBytes.length === 32 && encapsulatedKey.length === 32, 'INVALID_KEY', 'HPKE X25519 keys must contain 32 bytes')
+  const ephemeralPublicKey = await importX25519PublicKey(encapsulatedKey)
+  const sharedSecret = await extractAndExpand(
+    await dh(recipientPrivateKey, ephemeralPublicKey),
+    concatBytes(encapsulatedKey, recipientPublicKeyBytes),
+  )
+  try { return await keySchedule(sharedSecret, info) }
+  finally { sharedSecret.fill(0) }
+}
+
+function clearContext(context: HpkeKeySchedule): void {
+  context.key.fill(0); context.nonce.fill(0); context.exporterSecret.fill(0)
+}
+
+export async function hpkeSealBase(
+  recipientPublicKeyBytes: Uint8Array,
+  plaintext: Uint8Array,
+  info: Uint8Array,
+  aad: Uint8Array,
+): Promise<HpkeCiphertext> {
+  const { encapsulatedKey, context } = await senderContext(recipientPublicKeyBytes, info)
+  try { return { encapsulatedKey, ciphertext: await aesGcmSeal(context.key, context.nonce, plaintext, aad) } }
+  finally { clearContext(context) }
 }
 
 export async function hpkeOpenBase(
@@ -187,12 +210,27 @@ export async function hpkeOpenBase(
   info: Uint8Array,
   aad: Uint8Array,
 ): Promise<Uint8Array> {
-  protocolInvariant(recipientPublicKeyBytes.length === 32 && encapsulatedKey.length === 32, 'INVALID_KEY', 'HPKE X25519 keys must contain 32 bytes')
-  const ephemeralPublicKey = await importX25519PublicKey(encapsulatedKey)
-  const sharedSecret = await extractAndExpand(
-    await dh(recipientPrivateKey, ephemeralPublicKey),
-    concatBytes(encapsulatedKey, recipientPublicKeyBytes),
-  )
-  const context = await keySchedule(sharedSecret, info)
-  return aesGcmOpen(context.key, context.nonce, ciphertext, aad)
+  const context = await recipientContext(recipientPrivateKey, recipientPublicKeyBytes, encapsulatedKey, info)
+  try { return await aesGcmOpen(context.key, context.nonce, ciphertext, aad) }
+  finally { clearContext(context) }
+}
+
+/** RFC 9180 §6.2: application keys use the exporter, never the HPKE traffic key. */
+export async function hpkeSendExportBase(
+  recipientPublicKeyBytes: Uint8Array, info: Uint8Array, exporterContext: Uint8Array, length: number,
+): Promise<{ readonly encapsulatedKey: Uint8Array; readonly exportedSecret: Uint8Array }> {
+  const { encapsulatedKey, context } = await senderContext(recipientPublicKeyBytes, info)
+  try {
+    return { encapsulatedKey, exportedSecret: await labeledExpand(HPKE_SUITE_ID, context.exporterSecret, 'sec', exporterContext, length) }
+  } finally { clearContext(context) }
+}
+
+/** The caller authenticates the encapsulation and its complete application context. */
+export async function hpkeReceiveExportBase(
+  recipientPrivateKey: CryptoKey, recipientPublicKeyBytes: Uint8Array, encapsulatedKey: Uint8Array,
+  info: Uint8Array, exporterContext: Uint8Array, length: number,
+): Promise<Uint8Array> {
+  const context = await recipientContext(recipientPrivateKey, recipientPublicKeyBytes, encapsulatedKey, info)
+  try { return await labeledExpand(HPKE_SUITE_ID, context.exporterSecret, 'sec', exporterContext, length) }
+  finally { clearContext(context) }
 }
