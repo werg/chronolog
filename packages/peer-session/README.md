@@ -11,8 +11,9 @@ generation and sequence. `operation.shared()` separately observes an independent
 peer's retained copy. Ordinary commands do not wait for that second copy, and
 neither result prevents an explicit recovery from abandoning a recent suffix.
 The current API uses these two names throughout sessions, tools and adapters.
-External-effect dispatchers need a separate supported recovery contract; the
-session does not install or trigger one automatically.
+[Application consumers](consumers.md) provide pure reset-aware projections,
+retained external-effect journals and guarded timer commands. Applications
+explicitly open and run them beside the session.
 
 ## Native events application
 
@@ -495,12 +496,18 @@ controls define its current data roles, so creator departure does not freeze
 shared data and data-role revocation survives history rollback. Private row
 ownership remains tied to its actual author.
 
-Effects retain their original dispatch journal and provider retry key across
-recovery, because an external call may
-outlive an abandoned application record. Before dispatch, check current intent
-and authorization; reconcile uncertain calls with the provider. Use the recovery
-floor when an application specifically requires an action's prerequisite to survive
-recovery. See [integration details](../../docs/plans/peer-generation-integration-details.md).
+`ApplicationEffectWorker` retains its original dispatch journal and provider key
+across recovery, checks selected intent and current authorization immediately
+before provider entry, and requires explicit recovery for uncertain calls.
+`ApplicationProjection` rebuilds pure state from a coherent selected view.
+`ApplicationTimerScheduler` retains occurrence identity while rebuilding
+schedules; `createApplicationTimerPrograms` supplies atomic SQL configuration,
+due-time and cancellation guards. These consumers reuse ordinary session
+commands for result publication and explicit reapplication.
+See [application consumers](consumers.md) for APIs and examples. Use a recovery
+floor when the application's action prerequisite must itself survive recovery;
+the [integration details](../../docs/plans/peer-generation-integration-details.md)
+describe that separate selection policy.
 
 ### A shared SQL command with a domain guard
 

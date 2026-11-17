@@ -29,18 +29,19 @@ The peer session's `applied()` result belongs to its selected generation;
 `shared()` adds authenticated retained-copy observations. Explicit recovery can
 abandon either result. Generation events therefore cannot be passed to these
 append-only workers. `FinalEventSource` has resumable cursors but no reset
-protocol. A generation-aware effect or timer service is not implemented here.
-Pure projection adapters also need explicit rebuild handling before consuming
-generation history.
+protocol. Generation applications use the maintained
+[`ApplicationProjection`, `ApplicationEffectWorker` and `ApplicationTimerScheduler`](../peer-session/consumers.md)
+from `@chronolog/peer-session`, beside their owned session. They do not depend on
+the chronological daemon or adapt its final-prefix port.
 
-A future generation-aware worker would need to preserve the dispatch journal,
-provider idempotency identities, and original authenticated request origin
-across resets, and link results to that request. Dispatch would still require
-current tool authorization; worker credentials would not become the requester's
-authority. An uncertain provider call requires idempotent recovery, provider
-reconciliation, or explicit manual resolution. Resetting an application view
-does not establish that the call never happened or permit erasing its recovery
-record.
+Those public consumers rebuild derived views and schedules while preserving
+dispatch facts, provider keys, original authenticated request origin and timer
+occurrence identity across resets. External dispatch requires the owning runtime
+and current application authorization; worker credentials never become the
+requester's authority. Uncertain provider calls require explicit idempotent
+retry, reconciliation or manual resolution. Result and timer commands share the
+session's signed attempt journal, with deliberate linked reapplication after
+abandonment. Resetting a view does not erase an external fact.
 
 The [generation integration notes](../../docs/plans/peer-generation-integration-details.md)
 also cover SQL permission recovery, sealed-reader policies and package wire
