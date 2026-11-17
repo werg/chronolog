@@ -14,6 +14,12 @@ can sort earlier and change that result even within the same generation. This
 package has no final state, frontier, `final()` wait or final-intent worker.
 Tendriller's default live adapter remains a separate profile.
 
+Fresh commands allocate author time after the device's prior authored work and
+observed applied work through the shared `nextAuthorTimestampMs` helper. Several
+commands in one wall-clock millisecond therefore retain their causal order. This
+helper adds no inclusion or finality rule; retrying a saved attempt preserves its
+original timestamp and signatures.
+
 ## Native events application
 
 Create or enroll a device explicitly before opening a session. Resuming a device
@@ -66,6 +72,21 @@ authorization: an authorized writer can still author a raw program. A command
 name, version or payload claim cannot grant private-tool rights. Check the
 authenticated signer and current application policy before privileged work.
 
+Enrollment supplies complete explicit grants: `reader`, `writer`, `coordinator`,
+`recovery`, `administrator` and `dataRole: 'member' | 'admin' | null`.
+`participantGrant` requires all of these choices; control administration does not
+imply data or schema administration. The explicit `controlParticipantGrant` grants
+only host recovery and control administration, without data access.
+
+Every signed generation transition requires
+`controlIntentDigest: await controlIntentDigest(control)` for the exact unsigned
+referenced control payload, plus `contextDigest`. Use `contextDigest: null` only
+when no external context is supplied. A host that consumes enrollment/account
+bindings must verify the caller-computable commitment to those exact bindings
+before selecting the transition. It cannot enrich a device-signed request with
+extra grants afterward. These control-transition retries preserve the exact
+selection; application retries below observe the current replay result.
+
 `observedRevision` checks that the reviewed ancestry is still selected. It does
 not implement compare-and-swap, reserve an execution position or guarantee that a
 previous query remains true. Put required business assertions in the program.
@@ -108,6 +129,21 @@ and independent-store qualification. It carries commands, verified history,
 retention acknowledgments and signed live signals. It is not a measurement of
 Internet WebRTC routing. No recipe needs its own application retry queue.
 
+For a framed connection use `connectApplicationTransport(session, { connection,
+expectedPeerId })`. The `/webrtc` entry exports `connectApplicationWebRtc`; the
+optional `/webrtc-native` entry exports `connectNativeApplicationWebRtc`. They
+compose the same authenticated session protocol with reliable history and
+separate disposable signal lanes.
+
+Synchronization uses bounded range transfers against one captured revision and
+its matching authority. The receiver acknowledges the exact advertised prefix
+only after durable retention, even when it already holds a longer history. A
+ready older peer can supply missing bodies for a newer selected generation
+without changing that selection. This recovers a verified selected prefix; it
+does not merge arbitrary branches or restore an excluded suffix. The current
+framed limits are 1 MiB per encoded frame, 16 outstanding requests and 4,096
+records / 64 MiB of encoded records per synchronization.
+
 This session's signal policy permits current readers. It does not inherit the
 live profile's topic-specific writer policy. The signed signal channel keeps
 expiry, replay protection and bounded queues separate from durable commands.
@@ -118,7 +154,19 @@ schema is initialized before application history. The default event path uses
 `createAppliedEventMaterializationRuntime`. Native SQL uses
 `AppliedMaterializer.open` and `createDoltLiteAppliedMaterializationRuntime` through
 the `/sql-native` entry. Applied runtimes expose no final fields or disabled
-finality methods. Row and schema authorization remain separate execution policy.
+finality methods.
+
+`createNativeSqlManifest()` authenticates `sqlPolicy: 'data-only'` and
+`authorizationPolicy: 'external-membership'`. The replica verifies signed controls
+and supplies their data-role projection to replay. Each proposal sees its
+historical membership; publication restores the latest selected membership, so
+recovering earlier application state cannot restore revoked current data rights.
+The full control prefix determines stable membership metadata independently of
+arrival order. A `dataRole` administrator controls shared data, not schema.
+Application programs cannot rewrite the reserved membership projection or the
+separately authenticated bootstrap schema. Other applied SQL integrations may
+choose `transaction-grants` explicitly; choosing an applied runtime alone grants
+no extra SQL permissions.
 
 Irreversible effects require an application policy for idempotency, recovery and
 reconciliation. An applied accepted event alone cannot authorize automatic
@@ -130,7 +178,10 @@ The native session tests exercise saved offline intent, reconnect after a lost
 reply, cancellation of one waiter, coherent recovery, explicit reapplication,
 close/reopen and exclusive store ownership. Replica tests cover authenticated
 history and retained-prefix selection; native SQL tests exercise deterministic
-execution and rollback. See [the profile contract](../../docs/peer-generation-v1.md)
+execution, historical membership, current authorization and rollback. Framed
+connection tests cover authenticated peer identity, captured-prefix retention,
+delayed intent, independent live signals and selected-history catch-up from an
+older peer. See [the profile contract](../../docs/peer-generation-v1.md)
 for the authority and recovery invariants.
 
 `connectApplications` calls peer sessions in process. These tests do not establish
