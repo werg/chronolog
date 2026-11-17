@@ -25,6 +25,7 @@
     "characterize": "tsx packages/conformance/src/release-characterization.ts --iterations 100 --reopen-every 20 --late-every 10 --late-depth 5 --output artifacts/release/characterization.json",
     "release:metadata": "pnpm build && tsx tools/generate-release-metadata.ts --output artifacts/release",
     "release:distribution": "tsx tools/build-distribution.ts --output artifacts/distribution",
+    "test:distribution-package": "tsx tools/test-distribution-package.ts --directory artifacts/distribution",
     "test:distribution-upgrade": "tsx tools/test-distribution-upgrade.ts --directory artifacts/distribution",
     "drill": "tsx tools/drill.ts",
     "conformance": "tsx packages/conformance/src/conformance-report.ts --output artifacts/conformance/report.json",

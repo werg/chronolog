@@ -64,15 +64,28 @@ normal `pnpm install --force` restores the pinned non-sanitized dependency.
 
 ```sh
 pnpm release:distribution
+pnpm test:distribution-package
 pnpm test:distribution-upgrade
 pnpm release:metadata
 ```
 
-The distribution command requires a clean worktree and uses pnpm's isolated
-deployment to assemble the daemon, online CLI, snapshot tool, TypeScript runtime, and native dependencies for the current OS and
+The distribution command requires a clean worktree and the exact committed pnpm
+version. It copies tracked source to a temporary release workspace, enables
+workspace injection only there, and uses pnpm's frozen isolated deployment to
+assemble the daemon, online CLI, snapshot tool, TypeScript runtime, and native dependencies for the current OS and
 architecture. It rejects escaping symlinks, records every regular file's hash
 and size, emits a relocatable tar archive, and includes `chronolog-verify` for
 post-extraction verification. Node.js 22 or later remains a host prerequisite.
+Ordinary development keeps its workspace links. External dependency versions,
+integrity hashes and native patch identities come from the source lockfile.
+
+The package consumer extracts the actual archive outside the checkout, runs
+its verifier and CLI, loads its daemon/client/RPC modules, exchanges signed live
+signals, and reopens persisted bytes through both native stores. It checks that
+the production signal dependencies are present and the separately composed
+hosted and WebRTC adapters are absent. The adjacent `.consumer.json` records the
+archive hash, source commit and checks; it does not depend on source aliases or
+development modules.
 
 The upgrade drill verifies the package, starts it on a fresh persistent data
 directory, checks health and CLI status, stops cleanly, verifies the replacement

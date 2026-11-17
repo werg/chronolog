@@ -44,6 +44,18 @@ jobs:
       - name: Measure portable membership storage and traffic
         run: node --import tsx tools/membership-cost.ts --output artifacts/membership-cost/ci
       - run: pnpm build
+      - name: Verify the isolated native distribution
+        run: |
+          pnpm release:distribution
+          pnpm test:distribution-package
+      - name: Preserve native package qualification
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/distribution/*.consumer.json
+          if-no-files-found: warn
+          retention-days: 30
       - name: Preserve authority recovery report
         if: always()
         uses: actions/upload-artifact@v6
