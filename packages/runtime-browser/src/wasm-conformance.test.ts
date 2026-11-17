@@ -5,8 +5,10 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { DeterministicMaterializer as NativeMaterializer, createDoltLiteExecutionManifest } from '@chronolog/materializer-doltlite'
-import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/browser'
-import { emit, encodeRowKey, encodeSealedEnvelope, platformObjectId, sealedOp, sqlStatement, sqlValue, utf8 } from '@chronolog/protocol'
+import { DeterministicMaterializer, createDoltLiteMaterializationRuntime } from '@chronolog/materializer-doltlite/browser'
+import { APPLICATION_COLLECTIVE_ID, bytesToHex, emit, encodeChangeProgram, encodeRowKey, encodeSealedEnvelope, executionManifestArtifacts, hexToBytes, platformObjectId, program, sealedOp, sqlStatement, sqlValue, utf8 } from '@chronolog/protocol'
+import { bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, participantGrant,
+  peerDigest, signApplicationDescriptor, signApplicationSchema, signControlRevision, signTransitionRequest, verifyApplicationSchema, type PeerReplica } from '../../peer-generation/src/index.js'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { replayProposal, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
@@ -42,6 +44,63 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
     nativeDirectory = await mkdtemp(join(tmpdir(), 'chronolog-wasm-'))
   })
   afterAll(async () => { if (nativeDirectory !== undefined) await rm(nativeDirectory, { recursive: true, force: true }) })
+
+  it('replays authenticated encrypted peer order and earlier-prefix recovery identically in native and WASM SQL', async () => {
+    const host = await createPeerIdentity(), a = await createPeerIdentity(), b = await createPeerIdentity()
+    const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
+    const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-peer-sql-v1' })
+    const { executionManifestDigest } = await executionManifestArtifacts(manifest)
+    const applicationId = '47'.repeat(32), definitionDigest = '48'.repeat(32)
+    const schema = await signApplicationSchema({ applicationId, definitionDigest, executionManifestDigest: bytesToHex(executionManifestDigest),
+      program: bytesToHex(encodeChangeProgram(program('CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE)'))) }, a)
+    const descriptor = await signApplicationDescriptor({ applicationId, historyId: 'native-wasm-peer', profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+      controlPublicKey: host.publicKey, schemaAdministrator: a.publicKey, definitionDigest, schemaDigest: await peerDigest(schema), executionManifestDigest: bytesToHex(executionManifestDigest) }, host)
+    const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
+      revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
+      grants: [controlParticipantGrant(host.publicKey), participantGrant(a.publicKey), participantGrant(b.publicKey)] }, host)
+    const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
+    await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
+      expectedGeneration: null, transitionId: 'initial', requester: a.publicKey, coordinator: a.publicKey, controlRevision: 0, reason: 'create', base: null }, a))
+    const options = { executionManifest: manifest, historyProfile: 'peer-generation-v1' as const, rootAdministrator: hexToBytes(a.publicKey),
+      bootstrapGroupId: hexToBytes(applicationId), bootstrapProgram: await verifyApplicationSchema(schema, descriptor.payload), checkpointEvery: 1 }
+    const native = await NativeMaterializer.open({ ...options, path: join(nativeDirectory, 'peer-native.db') })
+    let wasm = await DeterministicMaterializer.open({ ...options, path: '/peer-wasm.db', openDatabase: factory })
+    const retained = new MemoryPeerStore(), peers: PeerReplica[] = []
+    try {
+      const nativePeer = await createPeerReplica({ authority: await registry.read(), device: a, storageId: 'native', store: new MemoryPeerStore(), epochKeys,
+        materializer: createDoltLiteMaterializationRuntime(native) }); peers.push(nativePeer)
+      let wasmPeer = await createPeerReplica({ authority: await registry.read(), device: b, storageId: 'wasm', store: retained, epochKeys,
+        materializer: createDoltLiteMaterializationRuntime(wasm) }); peers.push(wasmPeer)
+      const team = bytesToHex(APPLICATION_COLLECTIVE_ID)
+      await nativePeer.order(await nativePeer.prepare({ operationId: 'shared-task', authorTimestampMs: 500n, program: program(
+        `INSERT INTO tasks(id,title,chronolog_owner) VALUES(1,'original',(SELECT id FROM chronolog_principals WHERE key=X'${team}'))`, emit('task.created', { id: 1 })) }))
+      const prefix = await nativePeer.recoveryPoint()
+      await nativePeer.order(await nativePeer.prepare({ operationId: 'duplicate', authorTimestampMs: 100n,
+        program: program("INSERT INTO tasks(id,title) VALUES(2,'original')") }))
+      await wasmPeer.ingest(await nativePeer.exportCommands())
+      expect(await wasmPeer.operation('duplicate', a.publicKey)).toMatchObject({ outcome: 'rejected', rejectionCode: 'constraint' })
+      expect(wasm.databaseContentHash).toBe(native.databaseContentHash)
+      await nativePeer.order(await nativePeer.prepare({ operationId: 'lost-tail', program: program("UPDATE tasks SET title='isolated' WHERE id=1") }))
+      await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
+        transitionId: 'recover', expectedGeneration: nativePeer.generation.id, requester: b.publicKey, coordinator: b.publicKey,
+        controlRevision: 0, reason: 'takeover', base: prefix }, b))
+      await wasmPeer.adopt(await registry.read())
+      await wasmPeer.order(await wasmPeer.prepare({ operationId: 'survivor-update', program: program("UPDATE tasks SET title='recovered' WHERE id=1", emit('task.updated', { id: 1 })) }))
+      await nativePeer.synchronize(await registry.read(), await wasmPeer.exportCommands())
+      expect(await nativePeer.operation('lost-tail')).toMatchObject({ status: 'abandoned' })
+      expect(wasm.databaseContentHash).toBe(native.databaseContentHash)
+      expect(wasm.transactionLog()).toEqual(native.transactionLog())
+      await wasmPeer.close()
+      wasm = await DeterministicMaterializer.open({ ...options, path: '/peer-wasm.db', openDatabase: factory })
+      wasmPeer = await createPeerReplica({ authority: await registry.read(), device: b, storageId: 'wasm', store: retained, epochKeys,
+        materializer: createDoltLiteMaterializationRuntime(wasm) }); peers.push(wasmPeer)
+      expect(wasm.databaseContentHash).toBe(native.databaseContentHash)
+      expect(await wasmPeer.operation('survivor-update')).toMatchObject({ outcome: 'accepted', author: b.publicKey })
+    } finally {
+      for (const peer of peers) await peer.close()
+      native.close(); wasm.close()
+    }
+  }, 60_000)
 
   it('executes identical histories, rejects assertions, replays a late predecessor, and reopens exact state', async () => {
     const executionManifest = createDoltLiteExecutionManifest()
