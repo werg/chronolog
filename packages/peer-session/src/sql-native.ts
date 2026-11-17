@@ -7,6 +7,7 @@ import { bytesToHex, encodeChangeProgram, executionManifestArtifacts, hexToBytes
 import { applicationDefinitionDigest, type ApplicationDefinition } from './definition.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
 import type { ApplicationSession } from './session.js'
+import { prepareApplicationSession, type ApplicationCreation, type ApplicationSessionBootstrapOptions } from './bootstrap.js'
 
 /** Exact compiled native engine and platform identity for the peer-generation SQL profile. */
 export function createNativeSqlManifest() {
@@ -47,4 +48,25 @@ export async function openNativeSqlApplication<const D extends ApplicationDefini
       bootstrapGroupId: hexToBytes(descriptor.applicationId), bootstrapProgram })
     return createDoltLiteMaterializationRuntime(materializer)
   } })
+}
+
+/** Create, join or resume SQL using the same owned bootstrap and schema authority. */
+export async function openNativeSqlSession<const D extends ApplicationDefinition>(options: Omit<ApplicationSessionBootstrapOptions<D>, 'create'> & {
+  readonly create?: Omit<ApplicationCreation, 'executionManifestDigest' | 'schemaAdministrator' | 'schema'>
+  readonly databasePath: string
+  readonly maxRecords?: number
+  readonly maxHistoryBytes?: number
+}): Promise<ApplicationSession<D>> {
+  const creation = options.create === undefined ? undefined : await prepareNativeSqlApplication({
+    applicationId: options.applicationId, definition: options.definition, schemaAdministrator: options.device.identity,
+  })
+  const prepared = await prepareApplicationSession({ device: options.device, definition: options.definition, applicationId: options.applicationId,
+    ...(options.host === undefined ? {} : { host: options.host }), ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(creation === undefined ? {} : { create: { ...options.create, executionManifestDigest: creation.binding.executionManifestDigest,
+      schemaAdministrator: creation.binding.schemaAdministrator, schema: creation.schema } }) })
+  if (prepared.schema === null) { await options.device.close(); throw new Error('APPLICATION_SCHEMA_REQUIRED') }
+  return openNativeSqlApplication({ device: options.device, definition: options.definition, authority: prepared.authority, schema: prepared.schema,
+    databasePath: options.databasePath,
+    ...(options.maxRecords === undefined ? {} : { maxRecords: options.maxRecords }),
+    ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) })
 }

@@ -4,14 +4,17 @@ import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { DeterministicMaterializer } from '@chronolog/materializer-doltlite'
 import {
-  bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant, peerDigest,
+  applicationDescriptionDigest, bytesDigest, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, MemoryPeerStore, participantGrant, peerDigest,
   signApplicationDescriptor, signApplicationSchema, signControlRevision, signTransitionRequest,
+  type GenerationRegistry,
 } from '@chronolog/peer-generation'
 import { bytesToHex, encodeChangeProgram, executionManifestArtifacts, program } from '@chronolog/protocol'
-import { applicationDefinitionDigest, defineApplication } from './definition.js'
+import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
 import { openApplicationDevice } from './device.js'
-import { createNativeSqlManifest, openNativeSqlApplication } from './sql-native.js'
-import type { ApplicationSession } from './session.js'
+import { createNativeSqlManifest, openNativeSqlApplication, openNativeSqlSession } from './sql-native.js'
+import type { ApplicationReadView, ApplicationSession } from './session.js'
+import type { ApplicationBootstrapHost, ApplicationPublication } from './bootstrap.js'
+import { openNativeDevice } from './native.js'
 
 it('rejects mismatched engines and duplicate owners before creating or disturbing durable SQL', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'peer-sql-owner-'))
@@ -66,4 +69,44 @@ it('rejects mismatched engines and duplicate owners before creating or disturbin
     await session?.close(); await device.close()
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+it('creates a signed SQL application through the canonical session opener and resumes without the host', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'peer-sql-bootstrap-')), path = join(directory, 'device.sqlite')
+  const device = await openNativeDevice({ path, create: true }), signer = await createPeerIdentity(), applicationId = 'ce'.repeat(32)
+  let session: ApplicationSession | undefined, registry: GenerationRegistry | undefined, publication: ApplicationPublication | undefined
+  const definition = defineApplication({ id: 'sql-bootstrap', version: '1', schema: program('CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL)'),
+    commands: { insert: defineCommand({ description: 'Insert an item', input: { type: 'null' }, prepare: () => program("INSERT INTO items(id,value) VALUES(1,'owned')") }) },
+    queries: { items: defineQuery({ description: 'Read items', input: { type: 'null' }, read: (view: ApplicationReadView) => view.query('SELECT id,value FROM items ORDER BY id') }) } })
+  const host: ApplicationBootstrapHost = {
+    async configureApplication(configuration) {
+      const descriptor = await signApplicationDescriptor({ applicationId, historyId: configuration.historyId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+        controlPublicKey: signer.publicKey, schemaAdministrator: configuration.schemaAdministrator, executionManifestDigest: configuration.executionManifestDigest,
+        definitionDigest: await applicationDescriptionDigest(configuration.definition), schemaDigest: await peerDigest(configuration.schema) }, signer)
+      const control = await signControlRevision({ applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1', revision: 0, previous: null,
+        epoch: configuration.epoch, keyDigest: configuration.keyDigest, recoveryFloor: null,
+        grants: [controlParticipantGrant(signer.publicKey), participantGrant(device.identity.publicKey)] }, signer)
+      registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer })
+      publication = { descriptor, definition: configuration.definition, schema: configuration.schema }
+      return registry.read()
+    },
+    async application() { if (registry === undefined) throw new Error('NOT_CONFIGURED'); return registry.read() },
+    async definition() { if (publication === undefined) throw new Error('NOT_CONFIGURED'); return publication },
+    async selectGeneration(request) { if (registry === undefined) throw new Error('NOT_CONFIGURED'); return registry.select(request) },
+  }
+  try {
+    const created = await openNativeSqlSession({ device, definition, applicationId, host, create: {}, databasePath: join(directory, 'application.db') })
+    session = created
+    const operation = await created.command('insert', null, { operationId: 'once' })
+    expect((await operation.applied()).outcome).toBe('accepted')
+    const read = await session.readView()
+    expect(read.query('SELECT id,value FROM items').rows).toEqual([[1, 'owned']]); read.release()
+    const identity = session.deviceId
+    await session.close()
+    session = await openNativeSqlSession({ device: await openNativeDevice({ path }), definition, applicationId, databasePath: join(directory, 'application.db') })
+    expect(session.deviceId).toBe(identity)
+    expect(await session.operations.get('once')).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    const resumed = await session.readView()
+    expect(resumed.query('SELECT id,value FROM items').rows).toEqual([[1, 'owned']]); resumed.release()
+  } finally { await session?.close(); await device.close(); await rm(directory, { recursive: true, force: true }) }
 })

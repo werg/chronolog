@@ -19,8 +19,9 @@ Worker. A second owner receives a busy error.
 
 ```ts
 import { defineApplication, defineCommand, defineQuery, emit, program,
-  type ApplicationReadView } from '@chronolog/peer-session'
-import { openNativeDevice, openNativeApplication } from '@chronolog/peer-session/native'
+  openApplicationSession, type ApplicationReadView } from '@chronolog/peer-session'
+import { openNativeDevice } from '@chronolog/peer-session/native'
+import { maintainNativeApplicationWebRtc } from '@chronolog/peer-session/webrtc-native'
 
 const definition = defineApplication({
   id: 'conversation', version: '1',
@@ -37,25 +38,44 @@ const definition = defineApplication({
     }),
   },
 })
-const device = await openNativeDevice({ path: './device.sqlite' })
-const session = await openNativeApplication({ device, definition, authority })
+// One-time device/application setup. Ordinary reopening omits both create flags.
+const device = await openNativeDevice({ path: './device.sqlite', create: true })
+const session = await openApplicationSession({
+  device, definition, applicationId, host: client.peers, create: {},
+})
+const network = maintainNativeApplicationWebRtc(session, { host: client.peers })
 try {
+  await network.ready
   const before = await session.query('messages', null)
   const operation = await session.command('say', { text: 'Hello' }, {
     operationId: crypto.randomUUID(), basedOn: before.revision,
   })
   const result = await operation.applied()
   console.log(result.generation, result.sequence, result.outcome)
-} finally { await session.close() }
+} finally { await network.close(); await session.close() }
 ```
 
-`authority` is the verified signed descriptor/control/generation bundle obtained
-from the configured control service. Enrolled decryption keys persist in the
-owned device store; a new reader acquires missing keys from an authorized peer.
-`applicationDefinitionDigest(definition)` binds the published
-schemas and semantic version. The event execution manifest is obtained with
+`applicationId` is the selected hosted application's ID, and `client.peers` is
+the public Tendriller client control/discovery port. First publication durably
+saves its random epoch key, immutable configuration and signed initial selection
+before sending them. Lost configuration or generation-selection replies reuse
+those exact records after device reopen. The host receives the key commitment,
+public schemas and signed controls; it never receives the plaintext epoch key.
+
+Omit the application `create` option to join an existing application after the
+administrator grants this device's public key. A new reader acquires wrapped
+keys from an authenticated current reader before replay. Its keys and verified
+application binding remain in the owned device store. Reopening the same device
+with `openApplicationSession({ device, definition, applicationId })` uses that
+cached binding without a hosted request. The maintained network learns newer
+signed controls on join/reconnect and through authenticated peer connections.
+
+`applicationDefinitionDigest(definition)` binds the published schemas and
+semantic version. The event execution manifest is
 `eventExecutionManifest('peer-generation-v1')`; a chronological manifest is a
-different execution contract and is rejected.
+different execution contract and is rejected. The lower-level
+`openPeerApplication({ device, definition, authority, epochKeys? })` accepts an
+explicit verified binding and optional bootstrap seed for embedded integrations.
 
 Only first device setup passes `{ create: true }`. Ordinary reopening omits it.
 The session owns one signed attempt journal in the device store. A disconnected
@@ -64,9 +84,9 @@ Cancelling `applied({ signal })` cancels that waiter only.
 
 ## Enrollment and epoch keys
 
-The device owns one Ed25519 identity and one durable application keyring. An
-initial creator passes `epochKeys` to the open function as explicit local
-bootstrap; normal reopening loads those keys from the owned store. A newly
+The device owns one Ed25519 identity and one durable application keyring.
+`openApplicationSession` creates and persists the initial key during explicit
+first publication; normal reopening loads it from the owned store. A newly
 granted reader can open without keys and reports `status.phase ===
 'awaiting-keys'` until it connects to another reader with the needed keys.
 
@@ -158,6 +178,21 @@ late work from surviving into its replacement. Connecting the same authenticated
 peer again closes its previous connection. Signal sends always use routes
 available when that attempt began; reconnecting never replays missed signals.
 
+The supported lifecycle is `maintainNativeApplicationWebRtc(session, { host })`
+from `/webrtc-native`, or `maintainApplicationWebRtc` with a browser-compatible
+RTC factory. It owns bounded discovery, targeted invitation listening, SDP
+rendezvous, authenticated catch-up, reconnect and eligible takeover. Directory
+hints select routes; signed controls decide membership and generation authority.
+
+Healthy connections do not consult the host for commands. Availability leases
+renew coarsely, by default at the server's refresh point within a ten-minute
+lease. An invitation listener has bounded backoff and an explicit stopped state;
+its failure does not close established data connections. `network.reconnect()`
+restarts an exhausted budget. Recovery defaults to a three-second observation
+grace and a thirty-second takeover cooldown; a current complete eligible peer
+still needs the control service to select a successor. Missing keys or an
+incomplete selected prefix never qualify as a takeover base.
+
 The `/webrtc` entry provides `connectApplicationWebRtc(session, options)` for a
 runtime with a usable RTC factory. The optional `/webrtc-native` entry supplies
 `connectNativeApplicationWebRtc(session, options)` with the exact supported
@@ -165,16 +200,23 @@ Werift implementation. Returned connections expose logical frame byte counts,
 request counts, and `rtc.getRoute()` observations. An unknown observed route
 stays unknown.
 
-In a browser, install `installApplicationWorkerTransport(session, self)` beside
-the Worker-owned session. The page calls
-`connectWorkerApplicationWebRtc(worker, { role, signaling, expectedPeerId })`.
-The helper transfers both negotiated channels synchronously, owns the dedicated
-control port, and waits for authentication and initial replay. The page retains
-the peer connection for ICE lifecycle and route diagnostics. This API requires a
-browser that supports transferring RTC data channels; unsupported browsers fail
-explicitly. Actual browser qualification is separate from native stream tests.
+In a browser, the Worker owns the device and session. The maintained page facade
+owns application calls and both-channel RTC handoff; its separate host bridge
+uses the page's existing signed-in host connection for bootstrap and recovery.
+The page owns discovery and negotiation. Keys, command preparation, materialized
+views and durable work stay in the Worker. The complete composition is below.
 
-A session with a selected recovery prefix that has not arrived reports
+For an already negotiated signaling route, the lower-level
+`connectWorkerApplicationWebRtc(worker, { role, signaling, expectedPeerId })`
+transfers both channels synchronously and waits for authentication and initial
+replay. `installApplicationWorkerTransport` remains the transport-only owner
+for integrations that deliberately omit the page application facade; do not
+install it beside `serveApplicationWorker`. Transfer requires browser support
+for transferable RTC data channels; unsupported browsers fail explicitly.
+Actual browser qualification is separate from native stream tests.
+
+`status.phase === 'awaiting-keys'` identifies a granted reader that still needs
+peer-held decryption keys. A session with a selected recovery prefix that has not arrived reports
 `status.phase === 'recovering'`. Queries fail with `PEER_RECOVERING` until a
 complete verified prefix is materialized. Change subscriptions wait for that
 first coherent view. Sessions permit at most eight simultaneously held read
@@ -183,21 +225,44 @@ and connections before closing its durable store.
 
 ## Page facade
 
-The Worker opens the device and owns the application. Installing its page facade
-also owns the RTC channel transfer bridge:
+The page exposes its existing `runtime.host.peers` through the bounded host
+bridge, then connects the application facade and maintained peer lifecycle:
 
 ```ts
-import { serveApplicationWorker } from '@chronolog/peer-session/browser'
+import { connectApplicationWorker, serveApplicationWorkerHost } from '@chronolog/peer-session/browser'
+import { maintainWorkerApplicationWebRtc } from '@chronolog/peer-session/webrtc'
 
-serveApplicationWorker(session, self, { host })
+const worker = new Worker(new URL('./application.worker.ts', import.meta.url), { type: 'module' })
+const hostBridge = serveApplicationWorkerHost(worker, runtime.host.peers)
+const session = await connectApplicationWorker<typeof definition>(worker)
+const network = maintainWorkerApplicationWebRtc(session, worker, { host: runtime.host.peers })
+await network.ready
 ```
 
-The page connects through a dedicated message port:
+The Worker waits for that control port before opening the application. This
+example performs first setup; ordinary reopening omits both `create` options:
 
 ```ts
-import { connectApplicationWorker } from '@chronolog/peer-session/browser'
+import { openApplicationSession } from '@chronolog/peer-session'
+import { connectApplicationWorkerHost, openBrowserDevice, serveApplicationWorker } from '@chronolog/peer-session/browser'
 
-const session = await connectApplicationWorker<typeof definition>(worker)
+const host = await connectApplicationWorkerHost(self)
+const device = await openBrowserDevice({ name: 'conversation', create: true })
+const session = await openApplicationSession({ device, definition, applicationId, host, create: {} })
+serveApplicationWorker(session, self, { host })
+session.signal.addEventListener('abort', () => { void host.close() }, { once: true })
+```
+
+The host bridge forwards only application lookup, definition lookup, immutable
+configuration and signed generation selection. It carries no signing keys,
+epoch keys, account credentials, commands or content. Its dedicated port bounds
+calls and JSON bytes; cancelling a host observation leaves the Worker journal's
+exact retry identity intact. Account authentication remains on the page's
+existing host connection, so a signed-in browser does not need an agent token.
+
+The page uses declared commands and queries:
+
+```ts
 const before = await session.query('messages', null)
 const operation = await session.command('say', { text: 'Hello' }, {
   operationId: crypto.randomUUID(), basedOn: before.revision,
@@ -219,11 +284,13 @@ results cross the bridge as plain records, arrays, scalar values, SQL bigints
 and `Uint8Array` bytes. Class instances, key objects and shared memory are
 rejected, and message budgets apply before posting.
 
-The optional `host` stays in the Worker for `recovery.takeover()` and
-`recovery.handover()`; ordinary commands do not call it. The bridge serves one
-page facade, bounds pending requests and pulled streams, and releases held views
+The optional Worker-side `host` handles `recovery.takeover()` and
+`recovery.handover()` through that same control port; ordinary commands do not call it. The facade serves one
+page owner, bounds pending requests and pulled streams, and releases held views
 on close. `session.close()` resolves after the Worker has released the owned
-device store, so the page can safely reopen it immediately afterward.
+device store, so the page can safely reopen it immediately afterward. On page
+retirement, await `network.close()` and `session.close()`, then call
+`hostBridge.close()` and `worker.terminate()`.
 
 The `/tendriller` entry exports `createPeerGenerationApplicationBackend()` for
 binding either an owned native session or this page facade to Tendriller's
@@ -247,8 +314,12 @@ without invalidating the application history that refers to it. Current read
 permissions are rechecked at every fetch; a reference is never a credential.
 
 `createApplicationTools(session, { host })` derives local query/command tool
-schemas from the same application definition. It exposes inspection, exact
-retry, wait, recovery inspection and explicit reapplication. A host port enables
+schemas from the same application definition, including optional `basedOn`
+revision guards. It exposes inspection, exact retry, wait, coherent change
+observation, recovery inspection and explicit reapplication. The `changes` tool
+accepts an optional `after` revision and returns one newer coalesced observation;
+a generation reset explicitly requires rereading. Cancelling its wait does not
+cancel any saved command. A host port enables
 the takeover tool. `serveApplicationToolLines(session, { input, write, host })`
 accepts bounded JSON lines such as
 `{"id":1,"tool":"command","input":{"name":"say","input":{"text":"Hello"},"operationId":"message-1"}}`.
@@ -256,44 +327,59 @@ Use `tool: "list"` for schemas and `tool: "wait"` with the operation ID for its
 current applied result. The transport creates no second identity, outbox, or
 hosted command proxy.
 
-## SQL composition
-
-The portable and ordinary browser entries are SQL-free. SQL applications use
-`openNativeSqlApplication` from `@chronolog/peer-session/sql-native` or
-`openBrowserSqlApplication` from `@chronolog/peer-session/sql-browser`. Both
-construct the same deterministic materializer under the owned device session,
-verify the signed initializer and execution identity before creating a SQL
-database, and close the materializer before releasing device storage.
-
-The native constructor takes `databasePath` and the signed `schema` alongside
-the usual `device`, `definition` and `authority` options.
-`prepareNativeSqlApplication({ applicationId, definition, schemaAdministrator })`
-returns that signed schema and the descriptor binding fields for the exact
-compiled engine. The definition must contain its initializer in `schema`.
-
-The browser constructor runs in the isolated owning Worker and takes `engineUrl`
-instead of a database path. Serve the packaged `browser-engine` directory as
-static assets with JavaScript/WASM content types and the same cross-origin
-isolation policy as the Worker. The directory URL may include or omit its final
-slash. For example:
+For a standard local MCP connection, `serveApplicationMcpLines` serves JSON-RPC
+over newline-delimited stdin/stdout using those same tools and saved operations:
 
 ```ts
-import { openBrowserSqlApplication } from '@chronolog/peer-session/sql-browser'
+import { createInterface } from 'node:readline'
+import { serveApplicationMcpLines } from '@chronolog/peer-session'
 
-const session = await openBrowserSqlApplication({
-  device, definition, authority, schema,
-  engineUrl: new URL('/chronolog-engine/', self.location.href),
+await serveApplicationMcpLines(session, {
+  input: createInterface({ input: process.stdin, crlfDelay: Infinity }),
+  write: line => { process.stdout.write(line) },
+  host: client.peers,
 })
 ```
 
-The session verifies the engine bytes and manifest, opens an OPFS handle pool
-scoped to the durable storage identity and application, and owns its lifetime.
-`createBrowserSqlManifest(buildManifest)` exposes the matching execution
-manifest for bootstrap. Native and browser peers must use that same signed
-identity; an incompatible engine fails before initializing the SQL cache.
-The database is derived from authenticated history. It does not replace the
-original encrypted records, saved operation intent, or epoch keyring.
-Irreversible effects require a separately declared protected boundary.
+It supports initialization, tool discovery, tool calls and request cancellation,
+with bounded requests and messages. A custom transport can use
+`createApplicationMcpServer(session, { host })` and its `handle`/`close` methods.
+The MCP adapter shares the application identity, declared input schemas,
+revision guards, recovery journal and command journal. Cancelling an applied or
+change observation leaves previously saved work available for inspection and
+exact retry.
+
+## SQL applications
+
+The portable and `/browser` entries remain SQL-free. A native SQL application
+uses `openNativeSqlSession({ device, definition, applicationId, host, create: {},
+databasePath })` from `/sql-native`. Its literal `definition.schema` is signed
+by the creating device and pinned in the application descriptor; the helper
+prepares that envelope, publishes it and initializes the protected genesis.
+Ordinary lossy commands cannot perform schema or permission changes. Joining or
+reopening omits `create` and uses the published or cached schema. Reopening also
+omits `host` when the device has a cached verified binding.
+
+Browser SQL uses `openBrowserSqlSession({ device, definition, applicationId,
+host, create: {}, engineUrl })` from the optional `/sql-browser` entry inside the
+isolated owning Worker. As in native SQL, omit `create` for joining or reopening.
+Serve the packaged `browser-engine` directory as static assets with
+JavaScript/WASM content types and the same cross-origin isolation policy as the
+Worker. The engine directory URL may include or omit its final slash. The
+session verifies the engine bytes and execution identity before opening its
+OPFS pool, scopes the database to the device and application, and waits for the
+pool to release its handles before closing device storage. Both SQL paths authenticate the same
+peer-generation engine profile. `prepareApplicationSession` and the explicit
+SQL openers remain available for custom engine/provider composition; callers do
+not implement control signing or bootstrap retry journals.
+
+Shared SQL rows can use `APPLICATION_COLLECTIVE_ID` ownership when the domain
+permits every currently authorized application member to edit them. Signed
+controls define its current data roles, so creator departure does not freeze
+shared data and data-role revocation survives history rollback. Private row
+ownership remains tied to its actual author. Irreversible effects require a
+separately declared protected boundary.
+
 
 ## Build a packed preview
 
@@ -305,13 +391,16 @@ Use `--native-rtc` to include the optional native RTC entry. That archive declar
 the exact `werift@0.27.0` peer dependency; the default archive has no runtime
 package dependencies and remains SQL-free.
 
-Use `--sql-native` for the native SQL entry and exact compiled patched addon.
-That archive is bound to the build platform and architecture. Use
-`--sql-browser artifacts/wasm` after `tools/build-wasm-engine.mjs` to include the
-browser SQL entry and its four engine assets. The packaging gate checks the WASM
-digest, source identity, deterministic hooks and runtime versions against the
-native build, then records every asset hash in provenance. Combine both flags
-when qualifying browser/native peers on the same execution profile.
+Use `--sql-native` to include the exact compiled native SQL engine and the
+`/sql-native` entry. Its provenance records the engine manifest, patch digest,
+platform and architecture. Qualify that artifact on the intended native target;
+a native result does not establish browser/WASM or deployed-network behavior.
+
+Use `--sql-browser artifacts/wasm` after `tools/build-wasm-engine.mjs` to include
+the browser SQL entry and its four engine assets. The packaging gate checks the
+WASM digest, source identity, deterministic hooks and runtime versions against
+the native build, then records every asset hash in provenance. Combine it with
+`--sql-native` when qualifying browser/native peers on the same execution profile.
 
 `node tools/test-peer-session-sql.mjs --artifact /path/to/archive.tgz` installs
 the native SQL archive into an empty independent project and exercises shared
