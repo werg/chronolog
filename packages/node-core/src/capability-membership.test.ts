@@ -2,7 +2,6 @@ import type {
   CapabilityGrant,
   CapabilitySnapshot,
   EffectiveCapability,
-  EffectivePolicy,
   ValidationPolicy,
 } from '@chronolog/capabilities'
 import type { StoredAttestation } from '@chronolog/control-store'
@@ -66,7 +65,6 @@ function snapshot(
   overrides: Partial<CapabilitySnapshot> = {},
 ): CapabilitySnapshot {
   const all = [...Object.values(capabilities), ...extra]
-  const effective: EffectivePolicy = { id: policyId, policy: validationPolicy, installedAtRevision: 1n }
   return { encryptionEpoch: 0n,
     groupId,
     revision: REVISION,
@@ -74,8 +72,7 @@ function snapshot(
     rootAdminPublicKey: bytes(0x90),
     capabilityLogFeed: bytes(0x91),
     capabilities: new Map(all.map((item) => [bytesToHex(item.id), item])),
-    policies: new Map([[bytesToHex(policyId), effective]]),
-    validatorFloorMs: 0n,
+    policies: new Map([[bytesToHex(policyId), validationPolicy]]),
     ...overrides,
   }
 }
@@ -384,14 +381,14 @@ describe('CapabilityMembershipResolver watermark policy', () => {
   })
 
   it('enumerates every authenticated policy for a safe global live frontier', async () => {
-    const two = snapshot(), one = { id: unknownPolicyId, policy: policy({ minimumValidators: 1n }), installedAtRevision: 1n }
-    const value = { ...two, policies: new Map([...two.policies, [bytesToHex(one.id), one]]) }
+    const two = snapshot(), one = policy({ minimumValidators: 1n })
+    const value = { ...two, policies: new Map([...two.policies, [bytesToHex(unknownPolicyId), one]]) }
     let revisions = [{ membershipRevision: revisionDigest, authorTimeAfterMs: -1n }]
     const resolver = resolverFor(value, { finalityRevisions: () => revisions })
     expect(await resolver.admissionScopes({ groupId })).toEqual([{
       membershipRevision: revisionDigest, authorTimeAfterMs: -1n, policies: [
         { kind: 'threshold', policyId: bytesToHex(policyId), validatorIds: [...validatorKeys], threshold: 2 },
-        { kind: 'threshold', policyId: bytesToHex(one.id), validatorIds: [...validatorKeys], threshold: 1 },
+        { kind: 'threshold', policyId: bytesToHex(unknownPolicyId), validatorIds: [...validatorKeys], threshold: 1 },
       ],
     }])
     expect(await resolver.admissionScopes({ groupId: otherGroupId })).toBeNull()

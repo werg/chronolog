@@ -107,7 +107,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
 
   async threshold(context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>): Promise<number> {
     const snapshot = await this.#snapshot(context)
-    const policy = snapshot?.policies.get(bytesToHex(context.validationPolicy))?.policy
+    const policy = snapshot?.policies.get(bytesToHex(context.validationPolicy))
     if (!policy || policy.minimumValidators > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER
     return Number(policy.minimumValidators)
   }
@@ -116,7 +116,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     context: Omit<CandidateAdmissionContext, 'validatorId' | 'validatorCapability'>,
   ): Promise<bigint> {
     const snapshot = await this.#snapshot(context)
-    return snapshot?.policies.get(bytesToHex(context.validationPolicy))?.policy.version ?? -1n
+    return snapshot?.policies.get(bytesToHex(context.validationPolicy))?.version ?? -1n
   }
 
   async canHeartbeat(context: ValidatorAuthorityContext): Promise<boolean> {
@@ -161,7 +161,7 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     attestations: readonly StoredAttestation[],
   ): Promise<readonly StoredAttestation[]> {
     const snapshot = await this.#snapshot(context)
-    const policy = snapshot?.policies.get(bytesToHex(context.validationPolicy))?.policy
+    const policy = snapshot?.policies.get(bytesToHex(context.validationPolicy))
     if (!snapshot || !policy) return []
     const indexed = new Map<string, { readonly evidence: ValidatorEvidence; readonly attestation: StoredAttestation }>()
     for (const attestation of attestations) {
@@ -199,9 +199,9 @@ export class CapabilityMembershipResolver implements MembershipResolver {
       ...(core.writerCapability === undefined ? {} : { writerCapability: core.writerCapability }),
     }
     const snapshot = await this.#snapshot(context)
-    const effective = snapshot?.policies.get(bytesToHex(core.validationPolicy))
-    if (!snapshot || !effective) return null
-    return this.#watermarkPolicies(snapshot)?.find(item => item.policyId === bytesToHex(effective.id)) ?? null
+    const policyId = bytesToHex(core.validationPolicy)
+    if (!snapshot?.policies.has(policyId)) return null
+    return this.#watermarkPolicies(snapshot)?.find(item => item.policyId === policyId) ?? null
   }
 
   #watermarkPolicies(snapshot: CapabilitySnapshot): readonly WatermarkPolicy[] | null {
@@ -211,10 +211,10 @@ export class CapabilityMembershipResolver implements MembershipResolver {
     const validatorIds = validators.map((capability) => capability.grant.signingPublicKey.slice())
     if (new Set(validatorIds.map(bytesToHex)).size !== validatorIds.length) return null
     const policies: WatermarkPolicy[] = []
-    for (const effective of snapshot.policies.values()) {
-      const threshold = Number(effective.policy.minimumValidators)
+    for (const [policyId, policy] of snapshot.policies) {
+      const threshold = Number(policy.minimumValidators)
       if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > validators.length) return null
-      policies.push({ kind: 'threshold', policyId: bytesToHex(effective.id), validatorIds, threshold })
+      policies.push({ kind: 'threshold', policyId, validatorIds, threshold })
     }
     return policies
   }

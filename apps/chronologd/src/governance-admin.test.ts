@@ -17,7 +17,6 @@ describe('governance admin RPC adapter', () => {
         issuerRootPublicKey: snapshot.rootAdminPublicKey,
         grants: (change.grants ?? []).map((grant) => ({ ...grant, validFromRevision: 4n })),
         revocations: [],
-        validationPolicies: [],
       },
       signature: bytes(99),
     }))
@@ -92,7 +91,6 @@ function capabilitySnapshot(): CapabilitySnapshot {
       grantedAtRevision: 0n,
     }]]),
     policies: new Map(),
-    validatorFloorMs: 0n,
   }
 }
 

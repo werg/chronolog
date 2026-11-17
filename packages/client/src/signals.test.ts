@@ -16,7 +16,7 @@ describe('public live signal client', () => {
         validFromRevision: 0n, hpkePublicKey: new Uint8Array(32) } },
     ]
     const snapshot: CapabilitySnapshot = { encryptionEpoch: 0n, groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
-      capabilityLogFeed: new Uint8Array(32), capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), validatorFloorMs: 0n }
+      capabilityLogFeed: new Uint8Array(32), capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map() }
     const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, trySend: async () => { return true } })
     const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, trySend: async frame => { await receiver.receive(frame); return true } })
     // Deliberately no authoring, SQL, operation or finality service exists here.

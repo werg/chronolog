@@ -3,9 +3,12 @@ import { assertCanonicalCbor, encodeCanonicalCbor, generateEd25519KeyPair, type 
 import {
   applyCapabilityRevision,
   capabilityId,
+  capabilityCodecInternals,
+  decodeCapabilityRevision,
   decodeGenesisManifest,
   decodeSignedGenesis,
   encodeGenesisManifest,
+  encodeCapabilityRevision,
   encodeSignedGenesis,
   isCapabilityActive,
   reduceCapabilityLog,
@@ -48,7 +51,7 @@ function revisionAfter(
 ): CapabilityRevision {
   return { encryptionEpoch: f.snapshot.encryptionEpoch,
     groupId: f.snapshot.groupId, revision: f.snapshot.revision + 1n, previousRevisionDigest: f.snapshot.revisionDigest,
-    issuerRootPublicKey: f.root.publicKeyBytes, grants: [], revocations: [], validationPolicies: [], ...overrides,
+    issuerRootPublicKey: f.root.publicKeyBytes, grants: [], revocations: [], ...overrides,
   }
 }
 
@@ -138,7 +141,7 @@ describe('capability revision chain', () => {
     await expect(applyCapabilityRevision(f.snapshot, swapped)).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
   })
 
-  it('rejects unknown and repeated revocations, early grants, duplicates and repeated policies', async () => {
+  it('rejects unknown and repeated revocations, early grants and duplicates', async () => {
     const f = await fixture()
     const writerId = await capabilityId(writer)
     const extra: CapabilityGrant = { ...writer, subjectId: bytes(51), signingPublicKey: bytes(51), validFromRevision: 1n }
@@ -148,51 +151,44 @@ describe('capability revision chain', () => {
     await expect(sign(revisionAfter(f, { revocations: [bytes(98)] }))).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
     await expect(sign(revisionAfter(f, { grants: [{ ...extra, validFromRevision: 5n }] }))).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
     await expect(sign(revisionAfter(f, { grants: [extra, extra] }))).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
-    await expect(sign(revisionAfter(f, { validationPolicies: [policy] }))).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
 
     const revoked = await sign(revisionAfter(f, { revocations: [writerId] }))
     await expect(sign(revisionAfter({ snapshot: revoked, root: f.root }, { revocations: [writerId] }), revoked))
       .rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
   })
 
-  it('prevents a later-granted validator from reopening closed timestamp history', async () => {
+  it('rejects validator grants at both revision encoding and decoding boundaries', async () => {
     const f = await fixture()
-    const lowFloor = validatorAt(22, 1n, 500n)
-    const signed = await signCapabilityRevision(revisionAfter(f, { grants: [lowFloor] }), f.root.privateKey)
-    await expect(applyCapabilityRevision(f.snapshot, signed)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
+    const validator = validatorAt(22, 1n, 2_000n)
+    const invalid = { ...revisionAfter(f), grants: [validator] } as unknown as CapabilityRevision
+    expect(() => encodeCapabilityRevision(invalid)).toThrow('Validator capabilities are fixed by genesis')
+    const fields = assertCanonicalCbor(encodeCapabilityRevision(revisionAfter(f)))
+    if (!(fields instanceof Map)) throw new Error('REVISION_MAP_REQUIRED')
+    fields.set(5n, [capabilityCodecInternals.grantToCbor(validator)])
+    expect(() => decodeCapabilityRevision(encodeCanonicalCbor(fields))).toThrow('Validator capabilities are fixed by genesis')
   })
 
-  it('keeps the floor of a validator revoked in the same revision that grants a lower-floor one', async () => {
+  it('rejects validator revocations even with an authentic root signature', async () => {
     const f = await fixture()
-    const highFloorId = await capabilityId(validatorAt(21, 0n, 1_000n))
-    const swap = await signCapabilityRevision(
-      revisionAfter(f, { revocations: [highFloorId], grants: [validatorAt(22, 1n, 500n)] }),
-      f.root.privateKey,
-    )
-    await expect(applyCapabilityRevision(f.snapshot, swap)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
-    const flooredSwap = await signCapabilityRevision(
-      revisionAfter(f, { revocations: [highFloorId], grants: [validatorAt(22, 1n, 1_000n)] }),
-      f.root.privateKey,
-    )
-    expect((await applyCapabilityRevision(f.snapshot, flooredSwap)).revision).toBe(1n)
+    const validatorId = await capabilityId(validatorAt(21, 0n, 1_000n))
+    const signed = await signCapabilityRevision(revisionAfter(f, { revocations: [validatorId] }), f.root.privateKey)
+    await expect(applyCapabilityRevision(f.snapshot, signed)).rejects.toThrow('Validator capabilities are fixed by genesis')
+    expect(f.snapshot.revision).toBe(0n)
+    expect([...f.snapshot.capabilities.values()].filter(item => item.grant.role === 'validator')).toHaveLength(1)
   })
 
-  it('keeps the floor after every validator is revoked in an earlier revision', async () => {
+  it('accepts only the membership revision wire and rejects policy fields and prior versions', async () => {
     const f = await fixture()
-    const highFloorId = await capabilityId(validatorAt(21, 0n, 1_000n))
-    const emptied = await applyCapabilityRevision(f.snapshot, await signCapabilityRevision(
-      revisionAfter(f, { revocations: [highFloorId] }),
-      f.root.privateKey,
-    ))
-    expect(emptied.validatorFloorMs).toBe(1_000n)
-    const next = { snapshot: emptied, root: f.root }
-    const lowered = await signCapabilityRevision(revisionAfter(next, { grants: [validatorAt(22, 2n, 500n)] }), f.root.privateKey)
-    await expect(applyCapabilityRevision(emptied, lowered)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
-    const raised = await applyCapabilityRevision(emptied, await signCapabilityRevision(
-      revisionAfter(next, { grants: [validatorAt(22, 2n, 2_000n)] }),
-      f.root.privateKey,
-    ))
-    expect(raised.validatorFloorMs).toBe(2_000n)
+    const revision = revisionAfter(f)
+    const fields = assertCanonicalCbor(encodeCapabilityRevision(revision))
+    if (!(fields instanceof Map)) throw new Error('REVISION_MAP_REQUIRED')
+    expect(fields.get(0n)).toBe(2n)
+    expect(decodeCapabilityRevision(encodeCanonicalCbor(fields))).toEqual(revision)
+    fields.set(8n, [[2n, 1n]])
+    expect(() => decodeCapabilityRevision(encodeCanonicalCbor(fields))).toThrow()
+    fields.delete(8n)
+    fields.set(0n, 1n)
+    expect(() => decodeCapabilityRevision(encodeCanonicalCbor(fields))).toThrow()
   })
 
   it('advances encryption identity with the signed revision and rejects gaps or reopening', async () => {

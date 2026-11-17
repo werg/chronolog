@@ -98,7 +98,7 @@ it('keeps the authenticated durable session after live congestion and dispatches
       program: { sql: false, topics: [], signals: ['typing'] } } })
   const snapshot: CapabilitySnapshot = { groupId: new Uint8Array(32).fill(5), revision: 0n, revisionDigest: new Uint8Array(32).fill(6),
     rootAdminPublicKey: identities[0].publicKeyBytes, capabilityLogFeed: new Uint8Array(32).fill(7),
-    capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), validatorFloorMs: 0n, encryptionEpoch: 0n }
+    capabilities: new Map(grants.map(grant => [bytesToHex(grant.id), grant])), policies: new Map(), encryptionEpoch: 0n }
   const transports = await Promise.all(identities.map(async identity => new PortableFeedTransport({
     store: await DurableFeedStore.open(new MemoryOperationStore(), webFeedCrypto), crypto: webFeedCrypto,
     signer: webFeedSigner(feedIdFromPublicKey(identity.publicKeyBytes), identity.privateKey),

@@ -24,7 +24,8 @@ interface CapabilityIdentity {
 /** Membership administration belongs to the signed root key, not a grant role. */
 export type CapabilityGrantInput = CapabilityIdentity & (
   | { readonly role: 'writer'; readonly program: ProgramRights }
-  | { readonly role: 'reader' | 'validator'; readonly program?: never }
+  | { readonly role: 'reader'; readonly program?: never }
+  | { readonly role: 'validator'; readonly program?: never }
 )
 
 export type CapabilityGrant = CapabilityGrantInput & { readonly validFromRevision: bigint }
@@ -93,9 +94,8 @@ export interface CapabilityRevision {
   readonly revision: bigint
   readonly previousRevisionDigest: Uint8Array
   readonly issuerRootPublicKey: Uint8Array
-  readonly grants: readonly CapabilityGrant[]
+  readonly grants: readonly (CapabilityGrant & { readonly role: 'reader' | 'writer' })[]
   readonly revocations: readonly Uint8Array[]
-  readonly validationPolicies: readonly ValidationPolicy[]
   /** Retain the current epoch or advance it by one in this same authority transition. */
   readonly encryptionEpoch: bigint
 }
@@ -112,12 +112,6 @@ export interface EffectiveCapability {
   readonly revokedAtRevision?: bigint
 }
 
-export interface EffectivePolicy {
-  readonly id: Uint8Array
-  readonly policy: ValidationPolicy
-  readonly installedAtRevision: bigint
-}
-
 export interface CapabilitySnapshot {
   readonly groupId: Uint8Array
   readonly revision: bigint
@@ -125,15 +119,10 @@ export interface CapabilitySnapshot {
   readonly rootAdminPublicKey: Uint8Array
   readonly capabilityLogFeed: Uint8Array
   readonly capabilities: ReadonlyMap<string, EffectiveCapability>
-  readonly policies: ReadonlyMap<string, EffectivePolicy>
+  /** Fixed genesis policies, indexed by the hexadecimal policy digest. */
+  readonly policies: ReadonlyMap<string, ValidationPolicy>
   /** Genesis authorizes epoch zero; later epochs activate with their containing revision. */
   readonly encryptionEpoch: bigint
-  /**
-   * Highest minimum author timestamp ever granted to a validator. It only rises:
-   * revoking validators never lowers it, so closed history cannot be
-   * reopened by membership changes. Admitting older history requires a fork.
-   */
-  readonly validatorFloorMs: bigint
 }
 
 export interface ValidatorEvidence {

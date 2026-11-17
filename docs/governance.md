@@ -343,9 +343,13 @@ another enrolled feed requires `forwarded: true`; its default is denied.
 `grantCapability` accepts reader/writer grants and governance status returns the
 same rights for each writer, so an agent can inspect the permission it is requesting.
 Validator grants and their timestamp floors belong to signed genesis, not live
-mutation requests. The live `CapabilityChange` input likewise contains only
-reader/writer grants and revocations; received signed revisions still undergo
-the fixed-validator and fixed-policy checks.
+mutation requests. The live `CapabilityChange` input contains only reader/writer
+grants and revocations. The signed revision wire likewise permits only those
+membership changes and the encryption epoch; it has no policy-installation or
+validator-grant field. Its codecs reject unsupported grants and fields, and the
+shared reducer rejects revoking a genesis validator. These invariants apply
+equally to authored changes and root-signed records received from peers or a
+signed-inclusion provider. Genesis policies remain fixed across revisions.
 One exact grant must cover a program; rights from several grants are not pooled.
 
 Live enrollment selects reader/writer grants with explicit `writerProgram`

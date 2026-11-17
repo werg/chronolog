@@ -1,4 +1,6 @@
 import {
+  capabilityCodecInternals,
+  encodeCapabilityRevision,
   encodeSignedCapabilityRevision,
   signCapabilityRevision,
   signGenesis,
@@ -9,7 +11,8 @@ import {
   type ValidationPolicy,
 } from '@chronolog/capabilities'
 import { createEpochManifest, encodeSignedEpochManifest, generateX25519KeyPair } from '@chronolog/crypto'
-import { DOMAINS, encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair, signDomain } from '@chronolog/protocol'
+import { DOMAINS, assertCanonicalCbor, encodeCanonicalCbor, encodeEnvelope, generateEd25519KeyPair,
+  integerMap, signDomain, type CborValue } from '@chronolog/protocol'
 import { MemoryTransportNetwork } from '@chronolog/transport-ssb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -35,23 +38,36 @@ describe('replicated governance control plane', () => {
       controllers.push(received, canonical)
       const initial = received.snapshot, activation = new GovernanceActivationIndex(canonical.snapshot)
       const validator = [...initial.capabilities.values()].find(capability => capability.grant.role === 'validator')!
-      const changes: Record<typeof change, Partial<CapabilityRevision>> = {
-        policy: { validationPolicies: [{ version: 2n, minimumValidators: 1n }] },
-        'validator-grant': { grants: [{ ...grant(bytes32(102), 'validator', { minimumAuthorTimestampMs: 0n }), validFromRevision: 1n }] },
-        'validator-revoke': { revocations: [validator.id] },
+      const changes: Record<typeof change, (wire: Map<CborValue, CborValue>) => void> = {
+        policy: wire => { wire.set(8n, [[2n, 1n]]) },
+        'validator-grant': wire => { wire.set(5n, [capabilityCodecInternals.grantToCbor({
+          ...grant(bytes32(102), 'validator', { minimumAuthorTimestampMs: 0n }), validFromRevision: 1n,
+        })]) },
+        'validator-revoke': wire => { wire.set(6n, [validator.id]) },
       }
       const log = await ReferenceRecordLog.open('h_0123456789abcdef0123456789abcdef', new MemoryOperationStore())
-      const publish = async (fields: Partial<CapabilityRevision>) => {
-        const signed = await signCapabilityRevision({ encryptionEpoch: 0n, groupId: f.groupId, revision: 1n,
+      const publish = async (fields: Partial<CapabilityRevision>, mutate?: (wire: Map<CborValue, CborValue>) => void) => {
+        let revisionBytes = encodeCapabilityRevision({ encryptionEpoch: 0n, groupId: f.groupId, revision: 1n,
           previousRevisionDigest: initial.revisionDigest, issuerRootPublicKey: f.root.publicKeyBytes,
-          grants: [], revocations: [], validationPolicies: [], ...fields }, f.root.privateKey)
-        const payload = encodeCanonicalCbor([1n, encodeSignedCapabilityRevision(signed)])
+          grants: [], revocations: [], ...fields })
+        if (mutate !== undefined) {
+          const wire = assertCanonicalCbor(revisionBytes)
+          if (!(wire instanceof Map)) throw new Error('REVISION_MAP_REQUIRED')
+          mutate(wire)
+          revisionBytes = encodeCanonicalCbor(wire)
+        }
+        // Sign the injected bytes directly: the supported encoder refuses these
+        // mutations, but authenticated hostile controls must also fail on receipt.
+        const signedBytes = encodeCanonicalCbor(integerMap([
+          [0, 1n], [1, revisionBytes], [2, await signDomain(DOMAINS.capabilityRevision, revisionBytes, f.root.privateKey)],
+        ]))
+        const payload = encodeCanonicalCbor([1n, signedBytes])
         const signature = await signDomain(DOMAINS.capabilityRevision, payload, f.root.privateKey)
         const envelope = encodeEnvelope({ groupRoute: f.groupRoute, messageType: 'capability', encryptionEpoch: null,
           payload: encodeCanonicalCbor([1n, payload, f.root.publicKeyBytes, signature]) })
         return { record: await f.adminTransport.publish(envelope), entry: await log.append((await createLedgerRecord(envelope)).recordBytes) }
       }
-      const invalid = await publish(changes[change])
+      const invalid = await publish({}, changes[change])
       const receivedError = await received.ingest(invalid.record).catch((error: unknown) => error)
       const canonicalError = await canonical.ingestFinalized(invalid.entry, activation.activeSnapshot, 100n).catch((error: unknown) => error)
       expect(isInvalidGovernanceRecord(receivedError)).toBe(true)
@@ -82,7 +98,7 @@ describe('replicated governance control plane', () => {
       return log.append((await createLedgerRecord(envelope)).recordBytes)
     }
     const future = { encryptionEpoch: 0n, groupId: f.groupId, revision: 999n, previousRevisionDigest: bytes32(90),
-      issuerRootPublicKey: f.root.publicKeyBytes, grants: [], revocations: [], validationPolicies: [] }
+      issuerRootPublicKey: f.root.publicKeyBytes, grants: [], revocations: [] }
     const forged = await appendControl('capability', encodeSignedCapabilityRevision(await signCapabilityRevision(future, attacker.privateKey)), attacker)
     await expect(participant.ingestFinalized(forged, activation.activeSnapshot, 100n)).rejects.toThrow('GOVERNANCE_REVISION_CONFLICT')
     const misplaced = await appendControl('capability', encodeSignedCapabilityRevision(await signCapabilityRevision(future, f.root.privateKey)))
@@ -431,12 +447,17 @@ async function governanceFixture(operationStore?: DurableOperationStore) {
   return { network, root, rootHpke, adminTransport, genesis, admin, groupId, groupRoute, policy }
 }
 
-function grant<Role extends 'reader' | 'validator'>(
+type GrantOptions = { readonly transportAuthor?: string; readonly minimumAuthorTimestampMs?: bigint; readonly hpkePublicKey?: Uint8Array }
+
+function grant(signingPublicKey: Uint8Array, role: 'reader', options?: GrantOptions): CapabilityGrantInput & { readonly role: 'reader' }
+function grant(signingPublicKey: Uint8Array, role: 'validator', options?: GrantOptions): CapabilityGrantInput & { readonly role: 'validator' }
+function grant(
   signingPublicKey: Uint8Array,
-  role: Role,
-  options: { readonly transportAuthor?: string; readonly minimumAuthorTimestampMs?: bigint; readonly hpkePublicKey?: Uint8Array } = {},
-): CapabilityGrantInput & { readonly role: Role } {
-  return { subjectId: signingPublicKey, signingPublicKey, role, ...options }
+  role: 'reader' | 'validator',
+  options: GrantOptions = {},
+): CapabilityGrantInput {
+  const identity = { subjectId: signingPublicKey, signingPublicKey, ...options }
+  return role === 'reader' ? { ...identity, role: 'reader' } : { ...identity, role: 'validator' }
 }
 
 function sqlWriter(signingPublicKey: Uint8Array, options: { readonly transportAuthor?: string } = {}): CapabilityGrantInput & { readonly role: 'writer' } {

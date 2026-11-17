@@ -30,7 +30,7 @@ export function activeCapabilityById(
 }
 
 export function policyById(snapshot: CapabilitySnapshot, id: Uint8Array): ValidationPolicy | undefined {
-  return snapshot.policies.get(bytesToHex(id))?.policy
+  return snapshot.policies.get(bytesToHex(id))
 }
 
 export function canAuthorTransaction(snapshot: CapabilitySnapshot, core: TransactionCore): boolean {

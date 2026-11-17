@@ -5,6 +5,7 @@ import {
   encodeCanonicalCbor,
   equalBytes,
   hashDomain,
+  hexToBytes,
   integerMap,
   protocolInvariant,
   signDomain,
@@ -21,7 +22,6 @@ import type {
   CapabilityGrant,
   CapabilitySnapshot,
   EffectiveCapability,
-  EffectivePolicy,
   GenesisManifest,
   SignedCapabilityRevision,
   SignedGenesis,
@@ -67,11 +67,11 @@ async function genesisSnapshot(genesis: SignedGenesis): Promise<CapabilitySnapsh
     protocolInvariant(!capabilities.has(bytesToHex(id)), 'SCHEMA_INVALID', 'Genesis contains a duplicate capability')
     capabilities.set(bytesToHex(id), { id, grant, grantedAtRevision: 0n })
   }
-  const policies = new Map<string, EffectivePolicy>()
+  const policies = new Map<string, ValidationPolicy>()
   for (const policy of manifest.validationPolicies) {
     const id = await validationPolicyId(policy)
     protocolInvariant(!policies.has(bytesToHex(id)), 'SCHEMA_INVALID', 'Genesis contains a duplicate policy')
-    policies.set(bytesToHex(id), { id, policy, installedAtRevision: 0n })
+    policies.set(bytesToHex(id), policy)
   }
   return {
     groupId: manifest.groupId,
@@ -82,15 +82,7 @@ async function genesisSnapshot(genesis: SignedGenesis): Promise<CapabilitySnapsh
     capabilities,
     policies,
     encryptionEpoch: 0n,
-    validatorFloorMs: raiseValidatorFloor(0n, manifest.initialCapabilities),
   }
-}
-
-function raiseValidatorFloor(floor: bigint, grants: readonly CapabilityGrant[]): bigint {
-  return grants.reduce((maximum, grant) => {
-    const granted = grant.role === 'validator' ? grant.minimumAuthorTimestampMs ?? 0n : 0n
-    return granted > maximum ? granted : maximum
-  }, floor)
 }
 
 export async function reduceCapabilityLog(
@@ -125,23 +117,15 @@ export async function applyCapabilityRevision(
       const key = bytesToHex(revokedId)
       const active = capabilities.get(key)
       protocolInvariant(active !== undefined, 'SCHEMA_INVALID', 'Capability revision revokes an unknown capability')
+      protocolInvariant(active.grant.role !== 'validator', 'SCHEMA_INVALID', 'Validator capabilities are fixed by genesis')
       protocolInvariant(active.revokedAtRevision === undefined, 'SCHEMA_INVALID', 'Capability is already revoked')
       capabilities.set(key, { ...active, revokedAtRevision: revision.revision })
     }
     for (const grant of revision.grants) {
       protocolInvariant(grant.validFromRevision === revision.revision, 'SCHEMA_INVALID', 'New capability must begin at its containing revision')
-      if (grant.role === 'validator') {
-        protocolInvariant((grant.minimumAuthorTimestampMs ?? -1n) >= snapshot.validatorFloorMs, 'SCHEMA_INVALID', 'New validator would reopen closed timestamp history')
-      }
       const id = await capabilityId(grant)
       protocolInvariant(!capabilities.has(bytesToHex(id)), 'SCHEMA_INVALID', 'Capability revision contains a duplicate grant')
       capabilities.set(bytesToHex(id), { id, grant, grantedAtRevision: revision.revision })
-    }
-    const policies = new Map(snapshot.policies)
-    for (const policy of revision.validationPolicies) {
-      const id = await validationPolicyId(policy)
-      protocolInvariant(!policies.has(bytesToHex(id)), 'SCHEMA_INVALID', 'Capability revision repeats an existing policy')
-      policies.set(bytesToHex(id), { id, policy, installedAtRevision: revision.revision })
     }
     const revisionDigest = await capabilityRevisionDigest(revision)
     return {
@@ -150,8 +134,6 @@ export async function applyCapabilityRevision(
       revisionDigest,
       encryptionEpoch: revision.encryptionEpoch,
       capabilities,
-      policies,
-      validatorFloorMs: raiseValidatorFloor(snapshot.validatorFloorMs, revision.grants),
     }
 }
 
@@ -181,31 +163,24 @@ export function hasRole(
 
 export async function capabilitySnapshotDigest(snapshot: CapabilitySnapshot): Promise<Uint8Array> {
   const entries = [...snapshot.capabilities.values()].sort((a, b) => compareBytes(a.id, b.id))
-  const policies = [...snapshot.policies.values()].sort((a, b) => compareBytes(a.id, b.id))
+  const policies = [...snapshot.policies].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
   const value = integerMap([
     [0, snapshot.groupId], [1, snapshot.revision], [2, snapshot.revisionDigest],
     [3, snapshot.rootAdminPublicKey], [4, snapshot.capabilityLogFeed],
-    [5, entries.map((entry) => (awaitImportHackGrant(entry)))],
-    [6, policies.map((entry) => (awaitImportHackPolicy(entry)))],
-    [7, snapshot.validatorFloorMs],
-    [8, snapshot.encryptionEpoch],
+    [5, entries.map(effectiveCapabilityToCbor)],
+    [6, policies.map(([id, policy]) => integerMap([
+      [0, capabilityCodecInternals.policyToCbor(policy)], [1, hexToBytes(id)],
+    ]))],
+    [7, snapshot.encryptionEpoch],
   ])
   return hashDomain(DOMAINS.capabilitySnapshot, encodeCanonicalCbor(value))
 }
 
-function awaitImportHackGrant(entry: EffectiveCapability) {
+function effectiveCapabilityToCbor(entry: EffectiveCapability) {
   return integerMap([
     [0, capabilityCodecInternals.grantToCbor(entry.grant)],
     [1, entry.id],
     [2, entry.grantedAtRevision],
     [3, entry.revokedAtRevision],
-  ])
-}
-
-function awaitImportHackPolicy(entry: EffectivePolicy) {
-  return integerMap([
-    [0, capabilityCodecInternals.policyToCbor(entry.policy)],
-    [1, entry.id],
-    [2, entry.installedAtRevision],
   ])
 }

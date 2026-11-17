@@ -92,7 +92,7 @@ async function fixture() {
   const genesis: CapabilitySnapshot = { encryptionEpoch: 0n,
     groupId: bytes(1), revision: 0n, revisionDigest: bytes(2), rootAdminPublicKey: bytes(3),
     capabilityLogFeed: bytes(4), capabilities: new Map(effective.map((item) => [bytesToHex(item.id), item])),
-    policies: new Map(), validatorFloorMs: 0n,
+    policies: new Map(),
   }
   const next = { ...genesis, revision: 1n, revisionDigest: bytes(5) }
   const context = { groupId: genesis.groupId, membershipRevision: genesis.revisionDigest, validationPolicy: bytes(6), writerId: bytes(7) }

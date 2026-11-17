@@ -272,10 +272,21 @@ function revisionToCbor(value: CapabilityRevision): CborValue {
   protocolInvariant(value.issuerRootPublicKey.length === 32, 'SCHEMA_INVALID', 'Revision issuer key must contain 32 bytes')
   protocolInvariant(typeof value.encryptionEpoch === 'bigint' && value.encryptionEpoch >= 0n, 'SCHEMA_INVALID', 'Revision requires an encryption epoch')
   return integerMap([
-    [0, 1n], [1, value.groupId], [2, value.revision], [3, value.previousRevisionDigest],
-    [4, value.issuerRootPublicKey], [5, value.grants.map(grantToCbor)], [6, value.revocations],
-    [7, value.validationPolicies.map(policyToCbor)], [8, value.encryptionEpoch],
+    [0, 2n], [1, value.groupId], [2, value.revision], [3, value.previousRevisionDigest],
+    [4, value.issuerRootPublicKey], [5, value.grants.map(revisionGrantToCbor)], [6, value.revocations],
+    [7, value.encryptionEpoch],
   ])
+}
+
+function revisionGrantToCbor(grant: CapabilityGrant): CborValue {
+  protocolInvariant(grant.role !== 'validator', 'SCHEMA_INVALID', 'Validator capabilities are fixed by genesis')
+  return grantToCbor(grant)
+}
+
+function revisionGrantFromCbor(value: CborValue, field: string): CapabilityRevision['grants'][number] {
+  const grant = grantFromCbor(value, field)
+  protocolInvariant(grant.role !== 'validator', 'SCHEMA_INVALID', 'Validator capabilities are fixed by genesis')
+  return grant
 }
 
 export function encodeCapabilityRevision(value: CapabilityRevision): Uint8Array {
@@ -284,17 +295,16 @@ export function encodeCapabilityRevision(value: CapabilityRevision): Uint8Array 
 
 export function decodeCapabilityRevision(bytes: Uint8Array): CapabilityRevision {
   const map = expectMap(assertCanonicalCbor(bytes), 'capability_revision')
-  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7, 8], 'capability_revision')
-  expectVersion(map, 1n, 'capability_revision')
+  assertKnownIntegerKeys(map, [0, 1, 2, 3, 4, 5, 6, 7], 'capability_revision')
+  expectVersion(map, 2n, 'capability_revision')
   const revision: CapabilityRevision = {
     groupId: expectBytes(required(map, 1, 'revision.group_id'), 'revision.group_id'),
     revision: expectUint64(required(map, 2, 'revision.number'), 'revision.number'),
     previousRevisionDigest: expectBytes(required(map, 3, 'revision.previous_digest'), 'revision.previous_digest', 32),
     issuerRootPublicKey: expectBytes(required(map, 4, 'revision.issuer'), 'revision.issuer', 32),
-    grants: expectArray(required(map, 5, 'revision.grants'), 'revision.grants').map((item, index) => grantFromCbor(item, `revision.grants[${index}]`)),
+    grants: expectArray(required(map, 5, 'revision.grants'), 'revision.grants').map((item, index) => revisionGrantFromCbor(item, `revision.grants[${index}]`)),
     revocations: expectArray(required(map, 6, 'revision.revocations'), 'revision.revocations').map((item, index) => expectBytes(item, `revision.revocations[${index}]`, 32)),
-    validationPolicies: expectArray(required(map, 7, 'revision.policies'), 'revision.policies').map((item, index) => policyFromCbor(item, `revision.policies[${index}]`)),
-    encryptionEpoch: expectUint64(required(map, 8, 'revision.encryption_epoch'), 'revision.encryption_epoch'),
+    encryptionEpoch: expectUint64(required(map, 7, 'revision.encryption_epoch'), 'revision.encryption_epoch'),
   }
   revisionToCbor(revision)
   return revision

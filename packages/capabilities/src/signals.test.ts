@@ -11,7 +11,7 @@ describe('group signal authorization adapter', () => {
       grant: { role: 'writer', subjectId: writer.publicKeyBytes, signingPublicKey: writer.publicKeyBytes, validFromRevision: 0n,
         program: { sql: false, topics: [], signals: ['presence'] } } }
     let snapshot: CapabilitySnapshot = { encryptionEpoch: 0n, groupId, revision: 0n, revisionDigest: new Uint8Array(32), rootAdminPublicKey: new Uint8Array(32),
-      capabilityLogFeed: new Uint8Array(32), capabilities: new Map([[bytesToHex(grantId), grant]]), policies: new Map(), validatorFloorMs: 0n }
+      capabilityLogFeed: new Uint8Array(32), capabilities: new Map([[bytesToHex(grantId), grant]]), policies: new Map() }
     const outgoing: Uint8Array[] = []
     const sender = createCapabilitySignals({ groupId, identity: writer, current: () => snapshot, trySend: async frame => { outgoing.push(frame); return true } })
     const receiver = createCapabilitySignals({ groupId, identity: reader, current: () => snapshot, trySend: async () => { return true } })

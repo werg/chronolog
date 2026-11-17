@@ -90,7 +90,7 @@ async function advance(
 ): Promise<CapabilitySnapshot> {
   const signed = await signCapabilityRevision({ encryptionEpoch: 0n,
     groupId: snapshot.groupId, revision: snapshot.revision + 1n, previousRevisionDigest: snapshot.revisionDigest,
-    issuerRootPublicKey: genesisFixture.root.publicKeyBytes, grants: [], revocations: [], validationPolicies: [],
+    issuerRootPublicKey: genesisFixture.root.publicKeyBytes, grants: [], revocations: [],
     ...revision,
   }, genesisFixture.root.privateKey)
   return applyCapabilityRevision(snapshot, signed)
@@ -172,14 +172,13 @@ describe('validator attestation evidence', () => {
     expect(validatorEvidenceForAttestation(f.snapshot, asWriter, coreFor(f.snapshot, f.policyId), txId, candidateDigest)).toBeUndefined()
   })
 
-  it('ignores a revoked validator in the revision where it was revoked', async () => {
+  it('preserves validator evidence when a revision attempts to revoke a fixed validator', async () => {
     const f = await fixture()
     const attestation = await attestationFor(f.snapshot, 21)
-    const next = await advance(f, f.snapshot, { revocations: [attestation.validatorCapability] })
-    const core = coreFor(next, f.policyId)
-    const rebound = { ...attestation, membershipRevision: next.revisionDigest }
-    expect(activeCapabilityById(next, attestation.validatorCapability)).toBeUndefined()
-    expect(validatorEvidenceForAttestation(next, rebound, core, txId, candidateDigest)).toBeUndefined()
+    await expect(advance(f, f.snapshot, { revocations: [attestation.validatorCapability] }))
+      .rejects.toThrow('Validator capabilities are fixed by genesis')
+    expect(activeCapabilityById(f.snapshot, attestation.validatorCapability)).toBeDefined()
+    expect(validatorEvidenceForAttestation(f.snapshot, attestation, coreFor(f.snapshot, f.policyId), txId, candidateDigest)).toBeDefined()
   })
 })
 

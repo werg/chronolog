@@ -186,12 +186,14 @@ export class GovernanceControlPlane {
   async #publishCapabilityChange(change: CapabilityChange, rootPrivateKey: CryptoKey, options: GovernanceOperationOptions,
     rotation?: { readonly contentKey?: Uint8Array }): Promise<SignedCapabilityRevision> {
     this.#assertCapabilityFeedOwner()
-    this.#assertSupportedChange(change, this.#snapshot)
+    if (Object.keys(change).some(key => key !== 'grants' && key !== 'revocations')) {
+      throw new Error('GOVERNANCE_CHANGE_INVALID')
+    }
     const fingerprint = encodeCapabilityRevision({
       groupId: this.#snapshot.groupId, revision: 1n,
       previousRevisionDigest: new Uint8Array(32), issuerRootPublicKey: this.#options.genesis.manifest.rootAdminPublicKey,
       grants: (change.grants ?? []).map(grant => ({ ...grant, validFromRevision: 1n })),
-      revocations: [...(change.revocations ?? [])], validationPolicies: [], encryptionEpoch: 0n,
+      revocations: [...(change.revocations ?? [])], encryptionEpoch: 0n,
     })
     const prepared = await this.#operations.run({
       operationId: options.operationId ?? crypto.randomUUID(),
@@ -205,7 +207,6 @@ export class GovernanceControlPlane {
           previousRevisionDigest: this.#snapshot.revisionDigest, issuerRootPublicKey: this.#snapshot.rootAdminPublicKey,
           grants: (change.grants ?? []).map(grant => ({ ...grant, validFromRevision: revisionNumber })),
           revocations: (change.revocations ?? []).map(id => id.slice()),
-          validationPolicies: [],
           encryptionEpoch: this.#snapshot.encryptionEpoch + (rotate ? 1n : 0n),
         }
         const signed = await signCapabilityRevision(revision, rootPrivateKey)
@@ -386,7 +387,6 @@ export class GovernanceControlPlane {
     if (!equalBytes(signed.revision.groupId, active.groupId) ||
         !await verifyDomain(DOMAINS.capabilityRevision, encodeCapabilityRevision(signed.revision),
           signed.signature, signed.revision.issuerRootPublicKey)) throw new Error('GOVERNANCE_REVISION_CONFLICT')
-    this.#assertSupportedChange(signed.revision, active)
     if (signed.revision.revision <= active.revision) {
       const known = this.#snapshots.get(bytesToHex(await capabilityRevisionDigest(signed.revision)))
       if (known === undefined) throw new Error('GOVERNANCE_REVISION_CONFLICT')
@@ -413,7 +413,6 @@ export class GovernanceControlPlane {
     }
     if (decoded.type === 'capability') {
       const signed = decodeSignedCapabilityRevisionBytes(tagged[1])
-      this.#assertSupportedChange(signed.revision, this.#snapshot)
       if (signed.revision.revision > this.#snapshot.revision + 1n) {
         // An outer envelope signer cannot reserve unbounded future revisions
         // with a forged inner root signature, even on an unordered feed.
@@ -561,19 +560,6 @@ export class GovernanceControlPlane {
     }
   }
 
-  #assertSupportedChange(change: CapabilityChange | CapabilityRevision, snapshot: CapabilitySnapshot): void {
-    // These roles are pinned by genesis in every supported live runtime. Validate
-    // received controls before updating the snapshot, just as for authoring;
-    // a root signature cannot turn an unsupported change into activation.
-    if ('validationPolicies' in change && (change.validationPolicies?.length ?? 0) > 0) {
-      throw new Error('GOVERNANCE_FIXED_VALIDATION_POLICY')
-    }
-    if (change.grants?.some(grant => grant.role === 'validator') === true ||
-        change.revocations?.some(id => snapshot.capabilities.get(bytesToHex(id))?.grant.role === 'validator') === true) {
-      throw new Error('GOVERNANCE_FIXED_VALIDATORS')
-    }
-  }
-
   #emit(type: GovernanceEvent['type'], recordId: string, epoch?: bigint): void {
     this.#eventRevision += 1n
     this.#events.emit({
@@ -693,5 +679,5 @@ export class GovernanceRecordPendingError extends Error {
 }
 
 export function isInvalidGovernanceRecord(error: unknown): error is Error {
-  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_KEY_CONFLICT|REVISION_CONFLICT|ENVELOPE_INVALID|ENVELOPE_SIGNATURE_INVALID|FIXED_(VALIDATION_POLICY|VALIDATORS))$/u.test(error.message))
+  return error instanceof ProtocolError || (error instanceof Error && /^GOVERNANCE_(CAPABILITY_FEED_UNAUTHORIZED|PAYLOAD_INVALID|EPOCH_INVALID|EPOCH_KEY_CONFLICT|REVISION_CONFLICT|ENVELOPE_INVALID|ENVELOPE_SIGNATURE_INVALID)$/u.test(error.message))
 }

@@ -62,9 +62,9 @@ describe('live native governed peer', () => {
     const validatorGrant = [...root.runtime.activeSnapshot.capabilities.values()].find((entry) => entry.grant.role === 'validator')!
     const initialRecords = (await root.transport.history()).length
     await expect(root.runtime.governance.publishCapabilityChange({ revocations: [validatorGrant.id] }, root.identity.privateKey))
-      .rejects.toThrow('GOVERNANCE_FIXED_VALIDATORS')
+      .rejects.toThrow('Validator capabilities are fixed by genesis')
     await expect(root.runtime.governance.publishCapabilityChange({ validationPolicies: [{ version: 2n, minimumValidators: 0n }] } as unknown as CapabilityChange, root.identity.privateKey))
-      .rejects.toThrow('GOVERNANCE_FIXED_VALIDATION_POLICY')
+      .rejects.toThrow('GOVERNANCE_CHANGE_INVALID')
     expect((await root.transport.history()).length).toBe(initialRecords)
     const original = await root.runtime.node.publish({ operationId: 'schema', program: { version: 3, steps: [
       sqlStatement('CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)'),

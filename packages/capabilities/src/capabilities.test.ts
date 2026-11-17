@@ -22,9 +22,9 @@ import {
 
 const bytes = (value: number, length = 32) => new Uint8Array(length).fill(value)
 
-function validator(subject: number, revision: bigint, floor: bigint, _label = ''): CapabilityGrant {
+function validator(subject: number, floor: bigint): CapabilityGrant {
   return {
-    subjectId: bytes(subject), signingPublicKey: bytes(subject), role: 'validator', validFromRevision: revision,
+    subjectId: bytes(subject), signingPublicKey: bytes(subject), role: 'validator', validFromRevision: 0n,
     minimumAuthorTimestampMs: floor,
   }
 }
@@ -39,7 +39,7 @@ async function fixture() {
   const writer: CapabilityGrant = {
     subjectId: bytes(20), signingPublicKey: bytes(20), role: 'writer', program: { sql: true, topics: [], signals: [], forwarded: false }, validFromRevision: 0n,
   }
-  const initialValidator = validator(21, 0n, 1_000n)
+  const initialValidator = validator(21, 1_000n)
   const manifest: GenesisManifest = {
     groupId: bytes(1), schemaId: bytes(2), rootAdminPublicKey: root.publicKeyBytes, schemaAdminPublicKey: root.publicKeyBytes,
     capabilityLogFeed: bytes(3),
@@ -73,7 +73,7 @@ describe('capability chain', () => {
     const revision = await signCapabilityRevision({ encryptionEpoch: 0n,
       groupId: bytes(1), revision: 1n, previousRevisionDigest: initial.revisionDigest,
       issuerRootPublicKey: f.root.publicKeyBytes,
-      grants: [validator(22, 1n, 1_000n, 'B')], revocations: [writerId], validationPolicies: [],
+      grants: [{ ...f.writer, subjectId: bytes(22), signingPublicKey: bytes(22), validFromRevision: 1n }], revocations: [writerId],
     }, f.root.privateKey)
     const roundTrippedRevision = decodeSignedCapabilityRevision(encodeSignedCapabilityRevision(revision))
     const state = await reduceCapabilityLog(f.signedGenesis, [roundTrippedRevision])
@@ -81,17 +81,11 @@ describe('capability chain', () => {
     expect(state.rootAdminPublicKey).toEqual(f.root.publicKeyBytes)
     expect(hasRole(state, bytes(20), 'writer', 0n)).toBe(true)
     expect(hasRole(state, bytes(20), 'writer', 1n)).toBe(false)
-  })
-
-  it('rejects a new validator whose floor reopens timestamp history', async () => {
-    const f = await fixture()
-    const initial = await reduceCapabilityLog(f.signedGenesis, [])
-    const revision = await signCapabilityRevision({ encryptionEpoch: 0n,
-      groupId: bytes(1), revision: 1n, previousRevisionDigest: initial.revisionDigest,
-      issuerRootPublicKey: f.root.publicKeyBytes,
-      grants: [validator(22, 1n, 999n, 'B')], revocations: [], validationPolicies: [],
-    }, f.root.privateKey)
-    await expect(reduceCapabilityLog(f.signedGenesis, [revision])).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
+    expect(hasRole(state, bytes(22), 'writer')).toBe(true)
+    expect(hasRole(state, bytes(21), 'validator')).toBe(true)
+    expect(state.policies).toEqual(initial.policies)
+    expect([...state.capabilities.values()].find(item => item.grant.role === 'validator')?.grant)
+      .toEqual(f.initialValidator)
   })
 })
 
