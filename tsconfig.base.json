@@ -156,6 +156,12 @@
       ],
       "@chronolog/peer-session/tendriller": [
         "packages/peer-session/src/tendriller.ts"
+      ],
+      "@chronolog/materializer-doltlite/wasm": [
+        "packages/materializer-doltlite/src/wasm.ts"
+      ],
+      "@chronolog/peer-session/sql-browser": [
+        "packages/peer-session/src/sql-browser.ts"
       ]
     }
   }

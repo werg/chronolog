@@ -1,7 +1,8 @@
+import { WasmDatabase, type ChronologWasmModule } from '@chronolog/materializer-doltlite/wasm'
 import { decodeSignedGenesis, encodeSignedGenesis, signGenesis } from '@chronolog/capabilities'
 import { assertCanonicalCbor, bytesToBase64Url, decodeExecutionManifest, encodeCanonicalCbor, executionManifestArtifacts } from '@chronolog/protocol'
-import { BrowserControlPersistence, WasmDatabase, openBrowserPeer, serveBrowserPeer,
-  type BrowserPeer, type ChronologWasmModule, type WorkerEndpoint } from '@chronolog/runtime-browser'
+import { BrowserControlPersistence, openBrowserPeer, serveBrowserPeer,
+  type BrowserPeer, type WorkerEndpoint } from '@chronolog/runtime-browser'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 const groupId = new Uint8Array(32).fill(71)

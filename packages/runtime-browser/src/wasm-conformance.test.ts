@@ -13,7 +13,7 @@ import { replayProposal, ROOT_KEY } from '../../materializer-doltlite/src/test-f
 import { generateX25519KeyPair, sealSealedValue } from '../../crypto/src/index.js'
 import { openDatabase as openNativeDatabase } from '../../materializer-doltlite/src/driver.js'
 import { CONSENSUS_DENIED_FUNCTIONS } from '../../materializer-doltlite/src/sql-profile.js'
-import { createWasmEngineFactory, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
+import { createWasmEngineFactory, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from '@chronolog/materializer-doltlite/wasm'
 
 const directory = resolve(process.env.CHRONOLOG_WASM_DIRECTORY ?? 'artifacts/wasm')
 const built = existsSync(join(directory, 'manifest.json'))

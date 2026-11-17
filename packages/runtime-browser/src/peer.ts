@@ -18,8 +18,7 @@ import { InProcessRpcTransport, NodeRpcService, type GovernanceRpcAdmin } from '
 import { BrowserControlPersistence } from './control-persistence.js'
 import { openBrowserDeviceRecords } from './device-records.js'
 import { acquireBrowserStorage } from '@chronolog/records/browser'
-import { loadBrowserEngine, type LoadedBrowserEngine } from './load-engine.js'
-import { createWasmEngineFactory, type OpfsSqlitePool } from './wasm-engine.js'
+import { loadBrowserEngine, createWasmEngineFactory, type LoadedBrowserEngine, type OpfsSqlitePool } from '@chronolog/materializer-doltlite/wasm'
 import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'
 
 export interface BrowserPeerContext {

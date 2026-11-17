@@ -1,9 +1,9 @@
 import { bytesToHex, sha256Sync, utf8 } from '@chronolog/canonical'
-import { assertNativeSecurityConfiguration, configureSqliteLimits } from '@chronolog/materializer-doltlite/browser'
+import { assertNativeSecurityConfiguration, configureSqliteLimits } from './sql-profile.js'
 import type {
   DatabaseLike, DoltBranchInfoLike, MaterializerBackendInfo, NativeEngineManifest,
   NativeSecurityConfiguration, MaterializerOptions, StatementLike,
-} from '@chronolog/materializer-doltlite/browser'
+} from './types.js'
 
 type Authorizer = Parameters<DatabaseLike['setAuthorizer']>[0]
 type OpenedDatabase = ReturnType<NonNullable<MaterializerOptions['openDatabase']>>
@@ -102,8 +102,7 @@ export function createWasmEngineFactory(module: ChronologWasmModule, manifest: W
     const rc = module.wasm.xCall('chronolog_wasm_init', pointer)
     if (rc !== 0) throw new Error(`WASM_ENGINE_VFS_UNAVAILABLE:${vfs}:${rc}`)
   })
-  const descriptor = `chronolog-engine-manifest-v1\n${stableJson(manifest.nativeManifest)}`
-  const engineDigest = sha256Sync(utf8(descriptor))
+  const engineDigest = wasmEngineDigest(manifest)
   return (options) => {
     if (options.path === undefined || options.path === ':memory:') throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
     const database = new WasmDatabase(module, options.path)
@@ -359,4 +358,9 @@ function stableJson(value: unknown): string {
     return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`
   }
   throw new Error('WASM_ENGINE_MANIFEST_INVALID')
+}
+
+/** The same source/platform identity used by the native engine manifest. */
+export function wasmEngineDigest(manifest: WasmBuildManifest): Uint8Array {
+  return sha256Sync(utf8(`chronolog-engine-manifest-v1\n${stableJson(manifest.nativeManifest)}`))
 }
