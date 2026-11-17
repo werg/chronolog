@@ -351,6 +351,14 @@ first coherent view. Sessions permit at most eight simultaneously held read
 views; release them promptly. Closing the session releases all remaining views
 and connections before closing its durable store.
 
+SQL read views lease the already verified immutable published reader. Capturing
+or querying the current view opens no database connection and creates no branch.
+An update installs a new verified reader; the old reader and its process-owned
+reference remain alive until its last held view is released. SQL and events
+therefore stay at the same captured revision through append and prefix recovery.
+This removes storage work caused by repeated reads. It does not compact the
+database WAL or prune authenticated history.
+
 ## Page facade
 
 The page exposes its existing `runtime.host.peers` through the bounded host

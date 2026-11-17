@@ -5,7 +5,7 @@ import {
   type ExecutionLimits,
   type ProgramStep,
 } from '@chronolog/protocol'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { MaterializedApplicationSnapshot } from '@chronolog/materializer'
 
 import { DeterministicMaterializer } from './native.js'
@@ -24,7 +24,83 @@ function snapshotData(snapshot: MaterializedApplicationSnapshot) {
     transactions: Array.from({ length: snapshot.orderLength }, (_, index) => snapshot.transactionAt(index)) }
 }
 
+function observedDatabase(options: Pick<MaterializerOptions, 'path'>) {
+  const opened = openDatabase(options)
+  return { ...opened, branchSpy: vi.spyOn(opened.database, 'doltBranch'),
+    deleteSpy: vi.spyOn(opened.database, 'doltDeleteBranch'), closeSpy: vi.spyOn(opened.database, 'close') }
+}
+
 describe('replicated SQL materialization', () => {
+  it('captures repeated immutable reads without opening connections or writing branches', async () => {
+    const { path, manifest } = await fixture(), opened: ReturnType<typeof observedDatabase>[] = []
+    const factory: NonNullable<MaterializerOptions['openDatabase']> = options => {
+      const value = observedDatabase(options); opened.push(value)
+      return value
+    }
+    const materializer = await PortableMaterializer.open({ path, executionManifest: manifest, rootAdministrator: ROOT_KEY, openDatabase: factory })
+    const connections = opened.length
+    const writes = () => opened.map(value => [value.branchSpy.mock.calls.length, value.deleteSpy.mock.calls.length])
+    const before = writes()
+    for (let index = 0; index < 64; index++) {
+      const view = materializer.captureRead({ view: index % 2 === 0 ? 'local' : 'final' })
+      expect(view.query('SELECT 42 AS value').rows).toEqual([[{ kind: 'integer', value: '42' }]])
+      view.release()
+    }
+    expect(opened).toHaveLength(connections)
+    expect(writes()).toEqual(before)
+    const held = Array.from({ length: 16 }, () => materializer.captureRead({ view: 'local' }))
+    expect(() => materializer.captureRead()).toThrow('MATERIALIZER_SNAPSHOT_LIMIT')
+    expect(() => held[0]!.query('CREATE TABLE forbidden (id INTEGER)')).toThrow()
+    expect(held[1]!.query('SELECT 7').rows).toEqual([[{ kind: 'integer', value: '7' }]])
+    expect(writes()).toEqual(before)
+    materializer.close()
+    for (const value of opened) expect(value.closeSpy).toHaveBeenCalledTimes(1)
+    for (const view of held) { expect(() => view.query('SELECT 1')).toThrow('MATERIALIZER_SNAPSHOT_RELEASED'); view.release() }
+    materializer.close()
+  })
+
+  it('retires a published reader only after every local or final lease releases it', async () => {
+    const { path, manifest } = await fixture(), opened: ReturnType<typeof observedDatabase>[] = []
+    const materializer = await PortableMaterializer.open({ path, executionManifest: manifest, rootAdministrator: ROOT_KEY, checkpointEvery: 1,
+      openDatabase: options => { const value = observedDatabase(options); opened.push(value); return value } })
+    const writer = opened[0]!.database, reads = () => writer.doltBranches().filter(value => value.name.startsWith('chronolog_read_')).length
+    const setup = await transaction(1n, 'read-setup', [sqlStatement('CREATE TABLE values_table (id INTEGER PRIMARY KEY)')], materializer.executionManifestDigest)
+    const first = await transaction(2n, 'read-first', [sqlStatement('INSERT INTO values_table (id) VALUES (1)')], materializer.executionManifestDigest)
+    await materializer.materialize([setup]); await materializer.publishFinal(1)
+    const a = materializer.captureRead({ view: 'local' }), b = materializer.captureRead({ view: 'local' }), final = materializer.captureRead()
+    const connection = opened.at(-2)!
+    expect(reads()).toBe(2)
+    await materializer.materialize([setup, first]); await materializer.publishFinal(2)
+    expect(materializer.outcome(first.txId)?.outcome).toBe('accepted')
+    expect(reads()).toBe(4)
+    expect(a.query('SELECT count(*) FROM values_table').rows).toEqual([[{ kind: 'integer', value: '0' }]])
+    expect(final.query('SELECT count(*) FROM values_table').rows).toEqual([[{ kind: 'integer', value: '0' }]])
+    expect(materializer.localQuery('SELECT count(*) FROM values_table').rows).toEqual([[{ kind: 'integer', value: '1' }]])
+    a.release(); expect(reads()).toBe(4); expect(connection.closeSpy).not.toHaveBeenCalled()
+    final.release(); expect(reads()).toBe(3)
+    b.release(); expect(reads()).toBe(2); expect(connection.closeSpy).toHaveBeenCalledTimes(1)
+    materializer.close()
+    for (const value of opened) expect(value.closeSpy).toHaveBeenCalledTimes(1)
+    const reopened = await open(path, manifest, 1)
+    expect(reopened.localQuery('SELECT count(*) FROM values_table').rows).toEqual([[{ kind: 'integer', value: '1' }]])
+    reopened.close()
+  })
+
+  it('releases an unpublished candidate reader after a publication fault', async () => {
+    const { path, manifest } = await fixture(), opened: ReturnType<typeof observedDatabase>[] = []
+    const materializer = await PortableMaterializer.open({ path, executionManifest: manifest, rootAdministrator: ROOT_KEY,
+      publicationFaultInjector: point => { if (point === 'before_head_publish') throw new Error('INJECTED_PUBLISH_FAILURE') },
+      openDatabase: options => { const value = observedDatabase(options); opened.push(value); return value } })
+    const held = materializer.captureRead({ view: 'local' })
+    const setup = await transaction(1n, 'failed-reader', [sqlStatement('CREATE TABLE not_published (id INTEGER PRIMARY KEY)')], materializer.executionManifestDigest)
+    await expect(materializer.materialize([setup])).rejects.toThrow('INJECTED_PUBLISH_FAILURE')
+    expect(held.query("SELECT count(*) FROM sqlite_schema WHERE name = 'not_published'").rows).toEqual([[{ kind: 'integer', value: '0' }]])
+    expect(opened[0]!.database.doltBranches().filter(value => value.name.startsWith('chronolog_read_'))).toHaveLength(2)
+    expect(opened.at(-1)!.closeSpy).toHaveBeenCalledTimes(1)
+    materializer.close()
+    for (const value of opened) expect(value.closeSpy).toHaveBeenCalledTimes(1)
+  })
+
   it('pins the validated history profile when the caller mutates or deletes its options', async () => {
     const path = `${await fixtures.directory()}/application.db`
     const { createDoltLiteExecutionManifest } = await import('./manifest.js')
