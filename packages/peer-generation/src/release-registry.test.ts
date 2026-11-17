@@ -1,13 +1,13 @@
 import { expect, it, vi } from 'vitest'
 import {
-  bytesDigest, createPeerIdentity, createReleaseRegistry, MemoryPeerStore, peerDigest, RELEASE_PROFILE,
-  signReleaseActivationRequest, signReleaseManifest, type PeerStore, type ReleaseApplicationBinding,
+  bytesDigest, createPeerIdentity, createReleaseRegistry, MemoryBytesStore, peerDigest, RELEASE_PROFILE,
+  signReleaseActivationRequest, signReleaseManifest, type BytesStore, type ReleaseApplicationBinding,
   type ReleaseAsset, type ReleaseContentSource, type SignedReleaseManifest,
 } from './index.js'
 
 async function fixture() {
   const signer = await createPeerIdentity(), publisher = await createPeerIdentity(), other = await createPeerIdentity()
-  const store = new MemoryPeerStore(), files = new Map<string, Uint8Array>(), applicationId = 'ab'.repeat(32)
+  const store = new MemoryBytesStore(), files = new Map<string, Uint8Array>(), applicationId = 'ab'.repeat(32)
   let binding: ReleaseApplicationBinding | null = null, beforeRead: (() => Promise<void>) | undefined
   const content: ReleaseContentSource = { async *read(asset) {
     await beforeRead?.()
@@ -157,7 +157,7 @@ it('fails closed on missing or rolled-back control state', async () => {
   await f.registry.activate(await f.request('first', release.id))
   await f.store.put(head, old)
   await expect(f.registry.read()).rejects.toThrow('RELEASE_STATE_REGRESSION')
-  const empty: PeerStore = new MemoryPeerStore()
+  const empty: BytesStore = new MemoryBytesStore()
   await expect(createReleaseRegistry({ ...f.options, store: empty, requireExisting: true })).rejects.toThrow('RELEASE_STATE_MISSING')
 })
 

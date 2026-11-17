@@ -3,7 +3,7 @@ import {
   check, decodePeerValue, encodePeerValue, hex, isArray, object, peerDigest,
   samePeerValue, Serial, signPeerValue,
 } from './codec.js'
-import type { PeerStore } from './control-types.js'
+import type { BytesStore } from '@chronolog/records'
 import {
   RELEASE_LIMITS, RELEASE_PROFILE, type ReleasePolicyRequest, type ReleaseRegistry, type ReleaseRegistryOptions,
   type ReleaseState, type SignedReleaseActivation, type SignedReleaseActivationRequest, type SignedReleaseManifest,
@@ -16,8 +16,8 @@ import {
 
 interface Head { readonly version: 1; readonly state: ReleaseState; readonly publications: readonly string[] }
 interface Owner { readonly serial: Serial; pending: number }
-const owners = new WeakMap<PeerStore, Map<string, Owner>>()
-function ownerFor(store: PeerStore, key: string): Owner {
+const owners = new WeakMap<BytesStore, Map<string, Owner>>()
+function ownerFor(store: BytesStore, key: string): Owner {
   let values = owners.get(store)
   if (values === undefined) { values = new Map(); owners.set(store, values) }
   let owner = values.get(key)

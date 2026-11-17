@@ -1,4 +1,5 @@
-import type { PeerIdentity, PeerStore, Signed } from './control-types.js'
+import type { BytesStore } from '@chronolog/records'
+import type { PeerIdentity, Signed } from './control-types.js'
 
 export const RELEASE_PROFILE = 'chronolog-release-v1' as const
 export const RELEASE_LIMITS = Object.freeze({
@@ -97,7 +98,7 @@ export interface ReleaseRegistry {
   activate(request: SignedReleaseActivationRequest): Promise<SignedReleaseActivation>
 }
 export interface ReleaseRegistryOptions {
-  readonly store: PeerStore
+  readonly store: BytesStore
   readonly applicationId: string
   readonly signer: PeerIdentity
   readonly content: ReleaseContentSource
