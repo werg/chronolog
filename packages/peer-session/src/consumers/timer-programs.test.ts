@@ -16,7 +16,10 @@ const definition = defineApplication({ id: 'guarded-timer', version: '1', schema
   schedule: defineCommand({ description: 'Schedule a notification', input: applicationTimerScheduleSchema(payloadSchema), prepare: input => timerPrograms.schedule(input) }),
   cancel: defineCommand({ description: 'Cancel this notification version', input: applicationTimerCancellationSchema, prepare: input => timerPrograms.cancel(input) }),
   fire: defineCommand({ description: 'Publish an active due notification', input: occurrenceSchema,
-    prepare: input => program(...timerPrograms.fire(input).steps, emit('notification.requested', input.payload)) }),
+    prepare: input => {
+      const message: string = input.payload.message
+      return program(...timerPrograms.fire(input).steps, emit('notification.requested', { message }))
+    } }),
   reject: defineCommand({ description: 'Require a domain constraint', input: occurrenceSchema,
     prepare: input => program("SELECT chronolog_assert(0, 'notification_constraint')", ...timerPrograms.fire(input).steps) }),
 }, queries: {} })

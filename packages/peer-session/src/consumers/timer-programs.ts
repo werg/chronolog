@@ -10,21 +10,23 @@ const interval = { anyOf: [{ type: 'null' }, { type: 'integer', minimum: 1, maxi
 export const applicationTimerCancellationSchema = { type: 'object', properties: { timerId: id, generation: id }, required: ['timerId', 'generation'] } as const
 
 export function applicationTimerScheduleSchema<const S extends ApplicationInputSchema>(payload: S) {
-  return { type: 'object', properties: { timerId: id, generation: id, dueAtMs: time, intervalMs: interval, payload,
-    expectedGeneration: { anyOf: [{ type: 'null' }, id] } }, required: ['timerId', 'generation', 'dueAtMs', 'payload', 'expectedGeneration'] } as const satisfies ApplicationInputSchema
+  const schema = { type: 'object', properties: { timerId: id, generation: id, dueAtMs: time, intervalMs: interval, payload,
+    expectedGeneration: { anyOf: [{ type: 'null' }, id] } }, required: ['timerId', 'generation', 'dueAtMs', 'payload', 'expectedGeneration'] } as const
+  return schema satisfies ApplicationInputSchema
 }
 
 /** The command input carries provenance for deterministic checking; copied origin fields are never authentication by themselves. */
 export function applicationTimerOccurrenceSchema<const S extends ApplicationInputSchema>(payload: S) {
   const configurationPayload = { type: 'object', properties: { type: { type: 'string', enum: ['timer.scheduled'] }, version: { type: 'integer', minimum: 1, maximum: 1 },
     timerId: id, generation: id, dueAtMs: time, intervalMs: interval, payload }, required: ['type', 'version', 'timerId', 'generation', 'dueAtMs', 'intervalMs', 'payload'] } as const
-  return { type: 'object', properties: {
+  const schema = { type: 'object', properties: {
     occurrenceId: id, timerId: id, generation: id, scheduledAtMs: time, observedAtMs: time, payload,
     configuration: { type: 'object', properties: {
       id, attemptId: { type: 'string', minLength: 64, maxLength: 64 }, operationId: id, author: { type: 'string', minLength: 64, maxLength: 64 },
       authorTimestampMs: { type: 'string', minLength: 1, maxLength: 32 }, topic: { type: 'string', minLength: 1, maxLength: 128 }, payload: configurationPayload,
     }, required: ['id', 'attemptId', 'operationId', 'author', 'authorTimestampMs', 'topic', 'payload'] },
-  }, required: ['occurrenceId', 'timerId', 'generation', 'configuration', 'scheduledAtMs', 'observedAtMs', 'payload'] } as const satisfies ApplicationInputSchema
+  }, required: ['occurrenceId', 'timerId', 'generation', 'configuration', 'scheduledAtMs', 'observedAtMs', 'payload'] } as const
+  return schema satisfies ApplicationInputSchema
 }
 
 export interface ApplicationTimerScheduleInput {
