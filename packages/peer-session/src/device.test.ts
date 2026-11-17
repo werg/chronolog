@@ -1,9 +1,75 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { assertCanonicalCbor, encodeCanonicalCbor } from '@chronolog/protocol'
 import { MemoryBytesStore, type BytesStore } from '@chronolog/peer-generation'
 import { openApplicationDevice } from './device.js'
 
 describe('owned application device identities', () => {
+  it('keeps protocol identity independent of lazy data storage and coalesces first use', async () => {
+    const metadata = new MemoryBytesStore(), data = new MemoryBytesStore(), closed = vi.fn()
+    const openStorage = vi.fn(async () => ({ store: data, close: closed }))
+    const device = await openApplicationDevice({ store: metadata, create: true, openStorage })
+    const identity = device.identity, storageId = device.storageId
+    expect(openStorage).not.toHaveBeenCalled()
+    expect(device.store).toBe(metadata)
+    const first = device.openStorage(), second = device.openStorage()
+    expect(first).toBe(second)
+    expect(await first).toBe(data)
+    expect(openStorage).toHaveBeenCalledTimes(1)
+    expect(device.identity).toBe(identity); expect(device.storageId).toBe(storageId)
+    await device.close(); await device.close()
+    expect(closed).toHaveBeenCalledTimes(1)
+    await expect(device.openStorage()).rejects.toThrow('APPLICATION_DEVICE_CLOSED')
+    const resumed = await openApplicationDevice({ store: metadata, openStorage })
+    expect(resumed.identity.publicKey).toBe(identity.publicKey)
+    expect(resumed.storageId).toBe(storageId)
+    await resumed.close()
+    expect(openStorage).toHaveBeenCalledTimes(1)
+  })
+
+  it('never opens unused data storage and drains an opening resource before closing metadata', async () => {
+    const unopened = vi.fn(), unused = await openApplicationDevice({ store: new MemoryBytesStore(), create: true,
+      openStorage: unopened })
+    await unused.close(); expect(unopened).not.toHaveBeenCalled()
+    const order: string[] = [], metadata = new MemoryBytesStore()
+    let release!: () => void
+    const wait = new Promise<void>(resolve => { release = resolve })
+    const opening = vi.fn(async () => { await wait; return { store: new MemoryBytesStore(), close() { order.push('data') } } })
+    const device = await openApplicationDevice({ store: metadata, create: true, openStorage: opening, close() { order.push('metadata') } })
+    const pending = device.openStorage(), checked = expect(pending).rejects.toThrow('APPLICATION_DEVICE_CLOSED')
+    await vi.waitFor(() => { expect(opening).toHaveBeenCalledTimes(1) })
+    const closing = device.close()
+    expect(order).toEqual([])
+    release(); await Promise.all([checked, closing])
+    expect(order).toEqual(['data', 'metadata'])
+  })
+
+  it('retains the first storage failure without reopening or changing the signer', async () => {
+    const openStorage = vi.fn(async () => { throw new Error('QUOTA_DENIED') })
+    const device = await openApplicationDevice({ store: new MemoryBytesStore(), create: true, openStorage })
+    const identity = device.identity
+    await expect(device.openStorage()).rejects.toThrow('QUOTA_DENIED')
+    await expect(device.openStorage()).rejects.toThrow('QUOTA_DENIED')
+    expect(openStorage).toHaveBeenCalledTimes(1); expect(device.identity).toBe(identity)
+    await device.close()
+  })
+
+  it('uses the atomically retained identity when concurrent protocol owners create the same device', async () => {
+    const store = new MemoryBytesStore()
+    let tail: Promise<void> = Promise.resolve()
+    const shared = { get: (key: string) => store.get(key), put: (key: string, value: Uint8Array) => store.put(key, value),
+      initialize(entries: readonly { readonly key: string; readonly value: Uint8Array }[]) {
+        const result = tail.then(async () => {
+          const values = await Promise.all(entries.map(entry => store.get(entry.key)))
+          if (values.every(value => value === null)) for (const entry of entries) await store.put(entry.key, entry.value)
+        })
+        tail = result; return result
+      } }
+    const [first, second] = await Promise.all([openApplicationDevice({ store: shared, create: true }), openApplicationDevice({ store: shared, create: true })])
+    expect(first.identity.publicKey).toBe(second.identity.publicKey)
+    expect(first.storageId).toBe(second.storageId)
+    await first.close(); await second.close()
+  })
+
   it('never recreates lost keys when the device storage binding already exists', async () => {
     const retained = new MemoryBytesStore()
     await openApplicationDevice({ store: retained, create: true })
