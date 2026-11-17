@@ -133,7 +133,6 @@ const control = session.connectControlParticipant({
   exchange: (request, { signal }) => client.peers.exchange(request, { signal }),
 })
 const definition = await control.definition()
-const notice = await session.recovery.takeover(control, { transitionId: crypto.randomUUID() })
 ```
 
 The attachment shares the session's identity and lifetime. It performs no request
@@ -147,6 +146,79 @@ code or page manifest. `control.publish(manifest, assets)` submits it with bound
 hash-verified assets, and `control.publication()` verifies the selected chain.
 Retries preserve the original signed intent and receipt. The selected publication
 head persists outside recoverable application history and cannot move backward.
+
+## Owned participation and recovery
+
+Call `session.participate()` once after opening the session. It owns discovery,
+invitations, authenticated peer connections, reconnect backoff and recovery policy.
+The supplied ports deliver routing hints and raw framed connections; they cannot
+declare a peer authorized or choose a recovery prefix.
+
+```ts
+import { createPeerIntroductions } from '@tendriller/core/peers'
+import { openWebRtcConnection } from '@chronolog/peer-session/webrtc'
+
+const participation = session.participate({
+  control,
+  ...createPeerIntroductions({
+    peers: client.peers,
+    identity: session.deviceId,
+    openConnection: options => openWebRtcConnection(options),
+  }),
+  recovery: { graceMs: 3000, freshnessMs: 300_000 },
+})
+participation.onStatus(status => renderParticipation(status))
+// After presenting the current proposal and obtaining the user's decision:
+await participation.approveRecovery(proposal.id)
+```
+
+A native process supplies an RTC factory through its raw opener. A browser
+Worker uses `openWorkerWebRtcConnection(self, options)` as shown below. The same
+controller and authenticated protocol run in both environments.
+
+The default controller owns at most four connections, with a hard maximum of
+eight. Attempts have a 15-second deadline and bounded exponential backoff with
+jitter, starting at one second and capped at 30 seconds. A transport that ignores
+cancellation continues to occupy its bounded opening slot; a late connection is
+closed rather than attached. Discoverability leases renew every 60 seconds.
+Healthy peers synchronize on that coarse cadence, and directory reads occur
+only while the graph is underfilled or the coordinator is absent. Ordinary
+commands and live signals do not cause host requests.
+
+After coordinator loss, the controller first gives reconnection its configured
+grace. It verifies the current signed authority and synchronizes reachable peers
+before considering a successor. Candidate selection uses the complete best
+prefix actually verified locally on the selected ancestry. A remote successor
+must hold a signed retention acknowledgment for that exact prefix; a self
+candidate must be locally ready. Current coordinator and recovery grants are
+checked independently. Directory hints, advertised eligibility and remote
+retention timestamps supply no authority or freshness evidence.
+
+Automatic selection additionally requires recent local evidence from an
+authenticated coordinator head request whose complete prefix was verified.
+The durable timestamp is the start of that request, so transfer delay cannot
+make old evidence appear newer. Evidence from a different generation, a future
+local timestamp or an excluded prefix does not qualify. This observation budget
+is a conservative recovery policy, not an unconditional loss guarantee: host
+outages, suspension and long disconnection can leave freshness unknown or older
+than the budget. Such cases expose `phase: 'approval-required'` with the exact
+complete prefix, candidate, observation age and reason. Only approving that
+proposal ID permits the broader recovery; changed authority or prefix invalidates
+the choice. An incomplete selected prefix cannot be approved into completeness.
+
+The controller uses the existing durable transition journal. Lost takeover and
+handover replies retry the same signed request, and competing valid selections
+are resolved by the host CAS. Host unavailability leaves ordinary commands saved
+in their original journal until a usable coordinator is available. Reconnection
+resumes eligible original attempts. A generation change marks excluded saved
+attempts `needsReapply`, requiring an explicit new operation instead of silently
+changing their signed meaning. There is no second application queue.
+
+`session.participation` exposes the one handle for the session's lifetime.
+`participation.close()` fences timers, pending replies and invitations, closes
+its peer connections and attempts a bounded lease withdrawal. The closed handle
+remains inspectable; starting a second controller is rejected. Closing the
+session also closes participation before releasing its durable store.
 
 ## Enrollment and epoch keys
 
@@ -224,8 +296,9 @@ signed command before retaining its ciphertext and replaying it. Retention proof
 refer to an exact locally held prefix. Both directions exchange available history,
 including when a fresh device is still recovering an inherited generation.
 Explicit synchronization observes a fresh head after any older background pull.
-Local history/control changes trigger coalesced peer hints; there is no idle host
-polling or application-data HTTP fallback. Pending commands use the session's
+Local history/control changes trigger coalesced peer hints. Owned participation
+adds coarse discoverability renewal and peer synchronization, without an
+application-data HTTP fallback. Pending commands use the session's
 existing immutable attempt journal, and retry after reconnection preserves those
 original bytes.
 
@@ -259,7 +332,7 @@ protocol over bounded memory byte lanes, including live signals. It is not a
 measurement of Internet WebRTC routing. No recipe needs its own application retry
 queue.
 
-`session.recovery.takeover(host, { transitionId })` validates this device's
+The lower-level `session.recovery.takeover(host, { transitionId })` validates this device's
 complete recovery point, saves one signed transition request, selects it through
 the host, and adopts the verified result. Retry the same transition ID after a
 lost hosted reply, including after device reopen. A planned
@@ -318,12 +391,13 @@ Werift implementation. Returned connections expose reliable framed byte counts (
 request counts, and `rtc.getRoute()` observations. An unknown observed route
 stays unknown.
 
-In a browser, install `installApplicationWorkerTransport(session, self)` beside
-the Worker-owned session. The page calls
-`connectWorkerApplicationWebRtc(worker, { role, signaling, peerIdentity })`.
-The helper transfers both negotiated channels synchronously, owns the dedicated
-control port, and waits for authentication and initial replay. The page retains
-the peer connection for ICE lifecycle and route diagnostics. This API requires a
+In a browser, the page serves `serveWorkerWebRtcConnections(worker)`. The owning
+Worker calls `openWorkerWebRtcConnection(self, options)` through its raw transport
+opener. The Worker owns discovery, signaling and recovery policy; the page performs
+RTC negotiation and synchronously transfers both negotiated channels back. The
+common session then authenticates the connection and verifies the selected
+history. The page retains the peer connection for ICE lifecycle and route
+diagnostics. This API requires a
 browser that supports transferring RTC data channels; unsupported browsers fail
 explicitly. Actual browser qualification is separate from native stream tests.
 
@@ -346,26 +420,35 @@ and connections before closing its durable store.
 
 ## Page facade
 
-The Worker opens the device and owns the application. For RTC connections,
-install both owners before announcing that the Worker is ready:
+The Worker opens the device and owns the application. Configure participation
+before serving the facade so the page receives its stable status and approval
+handle:
 
 ```ts
 import { serveApplicationWorker } from '@chronolog/peer-session/browser'
-import { installApplicationWorkerTransport } from '@chronolog/peer-session/webrtc'
+import { openWorkerWebRtcConnection } from '@chronolog/peer-session/webrtc'
+import { createPeerIntroductions } from '@tendriller/core/peers'
 
-installApplicationWorkerTransport(session, self)
-serveApplicationWorker(session, self, { host })
+session.participate({
+  control,
+  ...createPeerIntroductions({
+    peers: client.peers, identity: session.deviceId,
+    openConnection: options => openWorkerWebRtcConnection(self, options),
+  }),
+})
+serveApplicationWorker(session, self, { host: control })
 ```
 
-The page facade and RTC transport use separate message namespaces. Serving the
-facade alone does not receive transferred RTC channels; the transport owner is
-optional when the application does not use RTC.
+The page facade and RTC delivery use separate message namespaces. The RTC helper
+is optional when the application does not use RTC.
 
 The page connects through a dedicated message port:
 
 ```ts
 import { connectApplicationWorker } from '@chronolog/peer-session/browser'
+import { serveWorkerWebRtcConnections } from '@chronolog/peer-session/webrtc'
 
+const rtc = serveWorkerWebRtcConnections(worker)
 const session = await connectApplicationWorker<typeof definition>(worker)
 const before = await session.query('messages', null)
 const operation = await session.command('say', { text: 'Hello' }, {
@@ -379,6 +462,9 @@ queries, operation inspection, retry, explicit reapplication, changes, live
 signals and content handles. `status` and `revision` are synchronous snapshots;
 `describe()` returns the application contract. `onStatus()` and `onRecovery()`
 observe updates, while `inspectRecovery()` loads retained recovery notices.
+If the Worker configured participation, `session.participation` exposes its
+`status`, `onStatus()`, `approveRecovery()` and `close()` without moving policy or
+credentials into the page.
 `readView()` holds one coherent SQL/event view until `release()` resolves.
 Only the Worker holds signing keys and the durable command journal. Cancelling
 a page waiter ends that observation and leaves the saved command inspectable.

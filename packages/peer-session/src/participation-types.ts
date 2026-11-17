@@ -41,6 +41,7 @@ export interface ApplicationParticipationOptions {
     readonly maxPeers?: number
     readonly retryInitialMs?: number
     readonly retryMaxMs?: number
+    readonly timeoutMs?: number
     /** Coarse discoverability lease renewal. Defaults to 60 seconds. */
     readonly advertiseMs?: number
   }

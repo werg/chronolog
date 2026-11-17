@@ -15,9 +15,10 @@ import { ApplicationRecovery } from './recovery.js'
 import type { ApplicationContent } from './content.js'
 import type { ApplicationKeyring } from './keys.js'
 import { ApplicationControlParticipant, type ControlParticipantOptions } from './control-participant.js'
-import type { ApplicationParticipation } from './participation-types.js'
+import { OwnedApplicationParticipation } from './participation.js'
+import type { ApplicationParticipation, ApplicationParticipationOptions } from './participation-types.js'
 import {
-  connectApplicationPeer, connectApplicationPeerPair,
+  connectApplicationPeer, connectApplicationPeerPair, connectedApplicationPeers,
   type ApplicationPeerConnectOptions, type ApplicationPeerLink, type ApplicationPeerPort,
 } from './network.js'
 
@@ -116,7 +117,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #closed = false
   #closeTask: Promise<void> | undefined
   #control: ApplicationControlParticipant | undefined
-  #participation: ApplicationParticipation | undefined
+  #participation: OwnedApplicationParticipation | undefined
 
   constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: BytesStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#definition = options.definition; this.#closing = options.close
@@ -133,6 +134,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const port: ApplicationPeerPort = { replica, signals, content: options.content, keys: options.keys, signal: this.#lifetime.signal,
       attach: (peerId, submit, link) => this.#attachPeer(peerId, submit, link),
       resume: () => this.resume(),
+      observeHead: (peerId, revision, observedAt) => this.#participation?.observeHead(peerId, revision, observedAt),
     }
     internals.set(this, { port })
     this.#stopStatus = replica.subscribe(() => this.#publishStatus())
@@ -242,6 +244,20 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   connectPeer(options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
     this.#assertOpen()
     return connectApplicationPeer(internals.get(this)!.port, options)
+  }
+
+  /** Own discovery, reconnection and conservative recovery for this session lifetime. */
+  participate(options: ApplicationParticipationOptions): ApplicationParticipation {
+    this.#assertOpen()
+    if (this.#participation !== undefined) throw new Error('APPLICATION_PARTICIPATION_ALREADY_STARTED')
+    const participation = new OwnedApplicationParticipation({ replica: this.#replica, recovery: this.recovery,
+      store: this.#store, signal: this.signal, connect: input => this.connectPeer(input),
+      links: () => connectedApplicationPeers(internals.get(this)!.port),
+      resume: () => this.resume(),
+    }, options)
+    this.#participation = participation
+    this.#links.add(participation)
+    return participation
   }
 
   connectControlParticipant(options: ControlParticipantOptions): ApplicationControlParticipant {

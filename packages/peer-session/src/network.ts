@@ -34,7 +34,7 @@ export interface ApplicationPeerPort {
   attach(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): Promise<void> }): () => void
   resume(): Promise<void>
   /** A complete head received through this authenticated coordinator link. */
-  observeHead?(peerId: string, revision: PeerRevision): void
+  observeHead?(peerId: string, revision: PeerRevision, requestedAt: number): void
 }
 export interface ApplicationPeerConnectOptions {
   readonly connection: FramedPeerConnection
@@ -423,6 +423,7 @@ class NetworkPeer implements ApplicationPeerLink {
     this.#sync = task; return task
   }
   async #pull(): Promise<void> {
+    const requestedAt = Date.now()
     const response = record(await this.#request('state', null), ['authority', 'point', 'revision']) as unknown as RemoteState
     const replica = this.#port.replica
     const remote = await verifyAuthorityBundle(response.authority, replica.authority.descriptor)
@@ -489,7 +490,7 @@ class NetworkPeer implements ApplicationPeerLink {
     }
     if (at !== null && replica.generation.id === at.generation && this.peerId === replica.generation.payload.coordinator) {
       this.#reader()
-      this.#port.observeHead?.(this.peerId, structuredClone(at))
+      this.#port.observeHead?.(this.peerId, structuredClone(at), requestedAt)
     }
   }
   #kick(): void {
@@ -544,6 +545,10 @@ class NetworkPeer implements ApplicationPeerLink {
     return this.#closeTask
   }
   close(): Promise<void> { return this.#dispose() }
+}
+
+export function connectedApplicationPeers(port: ApplicationPeerPort): readonly ApplicationPeerLink[] {
+  return [...owners.get(port)?.peers.values() ?? []]
 }
 
 export async function connectApplicationPeer(port: ApplicationPeerPort, input: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
