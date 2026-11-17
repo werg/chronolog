@@ -372,6 +372,24 @@ importers:
         specifier: workspace:*
         version: link:../protocol
 
+  packages/peer-session:
+    dependencies:
+      '@chronolog/materializer':
+        specifier: workspace:*
+        version: link:../materializer
+      '@chronolog/peer-generation':
+        specifier: workspace:*
+        version: link:../peer-generation
+      '@chronolog/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:../signals
+
   packages/protocol:
     dependencies:
       '@chronolog/canonical':
