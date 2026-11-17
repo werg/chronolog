@@ -120,7 +120,7 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
       rootAdministrator: bootstrap.genesis.manifest.schemaAdminPublicKey })
     governed = await createGovernedNode({ genesis: bootstrap.genesis, groupRoute, identity: identity.signing, transport,
       clock: { now: () => clockNow },
-      operationStore: store, controlStore: new ControlStore(new SqliteControlStorePersistence(control), { orderPolicy: 'coordinated' }),
+      operationStore: store, controlStore: new ControlStore(new SqliteControlStorePersistence(control)),
       materialization: createDoltLiteMaterializationRuntime(materializer),
       recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
       initialEpochContentKey: privateBootstrap.slice(64) })

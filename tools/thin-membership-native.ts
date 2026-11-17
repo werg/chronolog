@@ -275,7 +275,7 @@ export async function createThinMembershipNative(options: {
       governed = await createGovernedNode({ genesis, groupRoute: base64UrlToBytes(input.groupRoute), identity: identity.signing,
         transport, operationStore: store, materialization: createDoltLiteMaterializationRuntime(materializer),
         ...(options.clock === undefined ? {} : { clock: options.clock }),
-        controlStore: new ControlStore(new SqliteControlStorePersistence(control), { orderPolicy: 'coordinated' }),
+        controlStore: new ControlStore(new SqliteControlStorePersistence(control)),
         recipient: { id: identity.signing.publicKeyBytes, privateKey: identity.reader.privateKey } })
       await governed.start()
       agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, descriptor: governed.descriptor,

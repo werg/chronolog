@@ -41,7 +41,6 @@ export class ControlStoreConflictError extends Error {
 }
 
 export class ControlStore {
-  readonly orderPolicy: 'peer' | 'coordinated'
   readonly #persistence: ControlStorePersistence | null
   #sequence = 0n
   #deltaFloor = 0n
@@ -59,28 +58,18 @@ export class ControlStore {
 
   constructor(
     persistence: ControlStorePersistence | null = null,
-    options: { readonly maximumRetainedDeltas?: number; readonly orderPolicy?: 'peer' | 'coordinated' } = {},
+    options: { readonly maximumRetainedDeltas?: number } = {},
   ) {
     this.#persistence = persistence
-    this.orderPolicy = options.orderPolicy ?? 'peer'
     this.#maximumRetainedDeltas = options.maximumRetainedDeltas ?? 2_048
     if (!Number.isSafeInteger(this.#maximumRetainedDeltas) || this.#maximumRetainedDeltas < 1) {
       throw new RangeError('CONTROL_STORE_INVALID_DELTA_RETENTION')
     }
-    const journalCutoffs = persistence?.loadValidatorCutoffs?.() ?? null
+    const journalCutoffs = persistence?.loadValidatorCutoffs?.() ?? []
     const snapshot = persistence?.load()
-    if (snapshot != null && (snapshot.orderPolicy ?? 'peer') !== this.orderPolicy) {
-      throw new ControlStoreConflictError('CONTROL_STORE_HISTORY_POLICY_MISMATCH')
-    }
-    try {
-      if (snapshot !== null && snapshot !== undefined) this.#restore(snapshot)
-      this.#replayJournal(persistence?.loadJournal?.() ?? [])
-    } catch (error) {
-      if (persistence?.recoverCorruptSnapshot?.(error) !== true) throw error
-      this.#reset()
-    }
-    for (const cutoff of journalCutoffs ?? []) this.#mergeValidatorCutoff(cutoff)
-    persistence?.initializeValidatorCutoffs?.(this.#listValidatorCutoffs())
+    if (snapshot !== null && snapshot !== undefined) this.#restore(snapshot)
+    this.#replayJournal(persistence?.loadJournal?.() ?? [])
+    for (const cutoff of journalCutoffs) this.#mergeValidatorCutoff(cutoff)
     // Compact on open: bounds replay work and discards any torn final line
     // before new entries are appended after it.
     if (persistence?.journalPresent?.() === true) persistence.save(this.snapshot())
@@ -567,7 +556,6 @@ export class ControlStore {
   snapshot(): ControlStoreSnapshot {
     return {
       format: 'chronolog-control-store/v1',
-      orderPolicy: this.orderPolicy,
       sequence: this.#sequence,
       candidates: this.listCandidates(),
       attestations: [...this.#attestations.values()].map(cloneAttestation),
@@ -577,10 +565,7 @@ export class ControlStore {
       deltaFloor: this.#deltaFloor,
       materializedHead: this.materializedHead(),
       checkpoints: [...this.#checkpoints.values()].map(clone),
-      validatorCutoffs: [...this.#validatorCutoffs.entries()].map(([key, acceptedAboveMs]) => ({
-        validatorId: hexToBytes(key),
-        acceptedAboveMs,
-      })),
+      validatorCutoffs: this.#listValidatorCutoffs(),
     }
   }
 
@@ -701,7 +686,7 @@ export class ControlStore {
 
   #restore(snapshot: ControlStoreSnapshot): void {
     this.#sequence = snapshot.sequence
-    this.#deltaFloor = snapshot.deltaFloor ?? 0n
+    this.#deltaFloor = snapshot.deltaFloor
     for (const candidate of snapshot.candidates) {
       this.#candidates.set(idKey(candidate.txId), cloneCandidate(candidate))
     }
@@ -717,7 +702,7 @@ export class ControlStore {
     for (const heartbeat of snapshot.heartbeats) {
       this.#heartbeats.set(heartbeatKey(heartbeat.membershipRevision, heartbeat.validatorId), cloneHeartbeat(heartbeat))
     }
-    for (const cutoff of snapshot.validatorCutoffs ?? []) {
+    for (const cutoff of snapshot.validatorCutoffs) {
       this.#validatorCutoffs.set(idKey(cutoff.validatorId), cutoff.acceptedAboveMs)
     }
     this.#orderedTxIds.push(...snapshot.orderedTxIds.map(copyBytes))
@@ -784,20 +769,6 @@ export class ControlStore {
     if (excess <= 0) return
     const removed = this.#deltas.splice(0, excess)
     this.#deltaFloor = removed.at(-1)!.sequence
-  }
-
-  #reset(): void {
-    this.#sequence = 0n
-    this.#deltaFloor = 0n
-    this.#candidates.clear()
-    this.#attestations.clear()
-    this.#attestationsByTx.clear()
-    this.#heartbeats.clear()
-    this.#validatorCutoffs.clear()
-    this.#orderedTxIds.splice(0)
-    this.#deltas.splice(0)
-    this.#checkpoints.clear()
-    this.#materializedHead = null
   }
 
   #mergeValidatorCutoff(cutoff: ValidatorCutoffState): void {

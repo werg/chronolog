@@ -185,13 +185,11 @@ async function startRuntime() {
         ...(runtime.historyPolicy === undefined ? {} : { historyPolicy: runtime.historyPolicy }),
       })
       await openMaterializer(bootstrap.genesis.manifest.schemaAdminPublicKey, bootstrap.genesis.manifest.forkedFrom !== undefined)
-      const orderPolicy = bootstrap.genesis.manifest.historyPolicy?.kind
-      if (orderPolicy === undefined) throw new Error('GENESIS_HISTORY_POLICY_REQUIRED')
       governed = await createGovernedNode({
         genesis: bootstrap.genesis, groupRoute: fromBase64(config.groupRoute), identity, transport,
         recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey },
         materialization: materialization!, operationStore,
-        controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState), { orderPolicy }),
+        controlStore: new ControlStore(new SqliteControlStorePersistence(nodeState)),
         initialEpochContentKey: fromBase64(config.epochContentKey),
         feedForkRegistry: new FeedForkRegistry(new SqliteFeedForkPersistence(nodeState.database)),
       })

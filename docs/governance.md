@@ -423,27 +423,40 @@ remain explicit blocked states, not SQL rejections or false readiness.
 Row grants are revoked by ordinary ordered transactions. A write ordered after
 a row-grant revoke sees the revoked grant. While the order is provisional,
 late transactions can still be inserted earlier and cause a suffix to replay.
-Once a blocking set of validators has closed the relevant timestamp prefix,
-a newly admitted backdated write cannot be inserted before that revoke. This
-is the existing finality mechanism; historical writes remain part of history.
+The live finality frontier closes the preceding history only after all earlier
+possible admissions are resolved. A raw validator watermark is insufficient:
+a proposal with a partial quorum may still gain a delayed vote from another
+validator. The frontier accounts for each pending proposal's own policy and
+revision, every allowed admission policy, and complete indexed feed prefixes.
+Once the revoke is final, no later admission can be inserted before it.
 
 `TransactionHandle.accepted()` and `settled()` report the materialized outcome
-at the transaction's **current position**. Neither waits for finality. For an
-irreversible decision, inspect settlement evidence: the relevant policy
-watermark must cover the transaction (`confidence: 'policy_watermark_reached'`),
-and unresolved referenced records must be accounted for. An accepted outcome
-alone does not establish that its preceding history is closed.
+at the transaction's **current position**. Neither waits for finality. Use
+`handle.final()` to wait for its immutable accepted or rejected result. External
+effects consume final events and retain their own dispatch checkpoint and
+idempotency key. Settlement evidence explains pending proof and admission
+blockers; a raw cutoff or an accepted speculative outcome does not establish
+finality. The common timestamp order and replay primitives do not themselves
+require finality; these readers and effects belong to the live history policy.
 
-Group capability revocations use the separate administration log. The node
-normally authors against its latest membership revision; historical snapshots
-remain available for replay. The current implementation can still admit a
-fresh transaction explicitly pinned to an older membership revision when that
-revision authorizes the signer and enough validators. Such a transaction can
-reach provisional materialized state. Once honest validators move to the newer
-revision, their new heartbeats do not advance the old revision's watermark, so
-that fresh transaction does not become final through those heartbeats. This
-revision-lifecycle boundary is distinct from rewriting an already closed
-timestamp prefix or bypassing an ordered row-grant revoke.
+Group capability revocations are signed control records. A new membership
+revision takes effect after its verified closed-time boundary; authorization
+continues to use the original signed author timestamp. Historical snapshots
+remain available for replay, and later revocation cannot rewrite an earlier
+final result. A newer revision's heartbeat cannot close an older revision.
+Complete revision-closure evidence must expose the earlier admissions and
+their authenticated feed prefixes first. If a pending proposal can no longer
+obtain its required proof, it receives the terminal rejection
+`ADMISSION_CLOSED`. Missing bodies or keys remain blocked inputs while they can
+still arrive. Retrying exact signed bytes preserves their identity and time;
+an intentional new attempt creates a new operation.
+
+The validator threshold is an admission quorum. The live protocol assumes the
+authorized validators honor their signed monotone cutoff and revision-closure
+promises; it does not implement a general Byzantine consensus protocol or
+automatic validator replacement. The signed-inclusion provider instead trusts
+its pinned inclusion signer for those promises. Both proof adapters feed the
+same chronological replay and final-prefix publication.
 
 ## Static override
 

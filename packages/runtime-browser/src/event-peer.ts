@@ -64,9 +64,8 @@ export async function openBrowserEventPeer(options: {
     customSignals = configuration.signals
     if (configuration.governed !== undefined && customSignals !== undefined) throw new Error('SIGNAL_GOVERNANCE_CONFIGURATION_CONFLICT')
     control = await openSyncControl(storage.directory)
-    const historyKind = configuration.governed?.genesis.manifest.historyPolicy?.kind ?? configuration.node?.historyPolicy?.kind ?? 'peer'
     const owned = { identity: identity.signing, transport: configuration.transport ?? transport,
-      operationStore: storage.bytes, controlStore: new ControlStore(control, { orderPolicy: historyKind }), materialization: runtime }
+      operationStore: storage.bytes, controlStore: new ControlStore(control), materialization: runtime }
     if (configuration.governed !== undefined) {
       governed = await createGovernedNode({ ...configuration.governed, ...owned,
         recipient: { id: identity.signing.publicKeyBytes, privateKey: identity.reader.privateKey } })

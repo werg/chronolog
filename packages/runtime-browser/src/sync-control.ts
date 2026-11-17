@@ -54,9 +54,6 @@ export class SyncControlPersistence implements ControlStorePersistence {
   load(): ControlStoreSnapshot | null { return this.#snapshot === null ? null : structuredClone(this.#snapshot) }
   loadJournal(): readonly ControlStoreJournalEntry[] { return structuredClone(this.#journal) }
   loadValidatorCutoffs(): readonly ValidatorCutoffState[] { return structuredClone([...this.#cutoffs.values()]) }
-  initializeValidatorCutoffs(cutoffs: readonly ValidatorCutoffState[]): void {
-    for (const cutoff of cutoffs) this.saveValidatorCutoff(cutoff)
-  }
   save(snapshot: ControlStoreSnapshot): void {
     this.#append(encodeCanonicalCbor(['snapshot', encodeControlStoreSnapshot(snapshot)]))
     this.#snapshot = structuredClone(snapshot)

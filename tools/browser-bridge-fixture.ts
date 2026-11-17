@@ -226,7 +226,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
     const adapter = new TendrillerTransport({ local, records, configuration, groupRoute, watch: false,
       certificate: createCertificateFetcher({ url: `${hubUrl}/_chronolog/certificate`, headers }) })
     governed = await createGovernedNode({ genesis, groupRoute, identity: administrator.signing, transport: adapter,
-      operationStore: operations, controlStore: new ControlStore(new SqliteControlStorePersistence(state), { orderPolicy: 'coordinated' }),
+      operationStore: operations, controlStore: new ControlStore(new SqliteControlStorePersistence(state)),
       materialization: createDoltLiteMaterializationRuntime(materializer),
       recipient: { id: administrator.signing.publicKeyBytes, privateKey: administrator.reader.privateKey },
     })

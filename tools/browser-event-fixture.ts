@@ -70,7 +70,7 @@ export async function createNativeBrowserFixture(options: {
   }, identity.signing.privateKey)
   const governed = await createGovernedNode({ genesis, groupRoute, identity: identity.signing, transport, operationStore: store,
     ...(options.authorClock === undefined ? {} : { clock: { now: options.authorClock } }),
-    controlStore: new ControlStore(new SqliteControlStorePersistence(control), { orderPolicy: 'coordinated' }), materialization,
+    controlStore: new ControlStore(new SqliteControlStorePersistence(control)), materialization,
     recipient: { id: identity.signing.publicKeyBytes, privateKey: identity.reader.privateKey }, initialEpochContentKey: epochContentKey })
   await governed.start()
   const agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, descriptor: governed.descriptor,

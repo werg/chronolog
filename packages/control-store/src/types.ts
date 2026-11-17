@@ -180,7 +180,6 @@ export type ControlStoreDelta =
     }
 
 export interface ControlStoreSnapshot {
-  readonly orderPolicy?: 'peer' | 'coordinated'
   readonly format: 'chronolog-control-store/v1'
   readonly sequence: bigint
   readonly candidates: readonly StoredCandidate[]
@@ -189,15 +188,14 @@ export interface ControlStoreSnapshot {
   readonly orderedTxIds: readonly Uint8Array[]
   readonly deltas: readonly ControlStoreDelta[]
   /** Highest sequence no longer retained in `deltas`. */
-  readonly deltaFloor?: bigint
+  readonly deltaFloor: bigint
   readonly materializedHead: MaterializedHead | null
   readonly checkpoints: readonly StoredCheckpoint[]
   /**
    * Cutoffs are validator signing state rather than a rebuildable index. They
    * are written synchronously before a validator publishes a signed record.
-   * Optional for snapshots produced before cutoff journaling was introduced.
    */
-  readonly validatorCutoffs?: readonly {
+  readonly validatorCutoffs: readonly {
     readonly validatorId: Uint8Array
     readonly acceptedAboveMs: bigint
   }[]
@@ -245,16 +243,12 @@ export interface ControlStorePersistence {
   /** True when loadJournal() found a journal file that should be compacted. */
   journalPresent?(): boolean
   /** Loads non-rebuildable validator signing state from its independent journal. */
-  loadValidatorCutoffs?(): readonly ValidatorCutoffState[] | null
-  /** Initializes the independent cutoff journal after loading a valid legacy snapshot. */
-  initializeValidatorCutoffs?(cutoffs: readonly ValidatorCutoffState[]): void
+  loadValidatorCutoffs?(): readonly ValidatorCutoffState[]
   /** Synchronously and durably advances one validator's signing cutoff. */
   saveValidatorCutoff?(cutoff: ValidatorCutoffState): void
   /** Optional coalescing hook for rebuildable persistence implementations. */
   requestSave?(snapshot: () => ControlStoreSnapshot): void
   flush?(): void
-  /** Quarantines a structurally corrupt rebuildable snapshot, if supported. */
-  recoverCorruptSnapshot?(error: unknown): boolean
 }
 
 export interface ValidatorCutoffState {

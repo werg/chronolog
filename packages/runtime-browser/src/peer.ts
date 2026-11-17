@@ -102,11 +102,10 @@ export async function openBrowserPeer(options: {
     materializer = await DeterministicMaterializer.open({
       ...configuration.materializer, path: `${directory}/application.db`, openDatabase: factory,
     })
-    const historyKind = configuration.governed?.genesis.manifest.historyPolicy?.kind ?? configuration.node?.historyPolicy?.kind ?? 'peer'
     const owned = {
       identity: identity.signing, transport: configuration.transport ?? transport,
       operationStore: storage.bytes,
-      controlStore: new ControlStore(control, { orderPolicy: historyKind }),
+      controlStore: new ControlStore(control),
       materialization: createDoltLiteMaterializationRuntime(materializer),
     }
     if (configuration.governed !== undefined) {

@@ -112,10 +112,6 @@ export class MemoryControlStorePersistence implements ControlStorePersistence {
     return [...this.#cutoffs.values()].map(cloneCutoff)
   }
 
-  initializeValidatorCutoffs(cutoffs: readonly ValidatorCutoffState[]): void {
-    for (const cutoff of cutoffs) this.saveValidatorCutoff(cutoff)
-  }
-
   saveValidatorCutoff(cutoff: ValidatorCutoffState): void {
     const key = bytesToHex(cutoff.validatorId)
     const previous = this.#cutoffs.get(key)

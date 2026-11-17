@@ -130,30 +130,24 @@ export class SqliteControlStorePersistence implements ControlStorePersistence {
     this.#pending = []
   }
 
-  loadValidatorCutoffs(): readonly ValidatorCutoffState[] | null {
+  loadValidatorCutoffs(): readonly ValidatorCutoffState[] {
     const rows = this.#database.prepare('SELECT validator_id, accepted_above_ms FROM validator_cutoffs ORDER BY validator_id')
     rows.setReadBigInts(true)
-    const cutoffs = (rows.all() as { validator_id: Uint8Array; accepted_above_ms: bigint }[])
+    return (rows.all() as { validator_id: Uint8Array; accepted_above_ms: bigint }[])
       .map((row) => ({ validatorId: Uint8Array.from(row.validator_id), acceptedAboveMs: row.accepted_above_ms }))
-    return cutoffs.length === 0 && this.load() === null ? null : cutoffs
-  }
-
-  initializeValidatorCutoffs(cutoffs: readonly ValidatorCutoffState[]): void {
-    this.#transaction(() => { for (const cutoff of cutoffs) this.#raiseCutoff(cutoff, false) })
   }
 
   /** Durable before it returns; a cutoff never moves backwards. */
   saveValidatorCutoff(cutoff: ValidatorCutoffState): void {
-    this.#transaction(() => this.#raiseCutoff(cutoff, true))
+    this.#transaction(() => this.#raiseCutoff(cutoff))
   }
 
-  #raiseCutoff(cutoff: ValidatorCutoffState, strict: boolean): void {
+  #raiseCutoff(cutoff: ValidatorCutoffState): void {
     const current = this.#database.prepare('SELECT accepted_above_ms FROM validator_cutoffs WHERE validator_id = ?')
     current.setReadBigInts(true)
     const row = current.get(cutoff.validatorId) as { accepted_above_ms: bigint } | undefined
     if (row !== undefined && cutoff.acceptedAboveMs < row.accepted_above_ms) {
-      if (strict) throw new Error('CONTROL_STORE_VALIDATOR_CUTOFF_REGRESSION')
-      return
+      throw new Error('CONTROL_STORE_VALIDATOR_CUTOFF_REGRESSION')
     }
     if (row?.accepted_above_ms === cutoff.acceptedAboveMs) return
     this.#database.prepare('INSERT OR REPLACE INTO validator_cutoffs (validator_id, accepted_above_ms) VALUES (?, ?)')

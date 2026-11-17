@@ -52,10 +52,6 @@ export class BrowserControlPersistence implements ControlStorePersistence {
     })
   }
 
-  initializeValidatorCutoffs(cutoffs: readonly ValidatorCutoffState[]): void {
-    for (const cutoff of cutoffs) this.saveValidatorCutoff(cutoff)
-  }
-
   saveValidatorCutoff(cutoff: ValidatorCutoffState): void {
     if (cutoff.validatorId.length !== 32 || cutoff.acceptedAboveMs < 0n) throw new Error('CONTROL_STORE_VALIDATOR_CUTOFF_INVALID')
     this.#transaction(() => {
