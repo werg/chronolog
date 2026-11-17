@@ -86,13 +86,16 @@ it('administers an independently ordered native/browser group through the actual
   const applicantMembers = members(applicant.api), otherMembers = members(other.api);
   await expect(applicantMembers.configure(setup)).rejects.toMatchObject({ status: 403 });
   const configured = await owner.configure(setup);
+  expect(configured.identity.administrator).toBe(true);
   expect(configured.descriptor).not.toBeNull();
   const genesis = decodeSignedGenesis(base64UrlToBytes(configured.descriptor.genesis));
   expect(bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).not.toBe(setup.nativeAuthority.publicKey);
+  expect(bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).not.toBe(setup.schemaAdministratorPublicKey);
   expect(bytesToBase64Url(genesis.manifest.schemaAdminPublicKey)).toBe(setup.schemaAdministratorPublicKey);
   const rootRoles = genesis.manifest.initialCapabilities.filter(grant =>
     bytesToBase64Url(grant.signingPublicKey) === bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).map(grant => grant.role);
-  expect(rootRoles).toEqual(['administrator']);
+  // Genesis pins administration directly; it grants the root no reader or writer rights.
+  expect(rootRoles).toEqual([]);
   const bootstrap = await fixture('start', configured.descriptor);
   await owner.sync();
   await passed('Cloudflare owns a durable membership-only root; the separate native signer owns application schema and ordering');
@@ -125,6 +128,10 @@ it('administers an independently ordered native/browser group through the actual
   const request = await device({ method: 'request', requestId });
   await expect(otherMembers.requestEnrollment(request.signedRequest)).rejects.toMatchObject({ status: 403 });
   const submitted = await applicantMembers.requestEnrollment(request.signedRequest);
+  await expect(owner.approve({ operationId: 'reject-admin-grant', requestId: submitted.id,
+    roles: ['reader', 'administrator'], grantFullHistory: true })).rejects.toMatchObject({ status: 400, code: 'bad_request' });
+  expect((await applicantMembers.requestStatus(submitted.id)).status).toBe('requested');
+  expect((await owner.info()).pendingActions).toBe(0);
   await expect(applicantMembers.history({ after: 0 })).rejects.toMatchObject({ status: 403 });
   await expect(applicantMembers.approve({ operationId: 'self-approve', requestId: submitted.id,
     roles: ['reader', 'writer'], grantFullHistory: true, writerProgram })).rejects.toMatchObject({ status: 403 });
