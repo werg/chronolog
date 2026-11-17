@@ -15,6 +15,7 @@ import { ApplicationRecovery } from './recovery.js'
 import type { ApplicationContent } from './content.js'
 import type { ApplicationKeyring } from './keys.js'
 import { ApplicationControlParticipant, type ControlParticipantOptions } from './control-participant.js'
+import type { ApplicationParticipation } from './participation-types.js'
 import {
   connectApplicationPeer, connectApplicationPeerPair,
   type ApplicationPeerConnectOptions, type ApplicationPeerLink, type ApplicationPeerPort,
@@ -115,6 +116,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #closed = false
   #closeTask: Promise<void> | undefined
   #control: ApplicationControlParticipant | undefined
+  #participation: ApplicationParticipation | undefined
 
   constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: BytesStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#definition = options.definition; this.#closing = options.close
@@ -147,6 +149,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   get revision(): PeerRevision { return this.#replica.revision }
   get deviceId(): string { return this.#replica.device.publicKey }
   get applicationId(): string { return this.#replica.descriptor.applicationId }
+  get participation(): ApplicationParticipation | undefined { return this.#participation }
   get historyId(): string { return this.#replica.descriptor.historyId }
   get storageId(): string { return this.#replica.storageId }
   get status(): SessionStatus {

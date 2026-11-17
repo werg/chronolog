@@ -228,6 +228,40 @@ describe('public peer application sessions', () => {
     expect((await f.registry.read()).generations).toHaveLength(1)
   })
 
+  it('requires an exact retained prefix before selecting another eligible coordinator', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), c = await f.open(f.c)
+    const host = { application: () => f.registry.read(), selectGeneration: (request: Parameters<typeof f.registry.select>[0]) => f.registry.select(request) }
+    await expect(b.recovery.takeover(host, { coordinator: c.deviceId, transitionId: 'remote' }))
+      .rejects.toThrow('APPLICATION_TAKEOVER_REQUIRES_RETAINED_PREFIX')
+    expect(await b.recovery.inspect()).toEqual([])
+    const ab = await connectApplications(a, b), bc = await connectApplications(b, c)
+    cleanup.push(() => ab.close(), () => bc.close())
+    await applied(a, 'retained', 'retained'); await ab.synchronize(); await bc.synchronize()
+    await b.recovery.takeover(host, { coordinator: c.deviceId, transitionId: 'remote' })
+    expect((await f.registry.read()).generations.at(-1)?.payload.coordinator).toBe(c.deviceId)
+    expect((await b.recovery.inspect())[0]?.request.payload.coordinator).toBe(c.deviceId)
+  })
+
+  it('fences a cancelled recovery owner while preserving its exact request for later resolution', async () => {
+    const f = await fixture(), b = await f.open(f.b), controller = new AbortController()
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve }), started = new Promise<void>(resolve => { entered = resolve })
+    let committed: Promise<Awaited<ReturnType<typeof f.registry.select>>> | undefined
+    const host = { application: () => f.registry.read(), selectGeneration(request: Parameters<typeof f.registry.select>[0]) {
+      entered(); committed = gate.then(() => f.registry.select(request)); return committed
+    } }
+    const before = b.revision, waiting = b.recovery.takeover(host, { transitionId: 'cancel-owner', signal: controller.signal })
+    const rejected = expect(waiting).rejects.toThrow('owner stopped')
+    await started; controller.abort(new Error('owner stopped')); await rejected
+    const saved = (await b.recovery.inspect())[0]!
+    expect(saved.selected).toBeNull()
+    release(); await committed
+    expect(b.revision).toEqual(before)
+    await b.recovery.takeover(host, { transitionId: 'cancel-owner' })
+    expect((await b.recovery.inspect())[0]?.request).toEqual(saved.request)
+    expect(b.status.role).toBe('coordinator')
+  })
+
   it('adopts a typed hosted conflict and never resubmits its superseded saved request', async () => {
     const f = await fixture(), b = await f.open(f.b), c = await f.open(f.c)
     const conflict = Object.assign(new Error('A different eligible coordinator won the transition'), {
