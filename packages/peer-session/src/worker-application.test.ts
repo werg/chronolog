@@ -12,6 +12,7 @@ import { openPeerApplication } from './runtime.js'
 import { AbandonedOperationError, connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
 import { connectApplicationWorker, serveApplicationWorker } from './worker-application.js'
 import type { ApplicationControlHost } from './recovery.js'
+import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
 
 const definition = defineApplication({ id: 'worker-messages', version: '1', commands: {
   say: defineCommand({ description: 'Write a message', input: { type: 'string', minLength: 1, maxLength: 128 },
@@ -59,6 +60,41 @@ async function facade(session: ApplicationSession, host?: ApplicationControlHost
 }
 
 describe('owned browser application facade', () => {
+  it('observes the owner participation policy and forwards exact broader-recovery approval', async () => {
+    const f = await fixture(), lifetime = new AbortController()
+    const listeners = new Set<(status: ApplicationParticipationStatus) => void>()
+    let status: ApplicationParticipationStatus = { phase: 'approval-required', connectedPeers: [], error: null,
+      recovery: { id: 'one-proposal', coordinator: f.a.deviceId, point: f.a.revision.point,
+        reason: 'freshness-unknown', observedAt: null, ageMs: null } }
+    const publish = (): void => { for (const listener of listeners) listener(status) }
+    const approveRecovery = vi.fn(async (id: string) => {
+      if (id !== status.recovery?.id) throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
+      status = { ...status, phase: 'coordinating', recovery: null }; publish()
+    })
+    const participation: ApplicationParticipation = {
+      get status() { return status }, signal: lifetime.signal,
+      onStatus(listener) { listeners.add(listener); listener(status); return () => { listeners.delete(listener) } },
+      approveRecovery,
+      async close() { lifetime.abort(); status = { ...status, phase: 'closed' }; publish() },
+    }
+    const getter = vi.spyOn(f.a, 'participation', 'get').mockReturnValue(participation)
+    cleanup.push(() => { getter.mockRestore() })
+    const { client } = await facade(f.a)
+    expect(client.participation?.status).toEqual(status)
+    const observations: string[] = []
+    client.participation!.onStatus(value => observations.push(value.phase))
+    await expect(client.participation!.approveRecovery('stale-proposal')).rejects.toThrow('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
+    expect(client.participation?.status.phase).toBe('approval-required')
+    await client.participation!.approveRecovery('one-proposal')
+    expect(approveRecovery).toHaveBeenLastCalledWith('one-proposal')
+    expect(client.participation?.status.phase).toBe('coordinating')
+    await client.participation!.close()
+    expect(client.participation?.signal.aborted).toBe(true)
+    expect(observations.at(-1)).toBe('closed')
+    expect(client.signal.aborted).toBe(false)
+    expect((await client.query('messages', null)).value.events).toEqual([])
+  })
+
   it('keeps keys in the owner and preserves saved intent when a page cancels its waiter', async () => {
     const f = await fixture(), { client } = await facade(f.b)
     expect(client.deviceId).toBe(f.b.deviceId)

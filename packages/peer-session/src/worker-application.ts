@@ -11,6 +11,7 @@ import {
   type QueryParameter, type QueryRows, type SessionStatus,
 } from './session.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
+import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
 
 const PROTOCOL = 'chronolog/peer-session/worker-application/v1'
 const MAX_REQUESTS = 64, MAX_STREAMS = 16, MAX_BYTES = 1_048_576
@@ -19,7 +20,11 @@ type Description = ReturnType<ApplicationSession['describe']>
 type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
 type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
 type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
-interface Snapshot { readonly status: SessionStatus; readonly revision: PeerRevision | null }
+interface Snapshot {
+  readonly status: SessionStatus
+  readonly revision: PeerRevision | null
+  readonly participation: ApplicationParticipationStatus | null
+}
 interface Metadata extends Snapshot {
   readonly protocol: typeof PROTOCOL
   readonly applicationId: string; readonly historyId: string; readonly deviceId: string; readonly storageId: string
@@ -84,6 +89,10 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     if (options.host === undefined) throw new Error('APPLICATION_CONTROL_HOST_UNAVAILABLE')
     return options.host
   }
+  const participation = (): ApplicationParticipation => {
+    if (session.participation === undefined) throw new Error('APPLICATION_PARTICIPATION_UNAVAILABLE')
+    return session.participation
+  }
   const view = (id: unknown): ApplicationReadView => {
     const result = typeof id === 'number' ? views.get(id) : undefined
     if (result === undefined) throw new Error('APPLICATION_VIEW_RELEASED')
@@ -106,6 +115,8 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'recovery.inspect': return session.recovery.inspect()
       case 'recovery.takeover': return session.recovery.takeover(controlHost(), args[0] as { transitionId?: string })
       case 'recovery.handover': return session.recovery.handover(controlHost(), args[0] as { coordinator: string; transitionId?: string })
+      case 'participation.approve': return participation().approveRecovery(args[0] as string)
+      case 'participation.close': return participation().close()
       case 'signals.send': return session.signals.send(args[0] as string, args[1] as SignalPayload, { ...args[2] as SignalSendOptions, signal })
       case 'view.open': {
         const captured = await session.readView()
@@ -133,6 +144,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'changes': return session.changes({ signal })[Symbol.asyncIterator]()
       case 'signals': return session.signals.subscribe({ ...args[0] as SignalSubscribeOptions, signal })[Symbol.asyncIterator]()
       case 'status': return observe<SessionStatus>(listener => session.onStatus(listener), signal)
+      case 'participation': return observe<ApplicationParticipationStatus>(listener => participation().onStatus(listener), signal)
       case 'recovery': return observe<RecoveryNotice>(listener => session.onRecovery(listener), signal)
       case 'content': return session.content.read(args[0] as ContentReference, { ...args[1] as { offset?: number; length?: number }, signal })[Symbol.asyncIterator]()
       default: throw new Error('APPLICATION_WORKER_STREAM_UNKNOWN')
@@ -217,6 +229,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   readonly deviceId: string
   readonly storageId: string
   readonly capabilities: Description['capabilities']
+  readonly participation: ApplicationParticipation | undefined
   readonly operations = {
     get: (id: string, options: { readonly author?: string } = {}): Promise<OperationState | null> => this.#call('operation.get', [id, options]),
     inspect: (id: string, options: { readonly author?: string } = {}): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null> => this.#call('operation.inspect', [id, options]),
@@ -249,6 +262,8 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   readonly #streams = new Set<AbortController>()
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
   readonly #recoveryListeners = new Set<(notice: RecoveryNotice) => void>()
+  readonly #participationListeners = new Set<(status: ApplicationParticipationStatus) => void>()
+  readonly #participationLifetime = new AbortController()
   #snapshot: Snapshot
   #nextId = 0
   #closing: Promise<void> | undefined
@@ -260,6 +275,21 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
     this.applicationId = metadata.applicationId; this.historyId = metadata.historyId; this.deviceId = metadata.deviceId; this.storageId = metadata.storageId
     this.capabilities = Object.freeze({ ...metadata.description.capabilities })
     this.#description = { ...metadata.description, capabilities: this.capabilities }
+    if (metadata.participation !== null) {
+      const owner = this
+      this.participation = {
+        get status() { return structuredClone(owner.#snapshot.participation!) },
+        signal: this.#participationLifetime.signal,
+        onStatus(listener) {
+          owner.#participationListeners.add(listener)
+          try { listener(structuredClone(owner.#snapshot.participation!)) } catch { /* Observation does not own participation. */ }
+          return () => { owner.#participationListeners.delete(listener) }
+        },
+        approveRecovery: id => this.#call('participation.approve', [id]),
+        close: () => this.#call('participation.close', []),
+      }
+      if (metadata.participation.phase === 'closed') this.#participationLifetime.abort(new Error('APPLICATION_PARTICIPATION_CLOSED'))
+    }
     port.addEventListener('message', this.#receive); port.addEventListener('messageerror', this.#messageError); port.start()
     if (signal !== undefined) {
       const abort = (): void => { void this.close().catch(() => undefined) }
@@ -272,6 +302,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
     void this.#observe('recovery', notice => {
       for (const listener of this.#recoveryListeners) { try { listener(notice as RecoveryNotice) } catch { /* Observers cannot change application progress. */ } }
     }).catch(error => this.#fail(error))
+    if (this.participation !== undefined) void this.#observe('participation', () => {}).catch(error => this.#fail(error))
   }
   get signal(): AbortSignal { return this.#lifetime.signal }
   get status(): SessionStatus { return { ...this.#snapshot.status } }
@@ -404,16 +435,29 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   }
   readonly #messageError = (): void => { this.#fail(new Error('APPLICATION_WORKER_MESSAGE_INVALID')) }
   #update(value: Snapshot): void {
+    validateParticipation(value.participation)
+    if ((value.participation === null) !== (this.participation === undefined)) throw new Error('APPLICATION_WORKER_PARTICIPATION_CHANGED')
     const changed = JSON.stringify(value.status) !== JSON.stringify(this.#snapshot.status)
+    const participationChanged = JSON.stringify(value.participation) !== JSON.stringify(this.#snapshot.participation)
     this.#snapshot = value
     if (changed) for (const listener of this.#statusListeners) { try { listener(this.status) } catch { /* Observation cannot change state. */ } }
+    if (value.participation?.phase === 'closed') this.#participationLifetime.abort(new Error('APPLICATION_PARTICIPATION_CLOSED'))
+    if (participationChanged) for (const listener of this.#participationListeners) {
+      try { listener(structuredClone(value.participation!)) } catch { /* Observation cannot choose recovery. */ }
+    }
   }
   #fail(reason: unknown): void {
     if (this.signal.aborted) return
     this.#lifetime.abort(reason); this.#stopExternal?.()
-    this.#snapshot = { ...this.#snapshot, status: { ...this.#snapshot.status, phase: 'closed' } }
+    this.#participationLifetime.abort(reason)
+    this.#snapshot = { ...this.#snapshot, status: { ...this.#snapshot.status, phase: 'closed' },
+      participation: this.#snapshot.participation === null ? null : { ...this.#snapshot.participation, phase: 'closed' } }
     for (const listener of this.#statusListeners) { try { listener(this.status) } catch { /* Observe closure independently. */ } }
     this.#statusListeners.clear(); this.#recoveryListeners.clear()
+    for (const listener of this.#participationListeners) {
+      try { listener(structuredClone(this.#snapshot.participation!)) } catch { /* Observe closure independently. */ }
+    }
+    this.#participationListeners.clear()
     for (const pending of this.#pending.values()) pending.reject(reason)
     this.#pending.clear()
     for (const controller of this.#streams) controller.abort(reason)
@@ -455,6 +499,7 @@ export function connectApplicationWorker<D extends ApplicationDefinition = Appli
           throw new Error('APPLICATION_WORKER_METADATA_INVALID')
         }
         validateApplicationDescription(description)
+        validateParticipation(metadata.participation)
         clean(); resolve(new WorkerApplicationSession<D>(port, metadata, timeoutMs, options.signal))
       } catch (error) { fail(error) }
     }
@@ -468,7 +513,22 @@ export function connectApplicationWorker<D extends ApplicationDefinition = Appli
 function snapshot(session: ApplicationSession): Snapshot {
   let revision: PeerRevision | null = null
   try { revision = session.revision } catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERING') throw error }
-  return { status: session.status, revision }
+  return { status: session.status, revision, participation: session.participation?.status ?? null }
+}
+function validateParticipation(value: unknown): asserts value is ApplicationParticipationStatus | null {
+  if (value === null) return
+  if (value === undefined || typeof value !== 'object') throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+  const status = value as ApplicationParticipationStatus
+  if (!['connecting', 'following', 'coordinating', 'recovering', 'approval-required', 'unavailable', 'closed'].includes(status.phase) ||
+      !Array.isArray(status.connectedPeers) || status.connectedPeers.length > 8 ||
+      status.connectedPeers.some(peer => typeof peer !== 'string' || !/^[0-9a-f]{64}$/u.test(peer)) ||
+      status.error !== null && typeof status.error !== 'string' || status.recovery === undefined ||
+      status.recovery !== null && (typeof status.recovery !== 'object' || typeof status.recovery.id !== 'string' ||
+        !['freshness-unknown', 'older-than-budget'].includes(status.recovery.reason) ||
+        status.recovery.observedAt !== null && (!Number.isSafeInteger(status.recovery.observedAt) || status.recovery.observedAt < 0) ||
+        status.recovery.ageMs !== null && (!Number.isSafeInteger(status.recovery.ageMs) || status.recovery.ageMs < 0))) {
+    throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+  }
 }
 function errorValue(error: unknown): WireError {
   if (!(error instanceof Error)) return { name: 'Error', message: String(error) }
