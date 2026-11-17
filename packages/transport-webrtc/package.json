@@ -5,8 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./native": "./src/native.ts",
-    "./resident": "./src/resident.ts"
+    "./native": "./src/native.ts"
   },
   "dependencies": {
     "@chronolog/records": "workspace:*"

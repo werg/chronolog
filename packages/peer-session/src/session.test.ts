@@ -140,7 +140,7 @@ describe('public peer application sessions', () => {
 
   it('keeps device identity and applied outcomes across close/reopen and rejects another owner', async () => {
     const f = await fixture(), a = await f.open(f.a), publicKey = a.deviceId
-    await expect(openNativeDevice({ path: join(f.directory, 'a.sqlite') })).rejects.toThrow('AGENT_STORE_IN_USE')
+    await expect(openNativeDevice({ path: join(f.directory, 'a.sqlite') })).rejects.toThrow('BYTES_STORE_IN_USE')
     await applied(a, 'persistent', 'saved')
     await a.close()
     const reopenedDevice = await openNativeDevice({ path: join(f.directory, 'a.sqlite') })

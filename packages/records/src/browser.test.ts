@@ -35,11 +35,11 @@ describe('OPFS atomic bytes', () => {
     const { handles } = directory()
     let store = new OpfsBytesStore(handles)
     await store.put('signer/private', Uint8Array.of(1, 2))
-    await store.put('feed/manifest', Uint8Array.of(3))
+    await store.put('authority/current', Uint8Array.of(3))
     await store.close()
     store = new OpfsBytesStore(handles)
     expect(await store.get('signer/private')).toEqual(Uint8Array.of(1, 2))
-    expect(await store.get('feed/manifest')).toEqual(Uint8Array.of(3))
+    expect(await store.get('authority/current')).toEqual(Uint8Array.of(3))
     expect(await store.get('missing')).toBeNull()
   })
 
@@ -61,6 +61,9 @@ describe('OPFS atomic bytes', () => {
     const pending = store.put('a', input)
     input[0] = 7
     await pending
+    const captured = await store.get('a')
+    expect(captured).toEqual(Uint8Array.of(4))
+    captured![0] = 9
     expect(await store.get('a')).toEqual(Uint8Array.of(4))
     const key = [...values.keys()][0]!
     const damaged = values.get(key)!.slice()

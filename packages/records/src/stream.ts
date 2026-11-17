@@ -1,5 +1,4 @@
 import type { PeerLiveLane, FramedPeerConnection } from './connection.js'
-export type { PeerFrameLane, PeerLiveLane, FramedPeerConnection } from './connection.js'
 
 export interface PeerStreamOptions {
   readonly readable: ReadableStream<Uint8Array>
