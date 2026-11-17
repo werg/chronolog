@@ -2,7 +2,7 @@ import { isEmitStep, isPlatformOp, type SqlStatement, type ChangeProgram } from 
 
 import { cachedInternalStatement, PlatformRejection, PlatformSession, toDatabaseValue, writeProtectedTables, lifecycleTriggerNames } from './platform/session.js'
 import { isOperationalSqliteError, SqlProfileError, sqlitePrimaryCode, withProfiledStatement, type SqlAuthorizationOptions } from './sql-profile.js'
-import type { DatabaseLike, SqlRuntimeLimits, StatementLike } from './types.js'
+import type { DatabaseLike, SqlMutationPolicy, SqlRuntimeLimits, StatementLike } from './types.js'
 
 export { toDatabaseValue }
 
@@ -47,7 +47,7 @@ export function executeTransactionProgram(
   program: ChangeProgram,
   context: DeterministicContext,
   limits: Partial<SqlRuntimeLimits> = {},
-  policy: { readonly protectedChanges?: boolean } = {},
+  policy: SqlMutationPolicy = 'authorized',
 ): void {
   const platform = new PlatformSession(database, { actor: context.actor, txId: context.txId, groupId: context.groupId, limits })
   // Before the context: it assigns a first-time signer its principal id, which
@@ -56,7 +56,7 @@ export function executeTransactionProgram(
   database.setDeterministicContext(context.authorTimestampMs, prngSeed(context.txId), context.actor, actorId, context.txId)
   try {
     resetChangeCounter(database)
-    let schemaAdmin = policy.protectedChanges !== false && signerIsSchemaAdmin
+    let schemaAdmin = policy === 'authorized' && signerIsSchemaAdmin
     // Reconcile right after every statement that changed the schema, so a new
     // table is owner-checked from the next statement on (§3).
     let reconciledVersion = schemaBefore
@@ -74,7 +74,7 @@ export function executeTransactionProgram(
       // durable outcome commits. A later SQL failure therefore exposes none.
       if (isEmitStep(step)) continue
       if (isPlatformOp(step)) {
-        if (policy.protectedChanges === false) throw new SqlRejection('protected_change_required', index)
+        if (policy === 'data-only') throw new SqlRejection('protected_change_required', index)
         try {
           platform.execute(step, index)
         } catch (error) {

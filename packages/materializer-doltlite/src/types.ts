@@ -195,8 +195,8 @@ export interface DatabaseLike {
 }
 
 export interface MaterializerOptions {
-  /** Authenticated history policy; immutable for the retained database. */
-  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
+  /** SQL authority semantics, authenticated by the execution manifest's platform digest. */
+  readonly sqlPolicy?: SqlMutationPolicy
   /** Verified schema-author program, executed once before the genesis checkpoint. */
   readonly bootstrapProgram?: ChangeProgram
   readonly bootstrapGroupId?: Uint8Array
@@ -229,6 +229,13 @@ export interface MaterializerOptions {
   readonly publicationFaultInjector?: (point: MaterializerPublicationFaultPoint) => void
 }
 
+/** Independent of replay/finality: data-only proposals cannot alter schema or platform rights. */
+export type SqlMutationPolicy = 'authorized' | 'data-only'
+
+export interface AppliedMaterializerOptions extends MaterializerOptions {
+  readonly sqlPolicy: SqlMutationPolicy
+}
+
 export type MaterializerPublicationFaultPoint =
   | 'after_candidate_commit'
   | 'after_revision_ref_created'
@@ -237,8 +244,10 @@ export type MaterializerPublicationFaultPoint =
   | 'after_reader_swap'
 
 export interface StoredExecutionManifest {
-  readonly historyProfile: 'chronological' | 'peer-generation-v1'
+  readonly publicationMode: 'applied' | 'live'
+  readonly sqlPolicy: SqlMutationPolicy
   readonly bootstrapProgram: Uint8Array
+  readonly bootstrapGroupId: Uint8Array
   readonly manifestDigest: Uint8Array
   readonly canonicalManifest: Uint8Array
 }

@@ -6,7 +6,8 @@ import {
 } from '@chronolog/protocol'
 import type { ReplayProposal } from './types.js'
 import {
-  publicationRequestForRevision, type ChronologMaterializationRuntime, type MaterializationOutcomeChange,
+  publicationRequestForRevision, type AppliedApplicationSnapshot, type AppliedMaterializationRuntime,
+  type AppliedReadHandle, type ChronologMaterializationRuntime, type MaterializationOutcomeChange,
   type MaterializedApplicationSnapshot, type MaterializedRevisionSnapshot, type MaterializedTransactionOutcome,
 } from './runtime.js'
 
@@ -15,31 +16,44 @@ export interface EventExecutionStore {
   put(key: string, value: Uint8Array): Promise<void>
 }
 
-/** A pinned SQL-absent execution profile; importing it never loads an SQL engine. */
-export async function eventExecutionManifest(historyProfile: 'chronological' | 'peer-generation-v1' = 'chronological') {
-  return createExecutionManifest({
-    profile: 'chronolog-events-v1', engine: 'none',
-    engineDigest: await sha256(utf8('chronolog/events-only/v1')),
-    platformDigest: await sha256(utf8(`chronolog/change-program/v3;literal-events;operation-conflicts/v1;${historyProfile === 'chronological' ? 'author-time-order/v1' : 'peer-generation-order/v1'}`)),
-  })
-}
-
-export async function createEventMaterializationRuntime(options: {
+export interface EventMaterializationOptions {
   readonly store: EventExecutionStore
   readonly namespace: string
   readonly maxHistoryBytes?: number
-  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
-}): Promise<ChronologMaterializationRuntime> {
+}
+
+/** One SQL-absent execution profile and timestamp comparator, independent of inclusion policy. */
+export async function eventExecutionManifest() {
+  return createExecutionManifest({
+    profile: 'chronolog-events-v1', engine: 'none',
+    engineDigest: await sha256(utf8('chronolog/events-only/v1')),
+    platformDigest: await sha256(utf8('chronolog/change-program/v3;literal-events;operation-conflicts/v1;author-time-order/v1')),
+  })
+}
+
+/** Applied events can be replayed in full; this runtime has no final view or finality state. */
+export function createAppliedEventMaterializationRuntime(options: EventMaterializationOptions): Promise<AppliedMaterializationRuntime> {
+  return openEventRuntime(options, false)
+}
+
+/** The live wrapper adds a durably pinned final prefix to the same replay engine. */
+export function createEventMaterializationRuntime(options: EventMaterializationOptions): Promise<ChronologMaterializationRuntime> {
+  return openEventRuntime(options, true)
+}
+
+interface FinalPrefix { length: number; revision: bigint }
+
+function openEventRuntime(options: EventMaterializationOptions, live: false): Promise<AppliedMaterializationRuntime>
+function openEventRuntime(options: EventMaterializationOptions, live: true): Promise<ChronologMaterializationRuntime>
+async function openEventRuntime(options: EventMaterializationOptions, live: boolean): Promise<AppliedMaterializationRuntime | ChronologMaterializationRuntime> {
   if (options.namespace.length === 0) throw new Error('EVENT_EXECUTION_NAMESPACE_REQUIRED')
-  const historyProfile = options.historyProfile ?? 'chronological'
-  if (historyProfile !== 'chronological' && historyProfile !== 'peer-generation-v1') throw new Error('EVENT_HISTORY_PROFILE_UNSUPPORTED')
-  const manifest = await eventExecutionManifest(historyProfile)
-  const artifacts = await executionManifestArtifacts(manifest)
+  const artifacts = await executionManifestArtifacts(await eventExecutionManifest())
   const digest = artifacts.executionManifestDigest
   const key = `event-execution/${options.namespace}`
   const quota = options.maxHistoryBytes ?? 64 * 1024 * 1024
   if (!Number.isSafeInteger(quota) || quota < 1024) throw new Error('EVENT_EXECUTION_QUOTA_INVALID')
-  let revision = 0n, finalRevision = 0n, finalLength = 0
+  let revision = 0n
+  const finalPrefix: FinalPrefix | null = live ? { length: 0, revision: 0n } : null
   let order: ReplayProposal[] = []
   let outcomes: MaterializedTransactionOutcome[] = []
   let closed = false
@@ -53,18 +67,17 @@ export async function createEventMaterializationRuntime(options: {
     await previous
     try { if (closed) throw new Error('EVENT_EXECUTION_CLOSED'); return await task() } finally { release() }
   }
-  const encode = (next: readonly ReplayProposal[], rev: bigint, final: number, finalRev: bigint): Uint8Array => encodeCanonicalCbor([
-    'chronolog/event-execution/v1', digest, rev, BigInt(final), finalRev,
+  const encode = (next: readonly ReplayProposal[], rev: bigint, prefix: FinalPrefix | null): Uint8Array => encodeCanonicalCbor([
+    'chronolog/event-execution/v2', digest, rev,
     next.map((entry) => [entry.txId, entry.candidateDigest, entry.canonicalCandidate]),
+    ...(prefix === null ? [] : [BigInt(prefix.length), prefix.revision]),
   ])
   const evaluate = async (next: readonly ReplayProposal[]): Promise<MaterializedTransactionOutcome[]> => {
     const operations = new Set<string>(), transactions = new Set<string>(), proposals = new Set<string>()
     const result: MaterializedTransactionOutcome[] = []
     for (const [index, entry] of next.entries()) {
       const core = entry.core
-      if (entry.txId.length === 0) {
-        throw new Error('EVENT_EXECUTION_INPUT_INVALID')
-      }
+      if (entry.txId.length === 0) throw new Error('EVENT_EXECUTION_INPUT_INVALID')
       if (!equalBytes(core.executionManifestDigest, digest)) throw new Error('EVENT_EXECUTION_PROFILE_UNAVAILABLE')
       if (!equalBytes(encodeTransactionCore(core), entry.canonicalCandidate) ||
           !equalBytes(await transactionDigest(entry.canonicalCandidate), entry.candidateDigest)) throw new Error('EVENT_EXECUTION_INPUT_INVALID')
@@ -74,7 +87,7 @@ export async function createEventMaterializationRuntime(options: {
       if (proposals.has(proposalId)) throw new Error('EVENT_EXECUTION_DUPLICATE_PROPOSAL')
       transactions.add(transactionId); proposals.add(proposalId)
       const orderKey = transactionOrderKey(core, entry.txId)
-      if (historyProfile === 'chronological' && index > 0 && compareTransactionOrder(result[index - 1]!.orderKey, orderKey) >= 0) {
+      if (index > 0 && compareTransactionOrder(result[index - 1]!.orderKey, orderKey) >= 0) {
         throw new Error('EVENT_EXECUTION_ORDER_NOT_CHRONOLOGICAL')
       }
       const operation = `${bytesToHex(core.authorId)}/${core.operationId}`
@@ -91,12 +104,16 @@ export async function createEventMaterializationRuntime(options: {
   if (persisted !== null) {
     if (persisted.length > quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
     const value = assertCanonicalCbor(persisted, { maxBytes: quota, maxByteStringBytes: quota, maxItems: quota })
-    if (!Array.isArray(value) || value.length !== 6 || value[0] !== 'chronolog/event-execution/v1' ||
+    if (!Array.isArray(value) || value.length !== (live ? 6 : 4) || value[0] !== 'chronolog/event-execution/v2' ||
         !(value[1] instanceof Uint8Array) || !equalBytes(value[1], digest) || typeof value[2] !== 'bigint' ||
-        typeof value[3] !== 'bigint' || typeof value[4] !== 'bigint' || !Array.isArray(value[5]) ||
-        value[2] < 0n || value[3] < 0n || value[3] > BigInt(value[5].length) || value[4] < 0n) throw new Error('EVENT_EXECUTION_STORE_INVALID')
-    revision = value[2]; finalLength = Number(value[3]); finalRevision = value[4]
-    order = value[5].map((row) => {
+        value[2] < 0n || !Array.isArray(value[3])) throw new Error('EVENT_EXECUTION_STORE_INVALID')
+    revision = value[2]
+    if (finalPrefix !== null) {
+      if (typeof value[4] !== 'bigint' || typeof value[5] !== 'bigint' ||
+          value[4] < 0n || value[4] > BigInt(value[3].length) || value[5] < 0n) throw new Error('EVENT_EXECUTION_STORE_INVALID')
+      finalPrefix.length = Number(value[4]); finalPrefix.revision = value[5]
+    }
+    order = value[3].map((row) => {
       if (!Array.isArray(row) || row.length !== 3 || !(row[0] instanceof Uint8Array) ||
           !(row[1] instanceof Uint8Array) || !(row[2] instanceof Uint8Array)) throw new Error('EVENT_EXECUTION_STORE_INVALID')
       return { txId: row[0], candidateDigest: row[1], canonicalCandidate: row[2], core: decodeTransactionCore(row[2]) }
@@ -108,22 +125,17 @@ export async function createEventMaterializationRuntime(options: {
     try { await options.store.put(key, bytes) }
     catch (error) {
       // Atomic storage may have committed before its acknowledgment was lost.
-      // Continuing from the old in-memory order/finality could overwrite that
-      // newer durable prefix. Reopen from storage before any further mutation.
+      // Reopen the newer durable state before allowing any further mutation.
       closed = true
       subscribers.clear()
       throw error
     }
   }
-  const captureApplication = (input: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot => {
+  const capture = (length = order.length, capturedRevision = revision): AppliedApplicationSnapshot => {
     if (closed) throw new Error('EVENT_EXECUTION_CLOSED')
-    const view = input.view ?? (historyProfile === 'peer-generation-v1' ? 'local' : 'final')
-    if (view === 'final' && historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
-    const length = view === 'final' ? finalLength : order.length
     const selected = order, selectedOutcomes = outcomes
     return {
-      view, revision: view === 'final' ? finalRevision : revision, orderLength: length,
-      finalRevision, finalOrderLength: finalLength,
+      revision: capturedRevision, orderLength: length,
       transactionAt(index) {
         if (!Number.isSafeInteger(index) || index < 0 || index >= length) return null
         const entry = selected[index]!
@@ -131,16 +143,17 @@ export async function createEventMaterializationRuntime(options: {
       },
     }
   }
-  return {
-    historyProfile,
+  const applied: AppliedMaterializationRuntime = {
+    kind: 'applied',
     coordinator: {
       materialize: async (input) => {
         const next = structuredClone(input) as ReplayProposal[]
         return serial(async () => {
           const nextOutcomes = await evaluate(next)
-          for (let i = 0; i < finalLength; i++) if (next[i] === undefined || !sameIdentity(order[i]!, next[i]!)) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_CHANGED')
-          // A provisional preview may lose authorization before its timestamp
-          // closes. Selection may change; original proposal bytes never do.
+          if (finalPrefix !== null) {
+            for (let i = 0; i < finalPrefix.length; i++) if (next[i] === undefined || !sameIdentity(order[i]!, next[i]!)) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_CHANGED')
+          }
+          // Selection may change; an original proposal's signed bytes never do.
           const previousById = new Map(order.map(entry => [bytesToHex(entry.txId), entry]))
           for (const entry of next) {
             const previous = previousById.get(bytesToHex(entry.txId))
@@ -151,7 +164,7 @@ export async function createEventMaterializationRuntime(options: {
           if (difference === order.length && difference === next.length) return null
           const previousRevision = revision
           const nextRevision = revision + 1n
-          const bytes = encode(next, nextRevision, finalLength, finalRevision)
+          const bytes = encode(next, nextRevision, finalPrefix)
           const contentHash = bytesToHex(await sha256(bytes))
           const changes: MaterializationOutcomeChange[] = nextOutcomes.flatMap((current) => {
             const before = outcomes.find((value) => equalBytes(value.txId, current.txId))
@@ -165,7 +178,6 @@ export async function createEventMaterializationRuntime(options: {
             txId: removed.txId.slice(), previous: removed.outcome, current: null,
             previousRejectionCode: removed.rejectionCode, currentRejectionCode: null,
           })
-          // The applied anchor and outcomes share the atomic durable record.
           await persist(bytes)
           order = next; outcomes = nextOutcomes; revision = nextRevision
           const result = { revision, previousRevision, orderLength: order.length, replayFromIndex: difference,
@@ -175,30 +187,16 @@ export async function createEventMaterializationRuntime(options: {
           return { revision: result, publication: publicationRequestForRevision(result) }
         })
       },
-      publishFinal: (length) => serial(async () => {
-        if (historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
-        if (!Number.isSafeInteger(length) || length < finalLength || length > order.length) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_INVALID')
-        if (length === finalLength) return
-        await persist(encode(order, revision, length, finalRevision + 1n))
-        finalLength = length; finalRevision++
-      }),
     },
     queries: {
       get revision() { return revision }, get orderLength() { return order.length },
-      get finalRevision() { return finalRevision }, get finalOrderLength() { return finalLength },
       get executionManifestDigest() { return digest.slice() },
       proposalIdAt(index) { return order[index]?.txId.slice() ?? null },
       localSql() { throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
       outcome(id) { return structuredClone(outcomes.find((entry) => equalBytes(entry.txId, id)) ?? null) },
       subscribe(subscriber) { subscribers.add(subscriber); return () => { subscribers.delete(subscriber) } },
-      captureApplication,
-      captureRead(input = {}) {
-        const application = captureApplication(input)
-        let released = false
-        return { ...application,
-          query() { if (released) throw new Error('VIEW_RELEASED'); throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
-          release() { released = true } }
-      },
+      captureApplication() { return capture() },
+      captureRead() { return eventReadHandle(capture()) },
     },
     publications: {
       async publish(request) {
@@ -214,6 +212,44 @@ export async function createEventMaterializationRuntime(options: {
     },
     close() { closed = true; subscribers.clear() },
   }
+  if (finalPrefix === null) return applied
+  const captureLive = (input: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot => {
+    const view = input.view ?? 'final'
+    return { ...capture(view === 'final' ? finalPrefix.length : order.length, view === 'final' ? finalPrefix.revision : revision),
+      view, finalRevision: finalPrefix.revision, finalOrderLength: finalPrefix.length }
+  }
+  return {
+    coordinator: {
+      materialize(input) { return applied.coordinator.materialize(input) },
+      publishFinal: (length) => serial(async () => {
+        if (!Number.isSafeInteger(length) || length < finalPrefix.length || length > order.length) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_INVALID')
+        if (length === finalPrefix.length) return
+        const next = { length, revision: finalPrefix.revision + 1n }
+        await persist(encode(order, revision, next))
+        Object.assign(finalPrefix, next)
+      }),
+    },
+    queries: {
+      get revision() { return revision }, get orderLength() { return order.length },
+      get finalRevision() { return finalPrefix.revision }, get finalOrderLength() { return finalPrefix.length },
+      get executionManifestDigest() { return digest.slice() },
+      proposalIdAt(index) { return applied.queries.proposalIdAt(index) },
+      localSql() { throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
+      outcome(id) { return applied.queries.outcome(id) },
+      subscribe(subscriber) { return applied.queries.subscribe(subscriber) },
+      captureApplication: captureLive,
+      captureRead(input) { return eventReadHandle(captureLive(input)) },
+    },
+    publications: applied.publications,
+    close() { return applied.close() },
+  }
+}
+
+function eventReadHandle<T extends AppliedApplicationSnapshot>(application: T): T & AppliedReadHandle {
+  let released = false
+  return { ...application,
+    query() { if (released) throw new Error('VIEW_RELEASED'); throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
+    release() { released = true } }
 }
 
 function sameIdentity(left: ReplayProposal, right: ReplayProposal): boolean {

@@ -10,8 +10,10 @@ export const SYSTEM_LOG_SQL = `
       singleton_key INTEGER PRIMARY KEY NOT NULL CHECK (singleton_key = 1),
       manifest_digest BLOB NOT NULL CHECK (length(manifest_digest) = 32),
       canonical_manifest BLOB NOT NULL,
-      history_profile TEXT NOT NULL,
-      bootstrap_program BLOB NOT NULL
+      publication_mode TEXT NOT NULL CHECK (publication_mode IN ('applied', 'live')),
+      sql_policy TEXT NOT NULL CHECK (sql_policy IN ('authorized', 'data-only')),
+      bootstrap_program BLOB NOT NULL,
+      bootstrap_group_id BLOB NOT NULL
     ) STRICT;
     CREATE TABLE ${TRANSACTION_LOG_TABLE} (
       tx_id BLOB PRIMARY KEY NOT NULL,
@@ -38,18 +40,20 @@ export function initializeSystemLog(database: DatabaseLike): void {
 
 export function insertExecutionManifest(database: DatabaseLike, manifest: StoredExecutionManifest): void {
   database.prepare(`
-    INSERT INTO ${EXECUTION_MANIFEST_TABLE} (singleton_key, manifest_digest, canonical_manifest, history_profile, bootstrap_program) VALUES (1, ?, ?, ?, ?)
-  `).run(manifest.manifestDigest, manifest.canonicalManifest, manifest.historyProfile, manifest.bootstrapProgram)
+    INSERT INTO ${EXECUTION_MANIFEST_TABLE} (singleton_key, manifest_digest, canonical_manifest, publication_mode, sql_policy, bootstrap_program, bootstrap_group_id) VALUES (1, ?, ?, ?, ?, ?, ?)
+  `).run(manifest.manifestDigest, manifest.canonicalManifest, manifest.publicationMode, manifest.sqlPolicy, manifest.bootstrapProgram, manifest.bootstrapGroupId)
 }
 
 export function readExecutionManifest(database: DatabaseLike): StoredExecutionManifest {
   const raw = database.prepare(`
-    SELECT manifest_digest, canonical_manifest, history_profile, bootstrap_program FROM ${EXECUTION_MANIFEST_TABLE} WHERE singleton_key = 1
+    SELECT manifest_digest, canonical_manifest, publication_mode, sql_policy, bootstrap_program, bootstrap_group_id FROM ${EXECUTION_MANIFEST_TABLE} WHERE singleton_key = 1
   `).get()
   if (raw === undefined || Array.isArray(raw)) throw new Error('DATABASE_MANIFEST_MISSING')
-  if (raw.history_profile !== 'chronological' && raw.history_profile !== 'peer-generation-v1') throw new Error('DATABASE_HISTORY_PROFILE_INVALID')
+  if (raw.publication_mode !== 'applied' && raw.publication_mode !== 'live') throw new Error('DATABASE_PUBLICATION_MODE_INVALID')
+  if (raw.sql_policy !== 'authorized' && raw.sql_policy !== 'data-only') throw new Error('DATABASE_SQL_POLICY_INVALID')
   return { manifestDigest: asDigest(raw.manifest_digest), canonicalManifest: asBytes(raw.canonical_manifest),
-    historyProfile: raw.history_profile, bootstrapProgram: asBytes(raw.bootstrap_program) }
+    publicationMode: raw.publication_mode, sqlPolicy: raw.sql_policy,
+    bootstrapProgram: asBytes(raw.bootstrap_program), bootstrapGroupId: asBytes(raw.bootstrap_group_id) }
 }
 
 export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {

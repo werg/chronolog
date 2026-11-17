@@ -1,9 +1,11 @@
 # Peer generations: selected history with tolerant recovery
 
-Status: the portable signed control foundation is implemented and has eight
-control-model tests. Application execution, peer replication, recovery of applied
-views, and native/browser/hosted runtime composition remain future work. This
-package does not change the default live collaboration profile.
+Status: the portable control service, encrypted peer replica and owned application
+session are implemented. The packages include event replay, native SQL replay,
+durable attempt retry, captured views and explicit recovery. Native and in-process
+tests exercise these surfaces; they do not establish Internet connectivity or a
+production recovery-loss bound. This profile does not change the default live
+collaboration integration.
 
 The authenticated profile is `peer-generation-v1`, with the bounded
 `eligible-members-v1` authority policy. It has no concept of finality. It is
@@ -16,41 +18,52 @@ receipt sequence authenticates a chain of included proposal references; generati
 selection chooses which receipt prefixes belong to the history. That sequence is
 an evidence position, not an application execution order.
 
-Application replay must use the shared Chronolog comparator: the original signed
+Application replay uses the shared Chronolog comparator: the original signed
 author timestamp, signing public key, then stable proposal ID. Selecting a receipt
 prefix supplies a proposal set to that comparator. A later receipt can include an
 earlier timestamp, so it can change application order and outcomes even within the
 same selected generation. Neither a receipt position nor a recovery floor closes
 author time or establishes an immutable application prefix.
 
-The implemented control participant retains signed descriptors, monotonic controls
+The control participant retains signed descriptors, monotonic controls
 and generation selections, and atomically chooses successors. It verifies prefix
 proofs and delegated inclusion headers without application bodies or SQL. It does
-not authenticate or execute encrypted application proposals. A future runtime must
-verify their original authorship, authorization and execution manifest before
-deterministic replay; the coordinator cannot supply trusted execution results.
+not authenticate or execute encrypted application proposals. `PeerReplica` verifies
+the original authorship, authorization, encryption and execution manifest before
+deterministic replay. A coordinator's receipt proves inclusion, not a trusted
+execution result.
 
 The control model trusts the control service not to equivocate and assumes one
 exclusive durable owner of its store. Its compare-and-swap does not implement
 Byzantine consensus or distributed storage consensus. Cached delegations have no
-heartbeat renewal requirement. Detecting conflicting coordinator receipts and
-handling an isolated old coordinator belong to the future replication runtime.
+heartbeat renewal requirement. The replica detects conflicting coordinator
+receipts and fences further local ordering. A returning old coordinator's excluded
+suffix remains outside the selected history; possession of that signed suffix
+does not restore its authority.
 
 ## Separate authority concerns
 
 | Concern | Contract |
 | --- | --- |
-| Authorship and authorization | Reader/writer grants identify permitted signers. Application proposal verification and SQL authorization still require runtime implementation. |
+| Authorship and authorization | Reader/writer grants identify permitted signers in the attempt's selected control context. Replicas verify the signed proposal and the execution engine enforces its separate SQL policy. |
 | Inclusion | A signed generation delegates receipt sequencing to one eligible reader. This grants no author or SQL administrator impersonation rights and does not change the application comparator. |
 | Recovery | The requester needs explicit recovery permission; the candidate separately needs coordinator eligibility. A stored replica or writer grant alone is insufficient. |
 | Control changes | An authorized administrator can request a signed control revision through generation selection. Schema authority is pinned separately. |
-| Retention | A future retained-prefix acknowledgment would report stored evidence. It would grant no authority and provide no finality. |
+| Retention | A signed retained-prefix acknowledgment reports a complete stored copy. It grants no authority, provides no finality and does not prove present reachability. |
 
 The application descriptor pins the control key, policy, definition, execution
 manifest and schema authority. Account login and directory advertisements are
 routing/enrollment inputs, never generation or author authority. Applications can
 grant participants both recovery and coordinator eligibility explicitly; no
 creator or native process has an implicit permanent role.
+
+Session command and query definitions share schemas and an explicit semantic
+version. Their definition digest does not hash JavaScript `prepare` or `read`
+callbacks. These definitions help callers construct valid programs; they do not
+replace the writer grant or prevent an authorized writer from submitting a raw
+program. Command names, versions and payload claims cannot grant private-tool
+rights. Privileged handlers must check authenticated authorship and current
+application policy independently.
 
 ## Selection and ancestry
 
@@ -64,63 +77,109 @@ Each successor adopts an evidence prefix of the *currently selected history*.
 A prefix in an inherited generation carries a chain of signed inclusion headers
 connecting it to that generation's exclusion cutoff. If G2 adopts G1 through 80,
 G3 can never inherit G1's positions 81–100. A valid old signature does not erase
-this cutoff. `PeerAuthority` implements these checks. Future native, browser and
+this cutoff. `PeerAuthority` implements these checks. Native, browser and
 hosted consumers must use the verified selection rather than substitute callbacks
 that bypass its authority decisions.
 
 The control verifier establishes selected evidence membership. It does not prove
 that a candidate possesses original proposal bodies, keys or replayable state.
-Recovery runtime work must verify that availability before publishing an applied
-view, retain available excluded history for review, and preserve original bytes and
-operation identities in the adopted set. There is no implemented automatic branch
-merge or application resubmission.
+The replica verifies that availability before publishing an applied view. It
+retains available excluded history for review and preserves original bytes and
+operation identities in the adopted set. A recovering peer cannot expose an
+applied view before it has the complete selected input. There is no automatic
+branch merge or application resubmission.
 
-## Application results: requirements for future composition
+## Applied replay and observed results
 
-This package exports implemented control, schema and store primitives. It does not
-export a replica interface, an application result lifecycle, or a materialization
-runtime. A future async composition must not require the live runtime's final-view
-fields, `final()` operation or `FinalEventSource`; this profile has no finality.
+`PeerReplica` depends on `AppliedMaterializationRuntime`. This port exposes
+replay, publication, outcomes, SQL and captured applied reads, with no final
+fields, final-view selector or disabled finality methods. Its event implementation
+is `createAppliedEventMaterializationRuntime`; native SQL uses
+`AppliedMaterializer.open` and `createDoltLiteAppliedMaterializationRuntime`.
+Live wrappers add their separate immutable final-prefix contract. An applied
+engine does not allocate a final SQL reader or persist a final-prefix checkpoint.
 
-An applied result must identify the view in which a proposal was accepted or
-rejected. That result can change when another included proposal sorts earlier or
-when recovery selects different evidence. Exact application retries must preserve
-the original signed bytes, identity and guards; they cannot promise an unchanged
-execution result. This differs from the implemented idempotent control-transition
-retry, which returns the exact previously selected generation.
+An `AppliedResult` carries the `PeerRevision` at which its accepted or rejected
+outcome was observed. Its generation and sequence identify its inclusion receipt,
+not an execution position. That outcome can change when another included proposal
+sorts earlier or when recovery selects different evidence. Exact application
+retries preserve the original signed bytes, identity and preconditions; they
+recover the current observed result rather than promise an unchanged execution
+outcome. This differs from an idempotent control-transition retry, which returns
+the exact previously selected generation.
 
-SQL, effective events, outcomes and view revisions must be published together after
-replay. A changed view needs an explicit invalidation or reset. Retaining an
-inherited receipt prefix preserves proposal membership, not an execution barrier
-or the truth of a previously observed business assertion. Deliberate reapplication
-would require newly signed intent, its relationship to the old intent, current
-authorization and reviewed domain guards. These are runtime requirements, not
-claims about implemented APIs.
+SQL, effective events, outcomes and view revisions are published coherently after
+replay. An `AppliedReadHandle` pins its original immutable observation while the
+current view changes. Session `changes()` invalidates projections and recovery
+also emits an explicit notice. Event cursors belong to their captured revision;
+consumers rebuild a projection after a revision change instead of treating such a
+cursor as a final-event processing checkpoint. The session raises
+`ChangedViewError` for a cursor from another revision. Its
+`operations.subscribe({ operationId, author, signal })` coalesces current operation
+observations and keeps running after an applied outcome.
+
+`observedRevision` records selected ancestry that the author reviewed. It detects
+excluded ancestry; it is not compare-and-swap, an execution barrier or proof that
+a business assertion remains true. Put those assertions in the program. The
+session's `reapply` operation creates a newly signed attempt with a new operation
+identity and `reapplyOf` lineage, under current authorization and reviewed domain
+preconditions. An abandoned attempt is never silently resubmitted as fresh work.
+
+The profile has no `final()` operation, final state, closed author-time frontier
+or `FinalEventSource`. Ordinary async collaboration does not need these live
+contracts. SQL authorization is also a separate execution policy: choosing an
+applied runtime does not remove row ownership or schema protection.
 
 ## Controls, keys and recovery floors
 
 Controls form a signed monotonic chain, activated with a generation. Revoking a
 reader requires a fresh encryption epoch and key commitment. Historical grants
-remain available to verification; a future command runtime must bind authorization
-to the selected control context. An author timestamp cannot itself grant revoked
+remain available to verification; each command binds authorization to its
+selected control context. An author timestamp cannot itself grant revoked
 permissions, and retained plaintext cannot be revoked.
 
 A recovery floor cannot regress or disappear. Introducing a new floor binds it to
 the exact adopted base, and a successor must select evidence at or after that
 floor. This protects inclusion membership only: it neither freezes SQL state nor
-makes application outcomes irreversible. The control tests do not establish
-protected SQL administration; that requires a separately implemented authorization
-and execution boundary. Reopening established control state with `requireExisting`
+makes application outcomes irreversible. Protected SQL administration is enforced
+by the separately pinned execution policy and authenticated bootstrap schema, not
+by the recovery floor. Reopening established control state with `requireExisting`
 refuses missing storage rather than silently creating an empty registry.
 
 Irreversible external actions cannot be dispatched automatically on mutable applied
-events. Any future integration for such actions needs explicit business
+events. An integration for such actions needs explicit business
 preconditions, effect identity, provider idempotency and reconciliation. It must
 not add a finality requirement to ordinary async collaboration.
 
-## Qualification and remaining runtime work
+## Session ownership and retention
 
-The eight executable control cases cover competing successors and exact retries,
+`@chronolog/peer-session` owns one durable signed-attempt journal per application
+device. Commands created while disconnected remain saved; reconnecting retries
+those exact bytes. Cancelling `operation.applied({ signal })` cancels only that
+waiter. Native devices use an exclusively owned SQLite store. The browser entry
+requires an owning Worker, Web Locks and OPFS, and refuses a second owner or
+missing required capabilities.
+
+`PeerReplica.ready` reflects completed selected-history materialization. A session
+remains `waiting` when adopted bodies are missing, even if its generation is
+verified and its coordinator is connected. Connection state cannot substitute for
+a coherent readable view.
+
+`connectApplications` is an in-process connector for embedded peers and
+independent-store tests. It exchanges verified history, retained-prefix evidence
+and signed live signals. Its signal policy permits current readers; the live
+Chronolog composition's topic-specific writer grants are a different policy.
+Signals remain disposable and never enter deterministic replay.
+
+`operation.shared()` waits for independently retained complete coverage. Distinct
+sessions using the same storage owner do not count as distinct copies. Coverage
+does not freeze an outcome or promise that the remote copy is still available.
+If neither the selected coordinator nor an authorized replacement is available,
+saved intent waits; there is no fallback authority or alternate local outbox.
+
+## Qualification and remaining deployment work
+
+The executable control cases cover competing successors and exact retries,
 independent recovery/coordinator permissions, three-generation exclusion, inherited
 prefix bridges, authenticated profile/application/execution bindings, restrictive
 controls and recovery floors, required key rotation on reader removal, and refusal
@@ -128,21 +187,30 @@ to recreate missing established control state. They use `MemoryPeerStore`; reope
 the same in-memory store is not a crash-durability qualification. Production use of
 the registry requires an exclusively owned store with atomic durable writes.
 
-The package also implements descriptor-bound schema signing and verification and
-provides a portable control-artifact packaging script. It does not yet qualify
-encrypted application attempts, actual SQL/events replay, network replication,
-host-blocked collaboration, recovery of incomplete bodies, independently reopened
-durable stores, or installed native/browser/hosted application consumers.
+Replica tests exercise encrypted signed attempts, contiguous inclusion evidence,
+missing or altered input refusal, exact retry after a lost storage acknowledgment,
+three-generation recovery, held views and coordinator-equivocation fencing.
+Native SQL tests exercise actual deterministic replay, guarded schema and row
+authority, conflicts and recovery. Session tests use independently opened native
+stores for saved-intent reconnect, lost replies, cancelled waiters, explicit
+reapplication, close/reopen and exclusive ownership. Test fixtures use the same
+applied runtime contracts as application code.
 
-A future runtime must retain sufficient original bodies, contiguous inclusion
-evidence, controls, keys and operation identity for deterministic replay. Metadata
-or a signed database image alone is insufficient. If both the control service and
-selected coordinator are unavailable, locally saved intent must await an authorized
-selection or resumed inclusion; this is a requirement to implement and test.
+These tests do not qualify a deployed control service, Internet WebRTC routes,
+real browser/native generation sessions, process termination at every storage
+boundary or a global loss bound. A browser entry point and a portable package are
+not evidence of those deployment properties. Consult the test results and artifact
+provenance for the exact checked revision; live-profile qualification does not
+automatically apply to this profile.
+
+Recovery requires original bodies, contiguous inclusion evidence, controls, keys
+and operation identities sufficient for deterministic replay. Metadata or a signed
+database image alone is insufficient. The packages provide descriptor-bound schema
+verification and portable packaging, not a substitute for that retained history.
 
 Replication freshness, second-copy retention and loss estimates need declared
 workloads and measured deployment runs. No operating loss bound is established by
-these control tests. Future recovery reports should distinguish known excluded
+these tests. Recovery notices distinguish known excluded
 work from unknown loss; directory last-seen times cannot establish that bound.
 
 There is no migration or backward-compatibility layer. History profiles are

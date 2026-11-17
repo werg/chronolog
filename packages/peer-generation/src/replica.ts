@@ -1,5 +1,5 @@
 import {
-  DOMAINS, encodeChangeProgram, encodeTransactionCore, transactionDigest,
+  DOMAINS, compareTransactionOrder, encodeChangeProgram, encodeTransactionCore, transactionDigest, transactionOrderKey,
   type TransactionCore,
 } from '@chronolog/protocol'
 import type { ReplayProposal } from '@chronolog/materializer'
@@ -37,6 +37,7 @@ class Replica implements PeerReplica {
   readonly #operations = new Map<string, string>()
   readonly #receipts = new Map<string, OrderedCommand>()
   #selected: Retained[] = []
+  #executionOrder: Retained[] = []
   #selectedIds = new Set<string>()
   readonly #lastOutcomes = new Map<string, AppliedResult>()
   readonly #fenced = new Set<string>()
@@ -57,6 +58,7 @@ class Replica implements PeerReplica {
     const generation = this.#authority.current; check(generation !== null, 'PEER_NO_SELECTED_GENERATION'); return generation
   }
   get isCoordinator(): boolean { return this.generation.payload.coordinator === this.device.publicKey }
+  get ready(): boolean { return this.#ready && !this.#closed }
   get revision(): PeerRevision {
     check(this.#publishedRevision !== null, 'PEER_RECOVERING')
     return structuredClone(this.#publishedRevision)
@@ -70,7 +72,7 @@ class Replica implements PeerReplica {
       } else assertExtension(previous, this.#authority)
     }
     check(this.#authority.current !== null, 'PEER_NO_SELECTED_GENERATION')
-    check(this.#options.materializer.historyProfile === 'peer-generation-v1', 'PEER_MATERIALIZER_PROFILE_MISMATCH')
+    check(this.#options.materializer.kind === 'applied', 'PEER_MATERIALIZER_PROFILE_MISMATCH')
     check(bytesToHex(this.#options.materializer.queries.executionManifestDigest) === this.descriptor.executionManifestDigest,
       'PEER_EXECUTION_MANIFEST_MISMATCH')
     const journal = await this.#options.store.get(`${this.#prefix}/journal-head`)
@@ -134,6 +136,9 @@ class Replica implements PeerReplica {
         check(result.status === 'applied' && result.attemptId === command.attempt.id && result.generation === generation.id &&
           result.sequence === index && result.operationId === command.receipt.payload.operationId &&
           result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected'), 'PEER_RESULT_JOURNAL_INVALID')
+        validatePeerRevision(result.revision)
+        check(result.revision.applicationId === this.descriptor.applicationId && result.revision.historyId === this.descriptor.historyId,
+          'PEER_RESULT_JOURNAL_INVALID')
         this.#lastOutcomes.set(command.attempt.id, result)
       }
     }
@@ -193,32 +198,41 @@ class Replica implements PeerReplica {
   }
   async #materialize(authority: PeerAuthority): Promise<void> {
     const selected = this.#selectedHistory(authority)
-    const admitted: ReplayProposal[] = selected.map(({ command, core }) => ({
+    // Receipt ancestry selects membership; the signed proposal always determines
+    // execution order, including when a new receipt introduces an earlier intent.
+    const executionOrder = [...selected].sort((left, right) => compareTransactionOrder(
+      transactionOrderKey(left.core, hexToBytes(left.command.attempt.id)),
+      transactionOrderKey(right.core, hexToBytes(right.command.attempt.id)),
+    ))
+    const proposals: ReplayProposal[] = executionOrder.map(({ command, core }) => ({
       txId: hexToBytes(command.attempt.id), candidateDigest: hexToBytes(command.attempt.payload.header.coreDigest),
       canonicalCandidate: encodeTransactionCore(core), core,
     }))
-    const output = await this.#options.materializer.coordinator.materialize(admitted)
+    const output = await this.#options.materializer.coordinator.materialize(proposals)
     if (output !== null) await this.#options.materializer.publications.publish(output.publication)
+    const generation = authority.current!, head = this.#heads.get(generation.id)!
+    const revision: PeerRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
+      generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
+      controlRevision: generation.payload.controlRevision, materializationRevision: String(this.#options.materializer.queries.revision) }
     for (const item of selected) {
       const { receipt, attempt } = item.command
       const outcome = this.#options.materializer.queries.outcome(hexToBytes(attempt.id))
       check(outcome !== null, 'PEER_OUTCOME_MISSING')
       const result: AppliedResult = { status: 'applied', attemptId: attempt.id, operationId: receipt.payload.operationId,
         author: receipt.payload.author, generation: receipt.payload.generation, sequence: receipt.payload.sequence,
-        outcome: outcome.outcome, rejectionCode: outcome.rejectionCode }
+        outcome: outcome.outcome, rejectionCode: outcome.rejectionCode, revision }
       const previous = this.#lastOutcomes.get(attempt.id)
-      check(previous === undefined || samePeerValue(previous, result), 'PEER_REPLAY_OUTCOME_CONFLICT')
-      if (previous === undefined) await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
+      if (previous === undefined || !samePeerValue(previous, result)) {
+        await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
+      }
       this.#lastOutcomes.set(attempt.id, result)
     }
-    const generation = authority.current!, head = this.#heads.get(generation.id)!
     // No await between these assignments: even synchronous status observers see
     // either the old complete publication or the new complete publication.
     this.#authority = authority
-    this.#selected = selected; this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
-    this.#publishedRevision = { applicationId: authority.descriptor.applicationId, historyId: authority.descriptor.historyId,
-      generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
-      controlRevision: generation.payload.controlRevision, materializationRevision: String(this.#options.materializer.queries.revision) }
+    this.#selected = selected; this.#executionOrder = executionOrder
+    this.#selectedIds = new Set(selected.map(value => value.command.attempt.id))
+    this.#publishedRevision = revision
     this.#ready = true
   }
   #publish(): void { for (const listener of [...this.#listeners]) { try { listener() } catch { /* Consumer failure cannot undo persistence. */ } } }
@@ -233,23 +247,28 @@ class Replica implements PeerReplica {
     validatePeerRevision(revision)
     check(revision.applicationId === this.descriptor.applicationId && revision.historyId === this.descriptor.historyId &&
       this.#pointAvailable(revision.point), 'PEER_VIEW_RECOVERY_REQUIRED')
+    check(revision.controlRevision === this.#authority.generation(revision.generation).payload.controlRevision,
+      'PEER_REVISION_INVALID')
   }
   prepare(input: PrepareCommand): Promise<SignedAttempt> {
     const captured = structuredClone(input)
     return this.#serial.run(async () => {
       this.#assertReady(); boundedText(captured.operationId)
+      check(Object.keys(captured).every(key => ['operationId', 'program', 'command', 'commandVersion', 'observedRevision', 'reapplyOf', 'authorTimestampMs'].includes(key)),
+        'PEER_COMMAND_OPTIONS_INVALID')
       const previousId = this.#operations.get(operationKey(this.device.publicKey, captured.operationId))
       if (previousId !== undefined) {
         const previous = this.#attempts.get(previousId)!, core = await verifyAttempt(previous, this.#authority, this.#options.epochKeys)
         check(bytesToHex(encodeChangeProgram(core.program)) === bytesToHex(encodeChangeProgram(captured.program)) &&
           previous.payload.header.command === (captured.command ?? 'raw') && previous.payload.header.commandVersion === (captured.commandVersion ?? '1') &&
           previous.payload.header.reapplyOf === (captured.reapplyOf ?? null) &&
-          (captured.basedOn === undefined || samePeerValue(previous.payload.header.basedOn, captured.basedOn)), 'PEER_OPERATION_ID_REUSED')
+          (captured.authorTimestampMs === undefined || captured.authorTimestampMs === core.authorTimestampMs) &&
+          (captured.observedRevision === undefined || samePeerValue(previous.payload.header.observedRevision, captured.observedRevision)), 'PEER_OPERATION_ID_REUSED')
         return structuredClone(previous)
       }
       const generation = this.generation, control = this.#authority.controlAt(generation.payload.controlRevision)
       check(this.#authority.grant(this.device.publicKey, control.payload.revision)?.writer === true, 'PEER_AUTHOR_FORBIDDEN')
-      if (captured.basedOn !== undefined) this.#checkView(captured.basedOn)
+      if (captured.observedRevision !== undefined) this.#checkView(captured.observedRevision)
       if (captured.reapplyOf !== undefined) {
         const old = this.#attempts.get(captured.reapplyOf)
         check(old !== undefined && !this.#selectedIds.has(old.id) && old.payload.header.generation !== generation.id, 'PEER_REAPPLY_SOURCE_INVALID')
@@ -262,7 +281,7 @@ class Replica implements PeerReplica {
       const attempt = await createSignedAttempt({ applicationId: this.descriptor.applicationId, profile: 'peer-generation-v1',
         generation: generation.id, controlRevision: control.payload.revision, epoch: control.payload.epoch, author: this.device.publicKey,
         operationId: captured.operationId, definitionDigest: this.descriptor.definitionDigest, command: captured.command ?? 'raw',
-        commandVersion: captured.commandVersion ?? '1', basedOn: captured.basedOn ?? null, reapplyOf: captured.reapplyOf ?? null,
+        commandVersion: captured.commandVersion ?? '1', observedRevision: captured.observedRevision ?? null, reapplyOf: captured.reapplyOf ?? null,
         coreDigest: bytesToHex(await transactionDigest(core)) }, core, key, this.device)
       await verifyAttempt(attempt, this.#authority, this.#options.epochKeys)
       check(this.#journalHead < this.#maxRecords, 'PEER_STORAGE_QUOTA')
@@ -282,7 +301,7 @@ class Replica implements PeerReplica {
         return structuredClone(existing)
       }
       check(attempt.payload.header.generation === this.generation.id, 'PEER_ATTEMPT_NEEDS_REAPPLY')
-      if (attempt.payload.header.basedOn !== null) this.#checkView(attempt.payload.header.basedOn)
+      if (attempt.payload.header.observedRevision !== null) this.#checkView(attempt.payload.header.observedRevision)
       const head = this.#heads.get(this.generation.id)!
       const payload = { applicationId: this.descriptor.applicationId, profile: 'peer-generation-v1' as const,
         generation: this.generation.id, sequence: head.sequence + 1, previousRoot: head.root, attemptId: attempt.id,
@@ -352,9 +371,9 @@ class Replica implements PeerReplica {
   }
   capture(): Promise<CapturedPeerView> {
     return this.#serial.run(async () => {
-      this.#assertReady(); check(this.#options.materializer.queries.captureRead !== undefined, 'PEER_CAPTURE_UNSUPPORTED')
-      const read = this.#options.materializer.queries.captureRead({ view: 'local' })
-      const outcomes = this.#selected.map(value => this.#options.materializer.queries.outcome(hexToBytes(value.command.attempt.id))!)
+      this.#assertReady()
+      const read = this.#options.materializer.queries.captureRead()
+      const outcomes = this.#executionOrder.map(value => this.#options.materializer.queries.outcome(hexToBytes(value.command.attempt.id))!)
       return { revision: this.revision, read, outcomes: structuredClone(outcomes), release: () => read.release() }
     })
   }

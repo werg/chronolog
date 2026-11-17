@@ -1,5 +1,5 @@
 import { createPeerReplica, type AuthorityBundle, type PeerReplicaOptions } from '@chronolog/peer-generation'
-import { createEventMaterializationRuntime, type ChronologMaterializationRuntime } from '@chronolog/materializer'
+import { createAppliedEventMaterializationRuntime, type AppliedMaterializationRuntime } from '@chronolog/materializer'
 
 import { applicationDefinitionDigest, type ApplicationDefinition } from './definition.js'
 import { claimApplicationDevice, type ApplicationDevice } from './device.js'
@@ -11,18 +11,18 @@ export interface OpenPeerApplicationOptions<D extends ApplicationDefinition = Ap
   readonly authority: AuthorityBundle
   readonly epochKeys: ReadonlyMap<number, Uint8Array>
   /** The events path needs no SQL/WASM. SQL runtimes supply the verified engine here. */
-  readonly materializer?: ChronologMaterializationRuntime
+  readonly materializer?: AppliedMaterializationRuntime
   readonly maxRecords?: number
   readonly maxHistoryBytes?: number
 }
 
 export async function openPeerApplication<const D extends ApplicationDefinition>(options: OpenPeerApplicationOptions<D>): Promise<ApplicationSession<D>> {
   const release = claimApplicationDevice(options.device)
-  let materializer: ChronologMaterializationRuntime | undefined
+  let materializer: AppliedMaterializationRuntime | undefined
   try {
     if (await applicationDefinitionDigest(options.definition) !== options.authority.descriptor.payload.definitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
-    materializer = options.materializer ?? await createEventMaterializationRuntime({ store: options.device.store,
-      namespace: options.authority.descriptor.payload.historyId, historyProfile: 'peer-generation-v1',
+    materializer = options.materializer ?? await createAppliedEventMaterializationRuntime({ store: options.device.store,
+      namespace: options.authority.descriptor.payload.historyId,
       ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) })
     const input: PeerReplicaOptions = { authority: options.authority, device: options.device.identity,
       store: options.device.store, storageId: options.device.storageId, epochKeys: options.epochKeys, materializer,

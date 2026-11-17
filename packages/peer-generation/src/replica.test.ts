@@ -1,19 +1,19 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
-import { emit, executionManifestArtifacts, program } from '@chronolog/protocol'
+import { createAppliedEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
+import { compareTransactionOrder, decodeTransactionCore, emit, executionManifestArtifacts, program, transactionOrderKey } from '@chronolog/protocol'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
   type AuthorityBundle, type PeerIdentity, type PeerReplica, type PeerStore, type PrefixProof,
 } from './index.js'
-import { bytesToHex, signPeerValue } from './codec.js'
+import { bytesToHex, hexToBytes, signPeerValue } from './codec.js'
 
 const opened: PeerReplica[] = []
 afterEach(async () => { for (const peer of opened.splice(0)) await peer.close() })
 async function fixture() {
   const [host, a, b, c] = await Promise.all(Array.from({ length: 4 }, () => createPeerIdentity())) as [PeerIdentity, PeerIdentity, PeerIdentity, PeerIdentity]
   const key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
-  const manifest = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '22'.repeat(32), historyId: 'replica-test',
     profile: 'peer-generation-v1', policy: 'eligible-members-v1', controlPublicKey: host.publicKey,
     schemaAdministrator: a.publicKey, executionManifestDigest: bytesToHex(manifest.executionManifestDigest),
@@ -31,7 +31,7 @@ async function fixture() {
   }
   await select(a, null, 'initial')
   const open = async (identity: PeerIdentity, store: PeerStore = new MemoryPeerStore(), authority?: AuthorityBundle, storageId = identity.publicKey) => {
-    const materializer = await createEventMaterializationRuntime({ store, namespace: 'test', historyProfile: 'peer-generation-v1' })
+    const materializer = await createAppliedEventMaterializationRuntime({ store, namespace: 'test' })
     const peer = await createPeerReplica({ authority: authority ?? await registry.read(), device: identity, store, storageId, materializer, epochKeys: keys })
     opened.push(peer); return peer
   }
@@ -40,22 +40,68 @@ async function fixture() {
 const event = (name: string) => program(emit('message', { name }))
 
 describe('peer-owned encrypted history and tolerant recovery', () => {
-  it('executes delegated order without altering author times and replays identically', async () => {
-    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+  it('replays author-time order independently of receipt sequence and retains exact intent through reopen', async () => {
+    const f = await fixture(), store = new MemoryPeerStore(), a = await f.open(f.a, store), b = await f.open(f.b)
     const first = await a.prepare({ operationId: 'first', program: event('first'), authorTimestampMs: 500n })
     const second = await a.prepare({ operationId: 'second', program: event('second'), authorTimestampMs: 100n })
-    await a.order(first); await a.order(second); await b.ingest(await a.exportCommands())
+    await a.order(first)
+    const held = await a.capture(), initial = await a.operation('first')
+    await a.order(second); await b.ingest(await a.exportCommands())
     const av = await a.capture(), bv = await b.capture()
     try {
       expect(av.read.orderLength).toBe(2)
       expect(av.outcomes).toEqual(bv.outcomes)
-      expect(av.outcomes.map(value => value.orderKey.authorTimestampMs)).toEqual([500n, 100n])
+      expect(av.outcomes.map(value => value.orderKey.authorTimestampMs)).toEqual([100n, 500n])
+      expect([0, 1].map(index => decodeTransactionCore(av.read.transactionAt(index)!.canonicalCandidate).operationId)).toEqual(['second', 'first'])
       expect(av.read.transactionAt(0)).toEqual(bv.read.transactionAt(0))
-    } finally { av.release(); bv.release() }
+      expect(held.read.orderLength).toBe(1)
+      expect(decodeTransactionCore(held.read.transactionAt(0)!.canonicalCandidate).operationId).toBe('first')
+      expect('finalOrderLength' in av.read).toBe(false)
+      expect('finalRevision' in av.read).toBe(false)
+      expect(await a.operation('first')).toMatchObject({ attemptId: first.id, sequence: 1, revision: av.revision })
+      expect(initial).toMatchObject({ attemptId: first.id, sequence: 1, revision: held.revision })
+    } finally { av.release(); bv.release(); held.release() }
     expect(await a.order(first)).toEqual((await a.exportCommands())[0])
-    expect((await a.exportCommands()).length).toBe(2)
+    expect((await a.exportCommands()).map(value => value.attempt.id)).toEqual([first.id, second.id])
     await b.observeCoverage(await a.retainedCoverage())
     expect(b.shared()).toHaveLength(1)
+    await a.close()
+    const reopened = await f.open(f.a, store)
+    expect(await reopened.prepare({ operationId: 'first', program: event('first') })).toEqual(first)
+    await expect(reopened.prepare({ operationId: 'first', program: event('first'), authorTimestampMs: 501n })).rejects.toThrow('PEER_OPERATION_ID_REUSED')
+    const restored = await reopened.capture()
+    try { expect(restored.outcomes.map(value => value.orderKey.authorTimestampMs)).toEqual([100n, 500n]) } finally { restored.release() }
+  })
+  it('uses the signing key and stable proposal identity to break equal authored timestamps', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const attempts = await Promise.all([
+      a.prepare({ operationId: 'a-one', program: event('a-one'), authorTimestampMs: 100n }),
+      a.prepare({ operationId: 'a-two', program: event('a-two'), authorTimestampMs: 100n }),
+      b.prepare({ operationId: 'b-one', program: event('b-one'), authorTimestampMs: 100n }),
+    ])
+    const keys = attempts.map(value => transactionOrderKey({ authorTimestampMs: 100n, authorId: hexToBytes(value.payload.header.author) }, hexToBytes(value.id)))
+      .sort(compareTransactionOrder)
+    const expected = keys.map(value => bytesToHex(value.txId))
+    for (const id of [...expected].reverse()) await a.order(attempts.find(value => value.id === id)!)
+    const captured = await a.capture()
+    try { expect(captured.outcomes.map(value => bytesToHex(value.txId))).toEqual(expected) } finally { captured.release() }
+  })
+  it('authenticates observed ancestry without treating a peer-local materialization counter as a state guard', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'first', program: event('first'), authorTimestampMs: 500n }))
+    await b.ingest(await a.exportCommands())
+    const observedRevision = b.revision
+    await a.order(await a.prepare({ operationId: 'earlier', program: event('earlier'), authorTimestampMs: 100n }))
+    expect(a.revision.point).not.toEqual(observedRevision.point)
+    const later = await a.prepare({ operationId: 'contextual', program: event('contextual'), observedRevision, authorTimestampMs: 700n })
+    await a.order(later)
+    expect(later.payload.header.observedRevision).toEqual(observedRevision)
+    expect(await a.operation('contextual')).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    await expect(a.prepare({ operationId: 'wrong-control', program: event('bad'), observedRevision: { ...observedRevision, controlRevision: 1 } })).rejects.toThrow('PEER_REVISION_INVALID')
+    await expect(a.prepare({ operationId: 'wrong-generation', program: event('bad'), observedRevision: { ...observedRevision, generation: 'ff'.repeat(32) } })).rejects.toThrow('PEER_REVISION_INVALID')
+    const legacy = { operationId: 'legacy-option', program: event('bad'), basedOn: observedRevision }
+    await expect(a.prepare(legacy)).rejects.toThrow('PEER_COMMAND_OPTIONS_INVALID')
+    expect(await a.attempt('legacy-option')).toBeNull()
   })
   it('adopts an older complete prefix, seeds a fresh peer and quarantines the returning suffix', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
@@ -75,7 +121,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect(notice?.abandoned).toContainEqual(expect.objectContaining({ operationId: 'two', status: 'abandoned' }))
     expect((await a.operation('two'))?.status).toBe('abandoned')
     expect(held.read.orderLength).toBe(2); held.release()
-    await expect(a.prepare({ operationId: 'stale-view', program: event('stale'), basedOn: oldRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
+    await expect(a.prepare({ operationId: 'stale-view', program: event('stale'), observedRevision: oldRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
     await expect(b.order(two)).rejects.toThrow('PEER_ATTEMPT_NEEDS_REAPPLY')
     expect(await b.order(one)).toEqual((await b.exportCommands())[0])
     const reapplied = await a.prepare({ operationId: 'two-reapplied', program: event('two'), reapplyOf: two.id })

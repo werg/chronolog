@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createGenerationRegistry, createPeerIdentity, MemoryPeerStore, signApplicationDescriptor,
@@ -10,7 +10,7 @@ import {
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import { defineApplication, defineCommand, defineQuery, applicationDefinitionDigest } from './definition.js'
-import { connectApplications, AbandonedOperationError, RecoveredViewError, type ApplicationReadView, type ApplicationSession } from './session.js'
+import { connectApplications, AbandonedOperationError, ChangedViewError, type ApplicationReadView, type ApplicationSession } from './session.js'
 import { openNativeApplication, openNativeDevice } from './native.js'
 
 const definition = defineApplication({ id: 'messages', version: '1', commands: {
@@ -19,21 +19,22 @@ const definition = defineApplication({ id: 'messages', version: '1', commands: {
   messages: defineQuery({ description: 'Messages', input: { type: 'null' }, read: (view: ApplicationReadView) => view.readEvents() }),
 } })
 const cleanup: Array<() => void | Promise<void>> = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close() })
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'peer-session-'))
   cleanup.push(() => rm(directory, { recursive: true, force: true }))
   const host = await createPeerIdentity()
-  const a = await openNativeDevice({ path: join(directory, 'a.sqlite'), create: true }), b = await openNativeDevice({ path: join(directory, 'b.sqlite'), create: true })
-  cleanup.push(() => a.close(), () => b.close())
+  const a = await openNativeDevice({ path: join(directory, 'a.sqlite'), create: true }), b = await openNativeDevice({ path: join(directory, 'b.sqlite'), create: true }),
+    c = await openNativeDevice({ path: join(directory, 'c.sqlite'), create: true })
+  cleanup.push(() => a.close(), () => b.close(), () => c.close())
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
-  const artifacts = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
+  const artifacts = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signApplicationDescriptor({ applicationId: '77'.repeat(32), historyId: 'session-test', profile: 'peer-generation-v1',
     policy: 'eligible-members-v1', controlPublicKey: host.publicKey, schemaAdministrator: a.identity.publicKey,
     executionManifestDigest: bytesToHex(artifacts.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: [a, b].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true })) }, host)
+    grants: [a, b, c].map(device => ({ publicKey: device.identity.publicKey, reader: true, writer: true, coordinator: true, recovery: true, administrator: true })) }, host)
   const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
   const select = async (identity: PeerIdentity, base: PrefixProof | null, transitionId: string) => {
     const bundle = await registry.read()
@@ -46,7 +47,7 @@ async function fixture() {
     const session = await openNativeApplication({ device, authority: await registry.read(), epochKeys, definition })
     cleanup.push(() => session.close()); return session
   }
-  return { a, b, directory, registry, select, open }
+  return { a, b, c, directory, registry, select, open }
 }
 
 async function applied(session: ApplicationSession<typeof definition>, text: string, id: string) {
@@ -98,6 +99,83 @@ describe('public peer application sessions', () => {
     await changes.return?.()
   })
 
+  it('keeps observing an applied attempt as late history changes its revision and preserves the captured event view', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(500)
+    const later = await a.command('say', 'later', { operationId: 'later' })
+    const original = await later.applied(), held = await a.readView(), heldBatch = held.readEvents()
+    const observations = a.operations.subscribe({ operationId: 'later' })[Symbol.asyncIterator]()
+    expect((await observations.next()).value).toEqual(original)
+    const changed = observations.next()
+    clock.mockReturnValue(100)
+    const earlier = await b.command('say', 'earlier', { operationId: 'earlier' })
+    const exact = await b.operations.inspect('earlier')
+    const link = await connectApplications(a, b); cleanup.push(() => link.close())
+    await earlier.applied({ signal: AbortSignal.timeout(5000) }); await link.synchronize()
+    const observed = (await changed).value
+    expect(observed).toMatchObject({ status: 'applied', attemptId: original.attemptId, outcome: 'accepted' })
+    expect(observed?.status === 'applied' && observed.revision).not.toEqual(original.revision)
+    expect(held.readEvents()).toEqual(heldBatch)
+    const current = await a.readView()
+    try {
+      expect(current.readEvents().events.map(value => [value.operationId, value.authorTimestampMs])).toEqual([['earlier', '100'], ['later', '500']])
+      expect(() => current.readEvents({ cursor: heldBatch.cursor })).toThrow(ChangedViewError)
+      expect('finalRevision' in current).toBe(false)
+    } finally { current.release(); held.release() }
+    await earlier.retry()
+    expect((await b.operations.inspect('earlier'))?.attempt).toEqual(exact?.attempt)
+    const waiting = observations.next()
+    await observations.return?.()
+    expect(await waiting).toMatchObject({ done: true })
+  })
+
+  it('seeds a fresh recovered generation before replacing a ready older peer view', async () => {
+    const f = await fixture(), a = await f.open(f.a)
+    await applied(a, 'retained', 'retained')
+    const held = await a.readView(), previous = a.revision
+    await f.select(f.b.identity, await a.recoveryPoint(), 'fresh-recovery')
+    const b = await f.open(f.b)
+    expect(b.status.phase).toBe('waiting')
+    await expect(b.readView()).rejects.toThrow('PEER_RECOVERING')
+    expect(a.revision).toEqual(previous)
+    const link = await connectApplications(a, b); cleanup.push(() => link.close())
+    expect(a.revision.generation).toBe(b.revision.generation)
+    expect((await b.query('messages', null)).value.events.map(value => value.operationId)).toEqual(['retained'])
+    expect(held.readEvents().events.map(value => value.operationId)).toEqual(['retained']); held.release()
+    const c = await f.open(f.c)
+    expect(c.status.phase).toBe('waiting')
+    const freshLink = await connectApplications(b, c); cleanup.push(() => freshLink.close())
+    expect((await c.query('messages', null)).value.events.map(value => value.operationId)).toEqual(['retained'])
+  })
+
+  it('keeps an incomplete recovery waiting and preserves the older source until a complete prefix is available', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await applied(a, 'one', 'one')
+    const link = await connectApplications(a, b); await link.synchronize(); link.close()
+    const older = b.revision
+    await applied(a, 'two', 'two')
+    await f.select(f.c.identity, await a.recoveryPoint(), 'complete-prefix-required')
+    const c = await f.open(f.c)
+    await expect(connectApplications(b, c)).rejects.toThrow('PEER_RECOVERY_PREFIX_INCOMPLETE')
+    expect(c.status.phase).toBe('waiting')
+    expect(b.revision).toEqual(older)
+    expect((await b.query('messages', null)).value.events).toHaveLength(1)
+    const full = await connectApplications(a, c); cleanup.push(() => full.close())
+    expect((await c.query('messages', null)).value.events).toHaveLength(2)
+    const retry = await connectApplications(b, c); cleanup.push(() => retry.close())
+    expect((await b.query('messages', null)).value.events).toHaveLength(2)
+  })
+
+  it('replicates retained history from the more complete follower without coordinator connectivity', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), c = await f.open(f.c)
+    await applied(a, 'retained', 'retained')
+    const initial = await connectApplications(a, c); await initial.synchronize(); initial.close()
+    const link = await connectApplications(b, c); cleanup.push(() => link.close())
+    expect(b.status).toMatchObject({ phase: 'waiting', role: 'follower', connectedPeers: 1 })
+    expect((await b.query('messages', null)).value.events.map(value => value.operationId)).toEqual(['retained'])
+    expect(b.revision.point).toEqual(c.revision.point)
+  })
+
   it('atomically resets recovery views, preserves abandoned evidence and links a deliberate reapplication', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const link = await connectApplications(a, b)
@@ -112,10 +190,10 @@ describe('public peer application sessions', () => {
     await expect(abandoned.applied()).rejects.toBeInstanceOf(AbandonedOperationError)
     expect(captured.readEvents().events).toHaveLength(2); captured.release()
     const current = await a.readView()
-    expect(() => current.readEvents({ cursor: old.value.cursor })).toThrow(RecoveredViewError); current.release()
+    expect(() => current.readEvents({ cursor: old.value.cursor })).toThrow(ChangedViewError); current.release()
     expect((await a.query('messages', null)).value.events).toHaveLength(1)
     const prior = await a.operations.inspect('tail')
-    const retried = await a.reapply('tail', 'say', 'tail reviewed', { operationId: 'tail-again', basedOn: a.revision })
+    const retried = await a.reapply('tail', 'say', 'tail reviewed', { operationId: 'tail-again', observedRevision: a.revision })
     expect((await retried.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
     expect((await a.operations.inspect('tail-again'))?.attempt.payload.header.reapplyOf).toBe(prior?.attempt.id)
     expect((await a.operations.get('tail'))?.status).toBe('abandoned')

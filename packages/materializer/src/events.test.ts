@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { bytesToHex, emit, encodeTransactionCore, program, transactionDigest, utf8, type ChangeProgram, type TransactionCore } from '@chronolog/protocol'
-import { createEventMaterializationRuntime } from './events.js'
+import { createAppliedEventMaterializationRuntime, createEventMaterializationRuntime } from './events.js'
 import type { ReplayProposal } from './types.js'
 import type { MaterializedApplicationSnapshot } from './runtime.js'
 
@@ -22,6 +22,42 @@ async function proposal(digest: Uint8Array, sequence: number, change: ChangeProg
   return { txId: utf8(`tx_${bytesToHex(candidateDigest)}`), candidateDigest, canonicalCandidate, core }
 }
 describe('SQL-free durable event execution', () => {
+  it('publishes replayable applied state without a finality API or final view', async () => {
+    const bytes = store(), runtime = await createAppliedEventMaterializationRuntime({ store: bytes, namespace: 'applied' })
+    const live = await createEventMaterializationRuntime({ store: store(), namespace: 'live' })
+    expect(runtime.queries.executionManifestDigest).toEqual(live.queries.executionManifestDigest)
+    await live.close()
+    expect(runtime.kind).toBe('applied')
+    expect(runtime.coordinator).not.toHaveProperty('publishFinal')
+    expect(runtime.queries).not.toHaveProperty('finalOrderLength')
+    expect(runtime.queries).not.toHaveProperty('finalRevision')
+    const digest = runtime.queries.executionManifestDigest
+    const late = await proposal(digest, 20, program(emit('chat', 'later')), 'same-operation')
+    const early = await proposal(digest, 10, program(emit('chat', 'earlier')), 'same-operation')
+    const first = await runtime.coordinator.materialize([late])
+    await runtime.publications.publish(first!.publication)
+    const held = runtime.queries.captureRead()
+    expect(held).not.toHaveProperty('view')
+    expect(held).not.toHaveProperty('finalRevision')
+    expect(held).not.toHaveProperty('finalOrderLength')
+    expect(held.transactionAt(0)?.outcome).toBe('accepted')
+    await runtime.coordinator.materialize([early, late])
+    expect(runtime.queries.outcome(late.txId)?.rejectionCode).toBe('operation_conflict')
+    expect(held.transactionAt(0)?.outcome).toBe('accepted')
+    expect(runtime.queries.captureApplication().transactionAt(0)?.txId).toEqual(early.txId)
+    await expect(runtime.coordinator.materialize([late, early])).rejects.toThrow('ORDER_NOT_CHRONOLOGICAL')
+    held.release()
+    await runtime.close()
+
+    const reopened = await createAppliedEventMaterializationRuntime({ store: bytes, namespace: 'applied' })
+    expect(reopened.queries.outcome(late.txId)?.outcome).toBe('rejected')
+    await reopened.coordinator.materialize([late])
+    expect(reopened.queries.outcome(late.txId)?.outcome).toBe('accepted')
+    expect(reopened.queries.captureApplication().orderLength).toBe(1)
+    await reopened.close()
+    await expect(createEventMaterializationRuntime({ store: bytes, namespace: 'applied' })).rejects.toThrow('EVENT_EXECUTION_STORE_INVALID')
+  })
+
   it('reopens final outcomes and deterministic operation conflicts without an SQL runtime', async () => {
     const bytes = store()
     const first = await createEventMaterializationRuntime({ store: bytes, namespace: 'group' })

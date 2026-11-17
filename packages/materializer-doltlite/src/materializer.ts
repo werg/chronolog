@@ -14,7 +14,8 @@ import {
   type ManifestArtifacts,
   type TransactionOrderKey,
 } from '@chronolog/protocol'
-import type { MaterializedApplicationSnapshot, MaterializedReadHandle } from '@chronolog/materializer'
+import type { AppliedApplicationSnapshot, AppliedReadHandle, AppliedSqlResult, MaterializedApplicationSnapshot, MaterializedReadHandle } from '@chronolog/materializer'
+import type { DoltLiteAppliedMaterializerRuntimeBackend } from './runtime-adapter.js'
 
 import {
   HEAD_BRANCH,
@@ -44,10 +45,11 @@ import {
   readSystemLog,
 } from './system-log.js'
 import { materializedLogDigest } from './snapshot-evidence.js'
-import { PLATFORM_DIGEST } from './platform/digest.js'
+import { computePlatformDigest } from './platform/digest.js'
 import { initializePlatform, readRootAdministrator } from './platform/schema.js'
 import type {
   ReplayProposal,
+  AppliedMaterializerOptions,
   DatabaseLike,
   LocalSqlOptions,
   LocalSqlQueryResult,
@@ -63,6 +65,7 @@ import type {
   StoredExecutionManifest,
   TransactionLogRow,
   TransactionOutcome,
+  SqlMutationPolicy,
 } from './types.js'
 
 export class MaterializerInputError extends Error {
@@ -72,13 +75,17 @@ export class MaterializerInputError extends Error {
   }
 }
 
+interface FinalMaterialization {
+  reader: DatabaseLike
+  published: PublishedRef
+  log: TransactionLogRow[]
+}
+
 export class DeterministicMaterializer implements MaterializerSqlBackend {
   readonly #readLeases = new Set<() => void>()
   readonly #writer: DatabaseLike
   #reader: DatabaseLike
-  #finalReader: DatabaseLike
-  #finalPublished: PublishedRef
-  #finalLog: TransactionLogRow[]
+  readonly #final: FinalMaterialization | null
   readonly #sourceOptions: MaterializerOptions
   readonly #options: Required<Pick<MaterializerOptions, 'checkpointEvery' | 'retainCheckpoints'>>
   readonly #backend: MaterializerBackendInfo
@@ -104,15 +111,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     published: PublishedRef,
     checkpoints: MaterializerCheckpointInfo[],
     log: TransactionLogRow[],
-    finalReader: DatabaseLike,
-    finalPublished: PublishedRef,
-    finalLog: TransactionLogRow[],
+    final: FinalMaterialization | null,
   ) {
     this.#writer = writer
     this.#reader = reader
-    this.#finalReader = finalReader
-    this.#finalPublished = finalPublished
-    this.#finalLog = finalLog
+    this.#final = final
     this.#sourceOptions = options
     this.#backend = backend
     this.#executionManifest = structuredClone(executionManifest)
@@ -129,17 +132,25 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   static async open(options: MaterializerOptions): Promise<DeterministicMaterializer> {
+    return DeterministicMaterializer.#open(options, true)
+  }
+
+  static async openApplied(options: AppliedMaterializerOptions): Promise<DoltLiteAppliedMaterializerRuntimeBackend> {
+    return (await DeterministicMaterializer.#open(options, false)).#appliedBackend()
+  }
+
+  static async #open(options: MaterializerOptions, live: boolean): Promise<DeterministicMaterializer> {
     if (!(options.rootAdministrator instanceof Uint8Array) || options.rootAdministrator.length !== 32) {
       throw new MaterializerInputError('MATERIALIZER_ROOT_ADMINISTRATOR_INVALID')
     }
-    if (!bytesEqual(options.executionManifest.platformDigest, PLATFORM_DIGEST)) {
+    const sqlPolicy = options.sqlPolicy ?? 'authorized'
+    if (!bytesEqual(options.executionManifest.platformDigest, computePlatformDigest(sqlPolicy))) {
       throw new MaterializerInputError('MATERIALIZER_PLATFORM_DIGEST_MISMATCH')
     }
     const artifacts = await executionManifestArtifacts(options.executionManifest)
-    const historyProfile = options.historyProfile ?? 'chronological'
-    if (historyProfile !== 'chronological' && historyProfile !== 'peer-generation-v1') throw new MaterializerInputError('MATERIALIZER_HISTORY_PROFILE_UNSUPPORTED')
     const bootstrapProgram = bootstrapBytes(options)
-    const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator, historyProfile, bootstrapProgram }
+    const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator,
+      publicationMode: live ? 'live' : 'applied', sqlPolicy, bootstrapProgram, bootstrapGroupId: options.bootstrapGroupId ?? new Uint8Array() }
     const bootstrapIdentity = await hashDomain(DOMAINS.peerSchema, bootstrapProgram)
     const opened = openDatabase(options)
     let reader: DatabaseLike | null = null
@@ -178,15 +189,19 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       if (reader.doltHashOf(published.branchRef) !== published.contentHash) {
         throw new Error('MATERIALIZER_READER_CONTENT_MISMATCH')
       }
-      const finalPublished = discoverFinalRef(opened.database) ?? publishFinalRef(
-        opened.database, 0n, [], checkpoints.find((checkpoint) => checkpoint.prefixLength === 0)!.doltCommitHash,
-      )
-      finalReader = openDatabase(options).database
-      finalReader.doltCheckout(finalPublished.branchRef)
-      verifyDatabaseState(finalReader, expected)
-      const finalLog = readSystemLog(finalReader)
-      verifyPublishedLog(finalPublished, finalLog)
-      verifyFinalPrefix(finalLog, readerLog)
+      let final: FinalMaterialization | null = null
+      if (live) {
+        const finalPublished = discoverFinalRef(opened.database) ?? publishFinalRef(
+          opened.database, 0n, [], checkpoints.find((checkpoint) => checkpoint.prefixLength === 0)!.doltCommitHash,
+        )
+        finalReader = openDatabase(options).database
+        finalReader.doltCheckout(finalPublished.branchRef)
+        verifyDatabaseState(finalReader, expected)
+        const finalLog = readSystemLog(finalReader)
+        verifyPublishedLog(finalPublished, finalLog)
+        verifyFinalPrefix(finalLog, readerLog)
+        final = { reader: finalReader, published: finalPublished, log: finalLog }
+      }
       return new DeterministicMaterializer(
         opened.database,
         reader,
@@ -197,9 +212,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         published,
         checkpoints,
         readerLog,
-        finalReader,
-        finalPublished,
-        finalLog,
+        final,
       )
     } catch (error) {
       reader?.close()
@@ -209,11 +222,10 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     }
   }
 
-  get historyProfile(): 'chronological' | 'peer-generation-v1' { return this.#sourceOptions.historyProfile ?? 'chronological' }
   get revision(): bigint { return this.#published.revision }
   get orderLength(): number { return this.#order.length }
-  get finalRevision(): bigint { return this.#finalPublished.revision }
-  get finalOrderLength(): number { return this.#finalLog.length }
+  get finalRevision(): bigint { return this.#liveState().published.revision }
+  get finalOrderLength(): number { return this.#liveState().log.length }
   get executionManifestDigest(): Uint8Array { return copyBytes(this.#artifacts.executionManifestDigest) }
   get executionManifest(): ExecutionManifest { return structuredClone(this.#executionManifest) }
   get backend(): MaterializerBackendInfo { return structuredClone(this.#backend) }
@@ -250,12 +262,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   ): LocalSqlQueryResult {
     this.#assertOpen()
     const final = options.view === 'final'
-    if (final && this.historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
     const revision = final ? this.finalRevision : this.revision
     if (options.atRevision !== undefined && options.atRevision !== revision) {
       throw new MaterializerInputError('MATERIALIZER_REVISION_UNAVAILABLE')
     }
-    const result = executeLocalSql(final ? this.#finalReader : this.#reader, sql, parameters)
+    const result = executeLocalSql(final ? this.#liveState().reader : this.#reader, sql, parameters)
     return { revision, orderLength: final ? this.finalOrderLength : this.orderLength, view: final ? 'final' : 'local', finalOrderLength: this.finalOrderLength, ...result }
   }
 
@@ -269,26 +280,25 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
   captureApplication(options: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot {
     this.#assertOpen()
-    const view = options.view ?? (this.historyProfile === 'peer-generation-v1' ? 'local' : 'final')
-    if (view === 'final' && this.historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
-    const log = view === 'final' ? this.#finalLog : this.#log
-    return {
-      view, revision: view === 'final' ? this.finalRevision : this.revision, orderLength: log.length,
-      finalRevision: this.finalRevision, finalOrderLength: this.finalOrderLength,
-      transactionAt(index) {
-        if (!Number.isSafeInteger(index) || index < 0 || index >= log.length) return null
-        const entry = log[index]!
-        return { txId: copyBytes(entry.txId), canonicalCandidate: copyBytes(entry.canonicalCandidate), outcome: entry.outcome }
-      },
-    }
+    const view = options.view ?? 'final'
+    const final = this.#liveState()
+    return { ...captureApplication(view === 'final' ? final.log : this.#log, view === 'final' ? final.published.revision : this.revision),
+      view, finalRevision: final.published.revision, finalOrderLength: final.log.length }
   }
 
   captureRead(options: { readonly view?: 'local' | 'final' } = {}): MaterializedReadHandle {
+    const application = this.captureApplication(options)
+    const { view, finalOrderLength } = application
+    const lease = this.#captureRead(application, view === 'final' ? this.#liveState().published : this.#published)
+    return { ...application,
+      query(sql, parameters) { return { ...lease.query(sql, parameters), view, finalOrderLength } },
+      release() { lease.release() } }
+  }
+
+  #captureRead(application: AppliedApplicationSnapshot, published: PublishedRef): AppliedReadHandle {
     this.#assertOpen()
     if (this.#readLeases.size >= 16) throw new Error('MATERIALIZER_SNAPSHOT_LIMIT')
-    const application = this.captureApplication(options)
-    const { view, revision, orderLength, finalOrderLength } = application
-    const published = view === 'final' ? this.#finalPublished : this.#published
+    const { revision, orderLength } = application
     const branch = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
     this.#writer.doltBranch(branch, published.doltCommitHash)
     let reader: DatabaseLike | undefined
@@ -305,8 +315,32 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     return { ...application,
       query(sql, parameters = []) {
         if (released) throw new Error('MATERIALIZER_SNAPSHOT_RELEASED')
-        return { revision, orderLength, finalOrderLength, view, ...executeLocalSql(reader, sql, parameters) }
+        return { revision, orderLength, ...executeLocalSql(reader, sql, parameters) }
       }, release }
+  }
+
+  #appliedBackend(): DoltLiteAppliedMaterializerRuntimeBackend {
+    const engine = this
+    return {
+      kind: 'applied',
+      get revision() { return engine.revision },
+      get orderLength() { return engine.orderLength },
+      get executionManifestDigest() { return engine.executionManifestDigest },
+      proposalIdAt(index) { return engine.proposalIdAt(index) },
+      materialize(input) { return engine.materialize(input) },
+      outcome(txId) { return engine.outcome(txId) },
+      subscribe(subscriber) { return engine.subscribe(subscriber) },
+      localSql(sql, parameters = [], options = {}): AppliedSqlResult {
+        engine.#assertOpen()
+        if (options.atRevision !== undefined && options.atRevision !== engine.revision) {
+          throw new MaterializerInputError('MATERIALIZER_REVISION_UNAVAILABLE')
+        }
+        return { revision: engine.revision, orderLength: engine.orderLength, ...executeLocalSql(engine.#reader, sql, parameters) }
+      },
+      captureApplication() { engine.#assertOpen(); return captureApplication(engine.#log, engine.revision) },
+      captureRead() { return engine.#captureRead(captureApplication(engine.#log, engine.revision), engine.#published) },
+      close() { engine.close() },
+    }
   }
 
   subscribe(subscriber: RevisionSubscriber): () => void {
@@ -330,13 +364,13 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       // Rows of the published log were fully verified when they were read;
       // byte-identical rows are not re-verified, so an append costs O(1)
       // verification work instead of O(history).
-      await validateTransactionSet(transactions, this.#log, this.historyProfile)
+      await validateTransactionSet(transactions, this.#log)
       for (const transaction of transactions) {
         if (!bytesEqual(transaction.core.executionManifestDigest, this.#artifacts.executionManifestDigest)) {
           throw new MaterializerInputError('MATERIALIZER_EXECUTION_MANIFEST_UNAVAILABLE')
         }
       }
-      verifyFinalTransactions(this.#finalLog, transactions)
+      if (this.#final !== null) verifyFinalTransactions(this.#final.log, transactions)
       validateExistingIdentities(this.#log, transactions)
       const difference = earliestDifference(this.#order, transactions.map((transaction) => transaction.txId))
       if (difference === null) return null
@@ -452,8 +486,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   async publishFinal(prefixLength: number): Promise<void> {
-    if (this.historyProfile === 'peer-generation-v1') throw new Error('FINALITY_UNSUPPORTED')
     this.#assertOpen()
+    const final = this.#liveState()
     if (!Number.isSafeInteger(prefixLength) || prefixLength < this.finalOrderLength || prefixLength > this.orderLength) {
       throw new MaterializerInputError('MATERIALIZER_FINAL_PREFIX_INVALID')
     }
@@ -494,11 +528,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       verifyFinalPrefix(prefix, log)
       const published = publishFinalRef(this.#writer, this.finalRevision + 1n, log, commitHash)
       reader.doltCheckout(published.branchRef)
-      const oldReader = this.#finalReader
-      this.#finalReader = reader
+      const oldReader = final.reader
+      final.reader = reader
       reader = null
-      this.#finalPublished = published
-      this.#finalLog = log
+      final.published = published
+      final.log = log
       oldReader.close()
     } finally {
       reader?.close()
@@ -515,7 +549,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#closed = true
     this.#subscribers.clear()
     this.#reader.close()
-    this.#finalReader.close()
+    this.#final?.reader.close()
     this.#writer.close()
   }
 
@@ -532,7 +566,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
           txId: transaction.txId,
           actor: transaction.core.authorId,
           groupId: transaction.core.groupId,
-        }, this.#executionManifest.limits, { protectedChanges: this.historyProfile === 'chronological' })
+        }, this.#executionManifest.limits, this.#sourceOptions.sqlPolicy ?? 'authorized')
     } catch (error) {
       if (!(error instanceof SqlRejection)) {
         rollbackIfActive(this.#writer)
@@ -555,8 +589,14 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   get #expected(): ExpectedState {
-    return { artifacts: this.#artifacts, rootAdministrator: this.#rootAdministrator, historyProfile: this.historyProfile,
-      bootstrapProgram: bootstrapBytes(this.#sourceOptions) }
+    return { artifacts: this.#artifacts, rootAdministrator: this.#rootAdministrator,
+      publicationMode: this.#final === null ? 'applied' : 'live', sqlPolicy: this.#sourceOptions.sqlPolicy ?? 'authorized',
+      bootstrapProgram: bootstrapBytes(this.#sourceOptions), bootstrapGroupId: this.#sourceOptions.bootstrapGroupId ?? new Uint8Array() }
+  }
+
+  #liveState(): FinalMaterialization {
+    if (this.#final === null) throw new Error('MATERIALIZER_LIVE_CAPABILITY_REQUIRED')
+    return this.#final
   }
 
   #publicationFault(point: MaterializerPublicationFaultPoint): void {
@@ -585,11 +625,29 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   #assertOpen(): void { if (this.#closed) throw new Error('MATERIALIZER_CLOSED') }
 }
 
+/** Portable applied-state constructor. Native callers supply the linked engine through native.ts. */
+export const AppliedMaterializer = {
+  open(options: AppliedMaterializerOptions): Promise<DoltLiteAppliedMaterializerRuntimeBackend> {
+    return DeterministicMaterializer.openApplied(options)
+  },
+}
+
+function captureApplication(log: readonly TransactionLogRow[], revision: bigint): AppliedApplicationSnapshot {
+  return { revision, orderLength: log.length,
+    transactionAt(index) {
+      if (!Number.isSafeInteger(index) || index < 0 || index >= log.length) return null
+      const entry = log[index]!
+      return { txId: copyBytes(entry.txId), canonicalCandidate: copyBytes(entry.canonicalCandidate), outcome: entry.outcome }
+    } }
+}
+
 interface ExpectedState {
   readonly artifacts: ManifestArtifacts
   readonly rootAdministrator: Uint8Array
-  readonly historyProfile: 'chronological' | 'peer-generation-v1'
+  readonly publicationMode: 'applied' | 'live'
+  readonly sqlPolicy: SqlMutationPolicy
   readonly bootstrapProgram: Uint8Array
+  readonly bootstrapGroupId: Uint8Array
 }
 
 /** `forkSeeding`: the genesis is a fork's, so its root may seed rows until the plan ends seeding. */
@@ -605,7 +663,8 @@ function initializeRepository(
   try {
     withAuthorizer(database, 'internal_bootstrap', () => {
       initializeSystemLog(database)
-      insertExecutionManifest(database, { ...storedManifest(expected.artifacts), historyProfile: expected.historyProfile, bootstrapProgram: expected.bootstrapProgram })
+      insertExecutionManifest(database, { ...storedManifest(expected.artifacts), publicationMode: expected.publicationMode,
+        sqlPolicy: expected.sqlPolicy, bootstrapProgram: expected.bootstrapProgram, bootstrapGroupId: expected.bootstrapGroupId })
       initializePlatform(database, expected.rootAdministrator, forkSeeding)
     })
     if (options.bootstrapProgram !== undefined) {
@@ -644,8 +703,10 @@ function verifyDatabaseState(
 ): void {
   const stored = readExecutionManifest(database)
   verifyStoredManifest(stored, expected.artifacts)
-  if (stored.historyProfile !== expected.historyProfile || !bytesEqual(stored.bootstrapProgram, expected.bootstrapProgram)) {
-    throw new Error('DATABASE_HISTORY_PROFILE_MISMATCH')
+  if (stored.publicationMode !== expected.publicationMode) throw new Error('DATABASE_PUBLICATION_MODE_MISMATCH')
+  if (stored.sqlPolicy !== expected.sqlPolicy) throw new Error('DATABASE_SQL_POLICY_MISMATCH')
+  if (!bytesEqual(stored.bootstrapProgram, expected.bootstrapProgram) || !bytesEqual(stored.bootstrapGroupId, expected.bootstrapGroupId)) {
+    throw new Error('DATABASE_BOOTSTRAP_MISMATCH')
   }
   if (!bytesEqual(readRootAdministrator(database), expected.rootAdministrator)) {
     throw new Error('DATABASE_ROOT_ADMINISTRATOR_MISMATCH')
@@ -688,7 +749,6 @@ function validateCheckpointRefs(
 async function validateTransactionSet(
   transactions: readonly ReplayProposal[],
   verified: readonly TransactionLogRow[],
-  historyProfile: 'chronological' | 'peer-generation-v1',
 ): Promise<void> {
   const seen = new Set<string>()
   const proposals = new Set<string>()
@@ -715,7 +775,7 @@ async function validateTransactionSet(
     const proposal = idKey(transaction.candidateDigest)
     if (proposals.has(proposal)) throw new MaterializerInputError('MATERIALIZER_DUPLICATE_PROPOSAL')
     proposals.add(proposal)
-    if (historyProfile === 'chronological' && index > 0 && compareTransactionOrder(orderKeyOf(transactions[index - 1]!), orderKeyOf(transaction)) >= 0) {
+    if (index > 0 && compareTransactionOrder(orderKeyOf(transactions[index - 1]!), orderKeyOf(transaction)) >= 0) {
       throw new MaterializerInputError('MATERIALIZER_ORDER_NOT_CHRONOLOGICAL')
     }
   }
@@ -856,7 +916,7 @@ function logRow(
   }
 }
 
-function storedManifest(artifacts: ManifestArtifacts): Omit<StoredExecutionManifest, 'historyProfile' | 'bootstrapProgram'> {
+function storedManifest(artifacts: ManifestArtifacts): Pick<StoredExecutionManifest, 'manifestDigest' | 'canonicalManifest'> {
   return {
     manifestDigest: artifacts.executionManifestDigest,
     canonicalManifest: artifacts.canonicalExecutionManifest,

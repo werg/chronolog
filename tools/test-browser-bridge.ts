@@ -113,17 +113,32 @@ try {
   assert.equal(membershipFinal.outcome.type, 'accepted')
   passed('native agent and browser explicitly join one collective owning the SQL task')
 
+  const [nativeBeforeClaims, browserBeforeClaims] = await Promise.all([fixture.snapshot(), state('browser')])
   const [nativeClaim, browserClaim] = await Promise.all([
     fixture.claimTask('native-claim'),
     page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserBridge.claim('browser', 'browser-claim')),
   ])
   const transactionIds = [nativeClaim, browserClaim]
-  const beforeCertification = await fixture.snapshot([nativeClaim])
-  assert(beforeCertification.outcomes.every(({ outcome, final }) => outcome.type === 'pending' && !final))
-  const browserPending = await page.evaluate((transactionId) =>
-    (globalThis as unknown as TestWindow).chronologBrowserBridge.outcome('browser', transactionId), browserClaim)
-  assert.equal(browserPending.outcome.type, 'pending')
-  assert.equal(browserPending.final, false)
+  const [nativePreview, browserPreview] = await Promise.all([
+    fixture.snapshot([nativeClaim]), state('browser', [browserClaim]),
+  ])
+  const provisionalOutcomes = [...nativePreview.outcomes, ...browserPreview.outcomes]
+  assert.equal(provisionalOutcomes.length, 2)
+  for (const preview of provisionalOutcomes) {
+    assert.notEqual(preview.outcome.type, 'pending', 'authorized claims must execute before certification')
+    assert.equal(preview.final, false, 'executed previews must not become final without closure evidence')
+    // The connected peers may already have observed each other's concurrent
+    // claim. A current guard rejection is an executed preview too.
+    if (preview.outcome.type === 'rejected') {
+      assert.deepEqual(preview.outcome, { type: 'rejected', rejection: { code: 'assert:already_claimed', statementIndex: 0 } })
+    }
+  }
+  assert(provisionalOutcomes.some(({ outcome }) => outcome.type === 'accepted'), 'at least one current claim must succeed')
+  for (const [preview, before] of [[nativePreview, nativeBeforeClaims], [browserPreview, browserBeforeClaims]] as const) {
+    assert.deepEqual(preview.rows, before.rows, 'provisional claims must not change the final SQL view')
+    assert.equal(preview.finalOrderLength, before.finalOrderLength, 'provisional claims must not extend the applied final prefix')
+  }
+  passed('native and browser execute nonfinal claim previews while their final SQL views remain unchanged')
   const nativeFinal = await fixture.sync(transactionIds)
   await sync()
   const browserFinal = await page.evaluate((transactionId) =>
@@ -191,6 +206,7 @@ try {
   await page.evaluate(() => (globalThis as unknown as TestWindow).chronologBrowserBridge.stop('browser'))
   await report({ passed: true, winner, transactionIds, finalOrderLength: approvedHistory.finalOrderLength,
     finalThrough: approvedHistory.finalThrough, databaseContentHash: approvedHistory.hash,
+    provisionalOutcomes: provisionalOutcomes.map(({ transactionId, outcome, final }) => ({ transactionId, outcome, final })),
     finalOutcomes: shared.outcomes.map(({ transactionId, outcome, final }) => ({ transactionId, outcome, final })),
     enrollmentStates: { browser: enrolled.state, reader: readyReader.state }, hubRequestsDuringOfflineReplay: 0 })
   process.stdout.write(`Browser/native coordinated qualification passed (${checks.length} checks), Chromium ${browser.version()}\n`)

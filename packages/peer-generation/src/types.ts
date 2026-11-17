@@ -1,5 +1,5 @@
 import type { ChangeProgram } from '@chronolog/protocol'
-import type { ChronologMaterializationRuntime, MaterializedReadHandle, MaterializedTransactionOutcome } from '@chronolog/materializer'
+import type { AppliedMaterializationRuntime, AppliedReadHandle, MaterializedTransactionOutcome } from '@chronolog/materializer'
 import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerIdentity, PeerStore, PrefixProof, Signed, SignedGeneration } from './control-types.js'
 import type { PEER_GENERATION_PROFILE } from './control-types.js'
 export * from './control-types.js'
@@ -15,7 +15,8 @@ export interface AttemptHeader {
   readonly definitionDigest: string
   readonly command: string
   readonly commandVersion: string
-  readonly basedOn: PeerRevision | null
+  /** Captured ancestry context, not a condition that application state stays unchanged. */
+  readonly observedRevision: PeerRevision | null
   readonly reapplyOf: string | null
   readonly coreDigest: string
 }
@@ -44,6 +45,8 @@ export interface AppliedResult {
   readonly sequence: number
   readonly outcome: 'accepted' | 'rejected'
   readonly rejectionCode: string | null
+  /** The result at this captured view; later replay can change its outcome. */
+  readonly revision: PeerRevision
 }
 export type OperationState =
   | { readonly status: 'saved'; readonly attemptId: string; readonly operationId: string; readonly generation: string }
@@ -73,7 +76,7 @@ export interface PeerReplicaOptions {
   readonly device: PeerIdentity
   readonly store: PeerStore
   readonly storageId: string
-  readonly materializer: ChronologMaterializationRuntime
+  readonly materializer: AppliedMaterializationRuntime
   readonly epochKeys: ReadonlyMap<number, Uint8Array>
   readonly now?: () => number
   readonly maxRecords?: number
@@ -84,13 +87,14 @@ export interface PrepareCommand {
   readonly program: ChangeProgram
   readonly command?: string
   readonly commandVersion?: string
-  readonly basedOn?: PeerRevision
+  /** Requires this observed ancestry to survive recovery; program guards check domain state. */
+  readonly observedRevision?: PeerRevision
   readonly reapplyOf?: string
   readonly authorTimestampMs?: bigint
 }
 export interface CapturedPeerView {
   readonly revision: PeerRevision
-  readonly read: MaterializedReadHandle
+  readonly read: AppliedReadHandle
   readonly outcomes: readonly MaterializedTransactionOutcome[]
   release(): void
 }
@@ -102,6 +106,8 @@ export interface PeerReplica {
   readonly authority: AuthorityBundle
   readonly generation: SignedGeneration
   readonly revision: PeerRevision
+  /** Selected ancestry has enough retained bodies to publish an applied view. */
+  readonly ready: boolean
   readonly isCoordinator: boolean
   prepare(input: PrepareCommand): Promise<SignedAttempt>
   order(attempt: SignedAttempt): Promise<OrderedCommand>

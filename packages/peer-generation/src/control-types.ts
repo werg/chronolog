@@ -1,6 +1,6 @@
 export const PEER_GENERATION_PROFILE = 'peer-generation-v1' as const
 export const PEER_GENERATION_POLICY = 'eligible-members-v1' as const
-/** Profile rules; application execution and replication are not implemented by this package. */
+/** Shared generation guarantees implemented by the replica and application session. */
 export const PEER_GENERATION_CAPABILITIES = Object.freeze({
   /** Signed author timestamp, signing public key, then stable proposal ID. */
   ordering: 'author-time',

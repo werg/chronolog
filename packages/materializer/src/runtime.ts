@@ -53,8 +53,12 @@ export interface MaterializationCoordinator {
   materialize(
     orderedTransactions: readonly ReplayProposal[],
   ): Promise<CoordinatedMaterialization | null>
+}
+
+/** Live consensus alone can freeze a proven application prefix. */
+export interface LiveMaterializationCoordinator extends MaterializationCoordinator {
   /** Materialize and pin an actual immutable final prefix, independently of local state. */
-  publishFinal?(prefixLength: number): Promise<void>
+  publishFinal(prefixLength: number): Promise<void>
 }
 
 export type MaterializedLocalSqlValue =
@@ -64,13 +68,17 @@ export type MaterializedLocalSqlValue =
   | { readonly kind: 'text'; readonly value: string }
   | { readonly kind: 'blob'; readonly value: Uint8Array }
 
-export interface MaterializedLocalSqlResult {
+export interface AppliedSqlResult {
   readonly revision: bigint
   readonly orderLength: number
-  readonly view?: 'local' | 'final'
-  readonly finalOrderLength?: number
   readonly columns: readonly { readonly name: string; readonly declaredType?: string }[]
   readonly rows: readonly (readonly MaterializedLocalSqlValue[])[]
+}
+
+/** SQL metadata for the live runtime's local and final views. */
+export interface MaterializedLocalSqlResult extends AppliedSqlResult {
+  readonly view?: 'local' | 'final'
+  readonly finalOrderLength?: number
 }
 
 export interface MaterializedRevisionSnapshot {
@@ -85,21 +93,48 @@ export interface MaterializedApplicationTransaction {
   readonly outcome: MaterializedTransactionOutcomeKind
 }
 
-/** Immutable published revision; only requested application entries are copied. */
-export interface MaterializedApplicationSnapshot {
+/** Immutable capture of a replaceable applied revision, with no finality semantics. */
+export interface AppliedApplicationSnapshot {
   readonly revision: bigint
   readonly orderLength: number
+  /** A detached entry at this captured revision, or null outside its prefix. */
+  transactionAt(index: number): MaterializedApplicationTransaction | null
+}
+
+/** A bounded SQL lease over the same applied revision as its application entries. */
+export interface AppliedReadHandle extends AppliedApplicationSnapshot {
+  query(sql: string, parameters?: readonly MaterializedLocalSqlValue[]): AppliedSqlResult
+  release(): void
+}
+
+/** Live view capture; only requested application entries are copied. */
+export interface MaterializedApplicationSnapshot extends AppliedApplicationSnapshot {
   readonly finalRevision: bigint
   readonly finalOrderLength: number
   readonly view: 'local' | 'final'
-  /** A detached entry at this captured revision, or null outside its prefix. */
-  transactionAt(index: number): MaterializedApplicationTransaction | null
 }
 
 /** A bounded SQL lease captured atomically with its published application snapshot. */
 export interface MaterializedReadHandle extends MaterializedApplicationSnapshot {
   query(sql: string, parameters?: readonly MaterializedLocalSqlValue[]): MaterializedLocalSqlResult
   release(): void
+}
+
+/** Reads the currently published applied state; a later replay can replace it. */
+export interface AppliedQueryService {
+  readonly revision: bigint
+  readonly orderLength: number
+  readonly executionManifestDigest: Uint8Array
+  proposalIdAt(index: number): Uint8Array | null
+  localSql(
+    sql: string,
+    parameters?: readonly MaterializedLocalSqlValue[],
+    options?: { readonly atRevision?: bigint },
+  ): AppliedSqlResult
+  outcome(txId: Uint8Array): MaterializedTransactionOutcome | null
+  captureApplication(): AppliedApplicationSnapshot
+  captureRead(): AppliedReadHandle
+  subscribe(subscriber: (revision: MaterializedRevisionSnapshot) => void): () => void
 }
 
 /** Reads one published immutable materialization and reports revision changes. */
@@ -136,9 +171,18 @@ export interface MaterializationPublicationStore {
   }): Promise<MaterializationPublicationResult>
 }
 
-export interface ChronologMaterializationRuntime {
-  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
+/** Deterministic replay and atomic publication, independent of any finality protocol. */
+export interface AppliedMaterializationRuntime {
+  readonly kind: 'applied'
   readonly coordinator: MaterializationCoordinator
+  readonly queries: AppliedQueryService
+  readonly publications: MaterializationPublicationStore
+  close(): void | Promise<void>
+}
+
+/** Live collaboration adds a proven immutable prefix to the shared replay engine. */
+export interface ChronologMaterializationRuntime {
+  readonly coordinator: LiveMaterializationCoordinator
   readonly queries: MaterializedQueryService
   readonly publications: MaterializationPublicationStore
   close(): void | Promise<void>
@@ -148,7 +192,9 @@ export function publicationRequestForRevision(
   revision: MaterializedRevision,
 ): MaterializationPublicationRequest {
   return {
-    publicationKey: `revision:${revision.contentHash}`,
+    // A later replay can restore identical content. It is a new publication,
+    // while retrying this exact revision keeps the same immutable request.
+    publicationKey: `revision:${revision.previousRevision}:${revision.revision}:${revision.orderLength}:${revision.contentHash}`,
     expectedRevision: revision.previousRevision,
     targetRevision: revision.revision,
     targetOrderLength: revision.orderLength,

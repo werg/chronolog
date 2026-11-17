@@ -377,6 +377,9 @@ importers:
       '@chronolog/materializer':
         specifier: workspace:*
         version: link:../materializer
+      '@chronolog/materializer-doltlite':
+        specifier: workspace:*
+        version: link:../materializer-doltlite
       '@chronolog/peer-generation':
         specifier: workspace:*
         version: link:../peer-generation

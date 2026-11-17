@@ -6,7 +6,7 @@ import { createChronologApplicationBackend, type ClientApplicationSource, type N
 function fixture() {
   type RawStatus = NonNullable<Awaited<ReturnType<NodeApplicationSource['operation']>>>
   let current: RawStatus | null = null, revision = 0n, reads = 0, watchers = 0, released = 0, changesReleased = 0
-  const calls: unknown[] = [], parameters: unknown[] = [], changeCalls: unknown[] = [], revisions = new RevisionBroadcaster<NodeRevisionEvent>()
+  const calls: unknown[] = [], parameters: unknown[] = [], changeCalls: unknown[] = [], viewCalls: unknown[] = [], revisions = new RevisionBroadcaster<NodeRevisionEvent>()
   const batch = { revision: 'pinned', transactions: [], scannedThrough: 'cursor', hasMore: false }
   const changes = { async *[Symbol.asyncIterator]() {
     try { yield { view: 'final' as const, revision: batch.revision, finalRevision: batch.revision } }
@@ -23,13 +23,21 @@ function fixture() {
     },
     events: { read: async () => batch, async *subscribe() { yield batch } },
     changes(options: unknown) { changeCalls.push(options); return changes },
-    async readView(options: { view?: 'local' | 'final' } = {}) { return { view: options.view ?? 'final', revision: batch.revision,
+    async readView(options: { view?: 'local' | 'final' } = {}) { viewCalls.push(options); return { view: options.view ?? 'final', revision: batch.revision,
       finalRevision: options.view === 'local' ? 'pinned-final' : batch.revision,
       query(_sql: string, values: unknown[]) { parameters.push(values); return { columns: [{ name: 'count' }], rows: [[{ kind: 'integer', value: '7' }]] } },
       readEvents: () => batch, release() { released++ },
     } },
   } as unknown as NodeApplicationSource
-  return { source, calls, parameters, changes, changeCalls, get changesReleased() { return changesReleased },
+  const client = {
+    changes: source.changes, readView: source.readView, events: source.events,
+    async submit(change: Parameters<ClientApplicationSource['submit']>[0], options: { readonly operationId: string }) {
+      const receipt = await source.publish({ program: change, operationId: options.operationId })
+      return { proposalId: receipt.txIdText, dispose() {} }
+    },
+    operations: { get: source.operation, async *subscribe() {} },
+  } as unknown as ClientApplicationSource
+  return { source, client, calls, parameters, changes, changeCalls, viewCalls, get changesReleased() { return changesReleased },
     get reads() { return reads }, get watchers() { return watchers }, get released() { return released },
     set(outcome: 'accepted' | 'rejected' | null, final: boolean) {
       current = { operationId: 'stable', proposalId: 'original-proposal', final,
@@ -90,13 +98,40 @@ describe('selected Chronolog application adapter', () => {
     expect(f.calls).toEqual([{ program: change, operationId: 'stable' }])
   })
 
+  it.each(['node', 'client'] as const)('rejects unsupported options before the %s replica creates or looks up an operation', async kind => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: kind === 'node' ? f.source : f.client, sql: true })
+    const change = program(emit('conversation', { text: 'original' }))
+    f.set('accepted', true)
+    for (const extra of [{ observedRevision: 'captured-revision' }, { basedOn: 'captured-revision' }, { basedOn: undefined }, { unknown: true }]) {
+      const guarded = { operationId: 'stable', ...extra }
+      await expect(backend.submit(change, guarded)).rejects.toMatchObject({ code: 'unsupported_option' })
+      await expect(backend.events.publish('conversation', { text: 'original' }, guarded)).rejects.toMatchObject({ code: 'unsupported_option' })
+    }
+    expect(f.calls).toEqual([])
+    expect(f.reads).toBe(0)
+    expect(await backend.submit(change, { operationId: 'stable' })).toEqual({
+      operationId: 'stable', proposalId: 'original-proposal', status: 'final', outcome: 'accepted',
+    })
+    expect(f.calls).toEqual([{ program: change, operationId: 'stable' }])
+  })
+
+  it.each(['node', 'client'] as const)('rejects an applied view before delegating to the %s replica', async kind => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: kind === 'node' ? f.source : f.client, sql: true })
+    // JavaScript callers and a broad profile-dependent binding can request a
+    // view that this concrete live adapter does not implement.
+    const unsupported = { view: 'applied' } as unknown as { readonly view?: 'local' | 'final' }
+    await expect(backend.readView(unsupported)).rejects.toMatchObject({ code: 'invalid_view' })
+    expect(() => backend.changes(unsupported)).toThrowError(expect.objectContaining({ code: 'invalid_view' }))
+    expect(f.viewCalls).toEqual([])
+    expect(f.changeCalls).toEqual([])
+    const view = await backend.readView()
+    expect(view).toMatchObject({ view: 'final', revision: 'pinned', finalRevision: 'pinned' })
+    await view.release()
+  })
+
   it.each(['node', 'client'] as const)('delegates the %s view changes stream and preserves its revision and lifetime', async kind => {
     const f = fixture(), controller = new AbortController()
-    const replica = kind === 'node' ? f.source : {
-      changes: f.source.changes, readView: f.source.readView, events: f.source.events,
-      submit: async () => { throw new Error('not used') },
-      operations: { get: f.source.operation, async *subscribe() {} },
-    } as unknown as ClientApplicationSource
+    const replica = kind === 'node' ? f.source : f.client
     const backend = createChronologApplicationBackend({ id: 'history', replica, sql: false })
     const options = { view: 'final' as const, signal: controller.signal }
     const stream = backend.changes(options)

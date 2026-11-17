@@ -1,10 +1,16 @@
 import {
   publicationRequestForRevision,
   type ReplayProposal,
+  type AppliedApplicationSnapshot,
+  type AppliedMaterializationRuntime,
+  type AppliedReadHandle,
+  type AppliedSqlResult,
   type ChronologMaterializationRuntime,
+  type MaterializationCoordinator,
   type MaterializedApplicationSnapshot,
   type MaterializationPublicationRequest,
   type MaterializationPublicationResult,
+  type MaterializationPublicationStore,
   type MaterializedRevisionSnapshot,
   type MaterializedReadHandle,
 } from '@chronolog/materializer'
@@ -17,36 +23,87 @@ import type {
   TransactionOutcome,
 } from './types.js'
 
-export interface DoltLiteMaterializerRuntimeBackend {
-  readonly historyProfile?: 'chronological' | 'peer-generation-v1'
+interface ReplayBackend {
   readonly revision: bigint
   readonly orderLength: number
-  readonly finalRevision?: bigint
-  readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
   proposalIdAt(index: number): Uint8Array | null
   materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null>
-  publishFinal?(prefixLength: number): Promise<void>
-  localSql(
-    sql: string,
-    parameters?: readonly LocalSqlValue[],
-    options?: LocalSqlOptions,
-  ): LocalSqlQueryResult
   outcome(txId: Uint8Array): TransactionOutcome | null
-  captureApplication(options?: { readonly view?: 'local' | 'final' }): MaterializedApplicationSnapshot
-  captureRead?(options?: { readonly view?: 'local' | 'final' }): MaterializedReadHandle
   subscribe(subscriber: (revision: MaterializedRevision) => void): () => void
   close(): void
 }
 
-/**
- * Adapts the branch-backed DoltLite materializer to the portable runtime seams.
- * DoltLite has already moved its local head when materialize() returns, so
- * publish() validates and memoizes that exact movement as already-current.
- */
+/** The applied SQL engine exposes no final prefix, final view, or finality operation. */
+export interface DoltLiteAppliedMaterializerRuntimeBackend extends ReplayBackend {
+  readonly kind: 'applied'
+  localSql(sql: string, parameters?: readonly LocalSqlValue[], options?: { readonly atRevision?: bigint }): AppliedSqlResult
+  captureApplication(): AppliedApplicationSnapshot
+  captureRead(): AppliedReadHandle
+}
+
+/** Live finality extends the same replay engine with an immutable published prefix. */
+export interface DoltLiteMaterializerRuntimeBackend extends ReplayBackend {
+  readonly finalRevision: bigint
+  readonly finalOrderLength: number
+  publishFinal(prefixLength: number): Promise<void>
+  localSql(sql: string, parameters?: readonly LocalSqlValue[], options?: LocalSqlOptions): LocalSqlQueryResult
+  captureApplication(options?: { readonly view?: 'local' | 'final' }): MaterializedApplicationSnapshot
+  captureRead(options?: { readonly view?: 'local' | 'final' }): MaterializedReadHandle
+}
+
+export function createDoltLiteAppliedMaterializationRuntime(
+  materializer: DoltLiteAppliedMaterializerRuntimeBackend,
+): AppliedMaterializationRuntime {
+  return {
+    kind: 'applied',
+    ...publicationRuntime(materializer),
+    queries: {
+      get revision() { return materializer.revision },
+      get orderLength() { return materializer.orderLength },
+      get executionManifestDigest() { return materializer.executionManifestDigest },
+      proposalIdAt(index) { return materializer.proposalIdAt(index) },
+      localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
+      outcome(txId) { return materializer.outcome(txId) },
+      captureApplication() { return materializer.captureApplication() },
+      captureRead() { return materializer.captureRead() },
+      subscribe(subscriber) { return subscribe(materializer, subscriber) },
+    },
+  }
+}
+
 export function createDoltLiteMaterializationRuntime(
   materializer: DoltLiteMaterializerRuntimeBackend,
 ): ChronologMaterializationRuntime {
+  const runtime = publicationRuntime(materializer)
+  return {
+    ...runtime,
+    coordinator: {
+      ...runtime.coordinator,
+      async publishFinal(prefixLength) { await materializer.publishFinal(prefixLength) },
+    },
+    queries: {
+      get revision() { return materializer.revision },
+      get orderLength() { return materializer.orderLength },
+      get finalRevision() { return materializer.finalRevision },
+      get finalOrderLength() { return materializer.finalOrderLength },
+      get executionManifestDigest() { return materializer.executionManifestDigest },
+      proposalIdAt(index) { return materializer.proposalIdAt(index) },
+      localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
+      outcome(txId) { return materializer.outcome(txId) },
+      captureApplication(options) { return materializer.captureApplication(options) },
+      captureRead(options) { return materializer.captureRead(options) },
+      subscribe(subscriber) { return subscribe(materializer, subscriber) },
+    },
+  }
+}
+
+/** DoltLite moves its applied head during replay; publication validates that exact movement. */
+function publicationRuntime(materializer: ReplayBackend): {
+  readonly coordinator: MaterializationCoordinator
+  readonly publications: MaterializationPublicationStore
+  close(): void
+} {
   const prepared = new Map<string, MaterializationPublicationRequest>()
   const publications = new Map<string, {
     readonly request: MaterializationPublicationRequest
@@ -61,14 +118,8 @@ export function createDoltLiteMaterializationRuntime(
     status: MaterializationPublicationResult['status'],
     publicationKey: string | null,
   ): MaterializationPublicationResult => ({ status, publicationKey, ...snapshot() })
-
   return {
-    historyProfile: materializer.historyProfile ?? 'chronological',
     coordinator: {
-      async publishFinal(prefixLength) {
-        if (materializer.publishFinal === undefined) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
-        await materializer.publishFinal(prefixLength)
-      },
       async materialize(orderedTransactions) {
         const revision = await materializer.materialize(orderedTransactions)
         if (revision === null) return null
@@ -77,45 +128,16 @@ export function createDoltLiteMaterializationRuntime(
         return { revision, publication }
       },
     },
-    queries: {
-      get revision() { return materializer.revision },
-      get orderLength() { return materializer.orderLength },
-      get finalRevision() { return materializer.finalRevision ?? 0n },
-      get finalOrderLength() { return materializer.finalOrderLength ?? 0 },
-      get executionManifestDigest() { return materializer.executionManifestDigest },
-      proposalIdAt(index) { return materializer.proposalIdAt(index) },
-      localSql(sql, parameters, options) { return materializer.localSql(sql, parameters, options) },
-      outcome(txId) { return materializer.outcome(txId) },
-      captureApplication(options) { return materializer.captureApplication(options) },
-      captureRead(options) {
-        if (materializer.captureRead === undefined) throw new Error('MATERIALIZER_SNAPSHOT_UNAVAILABLE')
-        return materializer.captureRead(options)
-      },
-      subscribe(subscriber) {
-        return materializer.subscribe((revision) => subscriber({
-          revision: revision.revision,
-          orderLength: revision.orderLength,
-          executionManifestDigest: revision.manifestDigest.slice(),
-        }))
-      },
-    },
     publications: {
       async publish(request): Promise<MaterializationPublicationResult> {
         const previous = publications.get(request.publicationKey)
         if (previous !== undefined) {
-          if (!sameRequest(previous.request, request)) {
-            throw new Error('MATERIALIZATION_PUBLICATION_KEY_REUSED')
-          }
+          if (!sameRequest(previous.request, request)) throw new Error('MATERIALIZATION_PUBLICATION_KEY_REUSED')
           return copyResult(previous.result)
         }
         const candidate = prepared.get(request.publicationKey)
-        if (candidate === undefined || !sameRequest(candidate, request)) {
-          throw new Error('MATERIALIZATION_PUBLICATION_NOT_PREPARED')
-        }
-        if (
-          materializer.revision !== request.targetRevision ||
-          materializer.orderLength !== request.targetOrderLength
-        ) {
+        if (candidate === undefined || !sameRequest(candidate, request)) throw new Error('MATERIALIZATION_PUBLICATION_NOT_PREPARED')
+        if (materializer.revision !== request.targetRevision || materializer.orderLength !== request.targetOrderLength) {
           throw new Error('MATERIALIZATION_PUBLICATION_NOT_CURRENT')
         }
         const completed = result('already_current', request.publicationKey)
@@ -124,11 +146,8 @@ export function createDoltLiteMaterializationRuntime(
         return copyResult(completed)
       },
       async reconcile(expectation): Promise<MaterializationPublicationResult> {
-        if (
-          materializer.orderLength !== expectation.targetOrderLength ||
-          (expectation.targetRevision !== undefined &&
-            materializer.revision !== expectation.targetRevision)
-        ) {
+        if (materializer.orderLength !== expectation.targetOrderLength ||
+            (expectation.targetRevision !== undefined && materializer.revision !== expectation.targetRevision)) {
           throw new Error('MATERIALIZATION_RECONCILIATION_MISMATCH')
         }
         return result('reconciled', null)
@@ -136,6 +155,14 @@ export function createDoltLiteMaterializationRuntime(
     },
     close() { materializer.close() },
   }
+}
+
+function subscribe(materializer: ReplayBackend, subscriber: (revision: MaterializedRevisionSnapshot) => void): () => void {
+  return materializer.subscribe((revision) => subscriber({
+    revision: revision.revision,
+    orderLength: revision.orderLength,
+    executionManifestDigest: revision.manifestDigest.slice(),
+  }))
 }
 
 function copyResult(value: MaterializationPublicationResult): MaterializationPublicationResult {
@@ -148,10 +175,7 @@ function copyResult(value: MaterializationPublicationResult): MaterializationPub
   }
 }
 
-function sameRequest(
-  left: MaterializationPublicationRequest,
-  right: MaterializationPublicationRequest,
-): boolean {
+function sameRequest(left: MaterializationPublicationRequest, right: MaterializationPublicationRequest): boolean {
   return left.publicationKey === right.publicationKey &&
     left.expectedRevision === right.expectedRevision &&
     left.targetRevision === right.targetRevision &&

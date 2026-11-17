@@ -14,15 +14,16 @@ export function validatePeerRevision(value: PeerRevision): void {
   object(value, ['applicationId', 'historyId', 'generation', 'point', 'controlRevision', 'materializationRevision'])
   hex(value.applicationId); boundedText(value.historyId, 128); hex(value.generation); uint(value.controlRevision)
   validateHistoryPoint(value.point)
+  check(value.point.generation === value.generation, 'PEER_REVISION_INVALID')
   check(typeof value.materializationRevision === 'string' && /^[0-9]{1,32}$/u.test(value.materializationRevision), 'PEER_REVISION_INVALID')
 }
 function validateHeader(value: AttemptHeader): void {
   object(value, ['applicationId', 'profile', 'generation', 'controlRevision', 'epoch', 'author', 'operationId',
-    'definitionDigest', 'command', 'commandVersion', 'basedOn', 'reapplyOf', 'coreDigest'])
+    'definitionDigest', 'command', 'commandVersion', 'observedRevision', 'reapplyOf', 'coreDigest'])
   hex(value.applicationId); hex(value.generation); uint(value.controlRevision); uint(value.epoch)
   hex(value.author); boundedText(value.operationId); hex(value.definitionDigest); hex(value.coreDigest)
   boundedText(value.command, 128); boundedText(value.commandVersion, 128)
-  if (value.basedOn !== null) validatePeerRevision(value.basedOn)
+  if (value.observedRevision !== null) validatePeerRevision(value.observedRevision)
   if (value.reapplyOf !== null) hex(value.reapplyOf)
   check(value.profile === 'peer-generation-v1', 'PEER_PROFILE_UNSUPPORTED')
 }
@@ -46,6 +47,12 @@ export async function verifyAttempt(attempt: SignedAttempt, authority: PeerAutho
   check(header.applicationId === descriptor.applicationId && header.definitionDigest === descriptor.definitionDigest, 'PEER_SCOPE_MISMATCH')
   const generation = authority.generation(header.generation), control = authority.controlAt(generation.payload.controlRevision)
   check(header.controlRevision === control.payload.revision && header.epoch === control.payload.epoch, 'PEER_ATTEMPT_CONTROL_MISMATCH')
+  if (header.observedRevision !== null) {
+    const observed = header.observedRevision, observedGeneration = authority.generation(observed.generation)
+    check(observed.applicationId === descriptor.applicationId && observed.historyId === descriptor.historyId &&
+      observed.controlRevision === observedGeneration.payload.controlRevision &&
+      observedGeneration.payload.number <= generation.payload.number, 'PEER_REVISION_INVALID')
+  }
   check(authority.grant(header.author, header.controlRevision)?.writer === true, 'PEER_AUTHOR_FORBIDDEN')
   check(attempt.id === await peerDigest(['chronolog/peer-generation/attempt/v1', attempt.payload]), 'PEER_ATTEMPT_ID_INVALID')
   await verifyPeerValue(DOMAINS.peerAttempt, { payload: attempt.payload, signature: attempt.signature }, header.author)

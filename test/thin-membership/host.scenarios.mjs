@@ -88,14 +88,22 @@ it('administers an independently ordered native/browser group through the actual
   const configured = await owner.configure(setup);
   expect(configured.descriptor).not.toBeNull();
   const genesis = decodeSignedGenesis(base64UrlToBytes(configured.descriptor.genesis));
-  expect(bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).not.toBe(setup.nativeAuthority.publicKey);
+  const membershipRootPublicKey = bytesToBase64Url(genesis.manifest.rootAdminPublicKey);
+  expect(membershipRootPublicKey).not.toBe(setup.schemaAdministratorPublicKey);
+  expect(membershipRootPublicKey).not.toBe(setup.nativeAuthority.publicKey);
   expect(bytesToBase64Url(genesis.manifest.schemaAdminPublicKey)).toBe(setup.schemaAdministratorPublicKey);
-  const rootRoles = genesis.manifest.initialCapabilities.filter(grant =>
-    bytesToBase64Url(grant.signingPublicKey) === bytesToBase64Url(genesis.manifest.rootAdminPublicKey)).map(grant => grant.role);
-  expect(rootRoles).toEqual(['administrator']);
+  expect(genesis.manifest.historyPolicy.kind).toBe('coordinated');
+  expect(genesis.manifest.historyPolicy.historyId).toBe(setup.nativeAuthority.historyId);
+  expect(bytesToBase64Url(genesis.manifest.historyPolicy.authorityPublicKey)).toBe(setup.nativeAuthority.publicKey);
+  // The signed root is the membership issuer directly; it receives no reader,
+  // writer or validator grant and acquires no SQL schema authority.
+  expect(genesis.manifest.initialCapabilities.filter(grant =>
+    bytesToBase64Url(grant.signingPublicKey) === membershipRootPublicKey)).toEqual([]);
   const bootstrap = await fixture('start', configured.descriptor);
   await owner.sync();
-  await passed('Cloudflare owns a durable membership-only root; the separate native signer owns application schema and ordering');
+  await passed('Cloudflare owns a membership-only root; the separate native signer owns SQL schema and certifies live finality',
+    { membershipRootPublicKey, schemaAdministratorPublicKey: setup.schemaAdministratorPublicKey,
+      finalityAuthorityPublicKey: setup.nativeAuthority.publicKey, initialRootGrants: 0 });
 
   await phase('large and small native workloads');
   const small = await fixture('workload', { namespace: 'host-small', count: 4, payloadBytes: 16 });
