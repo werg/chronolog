@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, type RecoveryNotice,
@@ -65,6 +65,7 @@ describe('owned browser application facade', () => {
     expect(client.storageId).toBe(f.b.storageId)
     expect(client.applicationId).toBe(f.b.applicationId)
     expect(client.describe().commands.map(value => value.name)).toEqual(['say'])
+    expect(client.capabilities.sql).toBe(false)
     expect('privateKey' in client).toBe(false)
     expect(client.status.phase).toBe('waiting')
     const operation = await client.command('say', 'saved once', { operationId: 'once' })
@@ -184,5 +185,13 @@ describe('owned browser application facade', () => {
     await Promise.all(streams.map(stream => stream.return!()))
     await expect(client.command('say', '💬'.repeat(300_000), { operationId: 'oversized' })).rejects.toThrow('APPLICATION_WORKER_MESSAGE_LIMIT')
     expect(await client.operations.get('oversized')).toBeNull()
+  })
+
+  it('rejects malformed query capabilities in Worker readiness metadata', async () => {
+    const f = await fixture(), description = f.a.describe()
+    const metadata = vi.spyOn(f.a, 'describe').mockReturnValue({ ...description,
+      capabilities: { ...description.capabilities, sql: 'yes' as unknown as boolean } })
+    try { await expect(facade(f.a)).rejects.toThrow('APPLICATION_WORKER_METADATA_INVALID') }
+    finally { metadata.mockRestore() }
   })
 })

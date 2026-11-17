@@ -24,12 +24,15 @@ export async function openPeerApplication<const D extends ApplicationDefinition>
   let materializer: ChronologMaterializationRuntime | undefined
   let replica: PeerReplica | undefined, keys: ApplicationKeyring | undefined
   try {
+    const requiresSql = options.definition.schema !== undefined || options.authority.descriptor.payload.schemaDigest !== null
+    if (requiresSql && options.createMaterializer === undefined) throw new Error('APPLICATION_SCHEMA_REQUIRES_SQL')
     if (await applicationDefinitionDigest(options.definition) !== options.authority.descriptor.payload.definitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
     keys = await ApplicationKeyring.open({ device: options.device, authority: options.authority,
       ...(options.epochKeys === undefined ? {} : { epochKeys: options.epochKeys }) })
     materializer = options.createMaterializer === undefined ? await createEventMaterializationRuntime({ store: options.device.store,
       namespace: options.authority.descriptor.payload.historyId,
       ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) }) : await options.createMaterializer()
+    if (requiresSql && materializer.queries.capabilities.sql !== true) throw new Error('APPLICATION_SCHEMA_REQUIRES_SQL')
     const input: PeerReplicaOptions = { authority: options.authority, device: options.device.identity,
       store: options.device.store, storageId: options.device.storageId, epochKeys: keys.epochKeys, materializer,
       ...(options.maxRecords === undefined ? {} : { maxRecords: options.maxRecords }),

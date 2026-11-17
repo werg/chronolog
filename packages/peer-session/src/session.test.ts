@@ -329,6 +329,8 @@ describe('public peer application sessions', () => {
   it('binds Tendriller to applied views and authenticated operations without hosted command calls', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const backend = createApplicationBackend({ id: b.applicationId, session: b })
+    expect(b.capabilities.sql).toBe(false)
+    expect(backend.capabilities).not.toContain('sql')
     const phases: string[] = [], unsubscribe = backend.onStatus(status => { phases.push(status.phase) })
     expect(phases).toEqual(['waiting'])
     const link = await connectApplications(a, b)
@@ -337,6 +339,7 @@ describe('public peer application sessions', () => {
     await backend.submit({ name: 'say', input: 'via adapter' }, { operationId: 'adapter-once' })
     const result = await b.operations.wait('adapter-once')
     const view = await backend.readView()
+    await expect(view.query('SELECT 1')).rejects.toThrow('SQL_NOT_AVAILABLE')
     expect(view.view).toBe('applied')
     expect('finalRevision' in view).toBe(false)
     const events = await view.readEvents()

@@ -393,6 +393,10 @@ The `/tendriller` entry exports `createApplicationBackend()` for
 binding either an owned native session or this page facade to Tendriller's
 application interface. It forwards declared commands and coherent views to the
 same session instead of introducing another identity or queue.
+SQL availability comes from `session.capabilities.sql`, including across the
+Worker bridge. The adapter requires no separate SQL flag. A definition with a
+schema must use an SQL materializer; opening it with the default event runtime
+fails before that runtime is initialized.
 
 ## Content and local agent tools
 

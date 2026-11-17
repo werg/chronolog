@@ -14,7 +14,6 @@ interface EventOptions extends ApplicationEventOptions { readonly signal?: Abort
 export function createApplicationBackend(options: {
   readonly id: string
   readonly session: ApplicationSession | WorkerApplicationSession
-  readonly sql?: boolean
   readonly eventCommand?: string
 }) {
   const session = options.session
@@ -40,7 +39,7 @@ export function createApplicationBackend(options: {
   return Object.freeze({
     id: options.id,
     capabilities: Object.freeze(['events', 'revision-views', 'operation-status', 'recovery',
-      ...(options.sql === true ? ['sql'] : []), ...(options.eventCommand === undefined ? [] : ['event-publication'])]),
+      ...(session.capabilities.sql ? ['sql'] : []), ...(options.eventCommand === undefined ? [] : ['event-publication'])]),
     get status() { return session.status },
     onStatus: session.onStatus.bind(session),
     submit,
@@ -57,7 +56,7 @@ export function createApplicationBackend(options: {
       const view = await session.readView()
       return Object.freeze({ view: 'applied' as const, revision: JSON.stringify(view.revision), generation: view.revision.generation,
         async query(sql: string, parameters: readonly QueryParameter[] = []) {
-          if (options.sql !== true) throw new Error('SQL_NOT_AVAILABLE')
+          if (!session.capabilities.sql) throw new Error('SQL_NOT_AVAILABLE')
           return await view.query(sql, parameters)
         },
         async readEvents(input: EventOptions = {}) { input.signal?.throwIfAborted(); return eventBatch(await view.readEvents(input)) },

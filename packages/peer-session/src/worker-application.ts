@@ -1,5 +1,5 @@
 import type { AuthorityBundle, AppliedResult, OperationState, PeerRevision, PrefixProof, RecoveryNotice, SignedAttempt, SignedRetainedCoverage } from '@chronolog/peer-generation'
-import { validateApplicationDescription } from '@chronolog/peer-generation'
+import { PEER_GENERATION_CAPABILITIES, validateApplicationDescription } from '@chronolog/peer-generation'
 import type { EphemeralSignal, SignalPayload, SignalSendOptions, Signals, SignalSubscribeOptions } from '@chronolog/signals'
 
 import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from './definition.js'
@@ -256,9 +256,10 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
 
   /** Construct through connectApplicationWorker so readiness is authenticated to the owned port. */
   constructor(port: MessagePort, metadata: Metadata, timeoutMs: number, signal?: AbortSignal) {
-    this.#port = port; this.#timeoutMs = timeoutMs; this.#snapshot = metadata; this.#description = metadata.description
+    this.#port = port; this.#timeoutMs = timeoutMs; this.#snapshot = metadata
     this.applicationId = metadata.applicationId; this.historyId = metadata.historyId; this.deviceId = metadata.deviceId; this.storageId = metadata.storageId
-    this.capabilities = metadata.description.capabilities
+    this.capabilities = Object.freeze({ ...metadata.description.capabilities })
+    this.#description = { ...metadata.description, capabilities: this.capabilities }
     port.addEventListener('message', this.#receive); port.addEventListener('messageerror', this.#messageError); port.start()
     if (signal !== undefined) {
       const abort = (): void => { void this.close().catch(() => undefined) }
@@ -447,7 +448,12 @@ export function connectApplicationWorker<D extends ApplicationDefinition = Appli
             typeof metadata.storageId !== 'string' || typeof metadata.historyId !== 'string') {
           throw new Error('APPLICATION_WORKER_METADATA_INVALID')
         }
-        const { capabilities: _capabilities, ...description } = metadata.description
+        const { capabilities, ...description } = metadata.description
+        if (capabilities === null || typeof capabilities !== 'object' || typeof capabilities.sql !== 'boolean' ||
+            Object.keys(capabilities).length !== Object.keys(PEER_GENERATION_CAPABILITIES).length + 1 ||
+            Object.entries(PEER_GENERATION_CAPABILITIES).some(([key, expected]) => capabilities[key as keyof typeof PEER_GENERATION_CAPABILITIES] !== expected)) {
+          throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+        }
         validateApplicationDescription(description)
         clean(); resolve(new WorkerApplicationSession<D>(port, metadata, timeoutMs, options.signal))
       } catch (error) { fail(error) }

@@ -115,8 +115,13 @@ export interface MaterializedReadHandle extends MaterializedApplicationSnapshot 
   release(): void
 }
 
+export interface MaterializedQueryCapabilities {
+  readonly sql: boolean
+}
+
 /** Reads one published immutable materialization and reports revision changes. */
 export interface MaterializedQueryService {
+  readonly capabilities: MaterializedQueryCapabilities
   readonly revision: bigint
   readonly orderLength: number
   readonly finalRevision?: bigint

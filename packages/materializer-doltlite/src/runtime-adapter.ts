@@ -75,6 +75,7 @@ export function createDoltLiteMaterializationRuntime(
       },
     },
     queries: {
+      capabilities: Object.freeze({ sql: true }),
       get revision() { return materializer.revision },
       get orderLength() { return materializer.orderLength },
       get finalRevision() { return materializer.finalRevision ?? 0n },

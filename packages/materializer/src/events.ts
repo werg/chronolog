@@ -159,6 +159,7 @@ export async function createEventMaterializationRuntime(options: {
       }),
     },
     queries: {
+      capabilities: Object.freeze({ sql: false }),
       get revision() { return revision }, get orderLength() { return order.length },
       get finalRevision() { return finalRevision }, get finalOrderLength() { return finalLength },
       get executionManifestDigest() { return digest.slice() },

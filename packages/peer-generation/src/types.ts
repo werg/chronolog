@@ -1,6 +1,6 @@
 import type { BytesStore } from '@chronolog/records'
 import type { ChangeProgram } from '@chronolog/protocol'
-import type { ChronologMaterializationRuntime, MaterializedReadHandle, MaterializedTransactionOutcome } from '@chronolog/materializer'
+import type { ChronologMaterializationRuntime, MaterializedQueryCapabilities, MaterializedReadHandle, MaterializedTransactionOutcome } from '@chronolog/materializer'
 import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerGrant, PeerIdentity, PrefixProof, Signed, SignedGeneration } from './control-types.js'
 import type { PEER_GENERATION_PROFILE } from './control-types.js'
 export * from './control-types.js'
@@ -103,6 +103,7 @@ export interface CapturedPeerView {
 
 /** All replication is peer-to-peer. Authority refresh is an explicit lifecycle action. */
 export interface PeerReplica {
+  readonly queryCapabilities: MaterializedQueryCapabilities
   readonly descriptor: ApplicationDescriptor
   readonly device: PeerIdentity
   readonly storageId: string

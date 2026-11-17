@@ -30,6 +30,7 @@ const operationKey = (author: string, operationId: string): string => `${author}
 
 /** One durable history/journal owner shared by browser and native sessions. */
 class Replica implements PeerReplica {
+  readonly queryCapabilities: PeerReplica['queryCapabilities']
   readonly #options: PeerReplicaOptions
   readonly #serial = new Serial()
   #authority: PeerAuthority
@@ -57,6 +58,7 @@ class Replica implements PeerReplica {
 
   constructor(options: PeerReplicaOptions, authority: PeerAuthority) {
     this.#options = options; this.#authority = authority
+    this.queryCapabilities = Object.freeze({ sql: options.materializer.queries.capabilities.sql })
     this.#prefix = `peer-generation/replica/${authority.descriptor.applicationId}`
   }
   get descriptor() { return this.#authority.descriptor }
@@ -596,6 +598,7 @@ async function* replicationPages(commands: readonly OrderedCommand[] | AsyncIter
 }
 
 export async function createPeerReplica(options: PeerReplicaOptions): Promise<PeerReplica> {
+  check(typeof options.materializer.queries.capabilities?.sql === 'boolean', 'PEER_QUERY_CAPABILITIES_INVALID')
   check(options.maxRecords === undefined || Number.isSafeInteger(options.maxRecords) && options.maxRecords >= 1 && options.maxRecords <= PEER_MAX_RECORDS, 'PEER_RECORD_LIMIT_INVALID')
   check(options.maxHistoryBytes === undefined || Number.isSafeInteger(options.maxHistoryBytes) && options.maxHistoryBytes >= 1024 && options.maxHistoryBytes <= PEER_MAX_HISTORY_BYTES, 'PEER_HISTORY_LIMIT_INVALID')
   const authority = await verifyAuthorityBundle(options.authority)

@@ -89,7 +89,7 @@ const internals = new WeakMap<ApplicationSession, SessionInternals>()
 
 /** The application-facing owner: one peer journal, coherent views and explicit recovery. */
 export class ApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
-  readonly capabilities = PEER_GENERATION_CAPABILITIES
+  readonly capabilities: typeof PEER_GENERATION_CAPABILITIES & PeerReplica['queryCapabilities']
   readonly signals: Signals
   readonly recovery: ApplicationRecovery
   readonly content: ApplicationContent
@@ -119,6 +119,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: BytesStore; readonly content: ApplicationContent; readonly keys: ApplicationKeyring; readonly close?: () => void | Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#definition = options.definition; this.#closing = options.close
     const replica = this.#replica
+    this.capabilities = Object.freeze({ ...PEER_GENERATION_CAPABILITIES, ...replica.queryCapabilities })
     const signals = new SignalChannel({ scope: replica.descriptor.applicationId,
       identity: { publicKeyBytes: hexToBytes(replica.device.publicKey), privateKey: replica.device.privateKey },
       authorize: ({ scope, authorId }) => scope === replica.descriptor.applicationId && currentReader(replica, bytesToHex(authorId)),
