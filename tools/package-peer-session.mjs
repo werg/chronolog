@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import process from 'node:process';
@@ -16,6 +16,7 @@ const { values } = parseArgs({ options: { output: { type: 'string', default: 'ar
   'sql-native': { type: 'boolean', default: false }, 'sql-browser': { type: 'string' } } });
 const output = resolve(values.output), packageRoot = join(output, 'package');
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
+const guides = (await readdir(join(root, 'packages/peer-session'))).filter(name => name.endsWith('.md')).sort();
 const engineImport = '#chronolog-peer-native-engine';
 const entries = Object.fromEntries(['index', 'native', 'browser', 'webrtc', 'tendriller', 'releases', ...(values['native-rtc'] ? ['webrtc-native'] : []),
   ...(values['sql-native'] ? ['sql-native'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]
@@ -37,7 +38,7 @@ assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).e
   'The session artifact must not fetch external runtime dependencies');
 const declaration = declarations(Object.values(entries));
 const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
-  'packages/peer-session/package.json', 'packages/peer-session/README.md', 'tools/package-peer-session.mjs',
+  'packages/peer-session/package.json', ...guides.map(name => `packages/peer-session/${name}`), 'tools/package-peer-session.mjs',
   ...(values['sql-native'] || values['sql-browser'] ? ['patches/@dolthub__doltlite@0.11.29.patch'] : []),
   ...(values['sql-browser'] ? ['tools/build-wasm-engine.mjs'] : [])])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
@@ -86,12 +87,22 @@ if (values['sql-browser']) {
 for (const file of bundled.outputFiles) files.set(relative(packageRoot, file.path).replaceAll('\\', '/'), file.contents);
 for (const [path, content] of declaration.files) files.set(path, content);
 for (const name of Object.keys(entries)) files.set(`${name}.d.ts`, `export * from './types/packages/peer-session/src/${name}.js';\n`);
-files.set('README.md', await readFile(join(root, 'packages/peer-session/README.md')));
+for (const name of guides) {
+  const markdown = await readFile(join(root, 'packages/peer-session', name), 'utf8');
+  files.set(name, markdown.replace(/\]\(([^\s)]+)\)/gu, (match, target) => {
+    if (target.startsWith('#') || /^[a-z][a-z0-9+.-]*:/iu.test(target)) return match;
+    const [path, ...anchor] = target.split('#');
+    if (guides.includes(path)) return match;
+    const repositoryPath = relative(root, resolve(root, 'packages/peer-session', path)).replaceAll('\\', '/');
+    assert(!repositoryPath.startsWith('..'), `Guide link leaves the repository: ${target}`);
+    return `](https://github.com/werg/chronolog-db/blob/${source}/${repositoryPath}${anchor.length ? `#${anchor.join('#')}` : ''})`;
+  }));
+}
 files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', version, type: 'module',
   description: 'Authenticated movable-peer application sessions with explicit recovery and applied outcomes',
   exports: { ...Object.fromEntries(Object.keys(entries).map(name => [name === 'index' ? '.' : `./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
     ...(values['sql-browser'] ? { './browser-engine/*': './browser-engine/*' } : {}) },
-  files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json', ...(values['sql-native'] ? ['engine'] : []),
+  files: ['*.mjs', '*.d.ts', '*.md', 'chunks', 'types', 'provenance.json', ...(values['sql-native'] ? ['engine'] : []),
     ...(values['sql-browser'] ? ['browser-engine'] : [])], dependencies: {}, engines: { node: '>=22.15' },
   ...(values['sql-native'] ? { imports: { [engineImport]: './engine/index.cjs' }, os: [process.platform], cpu: [process.arch] } : {}),
   ...(values['native-rtc'] ? { peerDependencies: { werift: '0.27.0' }, peerDependenciesMeta: { werift: { optional: true } } } : {}),
