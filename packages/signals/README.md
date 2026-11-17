@@ -167,19 +167,37 @@ cancellation is also retired. Some routes may have dispatched before an attempt
 later rejects, and cancellation cannot recall those bytes. Reconnect never
 resends prior messages.
 
-## Governed replicas
+## Owned application sessions
 
-`createCapabilitySignals` from `@chronolog/capabilities` supplies the current
-membership authorization adapter. `createGovernedPeerService` from
-`@chronolog/agent-service/governed-peer` uses that adapter with authenticated
-replication routes and relay enabled. It dynamically
-selects a current writer-kind capability with the requested signal topic. A
-read-only or unenrolled replica can construct the service without publisher
-rights; a send fails while those rights are absent.
+`ApplicationSession` from `@chronolog/peer-session` exposes `session.signals`
+using the session's durable signing identity and application scope:
 
-The service binds the peer's signing key and advertised feed to its current
-reader capability. It owns signal routes, replication attachment and session
-replacement. Each session exposes `signal`, `completion` and `close()`. Compact
-membership controls can establish these permissions before application history
-is applied. Rights are evaluated against the latest verified local membership;
-an offline replica cannot know a revocation it has not yet received. Signal traffic never advances an application frontier or finality.
+```ts
+// Bind this callback to the UI event handler.
+function onTyping(active: boolean) {
+  return session.signals.send('typing', { active }, { ttlMs: 2500 })
+}
+
+for await (const message of session.signals.subscribe({
+  topics: ['typing'], mode: 'latest', signal: viewLifetime,
+})) {
+  render(message.authorId, message.payload)
+}
+
+```
+
+The session checks authors against its current verified reader grants. Durable
+writer and coordinator permissions remain separate. A newly granted reader can
+establish its rights through the shared authenticated peer handshake, and reader
+removal retires its connection when the verified control update arrives.
+An offline device can only enforce authority it has already received.
+
+`session.participate()` owns discovery, connection replacement and recovery.
+Authenticated connections attach their separate bounded live lanes to the same
+signal channel. Reconnection starts fresh signal delivery, and closing the
+session closes its routes and subscriptions. The host control participant's
+interest policy keeps ordinary live signals on peer connections. Signals leave
+application history and its applied revision unchanged.
+
+See [owned participation](../peer-session/README.md#owned-participation-and-recovery)
+for the common native and browser lifecycle.
