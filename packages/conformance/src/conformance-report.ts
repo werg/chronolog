@@ -59,14 +59,14 @@ export async function generateConformanceReport(options: ReportOptions = {}): Pr
   const manifest = createDoltLiteExecutionManifest({ profile: 'chronolog-portable-core-conformance-v1' })
   const manifestArtifacts = await executionManifestArtifacts(manifest)
   const replay = await runReplayFixture(manifest, 'reference')
-  const productionReplay = await runReplayFixture(manifest, 'native-daemon')
+  const productionReplay = await runReplayFixture(manifest, 'runtime')
   if (productionReplay.replayDigest !== replay.replayDigest) {
-    throw new Error('CONFORMANCE_NATIVE_DAEMON_REPLAY_MISMATCH')
+    throw new Error('CONFORMANCE_RUNTIME_REPLAY_MISMATCH')
   }
   const testGroups: readonly ConformanceTestGroup[] = [
     { id: 'native-replay-v1', passed: true, evidenceDigest: replay.evidenceDigest },
     {
-      id: 'native-daemon-production-v1',
+      id: 'native-runtime-v1',
       passed: true,
       evidenceDigest: digestJson({
         reference: replay.evidenceDigest,
@@ -74,10 +74,10 @@ export async function generateConformanceReport(options: ReportOptions = {}): Pr
       }),
     },
   ]
-  const enabledFeatures = ['sql-core-v2', 'deployment-native-daemon-v1'] as const
+  const enabledFeatures = ['sql-core-v2', 'execution-runtime-v1'] as const
   const featureEvidence = {
-    'sql-core-v2': ['native-replay-v1', 'native-daemon-production-v1'],
-    'deployment-native-daemon-v1': ['native-daemon-production-v1'],
+    'sql-core-v2': ['native-replay-v1', 'native-runtime-v1'],
+    'execution-runtime-v1': ['native-runtime-v1'],
   }
   const deterministicWithoutDigest = {
     executionManifestDigest: hex(manifestArtifacts.executionManifestDigest),
@@ -150,7 +150,7 @@ export function assertConformanceReport(value: unknown): asserts value is Confor
 
 async function runReplayFixture(
   manifest: ExecutionManifest,
-  pathKind: 'reference' | 'native-daemon',
+  pathKind: 'reference' | 'runtime',
 ): Promise<{
   readonly evidenceDigest: string
   readonly replayDigest: string
@@ -159,7 +159,7 @@ async function runReplayFixture(
   const path = join(directory, 'application.db')
   try {
     const materializer = await DeterministicMaterializer.open({ path, executionManifest: manifest, rootAdministrator: AUTHOR, checkpointEvery: 1 })
-    const runtime = pathKind === 'native-daemon'
+    const runtime = pathKind === 'runtime'
       ? createDoltLiteMaterializationRuntime(materializer)
       : null
     try {

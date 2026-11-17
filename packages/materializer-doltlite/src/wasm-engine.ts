@@ -1,9 +1,9 @@
 import { bytesToHex, sha256Sync, utf8 } from '@chronolog/canonical'
-import { assertNativeSecurityConfiguration, configureSqliteLimits } from '@chronolog/materializer-doltlite/browser'
+import { assertNativeSecurityConfiguration, configureSqliteLimits } from './sql-profile.js'
 import type {
   DatabaseLike, DoltBranchInfoLike, MaterializerBackendInfo, NativeEngineManifest,
   NativeSecurityConfiguration, MaterializerOptions, StatementLike,
-} from '@chronolog/materializer-doltlite/browser'
+} from './types.js'
 
 type Authorizer = Parameters<DatabaseLike['setAuthorizer']>[0]
 type OpenedDatabase = ReturnType<NonNullable<MaterializerOptions['openDatabase']>>

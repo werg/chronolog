@@ -1,87 +1,88 @@
-name: WebRTC native and browser
+name: Independent application qualification
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: webrtc-${{ github.ref }}
+  group: application-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   qualify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Verify bounded framing and native ICE/DTLS/SCTP
-        run: pnpm exec vitest run packages/transport-webrtc/src
-      - name: Check out the exact public resident deployment recipe
+      - name: Check out exact independent consumers
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: 11c445e4d25e7b8ca415f3327c8049fcadc9f547
-          path: artifacts/tendriller-contrib
+          ref: 646ceca52c1cd4c164ef3af7c9bddeba3e3df90f
+          path: artifacts/contrib
           persist-credentials: false
-      - name: Build the clean public peer-session RTC package
-        run: node tools/package-peer-session.mjs --native-rtc --output artifacts/peer-session-rtc
-      - name: Qualify selected-history recovery through the packed native RTC API
-        shell: bash
-        run: |
-          archives=(artifacts/peer-session-rtc/chronolog-peer-session-*.tgz)
-          test "${#archives[@]}" -eq 1
-          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --transport native-rtc --output artifacts/peer-session-rtc-consumer
-      - name: Qualify actual hosted control and rendezvous with packed RTC peers
-        shell: bash
-        run: |
-          mkdir -p artifacts/tendriller-public-cb32e137
-          cp test/artifacts/tendriller-sdk-cb32e137.tgz artifacts/tendriller-public-cb32e137/tendriller-sdk-0.3.0-rc.9.tgz
-          cp test/artifacts/tendriller-engine-cb32e137.tgz artifacts/tendriller-public-cb32e137/tendriller-engine-0.3.0-rc.9.tgz
-          cp test/artifacts/tendriller-public-cb32e137.provenance.json artifacts/tendriller-public-cb32e137/provenance.json
-          archives=(artifacts/peer-session-rtc/chronolog-peer-session-*.tgz)
-          test "${#archives[@]}" -eq 1
-          node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/tendriller-public-cb32e137 --output artifacts/peer-session-host-consumer
-      - name: Qualify the native HTTPS resident task and current reader authorization
-        run: node --import tsx tools/test-resident-webrtc.ts --contrib artifacts/tendriller-contrib --output artifacts/resident-webrtc
-      - name: Install actual Chromium
-        run: pnpm exec playwright install --with-deps chromium
-      - name: Qualify OPFS peer after page and signaling host shutdown
-        run: node artifacts/tendriller-contrib/cookbooks/run-a-peer-application/checks/run-webrtc.mjs --chronolog . --output artifacts/browser-webrtc
-      - name: Qualify generation sessions over Worker and native WebRTC
-        run: node --import tsx tools/test-peer-session-webrtc.ts --output artifacts/peer-session-webrtc
-      - name: Preserve native and browser results and emitted graphs
-        if: always()
-        uses: actions/upload-artifact@v6
+      - name: Check out exact hosted participant
+        uses: actions/checkout@v6
         with:
-          name: webrtc-${{ github.run_id }}-${{ github.run_attempt }}
+          repository: werg/tendriller
+          ref: 112ae5f6b1d4f861ef13cdae90be3edf38d56c73
+          path: artifacts/host-source
+          persist-credentials: false
+      - name: Build public host artifacts
+        working-directory: artifacts/host-source
+        run: |
+          npm ci
+          npm run build
+      - name: Build clean public session artifacts
+        run: |
+          node tools/package-peer-session.mjs --native-rtc --output artifacts/session-rtc
+          node tools/package-peer-session.mjs --sql-native --output artifacts/session-sql
+      - name: Qualify independent native RTC and hosted participant
+        shell: bash
+        run: |
+          archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --transport native-rtc --output artifacts/qualification/native
+          node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/host-source/dist --output artifacts/qualification/host
+      - name: Qualify SQL and guarded task commands
+        shell: bash
+        run: |
+          archives=(artifacts/session-sql/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
+          node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --domain tasks --output artifacts/qualification/tasks
+      - name: Install real Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify packed browser Worker, OPFS and native RTC
+        shell: bash
+        run: |
+          archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-browser.mjs --artifact "${archives[0]}" --output artifacts/qualification/browser
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: application-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            artifacts/peer-session-rtc/*.tgz
-            artifacts/peer-session-rtc/package/provenance.json
-            artifacts/peer-session-rtc-consumer/report.json
-            artifacts/peer-session-rtc-consumer/summary.json
-            artifacts/peer-session-host-consumer/host-artifacts.json
-            artifacts/peer-session-host-consumer/host/package-lock.json
-            artifacts/peer-session-host-consumer/peers/report.json
-            artifacts/peer-session-host-consumer/peers/summary.json
-            artifacts/browser-webrtc/report.json
-            artifacts/browser-webrtc/bundle.json
-            artifacts/resident-webrtc/report.json
-            artifacts/resident-webrtc/bundle.json
-            artifacts/peer-session-webrtc/report.json
-            artifacts/peer-session-webrtc/bundle.json
-            artifacts/peer-session-webrtc/generation-rtc-page.js
-            artifacts/peer-session-webrtc/generation-rtc-worker.js
+            artifacts/session-rtc/*.tgz
+            artifacts/session-rtc/package/provenance.json
+            artifacts/session-sql/package/provenance.json
+            artifacts/peer-session-sql-check/report.json
+            artifacts/qualification/**/report.json
+            artifacts/qualification/**/summary.json
+            artifacts/qualification/**/host-artifacts.json
+            artifacts/qualification/**/*.png
+            artifacts/host-source/dist/provenance.json
           if-no-files-found: error
           retention-days: 30

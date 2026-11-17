@@ -9,10 +9,10 @@ import { DeterministicMaterializer } from '@chronolog/materializer-doltlite/brow
 import { emit, encodeRowKey, encodeSealedEnvelope, platformObjectId, sealedOp, sqlStatement, sqlValue, utf8 } from '@chronolog/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { replayProposal, ROOT_KEY } from '../../materializer-doltlite/src/test-fixtures.js'
+import { replayProposal, ROOT_KEY } from './test-fixtures.js'
 import { generateX25519KeyPair, sealSealedValue } from '../../crypto/src/index.js'
-import { openDatabase as openNativeDatabase } from '../../materializer-doltlite/src/driver.js'
-import { CONSENSUS_DENIED_FUNCTIONS } from '../../materializer-doltlite/src/sql-profile.js'
+import { openDatabase as openNativeDatabase } from './driver.js'
+import { CONSENSUS_DENIED_FUNCTIONS } from './sql-profile.js'
 import { createWasmEngineFactory, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
 
 const directory = resolve(process.env.CHRONOLOG_WASM_DIRECTORY ?? 'artifacts/wasm')

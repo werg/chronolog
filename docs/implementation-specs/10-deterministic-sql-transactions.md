@@ -76,7 +76,7 @@ encoded as canonical CBOR inside `TransactionCore.program`: a step is
 
 The transaction core is version 2 and signs `operationId` alongside author, exact writer grant, membership revision, execution profile and program. Different proposals reusing one author/operation identity deterministically reject as `operation_conflict`. SQL/platform failure rolls back the whole program and exposes no effective emit. Accepted events are reconstructed from the canonical program and its durable outcome anchor; final readers never advance beyond missing or unresolved outcomes.
 
-The SQL-free execution profile accepts only emits. SQL/platform steps are a deterministic `profile:sql-disabled` rejection in that profile. See [application-log implementation](../plans/application-log.md) for cursors, scopes, pinned views and resident consumers.
+The SQL-free execution profile accepts only emits. SQL/platform steps are a deterministic `profile:sql-disabled` rejection in that profile. See [public application session](../../packages/peer-session/README.md) for cursors, coherent views and application consumers.
 
 The grant, collective or offer created by step `i` of transaction `txId` has
 the id `SHA-256(domain("chronolog/platform-object") ‖ len(txId) ‖ txId ‖ u32(i))`
@@ -368,9 +368,8 @@ tx_id = :earlier AND outcome = 'accepted'), 'needs_earlier')`.
 ## 9. Local reads
 
 Local query SQL runs on an immutable materialized revision, is not signed or
-replayed, and returns plain SQLite values. The caller selects the current
-local view or a separately pinned final view; final reads exclude the
-tentative suffix. Read-only host diagnostics, including the real clock and
+replayed, and returns plain SQLite values. The application captures the current applied view. A separately protected
+checkpoint is an explicit materializer capability, not a second application path. Read-only host diagnostics, including the real clock and
 the build and function catalogs denied during consensus execution, may be
 queried locally. External effects and Dolt control functions remain denied.
 There is no SELECT filtering: every reader node holds every row's stored

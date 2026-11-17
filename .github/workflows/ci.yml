@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,11 +16,9 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -29,104 +28,24 @@ jobs:
       - run: pnpm lint
       - run: pnpm docs:check
       - run: pnpm typecheck
-      - name: Verify the standalone live-signal package
+      - run: pnpm test:coverage
+      - run: pnpm build
+      - name: Verify public signal and participant artifacts
         run: |
           pnpm package:signals
           pnpm test:signals-package
-      - name: Check out the exact independent application recipes
-        uses: actions/checkout@v6
-        with:
-          repository: werg/tendriller-contrib
-          ref: 11c445e4d25e7b8ca415f3327c8049fcadc9f547
-          path: artifacts/contrib-recipes
-          persist-credentials: false
-      - name: Qualify previews through the standalone public package
-        run: node artifacts/contrib-recipes/cookbooks/share-live-signals/checks/run.mjs --signals-module artifacts/signals/index.mjs > artifacts/signals/contrib.consumer.json
-      - name: Build the clean public peer-session package
-        run: node tools/package-peer-session.mjs --output artifacts/peer-session
-      - name: Qualify an independent application through the packed peer session
-        shell: bash
-        run: |
-          archives=(artifacts/peer-session/chronolog-peer-session-*.tgz)
-          test "${#archives[@]}" -eq 1
-          node artifacts/contrib-recipes/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --output artifacts/peer-session-consumer
-      - name: Build and qualify the pinned native SQL application package
-        shell: bash
-        run: |
-          node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
-          archives=(artifacts/peer-session-sql/chronolog-peer-session-*.tgz)
-          test "${#archives[@]}" -eq 1
-          node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
-          node artifacts/contrib-recipes/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --domain tasks --output artifacts/peer-session-tasks
-      - name: Preserve public peer-session qualification
+          pnpm package:control
+      - uses: actions/upload-artifact@v6
         if: always()
-        uses: actions/upload-artifact@v6
         with:
-          name: peer-session-${{ github.run_id }}-${{ github.run_attempt }}
+          name: quality-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            artifacts/peer-session/*.tgz
-            artifacts/peer-session/package/provenance.json
-            artifacts/peer-session-consumer/report.json
-            artifacts/peer-session-consumer/summary.json
-            artifacts/peer-session-sql/package/provenance.json
-            artifacts/peer-session-sql-check/report.json
-            artifacts/peer-session-tasks/report.json
-            artifacts/peer-session-tasks/summary.json
-          if-no-files-found: warn
-          retention-days: 30
-      - name: Preserve the standalone live-signal package
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: chronolog-signals-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
+            coverage/coverage-summary.json
             artifacts/signals/*.tgz
             artifacts/signals/*.consumer.json
-          if-no-files-found: error
-          retention-days: 30
-      - run: pnpm test:coverage
-      - name: Rehearse native authority crash and storage recovery
-        run: pnpm exec tsx tools/authority-recovery.ts --output artifacts/authority-recovery/ci
-      - name: Measure portable membership storage and traffic
-        run: node --import tsx tools/membership-cost.ts --output artifacts/membership-cost/ci
-      - run: pnpm build
-      - name: Verify the isolated native distribution
-        run: |
-          pnpm release:distribution
-          pnpm test:distribution-package
-      - name: Preserve native package qualification
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: native-package-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/distribution/*.consumer.json
+            artifacts/peer-generation-control/*.tgz
           if-no-files-found: warn
           retention-days: 30
-      - name: Preserve authority recovery report
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: authority-recovery-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/authority-recovery/ci
-          if-no-files-found: warn
-          retention-days: 30
-      - name: Preserve public membership cost report
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: membership-cost-${{ github.run_id }}-${{ github.run_attempt }}
-          # The output directory also contains private disposable identity stores.
-          path: artifacts/membership-cost/ci/report.json
-          if-no-files-found: warn
-          retention-days: 30
-      - name: Preserve coverage summary
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: coverage-${{ github.run_id }}-${{ github.run_attempt }}
-          path: coverage/coverage-summary.json
-          if-no-files-found: warn
-          retention-days: 14
 
   conformance:
     name: Conformance (${{ matrix.os }})

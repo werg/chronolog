@@ -1,303 +1,122 @@
-# Chronolog DB
+# Chronolog
 
-Chronolog DB is a TypeScript prototype of a decentralized, permissioned
-application log. One signed change program combines **ordinary SQLite
-transactions**, platform operations, and bounded durable events. Native and
-browser peers verify the same original records; SQL profiles execute the same
-pinned DoltLite engine, and event-only profiles do not load it. A signed
-genesis selects a live inclusion/finality provider. Both built-in providers use the same
-deterministic application order: author timestamp, signing key, proposal ID.
-Validators or an external service can prove inclusion and close a timestamp
-prefix; neither supplies an execution order. SQL executes locally. Tendriller
-can serve the page and administer participants while application exchange runs
-over authenticated WebRTC between Chronolog peers. A retained-log adapter is an
-explicit alternative deployment choice.
+Chronolog is an owned application session for browser Workers and native peers.
+One eligible peer orders commands. All readers verify the original author,
+selected order and execution contract, then materialize the same history.
 
-Either durable policy can replay a tentative suffix when an eligible earlier
-proposal arrives before its timestamp closes.
-The signed-inclusion provider retains receipts and durable closure promises;
-receipt positions never order SQL or effective events. Newly included backdated
-proposals cannot reopen a closed prefix. Custom verifiers are selected by the
-provider ID and parameters signed in genesis.
-Both expose separate local and final application views, durable submission
-identity, and live scoped reader/writer enrollment. SQL profiles include actual
-local and final SQL revisions; event-only profiles need no SQL engine. Start with the
-[application primitives guide](docs/application-primitives.md) for choosing APIs,
-finality, replay and role boundaries. The [resident agent](packages/agent-service/README.md)
-and [pluggable finality](docs/pluggable-finality.md) explain the architecture;
-the [application-log report](docs/plans/application-log.md) tracks qualification.
-The [peer application architecture](docs/peer-application-architecture.md) describes
-the boundary between page hosting, compact membership, live signals and durable
-application work.
+The application API has one command journal, one query and event model, and one
+replication and recovery lifecycle. Participant roles determine what a participant
+may receive or do. Transports deliver those same scoped messages. A server can
+participate in control, discovery and signed code publication without receiving
+application bodies or executing ordinary commands.
 
-- **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
-  dialect or migration system. Assumptions are SQL statements, usually
-  `SELECT chronolog_assert(condition, 'code')`; a failing statement rejects the
-  whole transaction.
-- **Atomic events.** Accepted programs expose whole-proposal event batches with
-  stable IDs; rejected programs expose no effective events. Final event readers
-  use bounded pull delivery and history/filter-bound cursors, including progress
-  across nonmatching records. Local projections atomically checkpoint state and
-  processed progress outside the consensus core.
-- **Ephemeral signals.** `client.signals` carries typing, presence, cursors,
-  progress, transient samples and preview chunks without retained history, transactional execution or a
-  finality provider. The standalone `@chronolog/signals` package also works
-  without a database or Chronolog membership. Group adapters add explicit
-  signal rights; durable topic rights do not implicitly grant them.
-- **Coherent views.** A bounded read lease pins SQL and effective events to one
-  view. Provisional rebases replace that view; finality and operation status can
-  advance even when rows stay equal. `changes({ view })` invalidates display
-  snapshots; final event subscriptions process durable work. Reads default to
-  final, with an explicit local view for speculative UI.
-- **Owner-controlled rows.** Every application table automatically gets a
-  `chronolog_owner` column stamped with the signer of the insert, stored as a
-  small integer id (`chronolog_principals` maps ids to keys).
-  Generated triggers let only the owner, a collective it belongs to, or a key
-  it granted access update or delete a row; administrators included. Schema
-  administrators may run DDL and write app triggers that narrow, never widen,
-  those rights. Violations abort the whole transaction
-  ([design](docs/design-owner-rows.md)).
-- **Explicit encrypted readers.** An owner controls a row's reader policy;
-  the client encrypts individual BLOB columns and wraps each fresh value key
-  only to those readers. Sealed writes still obey ordinary row grants and
-  application triggers. Ownership does not imply decryption rights
-  ([guide](docs/sealed-data.md)).
-- **Determinism from a pinned engine.** SQL replicas run the same engine
-  build; `'now'`, `random()` and `localtime` are fixed per transaction; a short
-  authorizer block-list keeps statements inside the database.
-- **Replication.** Native SQLite and browser OPFS adapters share the original
-  signed-record codec, immutable evidence, and range/stream synchronization.
-  WebRTC, native SSB connections and the optional retained-log adapter supply connectivity;
-  a relay never changes original authorship.
-- **Governance.** A signed genesis fixes the consensus roles and history
-  policy. Live signed enrollment grants reader/writer access with explicit
-  historical-key approval. Writes bind their exact grant, and revocations
-  activate at verified policy boundaries. Epoch keys are wrapped to readers.
-  SQL, durable topic and ephemeral signal rights are distinct. Limited
-  publishers use original-signer ingress without reader keys or a local replica.
-- **Resident work.** Final-intent workers own timer generations and durable
-  dispatch checkpoints in a fenced native store. A native finality service can
-  run alongside them, or a replica can consume proofs from another provider.
-  External effects require provider idempotency/reconciliation or an explicit
-  uncertain state.
+This is prerelease software. Breaking changes update every maintained consumer;
+there are no alternate legacy applications, profile selectors or migration layers.
 
-Read [the design](docs/design.md) for how it works,
-[Specification 10](docs/implementation-specs/10-deterministic-sql-transactions.md)
-for the transaction contract, and [the documentation index](docs/README.md) for
-everything else.
+## Application contract
 
-## Quick start
+- `command()` saves one signed, encrypted attempt before sending it. An exact
+  retry preserves the original bytes and operation identity.
+- `applied()` reports acceptance or rejection at a generation and sequence.
+  `shared()` reports independently retained copies of that prefix.
+- `query()` and `readView()` capture coherent state. SQL, events, outcomes and
+  revision switch together during recovery.
+- A signed control transition selects a replacement coordinator. It may adopt
+  an earlier surviving prefix. Excluded work remains inspectable and requires
+  deliberate reapplication with a new linked identity.
+- Revocation and other control state do not roll back with application data.
+  Reader, writer, coordinator, recovery and administration rights are explicit.
+- Live signals and encrypted chunked content use the same session identity,
+  ownership and lifetime. They do not create another outbox or host data path.
+- Irreversible external effects require an explicit protected service. Applying
+  an ordinary command never dispatches such an effect automatically.
 
-For the workspace and native SQL runtime, use Node.js 22 or newer, the pinned
-pnpm 10.12.4, Python 3 and a C/C++ toolchain for
-`node-gyp`. The first install downloads the pinned DoltLite 0.11.29 source,
-verifies its SHA-256 and compiles the patched binding.
-An application using only live messages can instead consume the independent
-[`@chronolog/signals` archive](packages/signals/README.md#build-and-consume-the-standalone-package),
-which has no database or native build dependency.
+A healthy generation continues with every host endpoint blocked. If both the
+coordinator and control service are unavailable, commands stay saved locally.
+The system does not fabricate a successor or promise that all data copies survive.
 
-```sh
-pnpm install
-pnpm test
-pnpm demo        # two in-memory nodes: an ownership rejection, a grant, and a replay flip
-pnpm dev         # persistent daemon on http://127.0.0.1:8787, data in .chronolog/
-```
+## Start with the public session
 
-In another terminal:
-
-```sh
-pnpm cli status
-pnpm cli query 'SELECT * FROM accounts WHERE id = ?' '[1]'
-pnpm cli transact @transaction.json
-pnpm cli outcome TRANSACTION_ID
-```
-
-A CLI transaction file lists SQL statements and platform operations. Use the
-public client's `submit` and `events` APIs below for event-only or mixed programs.
-Bindings are JSON scalars or tagged values
-(`{"kind":"integer","value":"9007199254740993"}`, `{"kind":"real","value":1}`,
-`{"kind":"blob","value":"BASE64URL"}`). The convenience native bootstrap
-explicitly grants its owner both membership and schema administration, so it
-may create a table (it is owner-checked from the
-next statement on):
-
-```json
-{
-  "steps": [
-    { "sql": "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL) STRICT" },
-    { "sql": "INSERT INTO accounts (id, balance) VALUES (?, ?)", "bindings": [1, 100] }
-  ],
-  "wait": true
-}
-```
-
-The row now belongs to this node's key. Another node's
-`UPDATE accounts SET balance = 0 WHERE id = 1` is rejected with
-`policy:accounts:update`, until the owner grants it access:
-
-```json
-{ "steps": [{ "platform": "grant", "table": "accounts", "grantee": "BOB_KEY_BASE64URL", "operations": ["update"], "rowKey": [1], "columns": ["balance"] }] }
-```
-
-From TypeScript:
+See the [session guide](packages/peer-session/README.md) for application
+definitions, owned storage, enrollment, network connections, Worker ownership,
+control attachment, publication, content, recovery and local agent tools.
 
 ```ts
-import { platformOp, TransactionRejectedError } from '@chronolog/client'
-
-const tx = await client.transaction([
-  { sql: "SELECT chronolog_assert((SELECT balance FROM accounts WHERE id = :id) >= 50, 'insufficient_funds')", params: { id: 1 } },
-  { sql: 'UPDATE accounts SET balance = balance - 50 WHERE id = :id', params: { id: 1 } },
-  platformOp.grant({ table: 'accounts', grantee: bobKey, operations: ['update'], rowKey: [1] }),
-])
-const provisional = await tx.local() // current accepted/rejected result
-const outcome = await tx.final()     // actual applied final result
-tx.dispose()
-if (outcome.outcome.type === 'rejected') {
-  throw new TransactionRejectedError(tx.transactionId, outcome.outcome.rejection)
-}
-const rows = await client.query(`SELECT a.id, a.balance, p.key AS owner
-  FROM accounts AS a JOIN chronolog_principals AS p ON p.id = a.chronolog_owner`, [], { view: 'final' })
-```
-
-`platformOp` also builds collectives (`createCollective`, `acceptMembership`,
-`setMembers`, `leave`), revocations and transfers (`transferRow`,
-`transferAll`, `acceptTransfer`); the CLI accepts the same operations as
-`{"platform": ...}` steps (see `apps/chronolog/src/main.ts`).
-
-## Application events and pinned views
-
-Programs and manifests are pre-release formats: `ChangeProgram` is version 3,
-and its signed transaction core binds a stable `operationId`. Reusing that ID
-with different program bytes fails. Exact retries recover the original proposal
-and outcome, including after a writer grant is revoked.
-
-```ts
-import { emit, program, sqlStatement } from '@chronolog/protocol'
-import { TransactionRejectedError } from '@chronolog/client'
-
-const claim = await client.submit(program(
-  sqlStatement("SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = ?) = 1, 'already_claimed')", ['task-1']),
-  sqlStatement('UPDATE tasks SET claimed_by = ? WHERE id = ?', ['member-1', 'task-1']),
-  emit('tasks/claimed', { taskId: 'task-1', memberId: 'member-1' }),
-), { operationId: 'claim-task-1' })
-const result = await claim.final() // Wait for the applied final result.
-claim.dispose()
-if (result.outcome.type === 'rejected') {
-  throw new TransactionRejectedError(claim.transactionId, result.outcome.rejection)
-}
-
-const view = await client.readView({ view: 'final' })
+const session = await openNativeApplication({ device, definition, authority })
+const control = session.connectControlParticipant({ exchange })
 try {
-  const tasks = await view.query('SELECT id, claimed_by FROM tasks')
-  const events = await view.readEvents({ topics: ['tasks/claimed'] })
-  // Publish the combined UI only after both reads from this view finish.
-  render({ revision: view.revision, tasks, events })
-} finally { await view.release() }
+  const before = await session.query('messages', null)
+  const operation = await session.command('say', { text: 'Hello' }, {
+    operationId: crypto.randomUUID(), basedOn: before.revision,
+  })
+  const result = await operation.applied()
+  console.log(result.generation, result.sequence, result.outcome)
+} finally {
+  await session.close()
+}
 ```
 
-The schema/row grants and topic rights must authorize this program. Durable
-workers consume `client.events` or `node.events`; use `DurableProjection` with
-an atomic store for replayable frontend caches. Received cursors are not durable
-processed checkpoints. Typing and replaceable progress use `client.signals`:
+`definition` is the shared schema-validated command/query declaration. `device`
+is explicitly created or enrolled and then resumed; missing keys never silently
+create a replacement identity. `authority` is the signed descriptor, controls and
+generation chain. `exchange` is the hosted participant transport. Attaching it
+performs no I/O and does not give the host reader access.
 
-```ts
-await client.signals.send('presence/typing', { active: true }, { ttlMs: 3_000 })
-```
+A browser uses the same session in an owning Worker, with OPFS and a Web Lock.
+Native storage uses SQLite and an exclusive writer lock. The page facade forwards
+to that owner. Closing the session releases owned transports, streams and storage.
 
-Signals are best-effort and have no replay or final outcome. Publish a durable
-result when persistence matters. See the [signals contract](packages/signals/README.md)
-for bounded subscriptions, expiration and standalone use.
-
-`@chronolog/runtime-browser/events` opens the SQL-free OPFS Worker profile and
-exports `WorkerRpcTransport`. Its exclusive owner, synchronous private control
-journal and durable outbox preserve restart semantics without a WASM engine.
-The SQL profile retains the real pinned engine and isolated-Worker requirements.
-
-The [contrib pilot](https://github.com/werg/tendriller-contrib/pull/13) contains
-two task/chat layouts using the public application backend and the resident
-worker's actual request/result envelopes. Real deployment network routes,
-cost, disk-loss recovery and privacy/device qualification remain separately
-tracked there.
-
-Set `CHRONOLOG_URL`, `CHRONOLOG_GROUP_ID` and `CHRONOLOG_TOKEN` for a
-non-default daemon. RPC refuses a non-loopback bind without a token.
-
-## Running a group
-
-The convenience native bootstrap creates signed genesis on first start and
-pins the local identity as membership issuer and initial schema administrator,
-with explicit writer, validator and reader grants. Other deployments can name separate
-membership and schema administrators or select a distinct finality signer.
-New devices adopt the public descriptor, then use the live `client.enrollment`
-request/approval/status flow with explicit writer program rights and historical
-access. Membership administration comes from the pinned root, not a grantable
-administrator role. The fixed validator set does not change.
-See the [governance guide](docs/governance.md) and [client API](packages/client/README.md).
-Peers are configured with:
-
-```sh
-CHRONOLOG_SSB_HOST=0.0.0.0 CHRONOLOG_SSB_PORT=8008 CHRONOLOG_SSB_SCOPE=public \
-CHRONOLOG_SSB_PEERS='[{"address":"net:host:8008~shs:PUBLIC_KEY","feedId":"@FEED.ed25519"}]' \
-pnpm dev
-```
-
-A node replicates its configured peers' feeds and the feed of every granted
-member, relayed through any connected peer. The secret handshake authenticates
-the connection; Chronolog independently verifies every record's feed
-signature, the inner protocol signature, the capability revision, the
-validation policy and the encryption epoch.
-
-Operational tools: `pnpm snapshot export|import|repair` (signed archives and
-feed repair), `pnpm group fork|verify-fork` (forking a group),
-`pnpm release:distribution` (relocatable native archive), and
-`chronolog doctor`. See the [pilot runbook](docs/pilot-runbook.md).
-
-`CHRONOLOG_STATIC_MEMBERSHIP_FILE` is a testing override that replaces
-governance with a fixed out-of-band membership file; its `rootAdministrator`
-key is the first schema administrator.
-
-## Testing
-
-```sh
-pnpm test               # unit and integration tests
-pnpm conformance        # replay-equivalence report for this engine build
-pnpm test:soak          # long replay soak
-pnpm chaos:smoke        # container P2P fault runs (also :crash, :stress)
-```
-
-See the [chaos testing guide](docs/chaos-testing.md) and the
-[release-hardening guide](docs/release-hardening.md).
-
-## Workspace
+## Package boundaries
 
 | Package | Responsibility |
 | --- | --- |
-| `canonical` | Strict bounded CBOR, bytes, typed hash domains |
-| `protocol` | Signed messages, SQL/platform/event programs and value codecs, execution manifests, order keys |
-| `capabilities` | Genesis, grants, revocations, validation policy |
-| `crypto` | HPKE, signed epochs, content encryption |
-| `records` | Portable original signed records, immutable evidence, durable storage and shared range/stream synchronization |
-| `transport-ssb` | Native SQLite record/evidence storage and authenticated SSB connections |
-| `transport-webrtc` | Bounded RTC framing, HTTPS introduction, observed ICE routes and session supervision |
-| `transport-tendriller` | Public application backend adapter; optional retained-log finality adapter |
-| `signals` | Portable signed live messages, bounded subscriptions and explicit delivery lifetime |
-| `agent-service` | Governed peer routing, native finality, resident effects and timer workers |
-| `control-store` | Candidates, attestations, order, heartbeats, settlement evidence |
-| `node-core` | Governed peer composition, inclusion/finality policies, SQL-free event materialization, durable operations and enrollment |
-| `materializer-doltlite` | Deterministic SQL execution, owner-controlled rows (platform operations, generated triggers), Dolt checkpoints, suffix replay, local SQL |
-| `materializer` | Portable materialization contracts shared with the workerd path |
-| `runtime-browser` | Owning Worker, OPFS, Web Lock, SQL-free events or DoltLite WASM, and shared client RPC |
-| `runtime-workerd` | Experimental workerd execution contract ([plan](docs/workerd-reconstruction-plan.md)) |
-| `rpc` | Service contract, in-process and HTTP transports |
-| `client` / `react` | TypeScript client and React hooks |
-| `conformance` | Replay-equivalence and release characterization |
-| `chaos` | Container topology, faults, workloads, invariant checks |
-| `testkit` | Clocks, permutations, network helpers |
+| `peer-session` | Public lifecycle, commands, queries, operation journal, recovery, content, keys and tools |
+| `peer-generation` | Signed authority, ordering, selected ancestry, replica verification and participant protocol |
+| `records` | Shared byte store, native/browser ownership and bounded transport framing |
+| `materializer` | Execution contract and SQL-free event implementation |
+| `materializer-doltlite` | Deterministic SQL execution with native and WASM engine adapters |
+| `transport-webrtc` | RTC connections, bounded delivery and signaling mechanics |
+| `signals` | Replaceable, bounded ephemeral application signals |
+| `protocol`, `crypto`, `canonical` | Programs, canonical encodings, digests and cryptography |
+| `conformance` | Execution equivalence, crash/reopen and resource qualification |
 
-## Status
+`peer-generation-v1` is the immutable signed record format identifier. It does
+not select a different application runtime or public API. SQL availability is an
+explicit engine capability; participant transport and role do not alter replay.
 
-A comprehensive prototype, not a production release. Remaining work before
-production: witnessed pilot drills, hardware-backed key providers, the open
-security findings, and an external security review. See
-[implementation status](docs/implementation-status.md) and
-[upcoming work](upcoming.md).
+## Build and qualify
+
+Use Node 24 and the pinned package manager:
+
+```sh
+corepack pnpm install --frozen-lockfile
+corepack pnpm lint
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm docs:check
+```
+
+Package the supported composition from clean source:
+
+```sh
+node tools/package-peer-session.mjs
+node tools/package-peer-session.mjs --native-rtc --output artifacts/peer-session-rtc
+node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
+node tools/package-peer-generation-control.mjs
+```
+
+Archives include self-contained declarations, shared ESM chunks and exact source,
+tree, input and artifact hashes. Native SQL packaging requires the exact patched
+engine. The default browser/native session archive remains SQL-free. A development
+archive requires explicit `--allow-dirty` and records that fact.
+
+The [independent Tendriller recipes](https://github.com/werg/tendriller-contrib/tree/refactor/owned-peer-data-plane/cookbooks/run-a-peer-application)
+consume these packages and qualify conversation, guarded tasks, native RTC,
+browser ownership and actual hosted control/publication. CI pins exact consumer
+commits. Loopback and local Worker results do not establish Internet reachability,
+TURN behavior, browser suspension, or provider cost savings.
+
+Read the [architecture](docs/peer-generation-v1.md), [SQL contract](docs/implementation-specs/10-deterministic-sql-transactions.md)
+and [qualification guide](docs/release-hardening.md) for the trust and operating
+limits. There is no mandatory permanent resident or hosted command executor.

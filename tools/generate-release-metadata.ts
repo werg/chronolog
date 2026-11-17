@@ -42,7 +42,7 @@ const sbom = {
   components,
 }
 
-const subjects = await collectSubjects(['dist', 'patches', 'artifacts/distribution'])
+const subjects = await collectSubjects(['dist', 'patches', 'artifacts/peer-session', 'artifacts/peer-generation-control', 'artifacts/signals'])
 const provenance = {
   _type: 'https://in-toto.io/Statement/v1',
   subject: subjects.map((subject) => ({
@@ -88,7 +88,7 @@ process.stdout.write(`${JSON.stringify({
 
 async function collectComponents(): Promise<readonly Component[]> {
   const byRef = new Map<string, Component>()
-  for (const directory of ['apps', 'packages']) {
+  for (const directory of ['packages']) {
     for (const entry of await readdir(resolve(root, directory), { withFileTypes: true })) {
       if (!entry.isDirectory()) continue
       let source: string
