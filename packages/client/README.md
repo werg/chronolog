@@ -1,6 +1,6 @@
 # Chronolog client
 
-`ChronologClient` provides SQL, transaction outcomes, live resources, ownership
+`ChronologClient` provides SQL, durable events, live signals, transaction outcomes, ownership
 operations and reader/writer enrollment over the shared
 [replica RPC contract](../rpc/README.md). The same client talks to an embedded
 node, a native daemon, or a browser Worker running a local replica.
@@ -36,13 +36,17 @@ The Worker owns its signer, durable records, control state and SQL engine. The
 client forwards calls to that local replica; the browser runtime handles peer
 synchronization and history verification.
 
-## Send live signals
+## Send and observe live signals
+
+`client.signals` implements the portable `Signals` contract from
+`@chronolog/signals`. A governed peer supplies it automatically through the same
+local RPC and Worker bridge used by the rest of the client:
 
 ```ts
-await client.signals.send('typing', { active: true }, { ttlMs: 2_500 })
+await client.signals.send('typing', { active: true }, { ttlMs: 2500 })
 
 for await (const message of client.signals.subscribe({
-  topics: ['typing'], mode: 'latest', signal,
+  topics: ['typing'], mode: 'latest', signal: pageLifetime.signal,
 })) {
   // Keep independent authors/sessions separate and expire rendered state.
   showTyping(message.authorId, message.sessionId, message.payload, message.expiresAtMs)
@@ -51,17 +55,31 @@ for await (const message of client.signals.subscribe({
 
 Signals are best-effort live messages, separate from retained events and atomic
 programs. `send()` has no operation ID and never waits for finality; it confirms
-local dispatch only. `subscribe()` defaults to `mode: 'all'`, preserving accepted
-unexpired messages in a bounded FIFO; overflow fails that subscription explicitly.
-Choose `latest` for replaceable values. The client does not retry sends or silently
-reconnect a subscription: reconnect and send fresh state deliberately.
+local dispatch only. The peer signs each signal, checks the current writer's
+topic rights, and routes it through authenticated reader connections. Public
+`scope`, `authorId` and `sessionId` values are strings. Signed expiry remains
+unchanged across relay hops. Expired updates are discarded.
 
-Governed browser peers and the native daemon supply this interface directly.
-Subscribers need no writer grant; publication requires a current signal topic
-right. A signal-only writer grant need not permit SQL or durable events. Without
-an attached live route, sending fails immediately rather than saving an outbox.
+`subscribe()` defaults to `mode: 'all'`, preserving accepted unexpired messages
+in a bounded FIFO; overflow fails that subscription explicitly. `latest`
+coalesces queued updates by author, session and topic, retaining the newest
+sequence for each key. Subscribers need no writer grant; publication requires
+a current signal topic right. A signal-only writer grant need not permit SQL
+or durable events.
+
+Each send makes one attempt, even when the client's durable unary retries are
+enabled. A lost reply does not resend a typing or presence update. Without an
+attached live route, sending fails immediately rather than saving an outbox.
+Subscriptions have no replay cursor and surface RPC stream failures; a new
+subscription observes new live traffic. A retained local subscription can
+observe future traffic after peer routes reconnect. The Worker pulls only when
+the page advances its iterator and forwards cancellation. Closing the client
+cancels its live sends and streams. Durable application events use
+`client.events` and stable operation identities.
+
 For standalone use without any Chronolog database, use
 [`SignalChannel`](../signals/README.md) with your own transport and authorization.
+
 
 ## Submit SQL and wait for the result you need
 

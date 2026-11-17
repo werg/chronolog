@@ -281,11 +281,11 @@ export async function createThinMembershipNative(options: {
         store, transport, activeMembership: () => governed!.activeSnapshot,
         ...(options.clock === undefined ? {} : { finalityClock: () => options.clock!.now() }),
         peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
-      if (agent.finality === null) throw new Error('THIN_NATIVE_AUTHORITY_REQUIRED')
+      if (agent.finality === null) throw new Error('THIN_NATIVE_FINALITY_REQUIRED')
       membershipHandler = createMembershipLedgerHandler({ finality: agent.finality, descriptor: governed.descriptor, sink: transport })
       void agent.run().catch((error: unknown) => { retainFailure(error, 'agent') })
       client = new ChronologClient({ groupId: bytesToBase64Url(genesis.manifest.groupId),
-        transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node })), unaryRetryAttempts: 1 })
+        transport: new InProcessRpcTransport(new NodeRpcService({ node: governed.node, signals: agent.context.signals })), unaryRetryAttempts: 1 })
       return bootstrap()
     },
     async publishWorkload(input: { readonly count: number; readonly payloadBytes: number; readonly namespace: string }) {

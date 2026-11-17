@@ -60,8 +60,10 @@
     "@chronolog/rpc": "workspace:*",
     "@chronolog/runtime-browser": "workspace:*",
     "@chronolog/runtime-workerd": "workspace:*",
+    "@chronolog/signals": "workspace:*",
     "@chronolog/transport-ssb": "workspace:*",
     "@chronolog/transport-tendriller": "workspace:*",
+    "@chronolog/transport-webrtc": "workspace:*",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "1.65.0",
     "@tendriller/core": "file:./test/artifacts/tendriller-sdk-534e044c.tgz",
@@ -78,9 +80,7 @@
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.64.0",
     "vitest": "^3.2.4",
-    "ws": "8.21.0",
-    "@chronolog/transport-webrtc": "workspace:*",
-    "@chronolog/signals": "workspace:*"
+    "ws": "8.21.0"
   },
   "pnpm": {
     "ignoredBuiltDependencies": [

@@ -15,7 +15,7 @@ export const MEMBERSHIP_LEDGER_PATH = '/_chronolog/membership'
 export const MAX_MEMBERSHIP_PAGE_ENTRY_BYTES = 1024 * 1024
 
 /**
- * A root-signed control-plane route to the pinned native finality authority.
+ * A root-signed control-plane route to the pinned native finality service.
  * Reads contain only finalized controls and a signed cumulative completeness proof.
  * Appends accept only complete inline governance records; application descriptors and
  * detached payloads stay with the native peer.

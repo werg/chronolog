@@ -65,6 +65,7 @@ export interface SubmitSignedRequest {
 }
 export interface EventReadRequest extends EventReadOptions { readonly groupId: GroupId; readonly requestId: RequestId }
 export type EventReadResponse = EventBatch
+/** A live publication has no durable operation identity or replay cursor. */
 export interface SendSignalRequest {
   readonly groupId: GroupId
   readonly topic: string

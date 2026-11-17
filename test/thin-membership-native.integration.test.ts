@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import { NativeAgentStore } from '@chronolog/agent-service'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
 import { encodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
@@ -138,6 +139,9 @@ describe('thin membership qualification native boundary', () => {
         rootAdministrator: provisioned.descriptor.genesis.manifest.schemaAdminPublicKey })) })
     cleanup.push(() => replica.close())
     await replica.start()
+    const peerService = await createGovernedPeerService({ identity: device.signing, groupId: replica.descriptor.history.groupId,
+      activeMembership: () => replica.activeSnapshot, local: transport.asLink(), attach: link => transport.connect(link) })
+    cleanup.push(() => peerService.close())
     let session: Awaited<ReturnType<typeof attachMembershipPeer>> | undefined
     cleanup.push(() => session?.close())
     const enrollment = createEnrollmentService({ descriptor: replica.descriptor, store: deviceStore, identity: device.signing,
@@ -181,8 +185,7 @@ describe('thin membership qualification native boundary', () => {
         createPeerConnection: configuration => createNativePeerConnection(configuration,
           { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }) })
       observe(`${label}: authenticate peer`)
-      session = await attachMembershipPeer({ connection, nativeIdentity: bootstrap.nativeIdentity, identity: device, transport,
-        activeMembership: () => replica.activeSnapshot })
+      session = await attachMembershipPeer({ connection, nativeIdentity: bootstrap.nativeIdentity, peer: peerService })
       observe(`${label}: retained feed catch-up`)
       await transport.catchUp()
       observe(`${label}: local replay`)

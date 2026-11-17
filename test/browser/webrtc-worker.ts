@@ -1,9 +1,9 @@
 import { sha256 } from '@chronolog/canonical'
-import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
-import { decodeSignedGenesis, isCapabilityActive } from '@chronolog/capabilities'
+import type { GovernedPeerSession } from '@chronolog/agent-service/governed-peer'
+import { decodeSignedGenesis } from '@chronolog/capabilities'
 import { ChronologClient } from '@chronolog/client'
 import type { EnrollmentIdentity } from '@chronolog/node-core/browser'
-import { base64UrlToBytes, bytesToBase64Url, bytesToHex, equalBytes } from '@chronolog/protocol'
+import { base64UrlToBytes, bytesToBase64Url, bytesToHex } from '@chronolog/protocol'
 import { feedIdFromPublicKey } from '@chronolog/records'
 import { openBrowserEventPeer, prepareBrowserIdentity, type BrowserEventPeer } from '@chronolog/runtime-browser/events'
 import { frameRtcDataChannel, type DataChannelConnection } from '@chronolog/transport-webrtc'
@@ -11,9 +11,10 @@ import { frameRtcDataChannel, type DataChannelConnection } from '@chronolog/tran
 import type { BrowserEventBootstrap } from './event-contract.js'
 
 let peer: BrowserEventPeer | undefined, identity: EnrollmentIdentity | undefined, client: ChronologClient | undefined
-let channel: DataChannelConnection | undefined, session: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined
-let detach: (() => void) | undefined, completionError: string | undefined
+let channel: DataChannelConnection | undefined, session: GovernedPeerSession | undefined
+let completionError: string | undefined
 let generation = 0
+let nativeIdentity: Uint8Array | undefined
 let attachmentId: number | undefined
 
 async function disconnect(expected?: number): Promise<void> {
@@ -21,7 +22,6 @@ async function disconnect(expected?: number): Promise<void> {
   generation++
   const active = session, framed = channel, previousId = attachmentId
   session = undefined; channel = undefined; attachmentId = undefined
-  detach?.(); detach = undefined
   if (previousId !== undefined) endpoint.postMessage({ kind: 'peer-ended', attachmentId: previousId })
   await Promise.all([active?.close(), framed?.close()])
 }
@@ -39,6 +39,7 @@ endpoint.addEventListener('message', event => {
       }
       case 'open': {
         const bootstrap = request.bootstrap!, genesis = decodeSignedGenesis(base64UrlToBytes(bootstrap.genesis))
+        nativeIdentity = base64UrlToBytes(bootstrap.nativeIdentity)
         peer = await openBrowserEventPeer({ name: request.name!, configure(context) {
           identity = context.identity
           return { governed: { genesis, groupRoute: base64UrlToBytes(bootstrap.groupRoute),
@@ -55,22 +56,10 @@ endpoint.addEventListener('message', event => {
         channel = framed; attachmentId = request.attachmentId; completionError = undefined
         try {
           await framed.ready
-          const snapshot = peer!.governed!.activeSnapshot
-          const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
-            equalBytes(capability.grant.signingPublicKey, identity!.signing.publicKeyBytes) && isCapabilityActive(capability, snapshot.revision))
-          if (reader === undefined) throw new Error('WEBRTC_BROWSER_READER_MISSING')
-          const authenticated = await openAuthenticatedPeerLink({ connection: framed, local: peer!.transport.asLink(), groupId: snapshot.groupId,
-            identity: identity!.signing, grantId: reader.id, authorizePeer: ({ authorId, grantId }) => {
-              const current = peer!.governed!.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
-              return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
-                equalBytes(capability.grant.signingPublicKey, authorId)
-            } })
+          const authenticated = await peer!.connectPeer({ connection: framed, peerIdentity: nativeIdentity! })
           if (currentGeneration !== generation) { await authenticated.close(); throw new Error('WEBRTC_ATTACHMENT_SUPERSEDED') }
           session = authenticated
-          const disconnectFeed = peer!.transport.connect(authenticated.link)
-          detach = disconnectFeed
           void authenticated.completion.catch((error: unknown) => { if (session === authenticated) completionError = String(error) }).finally(() => {
-            disconnectFeed()
             if (session === authenticated) {
               session = undefined; channel = undefined; attachmentId = undefined
               endpoint.postMessage({ kind: 'peer-ended', attachmentId: request.attachmentId, error: completionError })
@@ -90,7 +79,7 @@ endpoint.addEventListener('message', event => {
         finally { handle.dispose() }
       }
       case 'payload': {
-        const bytes = await session!.link.readPayload(request.hash!)
+        const bytes = await peer!.transport.getPayload(request.hash!)
         if (bytes === null) throw new Error('WEBRTC_PAYLOAD_MISSING')
         return { bytes: bytes.length, sha256: bytesToHex(await sha256(bytes)) }
       }

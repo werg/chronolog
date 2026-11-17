@@ -38,7 +38,8 @@ export async function createNativeBrowserFixture(options: {
   const store = new NativeAgentStore(join(options.directory, 'agent.sqlite'))
   const control = new NodeStateDatabase(join(options.directory, 'control.sqlite'))
   const identity = await loadOrCreateEnrollmentIdentity(store, 'browser-fixture-native')
-  const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
+  const feedStore = await DurableFeedStore.open(store, webFeedCrypto)
+  const transport = new PortableFeedTransport({ store: feedStore, crypto: webFeedCrypto,
     signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey) })
   const executionManifest = options.manifest ?? await eventExecutionManifest()
   const { executionManifestDigest } = await executionManifestArtifacts(executionManifest)
@@ -148,7 +149,7 @@ export async function createNativeBrowserFixture(options: {
     epochContentKey: bytesToBase64Url(epochContentKey), executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
     nativeIdentity: bytesToBase64Url(identity.signing.publicKeyBytes), peerUrl: `http://127.0.0.1:${address.port}/peer`, peerToken: token }
   let closed = false
-  return { bootstrap, node: governed.node, governed, client, store, identity, agent, transport,
+  return { bootstrap, node: governed.node, governed, client, store, feedStore, identity, agent, transport,
     assertHealthy() {
       if (serviceFailure !== undefined) throw serviceFailure
       if (failures.length > 0) throw new Error(`BROWSER_PEER_SESSION_FAILED: ${failures.join('; ')}`)

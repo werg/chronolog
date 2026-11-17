@@ -185,6 +185,9 @@ importers:
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
+      '@chronolog/capabilities':
+        specifier: workspace:*
+        version: link:../capabilities
       '@chronolog/node-core':
         specifier: workspace:*
         version: link:../node-core
@@ -408,9 +411,6 @@ importers:
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
-      '@chronolog/capabilities':
-        specifier: workspace:*
-        version: link:../capabilities
       '@chronolog/control-store':
         specifier: workspace:*
         version: link:../control-store

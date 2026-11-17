@@ -5,7 +5,7 @@ import type { ApplicationOperation } from '@tendriller/core/application'
 import type { RtcDataChannel, WebRtcSession } from '@chronolog/transport-webrtc'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from '../browser/event-contract.js'
 
-export type PilotPeerBootstrap = Omit<BrowserEventBootstrap, 'peerUrl' | 'peerToken' | 'connection'>
+export type PilotPeerBootstrap = Omit<BrowserEventBootstrap, 'peerUrl' | 'peerToken'>
 export interface PilotBootstrap {
   readonly peer: PilotPeerBootstrap
   readonly teamId: string

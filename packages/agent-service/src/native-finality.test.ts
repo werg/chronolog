@@ -88,6 +88,31 @@ describe('native signed-inclusion finality service', () => {
     expect(f.values.size).toBe(0)
   })
 
+  it.each([
+    { cutoffLagMs: 0n, maxFutureSkewMs: 0n, heartbeatIntervalMs: 60_001n },
+    { cutoffLagMs: BigInt(Number.MAX_SAFE_INTEGER), maxFutureSkewMs: 1n, heartbeatIntervalMs: 1_000n },
+  ])('refuses an unsupported signed clock without initializing storage, case %#', async (clockPolicy) => {
+    const f = await metadataFixture(), descriptor = (await credentials({ clockPolicy, identity: f.identity })).descriptor
+    await expect(NativeFinalityService.open({ ...f, descriptor })).rejects.toThrow('FINALITY_CLOCK_POLICY_INVALID')
+    expect(f.values.size).toBe(0)
+  })
+
+  it('owns the verified descriptor snapshot and refuses later clock changes on the same lineage', async () => {
+    const f = await metadataFixture()
+    const input = structuredClone(f.descriptor)
+    const opening = NativeFinalityService.open({ ...f, descriptor: input })
+    input.history.genesisDigest.fill(9)
+    Object.assign(input.genesis.manifest.clockPolicy, { cutoffLagMs: 9_000n })
+    const finality = await opening
+    await finality.append(envelope('immutable signed timing'))
+    await finality.certify()
+    expect((await evaluateFinalitySnapshot(f.configuration, (await finality.read()).entries)).closedThroughMs).toBe(1_000n)
+    const changed = await credentials({ clockPolicy: { cutoffLagMs: 250n, maxFutureSkewMs: 31_000n, heartbeatIntervalMs: 1_000n }, identity: f.identity })
+    const before = structuredClone(f.values)
+    await expect(NativeFinalityService.open({ ...f, descriptor: changed.descriptor })).rejects.toThrow('AUTHORITY_CONFIGURATION_MISMATCH')
+    expect(f.values).toEqual(before)
+  })
+
   it('certifies only small descriptors while retaining exact detached payloads before commitment', async () => {
     const f = await fixture(), authority = await NativeFinalityService.open(f)
     const payload = envelope('large-content'.repeat(40_000)), entry = await authority.append(payload)
@@ -233,23 +258,25 @@ describe('native signed-inclusion finality service', () => {
       .rejects.toThrow('AUTHORITY_CONTINUITY_NOT_ESTABLISHED')
   })
 
-  it.each(['before-log', 'after-log', 'before-configuration', 'after-configuration'] as const)(
-    'initializes the empty log before configuration and recovers interruption %s', async (boundary) => {
+  it.each(['before-log', 'after-log', 'before-payload-index', 'after-payload-index', 'before-configuration', 'after-configuration'] as const)(
+    'initializes the empty log and payload index before configuration and recovers interruption %s', async (boundary) => {
       const f = await metadataFixture(), writes: string[] = []
       const store: DurableOperationStore = {
         get: (key) => f.store.get(key),
         put: async (key, bytes) => {
           writes.push(key)
-          const target = boundary.endsWith('log') ? f.logKey : f.configurationKey
+          const target = boundary.endsWith('log') ? f.logKey : boundary.endsWith('payload-index') ? f.payloadIndexKey : f.configurationKey
           if (key === target && boundary.startsWith('before-')) throw new Error('setup interrupted')
           await f.store.put(key, bytes)
           if (key === target && boundary.startsWith('after-')) throw new Error('setup interrupted')
         },
       }
       await expect(NativeFinalityService.open({ ...f, store })).rejects.toThrow('setup interrupted')
-      expect(writes).toEqual(boundary.endsWith('log') ? [f.logKey] : [f.logKey, f.payloadIndexKey, f.configurationKey])
+      expect(writes).toEqual(boundary.endsWith('log') ? [f.logKey] : boundary.endsWith('payload-index')
+        ? [f.logKey, f.payloadIndexKey] : [f.logKey, f.payloadIndexKey, f.configurationKey])
       expect(f.values.has(f.configurationKey)).toBe(boundary === 'after-configuration')
       expect(f.values.has(f.logKey)).toBe(boundary !== 'before-log')
+      expect(f.values.has(f.payloadIndexKey)).toBe(['after-payload-index', 'before-configuration', 'after-configuration'].includes(boundary))
       const recovered = await NativeFinalityService.open(f)
       expect((await recovered.head()).position).toBe(0)
       expect((await recovered.append(envelope('one'))).position).toBe(1)

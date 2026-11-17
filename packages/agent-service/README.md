@@ -81,8 +81,8 @@ their original receipt. Prefix certificates remain outside the log they certify.
 
 `serve(transport)` includes retained local records before its first new closure,
 then follows durable submissions and advances the frontier on the
-signed `heartbeatIntervalMs` timer even while the application is quiet. `now` is
-injectable for deterministic fixtures. Timing has one source: the authenticated
+signed `heartbeatIntervalMs` timer while admissible proposals still need closure.
+`now` is injectable for deterministic fixtures; it never changes the signed policy. Timing has one source: the authenticated
 genesis. There are no independently configurable service timing defaults.
 Retained exact retries do not trigger extra closures.
 
@@ -359,9 +359,13 @@ they do not append another record or create a separate payload history.
 The native `FeedTransport` exports `asLink()`, `connectLink()`,
 `disconnectLink()`, and `catchUpLinks()`. Its native SSB adapter and framed
 connections share the same signed record store. The portable browser transport
-uses `asLink()` and `connect()`. The daemon module context's `connectPeer()`
-performs active reader authorization and attaches a framed session to the native
-transport. `connect()` and `connectLink()` return a detach function bound to that
+uses `asLink()` and `connect()`. The daemon module context exposes `signals` on every governed replica and
+`finality` only when it owns the signed native provider.
+`connectPeer({ connection, peerIdentity? })` performs active reader authorization,
+attaches replication and live signal routes, and returns a session with an
+`AbortSignal`, `completion` and `close()`. No writer grant or callback injection is
+needed to receive signals. Sending selects the currently active writer credential
+for that topic at the time of publication. `connect()` and `connectLink()` return a detach function bound to that
 connection. Session owners use it on completion or close: delayed cleanup from an
 old route cannot remove a replacement connection for the same identity. The
 explicit `disconnect(identity)` / `disconnectLink(identity)` methods deliberately
@@ -371,7 +375,7 @@ Peer frames use canonical CBOR with domain `chronolog/peer/v1`; ephemeral frames
 use `chronolog/signal/v1`. The session multiplexes bounded range responses,
 content-addressed payload responses, change hints, and best-effort signals. Signals
 cannot hold up retained range handling. At most eight signal callbacks run per
-connection; overload drops incoming signals before application acceptance. There are at most four pending requests in either direction and each
+connection; exceeding this bound fails the session before application acceptance. There are at most four pending requests in either direction and each
 range is bounded to 64 records / 64 MiB. The event program limit normally makes
 actual batches considerably smaller. Connections require deployment measurement
 before making direct-connect, relay-bandwidth, or cost claims.

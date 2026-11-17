@@ -10,6 +10,27 @@ readers, forwards durable publication to the node, and reports outcomes and
 enrollment progress. Signed consensus records and history-policy evidence use
 their own canonical codecs in `@chronolog/protocol` and `@chronolog/node-core`.
 
+## Live signals
+
+`NodeRpcService({ node, signals })` exposes an injected portable `Signals` port.
+Governed native and browser peers wire their owned signal service automatically.
+RPC checks the selected group and forwards the caller's cancellation; it does
+not author another signal identity, persist an outbox or choose a relay policy.
+Closing RPC cancels its live work while the owning peer controls the channel's
+lifetime.
+
+| Method | Behavior |
+| --- | --- |
+| `signals.send` | Sends one topic/payload with optional `ttlMs`, returning its signed signal's public fields. The client makes one attempt. |
+| `signals.subscribe` | Streams future live signals with optional topics and `mode: 'all' \| 'latest'`. There is no resume or replay cursor. |
+
+Both methods run through in-process, HTTP and the existing pull-based Worker
+transport. Signal identities use string `scope`, `authorId` and `sessionId`;
+payloads are JSON values. Authorization, expiry, duplicate suppression, bounded
+queues and unchanged-byte forwarding belong to the peer's signal service. A
+subscription failure is visible to the caller; reconnecting durable event
+streams does not reconnect live signal subscriptions.
+
 ## Transports
 
 - `InProcessRpcTransport` runs the service in the same process with copied

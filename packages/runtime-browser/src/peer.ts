@@ -1,6 +1,6 @@
-import { ControlStore } from '@chronolog/control-store/browser'
-import { createCapabilitySignals } from '@chronolog/capabilities'
+import { createGovernedPeerService, type GovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import type { SignalChannel } from '@chronolog/signals'
+import { ControlStore } from '@chronolog/control-store/browser'
 import {
   DeterministicMaterializer, createDoltLiteMaterializationRuntime,
   type MaterializerOptions,
@@ -21,7 +21,6 @@ import { acquireBrowserStorage } from './opfs.js'
 import { loadBrowserEngine, type LoadedBrowserEngine } from './load-engine.js'
 import { createWasmEngineFactory, type OpfsSqlitePool } from './wasm-engine.js'
 import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'
-import { browserPeerConnections, type BrowserPeerConnection, type BrowserPeerConnectionOptions } from './peer-connections.js'
 
 export interface BrowserPeerContext {
   /** Private keys stay in the owner Worker and its private OPFS store. */
@@ -32,8 +31,6 @@ export interface BrowserPeerContext {
 }
 
 interface BrowserPeerConfigurationBase {
-  /** Custom live messaging policy for a low-level composition. Governed peers configure this automatically. */
-  readonly signals?: SignalChannel
   readonly materializer: Pick<MaterializerOptions, 'executionManifest' | 'rootAdministrator'> &
     Pick<Partial<MaterializerOptions>, 'checkpointEvery' | 'forkSeeding' | 'publicationFaultInjector'>
   /** Optional connection adapter wraps the same durable local signed feed. */
@@ -47,20 +44,21 @@ export type BrowserPeerConfiguration = BrowserPeerConfigurationBase & ({
   /** Production composition: one signed group descriptor selects governance and finality. */
   readonly governed: Omit<GovernedNodeOptions, 'identity' | 'transport' | 'operationStore' | 'controlStore' | 'materialization' | 'recipient'>
   readonly node?: never
+  readonly signals?: never
 } | {
   /** Low-level composition for applications with their own membership resolver. */
   readonly node: Omit<ChronologNodeOptions, 'identity' | 'transport' | 'operationStore' | 'controlStore' | 'materialization'>
   readonly governed?: never
+  /** Explicit live policy for a custom node; its routes remain explicitly configured. */
+  readonly signals?: SignalChannel
 })
 
-export interface BrowserPeer {
+export interface BrowserPeer extends Pick<GovernedPeerService, 'signals' | 'connectPeer'> {
   readonly node: ChronologNode
   readonly transport: PortableFeedTransport
   readonly materializer: DeterministicMaterializer
   readonly governed?: Awaited<ReturnType<typeof createGovernedNode>>
   readonly rpc: InProcessRpcTransport
-  readonly signals?: SignalChannel
-  connectPeer(options: BrowserPeerConnectionOptions): Promise<BrowserPeerConnection>
   close(): Promise<void>
 }
 
@@ -83,15 +81,17 @@ export async function openBrowserPeer(options: {
   let control: BrowserControlPersistence | undefined
   let node: ChronologNode | undefined
   let governed: Awaited<ReturnType<typeof createGovernedNode>> | undefined
+  let peers: GovernedPeerService | undefined
+  let customSignals: SignalChannel | undefined
   let configuration: BrowserPeerConfiguration | undefined
   let sqlStorage: OpfsSqlitePool | undefined
-  let signals: SignalChannel | undefined
-  let connections: ReturnType<typeof browserPeerConnections> | undefined
   try {
     const { identity, records } = await openBrowserDeviceRecords(storage.bytes, options.createIdentity)
     transport = new PortableFeedTransport({ store: records, signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey), crypto: webFeedCrypto })
     const engine = await loadBrowserEngine(options.engineUrl)
     configuration = await options.configure({ identity, operations: storage.bytes, transport, engine })
+    customSignals = configuration.signals
+    if (configuration.governed !== undefined && customSignals !== undefined) throw new Error('SIGNAL_GOVERNANCE_CONFIGURATION_CONFLICT')
     const directory = `/chronolog-${options.name}`
     if (engine.module.installOpfsSAHPoolVfs === undefined) throw new Error('BROWSER_SQLITE_OPFS_POOL_UNAVAILABLE')
     sqlStorage = await engine.module.installOpfsSAHPoolVfs({
@@ -119,6 +119,8 @@ export async function openBrowserPeer(options: {
     await configuration.start?.()
     if (governed === undefined) await node.start()
     else await governed.start()
+    if (governed !== undefined) peers = await createGovernedPeerService({ identity: identity.signing, groupId: node.groupId,
+      activeMembership: () => governed!.activeSnapshot, local: transport.asLink(), attach: link => transport!.connect(link) })
     const enrollment = governed === undefined ? undefined : createEnrollmentService({
       descriptor: governed.descriptor, store: storage.bytes, identity: identity.signing,
       readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: owned.transport.identity,
@@ -131,31 +133,37 @@ export async function openBrowserPeer(options: {
       executionManifestDigest: node.executionManifestDigest,
       isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
     })
-    signals = configuration.signals ?? (governed === undefined ? undefined : createCapabilitySignals({
-      groupId: node.groupId, identity: identity.signing, current: () => governed!.activeSnapshot,
-    }))
-    connections = browserPeerConnections({ identity: identity.signing, groupId: node.groupId, transport,
-      ...(governed === undefined ? {} : { current: () => governed!.activeSnapshot }), ...(signals === undefined ? {} : { signals }) })
     const rpc = new InProcessRpcTransport(new NodeRpcService({
       node, ...(enrollment === undefined ? {} : { enrollment }),
-      ...(signals === undefined ? {} : { signals }),
+      ...(peers === undefined ? customSignals === undefined ? {} : { signals: customSignals } : { signals: peers.signals }),
       ...(configuration.governanceAdmin === undefined ? {} : { governanceAdmin: configuration.governanceAdmin }),
     }))
     let closed = false
     return {
       node, transport, materializer, rpc, ...(governed === undefined ? {} : { governed }),
-      ...(signals === undefined ? {} : { signals }), connectPeer: (input) => connections!.connectPeer(input),
+      /** Convenience routing requires the configured governance controller. */
+      get signals() { const configured = peers?.signals ?? customSignals; if (configured === undefined) throw new Error('PEER_GOVERNANCE_REQUIRED'); return configured },
+      async connectPeer(input) {
+        if (peers === undefined) { await input.connection.close(); throw new Error('PEER_GOVERNANCE_REQUIRED') }
+        return peers.connectPeer(input)
+      },
       async close() {
         if (closed) return
         closed = true
-        signals?.close(); await connections!.close()
-        await rpc.close()
-        try { await configuration!.close?.(); if (governed === undefined) await node!.close(); else await governed.close() }
-        finally { try { control!.close(); sqlStorage!.pauseVfs() } finally { await storage.close() } }
+        customSignals?.close()
+        try { await rpc.close() }
+        finally {
+          await peers?.close()
+          try {
+            try { await configuration!.close?.() }
+            finally { if (governed === undefined) await node!.close(); else await governed.close() }
+          } finally { try { control!.close(); sqlStorage!.pauseVfs() } finally { await storage.close() } }
+        }
       },
     }
   } catch (error) {
-    signals?.close(); await connections?.close()
+    customSignals?.close()
+    try { await peers?.close() } catch { /* Keep the startup error. */ }
     try { await configuration?.close?.() } catch { /* Keep the startup error. */ }
     if (governed !== undefined) { try { await governed.close() } catch { /* Keep the startup error. */ } }
     else if (node !== undefined) { try { await node.close() } catch { /* Keep the startup error. */ } }

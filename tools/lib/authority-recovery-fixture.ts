@@ -128,6 +128,7 @@ export async function openAuthorityRecoveryFixture(directory: string, options: {
     agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing,
       descriptor: governed.descriptor, store: authorityStore, transport,
       activeMembership: () => governed!.activeSnapshot,
+      peerLinks: { local: transport.asLink(), attach: (link) => transport!.connect(link) },
       finalityClock: () => clockNow,
       ...(options.continuity === undefined ? {} : { continuity: options.continuity }) })
     assert(agent.finality !== null)

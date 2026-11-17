@@ -1,4 +1,3 @@
-import type { Signals, SignalPayload, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
 import {
   base64UrlToBytes,
   bytesToBase64Url as toBase64Url,
@@ -52,6 +51,7 @@ import {
   type OpenReadViewResponse,
   type SubmitChangeResponse,
 } from '@chronolog/rpc'
+import type { EphemeralSignal, SignalPayload, Signals, SignalSendOptions, SignalSubscribeOptions } from '@chronolog/signals'
 
 import {
   decodeLocalSqlResult,
@@ -228,33 +228,11 @@ export class ChronologClient {
   /** Sharing, teams and transfers of owned rows; each call submits one transaction. */
   readonly ownership: OwnershipActions = new OwnershipActions(this)
   readonly enrollment: EnrollmentActions = new EnrollmentActions(this)
-  /** Best-effort live messages: no operation IDs, automatic resend or reconnect replay. */
+  /** One live send attempt; a failed RPC stream is never resumed automatically. */
   readonly signals: Signals = {
-    send: (topic: string, payload: SignalPayload, options: SignalSendOptions = {}) => {
-      const signal = AbortSignal.any([this.#abort.signal, ...(options.signal === undefined ? [] : [options.signal])])
-      return this.#transport.unary('signals.send', { groupId: this.groupId, topic, payload,
-        ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }) }, this.#callOptions(signal))
-    },
-    subscribe: (options: SignalSubscribeOptions = {}) => {
-      const self = this
-      return {
-        [Symbol.asyncIterator]() {
-          const controller = new AbortController()
-          const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(options.signal === undefined ? [] : [options.signal])])
-          const iterator = self.#transport.stream('signals.subscribe', { groupId: self.groupId,
-            ...(options.topics === undefined ? {} : { topics: options.topics }),
-            ...(options.mode === undefined ? {} : { mode: options.mode }) }, self.#callOptions(signal))[Symbol.asyncIterator]()
-          return {
-            async next() {
-              try { return await iterator.next() }
-              catch (error) { if (controller.signal.aborted) return { done: true as const, value: undefined }; throw error }
-            },
-            async return() { controller.abort(); await iterator.return?.(); return { done: true as const, value: undefined } },
-            async throw(error: unknown) { controller.abort(error); await iterator.return?.(); throw error },
-          }
-        },
-      }
-    },
+    send: (topic, payload, options) => this.#sendSignal(topic, payload, options),
+    subscribe: options => this.#liveSignals(options),
+
   }
   /** At-least-once final batches; never coalesced into snapshot notifications. */
   readonly events = {
@@ -514,6 +492,58 @@ export class ChronologClient {
         // Only the next pull advances received progress. Durable processing is
         // the consumer's state/cursor commit, never this in-memory variable.
         cursor = batch.scannedThrough
+      }
+    } }
+  }
+
+  async #sendSignal(topic: string, payload: SignalPayload, options: SignalSendOptions = {}): Promise<EphemeralSignal> {
+    if (this.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
+    const signal = options.signal === undefined ? this.#abort.signal : AbortSignal.any([this.#abort.signal, options.signal])
+    signal.throwIfAborted()
+    // A lost reply must not repeat transient intent or extend its signed expiry.
+    return this.#transport.unary('signals.send', {
+      groupId: this.groupId, topic, payload,
+      ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+    }, this.#callOptions(signal))
+  }
+
+  #liveSignals(options: SignalSubscribeOptions = {}): AsyncIterable<EphemeralSignal> {
+    const request = { groupId: this.groupId,
+      ...(options.topics === undefined ? {} : { topics: [...options.topics] }),
+      ...(options.mode === undefined ? {} : { mode: options.mode }),
+    }
+    const externalSignal = options.signal
+    const self = this
+    return { [Symbol.asyncIterator]() {
+      if (self.#closed) throw new ChronologRpcError('transport_unavailable', 'Client is closed')
+      const controller = new AbortController()
+      const signal = AbortSignal.any([controller.signal, self.#abort.signal, ...(externalSignal === undefined ? [] : [externalSignal])])
+      signal.throwIfAborted()
+      // No cursor, persisted outbox or automatic reconnection for live signals.
+      const iterator = self.#transport.stream('signals.subscribe', request, self.#callOptions(signal))[Symbol.asyncIterator]()
+      return {
+        async next() {
+          try {
+            const next = await iterator.next()
+            if (next.done) controller.abort()
+            return next
+          } catch (error) {
+            if (controller.signal.aborted) return { done: true as const, value: undefined }
+            controller.abort(error)
+            throw error
+          }
+        },
+        async return() {
+          // Abort before awaiting return: an in-flight pull must be released too.
+          controller.abort()
+          await iterator.return?.()
+          return { done: true as const, value: undefined }
+        },
+        async throw(error: unknown) {
+          controller.abort(error)
+          await iterator.return?.()
+          throw error
+        },
       }
     } }
   }

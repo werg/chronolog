@@ -1,6 +1,6 @@
-import { ControlStore } from '@chronolog/control-store/browser'
-import { createCapabilitySignals } from '@chronolog/capabilities'
+import { createGovernedPeerService, type GovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import type { SignalChannel } from '@chronolog/signals'
+import { ControlStore } from '@chronolog/control-store/browser'
 import { createEventMaterializationRuntime, type ChronologMaterializationRuntime } from '@chronolog/materializer'
 import {
   ChronologNode, createGovernedNode, createEnrollmentService,
@@ -12,7 +12,6 @@ import { acquireBrowserStorage } from './opfs.js'
 import { openBrowserDeviceRecords } from './device-records.js'
 import { openSyncControl, type SyncControlPersistence } from './sync-control.js'
 import { serveWorkerRpc, type WorkerEndpoint } from './worker-rpc.js'
-import { browserPeerConnections, type BrowserPeerConnectionOptions } from './peer-connections.js'
 export { WorkerRpcTransport } from './worker-rpc.js'
 export { prepareBrowserIdentity } from './device-records.js'
 
@@ -23,7 +22,6 @@ export interface BrowserEventPeerContext {
   readonly executionManifestDigest: Uint8Array
 }
 interface ConfigurationBase {
-  readonly signals?: SignalChannel
   readonly transport?: ChronologTransport
   readonly governanceAdmin?: GovernanceRpcAdmin
   readonly start?: () => Promise<void>
@@ -32,9 +30,11 @@ interface ConfigurationBase {
 export type BrowserEventPeerConfiguration = ConfigurationBase & ({
   readonly governed: Omit<GovernedNodeOptions, 'identity' | 'transport' | 'operationStore' | 'controlStore' | 'materialization' | 'recipient'>
   readonly node?: never
+  readonly signals?: never
 } | {
   readonly node: Omit<ChronologNodeOptions, 'identity' | 'transport' | 'operationStore' | 'controlStore' | 'materialization'>
   readonly governed?: never
+  readonly signals?: SignalChannel
 })
 
 /** A durable browser peer whose dependency graph contains no SQL/WASM engine. */
@@ -50,10 +50,10 @@ export async function openBrowserEventPeer(options: {
   let control: SyncControlPersistence | undefined, runtime: ChronologMaterializationRuntime | undefined
   let transport: PortableFeedTransport | undefined, node: ChronologNode | undefined
   let governed: Awaited<ReturnType<typeof createGovernedNode>> | undefined
+  let peers: GovernedPeerService | undefined
+  let customSignals: SignalChannel | undefined
   let configuration: BrowserEventPeerConfiguration | undefined
   let service: NodeRpcService | undefined
-  let signals: SignalChannel | undefined
-  let connections: ReturnType<typeof browserPeerConnections> | undefined
   try {
     const { identity, records } = await openBrowserDeviceRecords(storage.bytes, options.createIdentity)
     transport = new PortableFeedTransport({ store: records,
@@ -61,6 +61,8 @@ export async function openBrowserEventPeer(options: {
     runtime = await createEventMaterializationRuntime({ store: storage.bytes, namespace: 'application',
       ...(options.maxHistoryBytes === undefined ? {} : { maxHistoryBytes: options.maxHistoryBytes }) })
     configuration = await options.configure({ identity, operations: storage.bytes, transport, executionManifestDigest: runtime.queries.executionManifestDigest })
+    customSignals = configuration.signals
+    if (configuration.governed !== undefined && customSignals !== undefined) throw new Error('SIGNAL_GOVERNANCE_CONFIGURATION_CONFLICT')
     control = await openSyncControl(storage.directory)
     const historyKind = configuration.governed?.genesis.manifest.historyPolicy?.kind ?? configuration.node?.historyPolicy?.kind ?? 'peer'
     const owned = { identity: identity.signing, transport: configuration.transport ?? transport,
@@ -72,6 +74,8 @@ export async function openBrowserEventPeer(options: {
     } else node = new ChronologNode({ ...configuration.node, ...owned })
     await configuration.start?.()
     if (governed === undefined) await node.start(); else await governed.start()
+    if (governed !== undefined) peers = await createGovernedPeerService({ identity: identity.signing, groupId: node.groupId,
+      activeMembership: () => governed!.activeSnapshot, local: transport.asLink(), attach: link => transport!.connect(link) })
     const enrollment = governed === undefined ? undefined : createEnrollmentService({
       descriptor: governed.descriptor, store: storage.bytes, identity: identity.signing,
       readerPublicKey: identity.reader.publicKeyBytes, transportAuthor: owned.transport.identity,
@@ -80,30 +84,34 @@ export async function openBrowserEventPeer(options: {
       connected: async () => { const status = await owned.transport.status(); return governed!.governance.ownsCapabilityFeed || (status.connected ?? status.peers.length > 0) },
       executionManifestDigest: node.executionManifestDigest, isFinalTargetApplied: (target) => node!.isFinalTargetApplied(target.frontier),
     })
-    signals = configuration.signals ?? (governed === undefined ? undefined : createCapabilitySignals({
-      groupId: node.groupId, identity: identity.signing, current: () => governed!.activeSnapshot,
-    }))
-    connections = browserPeerConnections({ identity: identity.signing, groupId: node.groupId, transport,
-      ...(governed === undefined ? {} : { current: () => governed!.activeSnapshot }), ...(signals === undefined ? {} : { signals }) })
-    service = new NodeRpcService({ node, ...(enrollment === undefined ? {} : { enrollment }), ...(signals === undefined ? {} : { signals }),
+    service = new NodeRpcService({ node, ...(enrollment === undefined ? {} : { enrollment }),
+      ...(peers === undefined ? customSignals === undefined ? {} : { signals: customSignals } : { signals: peers.signals }),
       ...(configuration.governanceAdmin === undefined ? {} : { governanceAdmin: configuration.governanceAdmin }) })
     const rpc = new InProcessRpcTransport(service)
     let closed = false
-    return { node, transport, rpc, ...(governed === undefined ? {} : { governed }), ...(signals === undefined ? {} : { signals }),
-      connectPeer: (input: BrowserPeerConnectionOptions) => connections!.connectPeer(input),
+    return { node, transport, rpc, ...(governed === undefined ? {} : { governed }),
+      get signals() { const configured = peers?.signals ?? customSignals; if (configured === undefined) throw new Error('PEER_GOVERNANCE_REQUIRED'); return configured },
+      async connectPeer(input: Parameters<GovernedPeerService['connectPeer']>[0]) {
+        if (peers === undefined) { await input.connection.close(); throw new Error('PEER_GOVERNANCE_REQUIRED') }
+        return peers.connectPeer(input)
+      },
       async close() {
         if (closed) return
         closed = true
-        signals?.close(); await connections!.close()
+        customSignals?.close()
         try {
-          await rpc.close()
-          try { await configuration!.close?.() }
-          finally { if (governed === undefined) await node!.close(); else await governed.close() }
+          try { await rpc.close() }
+          finally {
+            await peers?.close()
+            try { await configuration!.close?.() }
+            finally { if (governed === undefined) await node!.close(); else await governed.close() }
+          }
         } finally { try { control!.close() } finally { await storage.close() } }
       },
     }
   } catch (error) {
-    signals?.close(); await connections?.close()
+    customSignals?.close()
+    try { await peers?.close() } catch { /* Preserve the startup error. */ }
     try { await service?.close() } catch { /* Preserve the startup error. */ }
     try { await configuration?.close?.() } catch { /* Preserve the startup error. */ }
     try {

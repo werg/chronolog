@@ -336,16 +336,19 @@ read/query/enrollment/admin/local-signing routes remain protected.
 credentials and rejects redirects. The owner bearer must never be given to a
 limited publisher. Cross-origin allowlists belong to the deployment gateway.
 
-The current [`@chronolog/signals`](../../packages/signals/README.md) core is a
-standalone signed, expiring message channel with explicit application policy and
-no database prerequisite. `client.signals` and native `context.signals` are public
-surfaces; production peer attachment handles routing and resident forwarding.
-The default subscription preserves accepted messages in a bounded FIFO, with
-explicit overflow; `latest` coalesces per author/session/topic only when chosen.
-Signals never persist, advance a durable cursor, or wait for finality. The group
-adapter supplies current signal rights without imposing SQL/event rights. TTL
-starts at the call, and typing UI removes each session at its signed expiry.
-An offline receiver cannot know of revocations it has not received.
+`SignalChannel` from `@chronolog/signals` is a standalone signed, expiring
+message channel with explicit application policy and no database prerequisite.
+The governed composition selects current topic grants and owns verified relay
+routes, independently of SQL/event rights. `client.signals` crosses the ordinary
+Worker RPC boundary; native applications use `context.signals`. A page installs
+its port independently with `tendril.signals.install(client.signals)`.
+
+Bounded FIFO subscriptions expose overflow; explicit `latest` subscriptions
+coalesce replaceable values per author/session/topic. Signals have no durable
+cursor, replay or automatic send retry, and never wait for finality. Their TTL
+starts at the call; typing ends at signed expiry. An offline receiver cannot
+know of revocations it has not received. See the
+[signal contract](../../packages/signals/README.md).
 
 ## Executable public-runtime pilot
 
@@ -419,7 +422,7 @@ earlier administration/record format, not the new thin-membership gate.
 | Durable batches, empty scan progress, filter mismatch, bounded scans | [Reader tests](../../packages/node-core/src/events.test.ts), [client tests](../../packages/client/src/application.test.ts) | Full history retained; no long-history cost claim. |
 | Atomic projection/checkpoint and reducer invalidation | [Projection tests](../../packages/client/src/projections.test.ts), actual SQLite rollback/reopen, actual OPFS browser gate | Consumer must use an atomic state/cursor store. |
 | Limited publisher and anonymous HTTP boundary | Publisher tests, [HTTP tests](../../packages/rpc/src/publisher-http.test.ts) | TLS/CORS/device storage remain explicit deployment decisions. |
-| Native fencing, lost acknowledgement, quota and continuity refusal | [Authority tests](../../packages/agent-service/src/native-authority.test.ts) | Disk loss and independent backup freshness remain contrib #16. |
+| Native fencing, lost acknowledgement, quota and continuity refusal | [Authority tests](../../packages/agent-service/src/native-finality.test.ts) | Disk loss and independent backup freshness remain contrib #16. |
 | Original records/certificates across authenticated byte streams | [Link tests](../../packages/agent-service/src/peer-link.test.ts), [HTTP fixture integration](../../test/browser/event-fixture.test.ts) | No home/mobile/corporate direct byte-route claim. |
 | Final intent, uncertain effects, exact result retry and deadlines | [Worker tests](../../packages/agent-service/src/effect-worker.test.ts), daemon composition | Controlled provider fixtures cannot establish a real provider promise. |
 | Timer race, replacement generation and accepted retry after cancellation | [Scheduler tests](../../packages/agent-service/src/timers.test.ts), [real SQL integration](../../test/sql-timers.integration.test.ts) | External action cancellation remains a provider contract. |

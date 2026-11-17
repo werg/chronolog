@@ -28,8 +28,7 @@ async function connectNative(): Promise<void> {
   const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
     isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, localIdentity!.signing.publicKeyBytes))
   if (reader === undefined) return
-  const connected = await connectGovernedBrowserPeer({ bootstrap: nativeBootstrap, identity: localIdentity,
-    transport: peer.transport, activeMembership: () => peer!.governed!.activeSnapshot })
+  const connected = await connectGovernedBrowserPeer({ bootstrap: nativeBootstrap, peer })
   nativePeer = connected
   void connected.completion.finally(() => { if (nativePeer === connected) nativePeer = undefined }).catch(() => undefined)
 }

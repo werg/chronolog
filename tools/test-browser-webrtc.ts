@@ -8,9 +8,7 @@ import os, { tmpdir } from 'node:os'
 import { syncBuiltinESMExports } from 'node:module'
 import { join, resolve } from 'node:path'
 
-import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
-import { isCapabilityActive } from '@chronolog/capabilities'
-import { bytesToHex, equalBytes } from '@chronolog/protocol'
+import type { GovernedPeerSession } from '@chronolog/agent-service/governed-peer'
 import type { EventBatch } from '@chronolog/protocol'
 import type { TransactionOutcome } from '@chronolog/rpc'
 import { createWebRtcOfferHandler, WEBRTC_HTTP_LIMITS } from '@chronolog/transport-webrtc'
@@ -117,7 +115,7 @@ const context = await browser.newContext(), page = await context.newPage()
 const directory = await mkdtemp(join(tmpdir(), 'chronolog-webrtc-'))
 let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
 let nativeConnection: DataChannelConnection | undefined
-let nativeSession: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined, detach: (() => void) | undefined
+let nativeSession: GovernedPeerSession | undefined
 const errors: string[] = [], checks: Array<{ id: string; passed: boolean }> = []
 const expectedTerminations: string[] = []
 let injectingInterruption = false
@@ -136,6 +134,7 @@ try {
   const name = `rtc-${crypto.randomUUID()}`
   const identity = await page.evaluate(name => (globalThis as unknown as TestWindow).chronologWebRtcTest.prepare(name), name)
   native = await createNativeBrowserFixture({ directory, browsers: [identity], topics: ['chat'] })
+  assert.equal(await native.feedStore.putPayload(payload), payloadHash)
   await page.evaluate(({ name, bootstrap }) => (globalThis as unknown as TestWindow).chronologWebRtcTest.open(name, bootstrap), { name, bootstrap: native.bootstrap })
   // The fixture binds loopback explicitly. Avoid optional interface discovery,
   // which this sandbox denies; all ICE/DTLS/SCTP packets still use real sockets.
@@ -152,21 +151,8 @@ try {
       else errors.push(String(error))
     }, async accept(connection) {
     nativeConnection = connection
-    const snapshot = native!.governed.activeSnapshot
-    const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
-      equalBytes(capability.grant.signingPublicKey, native!.identity.signing.publicKeyBytes))!
-    const authenticated = await openAuthenticatedPeerLink({ connection,
-      local: { ...native!.transport.asLink(), readPayload: hash => hash === payloadHash ? Promise.resolve(payload) : native!.transport.asLink().readPayload(hash) },
-      groupId: snapshot.groupId, identity: native!.identity.signing, grantId: reader.id,
-      authorizePeer: ({ authorId, grantId }) => {
-        const current = native!.governed.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
-        return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
-          equalBytes(capability.grant.signingPublicKey, authorId)
-      } })
-    nativeSession = authenticated
-    const detachPeer = native!.transport.connect(authenticated.link)
-    detach = detachPeer
-    return { completion: authenticated.completion, async close() { detachPeer(); await authenticated.close() } }
+    nativeSession = await native!.agent.context.connectPeer({ connection })
+    return nativeSession
   } })
   const firstIntroduction = await page.evaluate(options => (globalThis as unknown as TestWindow).chronologWebRtcTest.connect(options),
     { url: `${base}/signal`, token: introductionToken })
@@ -297,7 +283,7 @@ try {
   throw error
 } finally {
   await introduction?.close()
-  detach?.(); await nativeSession?.close(); await nativeConnection?.close()
+  await nativeSession?.close(); await nativeConnection?.close()
   try { await page.evaluate(() => (globalThis as unknown as TestWindow).chronologWebRtcTest.close()) } catch { /* Preserve qualification errors. */ }
   await context.close(); await browser.close(); await native?.close(); await closeHost()
   await rm(directory, { recursive: true, force: true })

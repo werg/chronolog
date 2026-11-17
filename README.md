@@ -9,7 +9,9 @@ genesis selects an inclusion/finality provider. Every provider uses the same
 deterministic application order: author timestamp, signing key, proposal ID.
 Validators or an external service can prove inclusion and close a timestamp
 prefix; neither supplies an execution order. SQL executes locally. Tendriller
-can host and connect the application, or supply an optional retained log adapter.
+can serve the page and administer participants while application exchange runs
+over authenticated WebRTC between Chronolog peers. A retained-log adapter is an
+explicit alternative deployment choice.
 
 Peer history can replay a tentative suffix when a late transaction arrives.
 The signed-inclusion provider retains receipts and durable closure promises;
@@ -22,6 +24,9 @@ and live scoped reader/writer enrollment. Start with the
 finality, replay and role boundaries. The [resident agent](packages/agent-service/README.md)
 and [pluggable finality](docs/pluggable-finality.md) explain the architecture;
 the [application-log report](docs/plans/application-log.md) tracks qualification.
+The [peer application architecture](docs/peer-application-architecture.md) describes
+the boundary between page hosting, compact membership, live signals and durable
+application work.
 
 - **Plain SQL.** DDL and DML travel in one stream; there is no schema manifest,
   dialect or migration system. Assumptions are SQL statements, usually
@@ -58,7 +63,7 @@ the [application-log report](docs/plans/application-log.md) tracks qualification
   authorizer block-list keeps statements inside the database.
 - **Replication.** Native SQLite and browser OPFS adapters share the original
   signed-record codec, immutable evidence, and range/stream synchronization.
-  SSB connections and the optional Tendriller adapter supply connectivity;
+  WebRTC, native SSB connections and the optional retained-log adapter supply connectivity;
   a relay never changes original authorship.
 - **Governance.** A signed genesis fixes the consensus roles and history
   policy. Live signed enrollment grants reader/writer access with explicit
@@ -251,11 +256,12 @@ See the [chaos testing guide](docs/chaos-testing.md) and the
 | `crypto` | HPKE, signed epochs, content encryption |
 | `records` | Portable original signed records, immutable evidence, durable storage and shared range/stream synchronization |
 | `transport-ssb` | Native SQLite record/evidence storage and authenticated SSB connections |
+| `transport-webrtc` | Bounded RTC framing, HTTPS introduction, observed ICE routes and session supervision |
 | `transport-tendriller` | Optional public retained-log adapter and on-demand finality service |
+| `signals` | Portable signed live messages, bounded subscriptions and explicit delivery lifetime |
+| `agent-service` | Governed peer routing, native finality, resident effects and timer workers |
 | `control-store` | Candidates, attestations, order, heartbeats, settlement evidence |
 | `node-core` | Governed peer composition, two history policies, durable operations, live enrollment, admission and finality |
-| `signals` | Standalone bounded ephemeral messages and transport adapters, independent of history and finality |
-| `agent-service` | Native finality service, final-event effect workers, timers and authenticated peer sessions |
 | `materializer-doltlite` | Deterministic SQL execution, owner-controlled rows (platform operations, generated triggers), Dolt checkpoints, suffix replay, local SQL |
 | `materializer` | Portable materialization contracts shared with the workerd path |
 | `runtime-browser` | Owning Worker, OPFS, Web Lock, patched DoltLite WASM and shared client RPC |

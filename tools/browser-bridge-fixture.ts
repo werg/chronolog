@@ -3,8 +3,8 @@ import { mkdir } from 'node:fs/promises'
 import { createServer, type IncomingMessage } from 'node:http'
 import { join } from 'node:path'
 
-import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
-import { decodeSignedGenesis, encodeGenesisManifest, encodeSignedGenesis, isCapabilityActive, signGenesis } from '@chronolog/capabilities'
+import { createGovernedPeerService, type GovernedPeerService } from '@chronolog/agent-service/governed-peer'
+import { decodeSignedGenesis, encodeGenesisManifest, encodeSignedGenesis, signGenesis } from '@chronolog/capabilities'
 import { ChronologClient, OWNER_FOR_KEY_SQL, type TransactionHandle } from '@chronolog/client'
 import { ControlStore, NodeStateDatabase, SqliteControlStorePersistence } from '@chronolog/control-store'
 import {
@@ -19,7 +19,7 @@ import {
   type CoordinatedHistoryConfiguration, type OrderedRecordEntry,
 } from '@chronolog/node-core/history'
 import {
-  base64UrlToBytes, bytesToBase64Url, bytesToHex, digestExecutionManifest, DOMAINS, encodeExecutionManifest,
+  base64UrlToBytes, bytesToBase64Url, digestExecutionManifest, DOMAINS, encodeExecutionManifest,
   equalBytes, hashDomain, utf8,
 } from '@chronolog/protocol'
 import { DurableFeedStore, feedIdFromPublicKey, PortableFeedTransport, webFeedCrypto, webFeedSigner } from '@chronolog/records'
@@ -82,25 +82,11 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
   const appendMutex = new Mutex()
   const token = crypto.randomUUID()
   let governed: GovernedNode | undefined
+  let peers: GovernedPeerService | undefined
   const peerToken = crypto.randomUUID()
   const peerHttp = createPeerHttpFixture({ token: peerToken, async connect(connection) {
-    if (governed === undefined) throw new Error('BRIDGE_NATIVE_NOT_STARTED')
-    const native = governed
-    const snapshot = native.activeSnapshot
-    const reader = [...snapshot.capabilities.values()].find(capability => capability.grant.role === 'reader' &&
-      isCapabilityActive(capability, snapshot.revision) && equalBytes(capability.grant.signingPublicKey, administrator.signing.publicKeyBytes))
-    if (reader === undefined) throw new Error('BRIDGE_NATIVE_READER_MISSING')
-    const peer = await openAuthenticatedPeerLink({ connection, identity: administrator.signing,
-      local: local.asLink(), groupId: snapshot.groupId, grantId: reader.id,
-      authorizePeer: ({ authorId, grantId }) => {
-        const current = native.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
-        return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
-          equalBytes(capability.grant.signingPublicKey, authorId)
-      },
-    })
-    const detach = local.connect(peer.link)
-    void peer.completion.finally(detach).catch(() => undefined)
-    return peer
+    if (peers === undefined) { await connection.close(); throw new Error('BRIDGE_NATIVE_NOT_STARTED') }
+    return peers.connectPeer({ connection })
   } })
   let online = true
   let loseAppendResponse = false
@@ -213,6 +199,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
     closed = true
     try {
       await peerHttp.close()
+      await peers?.close()
       await client?.close()
       if (governed !== undefined) await governed.close()
       else { materializer.close(); await local.close() }
@@ -244,13 +231,15 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       recipient: { id: administrator.signing.publicKeyBytes, privateKey: administrator.reader.privateKey },
     })
     const root = governed
+    peers = await createGovernedPeerService({ identity: administrator.signing, groupId: root.descriptor.history.groupId,
+      activeMembership: () => root.activeSnapshot, local: local.asLink(), attach: link => local.connect(link) })
     const enrollment = createEnrollmentService({ descriptor: root.descriptor, store: operations, identity: administrator.signing,
       readerPublicKey: administrator.reader.publicKeyBytes, transportAuthor: adapter.identity,
       governance: root.governance, activeMembership: () => root.activeSnapshot, issuer: root.enrollmentIssuer!,
       connected: () => online, executionManifestDigest,
       isFinalTargetApplied: (target) => root.node.isFinalTargetApplied(target.frontier) })
     client = new ChronologClient({ groupId: bytesToBase64Url(genesis.manifest.groupId),
-      transport: new InProcessRpcTransport(new NodeRpcService({ node: root.node, enrollment })), unaryRetryAttempts: 1 })
+      transport: new InProcessRpcTransport(new NodeRpcService({ node: root.node, enrollment, signals: peers.signals })), unaryRetryAttempts: 1 })
     const native = client
     const syncEvidence = async () => {
       const throughMs = BigInt(Date.now())

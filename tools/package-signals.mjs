@@ -27,6 +27,7 @@ const inputs = [...new Set([...runtimeInputs, 'packages/signals/package.json', '
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('SIGNALS_PACKAGE_REQUIRES_CLEAN_INPUTS (commit package inputs before building)');
 const declarations = emitDeclarations();
+const readme = await readFile(join(root, 'packages/signals/README.md'));
 for (const text of declarations.values()) {
   const imports = ts.preProcessFile(text, true).importedFiles.map(value => value.fileName);
   assert(imports.every(name => name === './payload.js') && !/reference\s+(?:types|path)=/u.test(text),
@@ -36,11 +37,11 @@ assert.equal(git(['rev-parse', 'HEAD']).trim(), source, 'Signals source commit c
 assert.equal(git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim(), changed,
   'Signals package inputs changed during packaging');
 
-const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}`, version = `0.0.0-${suffix}`;
+const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}`, version = `0.0.0-g${suffix}`;
 await mkdir(output, { recursive: true });
 await writeFile(join(output, 'index.mjs'), bundled.outputFiles[0].contents);
 for (const [name, text] of declarations) await writeFile(join(output, name), text);
-await writeFile(join(output, 'README.md'), await readFile(join(root, 'packages/signals/README.md')));
+await writeFile(join(output, 'README.md'), readme);
 const packageJson = { name: '@chronolog/signals', version, type: 'module',
   description: 'Standalone signed, expiring live messages without a database or finality protocol',
   exports: { '.': { types: './index.d.ts', import: './index.mjs' } },

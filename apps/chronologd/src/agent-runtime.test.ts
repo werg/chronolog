@@ -5,9 +5,10 @@ import { join } from 'node:path'
 
 import { NativeAgentStore, framePeerStream, waitForAbortableDelay, type AgentApplicationContext } from '@chronolog/agent-service'
 import { signGenesis } from '@chronolog/capabilities'
+import { generateX25519KeyPair } from '@chronolog/crypto'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
-import { createGovernedNode, decodeLedgerRecord, isFinalityClosureRecord, membershipDescriptor } from '@chronolog/node-core'
-import { decodeEnvelope, executionManifestArtifacts, generateEd25519KeyPair } from '@chronolog/protocol'
+import { createGovernedNode, decodeLedgerRecord, isFinalityClosureRecord, membershipDescriptor, MemoryOperationStore } from '@chronolog/node-core'
+import { bytesToHex, decodeEnvelope, executionManifestArtifacts, generateEd25519KeyPair } from '@chronolog/protocol'
 import {
   DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner,
 } from '@chronolog/records'
@@ -39,13 +40,19 @@ describe('native agent composition', () => {
       recipient: { id: bootstrap.recipientId, privateKey: bootstrap.recipientPrivateKey }, initialEpochContentKey: new Uint8Array(32).fill(73) })
     cleanup.push(() => governed.close())
     await governed.start()
+    await expect(createDaemonAgentRuntime({ node: governed.node, identity: await generateEd25519KeyPair(),
+      descriptor: governed.descriptor, store, transport, activeMembership: () => governed.activeSnapshot,
+      peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) },
+    })).rejects.toThrow('AGENT_REPLICA_CONFIGURATION_MISMATCH')
     const history = governed.descriptor.history
     if (history.kind !== 'coordinated') throw new Error('Expected signed-inclusion fixture')
     const customGenesis = await signGenesis({ ...bootstrap.genesis.manifest,
       historyPolicy: { ...bootstrap.genesis.manifest.historyPolicy!, providerId: 'example-finality-v1' },
     }, identity.privateKey)
     const custom = await createDaemonAgentRuntime({ node: governed.node, identity, store, transport,
-      descriptor: await membershipDescriptor(customGenesis, governed.descriptor.groupRoute) })
+      descriptor: await membershipDescriptor(customGenesis, governed.descriptor.groupRoute),
+      activeMembership: () => governed.activeSnapshot,
+      peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
     expect(custom.finality).toBeNull()
     expect(custom.taskIds).toEqual([])
     await custom.close()
@@ -70,6 +77,7 @@ describe('native agent composition', () => {
     let dispatches = 0
     const agent = await createDaemonAgentRuntime({ node: governed.node, identity, descriptor: governed.descriptor, store, transport,
       activeMembership: () => governed.activeSnapshot, finalityClock: () => clockNow,
+      peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) },
       application: { createAgent: () => ({ effects: [{ resultTopic: 'jobs.results', handler: {
         id: 'echo', version: '1', topics: ['jobs.requested'], recovery: 'idempotent',
         dispatch: async ({ event }) => { dispatches += 1; return { echo: event.payload } },
@@ -132,5 +140,77 @@ describe('native agent composition', () => {
     await expect(waiting).rejects.toBe(reason)
     await agent.close()
     await running
+  })
+
+  it('routes live signals to a read-only native replica without a writer grant or local finality provider', async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), 'chronolog-native-signals-'))
+    cleanup.push(() => rm(dataDirectory, { recursive: true, force: true }))
+    const owner = await generateEd25519KeyPair(), reader = await generateEd25519KeyPair()
+    const readerKey = await generateX25519KeyPair(), groupId = new Uint8Array(32).fill(81)
+    const { executionManifestDigest } = await executionManifestArtifacts(await eventExecutionManifest())
+    const identities = [owner, reader]
+    const stores = [new MemoryOperationStore(), new MemoryOperationStore()]
+    const transports = await Promise.all(identities.map(async (identity, index) => new PortableFeedTransport({
+      store: await DurableFeedStore.open(stores[index]!, webFeedCrypto), crypto: webFeedCrypto,
+      signer: webFeedSigner(feedIdFromPublicKey(identity.publicKeyBytes), identity.privateKey),
+    })))
+    const bootstrap = await loadOrCreateGovernanceBootstrap({ dataDirectory, groupId, schemaId: executionManifestDigest,
+      identity: owner, transportAuthor: transports[0]!.identity, historyPolicy: 'coordinated' })
+    const genesis = await signGenesis({ ...bootstrap.genesis.manifest, initialCapabilities: [
+      ...bootstrap.genesis.manifest.initialCapabilities,
+      { subjectId: reader.publicKeyBytes, signingPublicKey: reader.publicKeyBytes, transportAuthor: transports[1]!.identity,
+        role: 'reader', validFromRevision: 0n, hpkePublicKey: readerKey.publicKeyBytes },
+    ] }, owner.privateKey)
+    const replicas = await Promise.all(identities.map(async (identity, index) => {
+      const store = stores[index]!, transport = transports[index]!
+      const governed = await createGovernedNode({ genesis, groupRoute: new Uint8Array(32).fill(82), identity, transport,
+        operationStore: store, materialization: await createEventMaterializationRuntime({ store, namespace: 'signals' }) })
+      cleanup.push(() => governed.close())
+      const runtime = await createDaemonAgentRuntime({ node: governed.node, descriptor: governed.descriptor, identity, store, transport,
+        activeMembership: () => governed.activeSnapshot,
+        peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
+      cleanup.push(() => runtime.close())
+      return { governed, runtime }
+    }))
+    const publisher = replicas[0]!.runtime, subscriber = replicas[1]!.runtime
+    expect(publisher.finality).not.toBeNull()
+    expect(subscriber.finality).toBeNull()
+    expect(subscriber.taskIds).toEqual([])
+    expect(subscriber.context).not.toHaveProperty('createSignals')
+    const toOwner = new TransformStream<Uint8Array, Uint8Array>(), toReader = new TransformStream<Uint8Array, Uint8Array>()
+    const sessions = await Promise.all([
+      publisher.context.connectPeer({ connection: framePeerStream({ readable: toOwner.readable, writable: toReader.writable }), peerIdentity: reader.publicKeyBytes }),
+      subscriber.context.connectPeer({ connection: framePeerStream({ readable: toReader.readable, writable: toOwner.writable }), peerIdentity: owner.publicKeyBytes }),
+    ])
+    const before = await publisher.finality!.head()
+    const iterator = subscriber.context.signals.subscribe({ topics: ['presence'], signal: AbortSignal.timeout(2_000) })[Symbol.asyncIterator]()
+    const waiting = iterator.next()
+    const sent = await publisher.context.signals.send('presence', { active: true })
+    const received = await waiting
+    expect(received.done).toBe(false)
+    expect(received.value).toEqual(sent)
+    expect(received.value?.authorId).toBe(bytesToHex(owner.publicKeyBytes))
+    await expect(subscriber.context.signals.send('presence', { active: false })).rejects.toThrow('SIGNAL_UNAUTHORIZED')
+    expect(await publisher.finality!.head()).toEqual(before)
+    await subscriber.close()
+    expect(sessions[1].signal.aborted).toBe(true)
+    await expect(sessions[0].completion).rejects.toThrow('PEER_CONNECTION_CLOSED')
+    expect(sessions[0].signal.aborted).toBe(true)
+    expect((await iterator.next()).done).toBe(true)
+
+    // A failed application factory owns the same cleanup boundary as shutdown.
+    // Its subscription must not remain live after the runtime fails to open.
+    let abandoned: Promise<IteratorResult<unknown>> | undefined
+    const failed = new Error('application initialization failed')
+    await expect(createDaemonAgentRuntime({ node: replicas[1]!.governed.node, descriptor: replicas[1]!.governed.descriptor,
+      identity: reader, store: stores[1]!, transport: transports[1]!,
+      activeMembership: () => replicas[1]!.governed.activeSnapshot,
+      peerLinks: { local: transports[1]!.asLink(), attach: (link) => transports[1]!.connect(link) },
+      application: { createAgent(context) {
+        abandoned = context.signals.subscribe()[Symbol.asyncIterator]().next()
+        throw failed
+      } },
+    })).rejects.toBe(failed)
+    await expect(abandoned).resolves.toMatchObject({ done: true })
   })
 })

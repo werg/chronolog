@@ -9,17 +9,18 @@ export function createCapabilitySignals(options: Omit<SignalChannelOptions, 'sco
   readonly current: () => CapabilitySnapshot
 }): SignalChannel {
   const groupId = options.groupId.slice(), scope = bytesToHex(groupId)
+  const identity = { ...options.identity, publicKeyBytes: options.identity.publicKeyBytes.slice() }
   if (groupId.length !== 32) throw new Error('SIGNAL_GROUP_INVALID')
   const current = (): CapabilitySnapshot => {
     const snapshot = options.current()
     if (!equalBytes(snapshot.groupId, groupId)) throw new Error('SIGNAL_GROUP_MISMATCH')
     return snapshot
   }
-  return new SignalChannel({ ...options, scope,
+  return new SignalChannel({ ...options, identity, scope,
     credential(topic) {
       const snapshot = current()
       for (const capability of snapshot.capabilities.values()) {
-        if (signalAllowed(snapshot, { capabilityId: capability.id, signer: options.identity.publicKeyBytes, topic })) return capability.id.slice()
+        if (signalAllowed(snapshot, { capabilityId: capability.id, signer: identity.publicKeyBytes, topic })) return capability.id.slice()
       }
       throw new Error('SIGNAL_UNAUTHORIZED')
     },

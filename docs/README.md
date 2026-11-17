@@ -17,7 +17,7 @@ resolves.
 
 ## Read first
 
-- **Developer:** [README](../README.md), [portable peers](portable-peers.md), then [design](design.md) and
+- **Developer:** [README](../README.md), [peer application architecture](peer-application-architecture.md), [portable peers](portable-peers.md), then [design](design.md) and
   [Specification 10](implementation-specs/10-deterministic-sql-transactions.md).
 - **Application/agent author:** [Application primitives](application-primitives.md),
   [signals](../packages/signals/README.md), [resident service](../packages/agent-service/README.md)
@@ -45,6 +45,7 @@ resolves.
 | [pluggable-finality.md](pluggable-finality.md) | Architecture and integration | Deterministic author-time order, inclusion, signed closure promises and the provider extension boundary. |
 | [plans/application-log.md](plans/application-log.md) | Implementation and qualification | Durable events, native finality, signed ingress, coherent projections, worker/timer recovery and the public contrib pilot. |
 | [portable-peers.md](portable-peers.md) | Architecture and integration | Two history policies, portable records, durable proposals, actual final SQL and live enrollment. |
+| [peer-application-architecture.md](peer-application-architecture.md) | Architecture and integration | Thin page host, compact participants, owned WebRTC sessions, live signals and independent finality. |
 | [implementation-status.md](implementation-status.md) | Status | What works end to end and what remains. |
 | [../upcoming.md](../upcoming.md) | Status (ordered roadmap) | Project queue and acceptance checks. |
 | [security-threat-review.md](security-threat-review.md) | Status | Internal authorizer/protocol review and open findings. |

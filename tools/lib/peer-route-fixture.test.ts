@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { NativeAgentStore } from '@chronolog/agent-service'
+import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import { loadOrCreateEnrollmentIdentity } from '@chronolog/node-core'
 import { bytesToBase64Url } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
@@ -33,6 +34,7 @@ it('introduces through the packaged host then replicates signed records over RTC
   let routes: Awaited<ReturnType<typeof createPeerRouteFixture>> | undefined
   let rtc: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
   let authenticated: Awaited<ReturnType<typeof attachPilotPeer>> | undefined
+  let peerService: Awaited<ReturnType<typeof createGovernedPeerService>> | undefined
   try {
     const engine = join(directory, 'engine')
     await mkdir(engine)
@@ -51,8 +53,9 @@ it('introduces through the packaged host then replicates signed records over RTC
     rtc = await openWebRtcConnection({ role, signaling: rendezvous, configuration: { iceServers: [] },
       createPeerConnection: configuration => createNativePeerConnection(configuration,
         { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }) })
-    authenticated = await attachPilotPeer({ connection: rtc, transport, identity,
-      nativeIdentity: bytesToBase64Url(native.identity.signing.publicKeyBytes), activeMembership: () => native!.governed.activeSnapshot })
+    peerService = await createGovernedPeerService({ identity: identity.signing, groupId: native.governed.descriptor.history.groupId,
+      activeMembership: () => native!.governed.activeSnapshot, local: transport.asLink(), attach: link => transport.connect(link) })
+    authenticated = await attachPilotPeer({ connection: rtc, peer: peerService, nativeIdentity: bytesToBase64Url(native.identity.signing.publicKeyBytes) })
     // The exact Worker attachment boundary must finish even if replay cannot
     // publish its first durable record. A slow OPFS/materializer is not a failed
     // RTC handshake and cannot tear down the established peer session.
@@ -86,7 +89,7 @@ it('introduces through the packaged host then replicates signed records over RTC
     throw error
   } finally {
     releaseWrites()
-    await authenticated?.close(); await rtc?.close(); await routes?.close()
+    await authenticated?.close(); await peerService?.close(); await rtc?.close(); await routes?.close()
     await native?.close(); await transport.close(); readerStore.close()
     await rm(directory, { recursive: true, force: true })
   }

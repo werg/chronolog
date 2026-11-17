@@ -1,5 +1,6 @@
 import { decodeChangeProgram, emit, program, type EventBatch } from '@chronolog/protocol'
-import { ChronologRpcError, type RpcTransport, type SubmitChangeRequest } from '@chronolog/rpc'
+import { ChronologRpcError, type RpcCallOptions, type RpcTransport, type SubmitChangeRequest } from '@chronolog/rpc'
+import type { EphemeralSignal } from '@chronolog/signals'
 import { describe, expect, it } from 'vitest'
 
 import { ChronologClient } from './client.js'
@@ -7,6 +8,57 @@ import { ChronologClient } from './client.js'
 const batch = (cursor: string): EventBatch => ({ transactions: [], revision: `revision-${cursor}`, scannedThrough: cursor, hasMore: false })
 
 describe('application client', () => {
+  it('never retries a live send after a lost reply, even when durable unary retries are enabled', async () => {
+    const calls: unknown[] = []
+    const transport = { unary: async (method: string, request: unknown) => {
+      calls.push({ method, request })
+      throw new ChronologRpcError('transport_unavailable', 'Reply lost after send')
+    } } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group', unaryRetryAttempts: 5, requestId: () => 'live-attempt' })
+    await expect(client.signals.send('typing', { active: true }, { ttlMs: 1000 })).rejects.toMatchObject({ code: 'transport_unavailable' })
+    expect(calls).toEqual([{ method: 'signals.send', request: {
+      groupId: 'group', topic: 'typing', payload: { active: true }, ttlMs: 1000,
+    } }])
+    await client.close()
+  })
+
+  it('copies live filters, preserves string identities, and ends a disconnected subscription without resume', async () => {
+    const value: EphemeralSignal = { scope: 'group', authorId: 'author', sessionId: 'session', sequence: 1,
+      topic: 'typing', payload: { active: true }, issuedAtMs: 100, expiresAtMs: 200 }
+    const calls: unknown[] = []
+    let lifetime: AbortSignal | undefined
+    const transport = { stream: (method: string, request: unknown, options: RpcCallOptions) => ({ async *[Symbol.asyncIterator]() {
+      calls.push({ method, request }); lifetime = options.signal
+      yield value
+      throw new ChronologRpcError('transport_unavailable', 'Live connection ended')
+    } }) } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group', streamRetryDelayMs: () => 0, requestId: () => 'live-stream' })
+    const topics = ['typing']
+    const source = client.signals.subscribe({ topics, mode: 'latest' })
+    topics.push('changed-after-subscribe')
+    const iterator = source[Symbol.asyncIterator]()
+    expect((await iterator.next()).value).toEqual(value)
+    await expect(iterator.next()).rejects.toMatchObject({ code: 'transport_unavailable' })
+    expect(lifetime?.aborted).toBe(true)
+    expect(calls).toEqual([{ method: 'signals.subscribe', request: {
+      groupId: 'group', topics: ['typing'], mode: 'latest',
+    } }])
+    await client.close()
+  })
+
+  it('cancels outstanding live intent when its client closes', async () => {
+    let signal: AbortSignal | undefined
+    const transport = { unary: async (_method: string, _request: unknown, options: RpcCallOptions) => {
+      signal = options.signal
+      return new Promise((_resolve, reject) => signal!.addEventListener('abort', () => reject(signal!.reason), { once: true }))
+    } } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group' })
+    const sending = client.signals.send('typing', { active: true })
+    const rejected = expect(sending).rejects.toMatchObject({ code: 'cancelled' })
+    await client.close(); await rejected
+    expect(signal?.aborted).toBe(true)
+  })
+
   it('carries requested and approved SQL/topic/signal scopes without broadening either request', async () => {
     const calls: Array<{ method: string; request: unknown }> = []
     const transport = { unary: async (method: string, request: unknown) => {

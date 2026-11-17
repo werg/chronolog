@@ -1,5 +1,6 @@
 import { bytesToBase64Url, emit, encodeChangeProgram, program, type EventBatch } from '@chronolog/protocol'
 import { describe, expect, it, vi } from 'vitest'
+import type { EphemeralSignal, SignalSubscribeOptions } from '@chronolog/signals'
 
 import { InProcessRpcTransport } from './in-process.js'
 import { NodeRpcService } from './node-service.js'
@@ -24,6 +25,45 @@ function readHandle(revision: string, release: () => void): RpcReadHandle {
 }
 
 describe('application RPC', () => {
+  it('carries live signals over HTTP with exact string identities and no durable publication', async () => {
+    const value: EphemeralSignal = { scope: group, authorId: 'author', sessionId: 'session', sequence: 1,
+      topic: 'typing', payload: { active: true, $chronologRpc: ['bytes', 'AA=='] }, issuedAtMs: 1, expiresAtMs: 1000 }
+    const publish = vi.fn()
+    const send = vi.fn(async () => value)
+    const subscriptions: SignalSubscribeOptions[] = []
+    const service = new NodeRpcService({ node: node({ publish }), signals: { send,
+      subscribe: options => ({ async *[Symbol.asyncIterator]() { subscriptions.push(options!); yield value } }),
+    } })
+    const server = new HttpRpcServer({ service, port: 0 })
+    const transport = new HttpRpcTransport({ baseUrl: (await server.listen()).url })
+    try {
+      expect(await transport.unary('signals.send', { ...request, topic: 'typing', payload: value.payload, ttlMs: 999 })).toEqual(value)
+      expect(send).toHaveBeenCalledWith('typing', value.payload, expect.objectContaining({ ttlMs: 999, signal: expect.any(AbortSignal) }))
+      const received = []
+      for await (const signal of transport.stream('signals.subscribe', { ...request, topics: ['typing'], mode: 'latest' })) received.push(signal)
+      expect(received).toEqual([value])
+      expect(subscriptions).toHaveLength(1)
+      expect(subscriptions[0]).toMatchObject({ topics: ['typing'], mode: 'latest' })
+      expect(publish).not.toHaveBeenCalled()
+      await expect(transport.unary('signals.send', { ...request, groupId: 'wrong', topic: 'typing', payload: null })).rejects.toMatchObject({ code: 'not_found' })
+      expect(send).toHaveBeenCalledTimes(1)
+    } finally { await transport.close(); await server.close() }
+  })
+
+  it('cancels live service work on close without closing the injected peer signal channel', async () => {
+    let lifetime: AbortSignal | undefined
+    const signals = { send: vi.fn(async (_topic: string, _payload: unknown, options?: { signal?: AbortSignal }) => {
+      lifetime = options?.signal
+      return new Promise<EphemeralSignal>((_resolve, reject) => lifetime!.addEventListener('abort', () => reject(lifetime!.reason), { once: true }))
+    }), subscribe: () => ({ async *[Symbol.asyncIterator]() { /* no history to replay */ } }), close: vi.fn() }
+    const service = new NodeRpcService({ node: node({}), signals })
+    const sent = service.sendSignal({ ...request, topic: 'typing', payload: null }, { method: 'signals.send' })
+    const rejected = expect(sent).rejects.toMatchObject({ code: 'cancelled' })
+    await service.close(); await rejected
+    expect(lifetime?.aborted).toBe(true)
+    expect(signals.close).not.toHaveBeenCalled()
+  })
+
   it('closes the owning service once when HTTP shutdown calls overlap', async () => {
     const close = vi.fn(async () => { await Promise.resolve() })
     const server = new HttpRpcServer({ service: { close } as unknown as ChronologRpcService, port: 0 })
@@ -134,6 +174,8 @@ describe('application RPC', () => {
     const service = new NodeRpcService({ node: node({}) })
     await expect(service.readEvents(request, { method: 'events.read' })).rejects.toMatchObject({ code: 'failed_precondition' })
     await expect(service.openReadView(request, { method: 'view.open' })).rejects.toMatchObject({ code: 'failed_precondition' })
+    await expect(service.sendSignal({ ...request, topic: 'typing', payload: null }, { method: 'signals.send' })).rejects.toMatchObject({ code: 'failed_precondition' })
+    await expect(service.subscribeSignals(request, { method: 'signals.subscribe' })[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'failed_precondition' })
     await service.close()
   })
 

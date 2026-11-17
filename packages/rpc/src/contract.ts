@@ -38,9 +38,9 @@ import type {
   GrantHistoricalAccessResponse,
   SubmitChangeRequest, SubmitChangeResponse, SubmitSignedRequest,
   EventReadRequest, EventReadResponse,
+  SendSignalRequest, SubscribeSignalsRequest,
   GetOperationRequest, OperationStatus, StreamOperationsRequest,
   OpenReadViewRequest, OpenReadViewResponse, ReadViewRequest, QueryReadViewRequest, EventsReadViewRequest, LocalSqlResult,
-  SendSignalRequest, SubscribeSignalsRequest,
 } from './types.js'
 
 export interface RpcCallOptions { readonly signal?: AbortSignal; readonly token?: string; readonly timeoutMs?: number; readonly metadata?: Readonly<Record<string, string>> }

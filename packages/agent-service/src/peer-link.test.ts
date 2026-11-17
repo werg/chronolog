@@ -98,23 +98,28 @@ async function rangeSession(range: 'records' | 'evidence', read: () => Promise<r
     ? clientLink.link.read(server.transport.identity, 0n, limit) : clientLink.link.readEvidence(0n, limit) }
 }
 
-async function signalSession() {
+async function signalSession(receive?: (frame: Uint8Array) => Promise<void>, options?: {
+  readonly dispatch?: () => Promise<void>
+  readonly sendTimeoutMs?: number
+}) {
   const server = await portable(), client = await portable(), [outgoing, incoming] = connections()
-  const sent: Uint8Array[] = []
-  let active = true, guard: (() => Promise<void>) | undefined
+  const sent: Uint8Array[] = [], received: Uint8Array[] = []
+  let active = true, incomingActive = true, guard: (() => Promise<void>) | undefined
   const groupId = new Uint8Array(32).fill(31), grantId = new Uint8Array(32).fill(32)
   const [sender, receiver] = await Promise.all([
     openAuthenticatedPeerLink({ connection: { ...outgoing, async send(bytes) {
       const frame = assertCanonicalCbor(bytes)
-      if (Array.isArray(frame) && frame[1] === SIGNAL_DOMAIN) sent.push(bytes.slice())
+      if (Array.isArray(frame) && frame[1] === SIGNAL_DOMAIN) { sent.push(bytes.slice()); await options?.dispatch?.() }
       await outgoing.send(bytes)
     } }, local: server.transport.asLink(), identity: server.identity, groupId, grantId,
-      async authorizePeer() { await guard?.(); return active } }),
+      async authorizePeer() { await guard?.(); return active },
+      ...(options?.sendTimeoutMs === undefined ? {} : { sendTimeoutMs: options.sendTimeoutMs }) }),
     openAuthenticatedPeerLink({ connection: incoming, local: client.transport.asLink(), identity: client.identity,
-      groupId, grantId, authorizePeer: () => true }),
+      groupId, grantId, authorizePeer: () => incomingActive,
+      receiveSignal: async frame => { received.push(frame); await receive?.(frame) } }),
   ])
   cleanup.push(async () => { await Promise.all([sender.close(), receiver.close()]) })
-  return { sender, sent, revoke() { active = false }, block() {
+  return { sender, receiver, sent, received, revoke() { active = false }, revokeIncoming() { incomingActive = false }, block() {
     let entered!: () => void, release!: () => void
     const blocked = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
     guard = async () => { guard = undefined; entered(); await gate }
@@ -123,6 +128,34 @@ async function signalSession() {
 }
 
 describe('authenticated framed range synchronization', () => {
+  it('rechecks reader access before releasing ephemeral messages after authentication', async () => {
+    const session = await payloadSession(async () => null)
+    const identity = await generateEd25519KeyPair(), frames: Uint8Array[] = []
+    const signals = new SignalChannel({ scope: 'room', identity, authorize: () => true, send: async frame => { frames.push(frame) } })
+    try {
+      await signals.send('progress', 1)
+      await session.server.sendSignal(frames[0]!)
+      session.revoke()
+      await expect(session.server.sendSignal(frames[0]!)).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    } finally { signals.close() }
+  })
+
+  it('discards a valid expired signal while keeping durable range synchronization usable', async () => {
+    const identity = await generateEd25519KeyPair(), frames: Uint8Array[] = []
+    const sender = new SignalChannel({ scope: 'room', identity, authorize: () => true, now: () => 100,
+      send: async frame => { frames.push(frame) } })
+    const receiver = new SignalChannel({ scope: 'room', identity, authorize: () => true, now: () => 200 })
+    let received!: (value: Awaited<ReturnType<SignalChannel['receive']>>) => void
+    const processed = new Promise<Awaited<ReturnType<SignalChannel['receive']>>>(resolve => { received = resolve })
+    const session = await signalSession(async frame => { received(await receiver.receive(frame)) })
+    try {
+      await sender.send('typing', true, { ttlMs: 50 })
+      await session.sender.sendSignal(frames[0]!)
+      expect(await processed).toBeNull()
+      expect(await session.receiver.link.read(session.receiver.peer.feedId, 0n, 1)).toEqual([])
+    } finally { sender.close(); receiver.close() }
+  })
+
   it('exchanges exact native/browser records and evidence bidirectionally over the same framed link', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'chronolog-framed-native-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true }))
@@ -182,18 +215,6 @@ describe('authenticated framed range synchronization', () => {
     await Promise.all([leftConnection.close(), rightConnection.close()])
   })
 
-  it('rechecks reader access before releasing ephemeral messages after authentication', async () => {
-    const session = await payloadSession(async () => null)
-    const identity = await generateEd25519KeyPair(), frames: Uint8Array[] = []
-    const signals = new SignalChannel({ scope: 'room', identity, authorize: () => true, send: async frame => { frames.push(frame) } })
-    try {
-      await signals.send('progress', 1)
-      await session.server.sendSignal(frames[0]!)
-      session.revoke()
-      await expect(session.server.sendSignal(frames[0]!)).rejects.toThrow('PEER_READ_UNAUTHORIZED')
-    } finally { signals.close() }
-  })
-
   it('fetches a detached payload only on demand and rechecks reader rights', async () => {
     const body = new Uint8Array(256 * 1024 + 17).fill(53), hash = bytesToHex(await sha256(body))
     const provider = vi.fn(async (requested: string) => requested === hash ? body : null)
@@ -239,6 +260,58 @@ describe('authenticated framed range synchronization', () => {
     else await session.sender.close()
     gate.release(); await rejected
     expect(session.sent).toEqual([])
+  })
+
+  it('closes an incoming signal lifetime after the remote reader grant is revoked', async () => {
+    const session = await signalSession()
+    session.revokeIncoming()
+    const failed = expect(session.receiver.completion).rejects.toThrow('PEER_READ_UNAUTHORIZED')
+    await session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'not admitted']))
+    await failed
+    expect(session.received).toEqual([])
+  })
+
+  it('honors cancellation during asynchronous reader authorization without closing the healthy route', async () => {
+    const session = await signalSession(), gate = session.block(), controller = new AbortController()
+    const frame = encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'cancel before transport handoff'])
+    const sending = session.sender.sendSignal(frame, controller.signal)
+    const rejected = expect(sending).rejects.toThrow('cancel this signal')
+    await gate.blocked
+    controller.abort(new Error('cancel this signal')); gate.release(); await rejected
+    expect(session.sent).toEqual([])
+    await session.sender.sendSignal(frame)
+    expect(session.sent).toEqual([frame])
+  })
+
+  it('retires a signal transport write that never completes after handoff', async () => {
+    const session = await signalSession(undefined, { dispatch: async () => new Promise<void>(() => undefined), sendTimeoutMs: 25 })
+    vi.useFakeTimers()
+    const sending = session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'blocked transport']))
+    const failed = expect(sending).rejects.toThrow('PEER_SIGNAL_SEND_TIMEOUT')
+    const closed = expect(session.sender.completion).rejects.toThrow('PEER_SIGNAL_SEND_TIMEOUT')
+    await vi.advanceTimersByTimeAsync(26)
+    await failed; await closed
+  })
+
+  it('surfaces bounded signal ingress overload instead of silently dropping admitted work', async () => {
+    let release!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const session = await signalSession(async () => blocked)
+    const failed = expect(session.receiver.completion).rejects.toThrow('PEER_SIGNAL_BACKPRESSURE')
+    try {
+      for (let index = 0; index < 9; index += 1) {
+        await session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, BigInt(index)])).catch(() => undefined)
+      }
+      await failed
+      expect(session.received.length).toBeLessThanOrEqual(8)
+    } finally { release() }
+  })
+
+  it('surfaces a failed signal verification through the owned peer completion', async () => {
+    const session = await signalSession(async () => { throw new Error('SIGNAL_SIGNATURE_INVALID') })
+    const failed = expect(session.receiver.completion).rejects.toThrow('SIGNAL_SIGNATURE_INVALID')
+    await session.sender.sendSignal(encodeCanonicalCbor([1n, SIGNAL_DOMAIN, 'bad signature']))
+    await failed
   })
 
   it.each(['records', 'evidence'] as const)('does not release %s when a grant is revoked during the storage read', async range => {

@@ -107,8 +107,7 @@ endpoint.addEventListener('message', event => {
         opening = framed
         try {
           const attached = await attachMembershipPeer({ connection: framed,
-            nativeIdentity: bootstrap!.nativeIdentity, identity: identity!, transport: peer!.transport,
-            activeMembership: () => peer!.governed!.activeSnapshot })
+            nativeIdentity: bootstrap!.nativeIdentity, peer: peer! })
           if (generation !== connectionGeneration) { await attached.close(); throw new Error('THIN_BROWSER_ATTACHMENT_SUPERSEDED') }
           connection = attached
         } finally { if (opening === framed) opening = undefined }

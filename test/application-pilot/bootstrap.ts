@@ -19,13 +19,17 @@ const lifetime = new AbortController()
 const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>()
 const connectionErrors: string[] = []
 let supervisor: ReturnType<typeof supervisePeerSession<WebRtcSession>> | undefined
+let activeWorkerLifetime: AbortController | undefined
 let sequence = 0, connectionSequence = 0, activeConnection = 0
 worker.addEventListener('message', (event: MessageEvent) => {
   const response = event.data as { pilot?: string; id?: number; connectionId?: number; value?: unknown; error?: string }
   if (response.pilot === 'connection-error') {
     if (response.connectionId !== activeConnection) return
-    connectionErrors.push(response.error ?? 'Unknown connection failure')
-    void supervisor?.session?.close()
+    const error = response.error ?? 'Unknown connection failure'
+    connectionErrors.push(error)
+    // A Worker authentication/framing loss can precede ICE disconnection or
+    // even the end of negotiation. Fence that exact attempt immediately.
+    activeWorkerLifetime?.abort(new Error(error))
     return
   }
   if (response.pilot !== 'response' || response.id === undefined) return
@@ -77,16 +81,24 @@ async function connect(): Promise<void> {
   supervisor ??= supervisePeerSession({ signal: lifetime.signal, readiness: 'authenticated',
     retry: { initialDelayMs: 250, maxDelayMs: 2_000, maxAttempts: 4 }, async connect(signal) {
       let attached: Promise<unknown> | undefined
-      const introduced = await introducePeerWorker({ peers: target.tendril.peers, channel: crypto.randomUUID(), peerId: device!,
-        signal, configuration: { iceServers: [] }, handoff(channel) {
-          // Transfer synchronously; only the Worker owns keys, frames and replay.
-          activeConnection = ++connectionSequence
-          attached = command('channel', { channel, connectionId: activeConnection }, 60_000, [channel as RTCDataChannel], signal)
-          void attached.catch(() => undefined)
-        } })
-      sessions.push(introduced)
-      try { await attached; signal.throwIfAborted(); return introduced }
-      catch (error) { await introduced.close(); throw error }
+      let introduced: WebRtcSession | undefined
+      const workerLifetime = new AbortController()
+      const attempt = AbortSignal.any([signal, workerLifetime.signal])
+      try {
+        introduced = await introducePeerWorker({ peers: target.tendril.peers, channel: crypto.randomUUID(), peerId: device!,
+          signal: attempt, configuration: { iceServers: [] }, handoff(channel) {
+            // Transfer synchronously; only the Worker owns keys, frames and replay.
+            activeConnection = ++connectionSequence
+            activeWorkerLifetime = workerLifetime
+            attached = command('channel', { channel, connectionId: activeConnection }, 60_000, [channel as RTCDataChannel], attempt)
+            void attached.catch(() => undefined)
+          } })
+        sessions.push(introduced)
+        await attached; attempt.throwIfAborted()
+        const established = introduced
+        return { ...established, signal: AbortSignal.any([established.signal, attempt]),
+          async close() { workerLifetime.abort(); await established.close() } }
+      } catch (error) { workerLifetime.abort(error); await introduced?.close(); throw error }
     } })
   await supervisor.waitForSession()
 }
@@ -94,6 +106,7 @@ async function disconnect(): Promise<void> {
   const previous = supervisor
   supervisor = undefined
   activeConnection = ++connectionSequence
+  activeWorkerLifetime?.abort(); activeWorkerLifetime = undefined
   // close() cancels the attempt immediately, before a late Worker reply can win.
   const stopping = previous?.close()
   try { await command('disconnect') } finally { await stopping }

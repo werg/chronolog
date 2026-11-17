@@ -47,8 +47,8 @@ import { SignalChannel, generateSignalIdentity } from '@chronolog/signals';
 const identity = await generateSignalIdentity();
 const receiver = new SignalChannel({ scope: 'isolated-artifact', identity: await generateSignalIdentity(), authorize: () => true });
 const sender = new SignalChannel({ scope: 'isolated-artifact', identity, authorize: () => true });
-await assert.rejects(sender.send('typing', true), /SIGNAL_DISCONNECTED/);
-const detach = sender.attach(async frame => { await receiver.receive(frame); });
+await assert.rejects(sender.send('typing', true), /SIGNAL_ROUTE_UNAVAILABLE/);
+const route = sender.attachRoute({ send: async frame => { await receiver.receive(frame); } });
 const iterator = receiver.subscribe({ topics: ['typing'] })[Symbol.asyncIterator]();
 const next = iterator.next();
 const first = await sender.send('typing', { active: true }, { ttlMs: 5000 });
@@ -61,8 +61,8 @@ assert.equal(first.expiresAtMs - first.issuedAtMs, 5000);
 const idle = iterator.next();
 assert.equal((await iterator.return()).done, true);
 assert.equal((await idle).done, true);
-detach();
-await assert.rejects(sender.send('typing', false), /SIGNAL_DISCONNECTED/);
+route.close();
+await assert.rejects(sender.send('typing', false), /SIGNAL_ROUTE_UNAVAILABLE/);
 sender.close(); receiver.close();
 `;
   await writeFile(join(directory, 'consumer.mjs'), runtime);
@@ -71,14 +71,17 @@ sender.close(); receiver.close();
 
   await writeFile(join(directory, 'consumer.ts'), `import { SignalChannel, generateSignalIdentity,
   type Signals, type SignalPayload, type EphemeralSignal, type SignalSendOptions, type SignalSubscribeOptions } from '@chronolog/signals';
-const channel: Signals = new SignalChannel({ scope: 'typed-artifact', identity: await generateSignalIdentity(),
+const signalChannel = new SignalChannel({ scope: 'typed-artifact', identity: await generateSignalIdentity(),
   authorize: ({ scope, authorId, credential, topic }) => scope.length > 0 && authorId.length === 32 && credential === null && topic.length > 0 });
+const route = signalChannel.attachRoute({ send: async (frame, { signal }) => { signal.throwIfAborted(); void frame; } });
+const channel: Signals = signalChannel;
 const payload: SignalPayload = { values: [null, true, 2, 'preview'] };
 const send: SignalSendOptions = { ttlMs: 1000 };
 const delivered: EphemeralSignal = await channel.send('preview', payload, send);
 const options: SignalSubscribeOptions = { topics: [delivered.topic], mode: 'latest', signal: new AbortController().signal };
 const stream: AsyncIterable<EphemeralSignal> = channel.subscribe(options);
 void stream;
+route.close(); signalChannel.close();
 // @ts-expect-error Signal payloads exclude executable values.
 void channel.send('preview', () => 'not JSON');
 // @ts-expect-error Only the declared FIFO/latest modes are supported.

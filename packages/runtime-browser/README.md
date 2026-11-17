@@ -30,7 +30,9 @@ Both governed browser profiles expose `peer.signals` and
 `peer.connectPeer({ connection, peerIdentity? })`. Supply a ready framed connection,
 for example `frameRtcDataChannel(channel)` after its `ready` promise resolves.
 The runtime selects the local reader grant, verifies the remote current reader,
-attaches replication and signals, and returns `{ completion, close }`. An optional
+attaches replication and signals through the same governed service used by native
+peers, and returns `{ peer, signal, completion, close }`. The session's `signal`
+aborts when that exact connection ends. An optional
 `peerIdentity` pins a particular endpoint in addition to its group capability.
 The owning Worker retains all keys and signs outgoing messages there.
 
@@ -45,7 +47,10 @@ publication rights, and a read-only member can subscribe.
 Connection close detaches its exact replication and signal route, including
 failed attachment and late handshake completion during shutdown. Browser peer
 close aborts the live channel and pending connection setup before releasing OPFS.
-A low-level composition may provide `configuration.signals` with its own policy;
+A low-level custom `node` composition may provide `configuration.signals` with
+its own policy and explicitly configured routes. Governed composition always
+derives its signal policy from active membership, and convenience `connectPeer`
+requires that governance controller. The
 standalone [`SignalChannel`](../signals/README.md) works without any browser peer,
 OPFS store, SQL engine or database grant.
 

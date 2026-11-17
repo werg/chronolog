@@ -53,7 +53,7 @@ export function createAdmissionClock(options: { readonly now?: () => number; rea
 }
 
 /** Match the original signed core to an actual native inclusion receipt. */
-export function observeIncludedProposals(native: NativeBrowserFixture) {
+export function observeIncludedProposals(native: Pick<NativeBrowserFixture, 'agent' | 'transport' | 'governed'>) {
   const observed = new Set<string>()
   const decoded = new Set<string>()
   return async () => {

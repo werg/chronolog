@@ -12,10 +12,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 
 import type { AgentApplicationContext } from '@chronolog/agent-service'
+import { createGovernedPeerService, type GovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import { openAuthenticatedPeerLink } from '@chronolog/agent-service/peer-link'
-import { createCapabilitySignals, isCapabilityActive } from '@chronolog/capabilities'
 import { loadOrCreateEnrollmentIdentity, MemoryOperationStore } from '@chronolog/node-core'
-import { bytesToBase64Url, bytesToHex, equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
+import { bytesToBase64Url, equalBytes, generateEd25519KeyPair } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
 import { createHttpWebRtcSignaling, openWebRtcConnection, type WebRtcOfferHandler } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
@@ -67,9 +67,9 @@ try { interfaces() } catch { changedInterfaces = true; os.networkInterfaces = ()
 let native: Awaited<ReturnType<typeof createNativeBrowserFixture>> | undefined
 let local: PortableFeedTransport | undefined
 let rtc: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined
-let session: Awaited<ReturnType<typeof openAuthenticatedPeerLink>> | undefined
-let signals: ReturnType<typeof createCapabilitySignals> | undefined
-let task: ResidentTask | undefined, running: Promise<void> | undefined, detach: (() => void) | undefined
+let session: Awaited<ReturnType<GovernedPeerService['connectPeer']>> | undefined
+let peerService: GovernedPeerService | undefined
+let task: ResidentTask | undefined, running: Promise<void> | undefined
 const lifetime = new AbortController(), errors: string[] = []
 try {
   const keyPath = join(directory, 'localhost-key.pem'), certPath = join(directory, 'localhost-cert.pem')
@@ -82,8 +82,9 @@ try {
     signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey) })
   native = await createNativeBrowserFixture({ directory: join(directory, 'native'), topics: ['chat'], browsers: [{
     identity: bytesToBase64Url(identity.signing.publicKeyBytes), readerKey: bytesToBase64Url(identity.reader.publicKeyBytes), transportAuthor: local.identity }] })
-  signals = createCapabilitySignals({ groupId: native.node.groupId, identity: identity.signing,
-    current: () => native!.governed.activeSnapshot })
+  peerService = await createGovernedPeerService({ groupId: native.node.groupId, identity: identity.signing,
+    activeMembership: () => native!.governed.activeSnapshot, local: local.asLink(), attach: link => local!.connect(link) })
+  const signals = peerService.signals
   const token = crypto.randomUUID(), nativeOptions = { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }
   let authorizations = 0
   const options = { context: native.agent.context, endpoint, listen: { host: '127.0.0.1', port }, tls: { key, cert },
@@ -127,16 +128,8 @@ try {
   const signaling = createHttpWebRtcSignaling({ url: endpoint, headers: { Origin: origin, Authorization: `Bearer ${token}` }, fetch })
   rtc = await openWebRtcConnection({ role: 'offerer', signaling, configuration: { iceServers: [] },
     createPeerConnection: configuration => createNativePeerConnection(configuration, nativeOptions) })
-  session = await openAuthenticatedPeerLink({ connection: rtc, local: local.asLink(), groupId: snapshot.groupId, identity: identity.signing, grantId: grant.id,
-    receiveSignal: async frame => { await signals!.receive(frame) },
-    authorizePeer: ({ authorId, grantId }) => {
-      const current = native!.governed.activeSnapshot, capability = current.capabilities.get(bytesToHex(grantId))
-      return capability !== undefined && capability.grant.role === 'reader' && isCapabilityActive(capability, current.revision) &&
-        equalBytes(capability.grant.signingPublicKey, authorId) && equalBytes(authorId, native!.identity.signing.publicKeyBytes)
-    } })
-  const detachFeed = local.connect(session.link), detachSignals = signals.attach(frame => session!.sendSignal(frame))
-  detach = () => { detachSignals(); detachFeed() }
-  void session.completion.finally(detach).catch(() => undefined)
+  session = await peerService.connectPeer({ connection: rtc, peerIdentity: native.identity.signing.publicKeyBytes })
+  void session.completion.catch(() => undefined)
   await waitFor(async () => task!.stats?.active === 1)
   assert.equal(signaling.stats.closed, true); assert.equal(signaling.stats.requests, 1)
   passed('a cold native client completes one direct HTTPS offer and authenticates through the actual resident context')
@@ -177,8 +170,8 @@ try {
   lifetime.abort()
   await bounded(running, 5_000)
   await bounded(session.completion.catch(() => undefined), 5_000)
-  await assert.rejects(native.client.signals.send('typing', { typing: false }), /SIGNAL_DISCONNECTED/u)
-  await assert.rejects(signals.send('typing', { typing: false }), /SIGNAL_DISCONNECTED/u)
+  await assert.rejects(native.client.signals.send('typing', { typing: false }), /SIGNAL_ROUTE_UNAVAILABLE/u)
+  await assert.rejects(signals.send('typing', { typing: false }), /SIGNAL_ROUTE_UNAVAILABLE/u)
   assert.equal(task.stats?.closed, true); assert.equal(task.stats?.active, 0); assert.equal(task.stats?.pending, 0)
   assert.equal(getEventListeners(lifetime.signal, 'abort').length, 0)
   await assert.rejects(fetch(endpoint))
@@ -203,9 +196,8 @@ try {
   report.passed = true
 } catch (error) { report.error = error instanceof Error ? error.stack ?? error.message : String(error); throw error }
 finally {
-  lifetime.abort(); detach?.()
-  signals?.close()
-  await Promise.allSettled([running, session?.close(), rtc?.close()])
+  lifetime.abort()
+  await Promise.allSettled([running, peerService?.close(), session?.close(), rtc?.close()])
   await local?.close(); await native?.close()
   await writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n')
   if (changedInterfaces) { os.networkInterfaces = interfaces; syncBuiltinESMExports() }

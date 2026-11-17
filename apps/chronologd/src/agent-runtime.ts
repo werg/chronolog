@@ -3,12 +3,12 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
-  DurableEffectWorker, DurableTimerScheduler, NativeFinalityService, ResidentAgentService, openAuthenticatedPeerLink,
+  DurableEffectWorker, DurableTimerScheduler, NativeFinalityService, ResidentAgentService,
 } from '@chronolog/agent-service'
 import type {
   AgentApplicationContext, AgentApplicationModule, FinalEventPublisher, ResidentTask,
 } from '@chronolog/agent-service'
-import { createCapabilitySignals, isCapabilityActive } from '@chronolog/capabilities'
+import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import type { CapabilitySnapshot } from '@chronolog/capabilities'
 import type {
   ChronologNode, DurableOperationStore, EnrollmentDescriptor, OrderedRecordHead,
@@ -24,7 +24,7 @@ export interface DaemonAgentRuntimeOptions {
   readonly store: DurableOperationStore
   readonly identity: Ed25519KeyPair
   readonly descriptor: EnrollmentDescriptor
-  readonly activeMembership?: () => CapabilitySnapshot
+  readonly activeMembership: () => CapabilitySnapshot
   readonly finalityRecordQuotaBytes?: number
   readonly finalityPayloadQuotaBytes?: number
   readonly finalityClock?: () => number
@@ -32,15 +32,17 @@ export interface DaemonAgentRuntimeOptions {
   readonly modulePath?: string
   /** Dependency injection for native integration tests and embedded deployments. */
   readonly application?: AgentApplicationModule
-  readonly peerLinks?: { readonly local: FeedLink; attach(link: FeedLink): () => void }
+  readonly peerLinks: { readonly local: FeedLink; attach(link: FeedLink): () => void }
 }
 
 export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOptions) {
+  if (options.application !== undefined && options.modulePath !== undefined) throw new Error('AGENT_MODULE_DUPLICATE')
   const descriptor = structuredClone(options.descriptor)
   await verifyEnrollmentDescriptor(descriptor)
-  if (!equalBytes(options.node.groupId, descriptor.history.groupId) ||
-      !equalBytes(options.node.executionManifestDigest, descriptor.history.executionManifestDigest)) throw new Error('AGENT_DESCRIPTOR_MISMATCH')
   const history = descriptor.history
+  if (!equalBytes(options.node.groupId, history.groupId) || !equalBytes(options.node.identity, options.identity.publicKeyBytes) ||
+      !equalBytes(options.node.executionManifestDigest, history.executionManifestDigest) ||
+      options.node.historyPolicy !== history.kind) throw new Error('AGENT_REPLICA_CONFIGURATION_MISMATCH')
   const sourceId = `${bytesToHex(history.groupId)}/${history.kind === 'coordinated'
     ? history.historyId : bytesToHex(history.genesisDigest)}`
   const finality = history.kind === 'coordinated' &&
@@ -52,15 +54,11 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
       ...(options.finalityPayloadQuotaBytes === undefined ? {} : { payloadQuotaBytes: options.finalityPayloadQuotaBytes }),
       ...(options.continuity === undefined ? {} : { continuity: options.continuity }) })
     : null
-  if (finality === null && options.continuity !== undefined) throw new Error('AUTHORITY_CONTINUITY_WITHOUT_LOCAL_AUTHORITY')
+  if (finality === null && options.continuity !== undefined) throw new Error('FINALITY_CONTINUITY_WITHOUT_LOCAL_PROVIDER')
   const controller = new AbortController()
-  const signals = createCapabilitySignals({ groupId: history.groupId, identity: options.identity, relay: true,
-    current() {
-      if (options.activeMembership === undefined) throw new Error('SIGNAL_GOVERNANCE_REQUIRED')
-      return options.activeMembership()
-    },
-  })
-  const peerClosers = new Set<() => Promise<void>>()
+  const peers = await createGovernedPeerService({ identity: options.identity, groupId: history.groupId,
+    activeMembership: options.activeMembership, local: options.peerLinks.local,
+    attach: (link) => options.peerLinks.attach(link) })
   const publisher: FinalEventPublisher = {
     publishFinal: async (topic, payload, input) => {
       // A sibling resident task can stop the authority before runtime.close().
@@ -72,44 +70,10 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
     },
   }
   const context: AgentApplicationContext = {
-    node: options.node, store: options.store, finality, publisher, sourceId, signals,
-    connectPeer: async (input) => {
-      const closeOpening = async (): Promise<void> => { await input.connection.close() }
-      peerClosers.add(closeOpening)
-      try {
-        controller.signal.throwIfAborted()
-        if (options.activeMembership === undefined || options.peerLinks === undefined) throw new Error('PEER_GOVERNANCE_TRANSPORT_REQUIRED')
-        const current = options.activeMembership()
-        const reader = input.grantId ?? [...current.capabilities.values()].find((capability) => capability.grant.role === 'reader' &&
-          isCapabilityActive(capability, current.revision) && equalBytes(capability.grant.signingPublicKey, options.identity.publicKeyBytes))?.id
-        if (reader === undefined) throw new Error('PEER_LOCAL_READER_GRANT_REQUIRED')
-        const session = await openAuthenticatedPeerLink({ connection: input.connection, local: options.peerLinks.local,
-          identity: options.identity, groupId: history.groupId, grantId: reader,
-          authorizePeer: ({ authorId, grantId }) => {
-            const snapshot = options.activeMembership!(), capability = snapshot.capabilities.get(bytesToHex(grantId))
-            return equalBytes(snapshot.groupId, history.groupId) && capability !== undefined &&
-              capability.grant.role === 'reader' && isCapabilityActive(capability, snapshot.revision) &&
-              equalBytes(capability.grant.signingPublicKey, authorId)
-          },
-          receiveSignal: async (frame: Uint8Array) => { await signals.receive(frame) },
-        })
-        let detach: (() => void) | undefined, detachSignals: (() => void) | undefined
-        try {
-          controller.signal.throwIfAborted()
-          detach = options.peerLinks.attach(session.link)
-          detachSignals = signals.attach((bytes) => session.sendSignal(bytes))
-          const cleanup = (): void => { detachSignals?.(); detach?.(); peerClosers.delete(close) }
-          const close = async (): Promise<void> => { cleanup(); await session.close() }
-          peerClosers.add(close)
-          void session.completion.finally(cleanup).catch(() => undefined)
-          return { completion: session.completion, close }
-        } catch (error) { detachSignals?.(); detach?.(); await session.close(); throw error }
-      } catch (error) { await input.connection.close(); throw error }
-      finally { peerClosers.delete(closeOpening) }
-    },
+    node: options.node, store: options.store, finality, signals: peers.signals, publisher, sourceId,
+    connectPeer: (input) => peers.connectPeer(input),
   }
   try {
-    if (options.application !== undefined && options.modulePath !== undefined) throw new Error('AGENT_MODULE_DUPLICATE')
     const application = options.application ?? (options.modulePath === undefined ? undefined : await loadApplicationModule(options.modulePath))
     const definition = application === undefined ? {} : await application.createAgent(context)
     const tasks: ResidentTask[] = finality === null ? [] : [{ id: 'finality', run: (signal) => finality.serve(options.transport, signal) }]
@@ -136,19 +100,22 @@ export async function createDaemonAgentRuntime(options: DaemonAgentRuntimeOption
       run(): Promise<void> {
         if (running !== null) throw new Error('AGENT_SERVICE_ALREADY_RUNNING')
         if (controller.signal.aborted) throw new Error('AGENT_SERVICE_STOPPED')
-        running = service?.run(controller.signal) ?? Promise.resolve()
+        running = (service?.run(controller.signal) ?? Promise.resolve()).catch(async (error: unknown) => {
+          controller.abort(error)
+          await peers.close().catch(() => undefined)
+          throw error
+        })
         return running
       },
       async close(): Promise<void> {
         controller.abort()
-        signals.close()
-        await Promise.all([...peerClosers].map((close) => close()))
+        await peers.close()
         if (running !== null) await running.catch(() => undefined)
       },
     }
   } catch (error) {
-    controller.abort(); signals.close()
-    await Promise.allSettled([...peerClosers].map(close => close()))
+    controller.abort(error)
+    await peers.close().catch(() => undefined)
     throw error
   }
 }
@@ -179,7 +146,7 @@ export async function waitForFinalAcceptance(node: ChronologNode, txId: Uint8Arr
   }
 }
 
-export async function readAuthorityContinuity(path: string): Promise<OrderedRecordHead> {
+export async function readFinalityContinuity(path: string): Promise<OrderedRecordHead> {
   const value = JSON.parse(await readFile(resolve(path), 'utf8')) as unknown
   if (typeof value !== 'object' || value === null || !('historyId' in value) || !('position' in value) || !('root' in value) ||
       typeof value.historyId !== 'string' || !/^h_[0-9a-f]{32}$/u.test(value.historyId) ||

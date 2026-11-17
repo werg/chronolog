@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { createGovernedPeerService } from '@chronolog/agent-service/governed-peer'
 import { decodeSignedGenesis } from '@chronolog/capabilities'
 import { createEventMaterializationRuntime } from '@chronolog/materializer'
 import { createDoltLiteExecutionManifest, createDoltLiteMaterializationRuntime, DeterministicMaterializer } from '@chronolog/materializer-doltlite'
@@ -64,8 +65,10 @@ describe('browser qualification native fixture', () => {
       initialEpochContentKey: base64UrlToBytes(native.bootstrap.epochContentKey) })
     cleanup.push(() => replica.close())
     await replica.start()
-    const session = await connectGovernedBrowserPeer({ bootstrap: native.bootstrap, identity, transport,
-      activeMembership: () => replica.activeSnapshot })
+    const peerService = await createGovernedPeerService({ identity: identity.signing, groupId: replica.descriptor.history.groupId,
+      activeMembership: () => replica.activeSnapshot, local: transport.asLink(), attach: link => transport.connect(link) })
+    cleanup.push(() => peerService.close())
+    const session = await connectGovernedBrowserPeer({ bootstrap: native.bootstrap, peer: peerService })
     cleanup.push(() => session.close())
     await transport.catchUp()
     await replica.node.waitForIdle()

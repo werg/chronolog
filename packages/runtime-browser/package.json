@@ -8,6 +8,8 @@
     "./events": "./src/event-peer.ts"
   },
   "dependencies": {
+    "@chronolog/agent-service": "workspace:*",
+    "@chronolog/signals": "workspace:*",
     "@chronolog/rpc": "workspace:*",
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/node-core": "workspace:*",
@@ -15,9 +17,6 @@
     "@chronolog/control-store": "workspace:*",
     "@chronolog/canonical": "workspace:*",
     "@chronolog/records": "workspace:*",
-    "@chronolog/materializer": "workspace:*",
-    "@chronolog/signals": "workspace:*",
-    "@chronolog/capabilities": "workspace:*",
-    "@chronolog/agent-service": "workspace:*"
+    "@chronolog/materializer": "workspace:*"
   }
 }

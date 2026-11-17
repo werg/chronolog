@@ -8,10 +8,12 @@
     "./workers": "./src/workers.ts",
     "./framing": "./src/framing.ts",
     "./peer-link": "./src/peer-link.ts",
+    "./governed-peer": "./src/governed-peer.ts",
     "./membership-http": "./src/membership-http.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",
+    "@chronolog/capabilities": "workspace:*",
     "@chronolog/node-core": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",

@@ -7,6 +7,7 @@ import { frameRtcDataChannel, type DataChannelConnection, type RtcDataChannel } 
 import type { BrowserEventIdentity } from '../browser/event-contract.js'
 import type { PilotPeerBootstrap, PilotProgress, PilotRouteStats } from './contract.js'
 import { routeState } from './route-state.js'
+import { attachPilotPeer } from './peer.js'
 
 const endpoint = globalThis as unknown as WorkerEndpoint
 let peer: BrowserPeer | undefined
@@ -23,20 +24,21 @@ async function connect(channel: RtcDataChannel, connectionId: number): Promise<v
   const framed = frameRtcDataChannel(channel)
   opening = framed
   try {
-    const started = performance.now()
-    await framed.ready
-    const authenticated = await peer.connectPeer({ connection: framed, peerIdentity: base64UrlToBytes(bootstrap.nativeIdentity) })
-    const authenticatedMs = performance.now() - started
+    const authenticated = await attachPilotPeer({ connection: framed, peer, nativeIdentity: bootstrap.nativeIdentity })
     if (generation !== connectionGeneration) { await authenticated.close(); throw new Error('PILOT_CONNECTION_SUPERSEDED') }
     let closed = false
     const current = {
-      stats: (): PilotRouteStats => { const stats = framed.stats; return { route: 'webrtc', authenticatedMs,
+      stats: (): PilotRouteStats => { const stats = framed.stats; return { route: 'webrtc', authenticatedMs: authenticated.authenticatedMs,
         sentBytes: stats.sentBytes, receivedBytes: stats.receivedBytes, queuedBytes: stats.queuedSendBytes + stats.queuedReceiveBytes } },
       async close() { if (closed) return; closed = true; await authenticated.close() } }
     connection = current
-    void authenticated.completion.catch((error: unknown) => {
-      if (!closed && connection === current) endpoint.postMessage({ pilot: 'connection-error', connectionId, error: String(error) })
-    }).finally(() => {
+    const ended = () => {
+      if (!closed && connection === current) endpoint.postMessage({ pilot: 'connection-error', connectionId, error: 'Authenticated peer session ended' })
+    }
+    authenticated.signal.addEventListener('abort', ended, { once: true })
+    if (authenticated.signal.aborted) ended()
+    void authenticated.completion.catch(() => undefined).finally(() => {
+      authenticated.signal.removeEventListener('abort', ended)
       if (connection === current) { connection = undefined; connectionHistory.push(current.stats()) }
     })
   } catch (error) { await framed.close(); throw error }
@@ -70,9 +72,7 @@ endpoint.addEventListener('message', (event) => {
         peer = await openBrowserPeer({ name: request.name!, engineUrl: new URL('./engine/', globalThis.location.href), configure() {
           return { materializer: { executionManifest: decodeExecutionManifest(base64UrlToBytes(bootstrap!.executionManifest)), rootAdministrator: genesis.manifest.schemaAdminPublicKey },
             governed: { genesis, groupRoute: base64UrlToBytes(bootstrap!.groupRoute), initialEpochContentKey: base64UrlToBytes(bootstrap!.epochContentKey) },
-            close: async () => {
-              await disconnect()
-            } }
+            close: disconnect }
         } })
         serveBrowserPeer(endpoint, peer)
         return { groupId: bytesToBase64Url(genesis.manifest.groupId), identity: bytesToBase64Url(peer.node.identity) }

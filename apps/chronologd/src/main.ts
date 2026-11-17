@@ -28,7 +28,7 @@ import { daemonSecretStoreFromEnvironment } from './secret-store.js'
 import { createGovernanceRpcAdmin } from './governance-admin.js'
 import { acquireDataDirectoryLock } from './data-lock.js'
 import { SqliteOperationStore } from './operation-store.js'
-import { createDaemonAgentRuntime, readAuthorityContinuity } from './agent-runtime.js'
+import { createDaemonAgentRuntime, readFinalityContinuity } from './agent-runtime.js'
 
 const dataDirectory = resolve(process.env.CHRONOLOG_DATA_DIR ?? '.chronolog')
 const dataLock = await acquireDataDirectoryLock(dataDirectory, 'daemon')
@@ -216,7 +216,7 @@ async function startRuntime() {
         finalityRecordQuotaBytes: runtime.finalityRecordQuotaBytes,
         finalityPayloadQuotaBytes: runtime.finalityPayloadQuotaBytes,
         ...(runtime.agentModule === undefined ? {} : { modulePath: runtime.agentModule }),
-        ...(runtime.finalityContinuityFile === undefined ? {} : { continuity: await readAuthorityContinuity(runtime.finalityContinuityFile) }),
+        ...(runtime.finalityContinuityFile === undefined ? {} : { continuity: await readFinalityContinuity(runtime.finalityContinuityFile) }),
       })
     }
     server = new HttpRpcServer({

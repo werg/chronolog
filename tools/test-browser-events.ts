@@ -111,7 +111,7 @@ try {
     assert.deepEqual(await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.nextSignal('owner', 'live')), nativeSignal)
     await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.unsubscribeSignals('owner', 'live'))
     await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.disconnect('owner'))
-    await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: true, from: 'disconnected' })), /SIGNAL_DISCONNECTED/u)
+    await assert.rejects(page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: true, from: 'disconnected' })), /SIGNAL_ROUTE_UNAVAILABLE/u)
     await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.connect('owner'))
     await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.subscribeSignals('owner', 'reconnected'))
     const reconnectedBrowserSignal = await page.evaluate(() => (globalThis as unknown as TestWindow).chronologEventTest.sendSignal('owner', { typing: false, from: 'reconnected-browser' }))

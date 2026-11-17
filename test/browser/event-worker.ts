@@ -8,7 +8,7 @@ import { openBrowserEventPeer, prepareBrowserIdentity, serveBrowserEventPeer, ty
 import { acquireBrowserStorage } from '../../packages/runtime-browser/src/opfs.js'
 import { openSyncControl } from '../../packages/runtime-browser/src/sync-control.js'
 import type { WorkerEndpoint } from '../../packages/runtime-browser/src/worker-rpc.js'
-import { openHttpPeerConnection } from './event-connection.js'
+import { connectGovernedBrowserPeer } from './event-connection.js'
 import type { BrowserEventBootstrap, BrowserEventIdentity } from './event-contract.js'
 import { qualifyStorageQuota } from './storage-quota.js'
 
@@ -25,8 +25,8 @@ const pause = async (point: string): Promise<never> => {
 }
 const checkpoint = () => new CheckpointStore(operations!, { id: 'browser-projection', binding: checkpointBinding })
 async function connect(): Promise<void> {
-  connection = await peer!.connectPeer({ connection: await openHttpPeerConnection(bootstrap!.peerUrl, bootstrap!.peerToken),
-    peerIdentity: base64UrlToBytes(bootstrap!.nativeIdentity) })
+  await connection?.close()
+  connection = await connectGovernedBrowserPeer({ bootstrap: bootstrap!, peer: peer! })
   void connection.completion.catch((error: unknown) => endpoint.postMessage({ fixture: 'connection-error', error: String(error) }))
 }
 

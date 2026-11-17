@@ -62,7 +62,7 @@ admission window. Idle closure publication, real SQLite commits, process kills
 and exact accepted/rejected recovery still run. This is a crash durability test;
 real network and wall-clock admission latency require separate deployment tests.
 
-Twelve scenarios send **SIGKILL**, without graceful cleanup, at six observed
+Eighteen scenarios send **SIGKILL**, without graceful cleanup, at nine observed
 boundaries for both an accepted SQL/event operation and an operation whose final
 SQL assertion rejects the whole transaction:
 
@@ -72,6 +72,9 @@ SQL assertion rejects the whole transaction:
 | After detached payload commit | Previous complete prefix; an unreferenced payload may exist within its durable reservation |
 | Before ordered record commit | Previous complete prefix |
 | After ordered record commit | Prefix includes the original new descriptor |
+| Before closure marker commit | Prefix includes the descriptor without its next closure |
+| After closure marker commit | Prefix includes the descriptor and durable signed closure |
+| Before prefix certificate commit | Durable closure survives an older retained certificate |
 | After prefix certificate commit | Prefix includes the original new descriptor and its certificate |
 | After final application outcome, before caller acknowledgment | Original accepted/rejected result remains recoverable |
 
@@ -155,8 +158,8 @@ fails closed without replacing the surviving configuration or proof. A still-ope
 log also refuses a missing underlying value. A committed append ahead of the
 last saved certificate remains recoverable with its original retry position.
 
-`packages/agent-service/src/native-authority.test.ts` exercises interrupted setup
-before/after the empty-log and configuration writes, loss of an empty or certified
+`packages/agent-service/src/native-finality.test.ts` exercises interrupted setup
+before/after the empty-log, payload-index and configuration writes, loss of an empty or certified
 log, shorter/conflicting replacement logs, invalid encoding/kind/signature/configuration
 in retained proof, and recovery of an append ahead of the last certificate. These
 targeted metadata tests complement the real process-crash rehearsal above.
