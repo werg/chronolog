@@ -1,17 +1,11 @@
+import type { PeerMessageChannel } from '@chronolog/records'
+
 /** The small browser/native WebRTC surface used by the transport. */
-export interface RtcDataChannel {
+export interface RtcDataChannel extends PeerMessageChannel {
   readonly label: string
   readonly ordered: boolean
   readonly maxPacketLifeTime: number | null
   readonly maxRetransmits: number | null
-  readonly readyState: string
-  readonly bufferedAmount: number
-  bufferedAmountLowThreshold: number
-  binaryType: string
-  send(data: ArrayBuffer): void
-  close(): void
-  addEventListener(type: string, listener: EventListener): void
-  removeEventListener(type: string, listener: EventListener): void
 }
 
 export interface RtcPeerConnection {
