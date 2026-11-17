@@ -218,7 +218,10 @@ identity; an incompatible engine fails before initializing the SQL cache.
 This composition uses the same page facade and Tendriller adapter described
 below. Both SQL databases are derived from authenticated history; they do not
 replace original encrypted records, saved operation intent, or the epoch keyring.
-Irreversible effects require a separately declared protected boundary.
+External effects retain their dispatch journal across recovery and reconcile
+uncertain calls with the provider. Protect prerequisites only when the application
+requires them to survive recovery; see
+[Shared SQL commands and effects](#shared-sql-commands-and-effects).
 
 ## Recovery and inspection
 
