@@ -5,13 +5,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { frameLivePeerStream, framePeerStream } from '@chronolog/records'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
-  decodePeerValue, encodePeerValue, peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest, type HistoryPoint, type PeerIdentity, type PrefixProof, type ParticipantRequest } from '@chronolog/peer-generation'
-import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program } from '@chronolog/protocol'
+  peerDigest, signApplicationDescriptor, signControlRevision, signTransitionRequest, type HistoryPoint, type PeerIdentity, type PrefixProof, type ParticipantRequest } from '@chronolog/peer-generation'
+import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
 import type { FramedPeerConnection } from '@chronolog/records'
 import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
 import { openNativeDevice } from './native.js'
 import { openPeerApplication } from './runtime.js'
 import { connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
+import { observePeerWire } from './network.test-helpers.js'
 
 const definition = defineApplication({ id: 'network-messages', version: '1', commands: {
   say: defineCommand({ description: 'Post a message', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
@@ -75,27 +76,10 @@ function deferred() {
   return { promise, resolve }
 }
 type Packet = { readonly kind: string; readonly message?: ParticipantRequest }
-/** Observe complete logical messages while exercising the real fragment codec. */
-function intercept(connection: FramedPeerConnection, inspect: (packet: Packet, bytes: number) => Packet | void | Promise<Packet | void>): FramedPeerConnection {
-  let assembled: Uint8Array | undefined
-  return { ...connection, async send(frame, options) {
-    const value = assertCanonicalCbor(frame)
-    if (!Array.isArray(value) || value.length !== 5 || !(value[4] instanceof Uint8Array)) throw new Error('TEST_FRAGMENT_INVALID')
-    const offset = Number(value[2]), total = Number(value[3]), chunk = value[4]
-    if (offset === 0) assembled = new Uint8Array(total)
-    if (assembled === undefined) throw new Error('TEST_FRAGMENT_ORDER')
-    assembled.set(chunk, offset)
-    if (offset + chunk.length === total) {
-      const result = await inspect(decodePeerValue<Packet>(assembled), total)
-      assembled = undefined
-      if (result !== undefined) {
-        if (offset !== 0) throw new Error('TEST_REWRITE_REQUIRES_ONE_FRAGMENT')
-        const bytes = encodePeerValue(result)
-        frame = encodeCanonicalCbor([value[0]!, value[1]!, 0n, BigInt(bytes.length), bytes])
-      }
-    }
-    await connection.send(frame, options)
-  } }
+/** Observe the participant's actual framed messages before the shared channel encrypts them. */
+function intercept(connection: FramedPeerConnection, identity: string, inspect: (packet: Packet, bytes: number) => Packet | void | Promise<Packet | void>): FramedPeerConnection {
+  observePeerWire(identity, inspect)
+  return connection
 }
 async function seed(session: ApplicationSession<typeof definition>, count: number): Promise<void> {
   // Real public authoring supplies the original encrypted attempts and receipts.
@@ -230,7 +214,7 @@ describe('authenticated application transport', () => {
     await (await a.command('say', 'captured', { operationId: 'captured' })).applied()
     let enabled = false, states = 0
     const nextState = deferred(), release = deferred()
-    const left = intercept(channels[0], async value => {
+    const left = intercept(channels[0], a.deviceId, async value => {
       const payload = value.message?.payload
       if (enabled && value.kind === 'response' && payload !== null && typeof payload === 'object' && 'authority' in payload) {
         states++
@@ -270,7 +254,7 @@ describe('authenticated application transport', () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
     await (await a.command('say', 'first', { operationId: 'first' })).applied()
     let advance = false, captured: HistoryPoint | undefined
-    const right = intercept(channels[1], async value => {
+    const right = intercept(channels[1], b.deviceId, async value => {
       const receipt = value.message?.payload as { readonly payload?: { readonly peer?: string; readonly point?: HistoryPoint } } | null
       if (advance && value.kind === 'response' && receipt?.payload?.peer === b.deviceId && receipt.payload.point?.sequence === 1) {
         advance = false; captured = receipt.payload.point
@@ -342,7 +326,7 @@ describe('authenticated application transport', () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
     await seed(a, 65)
     const channels = pair(), pageSizes: number[] = [], responseBytes: number[] = []
-    const left = intercept(channels[0], (value, bytes) => {
+    const left = intercept(channels[0], a.deviceId, (value, bytes) => {
       if (value.kind === 'response' && Array.isArray(value.message?.payload)) { pageSizes.push(value.message.payload.length); responseBytes.push(bytes) }
     })
     await connect(a, b, [left, channels[1]])
@@ -358,7 +342,7 @@ describe('authenticated application transport', () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
     const requested = deferred(), release = deferred(), controller = new AbortController()
     let target: number | undefined, requestBytes = 0
-    const left = intercept(channels[0], value => {
+    const left = intercept(channels[0], a.deviceId, value => {
       const state = value.message?.payload
       if (value.kind === 'response' && value.message !== undefined && state !== null && typeof state === 'object' && 'authority' in state && 'revision' in state) {
         const revision = a.revision
@@ -369,7 +353,7 @@ describe('authenticated application transport', () => {
         return { ...value, message: { ...value.message, payload: { ...state, point, revision: { ...revision, point } } } }
       }
     })
-    const right = intercept(channels[1], async (value, bytes) => {
+    const right = intercept(channels[1], b.deviceId, async (value, bytes) => {
       if (value.kind === 'request' && value.message?.action === 'range') {
         target = (value.message.payload as { readonly through: { readonly sequence: number } }).through.sequence
         requestBytes = bytes; requested.resolve(); await release.promise

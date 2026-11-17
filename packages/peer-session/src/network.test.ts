@@ -10,6 +10,7 @@ import { defineApplication, defineCommand, applicationDefinitionDigest } from '.
 import { openApplicationDevice } from './device.js'
 import { openPeerApplication } from './runtime.js'
 import { createFramedPeerConnectionPair, type FramedPeerConnection } from './network.js'
+import { observePeerWire } from './network.test-helpers.js'
 
 const definition = defineApplication({ id: 'network', version: '1', commands: {
   say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
@@ -42,7 +43,7 @@ async function fixture(options: { readerOnly?: boolean } = {}) {
   return { a, b, host, keys, descriptor, control, registry, open }
 }
 
-/** Fault injection at an existing single-fragment control response, preserving framing IDs. */
+/** The public handshake remains visible to an untrusted relay. */
 function rewrite(connection: FramedPeerConnection, change: (value: Record<string, unknown>) => unknown): FramedPeerConnection {
   return { ...connection, async send(bytes, options) {
     const frame = assertCanonicalCbor(bytes)
@@ -53,15 +54,22 @@ function rewrite(connection: FramedPeerConnection, change: (value: Record<string
   } }
 }
 
+function rewriteParticipant(connection: FramedPeerConnection, identity: string, change: (value: Record<string, unknown>) => unknown): FramedPeerConnection {
+  observePeerWire(identity, value => change(value) as typeof value)
+  return connection
+}
+
 describe('authenticated peer application connections', () => {
   it('routes original saved commands, fragmented ciphertext, exact coverage and live signals over separate lanes', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const operation = await b.command('bulk', 'private payload '.repeat(500), { operationId: 'fragmented' })
     const saved = await b.operations.inspect('fragmented')
-    const [left, right] = createFramedPeerConnectionPair(), sizes: number[] = [], reliableText: string[] = []
+    const [left, right] = createFramedPeerConnectionPair(), sizes: number[] = [], reliableText: string[] = [], liveText: string[] = []
     const counted = { ...right, async send(bytes: Uint8Array, options?: { signal?: AbortSignal }) {
       sizes.push(bytes.length); reliableText.push(new TextDecoder().decode(bytes)); await right.send(bytes, options)
-    } }
+    }, live: { ...right.live!, async trySend(bytes: Uint8Array, options?: { signal?: AbortSignal }) {
+      liveText.push(new TextDecoder().decode(bytes)); return right.live!.trySend(bytes, options)
+    } } }
     const links = await Promise.all([a.connectPeer({ connection: left, peerIdentity: b.deviceId }),
       b.connectPeer({ connection: counted, peerIdentity: a.deviceId })])
     closing.push(async () => { await Promise.all(links.map(link => link.close())) })
@@ -76,8 +84,10 @@ describe('authenticated peer application connections', () => {
     expect(view.readEvents().events).toHaveLength(8); view.release()
     expect(await operation.shared({ signal: AbortSignal.timeout(5000) })).toHaveLength(1)
     const subscription = a.signals.subscribe({ topics: ['typing'] })[Symbol.asyncIterator](), received = subscription.next()
-    const sent = await b.signals.send('typing', { active: true })
+    const sent = await b.signals.send('typing', { active: true, cursor: 'private live marker' })
     expect((await received).value).toEqual(sent)
+    expect(liveText).toHaveLength(1); expect(liveText[0]).not.toContain('private live marker')
+    expect(reliableText.join('')).not.toContain('requestId')
     await subscription.return?.()
     await b.close()
     expect(links[0].signal.aborted).toBe(true); expect(links[1].signal.aborted).toBe(true)
@@ -95,6 +105,44 @@ describe('authenticated peer application connections', () => {
     expect(left.signal.aborted).toBe(true)
   })
 
+  it.each(['suite', 'receiver key', 'encapsulation'] as const)('rejects a relay substituting the handshake %s', async fault => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    const forged = rewrite(right, value => {
+      if (value.kind === 'proof' && fault === 'encapsulation') return { ...value, encapsulatedKey: '11'.repeat(32) }
+      if (value.kind !== 'hello' || fault === 'encapsulation') return value
+      const hello = value.value as { readonly channel: object }
+      return { ...value, value: { ...hello, channel: { ...hello.channel,
+        ...(fault === 'suite' ? { suite: 'plaintext' } : { receiverKey: '22'.repeat(32) }) } } }
+    })
+    const results = await Promise.allSettled([a.connectPeer({ connection: left }), b.connectPeer({ connection: forged })])
+    expect(results.some(result => result.status === 'rejected')).toBe(true)
+    for (const result of results) if (result.status === 'fulfilled') await result.value.close()
+    expect(a.status.connectedPeers).toBe(0); expect(b.status.connectedPeers).toBe(0)
+    expect(left.signal.aborted).toBe(true)
+  })
+
+  it.each(['tamper', 'replay', 'plaintext'] as const)('retires the authenticated owner when a relay attempts %s', async fault => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair()
+    let inject = false
+    const hostile: FramedPeerConnection = { ...left, async send(frame, options) {
+      if (!inject) return left.send(frame, options)
+      const changed = frame.slice()
+      if (fault === 'tamper') changed[changed.length - 1]! ^= 1
+      if (fault === 'plaintext') changed[0] = 0x85
+      await left.send(changed, options)
+      if (fault === 'replay') await left.send(changed, options)
+    } }
+    const links = await Promise.all([a.connectPeer({ connection: hostile }), b.connectPeer({ connection: right })])
+    await Promise.all(links.map(link => link.synchronize()))
+    const revision = b.revision; inject = true
+    await expect(links[1].synchronize()).rejects.toThrow(/^APPLICATION_CHANNEL_/u)
+    expect(b.revision).toEqual(revision); expect(links[1].signal.aborted).toBe(true)
+    expect(left.signal.aborted).toBe(true); expect(b.status.connectedPeers).toBe(0)
+    await Promise.all(links.map(link => link.close()))
+  })
+
   it.each([
     ['scope', 'APPLICATION_NETWORK_SCOPE_MISMATCH'],
     ['control action', 'PEER_PARTICIPANT_FACET_FORBIDDEN'],
@@ -104,7 +152,7 @@ describe('authenticated peer application connections', () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const [left, right] = createFramedPeerConnectionPair()
     let inject = false
-    const malicious = rewrite(left, value => {
+    const malicious = rewriteParticipant(left, a.deviceId, value => {
       if (!inject || value.kind !== 'response') return value
       const message = value.message as ParticipantRequest
       if (fault === 'error payload') return { ...value, ok: false, message: { ...message, payload: null } }
@@ -168,7 +216,7 @@ describe('authenticated peer application connections', () => {
       expect(bytes).not.toBeNull(); commands.push(decodePeerValue<OrderedCommand>(bytes!))
     }
     const [left, right] = createFramedPeerConnectionPair()
-    const malicious = rewrite(left, value => {
+    const malicious = rewriteParticipant(left, a.deviceId, value => {
       if (value.kind !== 'response') return value
       const message = value.message as ParticipantRequest
       if (fault === 'root mismatch' && value.ok === false && message.payload === 'PEER_VIEW_RECOVERY_REQUIRED') {
@@ -213,13 +261,13 @@ describe('authenticated peer application connections', () => {
   it.each(['recipient', 'issuer'] as const)('binds the key-share %s to the authenticated peer', async field => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b, new Map())
     const [left, right] = createFramedPeerConnectionPair()
-    const request = rewrite(right, value => {
+    const request = rewriteParticipant(right, b.deviceId, value => {
       const message = value.message as ParticipantRequest | undefined
       if (field !== 'recipient' || value.kind !== 'request' || message?.action !== 'keyShare') return value
       const envelope = message.payload as { readonly payload: object }
       return { ...value, message: { ...message, payload: { ...envelope, payload: { ...envelope.payload, recipient: a.deviceId } } } }
     })
-    const response = rewrite(left, value => {
+    const response = rewriteParticipant(left, a.deviceId, value => {
       const message = value.message as ParticipantRequest | undefined
       const envelope = message?.payload as { readonly payload?: { readonly requestDigest?: string } } | null
       if (field !== 'issuer' || value.kind !== 'response' || envelope?.payload?.requestDigest === undefined) return value
@@ -255,7 +303,7 @@ describe('authenticated peer application connections', () => {
       entered(); await gate; return offer(request)
     })
     const coverage: unknown[] = [], [left, right] = createFramedPeerConnectionPair()
-    const observed = rewrite(right, value => {
+    const observed = rewriteParticipant(right, b.deviceId, value => {
       const message = value.message as ParticipantRequest | undefined
       if (value.kind === 'response' && message?.action === 'coverage') coverage.push(message.payload)
       return value

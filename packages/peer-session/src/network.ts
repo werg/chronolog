@@ -8,6 +8,7 @@ import { bytesToHex, hexToBytes, signDomain, verifyDomain, DOMAINS } from '@chro
 import { MAX_SIGNAL_BYTES, type SignalChannel, type SignalRoute } from '@chronolog/signals'
 import type { ApplicationContent, ContentManifest, ContentReference, ContentRetention } from './content.js'
 import type { ApplicationKeyring, ApplicationKeyRequest, ApplicationKeyShare } from './keys.js'
+import { ApplicationSecureChannel, APPLICATION_CHANNEL_SUITE, type ApplicationChannelHello } from './secure-channel.js'
 import {
   APPLICATION_NETWORK_LIMITS as LIMITS, ApplicationMessageWire, createFramedPeerConnectionPair,
   interruptible, networkError, record, requireNetwork, timeout,
@@ -44,7 +45,7 @@ export interface ApplicationPeerConnectOptions {
   readonly requestTimeoutMs?: number
   readonly transferTimeoutMs?: number
 }
-interface Hello { readonly application: string; readonly profile: 'peer-generation-v1'; readonly descriptor: string; readonly author: string; readonly nonce: string; readonly authority: AuthorityBundle }
+interface Hello { readonly application: string; readonly profile: 'peer-generation-v1'; readonly descriptor: string; readonly author: string; readonly nonce: string; readonly authority: AuthorityBundle; readonly channel: ApplicationChannelHello }
 interface RemoteState { readonly authority: AuthorityBundle; readonly point: HistoryPoint | null; readonly revision: PeerRevision | null }
 type Method = 'state' | 'range' | 'submit' | 'coverage' | 'keyShare' | 'contentManifest' | 'contentChunk' | 'contentRetained' | 'contentObserveRetention'
 const methods: readonly Method[] = ['state', 'range', 'submit', 'coverage', 'keyShare', 'contentManifest', 'contentChunk', 'contentRetained', 'contentObserveRetention']
@@ -109,6 +110,8 @@ class NetworkPeer implements ApplicationPeerLink {
   readonly #attempt: number
   readonly #controller = new AbortController()
   readonly #wire: ApplicationMessageWire
+  readonly #channel: ApplicationSecureChannel
+  #proofSent: Promise<void> | undefined
   readonly #pending = new Map<number, Pending>()
   readonly #requestMs: number
   readonly #handshakeMs: number
@@ -144,7 +147,8 @@ class NetworkPeer implements ApplicationPeerLink {
   constructor(port: ApplicationPeerPort, input: ApplicationPeerConnectOptions, owner: Owner, attempt: number) {
     this.#port = port; this.#input = input; this.#owner = owner; this.#attempt = attempt
     this.#requestMs = deadline(input.requestTimeoutMs, 120_000); this.#handshakeMs = deadline(input.handshakeTimeoutMs, 10_000)
-    this.#wire = new ApplicationMessageWire(input.connection, this.signal, deadline(input.transferTimeoutMs, 30_000), () => {
+    this.#channel = new ApplicationSecureChannel(input.connection, this.signal)
+    this.#wire = new ApplicationMessageWire(this.#channel.connection, this.signal, deadline(input.transferTimeoutMs, 30_000), () => {
       if (this.#authenticated) this.#reader()
     })
     this.#ready = new Promise((resolve, reject) => { this.#readyResolve = resolve; this.#readyReject = reject })
@@ -173,7 +177,7 @@ class NetworkPeer implements ApplicationPeerLink {
     requireNetwork(grant(replica, replica.device.publicKey, 'reader'), 'APPLICATION_PEER_NOT_AUTHORIZED')
     this.#local = { application: replica.descriptor.applicationId, profile: 'peer-generation-v1',
       descriptor: await peerDigest(replica.authority.descriptor), author: replica.device.publicKey,
-      nonce: bytesToHex(crypto.getRandomValues(new Uint8Array(32))), authority: replica.authority }
+      nonce: bytesToHex(crypto.getRandomValues(new Uint8Array(32))), authority: replica.authority, channel: await this.#channel.hello() }
     const handshake = timeout(this.#handshakeMs, 'APPLICATION_PEER_HANDSHAKE_TIMEOUT')
     void this.#read().catch(error => this.#fail(error))
     try {
@@ -214,8 +218,8 @@ class NetworkPeer implements ApplicationPeerLink {
         requireNetwork(share?.payload?.issuer === this.peerId, 'APPLICATION_KEY_SHARE_INVALID')
         return share
       })
-      if (this.#input.connection.live !== undefined) {
-        const lane = this.#input.connection.live
+      if (this.#channel.connection.live !== undefined) {
+        const lane = this.#channel.connection.live
         this.#route = this.#port.signals.attachRoute({ close: () => this.close(), trySend: async (frame, { signal }) => {
           signal.throwIfAborted(); this.#reader()
           const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
@@ -244,10 +248,12 @@ class NetworkPeer implements ApplicationPeerLink {
       requireNetwork(value !== null && typeof value === 'object' && 'kind' in value, 'APPLICATION_NETWORK_MESSAGE_INVALID')
       const kind = value.kind
       if (kind === 'hello') {
-        const message = record(value, ['kind', 'value']), input = record(message.value, ['application', 'profile', 'descriptor', 'author', 'nonce', 'authority'])
+        const message = record(value, ['kind', 'value']), input = record(message.value, ['application', 'profile', 'descriptor', 'author', 'nonce', 'authority', 'channel'])
+        const channel = record(input.channel, ['suite', 'receiverKey'])
         const local = this.#local
         requireNetwork(local !== undefined, 'APPLICATION_NETWORK_HANDSHAKE_ORDER')
-        requireNetwork(this.#remote === undefined && input.application === local.application && input.profile === local.profile &&
+        requireNetwork(this.#remote === undefined && channel.suite === APPLICATION_CHANNEL_SUITE && hexadecimal(channel.receiverKey) &&
+          input.application === local.application && input.profile === local.profile &&
           input.descriptor === local.descriptor && hexadecimal(input.author) && hexadecimal(input.nonce) &&
           input.author !== local.author && (this.#input.peerIdentity === undefined || input.author === this.#input.peerIdentity), 'APPLICATION_NETWORK_SCOPE_MISMATCH')
         // Public authority evidence is authenticated independently of its relay.
@@ -261,16 +267,24 @@ class NetworkPeer implements ApplicationPeerLink {
         this.signal.throwIfAborted()
         this.#remote = input as unknown as Hello
         this.#reader()
-        const signature = await signDomain(DOMAINS.peerConnection, encodePeerValue({ sender: this.#local, receiver: this.#remote }), this.#port.replica.device.privateKey)
+        const encapsulatedKey = await this.#channel.prepare(channel.receiverKey, this.#local, this.#remote)
+        this.#reader()
+        const signature = await signDomain(DOMAINS.peerConnection, encodePeerValue({ sender: this.#local, receiver: this.#remote, encapsulatedKey }), this.#port.replica.device.privateKey)
         this.#reader()
         // Continue reading while the other endpoint applies stream backpressure.
         // Both peers may be waiting to send their proof at this exact boundary.
-        void this.#wire.send({ kind: 'proof', signature: bytesToHex(signature) }, () => this.#reader()).catch(error => this.#fail(error))
+        this.#proofSent = this.#wire.send({ kind: 'proof', signature: bytesToHex(signature), encapsulatedKey }, () => this.#reader())
+          .then(() => { this.#channel.enableSending() })
+        void this.#proofSent.catch(error => this.#fail(error))
       } else if (kind === 'proof') {
-        const message = record(value, ['kind', 'signature'])
-        requireNetwork(!this.#authenticated && this.#remote !== undefined && hexadecimal(message.signature, 128), 'APPLICATION_PEER_PROOF_INVALID')
-        requireNetwork(await verifyDomain(DOMAINS.peerConnection, encodePeerValue({ sender: this.#remote, receiver: this.#local }),
+        const message = record(value, ['kind', 'signature', 'encapsulatedKey'])
+        requireNetwork(!this.#authenticated && this.#remote !== undefined && this.#proofSent !== undefined &&
+          hexadecimal(message.signature, 128) && hexadecimal(message.encapsulatedKey), 'APPLICATION_PEER_PROOF_INVALID')
+        requireNetwork(await verifyDomain(DOMAINS.peerConnection, encodePeerValue({ sender: this.#remote, receiver: this.#local, encapsulatedKey: message.encapsulatedKey }),
           hexToBytes(message.signature), hexToBytes(this.peerId)), 'APPLICATION_PEER_PROOF_INVALID')
+        this.#reader()
+        await this.#channel.accept(message.encapsulatedKey, this.#remote, this.#local)
+        await interruptible(this.#proofSent, this.signal)
         this.#reader(); this.#authenticated = true; this.#readyResolve()
       } else {
         requireNetwork(this.#authenticated, 'APPLICATION_PEER_AUTHENTICATION_REQUIRED'); this.#reader()
@@ -532,7 +546,7 @@ class NetworkPeer implements ApplicationPeerLink {
     let closed!: () => void
     this.#closeTask = new Promise(resolve => { closed = resolve })
     const reason = error ?? networkError('APPLICATION_NETWORK_CLOSED')
-    this.#controller.abort(reason); this.#readyReject(reason)
+    this.#controller.abort(reason); this.#channel.clear(); this.#readyReject(reason)
     for (const pending of this.#pending.values()) { pending.cancel(); pending.reject(reason) }
     this.#pending.clear(); this.#detach?.(); this.#detachContent?.(); this.#detachKeys?.(); this.#unsubscribe?.(); this.#route?.close(); this.#disposeLive?.()
     for (const dispose of this.#disposeListeners) dispose()
