@@ -158,6 +158,18 @@ exported from `@chronolog/agent-service`. A factory describes its workers and
 long-lived connection tasks; it should not wait for final publication during
 configuration, before the resident loops start.
 
+The module owns its runtime dependencies. The native distribution does not
+include the optional `@chronolog/transport-webrtc` package or its Werift
+implementation. Setting `CHRONOLOG_AGENT_MODULE` loads the specified file; it
+does not install dependencies or expose the daemon's dependencies to that file.
+For a resident HTTPS/WebRTC task, build and ship the application module with its
+transport dependencies from the matching Chronolog source checkout, following
+the [native transport packaging guide](../transport-webrtc/README.md#shipping-a-native-application-module).
+Point the environment variable at the absolute path of the resulting module
+exporting `createAgent`, which composes the resident task with the rest of the
+application. The contrib `serve-resident-webrtc.mjs` snippet exports a task
+factory and must be included in that composition.
+
 ```ts
 import type { AgentApplication } from '@chronolog/agent-service'
 

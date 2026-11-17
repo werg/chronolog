@@ -29,6 +29,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm conformance:production
+      - run: pnpm package:signals
+      - run: pnpm test:signals-package
       - run: pnpm release:distribution
       - run: pnpm test:distribution-upgrade
       - run: pnpm release:metadata
@@ -39,6 +41,7 @@ jobs:
             artifacts/release/provenance.intoto.jsonl
             artifacts/conformance/production-native.json
             artifacts/distribution/*.tar.gz
+            artifacts/signals/*.tgz
       - uses: actions/upload-artifact@v6
         with:
           name: release-evidence-${{ matrix.os }}-${{ github.sha }}
@@ -46,5 +49,7 @@ jobs:
             artifacts/release/
             artifacts/conformance/production-native.json
             artifacts/distribution/*.tar.gz
+            artifacts/signals/*.tgz
+            artifacts/signals/*.consumer.json
           if-no-files-found: error
           retention-days: 90

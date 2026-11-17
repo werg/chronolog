@@ -101,6 +101,45 @@ create an idle host subscription to conceal that reachability requirement.
 The optional `./native` entrypoint adapts pinned Werift 0.27.0. Browser bundles
 import only the main entrypoint and never include Werift or Node modules.
 
+### Shipping a native application module
+
+`@chronolog/transport-webrtc` is currently a private workspace package supplied
+by the Chronolog source checkout. The native daemon distribution omits this
+optional transport and Werift. An external `AgentApplication` that uses
+`./resident` or `./native` must ship those dependencies with its own module.
+
+Use the matching Chronolog checkout, Node.js 22 or newer and its pinned pnpm
+version. Install with `pnpm install --frozen-lockfile`, including optional
+dependencies so that the pinned Werift implementation is available. Bundle the
+application's complete `createAgent` entrypoint together with the contrib task
+and transport implementation. The existing
+[resident qualification tool](../../tools/test-resident-webrtc.ts) shows the
+build settings: Node ESM targeting Node 22, explicit aliases resolving the main,
+`./native` and `./resident` exports from that checkout, and a `createRequire`
+banner for bundled CommonJS dependencies. Preserve the source revisions and
+bundle digest with the deployment artifact. Any dependencies left external by
+your build must be installed alongside the application module and resolve from
+its location.
+
+Set `CHRONOLOG_AGENT_MODULE` to the absolute path of the emitted application
+module that exports `createAgent(context)`. The contrib
+`serve-resident-webrtc.mjs` exports `createResidentWebRtcTask`; it is a helper to
+compose inside that factory, not the daemon's module entrypoint. Loading a file
+through the environment variable does not install or bundle its dependencies.
+Qualify the exact source pair with:
+
+```sh
+node --import tsx tools/test-resident-webrtc.ts \
+  --contrib /exact/tendriller-contrib-checkout \
+  --output /new/resident-https-evidence
+```
+
+This gate builds and exercises the supplied task helper. The deployment still
+supplies the enclosing application module, TLS credentials and introduction
+admission policy.
+
+### Connecting from a native peer
+
 ```ts
 import { openWebRtcConnection } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'

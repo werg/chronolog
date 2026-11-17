@@ -6,6 +6,49 @@ that may be missed, and transient stream chunks. It depends on the portable
 canonical byte codec only. It does not open a log, store an operation, load SQL,
 wait for finality, contact an authority, or replay after reconnect.
 
+## Build and consume the standalone package
+
+This package is not yet published to npm. The source workspace and the native
+distribution already include it; an independent browser/Node package is built
+deliberately from a source checkout:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm package:signals
+pnpm test:signals-package
+```
+
+Run these commands from the Chronolog repository root with its pinned pnpm.
+Packaging requires committed package inputs and creates
+`artifacts/signals/chronolog-signals-<commit8>.tgz`. The archive contains a bundled
+ES module, public TypeScript declarations, this guide and source provenance with
+content hashes. It has no runtime, optional or peer dependencies. It needs no
+workspace aliases, TypeScript loader, database or Chronolog protocol package.
+The repository's CI and release-evidence workflows build and verify this same
+archive and preserve it as a workflow artifact. They do not publish it to npm.
+
+`test:signals-package` installs the current commit's tarball in a separate
+directory with an empty npm cache and offline mode. It verifies signed delivery
+from ordinary Node ESM, compiles a strict TypeScript consumer, checks the content
+hashes and bundles the installed browser entry. Pass `--artifact /path/package.tgz`
+to qualify another exact archive. For local debugging, pass `--allow-dirty` to
+`package:signals`, then select its `-dirty.tgz` archive with
+`test:signals-package --artifact /path/package-dirty.tgz --allow-dirty`. These
+packages are explicitly marked dirty and are not release evidence.
+
+Install an exact archive into the consuming application, then use the imports
+shown below:
+
+```sh
+npm install --offline --ignore-scripts --no-audit --no-fund "/absolute/path/chronolog-signals-<commit8>.tgz"
+```
+
+Use Node.js 22 or newer, or a browser with WebCrypto Ed25519 and the standard
+`AbortSignal` APIs. Browser applications bundle the package through its public
+ESM export. The package uses platform cryptography and has no Node-specific code.
+
+## Create a channel
+
 ```ts
 import { SignalChannel, generateSignalIdentity } from '@chronolog/signals'
 

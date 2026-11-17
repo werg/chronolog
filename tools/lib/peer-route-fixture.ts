@@ -9,7 +9,7 @@ import { syncBuiltinESMExports } from 'node:module'
 
 import { openWebRtcConnection, WEBRTC_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
-import { createPeerRendezvous, PEER_RENDEZVOUS_LIMITS, PEER_RENDEZVOUS_PROTOCOL, type PeerRendezvous, type PeerSocket } from '@tendriller/core/peers'
+import { createPeerRendezvous, PEER_RENDEZVOUS_LIMITS, PEER_RENDEZVOUS_PROTOCOL, type PeerRendezvous } from '@tendriller/core/peers'
 import { Miniflare, Response as HostResponse } from 'miniflare'
 import { WebSocketServer, type WebSocket } from 'ws'
 
@@ -207,7 +207,7 @@ export async function createPeerRouteFixture(options: {
           headers: { ...common, Authorization: `Bearer ${hostPage.token}` },
         })
         if (counterpart.status !== 101 || counterpart.webSocket === null) throw new Error(`ROUTE_RENDEZVOUS_AGENT_FAILED: ${counterpart.status}`)
-        const rendezvous = createPeerRendezvous(counterpart.webSocket as unknown as PeerSocket)
+        const rendezvous = createPeerRendezvous(counterpart.webSocket)
         counterpart.webSocket.accept()
         if (closed) { rendezvous.close(); return }
         void connect(rendezvous)

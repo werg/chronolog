@@ -27,6 +27,17 @@ jobs:
       - run: pnpm lint
       - run: pnpm docs:check
       - run: pnpm typecheck
+      - name: Verify the standalone live-signal package
+        run: |
+          pnpm package:signals
+          pnpm test:signals-package
+      - name: Preserve the standalone live-signal package
+        uses: actions/upload-artifact@v6
+        with:
+          name: chronolog-signals-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/signals/*.tgz
+          if-no-files-found: error
+          retention-days: 30
       - run: pnpm test:coverage
       - name: Rehearse native authority crash and storage recovery
         run: pnpm exec tsx tools/authority-recovery.ts --output artifacts/authority-recovery/ci

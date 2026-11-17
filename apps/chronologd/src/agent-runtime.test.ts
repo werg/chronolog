@@ -89,7 +89,7 @@ describe('native agent composition', () => {
     const closePublishedCandidate = async (count: number) => {
       for (;;) {
         deadline.signal.throwIfAborted()
-        if (serviceFailure !== undefined) throw serviceFailure
+        if (serviceFailure !== undefined) throw new Error('Agent runtime failed while waiting for inclusion', { cause: serviceFailure })
         const candidates = (await transport.history()).filter(record => decodeEnvelope(record.payload).messageType === 'candidate')
         if (candidates.length >= count) {
           expect(candidates).toHaveLength(count)

@@ -663,6 +663,12 @@ export class ChronologNode {
     await this.#mutex.run(async () => {
       await policy.ingestEvidence(exact)
       await this.#options.transport.putEvidence?.(exact)
+      const snapshot = policy.snapshot()
+      // Exact proof replays and open receipt growth cannot change an already
+      // applied closed prefix. Pending bodies, keys or publication failures
+      // still need reconciliation even when the verified frontier is unchanged.
+      if (!this.#materializationPending && snapshot.closedReceiptThrough === this.#coordinatedAppliedThrough &&
+          snapshot.closedThroughMs === this.#appliedClosedThroughMs) return
       this.#materializationPending = true
       await this.#reconcileMaterializer()
     })

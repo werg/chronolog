@@ -132,10 +132,10 @@ describe('public Tendriller adapter', () => {
 
   it('pins the built public SDK/engine artifacts and provenance', async () => {
     for (const name of ['sdk', 'engine']) {
-      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-b8db8dcd.tgz`, import.meta.url)
-      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-b8db8dcd.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
+      const artifact = new URL(`../../../test/artifacts/tendriller-${name}-534e044c.tgz`, import.meta.url)
+      const provenance = JSON.parse(await readFile(new URL(`../../../test/artifacts/tendriller-${name}-534e044c.provenance.json`, import.meta.url), 'utf8')) as { sha256: string; sourceCommit: string }
       expect(createHash('sha256').update(await readFile(artifact)).digest('hex')).toBe(provenance.sha256)
-      expect(provenance.sourceCommit).toBe('b8db8dcdd1d3730876f1346550ef04f7a6cbdeb6')
+      expect(provenance.sourceCommit).toBe('534e044c74589a2c19757386813c5627b9383b8d')
     }
     expect(RECORD_LOG_FORMAT).toBe('record-log/v1')
   })

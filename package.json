@@ -42,7 +42,9 @@
     "chaos:stress": "tsx packages/chaos/src/cli.ts run stress",
     "docs:check": "node tools/check-doc-links.mjs",
     "prepare": "husky",
-    "package:membership": "node tools/package-membership.mjs"
+    "package:membership": "node tools/package-membership.mjs",
+    "package:signals": "node tools/package-signals.mjs",
+    "test:signals-package": "node tools/test-signals-package.mjs"
   },
   "devDependencies": {
     "@chronolog/agent-service": "workspace:*",
@@ -62,7 +64,7 @@
     "@chronolog/transport-tendriller": "workspace:*",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "1.65.0",
-    "@tendriller/core": "file:./test/artifacts/tendriller-sdk-b8db8dcd.tgz",
+    "@tendriller/core": "file:./test/artifacts/tendriller-sdk-534e044c.tgz",
     "@types/node": "^24.0.0",
     "@types/ws": "8.18.1",
     "@vitest/coverage-v8": "^3.2.4",
