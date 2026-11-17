@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmod, lstat, mkdir, readFile, readdir, readlink, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 
 interface Subject { readonly path: string; readonly sha256: string; readonly bytes: number }
@@ -12,6 +13,11 @@ if (dirty.length > 0 && !process.argv.includes('--allow-dirty')) {
   throw new Error('DISTRIBUTION_REQUIRES_CLEAN_WORKTREE (use --allow-dirty only for local package debugging)')
 }
 const commit = exec('git', ['rev-parse', 'HEAD']).trim()
+const requiredPackageManager = packageManager()
+const actualPackageManager = `pnpm@${exec('pnpm', ['--version']).trim()}`
+if (actualPackageManager !== requiredPackageManager) {
+  throw new Error(`DISTRIBUTION_PACKAGE_MANAGER_MISMATCH: required ${requiredPackageManager}, found ${actualPackageManager}`)
+}
 const version = tagVersion() ?? `0.0.0-${commit.slice(0, 12)}`
 const distributionName = `chronolog-${version}-${process.platform}-${process.arch}`
 const destination = join(outputDirectory, distributionName)
@@ -21,14 +27,18 @@ await mkdir(outputDirectory, { recursive: true })
 await rm(staging, { recursive: true, force: true })
 await rm(destination, { recursive: true, force: true })
 await mkdir(staging, { recursive: true })
+let releaseWorkspace: string | undefined
 try {
-  exec('pnpm', ['--filter', 'chronolog-distribution', 'deploy', '--prod', '--legacy', join(staging, 'runtime')], {
+  releaseWorkspace = await mkdtemp(join(tmpdir(), 'chronolog-release-workspace-'))
+  await prepareReleaseWorkspace(releaseWorkspace)
+  // Modern deploy projects the committed dependency snapshots into an isolated
+  // frozen install. Legacy deploy instead re-resolves every workspace, including
+  // hosted adapters whose peer SDK is deliberately absent from the native graph.
+  exec('pnpm', ['--config.inject-workspace-packages=true', '--config.shared-workspace-lockfile=true',
+    '--config.force-legacy-deploy=false', '--filter', 'chronolog-distribution',
+    'deploy', '--prod', '--frozen-lockfile', join(staging, 'runtime')], {
     HUSKY: '0',
-  })
-  // Legacy deploy leaves a convenience link back to the workspace package
-  // being deployed. It is not a runtime dependency and would make the archive
-  // non-relocatable, so remove that single known self-link before auditing.
-  await rm(join(staging, 'runtime', 'node_modules', '.pnpm', 'node_modules', 'chronolog-distribution'), { force: true })
+  }, releaseWorkspace)
   await mkdir(join(staging, 'bin'), { recursive: true })
   await Promise.all([
     launcher('chronologd', 'chronologd/src/main.ts'),
@@ -48,7 +58,7 @@ try {
     platform: process.platform,
     architecture: process.arch,
     node: process.versions.node,
-    packageManager: packageManager(),
+    packageManager: actualPackageManager,
     files: subjects,
   }
   await writeFile(join(staging, 'release-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
@@ -67,6 +77,33 @@ try {
 } catch (error) {
   await rm(staging, { recursive: true, force: true })
   throw error
+} finally {
+  if (releaseWorkspace !== undefined) await rm(releaseWorkspace, { recursive: true, force: true })
+}
+
+/** Copy committed paths from the current checkout; never mutate development dependencies. */
+async function prepareReleaseWorkspace(directory: string): Promise<void> {
+  const paths = exec('git', ['ls-files', '-z', '--', 'apps', 'packages', 'patches',
+    'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', '.pnpmfile.cjs']).split('\0').filter(Boolean)
+  for (const path of paths) {
+    const source = join(root, path), destination = join(directory, path)
+    if (!(await lstat(source)).isFile()) throw new Error(`DISTRIBUTION_SOURCE_FILE_TYPE_INVALID:${path}`)
+    await mkdir(dirname(destination), { recursive: true })
+    await copyFile(source, destination)
+  }
+  const path = join(directory, 'pnpm-lock.yaml'), lockfile = await readFile(path, 'utf8')
+  const settings = /^settings:\n(?: {2}[^\n]*\n)*/mu.exec(lockfile)?.[0]
+  if (settings === undefined) throw new Error('DISTRIBUTION_LOCKFILE_SETTINGS_MISSING')
+  const injection = /^ {2}injectWorkspacePackages: (?:true|false)\n/mu
+  if (/^ {2}injectWorkspacePackages:/mu.test(settings) && !injection.test(settings)) {
+    throw new Error('DISTRIBUTION_LOCKFILE_INJECTION_SETTING_INVALID')
+  }
+  const injected = injection.test(settings) ? settings.replace(injection, '  injectWorkspacePackages: true\n')
+    : settings.replace('settings:\n', 'settings:\n  injectWorkspacePackages: true\n')
+  // This single temporary deployment setting is the only lockfile change.
+  // External versions, integrity hashes, peer snapshots and patch hashes remain
+  // byte-for-byte the source lock; pnpm performs no resolving install here.
+  await writeFile(path, lockfile.replace(settings, injected))
 }
 
 async function launcher(name: string, entry: string): Promise<void> {
@@ -112,9 +149,9 @@ function installGuide(): string {
     `after a release declares an irreversible storage migration.\n`
 }
 
-function exec(command: string, arguments_: readonly string[], environment: Readonly<Record<string, string>> = {}): string {
+function exec(command: string, arguments_: readonly string[], environment: Readonly<Record<string, string>> = {}, cwd = root): string {
   return execFileSync(command, [...arguments_], {
-    cwd: root,
+    cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
     env: { ...process.env, ...environment },
