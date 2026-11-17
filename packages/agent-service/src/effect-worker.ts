@@ -97,7 +97,7 @@ export class DurableEffectWorker {
     this.#options = options
     this.#checkpoint = new CheckpointStore(options.store, {
       id: `effects/${options.handler.id}`,
-      binding: encodeCanonicalCbor([1n, 'effects', options.sourceId, options.handler.id, options.handler.version,
+      binding: encodeCanonicalCbor([2n, 'effects', options.sourceId, options.handler.id, options.handler.version,
         this.#topics, options.resultTopic, options.handler.recovery]),
     })
   }

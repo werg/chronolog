@@ -79,18 +79,21 @@ export interface MaterializedRevisionSnapshot {
   readonly executionManifestDigest: Uint8Array
 }
 
-/** Detached application inputs and outcomes from one published revision. */
+export interface MaterializedApplicationTransaction {
+  readonly txId: Uint8Array
+  readonly canonicalCandidate: Uint8Array
+  readonly outcome: MaterializedTransactionOutcomeKind
+}
+
+/** Immutable published revision; only requested application entries are copied. */
 export interface MaterializedApplicationSnapshot {
   readonly revision: bigint
   readonly orderLength: number
   readonly finalRevision: bigint
   readonly finalOrderLength: number
   readonly view: 'local' | 'final'
-  readonly transactions: readonly {
-    readonly txId: Uint8Array
-    readonly canonicalCandidate: Uint8Array
-    readonly outcome: MaterializedTransactionOutcomeKind
-  }[]
+  /** A detached entry at this captured revision, or null outside its prefix. */
+  transactionAt(index: number): MaterializedApplicationTransaction | null
 }
 
 /** A bounded SQL lease captured atomically with its published application snapshot. */

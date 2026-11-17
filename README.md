@@ -5,7 +5,7 @@ application log. One signed change program combines **ordinary SQLite
 transactions**, platform operations, and bounded durable events. Native and
 browser peers verify the same original records; SQL profiles execute the same
 pinned DoltLite engine, and event-only profiles do not load it. A signed
-genesis selects an inclusion/finality provider. Every provider uses the same
+genesis selects a live inclusion/finality provider. Both built-in providers use the same
 deterministic application order: author timestamp, signing key, proposal ID.
 Validators or an external service can prove inclusion and close a timestamp
 prefix; neither supplies an execution order. SQL executes locally. Tendriller
@@ -13,13 +13,15 @@ can serve the page and administer participants while application exchange runs
 over authenticated WebRTC between Chronolog peers. A retained-log adapter is an
 explicit alternative deployment choice.
 
-Peer history can replay a tentative suffix when a late transaction arrives.
+Either durable policy can replay a tentative suffix when an eligible earlier
+proposal arrives before its timestamp closes.
 The signed-inclusion provider retains receipts and durable closure promises;
 receipt positions never order SQL or effective events. Newly included backdated
 proposals cannot reopen a closed prefix. Custom verifiers are selected by the
 provider ID and parameters signed in genesis.
-Both expose separate local and final SQL revisions, durable submission identity,
-and live scoped reader/writer enrollment. Start with the
+Both expose separate local and final application views, durable submission
+identity, and live scoped reader/writer enrollment. SQL profiles include actual
+local and final SQL revisions; event-only profiles need no SQL engine. Start with the
 [application primitives guide](docs/application-primitives.md) for choosing APIs,
 finality, replay and role boundaries. The [resident agent](packages/agent-service/README.md)
 and [pluggable finality](docs/pluggable-finality.md) explain the architecture;
@@ -37,14 +39,16 @@ application work.
   use bounded pull delivery and history/filter-bound cursors, including progress
   across nonmatching records. Local projections atomically checkpoint state and
   processed progress outside the consensus core.
-- **Ephemeral signals.** `client.signals` carries typing, presence, cursors and
-  replaceable progress without retained history, transactional execution or a
+- **Ephemeral signals.** `client.signals` carries typing, presence, cursors,
+  progress, transient samples and preview chunks without retained history, transactional execution or a
   finality provider. The standalone `@chronolog/signals` package also works
   without a database or Chronolog membership. Group adapters add explicit
   signal rights; durable topic rights do not implicitly grant them.
 - **Coherent views.** A bounded read lease pins SQL and effective events to one
   view. Provisional rebases replace that view; finality and operation status can
-  advance even when rows stay equal.
+  advance even when rows stay equal. `changes({ view })` invalidates display
+  snapshots; final event subscriptions process durable work. Reads default to
+  final, with an explicit local view for speculative UI.
 - **Owner-controlled rows.** Every application table automatically gets a
   `chronolog_owner` column stamped with the signer of the insert, stored as a
   small integer id (`chronolog_principals` maps ids to keys).
@@ -58,7 +62,7 @@ application work.
   only to those readers. Sealed writes still obey ordinary row grants and
   application triggers. Ownership does not imply decryption rights
   ([guide](docs/sealed-data.md)).
-- **Determinism from a pinned engine.** Every replica runs the same engine
+- **Determinism from a pinned engine.** SQL replicas run the same engine
   build; `'now'`, `random()` and `localtime` are fixed per transaction; a short
   authorizer block-list keeps statements inside the database.
 - **Replication.** Native SQLite and browser OPFS adapters share the original
@@ -84,9 +88,13 @@ everything else.
 
 ## Quick start
 
-Requirements: Node.js 22 or newer, the pinned pnpm 10.12.4, Python 3 and a C/C++ toolchain for
+For the workspace and native SQL runtime, use Node.js 22 or newer, the pinned
+pnpm 10.12.4, Python 3 and a C/C++ toolchain for
 `node-gyp`. The first install downloads the pinned DoltLite 0.11.29 source,
 verifies its SHA-256 and compiles the patched binding.
+An application using only live messages can instead consume the independent
+[`@chronolog/signals` archive](packages/signals/README.md#build-and-consume-the-standalone-package),
+which has no database or native build dependency.
 
 ```sh
 pnpm install
@@ -108,8 +116,9 @@ A CLI transaction file lists SQL statements and platform operations. Use the
 public client's `submit` and `events` APIs below for event-only or mixed programs.
 Bindings are JSON scalars or tagged values
 (`{"kind":"integer","value":"9007199254740993"}`, `{"kind":"real","value":1}`,
-`{"kind":"blob","value":"BASE64URL"}`). The daemon's own node is the group's
-root administrator, so it may create a table (it is owner-checked from the
+`{"kind":"blob","value":"BASE64URL"}`). The convenience native bootstrap
+explicitly grants its owner both membership and schema administration, so it
+may create a table (it is owner-checked from the
 next statement on):
 
 ```json
@@ -142,6 +151,7 @@ const tx = await client.transaction([
 ])
 const provisional = await tx.local() // current accepted/rejected result
 const outcome = await tx.final()     // actual applied final result
+tx.dispose()
 if (outcome.outcome.type === 'rejected') {
   throw new TransactionRejectedError(tx.transactionId, outcome.outcome.rejection)
 }
@@ -163,13 +173,18 @@ and outcome, including after a writer grant is revoked.
 
 ```ts
 import { emit, program, sqlStatement } from '@chronolog/protocol'
+import { TransactionRejectedError } from '@chronolog/client'
 
 const claim = await client.submit(program(
   sqlStatement("SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = ?) = 1, 'already_claimed')", ['task-1']),
   sqlStatement('UPDATE tasks SET claimed_by = ? WHERE id = ?', ['member-1', 'task-1']),
   emit('tasks/claimed', { taskId: 'task-1', memberId: 'member-1' }),
 ), { operationId: 'claim-task-1' })
-await claim.final()
+const result = await claim.final() // Wait for the applied final result.
+claim.dispose()
+if (result.outcome.type === 'rejected') {
+  throw new TransactionRejectedError(claim.transactionId, result.outcome.rejection)
+}
 
 const view = await client.readView({ view: 'final' })
 try {
@@ -209,11 +224,14 @@ non-default daemon. RPC refuses a non-loopback bind without a token.
 
 ## Running a group
 
-The daemon creates a signed governance genesis on first start. It pins the local
-identity as membership issuer and initial SQL schema administrator, and gives
-it explicit writer, validator and reader grants. New devices adopt the
-public descriptor, then use the live `client.enrollment` request/approval/status
-flow with explicit full-history access. The fixed validator set does not change.
+The convenience native bootstrap creates signed genesis on first start and
+pins the local identity as membership issuer and initial schema administrator,
+with explicit writer, validator and reader grants. Other deployments can name separate
+membership and schema administrators or select a distinct finality signer.
+New devices adopt the public descriptor, then use the live `client.enrollment`
+request/approval/status flow with explicit writer program rights and historical
+access. Membership administration comes from the pinned root, not a grantable
+administrator role. The fixed validator set does not change.
 See the [governance guide](docs/governance.md) and [client API](packages/client/README.md).
 Peers are configured with:
 
@@ -255,20 +273,20 @@ See the [chaos testing guide](docs/chaos-testing.md) and the
 | Package | Responsibility |
 | --- | --- |
 | `canonical` | Strict bounded CBOR, bytes, typed hash domains |
-| `protocol` | Signed messages, program (SQL and platform-operation) and value codecs, execution manifest, order keys |
+| `protocol` | Signed messages, SQL/platform/event programs and value codecs, execution manifests, order keys |
 | `capabilities` | Genesis, grants, revocations, validation policy |
 | `crypto` | HPKE, signed epochs, content encryption |
 | `records` | Portable original signed records, immutable evidence, durable storage and shared range/stream synchronization |
 | `transport-ssb` | Native SQLite record/evidence storage and authenticated SSB connections |
 | `transport-webrtc` | Bounded RTC framing, HTTPS introduction, observed ICE routes and session supervision |
-| `transport-tendriller` | Optional public retained-log adapter and on-demand finality service |
+| `transport-tendriller` | Public application backend adapter; optional retained-log finality adapter |
 | `signals` | Portable signed live messages, bounded subscriptions and explicit delivery lifetime |
 | `agent-service` | Governed peer routing, native finality, resident effects and timer workers |
 | `control-store` | Candidates, attestations, order, heartbeats, settlement evidence |
-| `node-core` | Governed peer composition, two history policies, durable operations, live enrollment, admission and finality |
+| `node-core` | Governed peer composition, inclusion/finality policies, SQL-free event materialization, durable operations and enrollment |
 | `materializer-doltlite` | Deterministic SQL execution, owner-controlled rows (platform operations, generated triggers), Dolt checkpoints, suffix replay, local SQL |
 | `materializer` | Portable materialization contracts shared with the workerd path |
-| `runtime-browser` | Owning Worker, OPFS, Web Lock, patched DoltLite WASM and shared client RPC |
+| `runtime-browser` | Owning Worker, OPFS, Web Lock, SQL-free events or DoltLite WASM, and shared client RPC |
 | `runtime-workerd` | Experimental workerd execution contract ([plan](docs/workerd-reconstruction-plan.md)) |
 | `rpc` | Service contract, in-process and HTTP transports |
 | `client` / `react` | TypeScript client and React hooks |

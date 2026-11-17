@@ -92,8 +92,8 @@ describe('NodeRpcService policy views and enrollment', () => {
   it('selects the actual SQL reader and labels its revision and immutable prefix', async () => {
     const transport = new InProcessRpcTransport(new NodeRpcService({ node: readerNode() }))
     const request = { groupId: group, requestId: 'query', sql: 'SELECT value FROM t', parameters: [] }
-    const local = await transport.unary('query.localSql', request)
-    const final = await transport.unary('query.localSql', { ...request, view: 'final' })
+    const local = await transport.unary('query.localSql', { ...request, view: 'local' })
+    const final = await transport.unary('query.localSql', request)
     expect(local.result.rows).toEqual([[{ kind: 'integer', value: '30' }]])
     expect(local.revision).toMatchObject({ view: 'local', materializedRevision: '6', publishedOrderLength: '3', finalRevision: '2', finalOrderLength: '1' })
     expect(final.result.rows).toEqual([[{ kind: 'integer', value: '10' }]])

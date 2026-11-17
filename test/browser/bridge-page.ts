@@ -49,13 +49,13 @@ class BrowserClaimPeer {
     const handle = await this.client.transaction([
       "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",
       { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = 1', params: ['browser'] },
-    ], { idempotencyKey: operationId })
+    ], { operationId: operationId })
     this.handles.set(handle.transactionId, handle)
     return handle.transactionId
   }
 
   async acceptTeam(teamId: string): Promise<string> {
-    const change = await this.client.ownership.acceptInvitation(base64UrlToBytes(teamId), { idempotencyKey: 'accept-team' })
+    const change = await this.client.ownership.acceptInvitation(base64UrlToBytes(teamId), { operationId: 'accept-team' })
     this.handles.set(change.handle.transactionId, change.handle)
     return change.handle.transactionId
   }

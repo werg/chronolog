@@ -19,8 +19,8 @@ export interface ChronologApplicationQuery {
   readonly truncated: boolean
 }
 export type ChronologApplicationBackend = ApplicationBackend<ChangeProgram, ApplicationOperation, ChronologApplicationQuery, LocalSqlInput>
-export type NodeApplicationSource = Pick<ChronologNode, 'publish' | 'operation' | 'revisions' | 'revision' | 'readView' | 'events' | 'changes'>
-export type ClientApplicationSource = Pick<ChronologClient, 'submit' | 'operations' | 'readView' | 'events' | 'changes'>
+export type NodeApplicationSource = Pick<ChronologNode, 'publish' | 'operation' | 'revisions' | 'revision' | 'changes' | 'readView' | 'events'>
+export type ClientApplicationSource = Pick<ChronologClient, 'submit' | 'operations' | 'changes' | 'readView' | 'events'>
 
 interface OperationState {
   readonly operationId: string
@@ -34,13 +34,12 @@ interface OperationState {
 }
 function operation(value: OperationState): ApplicationOperation {
   const result = value.outcome
+  const identity = { operationId: value.operationId, proposalId: value.proposalId }
+  if (result === null) return { ...identity, status: 'queued' }
   // A speculative rejection can change under replay; never render it as final.
   return {
-    operationId: value.operationId, proposalId: value.proposalId,
-    status: value.final && result !== null ? 'final'
-      : result === null ? 'queued' : 'provisional',
-    ...(result === null ? {} : { outcome: result.outcome }),
-    ...(result?.rejectionCode == null ? {} : { error: result.rejectionCode,
+    ...identity, status: value.final ? 'final' : 'provisional', outcome: result.outcome,
+    ...(result.rejectionCode === null ? {} : { error: result.rejectionCode,
       message: result.failingStatementIndex === null ? result.rejectionCode : `${result.rejectionCode} at program step ${result.failingStatementIndex}` }),
   }
 }

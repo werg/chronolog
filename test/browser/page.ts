@@ -41,7 +41,8 @@ class TestPeer {
     })
   }
   async submit(steps: string[], operationId: string): Promise<string> {
-    const handle = await this.client.transaction(steps, { idempotencyKey: operationId })
+    const handle = await this.client.transaction(steps, { operationId })
+    // The replay fixture closes time explicitly; authoring observes the provisional view.
     try {
       // These crash/replay fixtures inspect local SQL before closing finality.
       const result = await handle.local()
@@ -49,7 +50,7 @@ class TestPeer {
       return handle.transactionId
     } finally { handle.dispose() }
   }
-  async query(sql: string, options: QueryOptions = {}) { return this.client.query(sql, [], options) }
+  async query(sql: string, options: QueryOptions = {}) { return this.client.query(sql, [], { view: 'local', ...options }) }
   async change(value: string, operationId: string, reject = false) {
     const handle = await this.client.submit(program(
       sqlStatement('UPDATE notes SET value=? WHERE id=1', [value]),

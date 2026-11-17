@@ -279,7 +279,7 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
       'CREATE TABLE tasks (id INTEGER PRIMARY KEY, claimed_by TEXT) STRICT',
       'CREATE TABLE history (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT',
       "INSERT INTO history (id, value) VALUES (1, 'before-enrollment')",
-    ], { idempotencyKey: 'bridge-schema' }))
+    ], { operationId: 'bridge-schema' }))
     const bootstrap: BrowserBridgeBootstrap = {
       hubUrl, token, genesis: bytesToBase64Url(savedGenesis), groupRoute: bytesToBase64Url(groupRoute),
       executionManifest: bytesToBase64Url(encodeExecutionManifest(executionManifest)),
@@ -307,18 +307,18 @@ export async function createBrowserBridgeFixture(options: { readonly rootDirecto
         return approval
       },
       async prepareTask(browserIdentity: string) {
-        const team = await native.ownership.createTeam({ invite: [base64UrlToBytes(browserIdentity)] }, { idempotencyKey: 'bridge-team' })
+        const team = await native.ownership.createTeam({ invite: [base64UrlToBytes(browserIdentity)] }, { operationId: 'bridge-team' })
         const teamTransaction = await finalize(team.handle)
         const taskTransaction = await finalize(await native.transaction([{
           sql: `INSERT INTO tasks (id, chronolog_owner) VALUES (1, ${OWNER_FOR_KEY_SQL})`, params: [team.id],
-        }], { idempotencyKey: 'bridge-task' }))
+        }], { operationId: 'bridge-task' }))
         return { teamId: bytesToBase64Url(team.id), transactionIds: [schemaId, teamTransaction, taskTransaction] }
       },
       async claimTask(operationId = 'native-claim') {
         const handle = await native.transaction([
           "SELECT chronolog_assert((SELECT claimed_by IS NULL FROM tasks WHERE id = 1), 'already_claimed')",
           { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = 1', params: ['native'] },
-        ], { idempotencyKey: operationId })
+        ], { operationId: operationId })
         try { return handle.transactionId } finally { handle.dispose() }
       },
       async sync(transactionIds: readonly string[] = []) { await syncEvidence(); return snapshot(transactionIds) },

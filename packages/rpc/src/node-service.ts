@@ -1,15 +1,9 @@
 import { sha256, utf8 } from '@chronolog/canonical'
 import type { EphemeralSignal, Signals } from '@chronolog/signals'
 import {
-  assertValidChangeProgram,
   bytesToBase64Url as toBase64Url,
-  decodePlatformOp,
   decodeChangeProgram,
-  emit,
-  type ProgramStep,
-  type SqlStatement,
   type ChangeProgram,
-  type SqlValue,
   type EventReadOptions,
 } from '@chronolog/protocol'
 
@@ -43,8 +37,6 @@ import type {
   RevokeCapabilitiesResponse,
   ReplicationStatus,
   RevisionMetadata,
-  RpcProgramStep,
-  RpcSqlStatement,
   SettlementEvidence,
   SqlView,
   StreamOutcomeRequest,
@@ -53,7 +45,6 @@ import type {
   StreamStatusRequest,
   RotateEpochRequest,
   RotateEpochResponse,
-  SubmitTransactionRequest,
   SubmitTransactionResponse,
   TransactionOutcome,
   ValidatorWatermark,
@@ -447,15 +438,6 @@ export class NodeRpcService implements ChronologRpcService {
     }
   }
 
-  async submitTransaction(request: SubmitTransactionRequest, context: RpcCallContext): Promise<SubmitTransactionResponse> {
-    this.#assertGroup(request.groupId)
-    const program: ChangeProgram = { version: 3, steps: decodeSteps(request.steps) }
-    try { assertValidChangeProgram(program) } catch (error) {
-      throw new ChronologRpcError('invalid_argument', `Invalid SQL transaction: ${errorCode(error, 'SQL_PROGRAM_INVALID')}`, { cause: error })
-    }
-    return this.#publish(program, request.idempotencyKey ?? request.requestId, request.groupId, context)
-  }
-
   async #publish(program: ChangeProgram, callerOperationId: string, groupId: string, context: RpcCallContext): Promise<SubmitTransactionResponse> {
     const operationId = await operationIdentity(callerOperationId, groupId, context)
     try {
@@ -652,73 +634,6 @@ function submissionResponse(published: RpcPublishedTransaction): SubmitTransacti
   }
 }
 
-function decodeSteps(values: readonly RpcProgramStep[]): ProgramStep[] {
-  if (!(values instanceof Array)) throw invalid('steps must be an array')
-  return values.map((value): ProgramStep => {
-    if (typeof value === 'object' && value !== null && 'emit' in value) {
-      if (Object.keys(value).length !== 1 || typeof value.emit !== 'object' || value.emit === null) throw invalid('Emit step is malformed')
-      try { return emit(value.emit.topic, value.emit.payload) }
-      catch (error) { throw new ChronologRpcError('invalid_argument', 'Invalid emit step', { cause: error }) }
-    }
-    if (typeof value === 'object' && value !== null && 'platform' in value) {
-      if (!(value.platform instanceof Uint8Array)) throw invalid('Platform step must be canonical CBOR bytes')
-      try { return decodePlatformOp(value.platform) } catch (error) {
-        throw new ChronologRpcError('invalid_argument', `Invalid platform step: ${errorCode(error, 'PLATFORM_OP_INVALID')}`, { cause: error })
-      }
-    }
-    return decodeStatement(value)
-  })
-}
-
-function decodeStatement(value: RpcSqlStatement): SqlStatement {
-  {
-    const bindings: RpcSqlStatement['bindings'] = value?.bindings
-    if (typeof value?.sql !== 'string' || !(bindings instanceof Array)) throw invalid('SQL statement is malformed')
-    return {
-      sql: value.sql,
-      bindings: bindings.map((binding) => ({
-        parameter: binding.parameter?.kind === 'index'
-          ? { kind: 'index' as const, index: binding.parameter.index }
-          : binding.parameter?.kind === 'name'
-            ? { kind: 'name' as const, name: binding.parameter.name }
-            : (() => { throw invalid('SQL binding parameter is malformed') })(),
-        value: rpcValueToSqlValue(binding.value),
-      })),
-    }
-  }
-}
-
-/** The JSON-safe RPC value (integer as decimal text) as a protocol SqlValue. */
-export function rpcValueToSqlValue(value: LocalSqlValue): SqlValue {
-  switch (value?.kind) {
-    case 'null': return { kind: 'null' }
-    case 'integer':
-      if (typeof value.value !== 'string' || !/^-?(0|[1-9][0-9]*)$/u.test(value.value)) throw invalid('SQL integer must be decimal text')
-      return { kind: 'integer', value: BigInt(value.value) }
-    case 'real':
-      if (typeof value.value !== 'number' || !Number.isFinite(value.value)) throw invalid('SQL real must be a finite number')
-      return { kind: 'real', value: value.value }
-    case 'text':
-      if (typeof value.value !== 'string') throw invalid('SQL text must be a string')
-      return { kind: 'text', value: value.value }
-    case 'blob':
-      if (!(value.value instanceof Uint8Array)) throw invalid('SQL blob must be bytes')
-      return { kind: 'blob', value: Uint8Array.from(value.value) }
-    default: throw invalid('SQL value kind is unknown')
-  }
-}
-
-/** A protocol SqlValue in the JSON-safe RPC form. */
-export function sqlValueToRpcValue(value: SqlValue): LocalSqlValue {
-  switch (value.kind) {
-    case 'null': return { kind: 'null' }
-    case 'integer': return { kind: 'integer', value: value.value.toString(10) }
-    case 'real': return { kind: 'real', value: value.value }
-    case 'text': return { kind: 'text', value: value.value }
-    case 'blob': return { kind: 'blob', value: Uint8Array.from(value.value) }
-  }
-}
-
 function copyLocalSqlValue(value: LocalSqlValue): LocalSqlValue {
   return value.kind === 'blob' ? { ...value, value: Uint8Array.from(value.value) } : { ...value }
 }
@@ -755,7 +670,7 @@ function errorCode(error: unknown, fallback: string): string {
 
 function sqlView(value: SqlView | undefined): SqlView {
   if (value !== undefined && value !== 'local' && value !== 'final') throw invalid('SQL view must be local or final')
-  return value ?? 'local'
+  return value ?? 'final'
 }
 
 function parseRevision(value: string): bigint {

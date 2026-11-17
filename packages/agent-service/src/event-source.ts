@@ -35,6 +35,7 @@ export function cloneFinalEvent(event: FinalEvent): FinalEvent {
     throw new Error('CONSUMER_EVENT_INVALID')
   }
   assertEventTopic(topic)
+  if (id !== `${proposalId}:${eventOrdinal}`) throw new Error('CONSUMER_EVENT_INVALID')
   const origin = cloneEventOrigin(event.origin)
   return { id, proposalId, eventOrdinal, topic, payload: JSON.parse(canonicalEventPayload(payload)) as EventPayload, origin }
 }

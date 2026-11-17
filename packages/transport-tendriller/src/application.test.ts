@@ -80,6 +80,16 @@ describe('selected Chronolog application adapter', () => {
     expect(f.watchers).toBe(0)
   })
 
+  it('returns the original final result from an exact retry instead of regressing it to queued', async () => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: true })
+    const change = program(emit('conversation', { text: 'original' }))
+    f.set('rejected', true)
+    expect(await backend.submit(change, { operationId: 'stable' })).toMatchObject({
+      operationId: 'stable', proposalId: 'original-proposal', status: 'final', outcome: 'rejected', error: 'claim_conflict',
+    })
+    expect(f.calls).toEqual([{ program: change, operationId: 'stable' }])
+  })
+
   it.each(['node', 'client'] as const)('delegates the %s view changes stream and preserves its revision and lifetime', async kind => {
     const f = fixture(), controller = new AbortController()
     const replica = kind === 'node' ? f.source : {
@@ -101,10 +111,10 @@ describe('selected Chronolog application adapter', () => {
     } finally { await iterator.return?.(); await view.release() }
   })
 
-  it('captures one view, normalizes native SQL values and releases it once', async () => {
+  it.each(['final', 'local'] as const)('captures one %s view with its final boundary, normalizes SQL values and releases it once', async selected => {
     const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: true })
-    const view = await backend.readView({ view: 'local' })
-    expect(view).toMatchObject({ view: 'local', revision: 'pinned', finalRevision: 'pinned-final' })
+    const view = await backend.readView({ view: selected })
+    expect(view).toMatchObject({ view: selected, revision: 'pinned', finalRevision: selected === 'final' ? 'pinned' : 'pinned-final' })
     const result = await view.query('SELECT ?', [7n])
     expect(result).toEqual({ revision: 'pinned', columns: [{ name: 'count' }], rows: [[7n]], truncated: false })
     expect(f.parameters).toEqual([[{ kind: 'integer', value: '7' }]])
@@ -118,11 +128,4 @@ describe('selected Chronolog application adapter', () => {
     await eventsOnly.release()
   })
 
-  it('returns an original terminal outcome immediately on exact retry', async () => {
-    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: true })
-    f.set('rejected', true)
-    expect(await backend.submit(program(emit('conversation', null)), { operationId: 'stable' })).toMatchObject({
-      operationId: 'stable', proposalId: 'original-proposal', status: 'final', outcome: 'rejected', error: 'claim_conflict',
-    })
-  })
 })

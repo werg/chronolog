@@ -17,7 +17,6 @@ import type {
   LocalSqlRequest,
   LocalSqlResponse,
   NodeStatus,
-  SubmitTransactionRequest,
   SubmitTransactionResponse,
   ReplicationStatus,
   SettlementEvidence,
@@ -59,7 +58,6 @@ export interface UnaryRpcMethods {
   'view.release': { request: ReadViewRequest; response: { readonly released: true } }
   'node.getStatus': { request: GetStatusRequest; response: NodeStatus }
   'query.localSql': { request: LocalSqlRequest; response: LocalSqlResponse }
-  'transaction.submit': { request: SubmitTransactionRequest; response: SubmitTransactionResponse }
   'transaction.getOutcome': { request: GetOutcomeRequest; response: TransactionOutcome }
   'evidence.getSettlement': { request: GetSettlementEvidenceRequest; response: SettlementEvidence }
   'evidence.getValidatorWatermark': { request: GetValidatorWatermarkRequest; response: ValidatorWatermark }
@@ -116,7 +114,6 @@ export interface ChronologRpcService {
   streamStatus(request: StreamStatusRequest, context: RpcCallContext): AsyncIterable<NodeStatus>
   localSql(request: LocalSqlRequest, context: RpcCallContext): Promise<LocalSqlResponse>
   liveSql(request: LiveSqlRequest, context: RpcCallContext): AsyncIterable<LiveSqlEvent>
-  submitTransaction(request: SubmitTransactionRequest, context: RpcCallContext): Promise<SubmitTransactionResponse>
   getOutcome(request: GetOutcomeRequest, context: RpcCallContext): Promise<TransactionOutcome>
   streamOutcome(request: StreamOutcomeRequest, context: RpcCallContext): AsyncIterable<TransactionOutcome>
   getSettlementEvidence(request: GetSettlementEvidenceRequest, context: RpcCallContext): Promise<SettlementEvidence>

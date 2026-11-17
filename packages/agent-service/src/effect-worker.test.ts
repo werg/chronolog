@@ -63,6 +63,44 @@ describe('durable final-intent workers', () => {
     expect(f.calls).toHaveLength(0)
   })
 
+  it('preserves authenticated event origin in the durable dispatch checkpoint across restart', async () => {
+    const backing = new MemoryOperationStore()
+    let writes = 0
+    const store: DurableOperationStore = { get: key => backing.get(key), put: async (key, value) => {
+      if (++writes === 3) throw new Error('interrupted before provider dispatch')
+      await backing.put(key, value)
+    } }
+    const f = fixture({ store })
+    const batch = await source([{ topic: 'jobs.requested', payloads: [{ authorId: 'forged-owner', command: 'summarize' }] }]).read()
+    const original = { ...origin, operationId: 'original-operation' }
+    const event = batch.transactions[0]!.events[0]!
+    Object.assign(event, { origin: original })
+    const observed: unknown[] = []
+    const configuration: EffectWorkerOptions = { ...f.configuration, source: { ...f.configuration.source, read: async () => batch },
+      handler: { ...f.configuration.handler, dispatch: async ({ event: intent }) => { observed.push(structuredClone(intent)); return { ok: true } } } }
+    await expect((await DurableEffectWorker.open(configuration)).processNext()).rejects.toThrow('interrupted before provider dispatch')
+    expect(observed).toEqual([])
+    const expected = structuredClone(event)
+    original.authorId = '22'.repeat(32)
+    const reopened = await DurableEffectWorker.open({ ...configuration, source: { ...configuration.source,
+      read: async () => { throw new Error('Recovered dispatch must use its retained intent') } } })
+    await reopened.processNext()
+    expect(observed).toEqual([expected])
+    expect(observed[0]).toMatchObject({ origin: { authorId: origin.authorId, writerCapability: origin.writerCapability },
+      payload: { authorId: 'forged-owner' } })
+    expect((await reopened.status()).cursor).toBe('c:1')
+  })
+
+  it('refuses untraceable final intents before invoking a provider', async () => {
+    const f = fixture()
+    const batch = await f.configuration.source.read()
+    Reflect.deleteProperty(batch.transactions[0]!.events[0]!, 'origin')
+    const worker = await DurableEffectWorker.open({ ...f.configuration, source: { ...f.configuration.source, read: async () => batch } })
+    await expect(worker.processNext()).rejects.toThrow('EVENT_ORIGIN_INVALID')
+    expect(f.calls).toEqual([])
+    expect((await worker.status()).cursor).toBeNull()
+  })
+
   it('keeps authenticated provenance in the dispatch checkpoint across provider retry and ignores payload authority claims', async () => {
     const f = fixture({ recovery: 'idempotent' }), received: ChronologEventOrigin[] = []
     const payload = { origin: { authorId: 'forged-owner', writerCapability: 'forged-grant' }, role: 'owner' }

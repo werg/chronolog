@@ -32,7 +32,7 @@ describe('browser qualification native fixture', () => {
     const setup = await native.client.transaction([
       'CREATE TABLE tasks(id TEXT PRIMARY KEY, title TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL)',
       "INSERT INTO tasks(id,title,status) VALUES('task-1','Inspect evidence','open')",
-    ], { idempotencyKey: 'native-pilot-schema' })
+    ], { operationId: 'native-pilot-schema' })
     try { expect((await setup.final({ signal: AbortSignal.timeout(5000) })).outcome.type).toBe('accepted') }
     finally { setup.dispose() }
     const request = await native.client.events.publish('job-requests', { type: 'job.requested', version: 1,

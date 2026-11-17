@@ -116,12 +116,15 @@ export async function createEventMaterializationRuntime(options: {
     if (closed) throw new Error('EVENT_EXECUTION_CLOSED')
     const view = input.view ?? 'final'
     const length = view === 'final' ? finalLength : order.length
+    const selected = order, selectedOutcomes = outcomes
     return {
       view, revision: view === 'final' ? finalRevision : revision, orderLength: length,
       finalRevision, finalOrderLength: finalLength,
-      transactions: order.slice(0, length).map((entry, index) => ({
-        txId: entry.txId.slice(), canonicalCandidate: entry.canonicalCandidate.slice(), outcome: outcomes[index]!.outcome,
-      })),
+      transactionAt(index) {
+        if (!Number.isSafeInteger(index) || index < 0 || index >= length) return null
+        const entry = selected[index]!
+        return { txId: entry.txId.slice(), canonicalCandidate: entry.canonicalCandidate.slice(), outcome: selectedOutcomes[index]!.outcome }
+      },
     }
   }
   return {

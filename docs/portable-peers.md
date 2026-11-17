@@ -86,7 +86,7 @@ import { TransactionRejectedError } from '@chronolog/client'
 const handle = await client.transaction([
   { sql: "SELECT chronolog_assert((SELECT claimed_by FROM tasks WHERE id = ?) IS NULL, 'already_claimed')", params: [taskId] },
   { sql: 'UPDATE tasks SET claimed_by = ? WHERE id = ?', params: [workerName, taskId] },
-], { idempotencyKey: operationId })
+], { operationId: operationId })
 
 const provisional = await handle.local()
 const finalOutcome = await handle.final({ signal })
@@ -102,6 +102,8 @@ const finalRows = await client.query('SELECT * FROM tasks ORDER BY id', [], {
 Both live proof providers allow provisional execution before inclusion; later
 eligible history can change that tentative outcome.
 `final()` waits for the transaction's actual locally applied final position.
+SQL reads default to the final view; choose `view: 'local'` explicitly for
+optimistic state.
 `query(..., { view: 'final' })` reads a separately pinned SQL revision; it does
 not read tentative rows and attach final metadata to them. Live queries include
 the selected view in their identity and resume after finality-only events too.

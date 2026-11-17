@@ -2,6 +2,7 @@ import type { CapabilitySnapshot, EffectiveCapability } from '@chronolog/capabil
 import { MemoryOperationStore } from '@chronolog/node-core'
 import { assertCanonicalCbor, bytesToHex, generateEd25519KeyPair, utf8, type Ed25519KeyPair } from '@chronolog/protocol'
 import { DurableFeedStore, PortableFeedTransport, feedIdFromPublicKey, webFeedCrypto, webFeedSigner } from '@chronolog/records'
+import { SignalBackpressureError, type SignalLimits } from '@chronolog/signals'
 import { frameRtcPeerChannels, WEBRTC_LIVE_LIMITS, type RtcDataChannel } from '@chronolog/transport-webrtc'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -20,7 +21,7 @@ function capability(identity: Ed25519KeyPair, role: 'reader' | 'writer', id: num
     ? { ...common, role, program: { sql: false, topics: [], signals: ['typing'] } }
     : { ...common, role } }
 }
-async function replicas(writer = true) {
+async function replicas(writer = true, signalLimits?: SignalLimits) {
   const identities = await Promise.all([generateEd25519KeyPair(), generateEd25519KeyPair()])
   const grants = [capability(identities[0], 'reader', 1), capability(identities[1], 'reader', 2)]
   if (writer) grants.push(capability(identities[0], 'writer', 3))
@@ -33,12 +34,14 @@ async function replicas(writer = true) {
       signer: webFeedSigner(feedIdFromPublicKey(identity.publicKeyBytes), identity.privateKey), crypto: webFeedCrypto })
     transports.push(transport); cleanup.push(() => transport.close())
     const service = await createGovernedPeerService({ identity, groupId: original.groupId, activeMembership: () => snapshots[index]!,
-      local: transport.asLink(), attach: link => transport.connect(link) })
+      local: transport.asLink(), attach: link => transport.connect(link),
+      ...(signalLimits === undefined ? {} : { signalLimits }) })
     services.push(service); cleanup.push(() => service.close())
   }
   return { identities, snapshots, transports, services }
 }
-async function connect(left: GovernedPeerService, right: GovernedPeerService, expected?: Uint8Array, withLive = true) {
+async function connect(left: GovernedPeerService, right: GovernedPeerService, expected?: Uint8Array, withLive = true,
+  dispatch: () => void = () => {}) {
   const lane = () => {
     const forward = new TransformStream<Uint8Array, Uint8Array>(), backward = new TransformStream<Uint8Array, Uint8Array>()
     return [framePeerStream({ readable: backward.readable, writable: forward.writable }),
@@ -46,7 +49,9 @@ async function connect(left: GovernedPeerService, right: GovernedPeerService, ex
   }
   const reliable = lane(), live = withLive ? lane() : undefined
   const connections = reliable.map((connection, index) => ({ ...connection, ...(live === undefined ? {} : {
-    live: live[index]!, signal: AbortSignal.any([connection.signal, live[index]!.signal]),
+    live: { ...live[index]!, async send(bytes: Uint8Array, options?: { readonly signal?: AbortSignal }) {
+      dispatch(); await live[index]!.send(bytes, options)
+    } }, signal: AbortSignal.any([connection.signal, live[index]!.signal]),
   }),
     async close() { await Promise.all([connection.close(), live?.[index]?.close()]) } }))
   return Promise.all([left.connectPeer({ connection: connections[0]!, ...(expected === undefined ? {} : { peerIdentity: expected }) }),
@@ -89,6 +94,41 @@ function rtcConnections() {
 }
 
 describe('owned governed peer composition', () => {
+  it('keeps durable replication available through live congestion and sends only fresh observations on recovery', async () => {
+    const { services, transports } = await replicas()
+    let busy = true
+    const refusal = Object.assign(new Error('independent live adapter queue full'), { code: 'SIGNAL_BACKPRESSURE', dispatched: false })
+    expect(refusal).not.toBeInstanceOf(SignalBackpressureError)
+    const sessions = await connect(services[0]!, services[1]!, undefined, true, () => { if (busy) throw refusal })
+    await expect(services[0]!.signals.send('typing', 'discarded')).rejects.toMatchObject({ code: 'SIGNAL_BACKPRESSURE', dispatched: false })
+    expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+    await transports[0]!.publish(new Uint8Array([1, 2, 3]))
+    await transports[1]!.catchUp()
+    const history = await transports[0]!.history()
+    const original = await transports[0]!.asLink().read(transports[0]!.identity, 0n, 1)
+    expect(await transports[1]!.asLink().read(transports[0]!.identity, 0n, 1)).toEqual(original)
+    expect(history).toHaveLength(1)
+    busy = false
+    const iterator = services[1]!.signals.subscribe()[Symbol.asyncIterator](), receiving = iterator.next()
+    const sent = await services[0]!.signals.send('typing', 'fresh')
+    expect((await receiving).value).toEqual(sent)
+    expect(sent.payload).toBe('fresh')
+    expect(sessions.every(session => !session.signal.aborted)).toBe(true)
+    expect(await transports[0]!.history()).toEqual(history)
+    await iterator.return?.()
+  })
+
+  it('applies deployment signal limits without changing durable membership policy', async () => {
+    const { services } = await replicas(true, { maxTtlMs: 500 })
+    await connect(services[0]!, services[1]!)
+    await expect(services[0]!.signals.send('typing', true, { ttlMs: 501 })).rejects.toThrow('SIGNAL_TTL_INVALID')
+    const iterator = services[1]!.signals.subscribe()[Symbol.asyncIterator](), receiving = iterator.next()
+    const sent = await services[0]!.signals.send('typing', true, { ttlMs: 400 })
+    expect((await receiving).value).toEqual(sent)
+    expect(sent.expiresAtMs - sent.issuedAtMs).toBe(400)
+    await iterator.return?.()
+  })
+
   it('refuses congested live dispatch while preserving authenticated history and the next healthy signal', async () => {
     const { services, transports } = await replicas(), { connections, live } = rtcConnections()
     const sessions = await Promise.all(services.map((service, index) => service.connectPeer({ connection: connections[index]! })))

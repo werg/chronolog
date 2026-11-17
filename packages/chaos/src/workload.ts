@@ -83,13 +83,13 @@ export async function runWorkload(options: {
           workload: options.scenario.workload,
           readBalance: async (target) => {
             const query = queries[target]!
-            const value = (await client.query(query.sql, [...query.parameters])).result.rows[0]?.[0]
+            const value = (await client.query(query.sql, [...query.parameters], { view: 'local' })).result.rows[0]?.[0]
             if (typeof value !== 'bigint') throw new Error('CHAOS_BALANCE_RESULT_INVALID')
             return value
           },
         })
         const handle = await client.transaction(statements, {
-          idempotencyKey: `${options.random.seed}:${operationId}`,
+          operationId: `${options.random.seed}:${operationId}`,
           signal: AbortSignal.timeout(15_000),
         })
         published += 1

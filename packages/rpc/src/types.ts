@@ -1,4 +1,4 @@
-import type { EventBatch, EventPayload, EventReadOptions } from '@chronolog/protocol'
+import type { EventBatch, EventReadOptions } from '@chronolog/protocol'
 import type { SignalPayload } from '@chronolog/signals'
 import type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
 export type { CapabilityRole, ProgramRights } from '@chronolog/capabilities'
@@ -27,26 +27,6 @@ export interface LocalSqlResult {
   readonly truncated: boolean
   readonly consensusSafe: false
 }
-
-export interface RpcSqlBinding {
-  readonly parameter:
-    | { readonly kind: 'index'; readonly index: number }
-    | { readonly kind: 'name'; readonly name: string }
-  readonly value: LocalSqlValue
-}
-
-export interface RpcSqlStatement {
-  readonly sql: string
-  readonly bindings: readonly RpcSqlBinding[]
-}
-
-/** A platform operation (grant, transfer, register a table, …) as its canonical CBOR encoding. */
-export interface RpcPlatformStep {
-  readonly platform: Uint8Array
-}
-
-export interface RpcEmitStep { readonly emit: { readonly topic: string; readonly payload: EventPayload } }
-export type RpcProgramStep = RpcSqlStatement | RpcPlatformStep | RpcEmitStep
 
 export interface SubmitChangeRequest {
   readonly groupId: GroupId
@@ -125,7 +105,7 @@ export interface LocalSqlRequest {
   readonly requestId: RequestId
   readonly sql: string
   readonly parameters: readonly LocalSqlValue[]
-  /** Defaults to the current speculative reader. Final reads use a separate SQL snapshot. */
+  /** Defaults to the final applied reader. Select local explicitly for speculative SQL. */
   readonly view?: SqlView
   readonly maxRows?: number
   readonly atRevision?: Revision
@@ -163,14 +143,6 @@ export interface NodeStatus {
 export interface GetStatusRequest { readonly groupId?: GroupId; readonly requestId: RequestId }
 export interface StreamStatusRequest extends GetStatusRequest { readonly resumeAfterEventSetRevision?: Revision }
 
-export interface SubmitTransactionRequest {
-  readonly groupId: GroupId
-  readonly requestId: RequestId
-  /** SQL, emitted events and platform operations, executed in order as this node's key. */
-  readonly steps: readonly RpcProgramStep[]
-  /** Repeating a key with the same steps returns the original submission. */
-  readonly idempotencyKey?: string
-}
 export interface SubmitTransactionResponse {
   readonly transactionId: TransactionId
   readonly candidateDigest: string

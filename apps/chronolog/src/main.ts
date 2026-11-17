@@ -38,7 +38,7 @@ type PlatformSpec = { readonly platform: string } & Readonly<Record<string, unkn
 interface TransactionSpec {
   readonly steps: readonly (SqlSpec | PlatformSpec)[]
   readonly wait?: boolean
-  readonly idempotencyKey?: string
+  readonly operationId?: string
 }
 /** Plain JSON values, or an explicit SQLite value such as {"kind":"integer","value":"9007199254740993"}. */
 type JsonSqlValue = null | boolean | number | string | { readonly kind: string; readonly value?: unknown }
@@ -99,7 +99,7 @@ try {
         steps.map((step): TransactionStepInput => 'platform' in step
           ? jsonPlatformOp(step)
           : { sql: step.sql, params: jsonBindings(step.bindings ?? []) }),
-        spec.idempotencyKey === undefined ? {} : { idempotencyKey: spec.idempotencyKey },
+        spec.operationId === undefined ? {} : { operationId: spec.operationId },
       )
       output(spec.wait === true ? { submission: handle.submission, outcome: await waitForOutcome(handle.transactionId) } : handle.submission)
       handle.dispose()
@@ -280,7 +280,8 @@ async function waitForOutcome(transactionId: string, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs
   while (true) {
     const outcome = await client.getTransactionOutcome(transactionId)
-    if (outcome.outcome.type !== 'pending' || Date.now() >= deadline) return outcome
+    if (outcome.final && outcome.outcome.type !== 'pending') return outcome
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for an applied final outcome')
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
 }

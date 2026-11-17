@@ -5,7 +5,7 @@ import { cloneFinalEvent, type FinalEvent } from './event-source.js'
 
 const origin: ChronologEventOrigin = { kind: 'chronolog', groupId: 'A'.repeat(43), authorId: '11'.repeat(32),
   operationId: 'verified-operation', authorTimestampMs: '123', membershipRevision: 'A'.repeat(43), writerCapability: null }
-const event: FinalEvent = { id: 'event', proposalId: 'proposal', eventOrdinal: 0, topic: 'intent',
+const event: FinalEvent = { id: 'proposal:0', proposalId: 'proposal', eventOrdinal: 0, topic: 'intent',
   payload: { authorId: 'forged-author', origin: { ...origin } }, origin }
 
 describe('structural final-event provenance', () => {

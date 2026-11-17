@@ -468,13 +468,20 @@ revision, every allowed admission policy, and complete indexed feed prefixes.
 Once the revoke is final, no later admission can be inserted before it.
 
 `TransactionHandle.local()` reports the materialized accepted or rejected
-outcome at the transaction's **current position**. It does not wait for finality. Use
-`handle.final()` to wait for its immutable accepted or rejected result. External
-effects consume final events and retain their own dispatch checkpoint and
-idempotency key. Settlement evidence explains pending proof and admission
-blockers; a raw cutoff or an accepted speculative outcome does not establish
-finality. The common timestamp order and replay primitives do not themselves
-require finality; these readers and effects belong to the live history policy.
+outcome at the transaction's **current position**, which can change during replay.
+It does not wait for finality. `handle.final()` returns the immutable accepted
+or rejected result after verified finality and local application of the required
+prefix. Callers inspect that outcome; they do not need to reconstruct finality
+from raw settlement evidence. Settlement evidence
+explains pending proof and admission blockers; a raw cutoff or an accepted
+provisional outcome does not establish finality. Designated final-intent
+workers consume final events and retain their own dispatch checkpoint and
+idempotency key for irreversible external effects.
+
+The common timestamp order and replay primitives do not themselves require
+finality. Final readers and effects belong to the current live history policy.
+A future asynchronous branching and merging policy would have no finality;
+it is not implemented by the current live adapters.
 
 Group capability revocations are signed control records. A new membership
 revision takes effect after its verified closed-time boundary; authorization

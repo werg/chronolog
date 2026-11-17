@@ -86,12 +86,14 @@ Use `client.events.subscribe()` for durable
 processing: it delivers whole final event batches and advances received progress
 only on the next pull. Persist the processed cursor together with derived state.
 
+## Authenticated event provenance
+
 Each effective event includes authenticated `origin`, derived from its signed
 proposal rather than its payload. `origin.authorId` is the same lowercase hex
 public key used by signals. Chronolog also exposes `groupId`, `operationId`,
 `authorTimestampMs` as a decimal string, `membershipRevision` and the exact
-`writerCapability` (null only for static membership). Group, membership and
-capability identities use canonical base64url strings. These facts survive
+`writerCapability` (null only for static membership). Group, membership and grant
+IDs use canonical base64url encoding. These facts survive
 HTTP/Worker serialization and replica restart. They describe the original
 author's signed intent; they do not replace the handler's application-specific
 authorization for an external action. Payload fields claiming a role or author
@@ -114,7 +116,7 @@ const transaction = await client.transaction([
     sql: 'UPDATE accounts SET balance = balance - ? WHERE id = ?',
     params: [amount, accountId],
   },
-], { idempotencyKey: durableApplicationOperationId })
+], { operationId: durableApplicationOperationId })
 
 const result = await transaction.final({ signal: AbortSignal.timeout(30_000) })
 if (result.outcome.type === 'rejected') {
@@ -136,7 +138,7 @@ must remain REAL. Put assumptions in SQL with `chronolog_assert`.
 | API | What it waits for |
 | --- | --- |
 | `client.transaction(...)` | Durable local publication of the signed proposal. |
-| `handle.local()` | The current accepted/rejected SQL result, which can still change through replay. |
+| `handle.local()` | The current accepted/rejected program result, which can still change through replay. |
 | `handle.final()` | The immutable accepted/rejected result after its policy-final prefix is applied locally. |
 
 `local()` and `final()` both return rejections as well as acceptances. Always inspect
@@ -153,33 +155,35 @@ or rejected result with `final: false` is provisional. `final: true` identifies
 the immutable executed result. `admissible` separately reports inclusion under
 the selected policy; it does not turn a SQL rejection into a success.
 
-The `idempotencyKey` is the application's durable operation identity. Persist
+The `operationId` is the application's durable operation identity. Persist
 and reuse it with the same program after a lost response or client/process
 restart. A retry returns the original proposal, even if its author was later
 revoked. A changed program under the same identity fails with `already_exists`.
-Without a supplied key, each `transaction()` call generates a fresh request ID;
-automatic retries of that call reuse it, while a new call is a new operation.
+Without a supplied identity, each `transaction()` call generates a fresh operation ID
+and returns it as `handle.operationId`. A request ID identifies only an RPC call.
+Automatic retries of that call preserve the operation ID; a fresh call creates a
+new operation. `transaction(steps)` is a convenience compiler for the same
+canonical `submit(program, { operationId })` path used by durable events.
 
 ## Read local or final SQL explicitly
 
 ```ts
-const local = await client.query('SELECT id, balance FROM accounts ORDER BY id')
-const final = await client.query(
+const final = await client.query('SELECT id, balance FROM accounts ORDER BY id')
+const local = await client.query(
   'SELECT id, balance FROM accounts ORDER BY id',
   [],
-  { view: 'final' },
+  { view: 'local' },
 )
 
 console.log(final.revision.view)             // 'final'
 console.log(final.revision.finalOrderLength) // decimal string
 ```
 
-The default `local` reader includes the applied final prefix and a selected
-provisional suffix. A locally authorized proposal can appear before consensus
-admission and disappear if excluded. Admission makes its inclusion immutable,
-but its provisional application outcome can still change through replay.
-The `final` reader is a separate SQL snapshot of the locally applied immutable
-prefix.
+The default `final` reader is a separate SQL snapshot of the locally applied
+immutable prefix. Opt into `view: 'local'` for the applied final prefix plus its
+selected provisional suffix. An unadmitted preview can leave that suffix; an
+admitted proposal stays included while its application outcome can still change
+through replay.
 Both carry view, selected revision, order length, final-prefix metadata and
 execution-manifest identity. A final replica can still be behind other peers.
 
@@ -218,7 +222,7 @@ them or treating them as global progress. A read captured after notification
 may already be newer, so render using that handle's own tokens. A captured view
 does not change while it is held, including across a local rebase.
 
-Only successful application publication changes these identities. SQL-only
+Only successful publication of an applied view changes these identities. SQL-only
 transactions and replayed outcomes can invalidate a local view without emitting
 an event. Status, admission and transport progress do not. A final subscription
 stays quiet during speculative changes; a local notification can carry a new

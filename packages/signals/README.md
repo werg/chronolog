@@ -67,20 +67,35 @@ identity and the application's current authorization policy. Use
 that key belongs to the application. The package depends only on canonical
 encoding and browser WebCrypto, with its own strict JSON payload validation. An
 optional `credential` may be fixed bytes or a function that selects the current
-credential for each topic. An optional `send` callback supplies a standalone
+credential for each topic. Both `authorize(input, { signal })` and
+`credential(topic, { signal })` receive the attempt's `AbortSignal`: pass it to
+network policy/credential requests so caller cancellation, expiry and channel
+closure release their work promptly. Check current authorization when that work
+completes. An optional `send` callback supplies a standalone
 outgoing transport; pass its incoming frames to `channel.receive(frame)`.
 
 For bidirectional routes, call `channel.attachRoute({ send })` and give incoming
-frames to that returned route's `receive(frame)`. Verified messages are delivered
-locally. Set `relay: true` to relay their original signed bytes to the other live
-routes; standalone relay is disabled by default. Close the route when
-its connection ends. Distinct fresh sequences may arrive out of order through
-different paths; duplicate author/session/sequence identities are suppressed.
-A bounded replay cache fails explicitly when full instead of evicting protection
-for still-fresh messages. `receive()` returns `null` for a duplicate or an
-otherwise valid, authorized expired message. Ordinary expiry neither relays a
-frame nor tears down its authenticated connection. Invalid signatures, malformed
-frames and failed current authorization remain errors.
+frames to that returned route's `receive(frame)`. A transport's `send` returns
+`Promise<void>` and resolves after local dispatch. If a bounded queue is full,
+throw `SignalBackpressureError` before accepting any bytes. Do not queue the
+refused message for later; the channel preserves the healthy route for a fresh
+intent. Successful application `signals.send` returns the authenticated envelope.
+`SignalBackpressureError.is(error)` recognizes the stable `SIGNAL_BACKPRESSURE`
+code and explicit `dispatched: false` marker across independently bundled
+adapters. A matching code alone never proves that dispatch was refused.
+
+Verified messages are delivered locally. Set `relay: true` to relay their
+original signed bytes to other live routes; standalone relay is disabled by
+default. Close the route when its connection ends. Distinct fresh sequences may
+arrive out of order through different paths; duplicate author/session/sequence
+identities are suppressed. A bounded replay cache reports
+`SignalBackpressureError` when full instead of evicting protection for still-fresh
+messages. That incoming attempt was not admitted; a disposable transport can
+drop it while preserving the connection and existing duplicate protection.
+`receive()` returns `null` for a duplicate or an otherwise valid, authorized
+expired message. Ordinary expiry neither relays a frame nor tears down its
+connection. Invalid signatures, malformed frames and failed current
+authorization remain errors.
 
 An attached route also returns `null` when the channel's shared receive-work
 capacity is full. This is a drop before admission: it does not authenticate,
@@ -125,7 +140,10 @@ Scopes contain 1–256 UTF-8 bytes. JSON payloads permit finite numbers, at most
 32 nesting levels and 4,096 nodes, without accessors, sparse arrays or lossy
 serialization.
 
-These limits are independently configurable within fixed upper bounds. The
+These `SignalLimits` are independently configurable within fixed upper bounds.
+Governed composition accepts the same options through
+`createGovernedPeerService({ ..., signalLimits })`; configuring live budgets does
+not alter the group's durable protocol or permission grants. The
 maximum configurable TTL is 60 seconds. Queueing does not restart a message's
 TTL, and a local clock rollback cannot revive an expired frame.
 
@@ -134,20 +152,22 @@ least one route accepted local dispatch; it does not acknowledge remote receipt
 or application processing. A healthy route can complete a send while another
 route remains busy; every route permits at most one unsettled dispatch and has
 its own deadline. Policy work that ignores cancellation stays counted against
-its work quota until it settles. A low-level transport may return
-`{ refused: 'backpressure' }` only when that attempt queued and dispatched no
-frame. The application send rejects visibly while the route stays usable for a
-later fresh message; nothing retries the refused value. Normal dispatch returns
-`undefined`. Any other return value is a transport error. Some
+its work quota until it settles. A low-level transport may throw
+`SignalBackpressureError` only when that attempt queued and dispatched no frame.
+The application send rejects visibly while the route stays usable for a
+later fresh message; nothing retries the refused value. Normal dispatch resolves
+without a return value. Any other return value is a transport error. Some
 routes can receive a message even when the operation later rejects; cancellation
-cannot recall bytes already handed to a transport. A failed publication does not
-revoke healthy routes. A transport failure or a dispatched write that ignores
+cannot recall bytes already handed to a transport. When every available route is busy, the public send rejects with
+`SIGNAL_BACKPRESSURE`. Congestion creates a live delivery gap without retiring
+healthy routes or interrupting durable replication. A fresh send is a new
+observation; the channel never retries a discarded one. A failed publication does
+not revoke healthy routes. A transport failure or a dispatched write that ignores
 cancellation retires that route and invokes its optional `close()` callback;
-the connection owner should close its underlying session there. The public
-`signals.send()` reports refused capacity with `SignalBackpressureError` (code
-`SIGNAL_BACKPRESSURE`). Low-level transports return the explicit refusal above;
-throwing an exception does not establish that no dispatch occurred and retires
-the route. Reconnect never resends prior messages.
+the connection owner should close its underlying session there. The explicit
+`dispatched: false` marker distinguishes a healthy refusal from an arbitrary
+transport error. It must never describe a partially dispatched frame or a
+closed or failed transport. Reconnect never resends prior messages.
 
 ## Governed replicas
 

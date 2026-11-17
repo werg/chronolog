@@ -75,9 +75,9 @@ const created = await alice.sealed.setReaders({
 })
 await requireFinalAcceptance(created.handle)
 
-// The selected policy must be final before encrypting for its readers.
-// put() rechecks its current policy snapshot: a concurrent audience change may
-// require waiting for that newer policy and reviewing the intended audience.
+// The helper above waits for the applied final policy. put() reads that final
+// view and checks its final accepted outcome before encrypting for its readers.
+// A concurrent audience change still requires reviewing the intended audience.
 try {
   const change = await alice.sealed.put(
     created.id, 'body', new TextEncoder().encode('A private note'),
@@ -139,7 +139,7 @@ const changed = await alice.sealed.setReaders({
   expectedVersion: current.version,
 })
 await requireFinalAcceptance(changed.handle)
-// put() checks the selected policy again before disclosing the next value.
+// put() reads and checks the selected final policy before disclosing the next value.
 ```
 
 Every `put` generates a fresh random AES-256-GCM content key. It wraps that key
@@ -172,11 +172,11 @@ the ciphertext and reader wraps. A recipient can attempt decryption even when
 the transaction later fails a row-write check, a trigger or compare-and-swap.
 SQL rollback and deterministic replay cannot withdraw those bytes.
 
-For that reason `put()` checks the policy update's settlement evidence before
-encrypting. Its default requires an accepted outcome with `final === true` and
-no unresolved references. This condition uses the selected finality provider;
-it does not require peer-validator watermark metadata for a coordinated group.
-Otherwise it throws `SealedPolicyNotFinalError` without encrypting or submitting
+For that reason `put()` reads the final policy snapshot and checks the policy
+update's applied final acceptance before encrypting. The same rule works with
+validator and signed-inclusion finality; no provider-specific watermark is
+required. An absent final policy is unavailable. An unfinalized or rejected
+policy result throws `SealedPolicyNotFinalError` without encrypting or submitting
 the value. Tests or development tools can explicitly pass
 `allowProvisionalPolicy: true`; that permits irreversible disclosure under a
 policy that may later change during replay.

@@ -4,6 +4,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { framePeerStream, type FramedPeerConnection } from '@chronolog/agent-service/framing'
 import { MAX_SIGNAL_BYTES } from '@chronolog/signals'
 
+import { liveFrameLane } from '../../test/fixtures/live-frame-lane.js'
+
 type Lane = 'reliable' | 'live'
 interface OwnedSession { readonly completion: Promise<void>; close(): Promise<void> }
 interface StreamLane { readonly writer: WritableStreamDefaultWriter<Uint8Array>; readonly connection: FramedPeerConnection }
@@ -38,7 +40,7 @@ export async function createHttpPeerFixture(options: {
       signal.addEventListener('abort', () => { void close() }, { once: true })
       if (signal.aborted) { void close(); return }
       const connection: FramedPeerConnection = { signal, send: (frame, options) => reliable.send(frame, options),
-        frames: signal => reliable.frames(signal), live, close }
+        frames: signal => reliable.frames(signal), live: liveFrameLane(live), close }
       void options.accept(connection).then(value => {
         session = value
         void value.completion.catch(reportFailure).finally(close)

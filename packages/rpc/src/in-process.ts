@@ -34,7 +34,6 @@ const unaryDispatch: {
   'view.release': 'releaseReadView',
   'node.getStatus': 'getStatus',
   'query.localSql': 'localSql',
-  'transaction.submit': 'submitTransaction',
   'transaction.getOutcome': 'getOutcome',
   'evidence.getSettlement': 'getSettlementEvidence',
   'evidence.getValidatorWatermark': 'getValidatorWatermark',
