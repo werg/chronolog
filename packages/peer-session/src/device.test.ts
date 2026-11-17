@@ -13,10 +13,10 @@ describe('owned application device identities', () => {
     expect(device.store).toBe(metadata)
     const first = device.openStorage(), second = device.openStorage()
     expect(first).toBe(second)
-    expect(await first).toBe(data)
+    expect((await first).store).toBe(data)
     expect(openStorage).toHaveBeenCalledTimes(1)
     expect(device.identity).toBe(identity); expect(device.storageId).toBe(storageId)
-    await device.close(); await device.close()
+    await (await first).close(); await device.close(); await device.close()
     expect(closed).toHaveBeenCalledTimes(1)
     await expect(device.openStorage()).rejects.toThrow('APPLICATION_DEVICE_CLOSED')
     const resumed = await openApplicationDevice({ store: metadata, openStorage })
@@ -51,6 +51,23 @@ describe('owned application device identities', () => {
     await expect(device.openStorage()).rejects.toThrow('QUOTA_DENIED')
     expect(openStorage).toHaveBeenCalledTimes(1); expect(device.identity).toBe(identity)
     await device.close()
+  })
+
+  it('refuses lost or mismatched data storage without replacing the protocol identity', async () => {
+    const metadata = new MemoryBytesStore(), data = new MemoryBytesStore()
+    const original = await openApplicationDevice({ store: metadata, create: true, openStorage: () => ({ store: data, close() {} }) })
+    await original.openStorage(); await original.close()
+    const released = vi.fn(), empty = new MemoryBytesStore()
+    const lost = await openApplicationDevice({ store: metadata, openStorage: () => ({ store: empty, close: released }) })
+    expect(lost.identity.publicKey).toBe(original.identity.publicKey)
+    await expect(lost.openStorage()).rejects.toThrow('APPLICATION_DATA_STORAGE_MISSING')
+    expect(released).toHaveBeenCalledTimes(1)
+    expect(await empty.get('peer-session/storage-binding/v1')).toBeNull()
+    await lost.close(); expect(released).toHaveBeenCalledTimes(1)
+    const replacement = await openApplicationDevice({ store: new MemoryBytesStore(), create: true,
+      openStorage: () => ({ store: data, close() {} }) })
+    await expect(replacement.openStorage()).rejects.toThrow('APPLICATION_DATA_STORAGE_BINDING_INVALID')
+    await replacement.close()
   })
 
   it('uses the atomically retained identity when concurrent protocol owners create the same device', async () => {

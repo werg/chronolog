@@ -8,7 +8,7 @@ export interface ApplicationDevice {
   /** Small identity and verified-control metadata, independent of application data. */
   readonly store: BytesStore
   /** Acquire the application's durable store once, only when data is actually used. */
-  openStorage(): Promise<BytesStore>
+  openStorage(): Promise<ApplicationStorage>
   close(): void | Promise<void>
 }
 export interface ApplicationStorage { readonly store: BytesStore; close(): void | Promise<void> }
@@ -19,6 +19,8 @@ export interface DeviceMetadataStore extends BytesStore {
 }
 const DEVICE_KEY = 'peer-session/device/v1'
 const DEVICE_BINDING = 'peer-session/device-binding/v1'
+const STORAGE_BINDING = 'peer-session/storage-binding/v1'
+const STORAGE_OPENED = 'peer-session/storage-opened/v1'
 const claimed = new WeakSet<ApplicationDevice>()
 
 /** Explicit setup can create once. Resume never replaces a missing or inconsistent signer. */
@@ -60,15 +62,36 @@ export async function openApplicationDevice(options: {
     }
   }
   let closed = false, storage: ApplicationStorage | undefined
-  let opening: Promise<BytesStore> | undefined, closing: Promise<void> | undefined
+  let opening: Promise<ApplicationStorage> | undefined, closing: Promise<void> | undefined
   return Object.freeze({ identity: Object.freeze(identity), storageId, store: options.store,
     openStorage() {
       if (closed) return Promise.reject(new Error('APPLICATION_DEVICE_CLOSED'))
       return opening ??= Promise.resolve().then(async () => {
         if (closed) throw new Error('APPLICATION_DEVICE_CLOSED')
-        storage = options.openStorage === undefined ? { store: options.store, close() {} } : await options.openStorage()
-        if (closed) throw new Error('APPLICATION_DEVICE_CLOSED')
-        return storage.store
+        const resource = options.openStorage === undefined ? { store: options.store, close() {} } : await options.openStorage()
+        let releasing: Promise<void> | undefined
+        const acquired: ApplicationStorage = Object.freeze({ store: resource.store,
+          close: () => releasing ??= Promise.resolve().then(() => resource.close()) })
+        storage = acquired
+        try {
+          if (closed) throw new Error('APPLICATION_DEVICE_CLOSED')
+          const expected = encodeCanonicalCbor([identity.publicKey, storageId])
+          const opened = await options.store.get(STORAGE_OPENED), retained = await acquired.store.get(STORAGE_BINDING)
+          if (opened !== null && !sameBytes(opened, expected) || retained !== null && !sameBytes(retained, expected)) {
+            throw new Error('APPLICATION_DATA_STORAGE_BINDING_INVALID')
+          }
+          if (opened !== null && retained === null) throw new Error('APPLICATION_DATA_STORAGE_MISSING')
+          if (retained === null) await acquired.store.put(STORAGE_BINDING, expected)
+          // Once this flag is durable, losing the data store is an explicit
+          // failure, never a new empty replica claiming the old storage identity.
+          if (opened === null) await options.store.put(STORAGE_OPENED, expected)
+          if (closed) throw new Error('APPLICATION_DEVICE_CLOSED')
+          return acquired
+        } catch (error) {
+          storage = undefined
+          try { await acquired.close() } catch { /* Preserve the opening failure. */ }
+          throw error
+        }
       })
     },
     close() {
