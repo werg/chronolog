@@ -118,12 +118,51 @@ async function fixture(options: { omitC?: boolean } = {}) {
     offline(value: boolean) { offline = value }, loseSelection() { loseSelection = true } }
 }
 
-async function until(check: () => boolean | Promise<boolean>): Promise<void> {
-  await vi.waitFor(async () => { expect(await check()).toBe(true) }, { timeout: 5000, interval: 5 })
+async function until(check: () => boolean | Promise<boolean>, timeout = 5000): Promise<void> {
+  await vi.waitFor(async () => { expect(await check()).toBe(true) }, { timeout, interval: 5 })
 }
 async function post(session: ApplicationSession<typeof definition>, id: string) {
   const operation = await session.command('say', id, { operationId: id })
   await operation.applied({ signal: AbortSignal.timeout(5000) }); return operation
+}
+
+function gate() {
+  let resolve!: () => void
+  const promise = new Promise<void>(done => { resolve = done })
+  return { promise, resolve }
+}
+
+/** A real verified coordinator reconnects through an invitation already owned by the follower. */
+async function holdIncomingCoordinator({ advertised = true } = {}) {
+  const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(b.deviceId)
+  const opened = gate(), release = gate(), directory = gate(),
+    scanned = gate(), selected = gate()
+  let reconnecting = false, incoming = 0, attemptSignal: AbortSignal | undefined
+  const first = f.participate(a), participation = f.participate(b, {
+    control: { ...f.host, async selectGeneration(request, options) { selected.resolve(); return f.host.selectGeneration(request, options) } },
+    discovery: { ...ports.discovery, async read(options) {
+      if (!reconnecting) return ports.discovery.read(options)
+      await directory.promise; scanned.resolve()
+      return advertised ? [{ identity: a.deviceId, route: a.deviceId }] : []
+    } },
+    transport: { async open(input, options) {
+      const connection = await ports.transport.open(input, options)
+      if (reconnecting && input.invitation !== undefined) {
+        incoming++; attemptSignal = options.signal; opened.resolve(); await release.promise
+      }
+      return connection
+    } },
+    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 5000, advertiseMs: 15_000 },
+  })
+  closing.push(() => { directory.resolve(); release.resolve() })
+  await until(() => participation.status.phase === 'following')
+  await until(async () => await f.b.store.get(`peer-session/coordinator-observation/${b.applicationId}`) !== null)
+  const generation = b.revision.generation
+  reconnecting = true; await first.close()
+  const connection = await f.hub.ports(a.deviceId).transport.open({ peer: { identity: b.deviceId, route: b.deviceId } }, { signal: a.signal })
+  closing.push(() => connection.close())
+  await opened.promise; directory.resolve(); await scanned.promise
+  return { f, a, b, participation, connection, generation, release, selected, incoming: () => incoming, attemptSignal: () => attemptSignal }
 }
 
 describe('owned application participation', () => {
@@ -168,6 +207,46 @@ describe('owned application participation', () => {
     await until(() => participation.status.phase === 'following')
     expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).status).toBe('applied')
     expect(f.requests).toHaveLength(0)
+  })
+
+  it.each([true, false])('finishes an owned incoming coordinator opening before recovery (advertised: %s)', async advertised => {
+    const h = await holdIncomingCoordinator({ advertised })
+    const connecting = h.a.connectPeer({ connection: h.connection, peerIdentity: h.b.deviceId, handshakeTimeoutMs: 5000 })
+    void connecting.catch(() => undefined)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      // The existing attempt outlives the 25ms recovery grace but remains well
+      // within its own 5s budget, as a direct-to-relay transport attempt can.
+      await Promise.race([h.selected.promise, new Promise<void>(resolve => { timer = setTimeout(resolve, 1000) })])
+      expect(h.f.requests).toHaveLength(0)
+      h.release.resolve()
+      const link = await connecting
+      closing.push(() => link.close()); await link.synchronize()
+      await until(() => h.participation.status.phase === 'following')
+      expect(h.incoming()).toBe(1); expect(h.f.requests).toHaveLength(0)
+      expect(h.b.revision.generation).toBe(h.generation)
+    } finally { clearTimeout(timer); h.release.resolve(); await connecting.catch(() => undefined) }
+  })
+
+  it('releases the recovery fence when an incoming coordinator opening exhausts its bounded attempt', async () => {
+    const h = await holdIncomingCoordinator()
+    await until(() => h.participation.status.phase === 'coordinating', 7500)
+    expect(h.attemptSignal()?.aborted).toBe(true)
+    expect(h.incoming()).toBe(1); expect(h.f.requests).toHaveLength(1)
+    expect(h.b.revision.generation).not.toBe(h.generation)
+    expect(h.f.requests[0]?.payload).toMatchObject({ reason: 'takeover', coordinator: h.b.deviceId, expectedGeneration: h.generation })
+    // The noncooperative factory remains physically owned until it returns.
+    h.release.resolve()
+    await until(() => h.connection.signal.aborted)
+  })
+
+  it('closes discovery while its incoming coordinator opening remains pending', async () => {
+    const h = await holdIncomingCoordinator()
+    await h.participation.close()
+    expect(h.participation.status.phase).toBe('closed'); expect(h.f.requests).toHaveLength(0)
+    expect(h.b.revision.generation).toBe(h.generation)
+    h.release.resolve()
+    await until(() => h.connection.signal.aborted)
   })
 
   it('requires explicit approval for an unknown complete prefix and keeps saved commands during host outage', async () => {

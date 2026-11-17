@@ -235,6 +235,9 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     this.signal.throwIfAborted()
     const ageMs = observedAt === null ? null : now - observedAt
     const id = await peerDigest({ generation: expected.generation, control: expected.controlRevision, coordinator: selected, point: base.point })
+    // An invitation or its superseding attempt can arrive after discovery. Do
+    // not declare loss while that coordinator's bounded opening still owns work.
+    if (this.#healthy() || this.#joining.has(replica.generation.payload.coordinator)) return
     if (ageMs === null || ageMs > this.#freshnessMs) {
       this.#proposal = { id, coordinator: selected, point: base.point, reason: ageMs === null ? 'freshness-unknown' : 'older-than-budget', observedAt, ageMs }
       if (this.#approved !== id) return
@@ -292,7 +295,12 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     if (peer === undefined || this.#links().some(link => link.peerId === peer.identity)) return
     const previous = this.#joining.get(peer.identity), incoming = input.invitation !== undefined
     if (previous !== undefined) {
-      if (!incoming || previous.incoming || this.#owner.replica.device.publicKey < peer.identity) return
+      if (!incoming) {
+        // Discovery joins the already owned attempt, including an invitation.
+        await awaitOwnedTask(this.signal, () => previous.finished)
+        return
+      }
+      if (previous.incoming || this.#owner.replica.device.publicKey < peer.identity) return
       previous.controller.abort(new Error('APPLICATION_CONNECTION_SUPERSEDED'))
       await awaitOwnedTask(this.signal, () => previous.finished)
     }
