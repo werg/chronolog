@@ -1,8 +1,9 @@
 # Peer application sessions
 
 `@chronolog/peer-session` owns the application runtime. All participants use the
-same signed records, operation journal, replication, materialization and query
-contracts. `peer-generation-v1` identifies the signed record format; it is not
+same signed protocol and participant contract. Identity, membership, code exchange
+and live signals run immediately; the durable journal, replication, materializer
+and query implementation load on actual data demand. `peer-generation-v1` identifies the signed record format; it is not
 an application mode or a selector for a second implementation.
 One eligible peer sequences commands. Ordinary commands, queries, history and
 live signals need no control-service request while that generation is healthy.
@@ -15,12 +16,42 @@ An applied result is accepted or rejected at one generation and sequence. It is
 stable in that history, but is not irreversible finality. This package exposes
 no `final()` wait and no automatic external-effect dispatcher.
 
+## Immediate protocol, data on demand
+
+Opening an application starts its authenticated protocol participant. Reading
+`status`, `revision`, `capabilities` or `describe()`, observing status/recovery,
+registering a projection, connecting peers and exchanging control, publication
+or live signal messages do not load database code or acquire data storage.
+
+The first command, query, read view, operation inspection, content request,
+recovery action or projection read loads the one durable implementation. Pulling
+`changes()` also demands data; constructing the iterable does not. Concurrent
+first uses share one initialization and one initial synchronization through
+already connected peers. Later calls retain ordinary local-view semantics.
+There is no separate initialization call, application mode or transport profile.
+
+`status.database` reports `idle`, `opening`, `ready`, `failed` or `closed`.
+`ready` means the durable owner exists; `status.phase` still describes whether
+its selected history and keys are usable. `revision` is `null` before a coherent
+data view exists. Queries and captured views return their own non-null revision.
+A failed first initialization releases partial data resources and remains failed
+for that session. The same authenticated participant can still exchange live
+signals and control messages. Closing drains owned work and releases resources;
+closing an unused browser session never opens OPFS.
+
+Browser devices retain their small identity and verified-control metadata in
+IndexedDB. OPFS and its exclusive Web Lock are acquired only by durable use.
+Cold tabs can share the stable device identity; concurrent metadata updates
+preserve one signer and monotonic signed authority. A second durable owner gets
+a busy error. Loss of a previously opened data store is an explicit error and
+never creates an empty history under the old storage identity.
+
 ## Native events application
 
 Create or enroll a device explicitly before opening a session. Resuming a device
-never replaces missing keys. The native store holds an exclusive SQLite writer
-lock; the browser entry holds an exclusive Web Lock and uses OPFS in the owning
-Worker. A second owner receives a busy error.
+never replaces missing keys. The explicitly opened native store holds its SQLite
+writer lock. Its application materializer is still deferred until data use.
+Browser ownership follows the metadata/data boundary described above.
 
 ```ts
 import { defineApplication, defineCommand, defineQuery, emit, program,
@@ -86,7 +117,7 @@ const prepared = await prepareSqlApplication({
 })
 // The control participant signs an authority descriptor containing prepared.binding.
 const session = await openSqlApplication({
-  engine, device, definition, authority, schema: prepared.schema,
+  createEngine: () => engine, device, definition, authority, schema: prepared.schema,
   databasePath: './application.sqlite',
 })
 ```
@@ -95,21 +126,27 @@ Normal reopening reuses the published signed schema and existing device. It does
 not sign a new schema. The common opening function claims device ownership before
 constructing a materializer, verifies the schema authority and definition, and
 requires the engine manifest to match the descriptor before opening a database.
-It captures engine/schema inputs before asynchronous work. Closing the session
+The opening API captures the factory and signed schema immediately, invokes the
+factory only on first data demand, and then captures its engine capability.
+Normal reopen can dynamically import the native engine inside `createEngine`.
+Closing the session
 releases its SQL views and database handles through the same owned lifecycle as
 event execution.
 
-In an owning browser Worker, construct that same capability from verified WASM
-and an already owned SQLite VFS:
+In an owning browser Worker, import and load the verified WASM engine inside
+that same first-use factory:
 
 ```ts
-import { createBrowserSqlEngine, loadBrowserEngine } from '@chronolog/peer-session/sql-browser'
-
-const loaded = await loadBrowserEngine(engineAssetBaseUrl)
-const engine = createBrowserSqlEngine({ ...loaded, vfs: ownedSqlVfsName })
 const session = await openSqlApplication({
-  engine, device, definition, authority, schema,
-  databasePath: '/application.sqlite',
+  device, definition, authority, schema, databasePath: '/application.sqlite',
+  async createEngine({ signal }) {
+    const { createBrowserSqlEngine, loadBrowserEngine } =
+      await import('@chronolog/peer-session/sql-browser')
+    const loaded = await loadBrowserEngine(engineAssetBaseUrl)
+    signal.throwIfAborted()
+    // Acquire the owned SQLite VFS here, within this same data-resource lifetime.
+    return createBrowserSqlEngine({ ...loaded, vfs: ownedSqlVfsName })
+  },
 })
 ```
 
@@ -529,20 +566,30 @@ and connections before closing its durable store.
 
 ## Page facade
 
-The Worker opens the device and owns the application. Configure participation
+The `/worker` entry opens the device and owns the immediate protocol participant;
+its durable facet remains lazy. The `/browser` entry contains only the page
+facade and shared RPC contracts. Configure participation
 before serving the facade so the page receives its stable status and approval
 handle:
 
 ```ts
-import { serveApplicationWorker } from '@chronolog/peer-session/browser'
+import { openBrowserDevice, openBrowserApplication, serveApplicationWorker } from '@chronolog/peer-session/worker'
 import { openWorkerWebRtcConnection } from '@chronolog/peer-session/webrtc'
+import { openWebSocketConnection } from '@chronolog/peer-session/websocket'
 import { createPeerIntroductions } from '@tendriller/core/peers'
 
+const device = await openBrowserDevice({ name: 'conversation', create: true })
+const session = await openBrowserApplication({ device, definition, authority })
+const control = session.connectControlParticipant({
+  exchange: (request, { signal }) => client.peers.exchange(request, { signal }),
+})
 session.participate({
   control,
   ...createPeerIntroductions({
     peers: client.peers, identity: session.deviceId,
-    openConnection: options => openWorkerWebRtcConnection(self, options),
+    openDirectConnection: options => openWorkerWebRtcConnection(self, options),
+    openRelayConnection: ({ relay, signal }) =>
+      openWebSocketConnection(relay, { ready: relay.ready, signal }),
   }),
 })
 serveApplicationWorker(session, self, { host: control })
@@ -568,7 +615,7 @@ const result = await operation.applied()
 
 The returned `WorkerApplicationSession` provides the same declared commands,
 queries, operation inspection, retry, explicit reapplication, changes, live
-signals and content handles. `status` and `revision` are synchronous snapshots;
+signals and content handles. `status` and nullable `revision` are synchronous snapshots;
 `describe()` returns the application contract. `onStatus()` and `onRecovery()`
 observe updates, while `inspectRecovery()` loads retained recovery notices.
 If the Worker configured participation, `session.participation` exposes its
@@ -648,8 +695,9 @@ bounded observation. Set the request's `timeoutMs` above `input.waitMs` when a
 normal unchanged result is wanted. The transport creates no second identity,
 watcher queue, outbox or hosted command proxy.
 
-The portable entry and the browser entry are SQL-free. SQL applications supply
-a qualified materializer through the same execution contract; the pinned schema
+The portable, page, Worker and common SQL entries load no database implementation
+eagerly. SQL applications supply a lazy engine factory through the same execution
+contract; the pinned schema
 is initialized before application history. Irreversible effects require a
 separately declared protected boundary.
 
@@ -657,6 +705,9 @@ separately declared protected boundary.
 
 Run `node tools/package-peer-session.mjs`. The tarball includes shared ESM chunks,
 self-contained TypeScript declarations, and commit/tree/file-hash provenance.
+The `runtimeModules` provenance map records each emitted module's contributing
+source files and import edges so downstream builds can verify actual requested
+code against the lazy boundary.
 `--allow-dirty` produces an explicitly marked development artifact. Native and
 browser entries share session classes and ownership state through those chunks.
 Use `--native-rtc` to include the optional native RTC entry. That archive declares
@@ -666,6 +717,9 @@ package dependencies and remains SQL-free.
 `--sql-native` includes `/sql`, the thin native engine adapter and the exact
 compiled addon. `--sql-browser` includes `/sql` and the verified browser
 loader/factory without embedding an engine build. Both flags can be combined.
-The packager checks that the common SQL and browser entries import no native
-runtime even when the archive also contains the native adapter. Shared chunks
+The packager checks the actual emitted static import closure of `/`, `/browser`,
+`/worker`, `/tendriller` and `/sql`: none may load a replica, materializer, content
+owner, projection owner or OPFS implementation before a dynamic data demand.
+It also checks that browser entries import no native runtime even when the archive
+contains the native adapter. Shared chunks
 retain one session and one materializer class across all entries.
