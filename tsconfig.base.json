@@ -87,6 +87,12 @@
       ],
       "@chronolog/peer-session/sql-browser": [
         "packages/peer-session/src/sql-browser.ts"
+      ],
+      "@chronolog/transport-websocket": [
+        "packages/transport-websocket/src/index.ts"
+      ],
+      "@chronolog/peer-session/websocket": [
+        "packages/peer-session/src/websocket.ts"
       ]
     }
   }

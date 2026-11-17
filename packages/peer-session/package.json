@@ -12,7 +12,8 @@
     "./webrtc-native": "./src/webrtc-native.ts",
     "./tendriller": "./src/tendriller.ts",
     "./sql": "./src/sql.ts",
-    "./sql-browser": "./src/sql-browser.ts"
+    "./sql-browser": "./src/sql-browser.ts",
+    "./websocket": "./src/websocket.ts"
   },
   "dependencies": {
     "@chronolog/peer-generation": "workspace:*",
@@ -22,6 +23,7 @@
     "@chronolog/signals": "workspace:*",
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/transport-webrtc": "workspace:*",
-    "@chronolog/crypto": "workspace:*"
+    "@chronolog/crypto": "workspace:*",
+    "@chronolog/transport-websocket": "workspace:*"
   }
 }
