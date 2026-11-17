@@ -215,6 +215,9 @@ describe('owned application participation', () => {
     f.participate(a)
     const participation = f.participate(b, { recovery: { graceMs: 100, freshnessMs: 50 } })
     await until(() => participation.status.phase === 'following')
+    // Attachment precedes the fully verified head observation. Establish that
+    // evidence before making it idle; otherwise unknown freshness is correct.
+    await until(async () => await f.b.store.get(`peer-session/coordinator-observation/${b.applicationId}`) !== null)
     await a.close()
     await until(() => participation.status.phase === 'approval-required')
     expect(participation.status.recovery).toMatchObject({ reason: 'older-than-budget', point: b.revision.point })
