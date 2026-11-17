@@ -357,6 +357,15 @@ importers:
         specifier: workspace:*
         version: link:../materializer-doltlite
 
+  packages/peer-generation:
+    dependencies:
+      '@chronolog/canonical':
+        specifier: workspace:*
+        version: link:../canonical
+      '@chronolog/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
   packages/protocol:
     dependencies:
       '@chronolog/canonical':

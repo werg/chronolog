@@ -1,0 +1,14 @@
+{
+  "name": "@chronolog/peer-generation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./control": "./src/control.ts"
+  },
+  "dependencies": {
+    "@chronolog/canonical": "workspace:*",
+    "@chronolog/protocol": "workspace:*"
+  }
+}
