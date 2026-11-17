@@ -15,7 +15,7 @@ type NativeFixture = Awaited<ReturnType<typeof createThinMembershipNative>>
 interface PhaseTiming { name: string; startedAfterMs: number; elapsedMs: number | null; status: 'running' | 'completed' | 'failed' }
 interface CommandTiming {
   id: number; phase: string; method: string; startedAfterMs: number; elapsedMs: number | null
-  status: 'running' | 'completed' | 'failed'; error?: string; diagnostics?: unknown
+  status: 'running' | 'completed' | 'failed'; error?: string; diagnostics?: unknown; nativeDiagnostics?: unknown
 }
 
 // The measured browser/OPFS scenario used 226 s before its second fresh-device
@@ -265,6 +265,7 @@ async function callDevice(current: Page, command: Record<string, unknown>): Prom
     timing.status = 'completed'
     if (command.method === 'sync' && result !== null && typeof result === 'object' && 'diagnostics' in result) {
       timing.diagnostics = result.diagnostics
+      timing.nativeDiagnostics = native?.diagnostics() ?? null
     }
     return result
   } catch (error) {

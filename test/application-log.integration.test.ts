@@ -19,6 +19,78 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
 describe('public application backend with native durable execution', () => {
+  it('keeps SQL, events and view notifications on the published order while earlier admission awaits replay', async () => {
+    const fixture = await nativeReplica('sql')
+    const { node, backend, client } = fixture.current
+    const local = backend.changes({ view: 'local' })[Symbol.asyncIterator]()
+    const final = backend.changes({ view: 'final' })[Symbol.asyncIterator]()
+    const initialLocal = (await local.next()).value!, initialFinal = (await final.next()).value!
+    let finalChanged = false
+    const finalNext = final.next().then(value => { finalChanged = true; return value })
+    const setup = await backend.submit(program(
+      sqlStatement('CREATE TABLE view_balance (id INTEGER PRIMARY KEY, value INTEGER NOT NULL) STRICT'),
+      sqlStatement('INSERT INTO view_balance (id, value) VALUES (1, 100)'),
+    ), { operationId: 'view-setup' })
+    expect((await terminal(client, setup.proposalId)).outcome).toEqual({ type: 'accepted' })
+    const sqlOnly = (await local.next()).value!
+    expect(sqlOnly.revision).not.toBe(initialLocal.revision)
+    expect(sqlOnly.finalRevision).toBe(initialFinal.revision)
+    const empty = await backend.readView({ view: 'local' })
+    try { expect((await empty.readEvents()).transactions).toEqual([]) } finally { await empty.release() }
+
+    const setupTime = node.candidateCore(new TextEncoder().encode(setup.proposalId))!.authorTimestampMs
+    fixture.clock.now += 20
+    const later = await backend.submit(program(
+      sqlStatement("SELECT chronolog_assert((SELECT value FROM view_balance) = 100, 'changed')"),
+      sqlStatement('UPDATE view_balance SET value = 90'), emit('view.balance', { value: 90 }),
+    ), { operationId: 'view-later' })
+    expect((await terminal(client, later.proposalId)).outcome).toEqual({ type: 'accepted' })
+    const before = await backend.readView({ view: 'local' })
+    fixture.pauseMaterialization()
+    try {
+      expect((await local.next()).value?.revision).toBe(before.revision)
+      const nextApplied = local.next()
+      const earlier = await node.publish({ operationId: 'view-earlier', authorTimestampMs: setupTime + 1n,
+        program: program(sqlStatement('UPDATE view_balance SET value = 80'), emit('view.balance', { value: 80 })) })
+      await waitFor(async () => node.controlStore.orderedTransactionIds().some(id => equalBytes(id, earlier.txId)))
+      await expect(node.waitForIdle()).rejects.toThrow('TEST_MATERIALIZATION_PAUSED')
+      const during = await backend.readView({ view: 'local' })
+      try {
+        expect(during.revision).toBe(before.revision)
+        expect((await during.query('SELECT value FROM view_balance')).rows).toEqual([[90n]])
+        expect((await during.readEvents()).transactions.map(value => value.proposalId)).toEqual([later.proposalId])
+      } finally { await during.release() }
+      fixture.resumeMaterialization()
+      await node.waitForIdle()
+      // Pending control replay is silent; the next invalidation names its applied view.
+      const changed = (await nextApplied).value!
+      const current = await backend.readView({ view: 'local' })
+      try {
+        expect(changed.revision).toBe(current.revision)
+        expect(changed.revision).not.toBe(before.revision)
+        expect((await current.query('SELECT value FROM view_balance')).rows).toEqual([[80n]])
+        expect((await current.readEvents()).transactions.map(value => value.proposalId)).toEqual([earlier.txIdText])
+      } finally { await current.release() }
+      expect((await before.query('SELECT value FROM view_balance')).rows).toEqual([[90n]])
+      expect((await before.readEvents()).transactions.map(value => value.proposalId)).toEqual([later.proposalId])
+      expect(finalChanged).toBe(false)
+      await fixture.finalize()
+      const confirmed = (await finalNext).value!
+      const finalView = await backend.readView({ view: 'final' })
+      try { expect(confirmed.revision).toBe(finalView.revision) } finally { await finalView.release() }
+      expect((await local.next()).value).toEqual({ view: 'local', revision: changed.revision, finalRevision: confirmed.revision })
+
+      const nativeChanges = node.changes()[Symbol.asyncIterator]()
+      await nativeChanges.next()
+      const pending = nativeChanges.next()
+      await nativeChanges.return?.()
+      expect(await pending).toMatchObject({ done: true })
+    } finally {
+      fixture.resumeMaterialization()
+      await before.release(); await local.return?.(); await final.return?.()
+    }
+  })
+
   it('commits SQL and emits atomically and recovers accepted/rejected operations after revocation and restart', async () => {
     const fixture = await nativeReplica('sql')
     const { client, backend, node } = fixture.current
@@ -256,6 +328,7 @@ async function nativeReplica(profile: 'sql' | 'events') {
   const identity = await generateEd25519KeyPair()
   const groupId = new Uint8Array(32).fill(1), capabilityId = new Uint8Array(32).fill(4)
   const clock = { now: 10_000 }
+  let materializationPaused = false
   let revokedAfter: bigint | undefined
   const membership: MembershipResolver = {
     canWrite: context => equalBytes(context.writerId, identity.publicKeyBytes) &&
@@ -263,7 +336,8 @@ async function nativeReplica(profile: 'sql' | 'events') {
     canValidate: context => equalBytes(context.validatorId, identity.publicKeyBytes) && equalBytes(context.validatorCapability, capabilityId),
     threshold: () => 1,
     watermarkPolicy: () => ({ kind: 'threshold', policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }),
-    liveFinalityPolicies: () => [{ kind: 'threshold', policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }],
+    admissionScopes: () => [{ membershipRevision: new Uint8Array(32).fill(2), authorTimeAfterMs: -1n,
+      policies: [{ kind: 'threshold', policyId: 'one-validator', validatorIds: [identity.publicKeyBytes], threshold: 1 }] }],
   }
   const open = async () => {
     const store = new NativeAgentStore(join(directory, 'agent.sqlite'))
@@ -279,7 +353,12 @@ async function nativeReplica(profile: 'sql' | 'events') {
       })()
     const node = new ChronologNode({ identity, groupId, membershipRevision: new Uint8Array(32).fill(2), validationPolicy: new Uint8Array(32).fill(3),
       transport: feed, operationStore: store, controlStore: new ControlStore(new SqliteControlStorePersistence(control)),
-      materialization, membership, clock: { now: () => clock.now }, validator: { capabilityId, cutoffLagMs: 100 } })
+      materialization: { ...materialization, coordinator: { ...materialization.coordinator,
+        async materialize(ordered) {
+          if (materializationPaused) throw new Error('TEST_MATERIALIZATION_PAUSED')
+          return materialization.coordinator.materialize(ordered)
+        },
+      } }, membership, clock: { now: () => clock.now }, validator: { capabilityId, cutoffLagMs: 100 } })
     await node.start()
     const client = new ChronologClient({ groupId: bytesToBase64Url(groupId), transport: new InProcessRpcTransport(new NodeRpcService({ node })) })
     const backend = createChronologApplicationBackend({ id: 'application-pilot', replica: client, sql: profile === 'sql' })
@@ -294,6 +373,8 @@ async function nativeReplica(profile: 'sql' | 'events') {
   cleanup.push(async () => { await current.close(); await rm(directory, { recursive: true, force: true }) })
   return {
     directory, clock, get current() { return current },
+    pauseMaterialization() { materializationPaused = true },
+    resumeMaterialization() { materializationPaused = false },
     revokeWriter() { revokedAfter = BigInt(clock.now); clock.now += 1_000 },
     async restart() { await current.close(); current = await open() },
     async finalize() {

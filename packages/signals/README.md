@@ -132,8 +132,12 @@ routes can receive a message even when the operation later rejects; cancellation
 cannot recall bytes already handed to a transport. A failed publication does not
 revoke healthy routes. A transport failure or a dispatched write that ignores
 cancellation retires that route and invokes its optional `close()` callback;
-the connection owner should close its underlying session there. Reconnect never
-resends prior messages.
+the connection owner should close its underlying session there. A transport that
+rejects a frame before dispatch because its buffer is full throws
+`SignalBackpressureError` (code `SIGNAL_BACKPRESSURE`). That publication still
+rejects, but its healthy route remains attached for a later fresh intent. This
+error must never describe a partially dispatched frame or a closed or failed
+transport. Reconnect never resends prior messages.
 
 ## Governed replicas
 

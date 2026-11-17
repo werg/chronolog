@@ -33,12 +33,14 @@ describe('static membership bootstrap', () => {
     expect(await resolver.canValidate({ ...context, validatorId: validator, validatorCapability: bytes(9) })).toBe(false)
     expect(await resolver.threshold(context)).toBe(1)
     expect(await resolver.policyVersion?.(context)).toBe(4n)
-    expect(await resolver.liveFinalityPolicies?.({ groupId, membershipRevision })).toEqual([{
-      kind: 'threshold', policyId: Buffer.from(validationPolicy).toString('base64url'),
-      validatorIds: [validator], threshold: 1,
+    expect(await resolver.admissionScopes?.({ groupId })).toEqual([{
+      membershipRevision, authorTimeAfterMs: -1n, policies: [{
+        kind: 'threshold', policyId: Buffer.from(validationPolicy).toString('base64url'),
+        validatorIds: [validator], threshold: 1,
+      }],
     }])
-    expect(await resolver.liveFinalityPolicies?.({ groupId, membershipRevision: bytes(9) })).toBeNull()
-    expect(await resolver.liveFinalityPolicies?.({ groupId: bytes(9), membershipRevision })).toBeNull()
+    expect(await resolver.canWrite({ ...context, membershipRevision: bytes(9) })).toBe(false)
+    expect(await resolver.admissionScopes?.({ groupId: bytes(9) })).toBeNull()
     expect(await resolver.canUseTransportAuthor?.({
       groupId,
       membershipRevision,

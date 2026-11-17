@@ -8,6 +8,39 @@ import { ChronologClient } from './client.js'
 const batch = (cursor: string): EventBatch => ({ transactions: [], revision: `revision-${cursor}`, scannedThrough: cursor, hasMore: false })
 
 describe('application client', () => {
+  it('reconnects view invalidations from current state and cancels an abandoned pending pull', async () => {
+    const requests: unknown[] = []
+    let disconnect!: () => void
+    const disconnected = new Promise<void>(resolve => { disconnect = resolve })
+    let lifetime: AbortSignal | undefined, stopped = 0
+    const transport = { stream: (method: string, request: unknown, options: RpcCallOptions) => ({ async *[Symbol.asyncIterator]() {
+      expect(method).toBe('view.changes'); requests.push(request); lifetime = options.signal
+      try {
+        yield { view: 'local', revision: `local-${requests.length}`, finalRevision: 'final-1' }
+        if (requests.length === 1) { await disconnected; throw new ChronologRpcError('transport_unavailable', 'Worker restarted') }
+        await new Promise<void>(resolve => {
+          if (lifetime!.aborted) resolve()
+          else lifetime!.addEventListener('abort', () => resolve(), { once: true })
+        })
+      } finally { stopped++ }
+    } }) } as unknown as RpcTransport
+    const client = new ChronologClient({ transport, groupId: 'group', streamRetryDelayMs: () => 0, requestId: () => 'view-notifications' })
+    const selection: { view: 'local' | 'final' } = { view: 'local' }
+    const changes = client.changes(selection)
+    selection.view = 'final'
+    const iterator = changes[Symbol.asyncIterator]()
+    expect((await iterator.next()).value?.revision).toBe('local-1')
+    disconnect()
+    expect((await iterator.next()).value?.revision).toBe('local-2')
+    expect(requests).toEqual([{ groupId: 'group', requestId: 'view-notifications', view: 'local' }, { groupId: 'group', requestId: 'view-notifications', view: 'local' }])
+    const pending = iterator.next()
+    await iterator.return?.()
+    expect(await pending).toMatchObject({ done: true })
+    expect(lifetime?.aborted).toBe(true)
+    await expect.poll(() => stopped).toBe(2)
+    await client.close()
+  })
+
   it('never retries a live send after a lost reply, even when durable unary retries are enabled', async () => {
     const calls: unknown[] = []
     const transport = { unary: async (method: string, request: unknown) => {

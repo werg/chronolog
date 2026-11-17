@@ -18,7 +18,7 @@ function fixture() {
       finally { watchers-- }
     },
     events: { read: async () => batch, async *subscribe() { yield batch } },
-    async readView() { return { revision: batch.revision,
+    async readView(options = { view: 'final' as const }) { return { view: options.view, revision: batch.revision, finalRevision: 'pinned-final',
       query(_sql: string, values: unknown[]) { parameters.push(values); return { columns: [{ name: 'count' }], rows: [[{ kind: 'integer', value: '7' }]] } },
       readEvents: () => batch, release() { released++ },
     } },
@@ -61,9 +61,22 @@ describe('selected Chronolog application adapter', () => {
     expect(f.watchers).toBe(0)
   })
 
+  it('releases an abandoned operation observer while its next pull is waiting', async () => {
+    const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: false })
+    f.set('accepted', false)
+    const iterator = backend.operations.subscribe({ operationId: 'stable' })[Symbol.asyncIterator]()
+    expect((await iterator.next()).value?.status).toBe('provisional')
+    const pending = iterator.next()
+    await Promise.resolve()
+    await iterator.return?.()
+    expect(await pending).toMatchObject({ done: true })
+    expect(f.watchers).toBe(0)
+  })
+
   it('captures one view, normalizes native SQL values and releases it once', async () => {
     const f = fixture(), backend = createChronologApplicationBackend({ id: 'history', replica: f.source, sql: true })
     const view = await backend.readView({ view: 'final' })
+    expect(view).toMatchObject({ view: 'final', revision: 'pinned', finalRevision: 'pinned-final' })
     const result = await view.query('SELECT ?', [7n])
     expect(result).toEqual({ revision: 'pinned', columns: [{ name: 'count' }], rows: [[7n]], truncated: false })
     expect(f.parameters).toEqual([[{ kind: 'integer', value: '7' }]])

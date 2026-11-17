@@ -18,7 +18,7 @@ export async function openHttpPeerConnection(base: string, token: string): Promi
   const close = async () => {
     if (closed) return
     closed = true
-    controller.abort()
+    controller.abort(new Error('PEER_CONNECTION_CLOSED'))
     await Promise.allSettled([...connections].map(connection => connection.close()))
     try { await fetch(urlFor('reliable'), { method: 'DELETE' }) } catch { /* The server also observes stream cancellation. */ }
   }
@@ -39,7 +39,10 @@ export async function openHttpPeerConnection(base: string, token: string): Promi
   }
   try {
     const [reliable, live] = await Promise.all([open('reliable'), open('live')])
-    return { send: (bytes, options) => reliable.send(bytes, options), frames: signal => reliable.frames(signal), live, close }
+    const signal = AbortSignal.any([reliable.signal, live.signal, controller.signal])
+    signal.addEventListener('abort', () => { void close() }, { once: true })
+    if (signal.aborted) { await close(); signal.throwIfAborted() }
+    return { signal, send: (bytes, options) => reliable.send(bytes, options), frames: signal => reliable.frames(signal), live, close }
   } catch (error) { await close(); throw error }
 }
 

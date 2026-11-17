@@ -104,6 +104,21 @@ Live-query digests bind SQL, parameters, view and row limit. Each selected-reade
 revision produces a snapshot/change event, including revisions whose rows are
 unchanged. Switching a cursor to a different query or view is rejected.
 
+`view.open` captures SQL, effective events and revision metadata from one locally
+applied application prefix. `view.query` and `view.events` use that same capture
+until `view.release` or lease expiry. Both final and local captures stay coherent
+while the replica receives newer proof or replays its speculative suffix. Leases
+are bounded and belong to the RPC principal that opened them; expired views fail
+with `revision_unavailable` so the caller can capture a fresh view.
+
+`view.changes` defaults to `final` and yields current `{ view, revision,
+finalRevision }` metadata followed by coalesced invalidations. SQL-only changes,
+rebases and finality-only advances can all invalidate a selected view. This stream
+has no replay cursor, retains no SQL lease and does not poll the page host.
+Reconnecting observes current state; a slow consumer can skip intermediate
+invalidations. Durable event processing instead uses `events.subscribe` with
+whole transaction batches and explicit processed cursors.
+
 Transaction outcomes contain a separate `final` boolean. `accepted` or
 `rejected` alone describes the current SQL execution result. `final: true`
 requires the transaction's stable result to be applied in the local immutable
@@ -115,6 +130,15 @@ current state and then follow live changes. The service subscribes before
 reading that state. Resume cursors are hints: a cursor from a previous process
 cannot suppress newer finality after the local event counter restarts. Ending
 the iterator cancels its node subscription.
+
+Effective events retain `origin` reconstructed from the verified canonical
+proposal: the original group, signing author, operation ID, author timestamp,
+membership revision and exact writer capability. Captured views, event streams
+and HTTP/Worker serialization preserve those facts. Payload fields do not supply
+provenance. Effect workers retain the same origin in their durable checkpoints
+and apply their own dispatch policy before performing an external action.
+Ephemeral messages remain separate `signals.send` calls with no durable event
+cursor or automatic retry.
 
 ## Durable transaction submission
 
@@ -170,6 +194,9 @@ Only the device that created the request can claim its local readiness.
 | --- | --- | --- |
 | Node | `node.getStatus`, `node.getReplicationStatus` | `node.streamStatus`, `node.streamReplicationStatus` |
 | SQL | `query.localSql` | `query.liveSql` |
+| Captured views | `view.open`, `view.query`, `view.events`, `view.release` | `view.changes` |
+| Application changes and events | `change.submit`, `events.read`, `operation.get` | `events.subscribe`, `operation.subscribe` |
+| Live signals | `signals.send` | `signals.subscribe` |
 | Transactions | `transaction.submit`, `transaction.getOutcome` | `transaction.streamOutcome` |
 | Evidence | `evidence.getSettlement`, `evidence.getValidatorWatermark` | `evidence.streamSettlement` |
 | Governance | `governance.getStatus`, `governance.grantCapability`, `governance.revokeCapabilities`, `governance.rotateEpoch`, `governance.grantHistoricalAccess` | — |

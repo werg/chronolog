@@ -26,6 +26,7 @@ describe('bounded peer byte framing', () => {
     for await (const frame of connection.frames()) frames.push(frame)
     expect(frames).toEqual([utf8('first'), utf8('second')])
     expect(writes).toEqual([encoded('outgoing')])
+    expect(connection.signal.reason).toMatchObject({ message: 'PEER_CONNECTION_ENDED' })
   })
 
   it('rejects excessive lengths before allocation and refuses truncated durable frames', async () => {
@@ -33,8 +34,42 @@ describe('bounded peer byte framing', () => {
     new DataView(header.buffer).setUint32(0, 100, false)
     const oversized = framePeerStream({ readable: readable([header]), writable: new WritableStream(), maxFrameBytes: 8 })
     await expect(oversized.frames()[Symbol.asyncIterator]().next()).rejects.toThrow('PEER_FRAME_TOO_LARGE')
+    expect(oversized.signal.reason).toMatchObject({ message: 'PEER_FRAME_TOO_LARGE' })
     const truncated = framePeerStream({ readable: readable([encoded('body').slice(0, -1)]), writable: new WritableStream() })
     await expect(truncated.frames()[Symbol.asyncIterator]().next()).rejects.toThrow('PEER_FRAME_TRUNCATED')
+    expect(truncated.signal.reason).toMatchObject({ message: 'PEER_FRAME_TRUNCATED' })
+  })
+
+  it('reports the original write failure before closing its reader', async () => {
+    const failure = new Error('write failed'), seen: unknown[] = []
+    const connection = framePeerStream({ readable: new ReadableStream(),
+      writable: new WritableStream({ write() { throw failure } }) })
+    connection.signal.addEventListener('abort', () => { seen.push(connection.signal.reason) })
+    const reading = connection.frames()[Symbol.asyncIterator]().next()
+    await expect(connection.send(utf8('one'))).rejects.toBe(failure)
+    expect(seen).toEqual([failure])
+    expect(await reading).toEqual({ value: undefined, done: true })
+    expect(connection.signal.reason).toBe(failure)
+  })
+
+  it('cancels a queued frame before dispatch without retiring the healthy stream', async () => {
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve }), writing = new Promise<void>(resolve => { entered = resolve })
+    const writes: Uint8Array[] = []
+    const connection = framePeerStream({ readable: new ReadableStream(), writable: new WritableStream({ async write(bytes) {
+      writes.push(bytes); entered(); if (writes.length === 1) await gate
+    } }) })
+    const first = connection.send(utf8('one')), controller = new AbortController(), cancelled = new Error('cancelled')
+    await writing
+    const second = connection.send(utf8('discarded'), { signal: controller.signal })
+    controller.abort(cancelled); release()
+    await first
+    await expect(second).rejects.toBe(cancelled)
+    expect(connection.signal.aborted).toBe(false)
+    await connection.send(utf8('three'))
+    expect(writes).toEqual([encoded('one'), encoded('three')])
+    await connection.close()
+    expect(connection.signal.reason).toMatchObject({ message: 'PEER_CONNECTION_CLOSED' })
   })
 
   it('refuses an unbounded send backlog while the underlying stream is slow', async () => {

@@ -385,12 +385,18 @@ describe('CapabilityMembershipResolver watermark policy', () => {
 
   it('enumerates every authenticated policy for a safe global live frontier', async () => {
     const two = snapshot(), one = { id: unknownPolicyId, policy: policy({ minimumValidators: 1n }), installedAtRevision: 1n }
-    const resolver = resolverFor({ ...two, policies: new Map([...two.policies, [bytesToHex(one.id), one]]) })
-    expect(await resolver.liveFinalityPolicies({ groupId, membershipRevision: revisionDigest })).toEqual([
-      { kind: 'threshold', policyId: bytesToHex(policyId), validatorIds: [...validatorKeys], threshold: 2 },
-      { kind: 'threshold', policyId: bytesToHex(one.id), validatorIds: [...validatorKeys], threshold: 1 },
-    ])
-    expect(await resolver.liveFinalityPolicies({ groupId: otherGroupId, membershipRevision: revisionDigest })).toBeNull()
-    expect(await resolver.liveFinalityPolicies({ groupId, membershipRevision: otherRevisionDigest })).toBeNull()
+    const value = { ...two, policies: new Map([...two.policies, [bytesToHex(one.id), one]]) }
+    let revisions = [{ membershipRevision: revisionDigest, authorTimeAfterMs: -1n }]
+    const resolver = resolverFor(value, { finalityRevisions: () => revisions })
+    expect(await resolver.admissionScopes({ groupId })).toEqual([{
+      membershipRevision: revisionDigest, authorTimeAfterMs: -1n, policies: [
+        { kind: 'threshold', policyId: bytesToHex(policyId), validatorIds: [...validatorKeys], threshold: 2 },
+        { kind: 'threshold', policyId: bytesToHex(one.id), validatorIds: [...validatorKeys], threshold: 1 },
+      ],
+    }])
+    expect(await resolver.admissionScopes({ groupId: otherGroupId })).toBeNull()
+    revisions = [{ membershipRevision: otherRevisionDigest, authorTimeAfterMs: -1n }]
+    expect(await resolver.admissionScopes({ groupId })).toBeNull()
+    expect(await resolverFor(value).admissionScopes({ groupId })).toBeNull()
   })
 })

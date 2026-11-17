@@ -2,10 +2,11 @@ import {
   assertCanonicalCbor, concatBytes, encodeCanonicalCbor, equalBytes, utf8,
   type Ed25519KeyPair,
 } from '@chronolog/protocol'
-import { appendControl, controlGenesisRoot, isControlRecord, type ControlCommitment, type FinalizedControl } from './control-chain.js'
+import { appendControl, isControlRecord, type ControlCommitment, type FinalizedControl } from './control-chain.js'
+import { VerifiedFinalityPrefix } from './finality-prefix.js'
 
 import {
-  encodeHistoryConfiguration, orderedGenesisRoot, verifyOrderedEntry,
+  encodeHistoryConfiguration,
   type CoordinatedHistoryConfiguration,
   type OrderedRecordEntry, type OrderedRecordHead,
 } from './history-policy.js'
@@ -192,62 +193,10 @@ export async function evaluateFinalitySnapshot(configuration: CoordinatedHistory
   entries: readonly OrderedRecordEntry[], receivedThrough?: number): Promise<SignedInclusionSnapshot> {
   configuration = structuredClone(configuration)
   entries = structuredClone(entries)
-  const records: IncludedRecord[] = []
-  const closures: FinalityClosureBoundary[] = []
-  let root = await orderedGenesisRoot(configuration.historyId)
-  let position = 0
-  let closedThroughMs = -1n
-  let coveredRecords = 0
-  const controls: FinalizedControl[] = []
-  let control: ControlCommitment = { count: 0, root: await controlGenesisRoot(configuration) }
-  for (const entry of entries) {
-    if (entry.historyId !== configuration.historyId || entry.position !== position + 1 || entry.previousRoot !== root) {
-      throw new Error('FINALITY_CLOSURE_PREFIX_INCOMPLETE')
-    }
-    await verifyOrderedEntry(entry)
-    let closure: SignedFinalityClosure | null = null
-    if (isFinalityClosureRecord(entry.bytes)) {
-      try { closure = await verifyFinalityClosureRecord(entry.bytes, configuration) }
-      catch (error) {
-        // Generic retained logs can contain arbitrary writer bytes. A forged,
-        // foreign or malformed marker makes no authority promise and cannot
-        // poison the whole history. Authenticated contradictory promises below
-        // remain fatal continuity errors.
-        if (!(error instanceof Error) || !/^FINALITY_CLOSURE_(INVALID|SIGNATURE_INVALID|CONFIGURATION_MISMATCH)$/u.test(error.message)) throw error
-      }
-    }
-    if (closure !== null) {
-      if (closure.includedHead.position !== position || closure.includedHead.root !== root) {
-        throw new Error('FINALITY_CLOSURE_HEAD_MISMATCH')
-      }
-      if (closure.closedThroughMs < closedThroughMs) throw new Error('FINALITY_CLOSURE_REGRESSION')
-      const boundary: FinalityClosureBoundary = {
-        position: entry.position, root: entry.root, includedThrough: position,
-        includedRoot: root, closedThroughMs: closure.closedThroughMs,
-      }
-      closures.push(boundary)
-      for (; coveredRecords < records.length; coveredRecords += 1) {
-        const included = records[coveredRecords]!
-        if (isControlRecord(included.entry.bytes)) {
-          const next = await appendControl(control, included.entry, boundary.closedThroughMs)
-          controls.push(next); control = { count: next.index, root: next.root }
-        }
-        records[coveredRecords] = { ...included,
-          closureBoundary: boundary, closedThroughMs: boundary.closedThroughMs }
-      }
-      if (closure.control.count !== control.count || closure.control.root !== control.root) throw new Error('FINALITY_CONTROL_PROJECTION_MISMATCH')
-      closedThroughMs = closure.closedThroughMs
-    } else records.push({ entry, admissionFloorMs: closedThroughMs, closedThroughMs: -1n, closureBoundary: null })
-    root = entry.root
-    position = entry.position
-  }
-  const received = receivedThrough ?? position
-  if (!Number.isSafeInteger(received) || received < position) throw new Error('FINALITY_CLOSURE_PREFIX_INCOMPLETE')
-  return {
-    checkpointId: root, receivedThrough: received, includedThrough: position,
-    closedReceiptThrough: closures.at(-1)?.includedThrough ?? 0, closedThroughMs,
-    records, closures, control, controls,
-  }
+  // Public standalone verification always starts at genesis. The policy's
+  // private authenticated prefix is never accepted as an input here.
+  const empty = await VerifiedFinalityPrefix.empty(configuration)
+  return (await empty.append(entries)).snapshot(receivedThrough)
 }
 
 function closureFields(value: Omit<SignedFinalityClosure, 'signature'>) {

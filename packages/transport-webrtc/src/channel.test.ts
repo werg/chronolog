@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { SignalBackpressureError } from '@chronolog/signals'
 
 import { frameRtcDataChannel, frameRtcPeerChannels, WEBRTC_LIMITS } from './channel.js'
 import { frameRtcLiveChannel, WEBRTC_LIVE_LIMITS } from './live.js'
@@ -183,7 +184,7 @@ describe('independent live WebRTC lane', () => {
       const controller = new AbortController(); controller.abort(new Error('preview expired'))
       await expect(a.send(new Uint8Array([2]), { signal: controller.signal })).rejects.toThrow('preview expired')
       source.left.bufferedAmount = WEBRTC_LIVE_LIMITS.bufferedBytes
-      await expect(a.send(new Uint8Array([3]))).rejects.toThrow('WEBRTC_LIVE_BACKPRESSURE')
+      await expect(a.send(new Uint8Array([3]))).rejects.toBeInstanceOf(SignalBackpressureError)
       source.left.bufferedAmount = 0
       await a.send(new Uint8Array([4]))
       expect(source.left.sent).toEqual([new Uint8Array([4])])

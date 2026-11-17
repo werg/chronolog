@@ -34,6 +34,10 @@ export interface Signals {
 export class SignalError extends Error {
   constructor(readonly code: string, message = code) { super(message); this.name = 'SignalError' }
 }
+/** The frame was not dispatched; the bounded transport remains usable. */
+export class SignalBackpressureError extends SignalError {
+  constructor() { super('SIGNAL_BACKPRESSURE'); this.name = 'SignalBackpressureError' }
+}
 
 /** Credentials are authenticated opaque bytes; only the supplied policy interprets them. */
 export interface SignalAuthorization {
@@ -43,7 +47,7 @@ export interface SignalAuthorization {
   readonly credential: Uint8Array | null
 }
 export interface SignalTransport {
-  /** Must honor cancellation and bound its own framing queues. */
+  /** Must honor cancellation and bound its queues. A healthy pre-dispatch refusal uses SignalBackpressureError. */
   send(frame: Uint8Array, options: { readonly signal: AbortSignal }): Promise<void>
   /** Retire an underlying connection that cannot complete a dispatched write. */
   close?(): void | Promise<void>
@@ -161,7 +165,7 @@ export class SignalChannel implements Signals {
       if (typeof options !== 'object' || options === null) throw new SignalError('SIGNAL_OPTIONS_INVALID')
       this.#assertOpen(); options.signal?.throwIfAborted()
       if (this.#routes.size === 0) throw new SignalError('SIGNAL_ROUTE_UNAVAILABLE')
-      if (this.#pendingSends >= this.#maxSends) throw new SignalError('SIGNAL_BACKPRESSURE')
+      if (this.#pendingSends >= this.#maxSends) throw new SignalBackpressureError()
       assertSignalTopic(topic)
       const encodedPayload = canonicalSignalPayload(payload)
       const ttlMs = bound(options.ttlMs ?? Math.min(5_000, this.#ttl), 1, this.#ttl, 'SIGNAL_TTL_INVALID')
@@ -268,7 +272,7 @@ export class SignalChannel implements Signals {
     const attached = [...this.#routes].filter(route => route !== source)
     if (required && attached.length === 0) throw new SignalError('SIGNAL_ROUTE_UNAVAILABLE')
     const routes = attached.filter(route => !route.busy)
-    if (required && routes.length === 0) throw new SignalError('SIGNAL_BACKPRESSURE')
+    if (required && routes.length === 0) throw new SignalBackpressureError()
     const attempts = routes.map(route => {
       route.busy = true
       let handedOff = false, settled = false
@@ -286,7 +290,8 @@ export class SignalChannel implements Signals {
         // Give cooperative cancellation its microtask turn. A route whose write
         // remains outstanding cannot admit another write or survive indefinitely.
         if (handedOff && lifetime.aborted && !settled) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
-        if (handedOff && (!lifetime.aborted || !settled)) this.#detach(route, true)
+        const refused = error instanceof SignalBackpressureError && settled && !route.lifetime.signal.aborted
+        if (handedOff && !refused && (!lifetime.aborted || !settled)) this.#detach(route, true)
         throw error
       }).finally(() => { clearTimeout(timer) })
     })
@@ -296,6 +301,7 @@ export class SignalChannel implements Signals {
       try { await Promise.any(attempts) }
       catch (error) {
         if (error instanceof AggregateError && error.errors.length === 1) throw error.errors[0]
+        if (error instanceof AggregateError && error.errors.every(value => value instanceof SignalBackpressureError)) throw new SignalBackpressureError()
         throw new SignalError('SIGNAL_SEND_FAILED')
       }
     } else await Promise.allSettled(attempts)

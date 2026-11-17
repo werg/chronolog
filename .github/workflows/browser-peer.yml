@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller-contrib
-          ref: beab59dc58881671522b2029580821ae5d146b09
+          ref: 0a06a94eaf4cff7f7331b4c05694a232fc7fa28a
           path: artifacts/pilot-source/contrib
           persist-credentials: false
       - name: Qualify native and browser WebRTC after signaling host shutdown
@@ -68,7 +68,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: werg/tendriller
-          ref: edd6fe913a0c7412acbf80b019793ff9aeb95934
+          ref: 62b6e1c4fca530a70a02c1043c482752147a81a9
           path: artifacts/pilot-source/tendriller
           persist-credentials: false
       - name: Build the packaged public Tendriller SDK, runtime and engine

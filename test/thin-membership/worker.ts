@@ -9,6 +9,7 @@ import { openBrowserPeer, prepareBrowserIdentity, type BrowserPeer, type WorkerE
 import { frameRtcPeerChannels, type PeerDataChannelConnection, type WebRtcChannels } from '@chronolog/transport-webrtc'
 
 import { attachMembershipPeer } from './peer.js'
+import { observeFeedLink } from './link-observation.js'
 import type { ThinMembershipBootstrap } from '../../tools/thin-membership-native.js'
 
 type Request = {
@@ -37,7 +38,9 @@ let requestId: string | undefined
 // Qualification timings observe the public provider/store boundaries. They do
 // not issue extra reads, drain queues, or change the evidence being verified.
 const workNames = ['transportCatchUp', 'evidenceHistory', 'nodeIdle', 'finalityIngest',
-  'finalitySnapshot', 'finalityStoreRead', 'finalityStoreWrite', 'enrollmentStatus'] as const
+  'finalitySnapshot', 'finalityStoreRead', 'finalityStoreWrite', 'enrollmentStatus',
+  'transportEvidenceWrite', 'nodeEvidence', 'privateRead', 'privateObjectWrite',
+  'privateManifestWrite', 'privatePayloadWrite', 'privateOtherWrite'] as const
 type WorkName = typeof workNames[number]
 const work = Object.fromEntries(workNames.map(name => [name, {
   calls: 0, completed: 0, failed: 0, inputBytes: 0, outputBytes: 0, totalMs: 0, maximumMs: 0,
@@ -45,6 +48,7 @@ const work = Object.fromEntries(workNames.map(name => [name, {
 }])) as Record<WorkName, { calls: number; completed: number; failed: number; inputBytes: number; outputBytes: number
   totalMs: number; maximumMs: number; active: Map<number, number> }>
 const evidenceInputs = new Set<string>()
+const links: Array<ReturnType<typeof observeFeedLink>> = []
 let repeatedEvidenceInputs = 0, scannedEvidenceEntries = 0
 let finality: { includedThrough: number; closedReceiptThrough: number; closedThroughMs: string } | undefined
 let sync: { command: number; startedAtMs: number; phase: string; phaseStartedAtMs: number; finishedAtMs?: number
@@ -82,7 +86,7 @@ function diagnostics() {
       phaseAgeMs: (sync.finishedAtMs ?? now) - sync.phaseStartedAtMs, phases: sync.phases,
       evidenceBefore: sync.evidenceBefore },
     evidence: { uniqueInputs: evidenceInputs.size, repeatedInputs: repeatedEvidenceInputs, scannedEntries: scannedEvidenceEntries },
-    finality,
+    finality, links: links.map(link => link.snapshot()),
     // Durations include waiting for the observed call and may overlap between
     // the background consumer and the explicit idle barrier.
     work: Object.fromEntries(workNames.map(name => {
@@ -138,6 +142,19 @@ endpoint.addEventListener('message', event => {
         const genesis = decodeSignedGenesis(base64UrlToBytes(bootstrap.genesis))
         peer = await openBrowserPeer({ name: request.name!, engineUrl: new URL('./engine/', globalThis.location.href), configure(context) {
           identity = context.identity
+          const get = context.operations.get.bind(context.operations), put = context.operations.put.bind(context.operations)
+          context.operations.get = key => measured('privateRead', () => get(key))
+          context.operations.put = (key, bytes) => measured(key.startsWith('feed/object/') ? 'privateObjectWrite'
+            : key === 'feed/manifest' ? 'privateManifestWrite' : key.startsWith('feed/payload/') ? 'privatePayloadWrite'
+              : 'privateOtherWrite', () => put(key, bytes), bytes.length)
+          const connect = context.transport.connect.bind(context.transport)
+          context.transport.connect = link => {
+            const observation = observeFeedLink(link)
+            links.push(observation); if (links.length > 8) links.shift()
+            return connect(observation.link)
+          }
+          const putEvidence = context.transport.putEvidence.bind(context.transport)
+          context.transport.putEvidence = bytes => measured('transportEvidenceWrite', () => putEvidence(bytes), bytes.length)
           const evidenceHistory = context.transport.evidenceHistory.bind(context.transport)
           context.transport.evidenceHistory = () => measured('evidenceHistory', async () => {
             const history = await evidenceHistory()
@@ -171,6 +188,8 @@ endpoint.addEventListener('message', event => {
               },
             } }, close: disconnect }
         } })
+        const ingestEvidence = peer.node.ingestFinalityEvidence.bind(peer.node)
+        peer.node.ingestFinalityEvidence = bytes => measured('nodeEvidence', () => ingestEvidence(bytes), bytes.length)
         client = new ChronologClient({ groupId: bytesToBase64Url(genesis.manifest.groupId), transport: peer.rpc, unaryRetryAttempts: 1 })
         return status()
       }

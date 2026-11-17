@@ -69,6 +69,15 @@ export interface TransportAuthorContext {
   readonly validatorCapability?: Uint8Array
 }
 
+/** One revision in the complete history of authorized peer admission policies. */
+export interface AdmissionScope {
+  readonly membershipRevision: Uint8Array
+  /** This revision cannot authorize an author timestamp at or below this bound. */
+  readonly authorTimeAfterMs: bigint
+  /** Every permitted policy, including policies with no locally known proposals. */
+  readonly policies: readonly WatermarkPolicy[]
+}
+
 /**
  * Resolves authority at the transaction's pinned membership revision. It can be
  * backed by the in-log capability system, a central service, a chain, or a
@@ -96,15 +105,13 @@ export interface MembershipResolver {
   ): readonly StoredAttestation[] | Promise<readonly StoredAttestation[]>
   watermarkPolicy?(core: TransactionCore): WatermarkPolicy | null | Promise<WatermarkPolicy | null>
   /**
-   * Complete admission policy set for this revision's live chronological
-   * history. A global prefix must be safe under every permitted policy, not
-   * only the policy selected by its last proposal. Omission keeps local replay
-   * available without claiming heartbeat-based finality.
+   * Exhaustive activated revision/policy history for this group. Bounds require
+   * authenticated activation evidence, not a local clock. Missing completeness
+   * leaves peer application finality pending; encountered proposals cannot fill
+   * in this proof. Revisions remain listed after they permanently close.
    */
-  liveFinalityPolicies?(context: {
-    readonly groupId: Uint8Array
-    readonly membershipRevision: Uint8Array
-  }): readonly WatermarkPolicy[] | null | Promise<readonly WatermarkPolicy[] | null>
+  admissionScopes?(context: { readonly groupId: Uint8Array }): readonly AdmissionScope[] | null |
+    Promise<readonly AdmissionScope[] | null>
 }
 
 export interface ValidatorOptions {

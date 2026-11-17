@@ -184,6 +184,7 @@ describe('native agent composition', () => {
     }
     const reliable = lane(), live = lane()
     const connections = reliable.map((connection, index) => ({ ...connection, live: live[index]!,
+      signal: AbortSignal.any([connection.signal, live[index]!.signal]),
       async close() { await Promise.all([connection.close(), live[index]!.close()]) } }))
     const sessions = await Promise.all([
       publisher.context.connectPeer({ connection: connections[0]!, peerIdentity: reader.publicKeyBytes }),

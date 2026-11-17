@@ -26,6 +26,7 @@ import { createWebRtcOfferHandler, WEBRTC_HTTP_LIMITS, type DataChannelConnectio
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
 
 import { createDaemonAgentRuntime } from '../apps/chronologd/src/agent-runtime.js'
+import { observeFeedLink } from '../test/thin-membership/link-observation.js'
 
 export interface ThinMembershipBootstrap {
   readonly genesis: string
@@ -82,6 +83,8 @@ export async function createThinMembershipNative(options: {
   const executionManifestDigest = await digestExecutionManifest(executionManifest)
   const transport = new PortableFeedTransport({ store: await DurableFeedStore.open(store, webFeedCrypto), crypto: webFeedCrypto,
     signer: webFeedSigner(feedIdFromPublicKey(identity.signing.publicKeyBytes), identity.signing.privateKey) })
+  const servedRanges = observeFeedLink(transport.asLink()), remoteRanges: Array<ReturnType<typeof observeFeedLink>> = []
+  const rangeDiagnostics = () => ({ served: servedRanges.snapshot(), remote: remoteRanges.map(link => link.snapshot()) })
   const common = { subjectId: identity.signing.publicKeyBytes, signingPublicKey: identity.signing.publicKeyBytes,
     transportAuthor: transport.identity, validFromRevision: 0n }
   const initialCapabilities: readonly CapabilityGrant[] = [
@@ -288,7 +291,11 @@ export async function createThinMembershipNative(options: {
       agent = await createDaemonAgentRuntime({ node: governed.node, identity: identity.signing, descriptor: governed.descriptor,
         store, transport, activeMembership: () => governed!.activeSnapshot,
         ...(options.clock === undefined ? {} : { finalityClock: () => options.clock!.now() }),
-        peerLinks: { local: transport.asLink(), attach: (link) => transport.connect(link) } })
+        peerLinks: { local: servedRanges.link, attach(link) {
+          const observation = observeFeedLink(link)
+          remoteRanges.push(observation); if (remoteRanges.length > 8) remoteRanges.shift()
+          return transport.connect(observation.link)
+        } } })
       if (agent.finality === null) throw new Error('THIN_NATIVE_FINALITY_REQUIRED')
       membershipHandler = createMembershipLedgerHandler({ finality: agent.finality, descriptor: governed.descriptor, sink: transport })
       void agent.run().catch(retainFailure)
@@ -369,7 +376,8 @@ export async function createThinMembershipNative(options: {
         finalThrough: governed?.node.finalThrough ?? null,
         membershipRevision: governed === undefined ? null : String(governed.activeSnapshot.revision),
         availableEpochs: governed?.governance.cipherRing.epochs().map(String) ?? [],
-        traffic: measuredTraffic(), rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift' } }
+        traffic: measuredTraffic(), rtc: { ...introduction.stats, transport: 'webrtc', nativeImplementation: 'werift' },
+        ranges: rangeDiagnostics() }
     },
     loseNextAppendReply() { dropAppendReply = true },
     assertHealthy() { checked() },

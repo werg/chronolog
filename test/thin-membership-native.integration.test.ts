@@ -205,6 +205,7 @@ describe('thin membership qualification native boundary', () => {
     }
 
     observe('original accepted device operation')
+    const beforeOrdinaryOperation = native.traffic()
     const first = await client.events.publish('qualification', { text: 'before writer removal' }, { operationId: 'device-before-removal' })
     try {
       const signal = AbortSignal.timeout(10_000)
@@ -212,6 +213,14 @@ describe('thin membership qualification native boundary', () => {
       expect((await first.final({ signal })).outcome.type).toBe('accepted')
     }
     finally { first.dispose() }
+    const afterOrdinaryOperation = native.traffic()
+    // The authenticated peer carries both the proposal and its finality. No
+    // bootstrap, participant action or administrative sync occurs in this
+    // interval, so every membership and introduction HTTP counter stays fixed.
+    expect(afterOrdinaryOperation).toEqual({ ...beforeOrdinaryOperation,
+      peerInboundBytes: expect.any(Number), peerOutboundBytes: expect.any(Number) })
+    expect(afterOrdinaryOperation.peerInboundBytes).toBeGreaterThan(beforeOrdinaryOperation.peerInboundBytes)
+    expect(afterOrdinaryOperation.peerOutboundBytes).toBeGreaterThan(beforeOrdinaryOperation.peerOutboundBytes)
     await session!.close(); session = undefined
     const writer = activeDevice.find(capability => capability.grant.role === 'writer')!
     observe('writer revocation')

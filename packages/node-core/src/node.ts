@@ -14,6 +14,7 @@ import type {
   MaterializedLocalSqlValue,
   MaterializedTransactionOutcome,
   MaterializedReadHandle,
+  MaterializedApplicationSnapshot,
 } from '@chronolog/materializer'
 import {
   decodeTransactionCore,
@@ -37,8 +38,7 @@ import {
   type ValidatorHeartbeat,
   emit, program, bytesToBase64Url,
   type EventPayload,
-  type ViewChange,
-  type ViewChangeOptions,
+  type ViewChange, type ViewChangeOptions,
 } from '@chronolog/protocol'
 import { ChangeSignal, type TransportRecord } from '@chronolog/records'
 import { readEffectiveEvents, type EventBatch, type EventReadOptions, type EventHistorySnapshot, type EventHistoryItem } from './events.js'
@@ -82,7 +82,8 @@ export class ChronologNode {
   readonly events = {
     publish: (topic: string, payload: EventPayload, options: { readonly operationId: string }) =>
       this.publish({ program: program(emit(topic, payload)), operationId: options.operationId }),
-    read: (options: EventReadOptions = {}): Promise<EventBatch> => this.#mutex.run(() => readEffectiveEvents(this.#eventSnapshot('final'), options)),
+    read: (options: EventReadOptions = {}): Promise<EventBatch> => this.#mutex.run(() =>
+      readEffectiveEvents(this.#eventSnapshot(this.#options.materialization.queries.captureApplication({ view: 'final' })), options)),
     subscribe: (options: EventReadOptions & { readonly signal?: AbortSignal } = {}): AsyncIterable<EventBatch> => this.#subscribeEvents(options),
   }
   readonly #seen = new Set<string>()
@@ -326,6 +327,45 @@ export class ChronologNode {
     return { operationId, proposalId, final: this.isFinal(utf8(proposalId)), outcome: this.outcome(utf8(proposalId)) }
   }
 
+  /** Current coherent view metadata, then coalesced invalidations; no replay cursor or SQL lease. */
+  changes(options: ViewChangeOptions = {}): AsyncIterable<ViewChange> {
+    const view = options.view ?? 'final'
+    if (view !== 'local' && view !== 'final') throw new TypeError('APPLICATION_VIEW_INVALID')
+    const node = this
+    return { [Symbol.asyncIterator]() {
+      const stop = new AbortController()
+      const signal = options.signal === undefined ? stop.signal : AbortSignal.any([stop.signal, options.signal])
+      const source = node.#subscribeViewChanges(view, signal)
+      return {
+        next: () => source.next(),
+        async return() {
+          // An abandoned pending pull must release its waiter before return waits.
+          stop.abort()
+          await source.return(undefined)
+          return { done: true as const, value: undefined }
+        },
+        async throw(error: unknown) { stop.abort(error); await source.return(undefined); throw error },
+      }
+    } }
+  }
+
+  async *#subscribeViewChanges(view: 'local' | 'final', signal: AbortSignal): AsyncGenerator<ViewChange> {
+    let previous: ViewChange | undefined
+    while (!this.#closed && !signal.aborted) {
+      const version = this.#applicationChanges.version
+      const current = await this.#mutex.run(() => ({ view,
+        revision: this.#viewRevision(view, view === 'final' ? this.finalRevision : this.materializedRevision,
+          view === 'final' ? this.finalOrderLength : this.orderLength),
+        finalRevision: this.#viewRevision('final', this.finalRevision, this.finalOrderLength) }))
+      if (this.#closed || signal.aborted) return
+      if (previous === undefined || current.revision !== previous.revision || current.finalRevision !== previous.finalRevision) {
+        previous = current
+        yield current
+      }
+      await this.#applicationChanges.wait(version, signal)
+    }
+  }
+
   async readView(options: { readonly view?: 'local' | 'final' } = {}): Promise<{
     readonly revision: string; readonly finalRevision: string; readonly view: 'local' | 'final';
     query(sql: string, parameters?: readonly MaterializedLocalSqlValue[]): MaterializedLocalSqlResult;
@@ -337,8 +377,8 @@ export class ChronologNode {
       if (queries.captureRead === undefined) throw new Error('MATERIALIZER_SNAPSHOT_UNAVAILABLE')
       const sql: MaterializedReadHandle = queries.captureRead({ view })
       try {
-      const snapshot = this.#eventSnapshot(view)
-      const finalRevision = view === 'final' ? snapshot.revision : this.#viewIdentity('final').revision
+      const snapshot = this.#eventSnapshot(sql)
+      const finalRevision = this.#viewRevision('final', sql.finalRevision, sql.finalOrderLength)
       let released = false
       return { revision: snapshot.revision, finalRevision, view,
         query: (statement, parameters) => {
@@ -366,52 +406,32 @@ export class ChronologNode {
     }
   }
 
-  /** Coalesced applied-view invalidations, independent of SQL and event cursors. */
-  async *changes(options: ViewChangeOptions = {}): AsyncIterable<ViewChange> {
-    const view = options.view ?? 'final'
-    let previous: ViewChange | undefined
-    while (!this.#closed && options.signal?.aborted !== true) {
-      const version = this.#applicationChanges.version
-      const change = await this.#mutex.run(() => {
-        const snapshot = this.#viewIdentity(view)
-        return { view, revision: snapshot.revision,
-          finalRevision: view === 'final' ? snapshot.revision : this.#viewIdentity('final').revision }
-      })
-      if (previous === undefined || previous.revision !== change.revision || previous.finalRevision !== change.finalRevision) {
-        previous = change
-        yield change
-      }
-      await this.#applicationChanges.wait(version, options.signal)
-    }
-  }
-
-  #viewIdentity(view: 'local' | 'final') {
+  #applicationHistoryId(): string {
     const policy = this.#options.historyPolicy
-    const historyId = `${bytesToHex(this.groupId)}/${bytesToHex(this.executionManifestDigest)}/${policy?.kind === 'coordinated' ? this.#finalityHistoryId() : 'peer'}`
-    const ids = this.#control.orderedTransactionIds().slice(0, view === 'final' ? this.finalOrderLength : this.orderLength)
-    const revision = bytesToBase64Url(encodeCanonicalCbor(['chronolog/view/v1', historyId, view,
-      view === 'final' ? this.finalRevision : this.materializedRevision, BigInt(ids.length), ids.length === 0 ? null : this.#idKey(ids.at(-1)!),
-      view === 'local' ? this.#revision : null]))
-    return { historyId: view === 'local' ? `${historyId}/local/${revision}` : historyId, revision, ids }
+    return `${bytesToHex(this.groupId)}/${bytesToHex(this.executionManifestDigest)}/${policy?.kind === 'coordinated' ? this.#finalityHistoryId() : 'peer'}`
   }
 
-  #eventSnapshot(view: 'local' | 'final'): EventHistorySnapshot {
-    const { historyId, revision, ids } = this.#viewIdentity(view)
-    const item = (id: Uint8Array, anchor: string): EventHistoryItem => {
-      const core = this.#candidateCores.get(this.#idKey(id)) ?? null
-      const outcome = this.outcome(id)
-      return { anchor, proposalId: new TextDecoder().decode(id),
-        ...(core === null ? {} : { program: core.program, origin: {
-          kind: 'chronolog' as const, groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
+  #viewRevision(view: 'local' | 'final', revision: bigint, orderLength: number): string {
+    // Pending admissions and transport progress never rename an applied view.
+    return bytesToBase64Url(encodeCanonicalCbor(['chronolog/view/v2', this.#applicationHistoryId(), view, revision, BigInt(orderLength)]))
+  }
+
+  #eventSnapshot(applied: MaterializedApplicationSnapshot): EventHistorySnapshot {
+    const historyId = this.#applicationHistoryId()
+    const revision = this.#viewRevision(applied.view, applied.revision, applied.orderLength)
+    const items: EventHistoryItem[] = applied.transactions.map(entry => {
+      // The published materialization retains the original verified canonical
+      // proposal. Reopening or pending control replay cannot change this view.
+      const core = decodeTransactionCore(entry.canonicalCandidate)
+      return { anchor: this.#idKey(entry.txId), proposalId: new TextDecoder().decode(entry.txId),
+        program: core.program, outcome: entry.outcome, origin: {
+          kind: 'chronolog', groupId: bytesToBase64Url(core.groupId), authorId: bytesToHex(core.authorId),
           operationId: core.operationId, authorTimestampMs: core.authorTimestampMs.toString(),
           membershipRevision: bytesToBase64Url(core.membershipRevision),
           writerCapability: core.writerCapability === undefined ? null : bytesToBase64Url(core.writerCapability),
-        } }), outcome: outcome?.outcome ?? 'unresolved' }
-    }
-    // Event cursors follow the same chronological application prefix as SQL.
-    // Receipt positions and administrative traffic are separate provider progress.
-    const items = ids.map((id) => item(id, this.#idKey(id)))
-    return { historyId, revision, items: structuredClone(items) }
+        } }
+    })
+    return { historyId: applied.view === 'local' ? `${historyId}/local/${revision}` : historyId, revision, items }
   }
 
   /** Permanently stops old-revision admission before publishing its signed promise. */
@@ -902,8 +922,7 @@ export class ChronologNode {
       if (!heartbeat.feedContiguous) this.#control.recordHeartbeat({ ...heartbeat, feedContiguous: true })
     }
     return evaluatePeerLiveFinality({
-      groupId: this.#options.groupId, initialMembershipRevision: this.#options.membershipRevision,
-      membershipRevision: this.membershipRevision, membership: this.#options.membership,
+      groupId: this.#options.groupId, membership: this.#options.membership,
       control: this.#control, candidateCores: this.#candidateCores, verifiedHeartbeatIds,
       closedRevisions: this.#options.peerGovernance?.closedAdmissionRevisions() ?? [],
       isPrefixApplied: (author, sequence) => this.#isPrefixApplied(author, sequence),
@@ -1296,11 +1315,16 @@ export class ChronologNode {
 
   async #reconcileMaterializer(): Promise<void> {
     if (!this.#materializationReady) return
+    const beforeLocal = this.materializedRevision, beforeFinal = this.finalRevision
     try {
       await this.#applyMaterializedOrder()
     } catch (error) {
       if (error instanceof ControlStoreConflictError) throw error
       throw new MaterializationProgressError(error)
+    } finally {
+      // Local publication can succeed before a later finality/storage step
+      // fails. Readers still need the newly published coherent local view.
+      if (this.materializedRevision !== beforeLocal || this.finalRevision !== beforeFinal) this.#applicationChanges.notify()
     }
   }
 
@@ -1356,9 +1380,15 @@ export class ChronologNode {
     }
     let finalLength = this.finalOrderLength
     for (let index = finalLength; index < ordered.length; index += 1) {
+      // Selection can include a lower-level provisional preview. Closing its
+      // timestamp does not turn that preview into an admitted decision.
+      if (this.#control.getCandidate(ordered[index]!.txId)?.state !== 'admissible') break
       if (frontier.closedThroughMs === null || ordered[index]!.core.authorTimestampMs > frontier.closedThroughMs) break
       finalLength = index + 1
     }
+    // Persist terminal exclusions before publishing the irreversible prefix.
+    // A failed flush is retried while the old final length is still in place.
+    if (this.historyPolicy === 'peer' && (admissionClosed || finalLength > this.finalOrderLength)) this.#control.flush()
     if (this.#options.materialization.coordinator.publishFinal !== undefined) {
       await this.#options.materialization.coordinator.publishFinal(finalLength)
     } else if (finalLength > 0) throw new Error('MATERIALIZER_FINAL_VIEW_UNAVAILABLE')
@@ -1385,7 +1415,6 @@ export class ChronologNode {
     }
     const recovered = this.#materializationError !== undefined
     this.#materializationError = undefined
-    this.#applicationChanges.notify()
     if (coordinated !== null || admissionClosed || this.finalOrderLength !== previousFinalLength ||
         this.#coordinatedAppliedThrough !== previousAppliedThrough || recovered) this.#emit('materialized')
   }

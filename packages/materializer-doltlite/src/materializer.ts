@@ -10,7 +10,7 @@ import {
   type ManifestArtifacts,
   type TransactionOrderKey,
 } from '@chronolog/protocol'
-import type { MaterializedReadHandle } from '@chronolog/materializer'
+import type { MaterializedApplicationSnapshot, MaterializedReadHandle } from '@chronolog/materializer'
 
 import {
   HEAD_BRANCH,
@@ -257,14 +257,25 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     return this.localSql(sql, parameters, options)
   }
 
+  captureApplication(options: { readonly view?: 'local' | 'final' } = {}): MaterializedApplicationSnapshot {
+    this.#assertOpen()
+    const view = options.view ?? 'final'
+    const log = view === 'final' ? this.#finalLog : this.#log
+    return {
+      view, revision: view === 'final' ? this.finalRevision : this.revision, orderLength: log.length,
+      finalRevision: this.finalRevision, finalOrderLength: this.finalOrderLength,
+      transactions: log.map((entry) => ({
+        txId: copyBytes(entry.txId), canonicalCandidate: copyBytes(entry.canonicalCandidate), outcome: entry.outcome,
+      })),
+    }
+  }
+
   captureRead(options: { readonly view?: 'local' | 'final' } = {}): MaterializedReadHandle {
     this.#assertOpen()
     if (this.#readLeases.size >= 16) throw new Error('MATERIALIZER_SNAPSHOT_LIMIT')
-    const view = options.view ?? 'final'
+    const application = this.captureApplication(options)
+    const { view, revision, orderLength, finalOrderLength } = application
     const published = view === 'final' ? this.#finalPublished : this.#published
-    const revision = view === 'final' ? this.finalRevision : this.revision
-    const orderLength = view === 'final' ? this.finalOrderLength : this.orderLength
-    const finalOrderLength = this.finalOrderLength
     const branch = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
     this.#writer.doltBranch(branch, published.doltCommitHash)
     let reader: DatabaseLike | undefined
@@ -278,7 +289,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       finally { try { removeBranchIfPresent(this.#writer, branch) } finally { this.#readLeases.delete(release) } }
     }
     this.#readLeases.add(release)
-    return { revision, orderLength, finalOrderLength, view,
+    return { ...application,
       query(sql, parameters = []) {
         if (released) throw new Error('MATERIALIZER_SNAPSHOT_RELEASED')
         return { revision, orderLength, finalOrderLength, view, ...executeLocalSql(reader, sql, parameters) }

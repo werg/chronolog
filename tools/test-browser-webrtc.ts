@@ -147,8 +147,7 @@ try {
       { iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceUseIpv6: false, iceUseTcp: false }), configuration: { iceServers: [] },
     onError: error => {
       const message = error instanceof Error ? error.message : String(error)
-      if (injectingInterruption && ['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED',
-        'PEER_CONNECTION_ENDED', 'PEER_LIVE_ENDED'].includes(message)) expectedTerminations.push(message)
+      if (injectingInterruption && ['WEBRTC_CONNECTION_ENDED', 'WEBRTC_CONNECTION_CLOSED', 'WEBRTC_LIVE_ENDED', 'WEBRTC_LIVE_CLOSED'].includes(message)) expectedTerminations.push(message)
       else errors.push(String(error))
     }, async accept(connection) {
     nativeConnection = connection

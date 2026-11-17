@@ -1,14 +1,46 @@
-# Tendriller connection and finality provider
+# Tendriller application and history adapters
 
-`@chronolog/transport-tendriller` is an optional connection for the coordinated
-history policy. The portable record store, Chronolog protocol and history policy
-remain usable without it. Tendriller stores opaque bytes and supplies a retained,
-receipt log; this package supplies wire adaptation and an optional signed
-inclusion/closure endpoint. `coordinated` names the signed-inclusion protocol,
-not a different execution order. All replicas execute the same signed author-time
-order with deterministic tie-breakers.
+`@chronolog/transport-tendriller` connects Tendriller's public application contract
+to an owned Chronolog replica. It also supplies an optional public record-log
+adapter and signed inclusion/closure endpoint for deployments that select hosted
+finality. The portable record store, Chronolog protocol and history policy remain
+usable independently. `coordinated` names the signed-inclusion protocol; all
+replicas execute the same signed author-time order with deterministic tie-breakers.
 
-## Connect a replica
+## Use the replica as the application backend
+
+```ts
+import { createChronologApplicationBackend } from '@chronolog/transport-tendriller'
+
+const application = createChronologApplicationBackend({
+  id: 'project-replica',
+  replica: client, // ChronologClient or ChronologNode
+  sql: true, // The selected execution profile supports SQL.
+})
+```
+
+The adapter forwards durable submission, event reads and operation status to
+that replica. `changes({ view, signal })` defaults to `final`, emits the current
+view identity and coalesces later invalidations, including SQL-only changes and
+finality-only advances. It has no replay cursor or SQL lease and makes no page-host
+polls. Reconnection observes current state. Use `readView({ view })` to capture
+SQL and effective events from one locally applied prefix, then release the view
+after rendering. Durable consumers use final event batches and processed cursors.
+
+Operation lifecycle is `queued | provisional | final`; outcome is independently
+`accepted | rejected`. A final rejection is `status: 'final', outcome: 'rejected'`,
+and an exact retry returns that original result. Captured events and subscriptions
+preserve `event.origin` from the verified canonical proposal, including its
+author, group, operation, signed timestamp, membership revision and writer grant.
+Effect workers retain that origin when checkpointing their dispatch intent.
+
+Wire the selected peer's `signals` port separately for typing, presence and other
+ephemeral sends. `submit` and `events.publish` remain durable application actions.
+The application adapter owns no host request, signing identity, replay queue or
+membership policy. Its `sql` flag describes the selected execution profile and
+does not grant SQL permission.
+
+## Connect an optional hosted receipt log
 
 Create the ordinary durable transport first, using `PortableFeedTransport` in a
 browser or the native transport. Both expose the immutable evidence methods that

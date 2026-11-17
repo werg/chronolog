@@ -516,14 +516,17 @@ importers:
         specifier: file:../../test/artifacts/tendriller-sdk-edd6fe91.tgz
         version: file:test/artifacts/tendriller-sdk-edd6fe91.tgz
       '@tendriller/engine':
-        specifier: file:../../test/artifacts/tendriller-engine-534e044c.tgz
-        version: file:test/artifacts/tendriller-engine-534e044c.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-edd6fe91.tgz)
+        specifier: file:../../test/artifacts/tendriller-engine-edd6fe91.tgz
+        version: file:test/artifacts/tendriller-engine-edd6fe91.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-edd6fe91.tgz)
 
   packages/transport-webrtc:
     dependencies:
       '@chronolog/agent-service':
         specifier: workspace:*
         version: link:../agent-service
+      '@chronolog/signals':
+        specifier: workspace:*
+        version: link:../signals
     optionalDependencies:
       werift:
         specifier: 0.27.0
@@ -1261,8 +1264,8 @@ packages:
     resolution: {integrity: sha512-tLd8aAI6VpDfU4jJwAS9xbuJQjCs4G7hAhlB+IZ7QwNZeJy+9C6hZVSc8+48XrU+Q3MfxTky8WyI2GsZQ+GTTA==, tarball: file:test/artifacts/tendriller-sdk-edd6fe91.tgz}
     version: 0.3.0-rc.9
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-534e044c.tgz':
-    resolution: {integrity: sha512-gNLHqt+bKj/ubqfLJXYFZ643SmseWlV/+VlLlJ34EoydG09R9ThnC7Z4ep34xeN5kOPni9IfKlOG3Lc4W/vA+Q==, tarball: file:test/artifacts/tendriller-engine-534e044c.tgz}
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-edd6fe91.tgz':
+    resolution: {integrity: sha512-ED3SH7VX9lttNtbTZwJCFLnwzo+FQA0pu6btSOw2VaRFPba5Ido/YQ/64/tHnSPlyhY7OdfWx+f28bCgGpU5og==, tarball: file:test/artifacts/tendriller-engine-edd6fe91.tgz}
     version: 0.3.0-rc.9
     peerDependencies:
       '@tendriller/core': 0.3.0-rc.9
@@ -3608,7 +3611,7 @@ snapshots:
 
   '@tendriller/core@file:test/artifacts/tendriller-sdk-edd6fe91.tgz': {}
 
-  '@tendriller/engine@file:test/artifacts/tendriller-engine-534e044c.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-edd6fe91.tgz)':
+  '@tendriller/engine@file:test/artifacts/tendriller-engine-edd6fe91.tgz(@tendriller/core@file:test/artifacts/tendriller-sdk-edd6fe91.tgz)':
     dependencies:
       '@cloudflare/workers-types': 5.20261113.1
       '@tendriller/core': file:test/artifacts/tendriller-sdk-edd6fe91.tgz

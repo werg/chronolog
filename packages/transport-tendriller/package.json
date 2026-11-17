@@ -17,6 +17,6 @@
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/rpc": "workspace:*",
     "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-edd6fe91.tgz",
-    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-534e044c.tgz"
+    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-edd6fe91.tgz"
   }
 }

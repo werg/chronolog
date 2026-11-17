@@ -6,7 +6,7 @@ import {
 import type { CborValue, Ed25519KeyPair } from '@chronolog/protocol'
 import { ChangeSignal } from '@chronolog/records'
 import type { FeedLink } from '@chronolog/records'
-import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN } from '@chronolog/signals'
+import { MAX_SIGNAL_BYTES, SIGNAL_DOMAIN, SignalBackpressureError } from '@chronolog/signals'
 
 import type { FramedPeerConnection } from './framing.js'
 
@@ -241,11 +241,19 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
   }
 
   const handshakeTimer = setTimeout(() => fail(new Error('PEER_HANDSHAKE_TIMEOUT')), handshakeTimeoutMs)
+  // A sibling lane can close our frame iterator before its own reader throws.
+  // The connection owns that physical cause; retain it before any EOF fallback.
+  const connectionEnded = (): void => fail(options.connection.signal.reason ?? new Error('PEER_CONNECTION_ENDED'))
+  options.connection.signal.addEventListener('abort', connectionEnded, { once: true })
+  if (options.connection.signal.aborted) connectionEnded()
   const reading = (async () => {
     try {
       for await (const bytes of options.connection.frames(controller.signal)) {
         if (controller.signal.aborted) break
-        await handle(bytes)
+        // for-await closes its iterator before propagating a body exception.
+        // Record protocol failure first, before that cleanup closes a lane.
+        try { await handle(bytes) }
+        catch (error) { fail(error); break }
       }
       if (!controller.signal.aborted) fail(new Error('PEER_CONNECTION_ENDED'))
     } catch (error) { fail(error) }
@@ -256,18 +264,20 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       await ready
       for await (const bytes of options.connection.live.frames(controller.signal)) {
         if (controller.signal.aborted) break
-        if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
-        const frame = assertCanonicalCbor(bytes)
-        if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
-        // Verification may suspend independently of the reliable history reader.
-        // Once admitted here, failures and overload retire this owned lifetime.
-        if (signalsInFlight >= 8) throw new Error('PEER_SIGNAL_BACKPRESSURE')
-        const incoming = bytes.slice()
-        signalsInFlight += 1
-        void (async () => {
-          if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
-          if (!controller.signal.aborted) await options.receiveSignal?.(incoming)
-        })().catch(fail).finally(() => { signalsInFlight -= 1 })
+        try {
+          if (bytes.length > MAX_SIGNAL_BYTES) throw new Error('SIGNAL_FRAME_TOO_LARGE')
+          const frame = assertCanonicalCbor(bytes)
+          if (!Array.isArray(frame) || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN) throw new Error('SIGNAL_FRAME_INVALID')
+          // Verification may suspend independently of the reliable history reader.
+          // Once admitted here, failures and overload retire this owned lifetime.
+          if (signalsInFlight >= 8) throw new Error('PEER_SIGNAL_BACKPRESSURE')
+          const incoming = bytes.slice()
+          signalsInFlight += 1
+          void (async () => {
+            if (!await authorized()) throw new Error('PEER_READ_UNAUTHORIZED')
+            if (!controller.signal.aborted) await options.receiveSignal?.(incoming)
+          })().catch(fail).finally(() => { signalsInFlight -= 1 })
+        } catch (error) { fail(error); break }
       }
       if (!controller.signal.aborted) fail(new Error('PEER_LIVE_ENDED'))
     } catch (error) { fail(error) }
@@ -282,6 +292,7 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
     } catch (error) { fail(error) }
   })()
   const completion = Promise.all([reading, liveReading, hints]).then(() => { if (failure !== null) throw failure })
+    .finally(() => { options.connection.signal.removeEventListener('abort', connectionEnded) })
   void completion.catch(() => undefined)
   // Proof validation can finish before local HELLO dispatch settles. Its ready
   // promise then cannot reject, so opening failures need an independent gate.
@@ -346,7 +357,11 @@ export async function openAuthenticatedPeerLink(options: AuthenticatedPeerLinkOp
       // implementation too; data already handed to the network is not recallable.
       const timer = setTimeout(() => fail(new Error('PEER_SIGNAL_SEND_TIMEOUT')), sendTimeoutMs)
       try { await interruptible(live.send(outgoing, { signal }), signal) }
-      catch (error) { if (!signal.aborted) fail(error); throw error }
+      catch (error) {
+        if (controller.signal.aborted) throw failure ?? controller.signal.reason
+        if (!signal.aborted && !(error instanceof SignalBackpressureError)) fail(error)
+        throw error
+      }
       finally { clearTimeout(timer) }
     },
     async close() {

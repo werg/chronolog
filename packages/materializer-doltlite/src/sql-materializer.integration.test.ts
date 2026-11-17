@@ -8,6 +8,7 @@ import {
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { DeterministicMaterializer } from './native.js'
+import { createDoltLiteMaterializationRuntime } from './runtime-adapter.js'
 import { MaterializerFixture, ROOT_KEY, admitted, rows } from './test-fixtures.js'
 import type { AdmittedTransaction } from './types.js'
 
@@ -50,13 +51,41 @@ describe('replicated SQL materialization', () => {
       outcome: 'rejected', rejectionCode: 'assert:insufficient_funds', failingStatementIndex: 1,
     })
     expect(rows(materializer, "SELECT count(*) FROM sqlite_schema WHERE name = 'audit'")).toEqual([['0']])
-
+    const runtime = createDoltLiteMaterializationRuntime(materializer)
+    const held = runtime.queries.captureRead!({ view: 'local' })
+    const before = runtime.queries.captureApplication({ view: 'local' })
+    expect(held).toMatchObject(before)
+    expect(before.transactions).toEqual([
+      { txId: setup.txId, canonicalCandidate: setup.canonicalCandidate, outcome: 'accepted' },
+      { txId: withdraw.txId, canonicalCandidate: withdraw.canonicalCandidate, outcome: 'rejected' },
+    ])
+    expect(runtime.queries.captureApplication().transactions).toEqual([])
     const deposit = await transaction(3n, 'deposit', [sqlStatement('UPDATE accounts SET balance = balance + 100 WHERE id = 1')], digest)
-    const revision = await materializer.materialize([setup, deposit, withdraw])
-    expect(revision?.outcomeChanges.map((change) => [new TextDecoder().decode(change.txId), change.previous, change.current]))
-      .toEqual([['deposit', null, 'accepted'], ['withdraw', 'rejected', 'accepted']])
-    expect(rows(materializer, 'SELECT balance FROM accounts')).toEqual([['60']])
+    try {
+      const revision = await materializer.materialize([setup, deposit, withdraw])
+      expect(revision?.outcomeChanges.map((change) => [new TextDecoder().decode(change.txId), change.previous, change.current]))
+        .toEqual([['deposit', null, 'accepted'], ['withdraw', 'rejected', 'accepted']])
+      expect(rows(materializer, 'SELECT balance FROM accounts')).toEqual([['60']])
+      expect(held).toMatchObject(before)
+      expect(held.query('SELECT balance FROM accounts')).toMatchObject({
+        revision: before.revision, orderLength: before.orderLength, rows: [[{ kind: 'integer', value: '10' }]],
+      })
+      const detached = runtime.queries.captureApplication({ view: 'local' })
+      expect(detached.transactions).toEqual([setup, deposit, withdraw].map(entry => ({
+        txId: entry.txId, canonicalCandidate: entry.canonicalCandidate, outcome: 'accepted',
+      })))
+      detached.transactions[0]!.txId.fill(0)
+      detached.transactions[0]!.canonicalCandidate.fill(0)
+      expect(runtime.queries.captureApplication({ view: 'local' }).transactions[0])
+        .toEqual({ txId: setup.txId, canonicalCandidate: setup.canonicalCandidate, outcome: 'accepted' })
+      await materializer.publishFinal(3)
+      expect(held).toMatchObject(before)
+    } finally { held.release() }
+    const final = runtime.queries.captureApplication()
+    expect(final).toMatchObject({ view: 'final', revision: 1n, orderLength: 3, finalRevision: 1n, finalOrderLength: 3 })
     materializer.close()
+    const reopened = await open(path, manifest, 1)
+    try { expect(reopened.captureApplication()).toEqual(final) } finally { reopened.close() }
   })
 
   it('pins now, random, localtime and connection counters to the transaction, identically under replay', async () => {

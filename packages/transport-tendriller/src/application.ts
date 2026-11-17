@@ -76,7 +76,7 @@ export function createChronologApplicationBackend(options: {
     try { return await get(operationId) ?? { operationId, proposalId: receipt.proposalId, status: 'queued' } }
     finally { receipt.dispose() }
   }
-  const subscribe = async function* ({ operationId, signal }: { readonly operationId: string; readonly signal?: AbortSignal }): AsyncIterable<ApplicationOperation> {
+  const observeOperation = async function* ({ operationId, signal }: { readonly operationId: string; readonly signal?: AbortSignal }): AsyncIterable<ApplicationOperation> {
     assertApplicationOperationId(operationId)
     if (signal?.aborted === true) return
     if (!nodeSource(replica)) {
@@ -114,11 +114,24 @@ export function createChronologApplicationBackend(options: {
       await watch
     }
   }
-  const wrapView = (view: { readonly revision: string; readEvents(options?: ApplicationEventReadOptions): ApplicationEventBatch | Promise<ApplicationEventBatch>; release(): void | Promise<void> },
+  const subscribe: ChronologApplicationBackend['operations']['subscribe'] = (options) => ({ [Symbol.asyncIterator]() {
+    const stop = new AbortController()
+    const signal = options.signal === undefined ? stop.signal : AbortSignal.any([stop.signal, options.signal])
+    const iterator = observeOperation({ operationId: options.operationId, signal })[Symbol.asyncIterator]()
+    return {
+      async next() {
+        try { return await iterator.next() }
+        catch (error) { if (stop.signal.aborted) return { done: true as const, value: undefined }; throw error }
+      },
+      async return() { stop.abort(); await iterator.return?.(); return { done: true as const, value: undefined } },
+      async throw(error: unknown) { stop.abort(error); await iterator.return?.(); throw error },
+    }
+  } })
+  const wrapView = (view: { readonly view: 'local' | 'final'; readonly revision: string; readonly finalRevision: string; readEvents(options?: ApplicationEventReadOptions): ApplicationEventBatch | Promise<ApplicationEventBatch>; release(): void | Promise<void> },
     query: (sql: string, parameters: readonly LocalSqlInput[]) => Promise<ChronologApplicationQuery>): ApplicationReadView<ChronologApplicationQuery, LocalSqlInput> => {
     let released = false
     const assertHeld = (): void => { if (released) throw new Error('APPLICATION_VIEW_RELEASED') }
-    return Object.freeze({ revision: view.revision,
+    return Object.freeze({ view: view.view, revision: view.revision, finalRevision: view.finalRevision,
       async query(sql: string, parameters: readonly LocalSqlInput[] = []) {
         assertHeld()
         if (!supportsSql) throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE')

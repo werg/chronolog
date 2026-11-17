@@ -6,6 +6,8 @@ export interface PeerFrameLane {
 }
 
 export interface FramedPeerConnection extends PeerFrameLane {
+  /** Ends before frame readers finish; preserves the physical failure or close reason. */
+  readonly signal: AbortSignal
   /** Independent disposable traffic; never multiplex it into reliable history. */
   readonly live?: PeerFrameLane
 }
@@ -26,14 +28,17 @@ export function framePeerStream(options: {
   if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 16 * 1024 * 1024 ||
       !Number.isSafeInteger(maxPending) || maxPending < 1 || maxPending > 256) throw new Error('PEER_FRAME_BOUNDS_INVALID')
   const reader = options.readable.getReader(), writer = options.writable.getWriter()
+  const lifetime = new AbortController()
   let pending = 0, reading = false, closed = false
   let tail: Promise<unknown> = Promise.resolve()
   const close = async (): Promise<void> => {
     if (closed) return
     closed = true
+    lifetime.abort(new Error('PEER_CONNECTION_CLOSED'))
     await Promise.allSettled([reader.cancel(), writer.abort(new Error('PEER_CONNECTION_CLOSED'))])
   }
   return {
+    signal: lifetime.signal,
     send(input, sendOptions = {}) {
       if (closed) return Promise.reject(new Error('PEER_CONNECTION_CLOSED'))
       if (!(input instanceof Uint8Array) || input.length < 1 || input.length > maximum) return Promise.reject(new Error('PEER_FRAME_TOO_LARGE'))
@@ -43,11 +48,20 @@ export function framePeerStream(options: {
       frame.set(input, 4)
       pending += 1
       const task = tail.then(async () => {
-        sendOptions.signal?.throwIfAborted()
-        if (closed) throw new Error('PEER_CONNECTION_CLOSED')
-        await writer.ready
-        sendOptions.signal?.throwIfAborted()
-        await writer.write(frame)
+        let dispatched = false
+        try {
+          sendOptions.signal?.throwIfAborted()
+          if (closed) throw lifetime.signal.reason
+          await writer.ready
+          sendOptions.signal?.throwIfAborted()
+          dispatched = true
+          await writer.write(frame)
+        } catch (error) {
+          if (dispatched || sendOptions.signal?.aborted !== true || error !== sendOptions.signal.reason) {
+            lifetime.abort(error); void close()
+          }
+          throw error
+        }
       }).finally(() => { pending -= 1 })
       tail = task.catch(() => undefined)
       return task
@@ -65,6 +79,7 @@ export function framePeerStream(options: {
           const chunk = await reader.read()
           if (chunk.done) {
             if (headerBytes !== 0 || body !== null) throw new Error('PEER_FRAME_TRUNCATED')
+            lifetime.abort(new Error('PEER_CONNECTION_ENDED'))
             return
           }
           if (!(chunk.value instanceof Uint8Array) || chunk.value.length > maximum + 4) throw new Error('PEER_CHUNK_TOO_LARGE')
@@ -85,6 +100,9 @@ export function framePeerStream(options: {
             if (bodyBytes === body.length) { const complete = body; body = null; yield complete }
           }
         }
+      } catch (error) {
+        lifetime.abort(error)
+        throw error
       } finally {
         signal?.removeEventListener('abort', abort)
         await close()

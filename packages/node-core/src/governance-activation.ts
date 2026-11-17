@@ -37,6 +37,9 @@ export class GovernanceActivationIndex {
 
   get activeSnapshot(): CapabilitySnapshot { return structuredClone(this.#activations[this.#activations.length - 1]!.snapshot) }
   get activationBoundary(): bigint { return this.#activations[this.#activations.length - 1]!.after }
+  get finalityRevisions(): readonly { readonly membershipRevision: Uint8Array; readonly authorTimeAfterMs: bigint }[] {
+    return this.#activations.map(({ snapshot, after }) => ({ membershipRevision: snapshot.revisionDigest.slice(), authorTimeAfterMs: after }))
+  }
 
   /** The provider proved inclusion and closed this author-time boundary. */
   activateFinalized(snapshot: CapabilitySnapshot, cutoffMs: bigint): void {
