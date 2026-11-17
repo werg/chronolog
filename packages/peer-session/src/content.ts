@@ -63,15 +63,17 @@ export class ApplicationContent {
   readonly #replica: PeerReplica
   readonly #store: PeerStore
   readonly #storageId: string
-  readonly #keys: Map<number, Uint8Array>
+  readonly #keys: ReadonlyMap<number, Uint8Array>
+  readonly #acquireKey: ((epoch: number) => Promise<void>) | undefined
   readonly #prefix: string
   readonly #sources = new Map<string, ContentSource>()
   #pending: Promise<unknown> = Promise.resolve()
   #closed = false
 
-  constructor(options: { readonly replica: PeerReplica; readonly store: PeerStore; readonly storageId: string; readonly epochKeys: ReadonlyMap<number, Uint8Array> }) {
+  constructor(options: { readonly replica: PeerReplica; readonly store: PeerStore; readonly storageId: string; readonly epochKeys: ReadonlyMap<number, Uint8Array>; readonly acquireKey?: (epoch: number) => Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#storageId = options.storageId
-    this.#keys = new Map([...options.epochKeys].map(([epoch, bytes]) => [epoch, bytes.slice()]))
+    this.#keys = options.epochKeys
+    this.#acquireKey = options.acquireKey
     this.#prefix = `peer-content/${this.#replica.descriptor.applicationId}/${this.#replica.descriptor.historyId}`
   }
 
@@ -182,7 +184,7 @@ export class ApplicationContent {
     return result
   }
 
-  close(): void { this.#closed = true; this.#sources.clear(); for (const key of this.#keys.values()) key.fill(0); this.#keys.clear() }
+  close(): void { this.#closed = true; this.#sources.clear() }
 
   #access(peerId: string, write = false) {
     if (this.#closed) throw new Error('CONTENT_CLOSED')
@@ -192,6 +194,8 @@ export class ApplicationContent {
     return control
   }
   async #key(epoch: number): Promise<CryptoKey> {
+    if (!this.#keys.has(epoch)) await this.#acquireKey?.(epoch)
+    this.#access(this.#replica.device.publicKey)
     const bytes = this.#keys.get(epoch)
     if (bytes?.length !== 32) throw new Error('CONTENT_KEY_UNAVAILABLE')
     const control = this.#replica.authority.controls.find(item => item.payload.epoch === epoch)?.payload

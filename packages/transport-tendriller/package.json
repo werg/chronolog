@@ -5,6 +5,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
+    "@chronolog/peer-session": "workspace:*",
     "@chronolog/node-core": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",

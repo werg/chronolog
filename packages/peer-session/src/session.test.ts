@@ -14,6 +14,7 @@ import { connectApplications, AbandonedOperationError, RecoveredViewError, type 
 import { openNativeApplication, openNativeDevice } from './native.js'
 import { createApplicationTools, serveApplicationToolLines } from './tools.js'
 import { sessionInternals } from './internals.js'
+import { createPeerGenerationApplicationBackend } from './tendriller.js'
 
 const definition = defineApplication({ id: 'messages', version: '1', commands: {
   say: defineCommand({ description: 'Post a message', input: { type: 'string', minLength: 1 }, prepare: text => program(emit('message', { text })) }),
@@ -196,5 +197,28 @@ describe('public peer application sessions', () => {
     expect(JSON.parse(output[1]!)).toMatchObject({ id: 2, result: { status: 'applied', outcome: 'accepted' } })
     expect(JSON.parse(output[3]!)).toMatchObject({ id: 4, result: { value: { events: [expect.objectContaining({ operationId: 'tool-once', payload: { text: 'from local tool' } })] } } })
     expect((await app.query('messages', null)).value.events).toHaveLength(1)
+  })
+
+  it('binds Tendriller to applied views and authenticated operations without hosted command calls', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const backend = createPeerGenerationApplicationBackend({ id: b.applicationId, session: b })
+    const phases: string[] = [], unsubscribe = backend.onStatus(status => { phases.push(status.phase) })
+    expect(phases).toEqual(['waiting'])
+    const link = await connectApplications(a, b)
+    cleanup.push(() => link.close()); cleanup.push(unsubscribe)
+    expect(phases.at(-1)).toBe('ready')
+    await backend.submit({ name: 'say', input: 'via adapter' }, { operationId: 'adapter-once' })
+    const result = await b.operations.wait('adapter-once')
+    const view = await backend.readView()
+    expect(view.view).toBe('applied')
+    expect('finalRevision' in view).toBe(false)
+    const events = await view.readEvents()
+    expect(events.transactions[0]?.proposalId).toBe(result.attemptId)
+    expect(events.transactions[0]?.events[0]?.origin).toMatchObject({ kind: 'peer-generation', authorId: b.deviceId, operationId: 'adapter-once' })
+    await view.release()
+    await expect(backend.readView({ view: 'final' })).rejects.toThrow('APPLICATION_VIEW_UNSUPPORTED')
+    await expect(backend.events.publish('anything', {}, { operationId: 'undeclared' })).rejects.toThrow('APPLICATION_EVENT_PUBLICATION_NOT_CONFIGURED')
+    link.close()
+    expect(phases.at(-1)).toBe('waiting')
   })
 })

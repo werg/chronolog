@@ -8,10 +8,11 @@ import type { FramedPeerConnection } from '@chronolog/records'
 import type { ApplicationSession } from './session.js'
 import { sessionInternals } from './internals.js'
 import type { ContentManifest, ContentReference, ContentRetention } from './content.js'
+import type { ApplicationKeyRequest, ApplicationKeyShare } from './keys.js'
 
 const MAX_MESSAGE_BYTES = 1_048_576, MAX_REQUESTS = 16, MAX_RANGE_RECORDS = 32
 const HANDSHAKE_DOMAIN = 'chronolog/peer-generation/connection/v1'
-interface Hello { readonly type: 'hello'; readonly applicationId: string; readonly historyId: string; readonly peer: string; readonly nonce: string }
+interface Hello { readonly type: 'hello'; readonly applicationId: string; readonly historyId: string; readonly peer: string; readonly nonce: string; readonly authority: AuthorityBundle }
 interface RemoteState { readonly authority: AuthorityBundle; readonly revision: PeerRevision | null; readonly count: number }
 interface Pending { readonly resolve: (value: unknown) => void; readonly reject: (error: unknown) => void; readonly timer: ReturnType<typeof setTimeout> }
 interface Synchronization { readonly promise: Promise<void>; readonly resolve: () => void; readonly reject: (error: unknown) => void; background: boolean }
@@ -42,12 +43,12 @@ export async function connectApplicationTransport(session: ApplicationSession, o
   const lifetime = new AbortController()
   const inputSignal = AbortSignal.any([connection.signal, session.signal, ...(options.signal === undefined ? [] : [options.signal])])
   const local: Hello = { type: 'hello', applicationId: replica.descriptor.applicationId, historyId: replica.descriptor.historyId,
-    peer: replica.device.publicKey, nonce: bytesToHex(crypto.getRandomValues(new Uint8Array(32))) }
+    peer: replica.device.publicKey, nonce: bytesToHex(crypto.getRandomValues(new Uint8Array(32))), authority: replica.authority }
   const requests = new Map<number, Pending>()
   let remote: Hello | undefined, authenticated = false, sequence = 0, serving = 0, closed = false
   let sentBytes = 0, receivedBytes = 0, sentRequests = 0, receivedRequests = 0
   let detach = () => {}, unsubscribe = () => {}, disposeLive = () => {}, signalRoute: ReturnType<typeof owned.signals.attachRoute> | undefined
-  let detachContent = () => {}
+  let detachContent = () => {}, detachKeys = () => {}
   let resolveReady!: () => void, rejectReady!: (error: unknown) => void
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
   void ready.catch(() => undefined)
@@ -56,7 +57,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
     if (closing !== undefined) return closing
     closing = Promise.resolve().then(() => connection.close())
     closed = true; lifetime.abort(reason); clearTimeout(handshakeTimer); inputSignal.removeEventListener('abort', abort)
-    rejectReady(reason); detach(); unsubscribe(); disposeLive(); signalRoute?.close(); detachContent()
+    rejectReady(reason); detach(); unsubscribe(); disposeLive(); signalRoute?.close(); detachContent(); detachKeys()
     for (const pending of requests.values()) { clearTimeout(pending.timer); pending.reject(reason) }
     requests.clear()
     void closing.catch(() => undefined)
@@ -89,6 +90,18 @@ export async function connectApplicationTransport(session: ApplicationSession, o
     })
   }
 
+  const learnAuthority = async (bundle: AuthorityBundle): Promise<void> => {
+    const verified = await verifyAuthorityBundle(bundle, replica.authority.descriptor)
+    open()
+    if (verified.current === null) throw new Error('APPLICATION_PEER_GENERATION_MISSING')
+    if (verified.current.payload.number < replica.generation.payload.number) return
+    if (verified.current.id !== replica.generation.id || bundle.controls.length !== replica.authority.controls.length) {
+      try { await replica.adopt(bundle) }
+      catch (error) { if (!(error instanceof Error) || error.message !== 'PEER_RECOVERY_PREFIX_INCOMPLETE') throw error }
+      open()
+    }
+  }
+
   const pull = async (): Promise<void> => {
     authorized()
     const remoteState = await request<RemoteState>('state')
@@ -98,11 +111,19 @@ export async function connectApplicationTransport(session: ApplicationSession, o
     authorized()
     const remoteGeneration = authority.current
     if (remoteGeneration === null) throw new Error('APPLICATION_PEER_GENERATION_MISSING')
+    if (remoteGeneration.payload.number < replica.generation.payload.number) return
+    await learnAuthority(remoteState.authority); authorized()
+    for (let batch = 0; batch < 256; batch++) {
+      const ticket = await owned.keys.request()
+      if (ticket === null) break
+      try { await ticket.accept(await request<ApplicationKeyShare>('keyShare', ticket.request)); authorized() }
+      finally { ticket.cancel() }
+      if (batch === 255 && owned.keys.missing().length > 0) throw new Error('APPLICATION_KEY_EXCHANGE_LIMIT')
+    }
     if (remoteState.revision === null) {
       if (remoteState.count !== 0) throw new Error('APPLICATION_PEER_STATE_INVALID')
       return
     }
-    if (remoteGeneration.payload.number < replica.generation.payload.number) return
     const target = remoteState.revision
     validateHistoryPoint(target.point)
     const count = authority.selectedSegments().reduce((total, segment) => total + (segment.cutoff?.sequence ?? target.point.sequence), 0)
@@ -195,6 +216,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
         }
         case 'submit': result = await replica.order(value as SignedAttempt); break
         case 'retain': await replica.observeCoverage(value as SignedRetainedCoverage); result = null; break
+        case 'keyShare': result = await owned.keys.offer(value as ApplicationKeyRequest); break
         case 'contentManifest': result = await owned.content.serveManifest(remote!.peer, value as ContentReference); break
         case 'contentChunk': {
           const input = record(value)
@@ -227,7 +249,11 @@ export async function connectApplicationTransport(session: ApplicationSession, o
           if (remote !== undefined || value.applicationId !== local.applicationId || value.historyId !== local.historyId ||
               typeof value.peer !== 'string' || !/^[0-9a-f]{64}$/u.test(value.peer) || value.peer === local.peer ||
               options.expectedPeerId !== undefined && value.peer !== options.expectedPeerId ||
-              typeof value.nonce !== 'string' || !/^[0-9a-f]{64}$/u.test(value.nonce) || !reader(replica, value.peer)) throw new Error('APPLICATION_PEER_HELLO_INVALID')
+              typeof value.nonce !== 'string' || !/^[0-9a-f]{64}$/u.test(value.nonce)) throw new Error('APPLICATION_PEER_HELLO_INVALID')
+          // Signed controls are public evidence. Learn monotonic authority before
+          // deciding whether a newly enrolled signer can join this connection.
+          await learnAuthority(value.authority as AuthorityBundle)
+          if (!reader(replica, value.peer)) throw new Error('APPLICATION_PEER_HELLO_INVALID')
           remote = value as unknown as Hello
           const proof = await crypto.subtle.sign('Ed25519', replica.device.privateKey, transcript(local, remote))
           open()
@@ -300,6 +326,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
       })().catch(() => undefined)
     }
     await synchronize(); authorized()
+    detachKeys = owned.keys.attachSource(peerId, async keyRequest => request<ApplicationKeyShare>('keyShare', keyRequest))
     detach = session.attachPeer(peerId, async attempt => {
       authorized()
       await request<OrderedCommand>('submit', attempt)

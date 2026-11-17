@@ -153,6 +153,9 @@
       ],
       "@chronolog/peer-session/sql-native": [
         "packages/peer-session/src/sql-native.ts"
+      ],
+      "@chronolog/peer-session/tendriller": [
+        "packages/peer-session/src/tendriller.ts"
       ]
     }
   }

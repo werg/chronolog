@@ -374,6 +374,9 @@ importers:
 
   packages/peer-session:
     dependencies:
+      '@chronolog/crypto':
+        specifier: workspace:*
+        version: link:../crypto
       '@chronolog/materializer':
         specifier: workspace:*
         version: link:../materializer
@@ -392,7 +395,6 @@ importers:
       '@chronolog/signals':
         specifier: workspace:*
         version: link:../signals
-
       '@chronolog/transport-webrtc':
         specifier: workspace:*
         version: link:../transport-webrtc
@@ -539,6 +541,9 @@ importers:
       '@chronolog/node-core':
         specifier: workspace:*
         version: link:../node-core
+      '@chronolog/peer-session':
+        specifier: workspace:*
+        version: link:../peer-session
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol

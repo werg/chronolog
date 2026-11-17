@@ -399,7 +399,8 @@ class Replica implements PeerReplica {
     const abandoned: OperationState[] = []
     for (const [id, attempt] of this.#attempts) if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
     const notice: RecoveryNotice = { previousGeneration: pending.previousGeneration, generation: this.generation.id, adopted: this.generation.payload.adopted,
-      revision: this.revision, abandoned: abandoned.slice(0, 1024), unknownLoss: pending.previousCoordinator !== this.device.publicKey }
+      // Local abandoned evidence never certifies the last head held elsewhere.
+      revision: this.revision, abandoned: abandoned.slice(0, 1024), unknownLoss: true }
     this.#recoveries.push(structuredClone(notice)); if (this.#recoveries.length > 32) this.#recoveries.shift()
     await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(this.#recoveries))
     this.#pendingRecovery = null; await this.#persistAuthority()

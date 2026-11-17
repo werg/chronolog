@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { frameLivePeerStream, framePeerStream } from '@chronolog/agent-service/framing'
 import { eventExecutionManifest } from '@chronolog/materializer'
@@ -8,8 +11,8 @@ import type { FramedPeerConnection } from '@chronolog/records'
 import { createSignedAttempt } from '../../peer-generation/src/attempt.js'
 import { encodePeerValue, signPeerValue } from '../../peer-generation/src/codec.js'
 import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
-import { openApplicationDevice } from './device.js'
 import { sessionInternals } from './internals.js'
+import { openNativeDevice } from './native.js'
 import { connectApplicationTransport } from './network.js'
 import { openPeerApplication } from './runtime.js'
 import { connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
@@ -22,8 +25,11 @@ const definition = defineApplication({ id: 'network-messages', version: '1', com
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-async function fixture() {
-  const host = await createPeerIdentity(), devices = await Promise.all([0, 1, 2].map(() => openApplicationDevice({ store: new MemoryPeerStore(), create: true })))
+async function fixture(initialMembers = [0, 1, 2]) {
+  const directory = await mkdtemp(join(tmpdir(), 'peer-network-'))
+  cleanup.push(() => rm(directory, { recursive: true, force: true }))
+  const host = await createPeerIdentity(), devices = await Promise.all([0, 1, 2].map(index => openNativeDevice({ path: join(directory, `${index}.sqlite`), create: true })))
+  for (const device of devices) cleanup.push(() => device.close())
   const key = crypto.getRandomValues(new Uint8Array(32)), epochKeys = new Map([[0, key]])
   const manifest = await executionManifestArtifacts(await eventExecutionManifest('peer-generation-v1'))
   const descriptor = await signApplicationDescriptor({ applicationId: '81'.repeat(32), historyId: 'network-test', profile: 'peer-generation-v1',
@@ -31,7 +37,7 @@ async function fixture() {
     executionManifestDigest: bytesToHex(manifest.executionManifestDigest), definitionDigest: await applicationDefinitionDigest(definition), schemaDigest: null }, host)
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
     revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: devices.map((device, index) => participantGrant(device.identity.publicKey, { administrator: index === 0 })) }, host)
+    grants: devices.filter((_device, index) => initialMembers.includes(index)).map((device, index) => participantGrant(device.identity.publicKey, { administrator: index === 0 })) }, host)
   const registry = await createGenerationRegistry({ store: new MemoryPeerStore(), descriptor, controls: [control], signer: host })
   const select = async (identity: PeerIdentity, base: PrefixProof | null, transitionId: string) => {
     const bundle = await registry.read()
@@ -40,11 +46,11 @@ async function fixture() {
       requester: identity.publicKey, controlRevision: 0, base, transitionId, reason: base === null ? 'create' : 'takeover' }, identity))
   }
   await select(devices[0]!.identity, null, 'create')
-  const open = async (index: number) => {
-    const app = await openPeerApplication({ device: devices[index]!, authority: await registry.read(), definition, epochKeys })
+  const open = async (index: number, seedKeys = true) => {
+    const app = await openPeerApplication({ device: devices[index]!, authority: await registry.read(), definition, ...(seedKeys ? { epochKeys } : {}) })
     cleanup.push(() => app.close()); return app
   }
-  return { devices, open, select, registry, key }
+  return { devices, open, select, registry, key, directory, host }
 }
 
 function pair(): readonly [FramedPeerConnection, FramedPeerConnection] {
@@ -111,6 +117,53 @@ async function seed(session: ApplicationSession, count: number, key: Uint8Array)
 }
 
 describe('authenticated application transport', () => {
+  it('learns signed controls from a newly granted reader before authentication and supplies its inherited prefix', async () => {
+    const f = await fixture([0, 1]), a = await f.open(0)
+    await (await a.command('say', 'surviving prefix', { operationId: 'before-grant' })).applied()
+    const before = await f.registry.read(), previous = before.controls[0]!
+    const control = await signControlRevision({ ...previous.payload, revision: 1, previous: await peerDigest(previous),
+      grants: [...previous.payload.grants, participantGrant(f.devices[2]!.identity.publicKey)] }, f.host)
+    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+      expectedGeneration: before.generations.at(-1)!.id, coordinator: a.deviceId, requester: a.deviceId,
+      controlRevision: 1, base: await a.recoveryPoint(), transitionId: 'enroll-reader', reason: 'control-change' }, f.devices[0]!.identity), { control })
+    const c = await f.open(2, false)
+    expect(a.status.generation).not.toBe(c.status.generation)
+    expect(c.status.phase).toBe('awaiting-keys')
+    await connect(a, c)
+    expect(a.status.generation).toBe(c.status.generation)
+    expect(c.status.phase).toBe('ready')
+    expect((await c.query('messages', null)).value.events).toHaveLength(1)
+    const operation = await c.command('say', 'newly enrolled', { operationId: 'after-grant' })
+    expect(await operation.applied({ signal: AbortSignal.timeout(5000) })).toMatchObject({ status: 'applied', author: c.deviceId })
+  })
+
+  it('enrolls a reader without application-managed epoch keys and reopens its durable keys and history', async () => {
+    const f = await fixture(), a = await f.open(0)
+    await (await a.command('say', 'before enrollment', { operationId: 'retained' })).applied()
+    const b = await f.open(1, false), phases: string[] = []
+    cleanup.push(b.onStatus(status => { phases.push(status.phase) }))
+    expect(b.status.phase).toBe('awaiting-keys')
+    expect(b.keys.missing()).toEqual([0])
+    const links = await connect(a, b)
+    expect(b.keys.missing()).toEqual([])
+    expect(b.status.phase).toBe('ready')
+    expect((await b.query('messages', null)).value.events).toHaveLength(1)
+    const operation = await b.command('say', 'after enrollment', { operationId: 'enrolled' })
+    await operation.applied({ signal: AbortSignal.timeout(5000) })
+    await links[1].synchronize()
+    const identity = b.deviceId
+    await b.close()
+    const device = await openNativeDevice({ path: join(f.directory, '1.sqlite') })
+    const reopened = await openPeerApplication({ device, authority: await f.registry.read(), definition })
+    cleanup.push(() => reopened.close())
+    expect(reopened.deviceId).toBe(identity)
+    expect(reopened.keys.missing()).toEqual([])
+    expect((await reopened.query('messages', null)).value.events).toHaveLength(2)
+    expect(await reopened.operations.get('enrolled')).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    expect(phases[0]).toBe('awaiting-keys')
+    expect(phases).toContain('ready')
+  })
+
   it('owns ordered delivery, signed independent live traffic and durable retained acknowledgements', async () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
     const [left, right] = await connect(a, b)
