@@ -17,7 +17,7 @@
   "devDependencies": {
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/rpc": "workspace:*",
-    "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-90cfb794.tgz",
-    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-90cfb794.tgz"
+    "@tendriller/core": "file:../../test/artifacts/tendriller-sdk-e4939047.tgz",
+    "@tendriller/engine": "file:../../test/artifacts/tendriller-engine-e4939047.tgz"
   }
 }

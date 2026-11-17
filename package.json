@@ -67,7 +67,7 @@
     "@chronolog/transport-webrtc": "workspace:*",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "1.65.0",
-    "@tendriller/core": "file:./test/artifacts/tendriller-sdk-90cfb794.tgz",
+    "@tendriller/core": "file:./test/artifacts/tendriller-sdk-e4939047.tgz",
     "@types/node": "^24.0.0",
     "@types/ws": "8.18.1",
     "@vitest/coverage-v8": "^3.2.4",
