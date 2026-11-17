@@ -14,6 +14,7 @@ import { applicationDefinitionDigest, describeApplication, type ApplicationComma
 import { ApplicationRecovery } from './recovery.js'
 import type { ApplicationContent } from './content.js'
 import type { ApplicationKeyring } from './keys.js'
+import { ApplicationProjection, APPLICATION_PROJECTION_LIMITS, type ApplicationProjectionDefinition, type ApplicationProjectionHandle } from './projection.js'
 import { ApplicationControlParticipant, type ControlParticipantOptions } from './control-participant.js'
 import { OwnedApplicationParticipation } from './participation.js'
 import type { ApplicationParticipation, ApplicationParticipationOptions } from './participation-types.js'
@@ -109,6 +110,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #closing: (() => void | Promise<void>) | undefined
   readonly #inflight = new Map<string, Promise<void>>()
   readonly #links = new Set<{ close(): Promise<void> }>()
+  readonly #projections = new Map<string, ApplicationProjectionHandle>()
   readonly #views = new Set<ApplicationReadView>()
   #openingViews = 0
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
@@ -242,6 +244,25 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {
     return coalescedChanges(this.#replica, this.#lifetime.signal, options.signal)
+  }
+
+  /** Register a pure reducer in the owning Worker or native session. */
+  project<State extends EventPayload>(definition: ApplicationProjectionDefinition<State>): ApplicationProjection<State> {
+    this.#assertOpen()
+    if (this.#projections.has(definition.id)) throw new Error('APPLICATION_PROJECTION_IN_USE')
+    if (this.#projections.size >= APPLICATION_PROJECTION_LIMITS.active) throw new Error('APPLICATION_PROJECTION_LIMIT')
+    const projection = new ApplicationProjection({ source: this, store: this.#store, definition,
+      release: () => { this.#projections.delete(projection.id); this.#links.delete(projection) } })
+    this.#projections.set(projection.id, projection); this.#links.add(projection)
+    return projection
+  }
+
+  /** Read a registered projection without moving reducer callbacks across a transport. */
+  projection<State extends EventPayload = EventPayload>(id: string): ApplicationProjectionHandle<State> {
+    this.#assertOpen()
+    const projection = this.#projections.get(id)
+    if (projection === undefined) throw new Error('APPLICATION_PROJECTION_NOT_FOUND')
+    return projection as ApplicationProjectionHandle<State>
   }
 
   connectPeer(options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {

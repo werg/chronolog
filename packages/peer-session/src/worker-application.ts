@@ -12,6 +12,8 @@ import {
 } from './session.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
 import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
+import type { EventPayload } from '@chronolog/protocol'
+import type { ApplicationProjectionHandle, ApplicationProjectionSnapshot } from './projection.js'
 
 const PROTOCOL = 'chronolog/peer-session/worker-application/v1'
 const MAX_REQUESTS = 64, MAX_STREAMS = 16, MAX_BYTES = 1_048_576
@@ -128,6 +130,8 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'view.query': return view(args[0]).query(args[1] as string, args[2] as readonly QueryParameter[])
       case 'view.events': return view(args[0]).readEvents(args[1] as ApplicationEventOptions)
       case 'view.release': { const captured = views.get(args[0] as number); views.delete(args[0] as number); captured?.handle.release(); return null }
+      case 'projection.read': return session.projection(args[0] as string).read({ signal })
+      case 'projection.close': return session.projection(args[0] as string).close()
       case 'content.stage': return (await session.content.stage(args[0] as { bytes: number; mediaType?: string })).id
       case 'content.resume': return (await session.content.resume(args[0] as string)).id
       case 'content.write': return (await session.content.resume(args[0] as string)).write(args[1] as number, args[2] as Uint8Array)
@@ -147,6 +151,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'participation': return observe<ApplicationParticipationStatus>(listener => participation().onStatus(listener), signal)
       case 'recovery': return observe<RecoveryNotice>(listener => session.onRecovery(listener), signal)
       case 'content': return session.content.read(args[0] as ContentReference, { ...args[1] as { offset?: number; length?: number }, signal })[Symbol.asyncIterator]()
+      case 'projection': return session.projection(args[0] as string).changes({ signal })[Symbol.asyncIterator]()
       default: throw new Error('APPLICATION_WORKER_STREAM_UNKNOWN')
     }
   }
@@ -349,6 +354,13 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   recoveryPoint(): Promise<PrefixProof> { return this.#call('recoveryPoint', []) }
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> { return this.#call('adopt', [authority]) }
   changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> { return this.#stream('changes', [], options.signal) }
+  projection<State extends EventPayload = EventPayload>(id: string): ApplicationProjectionHandle<State> {
+    return Object.freeze({ id,
+      read: (options: { readonly signal?: AbortSignal } = {}): Promise<ApplicationProjectionSnapshot<State>> => this.#call('projection.read', [id], options.signal),
+      changes: (options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationProjectionSnapshot<State>> => this.#stream('projection', [id], options.signal),
+      close: (): Promise<void> => this.#call('projection.close', [id]),
+    })
+  }
   async readView(): Promise<WorkerApplicationReadView> {
     const captured = await this.#call<{ id: number; revision: PeerRevision }>('view.open', [])
     let released = false

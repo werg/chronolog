@@ -66,6 +66,24 @@ async function facade(session: ApplicationSession, host?: ApplicationControlHost
 }
 
 describe('owned browser application facade', () => {
+  it('reads and observes durable projections without moving reducers or storage to the page', async () => {
+    const f = await fixture(), reduce = vi.fn((count: number) => count + 1)
+    f.a.project({ id: 'message-count', version: '1', topics: ['message'], initial: 0, reduce })
+    const { client } = await facade(f.a), projection = client.projection<number>('message-count')
+    expect((await projection.read()).state).toBe(0)
+    const updates = projection.changes()[Symbol.asyncIterator]()
+    expect((await updates.next()).value?.state).toBe(0)
+    const changed = updates.next()
+    await (await client.command('say', 'owned reducer', { operationId: 'projected' })).applied()
+    expect((await changed).value?.state).toBe(1)
+    const result = await projection.read()
+    expect(result.revision).toEqual(client.revision)
+    expect(result.state).toBe(1); expect(reduce).toHaveBeenCalledOnce()
+    await updates.return?.(); await projection.close()
+    await expect(projection.read()).rejects.toThrow('APPLICATION_PROJECTION_NOT_FOUND')
+    expect((await client.query('messages', null)).value.events).toHaveLength(1)
+  })
+
   it('settles the requesting waiter when its response contains malformed participation metadata', async () => {
     const f = await fixture(), { client } = await facade(f.a)
     const getter = vi.spyOn(f.a, 'participation', 'get').mockReturnValue({ status: { phase: 'unknown' } } as unknown as ApplicationParticipation)

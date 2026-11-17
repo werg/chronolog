@@ -146,6 +146,56 @@ code or page manifest. `control.publish(manifest, assets)` submits it with bound
 hash-verified assets, and `control.publication()` verifies the selected chain.
 Retries preserve the original signed intent and receipt. The selected publication
 head persists outside recoverable application history and cannot move backward.
+Signing a release requires an explicit `publisher` grant. Administration and
+application-data access do not confer publication rights. The hosted control
+participant serves approved releases without publisher or application-reader
+rights; a publisher can sign portable release records without joining the data
+session or obtaining its encryption keys.
+
+## Durable derived views
+
+Register pure event reducers in the owning native session or browser Worker:
+
+```ts
+const counts = session.project({
+  id: 'message-count', version: '1', topics: ['message'], initial: 0,
+  reduce: count => count + 1,
+})
+const snapshot = await counts.read()
+// snapshot.state and snapshot.revision describe the same captured history.
+for await (const next of counts.changes({ signal })) render(next.state)
+```
+
+The session persists reducer state, normalized topic filter, reducer version,
+captured revision and verified event cursor in one atomic checkpoint. Ordinary
+reads reduce only new matching events; an unchanged read does no checkpoint
+write. Reopening the same projection resumes its durable cursor. Change the
+version whenever reducer semantics or initial state change.
+
+A generation change rebuilds from the selected history and returns
+`reset: { reason: 'recovery', previousRevision }`. A changed version or topic
+filter rebuilds with `reason: 'definition'`. The new state is visible only after
+its complete checkpoint is durable. An excluded suffix never remains hidden in
+a cumulative derived view. Coalesced change observations hold no captured view
+while waiting for the next update.
+
+The Worker registers reducers before serving its page facade. The page accesses
+the same handle through `application.projection<number>('message-count')`, with
+the same `read()`, `changes()` and `close()` operations. Reducer callbacks and
+checkpoint storage stay in the owner. There is at most one open projection for
+an ID, at most eight per session, and each JSON state is bounded to 512 KiB.
+
+Reducer failures leave the last checkpoint intact and do not interrupt ordinary
+application commands. A failed durable-write acknowledgment fences that
+projection until it is closed and reopened; it does not invent successful
+progress. Closing the session drains admitted checkpoint writes before releasing
+storage. Cancelling a read only stops that caller's wait.
+
+Reducers must not perform external effects. They may run again after recovery,
+a definition change or an interrupted checkpoint. An external dispatch journal
+must preserve provider outcomes independently and use an explicitly protected
+action policy; ordinary applied events and projection progress supply no such
+guarantee.
 
 ## Owned participation and recovery
 
