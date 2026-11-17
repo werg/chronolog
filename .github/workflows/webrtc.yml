@@ -39,23 +39,26 @@ jobs:
           ref: 9a63b6d1b2a102574be7f7c4ee86d20cc3a47b9a
           path: artifacts/host-source
           persist-credentials: false
+      - name: Build clean public session artifacts
+        id: session_artifacts
+        run: |
+          node tools/package-peer-session.mjs --native-rtc --output artifacts/session-rtc
+          node tools/package-peer-session.mjs --sql-native --output artifacts/session-sql
       - name: Build public host artifacts
+        id: host_artifacts
         working-directory: artifacts/host-source
         run: |
           npm ci
           npm run build
-      - name: Build clean public session artifacts
-        run: |
-          node tools/package-peer-session.mjs --native-rtc --output artifacts/session-rtc
-          node tools/package-peer-session.mjs --sql-native --output artifacts/session-sql
-      - name: Qualify independent native RTC and hosted participant
+      - name: Qualify independent native RTC
+        if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
         shell: bash
         run: |
           archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
           test "${#archives[@]}" -eq 1
           node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --transport native-rtc --output artifacts/qualification/native
-          node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/host-source/dist --output artifacts/qualification/host
       - name: Qualify SQL and guarded task commands
+        if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
         shell: bash
         run: |
           archives=(artifacts/session-sql/chronolog-peer-session-*.tgz)
@@ -63,13 +66,23 @@ jobs:
           node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
           node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --domain tasks --output artifacts/qualification/tasks
       - name: Install real Chromium
+        id: chromium
+        if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
       - name: Qualify packed browser Worker, OPFS and native RTC
+        if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' && steps.chromium.outcome == 'success' }}
         shell: bash
         run: |
           archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
           test "${#archives[@]}" -eq 1
           node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-browser.mjs --artifact "${archives[0]}" --output artifacts/qualification/browser
+      - name: Qualify the hosted participant
+        if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' && steps.host_artifacts.outcome == 'success' }}
+        shell: bash
+        run: |
+          archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation-host.mjs --artifact "${archives[0]}" --artifacts artifacts/host-source/dist --output artifacts/qualification/host
       - uses: actions/upload-artifact@v6
         if: always()
         with:
