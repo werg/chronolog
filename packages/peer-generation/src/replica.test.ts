@@ -3,11 +3,11 @@ import { createAppliedEventMaterializationRuntime, eventExecutionManifest } from
 import { compareTransactionOrder, decodeTransactionCore, emit, executionManifestArtifacts, program, transactionOrderKey } from '@chronolog/protocol'
 import {
   bytesDigest, controlIntentDigest, createGenerationRegistry, createPeerIdentity, createPeerReplica, MemoryPeerStore, peerDigest,
-  signApplicationDescriptor, signControlRevision, signTransitionRequest, verifyAuthorityBundle,
+  encodePeerValue, signApplicationDescriptor, signControlRevision, signTransitionRequest, verifyAuthorityBundle,
   type AuthorityBundle, type PeerIdentity, type PeerReplica, type PeerStore, type PrefixProof,
 } from './index.js'
 import { bytesToHex, hexToBytes, signPeerValue } from './codec.js'
-import { verifyAttempt } from './attempt.js'
+import { createSignedAttempt, verifyAttempt } from './attempt.js'
 
 const opened: PeerReplica[] = []
 afterEach(async () => { for (const peer of opened.splice(0)) await peer.close() })
@@ -76,7 +76,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
   })
   it('replays author-time order independently of receipt sequence and retains exact intent through reopen', async () => {
     const f = await fixture(), store = new MemoryPeerStore(), a = await f.open(f.a, store), b = await f.open(f.b)
-    const first = await a.prepare({ operationId: 'first', program: event('first'), authorTimestampMs: 500n })
+    const first = await a.prepare({ operationId: 'first', program: event('first'), authorTimestampMs: 500n, observedRevision: a.revision })
     const second = await a.prepare({ operationId: 'second', program: event('second'), authorTimestampMs: 100n })
     await a.order(first)
     const held = await a.capture(), initial = await a.operation('first')
@@ -139,6 +139,36 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     await expect(a.prepare(legacy)).rejects.toThrow('PEER_COMMAND_OPTIONS_INVALID')
     expect(await a.attempt('legacy-option')).toBeNull()
   })
+  it('rechecks observed ancestry on received history even with valid author and coordinator signatures', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    await a.order(await a.prepare({ operationId: 'base', program: event('base') }))
+    const base = await a.exportCommands(), observedRevision = a.revision
+    await b.ingest(base)
+    const original = await b.prepare({ operationId: 'contextual', program: event('contextual'), observedRevision })
+    const core = await verifyAttempt(original, await verifyAuthorityBundle(await f.registry.read()), f.keys)
+    for (const point of [
+      { ...observedRevision.point, root: 'ff'.repeat(32) },
+      { ...observedRevision.point, sequence: 2 },
+    ]) {
+      const attempt = await createSignedAttempt({ ...original.payload.header, observedRevision: { ...observedRevision, point } }, core, f.key, f.b)
+      await expect(a.order(attempt)).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
+      const payload = { ...base[0]!.receipt.payload, sequence: 2, previousRoot: observedRevision.point.root,
+        attemptId: attempt.id, author: f.b.publicKey, operationId: 'contextual',
+        bodyHash: await bytesDigest(encodePeerValue(attempt)), bodyBytes: encodePeerValue(attempt).length }
+      const receipt = { ...await signPeerValue('chronolog/peer-generation/order/v1', payload, f.a),
+        root: await peerDigest(['chronolog/peer-generation/order/v1', payload]) }
+      const follower = await f.open(f.c)
+      await follower.ingest(base)
+      const captured = await follower.capture()
+      try {
+        await expect(follower.ingest([{ attempt, receipt }])).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
+        expect(follower.ready).toBe(false)
+        expect(follower.revision).toEqual(captured.revision)
+        expect(captured.read.orderLength).toBe(1)
+        expect(decodeTransactionCore(captured.read.transactionAt(0)!.canonicalCandidate).operationId).toBe('base')
+      } finally { captured.release(); await follower.close() }
+    }
+  })
   it('adopts an older complete prefix, seeds a fresh peer and quarantines the returning suffix', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const one = await a.prepare({ operationId: 'one', program: event('one') })
@@ -150,7 +180,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     const base = await b.recoveryPoint(), g2 = await f.select(f.b, base, 'second')
     await b.adopt(await f.registry.read())
     await expect(b.exportCommands({ at: inheritedRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
-    const three = await b.prepare({ operationId: 'three', program: event('three') }); await b.order(three)
+    const three = await b.prepare({ operationId: 'three', program: event('three'), observedRevision: inheritedRevision }); await b.order(three)
     const c = await f.open(f.c)
     await expect(c.capture()).rejects.toThrow('PEER_RECOVERING')
     await c.synchronize(await f.registry.read(), await b.exportCommands())

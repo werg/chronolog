@@ -2,7 +2,7 @@ import { sessionInternals as internals } from './internals.js'
 import {
   PEER_GENERATION_CAPABILITIES, type PeerReplica, type PeerRevision, type AppliedResult,
   type OperationState, type AuthorityBundle, type RecoveryNotice, type SignedAttempt,
-  type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView,
+  type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView, type PeerStore,
 } from '@chronolog/peer-generation'
 import {
   bytesToHex, hexToBytes, decodeTransactionCore, isEmitStep,
@@ -12,6 +12,8 @@ import { SignalChannel, type Signals } from '@chronolog/signals'
 import type { MaterializedLocalSqlValue } from '@chronolog/materializer'
 
 import { applicationDefinitionDigest, describeApplication, type ApplicationCommand, type ApplicationDefinition, type ApplicationQuery } from './definition.js'
+import { ApplicationRecovery } from './recovery.js'
+import type { ApplicationContent } from './content.js'
 
 export type QueryParameter = null | string | number | bigint | Uint8Array
 export interface QueryRows {
@@ -87,6 +89,8 @@ interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void> }
 export class ApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
   readonly capabilities = PEER_GENERATION_CAPABILITIES
   readonly signals: Signals
+  readonly recovery: ApplicationRecovery
+  readonly content: ApplicationContent
   readonly operations: {
     get(operationId: string, options?: { readonly author?: string }): Promise<OperationState | null>
     inspect(operationId: string, options?: { readonly author?: string }): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null>
@@ -100,10 +104,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #lifetime = new AbortController()
   readonly #closing: (() => void | Promise<void>) | undefined
   readonly #inflight = new Map<string, Promise<void>>()
-  readonly #links = new Set<{ close(): void }>()
+  readonly #links = new Set<{ close(): void | Promise<void> }>()
+  readonly #views = new Set<ApplicationReadView>()
   #closed = false
 
-  constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly close?: () => void | Promise<void> }) {
+  constructor(options: { readonly replica: PeerReplica; readonly definition: D; readonly store: PeerStore; readonly content: ApplicationContent; readonly close?: () => void | Promise<void> }) {
     this.#replica = options.replica; this.#definition = options.definition; this.#closing = options.close
     const replica = this.#replica
     const signals = new SignalChannel({ scope: replica.descriptor.applicationId,
@@ -111,7 +116,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       authorize: ({ scope, authorId }) => scope === replica.descriptor.applicationId && currentReader(replica, bytesToHex(authorId)),
     })
     this.signals = signals
-    internals.set(this, { replica, signals })
+    this.recovery = new ApplicationRecovery({ replica, store: options.store, signal: this.#lifetime.signal })
+    this.content = options.content
+    internals.set(this, { replica, signals, store: options.store, content: options.content })
     this.operations = Object.freeze({ get: (operationId: string, options: { readonly author?: string } = {}) => replica.operation(operationId, options.author),
       inspect: async (operationId: string, options: { readonly author?: string } = {}) => {
         const state = await replica.operation(operationId, options.author), attempt = await replica.attempt(operationId, options.author)
@@ -170,18 +177,23 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   async readView(): Promise<ApplicationReadView> {
     this.#assertOpen()
+    if (this.#views.size >= 8) throw new Error('APPLICATION_VIEW_LIMIT')
     const captured = await this.#replica.capture()
+    if (this.#closed || this.#views.size >= 8) { captured.release(); throw new Error(this.#closed ? 'APPLICATION_SESSION_CLOSED' : 'APPLICATION_VIEW_LIMIT') }
     let released = false
+    const views = this.#views
     const held = (): void => { if (released) throw new Error('APPLICATION_VIEW_RELEASED') }
-    return Object.freeze({ revision: captured.revision,
+    const view: ApplicationReadView = Object.freeze({ revision: captured.revision,
       query(sql: string, parameters: readonly QueryParameter[] = []) {
         held()
         const result = captured.read.query(sql, parameters.map(encodeParameter))
         return { columns: result.columns, rows: result.rows.map(row => row.map(decodeParameter)) }
       },
       readEvents(options: ApplicationEventOptions = {}) { held(); return readEvents(captured, options) },
-      release() { if (released) return; released = true; captured.release() },
+      release() { if (released) return; released = true; views.delete(view); captured.release() },
     })
+    views.add(view)
+    return view
   }
 
   onRecovery(listener: (notice: RecoveryNotice) => void): () => void { this.#assertOpen(); return this.#replica.onRecovery(listener) }
@@ -248,7 +260,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   /** Runtime-owned attachment. Discovery hints never invoke this without peer authentication. */
-  attachPeer(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): void }): () => void {
+  attachPeer(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): void | Promise<void> }): () => void {
     this.#assertOpen()
     if (!currentReader(this.#replica, peerId)) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
     if (this.#peers.size >= 8 && !this.#peers.has(peerId)) throw new Error('APPLICATION_PEER_LIMIT')
@@ -260,16 +272,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true; this.#lifetime.abort(new Error('APPLICATION_SESSION_CLOSED'))
-    for (const link of [...this.#links]) link.close()
+    const closing = [...this.#links].map(link => Promise.resolve().then(() => link.close()))
+    for (const view of [...this.#views]) view.release()
     internals.get(this)!.signals.close()
-    await Promise.allSettled(this.#inflight.values())
+    this.content.close()
+    await Promise.allSettled([...this.#inflight.values(), ...closing])
     try { await this.#replica.close() } finally { await this.#closing?.() }
   }
   #assertOpen(): void { if (this.#closed) throw new Error('APPLICATION_SESSION_CLOSED') }
 }
 
 export async function openApplication<const D extends ApplicationDefinition>(options: {
-  readonly replica: PeerReplica; readonly definition: D; readonly close?: () => void | Promise<void>
+  readonly replica: PeerReplica; readonly definition: D; readonly store: PeerStore; readonly content: ApplicationContent; readonly close?: () => void | Promise<void>
 }): Promise<ApplicationSession<D>> {
   if (await applicationDefinitionDigest(options.definition) !== options.replica.descriptor.definitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
   const session = new ApplicationSession(options)
@@ -285,6 +299,7 @@ export async function connectApplications(left: ApplicationSession, right: Appli
       a.replica.descriptor.controlPublicKey !== b.replica.descriptor.controlPublicKey) throw new Error('APPLICATION_PEER_SCOPE_MISMATCH')
   let closed = false, pending = Promise.resolve(), requested = false
   let detachA = () => {}, detachB = () => {}, unsubscribeA = () => {}, unsubscribeB = () => {}
+  let contentA = () => {}, contentB = () => {}
   let signalA: ReturnType<SignalChannel['attachRoute']> | undefined, signalB: ReturnType<SignalChannel['attachRoute']> | undefined
   const assertOpen = (): void => {
     if (closed) throw new Error('APPLICATION_PEER_DISCONNECTED')
@@ -334,7 +349,7 @@ export async function connectApplications(left: ApplicationSession, right: Appli
   }
   const link = { synchronize, close() {
     if (closed) return
-    closed = true; requested = false; detachA(); detachB(); unsubscribeA(); unsubscribeB(); signalA?.close(); signalB?.close()
+    closed = true; requested = false; detachA(); detachB(); unsubscribeA(); unsubscribeB(); signalA?.close(); signalB?.close(); contentA(); contentB()
   } }
   const submit = (source: PeerReplica, coordinator: PeerReplica) => async (attempt: SignedAttempt): Promise<void> => {
     assertOpen()
@@ -347,8 +362,6 @@ export async function connectApplications(left: ApplicationSession, right: Appli
     await source.synchronize(coordinator.authority, commands)
   }
   try {
-    detachA = left.attachPeer(right.deviceId, submit(a.replica, b.replica), link)
-    detachB = right.attachPeer(left.deviceId, submit(b.replica, a.replica), link)
     signalA = a.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalB!.receive(frame); return true } })
     signalB = b.signals.attachRoute({ trySend: async frame => { assertOpen(); await signalA!.receive(frame); return true } })
     let priorA = replicaStateKey(a.replica), priorB = replicaStateKey(b.replica)
@@ -361,6 +374,20 @@ export async function connectApplications(left: ApplicationSession, right: Appli
       if (current !== priorB) { priorB = current; void synchronize().catch(() => { link.close() }) }
     })
     await synchronize()
+    contentA = a.content.attachSource(right.deviceId, {
+      manifest: async reference => { assertOpen(); const value = await b.content.serveManifest(left.deviceId, reference); assertOpen(); return value },
+      chunk: async (reference, index) => { assertOpen(); const value = await b.content.serveChunk(left.deviceId, reference, index); assertOpen(); return value },
+      retained: async reference => { assertOpen(); const value = await b.content.retained(reference); assertOpen(); return value },
+      observeRetention: async receipt => { assertOpen(); await b.content.observeRetention(receipt); assertOpen() },
+    })
+    contentB = b.content.attachSource(left.deviceId, {
+      manifest: async reference => { assertOpen(); const value = await a.content.serveManifest(right.deviceId, reference); assertOpen(); return value },
+      chunk: async (reference, index) => { assertOpen(); const value = await a.content.serveChunk(right.deviceId, reference, index); assertOpen(); return value },
+      retained: async reference => { assertOpen(); const value = await a.content.retained(reference); assertOpen(); return value },
+      observeRetention: async receipt => { assertOpen(); await a.content.observeRetention(receipt); assertOpen() },
+    })
+    detachA = left.attachPeer(right.deviceId, submit(a.replica, b.replica), link)
+    detachB = right.attachPeer(left.deviceId, submit(b.replica, a.replica), link)
     await Promise.all([left.resume(), right.resume()])
     return link
   } catch (error) { link.close(); throw error }

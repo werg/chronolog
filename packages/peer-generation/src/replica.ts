@@ -10,7 +10,7 @@ import {
 } from './codec.js'
 import { generationStartRoot, type PeerAuthority, validateHistoryPoint, verifyAuthorityBundle, verifyOrderReceipt } from './control.js'
 import type {
-  AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, OperationState, OrderedCommand,
+  AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, OperationState, OrderedCommand, OrderReceipt,
   PeerReplica, PeerReplicaOptions, PeerRevision, PeerStore, PrefixProof, PrepareCommand,
   RecoveryNotice, SignedAttempt, SignedGeneration, SignedRetainedCoverage,
 } from './types.js'
@@ -211,6 +211,10 @@ class Replica implements PeerReplica {
   }
   async #materialize(authority: PeerAuthority): Promise<void> {
     const selected = this.#selectedHistory(authority)
+    for (const { command } of selected) {
+      const observed = command.attempt.payload.header.observedRevision
+      if (observed !== null) this.#checkView(observed, authority, command.receipt)
+    }
     // Receipt ancestry selects membership; the signed proposal always determines
     // execution order, including when a new receipt introduces an earlier intent.
     const executionOrder = [...selected].sort((left, right) => compareTransactionOrder(
@@ -263,12 +267,19 @@ class Replica implements PeerReplica {
     const root = point.sequence === 0 ? records.get(1)?.command.receipt.payload.previousRoot ?? head.root : records.get(point.sequence)?.command.receipt.root
     return root === point.root
   }
-  #checkView(revision: PeerRevision): void {
+  #checkView(revision: PeerRevision, authority = this.#authority, before?: OrderReceipt): void {
     validatePeerRevision(revision)
     check(revision.applicationId === this.descriptor.applicationId && revision.historyId === this.descriptor.historyId &&
-      this.#pointAvailable(revision.point), 'PEER_VIEW_RECOVERY_REQUIRED')
-    check(revision.controlRevision === this.#authority.generation(revision.generation).payload.controlRevision,
-      'PEER_REVISION_INVALID')
+      this.#pointAvailable(revision.point, authority), 'PEER_VIEW_RECOVERY_REQUIRED')
+    const observed = authority.generation(revision.generation)
+    check(revision.controlRevision === observed.payload.controlRevision, 'PEER_REVISION_INVALID')
+    if (before !== undefined) {
+      // A receipt authenticates inclusion, not the coordinator's validation.
+      // Recheck ancestry on received history, including historical generations.
+      const generation = authority.generation(before.payload.generation)
+      check(observed.payload.number < generation.payload.number ||
+        observed.id === generation.id && revision.point.sequence < before.payload.sequence, 'PEER_VIEW_RECOVERY_REQUIRED')
+    }
   }
   prepare(input: PrepareCommand): Promise<SignedAttempt> {
     const captured = structuredClone(input)

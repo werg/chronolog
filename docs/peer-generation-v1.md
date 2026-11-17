@@ -33,6 +33,17 @@ allocation, not an inclusion or finality rule. Exact retries retain their origin
 timestamp and signed bytes. The live profile applies its separate signed clock
 bounds outside that helper.
 
+This generation profile currently has no wall-time skew admission bound. It
+relies on honest eligible writers and an honest coordinator to avoid admitting
+unreasonable future timestamps. A signature authenticates the supplied
+timestamp; it does not establish that the timestamp matches a wall clock. An
+explicit timestamp at the maximum nonnegative signed-int64 value can exhaust
+automatic causal authoring once applied: no greater timestamp can be encoded.
+Recovering an earlier prefix does not reset previously observed author time.
+The implementation neither clamps signed timestamps nor silently resets that
+clock. A future admission bound would be a separate inclusion-policy decision;
+it would not require finality.
+
 The control participant retains signed descriptors, monotonic controls
 and generation selections, and atomically chooses successors. It verifies prefix
 proofs and delegated inclusion headers without application bodies or SQL. It does
@@ -153,8 +164,10 @@ observations and keeps running after an applied outcome.
 
 `observedRevision` records selected ancestry that the author reviewed. It detects
 excluded ancestry; it is not compare-and-swap, an execution barrier or proof that
-a business assertion remains true. Put those assertions in the program. The
-session's `reapply` operation creates a newly signed attempt with a new operation
+a business assertion remains true. Replicas recheck the retained ancestry before
+replaying received history; a coordinator signature does not replace that check.
+Put business assertions in the program. The session's `reapply` operation creates
+a newly signed attempt with a new operation
 identity and `reapplyOf` lineage, under current authorization and reviewed domain
 preconditions. An abandoned attempt is never silently resubmitted as fresh work.
 
@@ -211,9 +224,10 @@ requires an owning Worker, Web Locks and OPFS, and refuses a second owner or
 missing required capabilities.
 
 `PeerReplica.ready` reflects completed selected-history materialization. A session
-remains `waiting` when adopted bodies are missing, even if its generation is
-verified and its coordinator is connected. Connection state cannot substitute for
-a coherent readable view.
+remains `recovering` when adopted bodies are missing, even if its generation is
+verified and its coordinator is connected. A materialized follower is `waiting`
+when its coordinator is disconnected. Connection state cannot substitute for a
+coherent readable view.
 
 `connectApplications` is an in-process connector for embedded peers and
 independent-store tests. It exchanges verified history, retained-prefix evidence

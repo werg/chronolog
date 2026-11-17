@@ -7,6 +7,7 @@ import type { FramedPeerConnection } from '@chronolog/records'
 
 import type { ApplicationSession } from './session.js'
 import { sessionInternals } from './internals.js'
+import type { ContentManifest, ContentReference, ContentRetention } from './content.js'
 
 const MAX_MESSAGE_BYTES = 1_048_576, MAX_REQUESTS = 16, MAX_SYNC_RECORDS = 4096, MAX_SYNC_BYTES = 64 * 1024 * 1024
 const HANDSHAKE_DOMAIN = 'chronolog/peer-generation/connection/v1'
@@ -45,6 +46,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
   let remote: Hello | undefined, authenticated = false, sequence = 0, serving = 0, closed = false
   let sentBytes = 0, receivedBytes = 0, sentRequests = 0, receivedRequests = 0
   let detach = () => {}, unsubscribe = () => {}, signalRoute: ReturnType<typeof owned.signals.attachRoute> | undefined
+  let detachContent = () => {}
   let resolveReady!: () => void, rejectReady!: (error: unknown) => void
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
   void ready.catch(() => undefined)
@@ -53,7 +55,7 @@ export async function connectApplicationTransport(session: ApplicationSession, o
     if (closing !== undefined) return closing
     closing = Promise.resolve().then(() => connection.close())
     closed = true; lifetime.abort(reason); clearTimeout(handshakeTimer); inputSignal.removeEventListener('abort', abort)
-    rejectReady(reason); detach(); unsubscribe(); signalRoute?.close()
+    rejectReady(reason); detach(); unsubscribe(); signalRoute?.close(); detachContent()
     for (const pending of requests.values()) { clearTimeout(pending.timer); pending.reject(reason) }
     requests.clear()
     void closing.catch(() => undefined)
@@ -190,6 +192,16 @@ export async function connectApplicationTransport(session: ApplicationSession, o
         }
         case 'submit': result = await replica.order(value as SignedAttempt); break
         case 'retain': await replica.observeCoverage(value as SignedRetainedCoverage); result = null; break
+        case 'contentManifest': result = await owned.content.serveManifest(remote!.peer, value as ContentReference); break
+        case 'contentChunk': {
+          const input = record(value)
+          if (!Number.isSafeInteger(input.index)) throw new Error('APPLICATION_CONTENT_CHUNK_INVALID')
+          const bytes = await owned.content.serveChunk(remote!.peer, input.reference as ContentReference, Number(input.index))
+          result = bytes === null ? null : bytesToHex(bytes)
+          break
+        }
+        case 'contentRetained': result = await owned.content.retained(value as ContentReference); break
+        case 'contentObserveRetention': await owned.content.observeRetention(value as ContentRetention); result = null; break
         default: throw new Error('APPLICATION_PEER_METHOD_UNKNOWN')
       }
       authorized()
@@ -257,12 +269,6 @@ export async function connectApplicationTransport(session: ApplicationSession, o
       synchronize,
       close: () => close(),
     }
-    detach = session.attachPeer(peerId, async attempt => {
-      authorized()
-      await request<OrderedCommand>('submit', attempt)
-      authorized()
-      await synchronize()
-    }, { close: () => { void close() } })
     let previous = currentRevision(replica)
     unsubscribe = replica.subscribe(() => {
       const current = currentRevision(replica)
@@ -276,7 +282,26 @@ export async function connectApplicationTransport(session: ApplicationSession, o
         catch (error) { if (!closed) await close(error) }
       })().catch(() => undefined)
     }
-    await synchronize(); await session.resume(); authorized()
+    await synchronize(); authorized()
+    detachContent = owned.content.attachSource(peerId, {
+      manifest: async reference => request<ContentManifest | null>('contentManifest', reference),
+      chunk: async (reference, index) => {
+        const value = await request<unknown>('contentChunk', { reference, index })
+        authorized()
+        if (value === null) return null
+        if (typeof value !== 'string' || value.length > 2 * (65_536 + 16) || !/^(?:[0-9a-f]{2})*$/u.test(value)) throw new Error('APPLICATION_CONTENT_CHUNK_INVALID')
+        return hexToBytes(value)
+      },
+      retained: async reference => request<ContentRetention>('contentRetained', reference),
+      observeRetention: async receipt => { await request('contentObserveRetention', receipt) },
+    })
+    detach = session.attachPeer(peerId, async attempt => {
+      authorized()
+      await request<OrderedCommand>('submit', attempt)
+      authorized()
+      await synchronize()
+    }, { close: () => close() })
+    await session.resume(); authorized()
     return result
   } catch (error) { await close(error); throw error }
 }

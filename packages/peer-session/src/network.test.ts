@@ -157,4 +157,24 @@ describe('authenticated application transport', () => {
     expect((await b.query('messages', null)).value.events.map(event => event.operationId)).toEqual(['retained'])
     expect(links.every(link => !link.signal.aborted)).toBe(true)
   })
+
+  it('resumes encrypted content over bounded peer chunks without changing application history', async () => {
+    const f = await fixture(), a = await f.open(0), b = await f.open(1)
+    const bytes = new Uint8Array(65_536 + 19).fill(43), upload = await a.content.stage({ bytes: bytes.length })
+    await upload.write(0, bytes.slice(0, 65_536)); await upload.write(1, bytes.slice(65_536))
+    const reference = await upload.commit(), revision = b.revision
+    const first = await connect(a, b)
+    const prefix: Uint8Array[] = []
+    for await (const chunk of b.content.read(reference, { length: 65_536 })) prefix.push(chunk)
+    expect(prefix).toEqual([bytes.slice(0, 65_536)])
+    await Promise.all(first.map(link => link.close()))
+    await expect(async () => { for await (const _chunk of b.content.read(reference)) { /* Complete content is required. */ } }).rejects.toThrow('CONTENT_UNAVAILABLE')
+    await connect(a, b)
+    await b.content.retain(reference)
+    expect(await a.content.retention(reference)).toEqual([expect.objectContaining({ payload: expect.objectContaining({ peer: b.deviceId }) })])
+    expect(b.revision).toEqual(revision)
+    const copied: Uint8Array[] = []
+    for await (const chunk of b.content.read(reference)) copied.push(chunk)
+    expect(copied).toEqual([bytes.slice(0, 65_536), bytes.slice(65_536)])
+  })
 })

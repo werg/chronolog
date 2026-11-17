@@ -1,7 +1,7 @@
 import { bytesToHex, sha256 } from '@chronolog/canonical'
 import {
-  assertCanonicalCbor, assertValidChangeProgram, createExecutionManifest, decodeTransactionCore,
-  encodeCanonicalCbor, encodeTransactionCore, equalBytes, executionManifestArtifacts,
+  assertValidChangeProgram, createExecutionManifest,
+  encodeTransactionCore, equalBytes, executionManifestArtifacts,
   isEmitStep, transactionDigest, transactionOrderKey, compareTransactionOrder, utf8,
 } from '@chronolog/protocol'
 import type { ReplayProposal } from './types.js'
@@ -11,10 +11,8 @@ import {
   type MaterializedApplicationSnapshot, type MaterializedRevisionSnapshot, type MaterializedTransactionOutcome,
 } from './runtime.js'
 
-export interface EventExecutionStore {
-  get(key: string): Promise<Uint8Array | null>
-  put(key: string, value: Uint8Array): Promise<void>
-}
+import { EventHistoryStore, type EventExecutionStore, type EventHistoryState } from './event-store.js'
+export type { EventExecutionStore } from './event-store.js'
 
 export interface EventMaterializationOptions {
   readonly store: EventExecutionStore
@@ -67,11 +65,10 @@ async function openEventRuntime(options: EventMaterializationOptions, live: bool
     await previous
     try { if (closed) throw new Error('EVENT_EXECUTION_CLOSED'); return await task() } finally { release() }
   }
-  const encode = (next: readonly ReplayProposal[], rev: bigint, prefix: FinalPrefix | null): Uint8Array => encodeCanonicalCbor([
-    'chronolog/event-execution/v2', digest, rev,
-    next.map((entry) => [entry.txId, entry.candidateDigest, entry.canonicalCandidate]),
-    ...(prefix === null ? [] : [BigInt(prefix.length), prefix.revision]),
-  ])
+  const storage = new EventHistoryStore(options.store, key, digest, quota, live ? 'live' : 'applied')
+  const historyState = (next: readonly ReplayProposal[], rev: bigint, prefix: FinalPrefix | null): EventHistoryState =>
+    prefix === null ? { kind: 'applied', order: next, revision: rev } :
+      { kind: 'live', order: next, revision: rev, finalLength: prefix.length, finalRevision: prefix.revision }
   const evaluate = async (next: readonly ReplayProposal[]): Promise<MaterializedTransactionOutcome[]> => {
     const operations = new Set<string>(), transactions = new Set<string>(), proposals = new Set<string>()
     const result: MaterializedTransactionOutcome[] = []
@@ -100,32 +97,21 @@ async function openEventRuntime(options: EventMaterializationOptions, live: bool
     }
     return result
   }
-  const persisted = await options.store.get(key)
+  const persisted = await storage.load()
   if (persisted !== null) {
-    if (persisted.length > quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
-    const value = assertCanonicalCbor(persisted, { maxBytes: quota, maxByteStringBytes: quota, maxItems: quota })
-    if (!Array.isArray(value) || value.length !== (live ? 6 : 4) || value[0] !== 'chronolog/event-execution/v2' ||
-        !(value[1] instanceof Uint8Array) || !equalBytes(value[1], digest) || typeof value[2] !== 'bigint' ||
-        value[2] < 0n || !Array.isArray(value[3])) throw new Error('EVENT_EXECUTION_STORE_INVALID')
-    revision = value[2]
-    if (finalPrefix !== null) {
-      if (typeof value[4] !== 'bigint' || typeof value[5] !== 'bigint' ||
-          value[4] < 0n || value[4] > BigInt(value[3].length) || value[5] < 0n) throw new Error('EVENT_EXECUTION_STORE_INVALID')
-      finalPrefix.length = Number(value[4]); finalPrefix.revision = value[5]
+    revision = persisted.revision
+    if (persisted.kind === 'live' && finalPrefix !== null) {
+      finalPrefix.length = persisted.finalLength; finalPrefix.revision = persisted.finalRevision
     }
-    order = value[3].map((row) => {
-      if (!Array.isArray(row) || row.length !== 3 || !(row[0] instanceof Uint8Array) ||
-          !(row[1] instanceof Uint8Array) || !(row[2] instanceof Uint8Array)) throw new Error('EVENT_EXECUTION_STORE_INVALID')
-      return { txId: row[0], candidateDigest: row[1], canonicalCandidate: row[2], core: decodeTransactionCore(row[2]) }
-    })
+    order = [...persisted.order]
     outcomes = await evaluate(order)
   }
-  const persist = async (bytes: Uint8Array): Promise<void> => {
-    if (bytes.length > quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
-    try { await options.store.put(key, bytes) }
+  let outcomeIndex = new Map(outcomes.map(outcome => [bytesToHex(outcome.txId), outcome]))
+  const persist = async (state: EventHistoryState, difference: number): Promise<string> => {
+    try { return await storage.commit(state, difference) }
     catch (error) {
-      // Atomic storage may have committed before its acknowledgment was lost.
-      // Reopen the newer durable state before allowing any further mutation.
+      // A body or atomic head may have committed before its reply was lost.
+      // Reopen from the durable head before any further mutation.
       closed = true
       subscribers.clear()
       throw error
@@ -164,10 +150,8 @@ async function openEventRuntime(options: EventMaterializationOptions, live: bool
           if (difference === order.length && difference === next.length) return null
           const previousRevision = revision
           const nextRevision = revision + 1n
-          const bytes = encode(next, nextRevision, finalPrefix)
-          const contentHash = bytesToHex(await sha256(bytes))
           const changes: MaterializationOutcomeChange[] = nextOutcomes.flatMap((current) => {
-            const before = outcomes.find((value) => equalBytes(value.txId, current.txId))
+            const before = outcomeIndex.get(bytesToHex(current.txId))
             return before?.outcome === current.outcome && before.rejectionCode === current.rejectionCode ? [] : [{
               txId: current.txId.slice(), previous: before?.outcome ?? null, current: current.outcome,
               previousRejectionCode: before?.rejectionCode ?? null, currentRejectionCode: current.rejectionCode,
@@ -178,8 +162,10 @@ async function openEventRuntime(options: EventMaterializationOptions, live: bool
             txId: removed.txId.slice(), previous: removed.outcome, current: null,
             previousRejectionCode: removed.rejectionCode, currentRejectionCode: null,
           })
-          await persist(bytes)
+          // Indexed immutable records are published by one small atomic head.
+          const contentHash = await persist(historyState(next, nextRevision, finalPrefix), difference)
           order = next; outcomes = nextOutcomes; revision = nextRevision
+          outcomeIndex = new Map(outcomes.map(outcome => [bytesToHex(outcome.txId), outcome]))
           const result = { revision, previousRevision, orderLength: order.length, replayFromIndex: difference,
             replayedTransactions: order.length - difference, checkpointPrefix: difference, contentHash,
             manifestDigest: digest.slice(), earliestChangedOrderIndex: difference, outcomeChanges: changes }
@@ -193,7 +179,7 @@ async function openEventRuntime(options: EventMaterializationOptions, live: bool
       get executionManifestDigest() { return digest.slice() },
       proposalIdAt(index) { return order[index]?.txId.slice() ?? null },
       localSql() { throw new Error('SQL_DISABLED_FOR_EVENT_PROFILE') },
-      outcome(id) { return structuredClone(outcomes.find((entry) => equalBytes(entry.txId, id)) ?? null) },
+      outcome(id) { return structuredClone(outcomeIndex.get(bytesToHex(id)) ?? null) },
       subscribe(subscriber) { subscribers.add(subscriber); return () => { subscribers.delete(subscriber) } },
       captureApplication() { return capture() },
       captureRead() { return eventReadHandle(capture()) },
@@ -225,7 +211,7 @@ async function openEventRuntime(options: EventMaterializationOptions, live: bool
         if (!Number.isSafeInteger(length) || length < finalPrefix.length || length > order.length) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_INVALID')
         if (length === finalPrefix.length) return
         const next = { length, revision: finalPrefix.revision + 1n }
-        await persist(encode(order, revision, next))
+        await persist(historyState(order, revision, next), order.length)
         Object.assign(finalPrefix, next)
       }),
     },

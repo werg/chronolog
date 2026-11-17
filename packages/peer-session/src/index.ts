@@ -7,3 +7,6 @@ export { eventExecutionManifest } from '@chronolog/materializer'
 export { emit, program, sqlStatement, executionManifestArtifacts, bytesToHex, hexToBytes } from '@chronolog/protocol'
 
 export * from './network.js'
+export * from './recovery.js'
+export * from './content.js'
+export * from './tools.js'
