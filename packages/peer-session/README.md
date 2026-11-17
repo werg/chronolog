@@ -38,7 +38,7 @@ const definition = defineApplication({
   },
 })
 const device = await openNativeDevice({ path: './device.sqlite' })
-const session = await openNativeApplication({ device, definition, authority, epochKeys })
+const session = await openNativeApplication({ device, definition, authority })
 try {
   const before = await session.query('messages', null)
   const operation = await session.command('say', { text: 'Hello' }, {
@@ -50,8 +50,9 @@ try {
 ```
 
 `authority` is the verified signed descriptor/control/generation bundle obtained
-from the configured control service. `epochKeys` contains explicitly enrolled
-decryption keys. `applicationDefinitionDigest(definition)` binds the published
+from the configured control service. Enrolled decryption keys persist in the
+owned device store; a new reader acquires missing keys from an authorized peer.
+`applicationDefinitionDigest(definition)` binds the published
 schemas and semantic version. The event execution manifest is obtained with
 `eventExecutionManifest('peer-generation-v1')`; a chronological manifest is a
 different execution contract and is rejected.
@@ -60,6 +61,38 @@ Only first device setup passes `{ create: true }`. Ordinary reopening omits it.
 The session owns one signed attempt journal in the device store. A disconnected
 command remains `saved`; connecting resumes its exact original attempt.
 Cancelling `applied({ signal })` cancels that waiter only.
+
+## Enrollment and epoch keys
+
+The device owns one Ed25519 identity and one durable application keyring. An
+initial creator passes `epochKeys` to the open function as explicit local
+bootstrap; normal reopening loads those keys from the owned store. A newly
+granted reader can open without keys and reports `status.phase ===
+'awaiting-keys'` until it connects to another reader with the needed keys.
+
+Maintained peer transports acquire missing keys before replay. Each request
+signs a fresh ephemeral HPKE receiver together with the application, history,
+selected generation, control digest and requested epochs. The donor checks the
+current reader grants and signed scope, then wraps the authenticated epoch keys
+for that one request. The recipient verifies the donor, request binding and key
+commitments before one durable install. A storage acknowledgment lost after
+installation is recovered by reopening the same device. The ephemeral receiver
+does not become a second persistent device identity.
+
+Any current reader holding a committed key can supply it to another current
+reader. Membership grants determine who can receive data; key delivery does not
+create a new grant. The host selects signed controls and generations, while
+readers exchange decryption keys directly. Revocation and generation changes
+expire an in-flight request. Removed readers cannot obtain new epoch keys.
+
+For rotation, adopt the new signed control and generation, then the device that
+created the new key calls `session.keys.install(new Map([[epoch, key]]))`.
+Other readers acquire the rotated key through their peer connections. Selected
+history determines the keys required for replay; content can acquire an older
+committed key when a retained attachment needs it. Old keys remain local for
+reading retained history and content. Advanced transports can use
+`session.keys.request()`, `offer()` and `attachSource()` directly; ordinary
+applications use the maintained connection helpers.
 
 ## Recovery and inspection
 
@@ -147,6 +180,52 @@ complete verified prefix is materialized. Change subscriptions wait for that
 first coherent view. Sessions permit at most eight simultaneously held read
 views; release them promptly. Closing the session releases all remaining views
 and connections before closing its durable store.
+
+## Page facade
+
+The Worker opens the device, owns the application and installs the application
+bridge alongside the transport bridge:
+
+```ts
+import { serveApplicationWorker } from '@chronolog/peer-session/browser'
+import { installApplicationWorkerTransport } from '@chronolog/peer-session/webrtc'
+
+serveApplicationWorker(session, self, { host })
+installApplicationWorkerTransport(session, self)
+```
+
+The page connects through a dedicated message port:
+
+```ts
+import { connectApplicationWorker } from '@chronolog/peer-session/browser'
+
+const session = await connectApplicationWorker<typeof definition>(worker)
+const before = await session.query('messages', null)
+const operation = await session.command('say', { text: 'Hello' }, {
+  operationId: crypto.randomUUID(), basedOn: before.revision,
+})
+const result = await operation.applied()
+```
+
+The returned `WorkerApplicationSession` provides the same declared commands,
+queries, operation inspection, retry, explicit reapplication, changes, live
+signals and content handles. `status` and `revision` are synchronous snapshots;
+`describe()` returns the application contract. `onStatus()` and `onRecovery()`
+observe updates, while `inspectRecovery()` loads retained recovery notices.
+`readView()` holds one coherent SQL/event view until `release()` resolves.
+Only the Worker holds signing keys and the durable command journal. Cancelling
+a page waiter ends that observation and leaves the saved command inspectable.
+
+The optional `host` stays in the Worker for `recovery.takeover()` and
+`recovery.handover()`; ordinary commands do not call it. The bridge serves one
+page facade, bounds pending requests and pulled streams, and releases held views
+on close. `session.close()` resolves after the Worker has released the owned
+device store, so the page can safely reopen it immediately afterward.
+
+The `/tendriller` entry exports `createPeerGenerationApplicationBackend()` for
+binding either an owned native session or this page facade to Tendriller's
+application interface. It forwards declared commands and coherent views to the
+same session instead of introducing another identity or queue.
 
 ## Content and local agent tools
 
