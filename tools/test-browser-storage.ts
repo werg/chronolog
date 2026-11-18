@@ -24,6 +24,8 @@ try {
   browser = await chromium.launch({ headless: true })
   const page = await browser.newPage()
   await page.goto('http://127.0.0.1:' + address.port)
+  await page.addInitScript({ content: 'globalThis.__name = (value) => value' })
+  await page.reload()
   const result = await page.evaluate(async (name: string) => {
     async function command(method: 'run' | 'resume'): Promise<{ id: string; storageId: string; backend?: string }> {
       const worker = new Worker('/worker.js', { type: 'module' })

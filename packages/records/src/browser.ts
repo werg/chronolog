@@ -32,6 +32,9 @@ export class OpfsBytesStore implements BytesStore {
         throw error
       }
       const raw = new Uint8Array(await (await file.getFile()).arrayBuffer())
+      // A first createWritable() that never committed can leave an empty
+      // placeholder; preserve the legacy OPFS absent-value interpretation.
+      if (raw.length === 0) return null
       return decodeRecordValue(key, raw, 'OPFS_VALUE_CORRUPT')
     })
   }
@@ -117,12 +120,12 @@ export async function acquireBrowserStorage(name: string): Promise<BrowserStorag
 }
 
 /** A prior app directory, even empty, is evidence of a possible interrupted legacy write. */
-export async function inspectLegacyOpfsDirectory(name: string): Promise<boolean> {
+export async function inspectLegacyOpfsDirectory(name: string, providedRoot?: FileSystemDirectoryHandle): Promise<boolean> {
   if (typeof navigator === 'undefined' || navigator.storage?.getDirectory === undefined) {
     throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS')
   }
   try {
-    const root = await navigator.storage.getDirectory()
+    const root = providedRoot ?? await navigator.storage.getDirectory()
     try { await root.getDirectoryHandle('chronolog-' + name); return true }
     catch (error) {
       if (error instanceof DOMException && error.name === 'NotFoundError') return false
@@ -132,9 +135,9 @@ export async function inspectLegacyOpfsDirectory(name: string): Promise<boolean>
 }
 
 /** An isolated writable-file test: API presence alone is insufficient on Safari. */
-export async function probeOpfsWritable(): Promise<boolean> {
+export async function probeOpfsWritable(providedRoot?: FileSystemDirectoryHandle): Promise<boolean> {
   if (typeof navigator === 'undefined' || navigator.storage?.getDirectory === undefined) return false
-  const root = await navigator.storage.getDirectory()
+  const root = providedRoot ?? await navigator.storage.getDirectory()
   const fileName = 'chronolog-probe-' + crypto.randomUUID()
   let created = false
   try {

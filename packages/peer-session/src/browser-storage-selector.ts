@@ -20,6 +20,13 @@ function decodePin(bytes: Uint8Array): RecordBackend {
 export async function openSelectedBrowserStorage(name: string, metadata: BrowserMetadataStore): Promise<ApplicationStorage> {
   const lock = await acquireBrowserStorageLock(name)
   try {
+    let root: FileSystemDirectoryHandle | undefined
+    const opfsRoot = async (): Promise<FileSystemDirectoryHandle> => {
+      if (typeof navigator === 'undefined' || navigator.storage?.getDirectory === undefined) {
+        throw new Error('BROWSER_DURABLE_STORAGE_UNAVAILABLE')
+      }
+      return root ??= await navigator.storage.getDirectory()
+    }
     const opened = await metadata.get(STORAGE_OPENED)
     const oldPin = await metadata.get(BACKEND_PIN)
     let backend: RecordBackend
@@ -28,8 +35,8 @@ export async function openSelectedBrowserStorage(name: string, metadata: Browser
       // An opened old device, or any pre-upgrade app directory including one
       // abandoned before STORAGE_OPENED, must never be redirected to empty IDB.
       let candidate: RecordBackend
-      if (opened !== null || await inspectLegacyOpfsDirectory(name)) candidate = 'opfs'
-      else if (await probeOpfsWritable()) candidate = 'opfs'
+      if (opened !== null || await inspectLegacyOpfsDirectory(name, await opfsRoot())) candidate = 'opfs'
+      else if (await probeOpfsWritable(await opfsRoot())) candidate = 'opfs'
       else if (await probeIndexedDbBytesStore()) candidate = 'indexeddb'
       else throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
       const created = await metadata.compareAndSwap(BACKEND_PIN, null, encodeCanonicalCbor([1n, candidate]))
@@ -47,14 +54,12 @@ export async function openSelectedBrowserStorage(name: string, metadata: Browser
         if (typeof indexedDB === 'undefined') throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
         return IndexedDbBytesStore.open(name)
       }
-      if (typeof navigator === 'undefined' || navigator.storage?.getDirectory === undefined) {
-        throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
-      }
-      // Check the operation needed by OPFS, even when the directory API exists.
-      if (!await probeOpfsWritable()) throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
-      const root = await navigator.storage.getDirectory()
+      // One root acquisition is shared between legacy inspection, capability
+      // verification and opening; a protocol-first session requests it once.
+      const directoryRoot = await opfsRoot()
+      if (!await probeOpfsWritable(directoryRoot)) throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
       let directory: FileSystemDirectoryHandle
-      try { directory = await root.getDirectoryHandle('chronolog-' + name, { create: opened === null }) }
+      try { directory = await directoryRoot.getDirectoryHandle('chronolog-' + name, { create: opened === null }) }
       catch (error) {
         if (opened !== null && error instanceof DOMException && error.name === 'NotFoundError') {
           throw new Error('APPLICATION_DATA_STORAGE_MISSING', { cause: error })
