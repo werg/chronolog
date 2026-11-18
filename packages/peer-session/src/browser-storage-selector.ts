@@ -40,6 +40,7 @@ export async function openSelectedBrowserStorage(name: string, metadata: Browser
     const opened = await metadata.get(STORAGE_OPENED)
     const oldPin = await metadata.get(BACKEND_PIN)
     let backend: RecordBackend
+    let verifiedOpfs = false
     if (oldPin !== null) backend = decodePin(oldPin)
     else {
       // An opened old device, or any pre-upgrade app directory including one
@@ -47,11 +48,14 @@ export async function openSelectedBrowserStorage(name: string, metadata: Browser
       let candidate: RecordBackend
       // If an IDB journal survived but its metadata pin did not, treating the
       // same named device as a new OPFS installation could fork signed history.
-      try {
-        if (await inspectExistingIndexedDbRecords(name)) throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS')
-      } catch (error) { throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS', { cause: error }) }
+      const hasIndexedDb = await inspectExistingIndexedDbRecords(name).catch((error: unknown) => {
+        throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS', { cause: error })
+      })
+      if (hasIndexedDb) throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS')
       if (opened !== null) candidate = 'opfs'
-      else if (await inspectLegacyOpfsDirectory(name, await opfsRoot())) {
+      else if (await inspectLegacyOpfsDirectory(name, await opfsRoot().catch((error: unknown) => {
+        throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS', { cause: error })
+      }))) {
         // A legacy directory can survive a crash before STORAGE_OPENED.
         // Require the old binding before pinning; an empty/partial directory
         // with unknown app records is not evidence of a new durable store.
@@ -63,28 +67,27 @@ export async function openSelectedBrowserStorage(name: string, metadata: Browser
           } finally { await legacy.close() }
         } catch (error) { throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS', { cause: error }) }
         candidate = 'opfs'
-      } else if (await probeOpfsWritable(await opfsRoot())) candidate = 'opfs'
-      else if (await probeIndexedDbBytesStore()) candidate = 'indexeddb'
-      else throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
-      const created = await metadata.compareAndSwap(BACKEND_PIN, null, encodeCanonicalCbor([1n, candidate]))
+      } else {
+        verifiedOpfs = await probeOpfsWritable(await opfsRoot())
+        if (verifiedOpfs) candidate = 'opfs'
+        else if (await probeIndexedDbBytesStore()) candidate = 'indexeddb'
+        else throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
+      }
+      await metadata.compareAndSwap(BACKEND_PIN, null, encodeCanonicalCbor([1n, candidate]))
       const persisted = await metadata.get(BACKEND_PIN)
       if (persisted === null) throw new Error('BROWSER_STORAGE_BACKEND_AMBIGUOUS')
       backend = decodePin(persisted)
-      if (!created && backend !== candidate) {
-        // A competing writer won the metadata CAS; only its immutable choice is safe.
-        // The named Web Lock still excludes simultaneous data owners.
-      }
     }
 
     const store = await (async () => {
       if (backend === 'indexeddb') {
         if (typeof indexedDB === 'undefined') throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
-        return IndexedDbBytesStore.open(name)
+        return IndexedDbBytesStore.open(name, { create: opened === null })
       }
       // One root acquisition is shared between legacy inspection, capability
       // verification and opening; a protocol-first session requests it once.
       const directoryRoot = await opfsRoot()
-      if (!await probeOpfsWritable(directoryRoot)) throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
+      if (!verifiedOpfs && !await probeOpfsWritable(directoryRoot)) throw new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED')
       let directory: FileSystemDirectoryHandle
       try { directory = await directoryRoot.getDirectoryHandle('chronolog-' + name, { create: opened === null }) }
       catch (error) {

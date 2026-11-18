@@ -75,13 +75,13 @@ SAH-pool VFS; there is **no** silent downgrade to events-only.
 | --- | --- | --- |
 | Current Chromium desktop | OPFS if the actual probe succeeds | Browser Worker regression included in the independent qualification workflow |
 | Current Chrome for Android | OPFS if the actual probe succeeds | Physical-device write/reopen not yet qualified by this change |
-| Safari 17 / iPadOS 17 | IndexedDB when OPFS createWritable is unsupported **and** native cryptography, Web Locks and IDB pass | API eligibility only until a real Safari 17 iPad completes event write, reload, resume, peer sync and contention |
+| Safari 17 / iPadOS 17 | The event path requires native X25519, documented by WebKit starting in Safari 18.4 | Treat Safari 17 as unsupported for this path unless a physical browser passes the native crypto probe and the full event round trip |
 | Current Safari / iPadOS | Determined by actual OPFS probe, otherwise eligible IndexedDB | No version-only assumptions or physical-device claim |
 | Missing native Ed25519/X25519 or Web Locks | None | Explicitly unsupported; no silent crypto or lock fallback |
 | Browser SQL/WASM | Independent of record backend | Unqualified on Safari 17 until the complete engine/VFS is tested |
 
 Desktop Playwright WebKit is useful regression evidence, but **does not** qualify
-real iPadOS 17 Safari. Qualify an actual iPad before stating Safari 17
+real iPadOS 17 Safari. [WebKit documents native X25519 in Safari 18.4.](https://webkit.org/blog/16574/webkit-features-in-safari-18-4/) Qualify an actual iPad before stating Safari 17
 application-level support. Browser storage persistence must also be tested
 across Worker termination and page reload with the shipped artifacts.
 

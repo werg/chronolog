@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { chromium } from '@playwright/test'
+import { chromium, webkit } from '@playwright/test'
 import { build } from 'esbuild'
 
 const bundle = await build({ entryPoints: ['test/browser-storage/worker.ts'], write: false, bundle: true,
@@ -21,7 +21,9 @@ const address = server.address()
 assert(address !== null && typeof address !== 'string')
 let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined
 try {
-  browser = await chromium.launch({ headless: true })
+  const engine = process.env.CHRONOLOG_STORAGE_BROWSER === 'webkit' ? webkit : chromium
+  const executablePath = process.env.CHRONOLOG_STORAGE_BROWSER_EXECUTABLE
+  browser = await engine.launch({ headless: true, ...(executablePath ? { executablePath } : {}) })
   const page = await browser.newPage()
   await page.goto('http://127.0.0.1:' + address.port)
   await page.addInitScript({ content: 'globalThis.__name = (value) => value' })

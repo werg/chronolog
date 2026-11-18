@@ -80,10 +80,11 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
     reason = error instanceof Error ? error.name + ': ' + error.message : String(error)
   }
   const backend = reason === undefined ? (opfsWritable ? 'opfs' : idbWritable ? 'indexeddb' : null) : null
-  const supported = secureContext && dedicatedWorker && webLocks && ed && x && backend !== null
+  const supported = secureContext && dedicatedWorker && webLocks && ed && x && idbWritable && backend !== null
   const unavailable = reason ?? (!secureContext ? 'Secure context required' : !dedicatedWorker ? 'Dedicated owner Worker required'
     : !webLocks ? 'Web Locks unavailable' : !ed || !x ? 'Required native WebCrypto algorithms unavailable'
-    : backend === null ? 'Neither durable record backend is writable' : undefined)
+    : !idbWritable ? 'Writable IndexedDB is required for device metadata'
+      : backend === null ? 'Neither durable record backend is writable' : undefined)
   const eligible = dedicatedWorker && wasm && syncHandle
   return {
     secureContext, dedicatedWorker, indexedDb: { supported: indexedSupported, writable: idbWritable },

@@ -115,12 +115,27 @@ async function run(name: string): Promise<{ id: string; storageId: string; backe
   check((await persisted.store.get('history/test'))?.[2] === 9, 'history persists')
   await reopened.close()
 
-  // An explicit IDB pin exercises the same owning device path in Chromium.
+  // Exercise automatic selection under the Safari-style split: the OPFS
+  // directory is inspectable, but its writable stream method is absent.
   const fallbackName = name + '-idb'
   const fallback = await openBrowserDevice({ name: fallbackName, create: true })
   const fallbackMeta = await BrowserMetadataStore.open(fallbackName)
-  check(await fallbackMeta.compareAndSwap(pinKey, null, encodeCanonicalCbor([1n, 'indexeddb'])), 'fixture IDB pin')
-  const fallbackStore = await fallback.openStorage()
+  const prototype = FileSystemFileHandle.prototype
+  const writable = Object.getOwnPropertyDescriptor(prototype, 'createWritable')
+  Object.defineProperty(prototype, 'createWritable', { configurable: true, value: undefined })
+  const fallbackStore = await (async () => {
+    try {
+      const capability = await probeBrowserCapabilities()
+      check(capability.events.backend === 'indexeddb', 'writable stream absence selects IDB')
+      return await fallback.openStorage()
+    } finally {
+      if (writable) Object.defineProperty(prototype, 'createWritable', writable)
+      else Reflect.deleteProperty(prototype, 'createWritable')
+    }
+  })()
+  const fallbackPin = await fallbackMeta.get(pinKey)
+  const expectedPin = encodeCanonicalCbor([1n, 'indexeddb'])
+  check(fallbackPin?.length === expectedPin.length && fallbackPin.every((value, index) => value === expectedPin[index]), 'automatic IDB pin')
   await fallbackStore.store.put('history/test', Uint8Array.of(42))
   await fallback.close()
   const fallbackAgain = await openBrowserDevice({ name: fallbackName })
@@ -139,6 +154,7 @@ async function run(name: string): Promise<{ id: string; storageId: string; backe
   const lost = await openBrowserDevice({ name: fallbackName })
   await fails(lost.openStorage(), 'APPLICATION_DATA_STORAGE_MISSING')
   await lost.close()
+  check(!await inspectExistingIndexedDbRecords(fallbackName), 'missing pinned IDB was not recreated')
 
   if (report.opfs.createWritable) {
     // Simulate a legacy release interrupted after writing STORAGE_BINDING

@@ -20,13 +20,23 @@ export class IndexedDbBytesStore implements BytesStore {
     }
   }
 
-  static open(name: string): Promise<IndexedDbBytesStore> {
+  static open(name: string, { create = true } = {}): Promise<IndexedDbBytesStore> {
     if (typeof indexedDB === 'undefined') return Promise.reject(new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED'))
     return new Promise((resolve, reject) => {
-      let blocked = false
+      let blocked = false, missing = false
       const request = indexedDB.open('chronolog-data:' + name, VERSION)
-      request.onupgradeneeded = () => { request.result.createObjectStore(TABLE) }
-      request.onerror = () => { reject(request.error ?? new Error('INDEXEDDB_STORE_OPEN_FAILED')) }
+      request.onupgradeneeded = () => {
+        if (blocked) { request.transaction?.abort(); return }
+        if (!create) {
+          missing = true
+          request.transaction?.abort()
+          return
+        }
+        request.result.createObjectStore(TABLE)
+      }
+      request.onerror = () => {
+        reject(missing ? new Error('APPLICATION_DATA_STORAGE_MISSING') : request.error ?? new Error('INDEXEDDB_STORE_OPEN_FAILED'))
+      }
       request.onblocked = () => { blocked = true; reject(new Error('INDEXEDDB_STORE_BLOCKED')) }
       request.onsuccess = () => {
         if (blocked) request.result.close()
