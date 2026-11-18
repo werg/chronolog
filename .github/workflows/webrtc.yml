@@ -100,6 +100,9 @@ jobs:
         id: chromium
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify both browser record stores and pinned ownership
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        run: pnpm exec tsx tools/test-browser-storage.ts
       - name: Qualify packed browser Worker, OPFS and native RTC
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' && steps.chromium.outcome == 'success' }}
         shell: bash

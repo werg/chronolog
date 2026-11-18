@@ -10,9 +10,8 @@ export async function openBrowserDevice(options: { readonly name: string; readon
     return await openApplicationDevice({ store: metadata,
       ...(options.create === undefined ? {} : { create: options.create }),
       async openStorage() {
-        const { acquireBrowserStorage } = await import('@chronolog/records/browser')
-        const owner = await acquireBrowserStorage(options.name)
-        return { store: owner.bytes, close: () => owner.close() }
+        const { openSelectedBrowserStorage } = await import('./browser-storage-selector.js')
+        return openSelectedBrowserStorage(options.name, metadata)
       },
       close: () => { metadata.close() },
     })
