@@ -200,6 +200,22 @@ async function run(name: string): Promise<{ id: string; storageId: string; backe
     await interrupted.close()
   }
 
+  // An absent OPFS directory API is different from a missing writable stream:
+  // an unpinned device cannot prove that no older OPFS journal exists.
+  const directoryMethod = Object.getOwnPropertyDescriptor(navigator.storage, 'getDirectory')
+  Object.defineProperty(navigator.storage, 'getDirectory', { configurable: true, value: undefined })
+  try {
+    const capability = await probeBrowserCapabilities()
+    check(capability.indexedDb.writable && !capability.events.supported && capability.events.backend === null,
+      'diagnostics fail closed if the OPFS directory cannot be inspected')
+    const unpinned = await openBrowserDevice({ name: name + '-no-directory', create: true })
+    try { await fails(unpinned.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS') }
+    finally { await unpinned.close() }
+  } finally {
+    if (directoryMethod) Object.defineProperty(navigator.storage, 'getDirectory', directoryMethod)
+    else Reflect.deleteProperty(navigator.storage, 'getDirectory')
+  }
+
   await idbConformance(name + '-conformance')
   await opfsConformance(name + '-conformance')
   return { id: device.identity.publicKey, storageId: device.storageId, backend: report.events.backend! }

@@ -78,11 +78,12 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
     // to select another backend. Diagnostics preserve the failure explicitly.
     reason = error instanceof Error ? error.name + ': ' + error.message : String(error)
   }
-  const backend = reason === undefined ? (opfsWritable ? 'opfs' : idbWritable ? 'indexeddb' : null) : null
+  const backend = reason === undefined && directory ? (opfsWritable ? 'opfs' : idbWritable ? 'indexeddb' : null) : null
   const supported = secureContext && dedicatedWorker && webLocks && ed && x && idbWritable && backend !== null
   const unavailable = reason ?? (!secureContext ? 'Secure context required' : !dedicatedWorker ? 'Dedicated owner Worker required'
     : !webLocks ? 'Web Locks unavailable' : !ed || !x ? 'Required native WebCrypto algorithms unavailable'
     : !idbWritable ? 'Writable IndexedDB is required for device metadata'
+      : !directory ? 'The OPFS directory must be inspectable before choosing a record backend'
       : backend === null ? 'Neither durable record backend is writable' : undefined)
   let sqlError: string | undefined
   if (directory && dedicatedWorker && wasm) {

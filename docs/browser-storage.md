@@ -73,7 +73,12 @@ SAH-pool VFS; there is **no** silent downgrade to events-only.
 
 | Environment | New events record backend | Evidence / limitation |
 | --- | --- | --- |
-| Current Chromium desktop | OPFS if the actual probe succeeds | Browser Worker regression included in the independent qualification workflow |
+| Current Chromium desktop | OPFS if the actual probe succeeds For a first data open, the owner must be able to inspect the OPFS directory
+even when IndexedDB will store records. This protects existing unpinned
+histories. A missing directory API or an unknown OPFS I/O failure leaves
+that first open unavailable.
+
+| Browser Worker regression included in the independent qualification workflow |
 | Current Chrome for Android | OPFS if the actual probe succeeds | Physical-device write/reopen not yet qualified by this change |
 | Safari 17 / iPadOS 17 | The event path requires native X25519, documented by WebKit starting in Safari 18.4 | Treat Safari 17 as unsupported for this path unless a physical browser passes the native crypto probe and the full event round trip |
 | Current Safari / iPadOS | Determined by actual OPFS probe, otherwise eligible IndexedDB | No version-only assumptions or physical-device claim |
