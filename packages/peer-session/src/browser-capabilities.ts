@@ -26,8 +26,8 @@ async function ed25519(): Promise<boolean> {
 }
 async function x25519(): Promise<boolean> {
   try {
-    const first = await crypto.subtle.generateKey('X25519', true, ['deriveBits'])
-    const second = await crypto.subtle.generateKey('X25519', true, ['deriveBits'])
+    const first = await crypto.subtle.generateKey('X25519', true, ['deriveBits']) as CryptoKeyPair
+    const second = await crypto.subtle.generateKey('X25519', true, ['deriveBits']) as CryptoKeyPair
     const publicRaw = await crypto.subtle.exportKey('raw', second.publicKey)
     const publicKey = await crypto.subtle.importKey('raw', publicRaw, 'X25519', false, [])
     const bits = await crypto.subtle.deriveBits({ name: 'X25519', public: publicKey }, first.privateKey, 256)

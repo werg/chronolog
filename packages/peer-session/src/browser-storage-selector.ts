@@ -13,7 +13,7 @@ function decodePin(bytes: Uint8Array): RecordBackend {
   try { value = assertCanonicalCbor(bytes) } catch { throw new Error('BROWSER_STORAGE_BACKEND_PIN_INVALID') }
   if (!Array.isArray(value) || value.length !== 2 || value[0] !== 1n ||
       (value[1] !== 'opfs' && value[1] !== 'indexeddb')) throw new Error('BROWSER_STORAGE_BACKEND_PIN_INVALID')
-  return value[1]
+  return value[1] as RecordBackend
 }
 
 /** Select once under the same exclusive lock that owns every subsequent record write. */

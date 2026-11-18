@@ -31,10 +31,12 @@ try {
         return await new Promise((resolve, reject) => {
           const timer = setTimeout(() => { reject(new Error('Storage Worker qualification timed out')) }, 45_000)
           worker.onerror = event => { clearTimeout(timer); reject(new Error(event.message)) }
-          worker.onmessage = ({ data }) => {
+          worker.onmessage = event => {
+            const data = event.data as { error?: string; value?: { id: string; storageId: string; backend?: string } }
             clearTimeout(timer)
             if (data.error) reject(new Error(data.error))
-            else resolve(data.value)
+            else if (data.value !== undefined) resolve(data.value)
+            else reject(new Error('Storage Worker response is missing a result'))
           }
           worker.postMessage({ id: 1, method, name })
         })

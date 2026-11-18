@@ -4,7 +4,8 @@ export { openPeerApplication as openBrowserApplication } from './runtime.js'
 export type { OpenPeerApplicationOptions } from './runtime.js'
 export { serveApplicationWorker } from './worker-application-server.js'
 
+import type { BrowserCapabilityReport } from './browser-capabilities.js'
 export type { BrowserCapabilityReport } from './browser-capabilities.js'
-export async function probeBrowserCapabilities(): Promise<import('./browser-capabilities.js').BrowserCapabilityReport> {
+export async function probeBrowserCapabilities(): Promise<BrowserCapabilityReport> {
   return (await import('./browser-capabilities.js')).probeBrowserCapabilities()
 }
