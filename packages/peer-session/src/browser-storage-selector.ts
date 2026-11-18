@@ -18,6 +18,15 @@ function decodePin(bytes: Uint8Array): RecordBackend {
 
 /** Select once under the same exclusive lock that owns every subsequent record write. */
 export async function openSelectedBrowserStorage(name: string, metadata: BrowserMetadataStore): Promise<ApplicationStorage> {
+  // Preserve the legacy unsupported-OPFS error before Web Lock contention for
+  // pinned OPFS devices. This is a read-only preflight, not backend selection:
+  // the pin is re-read authoritatively after taking the exclusive lock.
+  if (typeof navigator === 'undefined' || navigator.storage?.getDirectory === undefined) {
+    const preflightPin = await metadata.get(BACKEND_PIN)
+    if (preflightPin !== null && decodePin(preflightPin) === 'opfs') {
+      throw new Error('BROWSER_DURABLE_STORAGE_UNAVAILABLE')
+    }
+  }
   const lock = await acquireBrowserStorageLock(name)
   try {
     let root: FileSystemDirectoryHandle | undefined
