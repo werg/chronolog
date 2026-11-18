@@ -128,6 +128,15 @@ export async function probeIndexedDbBytesStore(): Promise<boolean> {
  */
 export function inspectExistingIndexedDbRecords(name: string): Promise<boolean> {
   if (typeof indexedDB === 'undefined') return Promise.resolve(false)
+  // Safari 17 and Chromium support enumeration. Prefer it: an OPFS-only
+  // first data use must not open a second IndexedDB database, and no
+  // versionchange transaction is needed to detect an orphaned journal.
+  if (typeof indexedDB.databases === 'function') {
+    return indexedDB.databases().then(databases =>
+      databases.some(database => database.name === 'chronolog-data:' + name))
+  }
+  // Older IDB engines lack enumeration. Abort their version-0 open before
+  // creating any new database, instead of taking absence as proof.
   return new Promise((resolve, reject) => {
     const request = indexedDB.open('chronolog-data:' + name)
     let absent = false
