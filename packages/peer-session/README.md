@@ -39,14 +39,24 @@ data view exists. Queries and captured views return their own non-null revision.
 A failed first initialization releases partial data resources and remains failed
 for that session. The same authenticated participant can still exchange live
 signals and control messages. Closing drains owned work and releases resources;
-closing an unused browser session never opens OPFS.
+closing an unused browser session never opens a record data store.
 
 Browser devices retain their small identity and verified-control metadata in
-IndexedDB. OPFS and its exclusive Web Lock are acquired only by durable use.
-Cold tabs can share the stable device identity; concurrent metadata updates
-preserve one signer and monotonic signed authority. A second durable owner gets
-a busy error. Loss of a previously opened data store is an explicit error and
-never creates an empty history under the old storage identity.
+IndexedDB. On the **first actual data use**, an exclusive named Web Lock is acquired
+and the local record backend is selected and pinned in metadata: OPFS when a real
+createWritable/write/reopen probe succeeds, or a separate IndexedDB bytes store
+for a fresh device when that OPFS write API is unsupported. The application's
+signed protocol and all consumer APIs remain unchanged. SQL's OPFS/SQLite VFS
+is **not** selected by this rule.
+
+A pinned device never switches record backends automatically, even after a
+browser update, quota failure or missing data. Existing OPFS records, including
+possible legacy interrupted writes, must remain OPFS or fail explicitly; no
+application history is copied, reset or forked. The lock is held until all
+admitted writes and the record store are closed. Cold tabs can share one signer
+without opening a data store, but a second concurrent durable owner receives
+`BROWSER_STORAGE_IN_USE`. See [browser record compatibility](../../docs/browser-storage.md)
+for capability diagnostics, failure behavior, and qualification boundaries.
 
 ## Native events application
 
