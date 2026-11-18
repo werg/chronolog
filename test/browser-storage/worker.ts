@@ -1,6 +1,6 @@
 import { encodeCanonicalCbor } from '@chronolog/canonical'
 import { OpfsBytesStore, acquireBrowserStorage, probeOpfsWritable } from '@chronolog/records/browser'
-import { IndexedDbBytesStore } from '@chronolog/records/indexeddb-browser'
+import { IndexedDbBytesStore, inspectExistingIndexedDbRecords } from '@chronolog/records/indexeddb-browser'
 import { openBrowserDevice, probeBrowserCapabilities } from '@chronolog/peer-session/worker'
 import { BrowserMetadataStore } from '../../packages/peer-session/src/browser-metadata.js'
 import type { BytesStore } from '@chronolog/records'
@@ -155,6 +155,33 @@ async function run(name: string): Promise<{ id: string; storageId: string; backe
     check((await oldMeta.get(pinKey))?.length === encodeCanonicalCbor([1n, 'opfs']).length, 'legacy OPFS pinned')
     await legacy.close()
     oldMeta.close()
+  }
+
+  // Metadata can disappear independently of records. Without an immutable
+  // pin, an orphaned IDB store must never silently turn into fresh OPFS data.
+  const orphanName = name + '-orphaned-idb'
+  check(!await inspectExistingIndexedDbRecords(orphanName), 'missing IDB inspection is non-creating')
+  const orphan = await IndexedDbBytesStore.open(orphanName)
+  await orphan.put('history/test', Uint8Array.of(19))
+  await orphan.close()
+  check(await inspectExistingIndexedDbRecords(orphanName), 'orphaned IDB exists')
+  const orphanDevice = await openBrowserDevice({ name: orphanName, create: true })
+  await fails(orphanDevice.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS')
+  const orphanMetadata = await BrowserMetadataStore.open(orphanName)
+  check(await orphanMetadata.get(pinKey) === null, 'ambiguous IDB does not claim a new backend')
+  orphanMetadata.close()
+  await orphanDevice.close()
+
+  // Old OPFS directories with missing/corrupt bindings are ambiguous instead
+  // of a fresh empty history. This is a different crash window from a valid
+  // STORAGE_BINDING awaiting the metadata STORAGE_OPENED marker.
+  if (report.opfs.createWritable) {
+    const interruptedName = name + '-empty-legacy'
+    const interrupted = await openBrowserDevice({ name: interruptedName, create: true })
+    const root = await navigator.storage.getDirectory()
+    await root.getDirectoryHandle('chronolog-' + interruptedName, { create: true })
+    await fails(interrupted.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS')
+    await interrupted.close()
   }
 
   await idbConformance(name + '-conformance')

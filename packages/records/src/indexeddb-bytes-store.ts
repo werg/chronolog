@@ -120,3 +120,31 @@ export async function probeIndexedDbBytesStore(): Promise<boolean> {
     })
   }
 }
+
+/**
+ * Read-only existence inspection for a data database whose metadata/pin may
+ * have been erased. Abort the version-0 upgrade rather than creating a
+ * replacement; callers must fail closed when an orphaned data DB exists.
+ */
+export function inspectExistingIndexedDbRecords(name: string): Promise<boolean> {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(false)
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('chronolog-data:' + name)
+    let absent = false
+    request.onupgradeneeded = event => {
+      if (event.oldVersion === 0) {
+        absent = true
+        request.transaction?.abort()
+      }
+    }
+    request.onerror = () => {
+      if (absent && request.error?.name === 'AbortError') resolve(false)
+      else reject(request.error ?? new Error('INDEXEDDB_INSPECTION_FAILED'))
+    }
+    request.onblocked = () => { reject(new Error('INDEXEDDB_INSPECTION_BLOCKED')) }
+    request.onsuccess = () => {
+      request.result.close()
+      resolve(true)
+    }
+  })
+}
