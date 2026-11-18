@@ -76,6 +76,9 @@
       "@chronolog/records/browser": [
         "packages/records/src/browser.ts"
       ],
+      "@chronolog/records/indexeddb-browser": [
+        "packages/records/src/indexeddb-bytes-store.ts"
+      ],
       "@chronolog/peer-session/sql-native": [
         "packages/peer-session/src/sql-native.ts"
       ],

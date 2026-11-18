@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./native": "./src/native.ts",
-    "./browser": "./src/browser.ts"
+    "./browser": "./src/browser.ts",
+    "./indexeddb-browser": "./src/indexeddb-bytes-store.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*"

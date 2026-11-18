@@ -62,7 +62,7 @@ const runtimeModules = Object.fromEntries(Object.entries(bundled.metafile.output
   inputs: Object.entries(value.inputs).filter(([, input]) => input.bytesInOutput > 0).map(([source]) => source).sort(),
   imports: value.imports.map(input => ({ path: input.external ? input.path : outputName(input.path), kind: input.kind, external: input.external === true })),
 }]));
-const durableImplementation = path => /^(?:packages\/peer-session\/src\/(?:application-data|content|keys|projection|recovery|network-data)\.ts|packages\/peer-generation\/src\/replica\.ts|packages\/materializer\/src\/(?:runtime|events|event-store)\.ts|packages\/materializer-doltlite\/|packages\/records\/src\/(?:browser|native)\.ts)/u.test(path);
+const durableImplementation = path => /^(?:packages\/peer-session\/src\/(?:browser-storage-selector|browser-capabilities|application-data|content|keys|projection|recovery|network-data)\.ts|packages\/peer-generation\/src\/replica\.ts|packages\/materializer\/src\/(?:runtime|events|event-store)\.ts|packages\/materializer-doltlite\/|packages\/records\/src\/(?:browser|native|record-envelope|indexeddb-bytes-store)\.ts)/u.test(path);
 for (const entry of ['index', 'browser', 'worker', 'tendriller', ...(sqlEnabled ? ['sql'] : [])]) {
   const output = Object.entries(bundled.metafile.outputs).find(([, value]) => value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(output, `Missing protocol entry: ${entry}`);

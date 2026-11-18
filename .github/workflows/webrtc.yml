@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      HOST_REF: ${{ inputs.host_ref || '6cf28eb3c04e602e96eb0c59dba9096866611d33' }}
+      HOST_REF: ${{ inputs.host_ref || 'df022330a4afb0b7659fecefdd45a9cfa58f9a2d' }}
       CONTRIB_REF: ${{ inputs.contrib_ref || '589eca2a14481363d56a5e266ee4e0f5f16899d1' }}
     steps:
       - name: Require immutable companion commits
@@ -100,6 +100,9 @@ jobs:
         id: chromium
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify both browser record stores and pinned ownership
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        run: pnpm exec tsx tools/test-browser-storage.ts
       - name: Qualify packed browser Worker, OPFS and native RTC
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' && steps.chromium.outcome == 'success' }}
         shell: bash
