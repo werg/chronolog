@@ -90,7 +90,7 @@ async function run(name: string): Promise<{ id: string; storageId: string; backe
   const report = await probeBrowserCapabilities()
   check(report.secureContext && report.dedicatedWorker && report.webLocks, 'worker and locks available')
   check(report.crypto.ed25519 && report.crypto.x25519, 'native crypto available')
-  check(report.indexedDb.writable && report.events.supported, 'durable record backend available')
+  check(report.indexedDb.writable && report.events.supported, 'durable record backend available: ' + JSON.stringify(report))
   check(!report.sql.qualified, 'SQL qualification is separate')
   const device = await openBrowserDevice({ name, create: true })
   const metadata = await BrowserMetadataStore.open(name)
@@ -218,6 +218,6 @@ endpoint.addEventListener('message', ({ data }) => {
   void (message.method === 'run' ? run(message.name) : resume(message.name)).then(value => {
     endpoint.postMessage({ id: message.id, value })
   }, (error: unknown) => {
-    endpoint.postMessage({ id: message.id, error: error instanceof Error ? error.stack : String(error) })
+    endpoint.postMessage({ id: message.id, error: error instanceof Error ? error.message + '\n' + (error.stack ?? '') : String(error) })
   })
 })

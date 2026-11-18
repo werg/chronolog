@@ -72,7 +72,6 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
     if (indexedSupported) idbWritable = await probeIndexedDbBytesStore()
     if (directory) {
       opfsWritable = await probeOpfsWritable()
-      if (dedicatedWorker) syncHandle = await syncOpfsHandle()
     }
   } catch (error) {
     // Quota, security and unknown I/O errors are not evidence that it is safe
@@ -85,6 +84,11 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
     : !webLocks ? 'Web Locks unavailable' : !ed || !x ? 'Required native WebCrypto algorithms unavailable'
     : !idbWritable ? 'Writable IndexedDB is required for device metadata'
       : backend === null ? 'Neither durable record backend is writable' : undefined)
+  let sqlError: string | undefined
+  if (directory && dedicatedWorker && wasm) {
+    try { syncHandle = await syncOpfsHandle() }
+    catch (error) { sqlError = error instanceof Error ? error.name + ': ' + error.message : String(error) }
+  }
   const eligible = dedicatedWorker && wasm && syncHandle
   return {
     secureContext, dedicatedWorker, indexedDb: { supported: indexedSupported, writable: idbWritable },
@@ -93,6 +97,6 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
     events: { supported, backend: supported ? backend : null, ...(supported ? {} : { reason: unavailable ?? 'Event prerequisites unavailable' }) },
     sql: { apiEligible: eligible, qualified: false, reason: eligible
       ? 'SQL/WASM application and VFS have not been qualified on this browser'
-      : 'SQL/WASM requires an owner Worker, WebAssembly and OPFS sync access handles' },
+      : sqlError ?? 'SQL/WASM requires an owner Worker, WebAssembly and OPFS sync access handles' },
   }
 }
