@@ -68,6 +68,10 @@ class PeerDataUnavailableError extends Error {
 export function isPeerDataUnavailable(error: unknown): error is PeerDataUnavailableError {
   return error instanceof PeerDataUnavailableError
 }
+function retryablePull(error: unknown): boolean {
+  return error instanceof Error && ['APPLICATION_NETWORK_STATE_CHANGED', 'PEER_AUTHORITY_REGRESSION', 'PEER_CURSOR_RECOVERY_REQUIRED',
+    'PEER_VIEW_RECOVERY_REQUIRED', 'APPLICATION_KEY_REQUEST_EXPIRED'].includes(error.message)
+}
 /** Retirement fences pending data work without retiring its authenticated connection. */
 async function useData<T>(data: ApplicationDataPort, run: () => Promise<T>): Promise<T> {
   try {
@@ -531,7 +535,12 @@ class NetworkPeer implements ApplicationPeerLink {
     this.#nextSync = next; return next
   }
   #startPull(): Promise<void> {
-    const task = this.#pull().finally(() => {
+    const task = this.#pull().catch((error: unknown) => {
+      // Validation retirement belongs to the pull, not its observer. Explicit
+      // synchronize() must fence the same invalid peer as a background hint.
+      if (!isPeerDataUnavailable(error) && !retryablePull(error)) this.#fail(error)
+      throw error
+    }).finally(() => {
       if (this.#sync === task) this.#sync = undefined
       if (this.#syncAgain && this.#nextSync === undefined && !this.signal.aborted) { this.#syncAgain = false; this.#kick() }
       if (!this.signal.aborted && this.#port.participant.data?.replica.ready === true) void this.#port.resume().catch(() => undefined)
@@ -627,9 +636,7 @@ class NetworkPeer implements ApplicationPeerLink {
     if (this.#sync !== undefined) { this.#syncAgain = true; return }
     void this.#startPull().then(() => { this.#stateRetries = 0 }).catch(error => {
       if (isPeerDataUnavailable(error)) return
-      if (error instanceof Error && ['APPLICATION_NETWORK_STATE_CHANGED', 'PEER_AUTHORITY_REGRESSION', 'PEER_CURSOR_RECOVERY_REQUIRED',
-        'PEER_VIEW_RECOVERY_REQUIRED', 'APPLICATION_KEY_REQUEST_EXPIRED'].includes(error.message) &&
-          this.#stateRetries++ < 2) this.#kick()
+      if (retryablePull(error) && this.#stateRetries++ < 2) this.#kick()
       else this.#fail(error)
     })
   }

@@ -208,7 +208,9 @@ describe('authenticated peer application connections', () => {
     closing.push(async () => { await Promise.all(links.map(link => link.close())) })
     await Promise.all(links.map(link => link.synchronize())); inject = true
     await expect(links[1].synchronize()).rejects.toThrow('APPLICATION_NETWORK_CURSOR_INVALID')
-    await expect.poll(() => links[1].signal.aborted).toBe(true)
+    // Explicit synchronization fences invalid input before returning its error;
+    // correctness cannot depend on a coincident background hint sharing the pull.
+    expect(links[1].signal.aborted).toBe(true)
     expect(openA).not.toHaveBeenCalled(); expect(openB).not.toHaveBeenCalled()
   })
 
