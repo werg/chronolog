@@ -97,7 +97,9 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   constructor(port: MessagePort, metadata: Metadata, timeoutMs: number, signal?: AbortSignal) {
     this.#port = port; this.#timeoutMs = timeoutMs; this.#snapshot = metadata
     this.applicationId = metadata.applicationId; this.historyId = metadata.historyId; this.deviceId = metadata.deviceId; this.storageId = metadata.storageId
-    this.endpoint = metadata.endpoint === undefined ? undefined : Object.freeze(structuredClone(metadata.endpoint))
+    this.endpoint = metadata.endpoint === undefined ? undefined : Object.freeze({ ...metadata.endpoint,
+      context: Object.freeze({ ...metadata.endpoint.context }), capabilities: Object.freeze([...metadata.endpoint.capabilities]),
+      ...(metadata.endpoint.identity === undefined ? {} : { identity: Object.freeze({ ...metadata.endpoint.identity }) }) })
     Object.defineProperty(this.signals, 'delivery', { value: metadata.signalDelivery ?? 'neighbors', enumerable: true })
     this.capabilities = Object.freeze({ ...metadata.description.capabilities })
     this.#description = { ...metadata.description, capabilities: this.capabilities }

@@ -810,7 +810,8 @@ The lightweight `chronolog-owner:<profileId>` Web Lock is separate from the real
 or suspension timeout. Hold the owner lease until session shutdown has released
 its resources. A failed acquisition returns `OWNER_BUSY`; missing Web Locks returns
 `APPLICATION_OWNER_LOCK_UNAVAILABLE`. Do not create a replacement signing identity
-as a fallback. SharedWorker and elected-context compositions must negotiate one
+as a fallback. `wait: true` queues a cancellable takeover behind actual lock release,
+without guessing failure from a timer. SharedWorker and elected-context compositions must negotiate one
 compatible immutable owner artifact and use the same profile lease; transport/RTC
 host handoff remains an explicit product composition responsibility.
 

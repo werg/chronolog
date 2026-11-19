@@ -1,3 +1,4 @@
+import { createApplicationBackend } from './tendriller.js'
 import { createApplicationOwner } from './session-owner.js'
 import { connectApplicationOwner } from './worker-application.js'
 import { serveApplicationWorker } from './worker-application-server.js'
@@ -514,6 +515,9 @@ describe('many endpoints attached to one owner', () => {
     expect(left.endpoint?.ownerInstanceId).toBe(right.endpoint?.ownerInstanceId)
     expect(left.endpoint?.endpointId).not.toBe(right.endpoint?.endpointId)
     expect(left.endpoint?.endpointIncarnation).not.toBe(right.endpoint?.endpointIncarnation)
+    const backend = createApplicationBackend({ id: f.a.applicationId, session: left })
+    expect(backend.endpoint).toBe(left.endpoint)
+    expect(Object.isFrozen(backend.endpoint?.context)).toBe(true)
     expect(openStorage).not.toHaveBeenCalled(); expect(f.a.status.database).toBe('idle')
     expect(owner.endpoints()).toHaveLength(2)
     const [one, two] = await Promise.all([

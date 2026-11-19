@@ -35,4 +35,30 @@ describe('protocol-first profile owner fencing', () => {
     await expect(acquireApplicationOwnerLock('../other')).rejects.toThrow('APPLICATION_OWNER_PROFILE_INVALID')
     await expect(acquireApplicationOwnerLock('profile', { locks: {} as ApplicationOwnerLockManager })).rejects.toThrow('APPLICATION_OWNER_LOCK_UNAVAILABLE')
   })
+  it('queues a follower behind the real exclusive lease and cancels queued takeover', async () => {
+    let releaseFirst!: () => void, acquireQueued!: () => void
+    let count = 0
+    const locks: ApplicationOwnerLockManager = { async request(_name, options, callback) {
+      if (++count === 1) {
+        try { await callback({}) } finally { releaseFirst?.() }
+      } else {
+        expect(options.ifAvailable).toBeUndefined()
+        await new Promise<void>((resolve, reject) => {
+          releaseFirst = resolve; acquireQueued = resolve
+          options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+        })
+        await callback({})
+      }
+    } }
+    const first = await acquireApplicationOwnerLock('profile', { locks })
+    let acquired = false
+    const waiting = acquireApplicationOwnerLock('profile', { locks, wait: true }).then(value => { acquired = true; return value })
+    await Promise.resolve(); expect(acquired).toBe(false)
+    await first.close(); const second = await waiting; expect(acquired).toBe(true); await second.close()
+    const cancellation = new AbortController()
+    const cancelled = acquireApplicationOwnerLock('profile', { locks, wait: true, signal: cancellation.signal })
+    cancellation.abort(new Error('tab closed')); await expect(cancelled).rejects.toThrow('tab closed')
+    acquireQueued() // A late callback cannot grant a cancelled acquisition.
+  })
+
 })
