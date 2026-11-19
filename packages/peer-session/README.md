@@ -791,6 +791,10 @@ schema })`. Bind `sqlStorage` to the application-owned Dolt cell with
 image. Use `createCelldSqlEngine(sqlStorage)` with `prepareSqlApplication`
 when signing the schema. Participants must use the same execution manifest,
 which includes the native engine build and its enabled module.
+For a device hosted by that same cell, open it with
+`openApplicationDevice({ store: new CelldPrivateBytesStore(ctx.storage) })`
+from the peer-session and SQL celld entries. The store keeps device and peer
+records in runtime KV across branch switches and restarts.
 
 `--sql-native` includes `/sql`, the thin native engine adapter and the exact
 compiled addon. `--sql-browser` includes `/sql` and the verified browser

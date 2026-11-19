@@ -13,6 +13,15 @@ export interface CelldBytesStorage {
   transactionSync<T>(operation: () => T): T
 }
 
+/** Runtime KV is outside the SQL namespace visible to a signed application. */
+export interface CelldPrivateBytesStorage {
+  readonly kv: {
+    get(key: string): unknown
+    put(key: string, value: unknown): void
+  }
+  transactionSync<T>(operation: () => T): T
+}
+
 interface Entry {
   readonly key: string
   readonly value: Uint8Array
@@ -55,9 +64,7 @@ export class CelldBytesStore implements BytesStore {
   /** Persist a device signer and its immutable binding together. */
   async initialize(entries: readonly Entry[]): Promise<void> {
     this.#assertOpen()
-    if (entries.length === 0 || entries.length > 8 || new Set(entries.map(({ key }) => key)).size !== entries.length) {
-      throw new Error('BYTES_STORE_INITIALIZATION_INVALID')
-    }
+    validateInitialEntries(entries)
     for (const { key, value } of entries) this.#validate(key, value)
     this.storage.transactionSync(() => {
       if (entries.every(({ key }) => this.#size(key) === null)) this.#write(entries)
@@ -121,6 +128,97 @@ export class CelldBytesStore implements BytesStore {
       ).toArray()
     }
     this.storage.sql.exec('UPDATE chronolog_record_usage SET used_bytes = ? WHERE singleton = 1', used).toArray()
+  }
+}
+
+/**
+ * Device and transport records held by the same activation as a Dolt
+ * application. The runtime carries these bytes across branch switches in KV.
+ */
+export class CelldPrivateBytesStore implements BytesStore {
+  readonly #limits: ReturnType<typeof sqliteByteLimits>
+  readonly #prefix: string
+  #closed = false
+
+  constructor(private readonly storage: CelldPrivateBytesStorage, options: CelldBytesStoreOptions & {
+    readonly namespace?: string
+  } = {}) {
+    const namespace = options.namespace ?? 'device'
+    if (!/^[a-zA-Z0-9_.-]{1,64}$/u.test(namespace)) throw new Error('BYTES_STORE_NAMESPACE_INVALID')
+    this.#prefix = `chronolog:records:v1:${namespace}:`
+    this.#limits = sqliteByteLimits(options)
+  }
+
+  async get(key: string): Promise<Uint8Array | null> {
+    this.#assertOpen()
+    validateSqliteByteKey(key)
+    return this.#read(key)?.slice() ?? null
+  }
+
+  async put(key: string, value: Uint8Array): Promise<void> {
+    this.#validate(key, value)
+    this.storage.transactionSync(() => this.#write([{ key, value }]))
+  }
+
+  async initialize(entries: readonly Entry[]): Promise<void> {
+    this.#assertOpen()
+    validateInitialEntries(entries)
+    for (const { key, value } of entries) this.#validate(key, value)
+    this.storage.transactionSync(() => {
+      if (entries.every(({ key }) => this.#read(key) === null)) this.#write(entries)
+    })
+  }
+
+  async compareAndSwap(key: string, expected: Uint8Array | null, value: Uint8Array): Promise<boolean> {
+    this.#validate(key, value)
+    return this.storage.transactionSync(() => {
+      const current = this.#read(key)
+      const matches = expected === null ? current === null
+        : current !== null && expected.byteLength === current.byteLength &&
+          expected.every((byte, index) => byte === current[index])
+      if (matches) this.#write([{ key, value }])
+      return matches
+    })
+  }
+
+  usageBytes(): number {
+    this.#assertOpen()
+    const value = this.storage.kv.get(this.#prefix + 'usage')
+    return value === undefined ? 0 : readNonnegativeBytes(value)
+  }
+
+  close(): void { this.#closed = true }
+
+  #assertOpen(): void { if (this.#closed) throw new Error('BYTES_STORE_CLOSED') }
+
+  #validate(key: string, value: Uint8Array): void {
+    this.#assertOpen()
+    validateSqliteByteKey(key)
+    if (!(value instanceof Uint8Array) || value.byteLength > this.#limits.maxValueBytes) {
+      throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
+    }
+  }
+
+  #read(key: string): Uint8Array | null {
+    const value = this.storage.kv.get(this.#prefix + 'bytes:' + key)
+    if (value === undefined) return null
+    if (!(value instanceof Uint8Array)) throw new Error('BYTES_STORE_VALUE_CORRUPT')
+    return value
+  }
+
+  #write(entries: readonly Entry[]): void {
+    const used = entries.reduce((bytes, { key, value }) =>
+      bytes - (this.#read(key)?.byteLength ?? 0) + value.byteLength, this.usageBytes())
+    if (!Number.isSafeInteger(used) || used < 0) throw new Error('BYTES_STORE_USAGE_CORRUPT')
+    if (used > this.#limits.quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
+    for (const { key, value } of entries) this.storage.kv.put(this.#prefix + 'bytes:' + key, value.slice())
+    this.storage.kv.put(this.#prefix + 'usage', used)
+  }
+}
+
+function validateInitialEntries(entries: readonly Entry[]): void {
+  if (entries.length === 0 || entries.length > 8 || new Set(entries.map(({ key }) => key)).size !== entries.length) {
+    throw new Error('BYTES_STORE_INITIALIZATION_INVALID')
   }
 }
 

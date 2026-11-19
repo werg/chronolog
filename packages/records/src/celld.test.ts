@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { CelldBytesStore, type CelldBytesStorage } from './celld.js'
+import { CelldBytesStore, CelldPrivateBytesStore, type CelldBytesStorage } from './celld.js'
 
 const opened: DatabaseSync[] = []
 afterEach(() => { for (const db of opened.splice(0)) db.close() })
@@ -64,5 +64,34 @@ describe('celld record storage', () => {
     expect(await store.get('signer')).toBeNull()
     expect(await store.get('binding')).toBeNull()
     expect(store.usageBytes()).toBe(0)
+  })
+
+  it('retains private device records and their quota within the selected KV namespace', async () => {
+    let committed = new Map<string, unknown>()
+    const kvStorage = {
+      kv: { get: (key: string) => committed.get(key), put: (key: string, value: unknown) => { committed.set(key, value) } },
+      transactionSync<T>(operation: () => T): T {
+        const previous = committed
+        committed = new Map(previous)
+        try { return operation() } catch (error) { committed = previous; throw error }
+      },
+    }
+    const metadata = new CelldPrivateBytesStore(kvStorage, { quotaBytes: 4 })
+    const other = new CelldPrivateBytesStore(kvStorage, { namespace: 'control' })
+    const original = Uint8Array.of(1, 2, 3)
+    await metadata.initialize([{ key: 'signer', value: original }, { key: 'binding', value: Uint8Array.of(4) }])
+    original[0] = 99
+    const decoded = await metadata.get('signer')
+    decoded!.fill(99)
+    expect(await metadata.get('signer')).toEqual(Uint8Array.of(1, 2, 3))
+    expect(await other.get('signer')).toBeNull()
+    await expect(metadata.put('overflow', Uint8Array.of(5))).rejects.toThrow('BYTES_STORE_QUOTA_EXCEEDED')
+    metadata.close()
+    const reopened = new CelldPrivateBytesStore(kvStorage)
+    expect(reopened.usageBytes()).toBe(4)
+    expect(await reopened.compareAndSwap('signer', original, Uint8Array.of())).toBe(false)
+    expect(await reopened.compareAndSwap('signer', Uint8Array.of(1, 2, 3), Uint8Array.of())).toBe(true)
+    expect(reopened.usageBytes()).toBe(1)
+    expect(await reopened.get('overflow')).toBeNull()
   })
 })

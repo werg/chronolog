@@ -5,6 +5,7 @@ import type { ApplicationDefinition } from './definition.js'
 import { openSqlApplication, type OpenSqlApplicationOptions } from './sql.js'
 
 export { createCelldSqlEngine, type CelldSqlStorage }
+export { CelldPrivateBytesStore, type CelldPrivateBytesStorage } from '@chronolog/records/celld'
 export { prepareSqlApplication } from './sql.js'
 
 export type OpenCelldSqlApplicationOptions<D extends ApplicationDefinition = ApplicationDefinition> =
