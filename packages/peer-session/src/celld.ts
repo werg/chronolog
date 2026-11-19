@@ -4,6 +4,7 @@ import { openApplicationDevice, type ApplicationDevice } from './device.js'
 
 export { openPeerApplication as openCelldApplication } from './runtime.js'
 export type { OpenPeerApplicationOptions } from './runtime.js'
+export { openCelldApplicationControl, type CelldApplicationControl } from './celld-control.js'
 export {
   createCelldPeerTransport, frameCelldPeerStream,
   type CelldPeerBinding, type CelldPeerEndpoint, type CelldPeerStream,
