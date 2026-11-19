@@ -5,6 +5,7 @@ export interface CelldPeerStream {
   readonly readable: ReadableStream<Uint8Array>
   readonly writable: WritableStream<Uint8Array>
   readonly remoteNodeId: string
+  readonly alpn?: string
   readonly closed: Promise<void>
   close(): Promise<void>
 }

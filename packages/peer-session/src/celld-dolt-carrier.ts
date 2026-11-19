@@ -4,7 +4,8 @@ import type { CelldPeerBinding, CelldPeerEndpoint, CelldPeerStream } from './cel
 
 export type CelldDoltPublicationGrant =
   | { readonly kind: 'applied'; readonly head: string }
-  | { readonly kind: 'grant'; readonly id: string; readonly ref: string; readonly token: string }
+  | { readonly kind: 'staged'; readonly head: string }
+  | { readonly kind: 'grant'; readonly id: string; readonly ref: string; readonly token: string; readonly branch?: string }
 type RequestHeader = {
   readonly v: 1
   readonly kind: 'grant' | 'push'
@@ -75,7 +76,7 @@ async function write(stream: CelldPeerStream, header: RequestHeader | ReplyHeade
   } finally { writer.releaseLock() }
 }
 
-interface AuthorizeDoltPublication {
+export interface AuthorizeDoltPublication {
   (input: {
     readonly peer: string
     readonly proof: SignedCelldWorkspacePublication
@@ -155,7 +156,7 @@ export function celldDoltPublicationPeer(binding: CelldPeerBinding, destination:
   return Object.freeze({
     async grant() {
       const result = await exchange('grant')
-      if (result instanceof Uint8Array || (result?.kind !== 'grant' && result?.kind !== 'applied'))
+      if (result instanceof Uint8Array || (result?.kind !== 'grant' && result?.kind !== 'staged' && result?.kind !== 'applied'))
         throw new Error('CELLD_DOLT_RESPONSE_INVALID')
       return result
     },

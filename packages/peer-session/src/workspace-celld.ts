@@ -5,6 +5,7 @@ import type { CelldSqlStorage } from '@chronolog/materializer-doltlite/celld'
 import { importCelldSigningIdentity } from './celld.js'
 import { CelldGroupControl, type CelldGroupInvitation, type CelldGroupNode, type CelldGroupRole } from './celld-group-control.js'
 import { celldGroupData } from './celld-group-data.js'
+import { serveCelldDoltPublication, type AuthorizeDoltPublication } from './celld-dolt-carrier.js'
 import { createCelldPeerTransport, type CelldPeerBinding, type CelldPeerEndpoint, type CelldPeerStream } from './celld-peer.js'
 import { celldGroupSocketStream, readCelldGroupAddress, writeCelldGroupAddress, type CelldGroupSocket } from './celld-group-stream.js'
 import type { ApplicationPeerLink } from './network.js'
@@ -17,6 +18,7 @@ import {
 } from './celld-workspace-publication.js'
 
 export const CHRONOLOG_WORKSPACE_OBJECT = 'chronolog'
+export const CELLD_WORKSPACE_HISTORY_ALPN = 'vibestudio/gad/1'
 const internal = 'x-chronolog-node-token'
 const remote = 'x-chronolog-remote-node'
 const key = /^[a-f0-9]{64}$/u
@@ -30,6 +32,7 @@ type GroupInput =
   | { action: 'join'; group: string; publicKey: string; offer: CelldGroupInvitation }
   | { action: 'invite'; publicKey: string; group: string; operationId: string; member: string; role: CelldGroupRole; node: CelldGroupNode; localEndpoint?: CelldPeerEndpoint }
   | { action: 'describe'; publicKey: string; group: string }
+  | { action: 'bind-history'; publicKey: string; group: string }
   | { action: 'review'; program: string }
   | { action: 'transact'; principal: Principal; group: string; operationId: string; program: string; basedOn?: PeerRevision }
   | { action: 'sign-publication'; principal: Principal; group: string; transition: CelldWorkspacePublication }
@@ -53,6 +56,7 @@ interface WorkspaceEnvironment {
   readonly CHRONOLOG_ADDRS?: readonly string[]
   readonly CHRONOLOG_P2P: CelldPeerBinding & { readonly nodeId: string }
   readonly CHRONOLOG_GROUPS: Namespace
+  readonly GATEWAY_URL?: string
 }
 
 interface WorkerAdapter {
@@ -60,6 +64,8 @@ interface WorkerAdapter {
   readonly socketPair: () => readonly [Socket, Socket]
   readonly encode: (data: unknown) => string
   readonly decode: (data: string) => unknown
+  /** Only the trusted host program can commit staged history or expose its content. */
+  readonly publication?: (env: { gatewayUrl: string; token: string }) => AuthorizeDoltPublication
 }
 
 function readProgram(value: string) {
@@ -80,7 +86,7 @@ interface WorkspaceRuntimeClasses {
 }
 
 /** Share one private node directory and Iroh listener among independently stored groups. */
-export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode, decode }: WorkerAdapter): WorkspaceRuntimeClasses {
+export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode, decode, publication }: WorkerAdapter): WorkspaceRuntimeClasses {
   const reply = (value: unknown) => new Response(encode(value), {
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
   })
@@ -108,11 +114,32 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
     }))
 
   class ChronologWorkspaceDO extends DurableObject {
+    #binding: Promise<void> = Promise.resolve()
+
     constructor(private readonly state: { storage: DirectoryStorage }, private readonly env: WorkspaceEnvironment) {
       super(state as never, env as never)
     }
 
     onp2pstream(raw: CelldPeerStream): void {
+      if (raw.alpn === CELLD_WORKSPACE_HISTORY_ALPN) {
+        if (publication === undefined || this.env.GATEWAY_URL === undefined) {
+          void raw.close().catch(() => undefined)
+          return
+        }
+        const receive = publication({ gatewayUrl: this.env.GATEWAY_URL, token: this.env.CHRONOLOG_ROOT_TOKEN })
+        void serveCelldDoltPublication(raw, async input => {
+          const group = await this.state.storage.get<string>('shared-history')
+          if (group === undefined || group !== input.proof.payload.applicationId) throw new Error('CELLD_WORKSPACE_HISTORY_GROUP_MISMATCH')
+          const { previousHead, proposedHead } = input.proof.payload
+          const verified = await submit(this.env, group, { action: 'verify-publication', group, sourceNodeId: input.peer,
+            previousHead, proposedHead, proof: input.proof,
+          })
+          if (!verified.ok) throw new Error(await verified.text())
+          await verified.arrayBuffer()
+          return receive(input)
+        }).catch(() => raw.close().catch(() => undefined))
+        return
+      }
       void (async () => {
         const { group, stream } = await readCelldGroupAddress(raw)
         if (!await this.state.storage.get(`group:${group}`)) throw new Error('CELLD_GROUP_NOT_FOUND')
@@ -150,6 +177,21 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
               if (row !== null) visible.push(row)
             }
             return reply(visible)
+          }
+          case 'bind-history': {
+            if (publication === undefined) return denied()
+            if (!key.test(input.group) || !await this.state.storage.get(`group:${input.group}`)) throw new Error('CELLD_GROUP_NOT_FOUND')
+            const allowed = await submit(this.env, input.group, input)
+            if (!allowed.ok) return allowed
+            await allowed.arrayBuffer()
+            const binding = this.#binding.then(async () => {
+              const existing = await this.state.storage.get<string>('shared-history')
+              if (existing !== undefined && existing !== input.group) throw new Error('CELLD_WORKSPACE_HISTORY_ALREADY_SHARED')
+              if (existing === undefined) await this.state.storage.put('shared-history', input.group)
+            })
+            this.#binding = binding.catch(() => undefined)
+            await binding
+            return reply({ group: input.group })
           }
           case 'create': {
             const group = await peerDigest(['chronolog/workspace/group/v1', this.env.WORKSPACE_ID, input.principal.publicKey, input.operationId])
@@ -278,6 +320,11 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
           return reply(grant?.reader === true ? {
             group: session.applicationId, name: session.historyId, writer: grant.writer, publisher: grant.publisher, administrator: grant.administrator,
           } : null)
+        }
+        if (input.action === 'bind-history') {
+          const origin = await group.origin()
+          if (origin !== null) await this.#synchronizeOrigin(group, origin)
+          return session.memberGrant(input.publicKey)?.administrator === true ? reply(true) : denied()
         }
         if (input.action === 'sign-publication' || input.action === 'verify-publication') {
           const origin = await group.origin()
