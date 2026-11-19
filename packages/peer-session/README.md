@@ -796,6 +796,11 @@ For a device hosted by that same cell, open it with
 from the peer-session and SQL celld entries. The store keeps device and peer
 records in runtime KV across branch switches and restarts.
 
+The same archive includes `/workspace-celld` for a host that deploys a
+workspace directory and independent group cells. The release workflow builds
+this archive once and attests it as `celld-peer-session-<source SHA>`. Use the
+verified archive and its exact `provenance.json` as the host build input.
+
 `--sql-native` includes `/sql`, the thin native engine adapter and the exact
 compiled addon. `--sql-browser` includes `/sql` and the verified browser
 loader/factory without embedding an engine build. Both flags can be combined.
