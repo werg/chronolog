@@ -69,3 +69,7 @@ export async function openCelldDevice(options: {
     throw error
   }
 }
+
+export {
+  celldDoltPublicationPeer, serveCelldDoltPublication, type CelldDoltPublicationGrant,
+} from './celld-dolt-carrier.js'
