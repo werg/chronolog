@@ -6,9 +6,11 @@ export type CelldDoltPublicationGrant =
   | { readonly kind: 'applied'; readonly head: string }
   | { readonly kind: 'staged'; readonly head: string }
   | { readonly kind: 'grant'; readonly id: string; readonly ref: string; readonly token: string; readonly branch?: string }
+export type CelldWorkspaceHistoryRequest = 'grant' | 'push' | 'missing' | 'blob' | 'publish'
 type RequestHeader = {
   readonly v: 1
-  readonly kind: 'grant' | 'push'
+  readonly kind: CelldWorkspaceHistoryRequest
+  readonly digest?: string
   readonly proof: SignedCelldWorkspacePublication
   readonly size: number
 }
@@ -21,6 +23,8 @@ const maxHeader = 4096
 /** The native Dolt remote API accepts a single message up to this bound. */
 const maxBody = 1 << 30
 const code = /^[A-Z][A-Z0-9_]{0,127}$/u
+const digest = /^[a-f0-9]{64}$/u
+const head = /^[a-f0-9]{40}$/u
 
 class CarrierReader {
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>
@@ -80,11 +84,15 @@ export interface AuthorizeDoltPublication {
   (input: {
     readonly peer: string
     readonly proof: SignedCelldWorkspacePublication
-    readonly kind: 'grant' | 'push'
+    readonly kind: CelldWorkspaceHistoryRequest
+    readonly digest?: string
     readonly bytes: number
   }): Promise<{
     grant(): Promise<CelldDoltPublicationGrant>
     push(bytes: Uint8Array): Promise<Uint8Array>
+    missing?(): Promise<readonly string[]>
+    blob?(digest: string, bytes: Uint8Array): Promise<void>
+    publish?(): Promise<string>
   }>
 }
 
@@ -93,21 +101,34 @@ export async function serveCelldDoltPublication(stream: CelldPeerStream, authori
   const reader = new CarrierReader(stream)
   try {
     const request = await reader.header<RequestHeader>()
-    if (request?.v !== 1 || (request.kind !== 'grant' && request.kind !== 'push') ||
+    if (request?.v !== 1 ||
+      !['grant', 'push', 'missing', 'blob', 'publish'].includes(request.kind) ||
       !Number.isSafeInteger(request.size) || request.size < 0 || request.size > maxBody ||
-      (request.kind === 'grant' ? request.size !== 0 : request.size === 0) ||
+      (request.kind !== 'blob' && request.digest !== undefined) ||
+      (request.kind === 'blob' && (typeof request.digest !== 'string' || !digest.test(request.digest))) ||
+      (request.kind === 'push' ? request.size === 0 : request.kind !== 'blob' && request.size !== 0) ||
       request.proof === null || typeof request.proof !== 'object') throw new Error('CELLD_DOLT_REQUEST_INVALID')
     if (request.proof.payload?.sourceNodeId !== stream.remoteNodeId)
       throw new Error('CELLD_WORKSPACE_PUBLICATION_SOURCE_MISMATCH')
-    const handler = await authorize({ peer: stream.remoteNodeId, proof: request.proof, kind: request.kind, bytes: request.size })
-    const bytes = request.kind === 'push' ? await reader.read(request.size) : undefined
+    const handler = await authorize({
+      peer: stream.remoteNodeId, proof: request.proof, kind: request.kind, bytes: request.size,
+      ...(request.digest === undefined ? {} : { digest: request.digest }),
+    })
+    const bytes = request.kind === 'push' || request.kind === 'blob' ? await reader.read(request.size) : new Uint8Array(0)
     await reader.eof()
-    if (bytes === undefined) {
+    if (request.kind === 'grant') {
       await write(stream, { v: 1, kind: 'granted', value: await handler.grant() })
-    } else {
-      const result = await handler.push(bytes)
-      await write(stream, { v: 1, kind: 'bytes', size: result.byteLength }, result)
+      return
     }
+    let result: Uint8Array
+    if (request.kind === 'push') result = await handler.push(bytes)
+    else if (request.kind === 'missing' && handler.missing) result = encodePeerValue(await handler.missing())
+    else if (request.kind === 'publish' && handler.publish) result = encodePeerValue(await handler.publish())
+    else if (request.kind === 'blob' && handler.blob && request.digest !== undefined) {
+      await handler.blob(request.digest, bytes)
+      result = new Uint8Array(0)
+    } else throw new Error('CELLD_WORKSPACE_HISTORY_OPERATION_UNAVAILABLE')
+    await write(stream, { v: 1, kind: 'bytes', size: result.byteLength }, result)
   } catch (error) {
     const nativeCode = (error as { code?: unknown } | null)?.code
     const message = typeof nativeCode === 'string' ? nativeCode : error instanceof Error ? error.message : ''
@@ -122,7 +143,7 @@ export async function serveCelldDoltPublication(stream: CelldPeerStream, authori
 /** One exact grant and the raw Dolt requests share the same signed Iroh scope. */
 export function celldDoltPublicationPeer(binding: CelldPeerBinding, destination: CelldPeerEndpoint, input: SignedCelldWorkspacePublication) {
   const proof = structuredClone(input), endpoint = structuredClone(destination)
-  const exchange = async (kind: RequestHeader['kind'], bytes?: Uint8Array) => {
+  const exchange = async (kind: CelldWorkspaceHistoryRequest, bytes?: Uint8Array, contentDigest?: string) => {
     const stream = await binding.connect(endpoint.nodeId, {
       ...(endpoint.addrs === undefined ? {} : { addrs: [...endpoint.addrs] }),
       ...(endpoint.relay === undefined ? {} : { relay: endpoint.relay }),
@@ -131,7 +152,9 @@ export function celldDoltPublicationPeer(binding: CelldPeerBinding, destination:
     let writer: Promise<void> | undefined
     try {
       if (stream.remoteNodeId !== endpoint.nodeId) throw new Error('CELLD_PEER_ENDPOINT_MISMATCH')
-      writer = write(stream, { v: 1, kind, proof, size: bytes?.byteLength ?? 0 }, bytes)
+      writer = write(stream, { v: 1, kind, proof, size: bytes?.byteLength ?? 0,
+        ...(contentDigest === undefined ? {} : { digest: contentDigest }),
+      }, bytes)
       void writer.catch(() => stream.close().catch(() => undefined))
       const response = await reader.header<ReplyHeader>()
       if (response?.v !== 1) throw new Error('CELLD_DOLT_RESPONSE_INVALID')
@@ -141,7 +164,7 @@ export function celldDoltPublicationPeer(binding: CelldPeerBinding, destination:
       }
       let result: CelldDoltPublicationGrant | Uint8Array
       if (kind === 'grant' && response.kind === 'granted') result = response.value
-      else if (kind === 'push' && response.kind === 'bytes') result = await reader.read(response.size)
+      else if (kind !== 'grant' && response.kind === 'bytes') result = await reader.read(response.size)
       else throw new Error('CELLD_DOLT_RESPONSE_INVALID')
       await reader.eof()
       await writer
@@ -164,6 +187,26 @@ export function celldDoltPublicationPeer(binding: CelldPeerBinding, destination:
       const result = await exchange('push', bytes)
       if (!(result instanceof Uint8Array)) throw new Error('CELLD_DOLT_RESPONSE_INVALID')
       return result
+    },
+    async missing() {
+      const result = await exchange('missing')
+      if (!(result instanceof Uint8Array)) throw new Error('CELLD_DOLT_RESPONSE_INVALID')
+      const hashes = decodePeerValue<unknown>(result)
+      if (!Array.isArray(hashes) || hashes.some(hash => typeof hash !== 'string' || !digest.test(hash)) ||
+          new Set(hashes).size !== hashes.length) throw new Error('CELLD_DOLT_RESPONSE_INVALID')
+      return hashes as string[]
+    },
+    async blob(contentDigest: string, bytes: Uint8Array) {
+      const result = await exchange('blob', bytes, contentDigest)
+      if (!(result instanceof Uint8Array) || result.byteLength !== 0) throw new Error('CELLD_DOLT_RESPONSE_INVALID')
+    },
+    async publish() {
+      const result = await exchange('publish')
+      if (!(result instanceof Uint8Array)) throw new Error('CELLD_DOLT_RESPONSE_INVALID')
+      const revision = decodePeerValue<unknown>(result)
+      if (typeof revision !== 'string' || !head.test(revision) || revision !== proof.payload.proposedHead)
+        throw new Error('CELLD_DOLT_RESPONSE_INVALID')
+      return revision
     },
   })
 }

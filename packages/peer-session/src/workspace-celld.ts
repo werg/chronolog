@@ -5,7 +5,7 @@ import type { CelldSqlStorage } from '@chronolog/materializer-doltlite/celld'
 import { importCelldSigningIdentity } from './celld.js'
 import { CelldGroupControl, type CelldGroupInvitation, type CelldGroupNode, type CelldGroupRole } from './celld-group-control.js'
 import { celldGroupData } from './celld-group-data.js'
-import { serveCelldDoltPublication, type AuthorizeDoltPublication } from './celld-dolt-carrier.js'
+import { celldDoltPublicationPeer, serveCelldDoltPublication, type AuthorizeDoltPublication } from './celld-dolt-carrier.js'
 import { createCelldPeerTransport, type CelldPeerBinding, type CelldPeerEndpoint, type CelldPeerStream } from './celld-peer.js'
 import { celldGroupSocketStream, readCelldGroupAddress, writeCelldGroupAddress, type CelldGroupSocket } from './celld-group-stream.js'
 import type { ApplicationPeerLink } from './network.js'
@@ -25,6 +25,15 @@ const key = /^[a-f0-9]{64}$/u
 
 type Socket = CelldGroupSocket & { accept(): void }
 type Principal = { publicKey: string; pkcs8Hex: string }
+type TransferInput = {
+  action: 'history-transfer'
+  destination: CelldPeerEndpoint
+  proof: SignedCelldWorkspacePublication
+} & (
+  | { kind: 'grant' | 'missing' | 'publish' }
+  | { kind: 'push'; bytes: Uint8Array }
+  | { kind: 'blob'; digest: string; bytes: Uint8Array }
+)
 type GroupInput =
   | { action: 'identity'; publicKey: string; localEndpoint?: CelldPeerEndpoint }
   | { action: 'list'; publicKey: string }
@@ -57,6 +66,7 @@ interface WorkspaceEnvironment {
   readonly CHRONOLOG_P2P: CelldPeerBinding & { readonly nodeId: string }
   readonly CHRONOLOG_GROUPS: Namespace
   readonly GATEWAY_URL?: string
+  readonly CHRONOLOG_HISTORY_P2P?: CelldPeerBinding
 }
 
 interface WorkerAdapter {
@@ -158,7 +168,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
     async fetch(request: Request): Promise<Response> {
       if (!authorized(this.env.CHRONOLOG_ROOT_TOKEN, request) || request.method !== 'POST') return denied()
       try {
-        const input = decode(await request.text()) as GroupInput
+        const input = decode(await request.text()) as GroupInput | TransferInput
         switch (input.action) {
           case 'identity':
             return reply({ publicKey: input.publicKey, node: { publicKey: this.env.CHRONOLOG_PUBLIC_KEY, endpoint: nodeEndpoint(this.env, input.localEndpoint) } })
@@ -177,6 +187,22 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
               if (row !== null) visible.push(row)
             }
             return reply(visible)
+          }
+          case 'history-transfer': {
+            const binding = this.env.CHRONOLOG_HISTORY_P2P
+            const origin = this.env.CHRONOLOG_P2P.nodeId
+            if (binding === undefined || input.proof.payload.sourceNodeId !== origin ||
+                input.proof.payload.destinationNodeId !== input.destination.nodeId) return denied()
+            if (!await this.state.storage.get(`group:${input.proof.payload.applicationId}`)) return denied()
+            const carrier = celldDoltPublicationPeer(binding, input.destination, input.proof)
+            switch (input.kind) {
+              case 'grant': return reply(await carrier.grant())
+              case 'push': return reply(await carrier.push(input.bytes))
+              case 'missing': return reply(await carrier.missing())
+              case 'blob': return reply(await carrier.blob(input.digest, input.bytes).then(() => true))
+              case 'publish': return reply(await carrier.publish())
+            }
+            return denied()
           }
           case 'bind-history': {
             if (publication === undefined) return denied()
