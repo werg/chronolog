@@ -61,6 +61,9 @@
       "@chronolog/peer-session/native": [
         "packages/peer-session/src/native.ts"
       ],
+      "@chronolog/peer-session/celld": [
+        "packages/peer-session/src/celld.ts"
+      ],
       "@chronolog/peer-session/browser": [
         "packages/peer-session/src/browser.ts"
       ],
@@ -72,6 +75,9 @@
       ],
       "@chronolog/records/native": [
         "packages/records/src/native.ts"
+      ],
+      "@chronolog/records/celld": [
+        "packages/records/src/celld.ts"
       ],
       "@chronolog/records/browser": [
         "packages/records/src/browser.ts"

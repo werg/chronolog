@@ -110,6 +110,23 @@ The session owns one signed attempt journal in the device store. A disconnected
 command remains `saved`; connecting resumes its exact original attempt.
 Cancelling `applied({ signal })` cancels that waiter only.
 
+## Run a device inside celld
+
+The `@chronolog/peer-session/celld` entry uses a celld Durable Object's
+SQLite storage for the same device identity and application session.
+
+```ts
+import { openCelldApplication, openCelldDevice } from '@chronolog/peer-session/celld'
+
+const device = await openCelldDevice({ storage: ctx.storage })
+const session = await openCelldApplication({ device, definition, authority })
+```
+
+Pass `create: true` during explicit device setup. Later activations reopen
+the retained signer and history. Provide `openDataStorage` to open a
+separate SQLite facet on demand. Closing the device releases its handles
+within the Durable Object.
+
 ## SQL as an explicit engine capability
 
 SQL uses the same application session, signed schema, commands, views and

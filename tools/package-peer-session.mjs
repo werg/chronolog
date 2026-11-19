@@ -18,7 +18,7 @@ const output = resolve(values.output), packageRoot = join(output, 'package');
 const sqlEnabled = values['sql-native'] || values['sql-browser'];
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 const engineImport = '#chronolog-peer-native-engine';
-const entries = Object.fromEntries(['index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(values['native-rtc'] ? ['webrtc-native'] : []),
+const entries = Object.fromEntries(['index', 'native', 'celld', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(values['native-rtc'] ? ['webrtc-native'] : []),
   ...(sqlEnabled ? ['sql'] : []), ...(values['sql-native'] ? ['sql-native'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]
   .map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
@@ -38,7 +38,7 @@ assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).e
   'The session artifact must not fetch external runtime dependencies');
 // The common SQL path and browser adapter must stay independently browser-loadable,
 // even when the same archive also contains the optional native engine.
-for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(sqlEnabled ? ['sql'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]) {
+for (const entry of ['index', 'celld', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(sqlEnabled ? ['sql'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]) {
   const output = Object.entries(bundled.metafile.outputs).find(([, value]) => value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(output, `Missing bundled entry: ${entry}`);
   const visited = new Set();
@@ -49,7 +49,7 @@ for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'tendr
     assert(metadata, `Missing bundled dependency: ${path}`);
     for (const dependency of metadata.imports) {
       assert(!dependency.external || !dependency.path.startsWith('node:') && dependency.path !== engineImport && dependency.path !== 'werift',
-        `Browser entry ${entry} imports a native runtime: ${dependency.path}`);
+        `Worker-compatible entry ${entry} imports a Node runtime: ${dependency.path}`);
       if (!dependency.external) inspect(dependency.path);
     }
   };
@@ -62,7 +62,7 @@ const runtimeModules = Object.fromEntries(Object.entries(bundled.metafile.output
   inputs: Object.entries(value.inputs).filter(([, input]) => input.bytesInOutput > 0).map(([source]) => source).sort(),
   imports: value.imports.map(input => ({ path: input.external ? input.path : outputName(input.path), kind: input.kind, external: input.external === true })),
 }]));
-const durableImplementation = path => /^(?:packages\/peer-session\/src\/(?:browser-storage-selector|browser-capabilities|application-data|content|keys|projection|recovery|network-data)\.ts|packages\/peer-generation\/src\/replica\.ts|packages\/materializer\/src\/(?:runtime|events|event-store)\.ts|packages\/materializer-doltlite\/|packages\/records\/src\/(?:browser|native|record-envelope|indexeddb-bytes-store)\.ts)/u.test(path);
+const durableImplementation = path => /^(?:packages\/peer-session\/src\/(?:browser-storage-selector|browser-capabilities|application-data|content|keys|projection|recovery|network-data)\.ts|packages\/peer-generation\/src\/replica\.ts|packages\/materializer\/src\/(?:runtime|events|event-store)\.ts|packages\/materializer-doltlite\/|packages\/records\/src\/(?:browser|native|celld|record-envelope|indexeddb-bytes-store)\.ts)/u.test(path);
 for (const entry of ['index', 'browser', 'worker', 'tendriller', ...(sqlEnabled ? ['sql'] : [])]) {
   const output = Object.entries(bundled.metafile.outputs).find(([, value]) => value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(output, `Missing protocol entry: ${entry}`);

@@ -3,11 +3,9 @@ import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 import type { BytesStore } from './bytes-store.js'
+import { sqliteByteLimits, validateSqliteByteKey, type SqliteBytesStoreOptions } from './sqlite-byte-limits.js'
 
-export interface NativeBytesStoreOptions {
-  readonly quotaBytes?: number
-  readonly maxValueBytes?: number
-}
+export type NativeBytesStoreOptions = SqliteBytesStoreOptions
 
 /**
  * One native storage owner for records, authority state, outboxes and local
@@ -23,11 +21,9 @@ export class NativeBytesStore implements BytesStore {
   #closed = false
 
   constructor(path: string, options: NativeBytesStoreOptions = {}) {
-    this.#quotaBytes = options.quotaBytes ?? 256 * 1024 * 1024
-    this.#maxValueBytes = options.maxValueBytes ?? 128 * 1024 * 1024
-    for (const value of [this.#quotaBytes, this.#maxValueBytes]) {
-      if (!Number.isSafeInteger(value) || value < 1) throw new Error('BYTES_STORE_QUOTA_INVALID')
-    }
+    const { quotaBytes, maxValueBytes } = sqliteByteLimits(options)
+    this.#quotaBytes = quotaBytes
+    this.#maxValueBytes = maxValueBytes
     if (path.length === 0) throw new Error('BYTES_STORE_PATH_REQUIRED')
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
     this.#database = new DatabaseSync(path)
@@ -58,7 +54,7 @@ export class NativeBytesStore implements BytesStore {
 
   async get(key: string): Promise<Uint8Array | null> {
     this.#assertOpen()
-    validateKey(key)
+    validateSqliteByteKey(key)
     const row = this.#database.prepare('SELECT value FROM stored_bytes WHERE key = ?').get(key) as
       { value: Uint8Array } | undefined
     return row === undefined ? null : Uint8Array.from(row.value)
@@ -66,7 +62,7 @@ export class NativeBytesStore implements BytesStore {
 
   async put(key: string, value: Uint8Array): Promise<void> {
     this.#assertOpen()
-    validateKey(key)
+    validateSqliteByteKey(key)
     if (!(value instanceof Uint8Array) || value.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
     this.#database.exec('BEGIN IMMEDIATE')
     try {
@@ -96,8 +92,4 @@ export class NativeBytesStore implements BytesStore {
   }
 
   #assertOpen(): void { if (this.#closed) throw new Error('BYTES_STORE_CLOSED') }
-}
-
-function validateKey(key: string): void {
-  if (key.length === 0 || key.length > 2048 || [...key].some((character) => character.charCodeAt(0) < 32)) throw new Error('BYTES_STORE_KEY_INVALID')
 }
