@@ -1,9 +1,9 @@
 import {
   PEER_GENERATION_CAPABILITIES, assertAuthorityExtension, verifyAuthorityBundle,
-  type AuthorityBundle, type PeerAuthority,
+  type AuthorityBundle, type PeerAuthority, type PeerIdentity,
 } from '@chronolog/peer-generation/control'
 import type { PeerRevision, AppliedResult, OperationState, RecoveryNotice, SignedAttempt, SignedRetainedCoverage, PrefixProof } from '@chronolog/peer-generation'
-import { bytesToHex, hexToBytes, type EventPayload } from '@chronolog/protocol'
+import { bytesToHex, hexToBytes, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import { SignalChannel, type Signals } from '@chronolog/signals'
 import { describeApplication, type ApplicationCommand, type ApplicationDefinition, type ApplicationQuery } from './definition.js'
 import type { OpenPeerApplicationOptions } from './runtime.js'
@@ -240,6 +240,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async command<Name extends keyof D['commands'] & string>(name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions): Promise<ApplicationOperation> {
     return (await this.#requireData()).command(name, input, options)
   }
+  /** The owning host has authenticated and approved the use of this signing identity. */
+  async submitProgramAs(program: ChangeProgram, author: PeerIdentity, options: CommandOptions): Promise<ApplicationOperation> {
+    const capturedProgram = structuredClone(program), identity = { ...author }, request = structuredClone(options)
+    return (await this.#requireData()).submitProgramAs(capturedProgram, identity, request)
+  }
   async reapply<Name extends keyof D['commands'] & string>(id: string, name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions & { readonly originalAuthor?: string }): Promise<ApplicationOperation> {
     return (await this.#requireData()).reapply(id, name, input, options)
   }
@@ -314,7 +319,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }, { once: true })
     return participant
   }
-  async retry(id: string): Promise<void> { return (await this.#requireData()).retry(id) }
+  async retry(id: string, author?: string): Promise<void> { return (await this.#requireData()).retry(id, author) }
   async resume(): Promise<void> {
     this.#assertOpen()
     if (this.#participant.data !== undefined) await this.#data?.resume()

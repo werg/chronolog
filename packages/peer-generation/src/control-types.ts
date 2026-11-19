@@ -42,6 +42,8 @@ export interface PeerGrant {
   readonly administrator: boolean
   /** May sign code/page releases; independent of controls, data access and sequencing. */
   readonly publisher: boolean
+  /** May carry independently signed attempts from current writers. */
+  readonly relay?: true
   /** Membership of the durable application data collective, independent of coordination. */
   readonly dataRole: 'member' | 'admin' | null
 }

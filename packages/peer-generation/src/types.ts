@@ -120,6 +120,7 @@ export interface PeerReplica {
   /** Current verified control, including a selection whose application bodies are still recovering. */
   grant(publicKey: string): PeerGrant | null
   prepare(input: PrepareCommand): Promise<SignedAttempt>
+  prepareAs(input: PrepareCommand, author: PeerIdentity): Promise<SignedAttempt>
   order(attempt: SignedAttempt): Promise<OrderedCommand>
   ingest(commands: readonly OrderedCommand[]): Promise<void>
   adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null>
