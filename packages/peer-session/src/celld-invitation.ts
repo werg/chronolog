@@ -38,7 +38,7 @@ function routeText(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 512 &&
     [...value].every(character => character.charCodeAt(0) > 32 && character.charCodeAt(0) !== 127)
 }
-function validateEndpoint(endpoint: CelldPeerEndpoint): void {
+export function validateCelldPeerEndpoint(endpoint: CelldPeerEndpoint): void {
   if (!endpoint || typeof endpoint !== 'object' || !key(endpoint.nodeId) ||
       Object.keys(endpoint).some(field => field !== 'nodeId' && field !== 'addrs' && field !== 'relay') ||
       endpoint.relay !== undefined && !routeText(endpoint.relay) ||
@@ -62,7 +62,7 @@ export async function signCelldApplicationInvitation(input: {
   const { memberPublicKey, inviter } = input
   const endpoint = structuredClone(input.endpoint)
   if (!key(memberPublicKey)) throw new Error('CELLD_INVITATION_MEMBER_INVALID')
-  validateEndpoint(endpoint)
+  validateCelldPeerEndpoint(endpoint)
   const authority = await verifyAuthorityBundle(input.authority)
   if (authority.current === null) throw new Error('CELLD_INVITATION_GENERATION_REQUIRED')
   verifyMembers(authority, memberPublicKey, inviter.publicKey)
@@ -88,7 +88,7 @@ export async function acceptCelldApplicationInvitation(
     throw new Error('CELLD_INVITATION_INVALID')
   }
   if (payload.memberPublicKey !== device.identity.publicKey) throw new Error('CELLD_INVITATION_MEMBER_MISMATCH')
-  validateEndpoint(payload.endpoint)
+  validateCelldPeerEndpoint(payload.endpoint)
   const valid = await verifyDomain(
     DOMAINS.celldApplicationInvitation, encodePeerValue(payload), hexToBytes(captured.signature), hexToBytes(payload.inviterPublicKey),
   )

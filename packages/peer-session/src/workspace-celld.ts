@@ -8,6 +8,7 @@ import { celldGroupData } from './celld-group-data.js'
 import { createCelldPeerTransport, type CelldPeerBinding, type CelldPeerEndpoint, type CelldPeerStream } from './celld-peer.js'
 import { celldGroupSocketStream, readCelldGroupAddress, writeCelldGroupAddress, type CelldGroupSocket } from './celld-group-stream.js'
 import type { ApplicationPeerLink } from './network.js'
+import type { ApplicationSession } from './session.js'
 import type { CommandOptions, QueryParameter } from './session-types.js'
 import type { PeerRevision } from '@chronolog/peer-generation'
 import {
@@ -23,11 +24,11 @@ const key = /^[a-f0-9]{64}$/u
 type Socket = CelldGroupSocket & { accept(): void }
 type Principal = { publicKey: string; pkcs8Hex: string }
 type GroupInput =
-  | { action: 'identity'; publicKey: string }
+  | { action: 'identity'; publicKey: string; localEndpoint?: CelldPeerEndpoint }
   | { action: 'list'; publicKey: string }
   | { action: 'create'; principal: Principal; operationId: string; name: string; schema: string }
   | { action: 'join'; group: string; publicKey: string; offer: CelldGroupInvitation }
-  | { action: 'invite'; publicKey: string; group: string; operationId: string; member: string; role: CelldGroupRole; node: CelldGroupNode }
+  | { action: 'invite'; publicKey: string; group: string; operationId: string; member: string; role: CelldGroupRole; node: CelldGroupNode; localEndpoint?: CelldPeerEndpoint }
   | { action: 'describe'; publicKey: string; group: string }
   | { action: 'review'; program: string }
   | { action: 'transact'; principal: Principal; group: string; operationId: string; program: string; basedOn?: PeerRevision }
@@ -88,10 +89,14 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
     const code = error instanceof Error && /^[A-Z0-9_]{1,120}$/u.test(error.message) ? error.message : 'CELLD_GROUP_REQUEST_FAILED'
     return new Response(code, { status: 409 })
   }
-  const nodeEndpoint = (env: WorkspaceEnvironment): CelldPeerEndpoint => ({
-    nodeId: env.CHRONOLOG_P2P.nodeId,
-    ...(env.CHRONOLOG_ADDRS === undefined ? {} : { addrs: env.CHRONOLOG_ADDRS }),
-  })
+  const nodeEndpoint = (env: WorkspaceEnvironment, hint?: CelldPeerEndpoint): CelldPeerEndpoint => {
+    const nodeId = env.CHRONOLOG_P2P.nodeId
+    if (hint !== undefined) {
+      if (hint.nodeId !== nodeId) throw new Error('CELLD_GROUP_ENDPOINT_MISMATCH')
+      return hint
+    }
+    return { nodeId, ...(env.CHRONOLOG_ADDRS === undefined ? {} : { addrs: env.CHRONOLOG_ADDRS }) }
+  }
   const nodeIdentity = (env: WorkspaceEnvironment): Promise<PeerIdentity> =>
     importCelldSigningIdentity(env.CHRONOLOG_PUBLIC_KEY, env.CHRONOLOG_SIGNING_KEY)
   const authorized = (token: string, request: Request) =>
@@ -129,7 +134,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
         const input = decode(await request.text()) as GroupInput
         switch (input.action) {
           case 'identity':
-            return reply({ publicKey: input.publicKey, node: { publicKey: this.env.CHRONOLOG_PUBLIC_KEY, endpoint: nodeEndpoint(this.env) } })
+            return reply({ publicKey: input.publicKey, node: { publicKey: this.env.CHRONOLOG_PUBLIC_KEY, endpoint: nodeEndpoint(this.env, input.localEndpoint) } })
           case 'review': {
             const steps = readProgram(input.program).steps.map(step =>
               encode(isEmitStep(step) ? { event: step.topic, payload: step.payload } : step))
@@ -220,6 +225,18 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
       return this.#dial ??= this.#attach(creator, group).finally(() => { this.#dial = undefined })
     }
 
+    async #prepareData(group: CelldGroupControl, session: ApplicationSession): Promise<void> {
+      if (await group.origin() === null) return
+      await session.keys.missing()
+      if (session.revision === null) {
+        await this.#ensureLink(group)
+      } else {
+        // A previously synchronized workspace may read retained data and save
+        // new signed attempts while the selected coordinator is offline.
+        void this.#ensureLink(group).catch(() => undefined)
+      }
+    }
+
     async fetch(request: Request): Promise<Response> {
       if (!authorized(this.env.CHRONOLOG_GROUP_TOKEN, request)) return denied()
       try {
@@ -246,7 +263,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
         }
         if (input.action === 'invite') return reply(await group.invite(input.operationId, {
           inviter: input.publicKey, member: input.member, role: input.role, node: input.node,
-        }))
+        }, nodeEndpoint(this.env, input.localEndpoint)))
         const session = await group.session()
         if (input.action === 'describe') {
           const grant = session.memberGrant(input.publicKey)
@@ -283,13 +300,13 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
         const data = celldGroupData(session)
         if (input.action === 'transact') {
           if (!session.memberGrant(input.principal.publicKey)?.writer) return denied()
-          await this.#ensureLink(group)
+          await this.#prepareData(group, session)
           const options: CommandOptions = { operationId: input.operationId, ...(input.basedOn === undefined ? {} : { basedOn: input.basedOn }) }
           return reply(await data.transact(await principal(input.principal), readProgram(input.program), options))
         }
         if (input.action === 'outcome' || input.action === 'query' || input.action === 'subscribe') {
           if (!session.memberGrant(input.publicKey)?.reader) return denied()
-          await this.#ensureLink(group)
+          await this.#prepareData(group, session)
           if (input.action === 'outcome') {
             const result = await data.outcome(input.publicKey, input.txId)
             if (result === null) return reply(null)

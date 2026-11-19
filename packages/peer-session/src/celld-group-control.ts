@@ -8,7 +8,7 @@ import { bytesToHex, decodeChangeProgram, encodeChangeProgram, hexToBytes } from
 import { CelldPrivateBytesStore, type CelldPrivateBytesStorage } from '@chronolog/records/celld'
 import { openApplicationDevice, type ApplicationDevice } from './device.js'
 import { defineApplication } from './definition.js'
-import { acceptCelldApplicationInvitation, signCelldApplicationInvitation, type CelldApplicationInvitation } from './celld-invitation.js'
+import { acceptCelldApplicationInvitation, signCelldApplicationInvitation, validateCelldPeerEndpoint, type CelldApplicationInvitation } from './celld-invitation.js'
 import type { CelldPeerEndpoint } from './celld-peer.js'
 import { createCelldSqlEngine, type CelldSqlStorage } from '@chronolog/materializer-doltlite/celld'
 import { openSqlApplication, prepareSqlApplication } from './sql.js'
@@ -61,6 +61,7 @@ function memberGrant(publicKey: string, role: CelldGroupRole): PeerGrant {
 /** One store and one materializer per group. Only an authenticated workspace host calls these methods. */
 export class CelldGroupControl {
   readonly #store: CelldPrivateBytesStore
+  #installed: GroupRecord | undefined
   #session: Promise<ApplicationSession> | undefined
   #registry: ReturnType<typeof createGenerationRegistry> | undefined
   #control = Promise.resolve<unknown>(null)
@@ -75,8 +76,10 @@ export class CelldGroupControl {
   }
 
   async #record(): Promise<GroupRecord | null> {
+    if (this.#installed !== undefined) return this.#installed
     const bytes = await this.#store.get('installed')
-    return bytes === null ? null : decodePeerValue<GroupRecord>(bytes)
+    if (bytes === null) return null
+    return this.#installed ??= decodePeerValue<GroupRecord>(bytes)
   }
 
   #ordered<T>(run: () => Promise<T>): Promise<T> {
@@ -171,16 +174,19 @@ export class CelldGroupControl {
     })().catch(error => { this.#session = undefined; throw error })
   }
 
-  invite(operationId: string, input: Admission): Promise<CelldGroupInvitation> {
-    const request = structuredClone(input)
+  invite(operationId: string, input: Admission, sourceEndpoint = this.options.endpoint): Promise<CelldGroupInvitation> {
+    const request = structuredClone(input), endpoint = structuredClone(sourceEndpoint)
     return this.#ordered(async () => {
       const record = await this.#record()
       if (record?.kind !== 'creator') throw new Error('CELLD_GROUP_CONTROL_NOT_LOCAL')
       const { applicationId, signer } = this.options
+      validateCelldPeerEndpoint(endpoint)
+      validateCelldPeerEndpoint(request.node.endpoint)
       if (!/^[a-zA-Z0-9_.-]{1,120}$/u.test(operationId) || request.member === request.node.publicKey ||
         request.member === signer.publicKey ||
         !/^[0-9a-f]{64}$/u.test(request.node.endpoint.nodeId) ||
         (request.node.publicKey === signer.publicKey) !== (request.node.endpoint.nodeId === this.options.endpoint.nodeId) ||
+        endpoint.nodeId !== this.options.endpoint.nodeId ||
         !['reader', 'writer', 'publisher', 'administrator'].includes(request.role)) throw new Error('CELLD_GROUP_INVITE_INVALID')
       const registry = await this.#controlRegistry(record)
       let authority = await registry.read()
@@ -189,6 +195,8 @@ export class CelldGroupControl {
       const key = `invite/${operationId}`, encoded = encodePeerValue(request)
       const saved = await this.#store.get(key)
       if (saved !== null && bytesToHex(saved) !== bytesToHex(encoded)) throw new Error('CELLD_GROUP_INVITE_CONFLICT')
+      const endpointKey = `invitation-endpoint/${operationId}`
+      const issuedEndpoint = await this.#store.get(endpointKey)
       const peerKey = `peer/${request.node.endpoint.nodeId}`
       const knownPeer = await this.#store.get(peerKey), existingNode = current.grant(request.node.publicKey)
       const localNode = request.node.publicKey === signer.publicKey
@@ -215,20 +223,23 @@ export class CelldGroupControl {
       await session.adopt(authority)
       const issuedAuthority = { descriptor: authority.descriptor, controls: authority.controls.slice(0, selected.payload.controlRevision + 1),
         generations: authority.generations.slice(0, selected.payload.number + 1) }
-      return { schema: record.schema, invitation: await signCelldApplicationInvitation({
-        authority: issuedAuthority, memberPublicKey: request.node.publicKey, inviter: signer, endpoint: this.options.endpoint,
+      const offer = { schema: record.schema, invitation: await signCelldApplicationInvitation({
+        authority: issuedAuthority, memberPublicKey: request.node.publicKey, inviter: signer,
+        endpoint: issuedEndpoint === null ? endpoint : decodePeerValue<CelldPeerEndpoint>(issuedEndpoint),
       }) }
+      if (issuedEndpoint === null) await this.#store.put(endpointKey, encodePeerValue(endpoint))
+      return offer
     })
   }
 
   async origin(): Promise<CelldGroupNode | null> {
     const record = await this.#record()
-    return record?.kind === 'joined' ? record.creator : null
+    return record?.kind === 'joined' ? structuredClone(record.creator) : null
   }
 
   async peer(nodeId: string): Promise<CelldGroupNode | null> {
     const record = await this.#record()
-    if (record?.kind === 'joined') return record.creator.endpoint.nodeId === nodeId ? record.creator : null
+    if (record?.kind === 'joined') return record.creator.endpoint.nodeId === nodeId ? structuredClone(record.creator) : null
     const bytes = await this.#store.get(`peer/${nodeId}`)
     return bytes === null ? null : decodePeerValue<CelldGroupNode>(bytes)
   }
