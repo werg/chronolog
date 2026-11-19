@@ -813,3 +813,30 @@ its resources. A failed acquisition returns `OWNER_BUSY`; missing Web Locks retu
 as a fallback. SharedWorker and elected-context compositions must negotiate one
 compatible immutable owner artifact and use the same profile lease; transport/RTC
 host handoff remains an explicit product composition responsibility.
+
+### Guarding work across generations in SQL
+
+The SQL runtime supplies a reserved, read-only `chronolog_execution_context` row
+while a verified attempt executes. It contains its actual transaction ID,
+application ID and original signed generation. Application triggers can use:
+
+```sql
+SELECT chronolog_assert(
+  NEW.generation IS (
+    SELECT lower(hex(generation)) FROM chronolog_execution_context
+    WHERE singleton = 1 AND transaction_id = chronolog_transaction_id()
+  ), 'claim_generation_mismatch'
+);
+```
+
+Guard completion against both the claim's stored generation and that current
+attempt context. An inherited claim still has its old fence after a generation
+transition, so completing it requires an explicit guarded rebind/reassignment.
+Historical replay validates it under its original generation. The peer history
+owner supplies authenticated attempt-generation mappings; command payloads never
+supply this execution context. Ordinary writers cannot mutate the context,
+retained `chronolog_attempt_generations`, or application triggers. The context row
+is cleared before publication; retained generation evidence prevents changing an
+existing attempt's interpretation. This changes the SQL execution manifest and
+requires a fresh compatible application/schema tuple; it does not silently migrate
+old SQL stores or grant exclusive execution to events-only projections.

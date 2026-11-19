@@ -320,6 +320,7 @@ class Replica implements PeerReplica {
   async #replay(selected: readonly Retained[], authority: PeerAuthority, continuing = false): Promise<void> {
     const admitted = selected.map(value => value.proposal)
     const controls: PeerExecutionControls = { applicationId: hexToBytes(authority.descriptor.applicationId),
+      attemptGenerations: selected.map(value => ({ attemptId: hexToBytes(value.command.attempt.id), generation: hexToBytes(value.command.attempt.payload.header.generation) })),
       currentRevision: authority.current!.payload.controlRevision,
       revisions: await Promise.all(authority.bundle.controls.map(async control => ({ revision: control.payload.revision,
         digest: hexToBytes(await peerDigest(control)), members: control.payload.grants.flatMap(grant => grant.dataRole === null ? [] :

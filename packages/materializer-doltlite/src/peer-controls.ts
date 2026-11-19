@@ -2,6 +2,8 @@ import { APPLICATION_COLLECTIVE_ID, bytesToHex, equalBytes } from '@chronolog/pr
 import type { PeerExecutionControl, PeerExecutionControls, ReplayProposal } from '@chronolog/materializer'
 import type { DatabaseLike } from './types.js'
 
+const generationIndexes = new WeakMap<PeerExecutionControls, ReadonlyMap<string, Uint8Array>>()
+
 /** These are already authenticated by the shared authority verifier, never by SQL callbacks. */
 export function validatePeerExecutionControls(context: PeerExecutionControls | undefined, transactions: readonly ReplayProposal[]): PeerExecutionControls {
   if (context === undefined || context.applicationId.length !== 32 || !Number.isSafeInteger(context.currentRevision) ||
@@ -21,7 +23,33 @@ export function validatePeerExecutionControls(context: PeerExecutionControls | u
   }
   for (const transaction of transactions) if (!equalBytes(transaction.core.groupId, context.applicationId) ||
       !digests.has(bytesToHex(transaction.core.membershipRevision))) throw new Error('MATERIALIZER_PEER_CONTROL_MISMATCH')
-  return structuredClone(context)
+  const captured = structuredClone(context), generations = new Map<string, Uint8Array>()
+  if (context.attemptGenerations !== undefined) {
+    if (!Array.isArray(context.attemptGenerations) || context.attemptGenerations.length > 1_048_576) throw new Error('MATERIALIZER_PEER_GENERATIONS_INVALID')
+    for (const item of context.attemptGenerations as NonNullable<PeerExecutionControls['attemptGenerations']>) {
+      if (item === null || typeof item !== 'object' || !(item.attemptId instanceof Uint8Array) || item.attemptId.length !== 32 || !(item.generation instanceof Uint8Array) || item.generation.length !== 32 || generations.has(bytesToHex(item.attemptId))) throw new Error('MATERIALIZER_PEER_GENERATIONS_INVALID')
+      generations.set(bytesToHex(item.attemptId), item.generation.slice())
+    }
+    for (const transaction of transactions) if (!generations.has(bytesToHex(transaction.txId))) throw new Error('MATERIALIZER_PEER_GENERATION_MISSING')
+  }
+  generationIndexes.set(captured, generations)
+  return captured
+}
+
+export function peerGenerationFor(context: PeerExecutionControls | undefined, transaction: ReplayProposal): Uint8Array | undefined {
+  return context === undefined ? undefined : generationIndexes.get(context)?.get(bytesToHex(transaction.txId))
+}
+
+/** Preserve the original generation interpretation when an existing attempt is replayed. */
+export function validateStoredAttemptGenerations(database: DatabaseLike, context: PeerExecutionControls | undefined): void {
+  const expected = context === undefined ? undefined : generationIndexes.get(context)
+  for (const row of database.prepare('SELECT transaction_id, generation FROM chronolog_attempt_generations').all()) {
+    if (Array.isArray(row) || !(row.transaction_id instanceof Uint8Array) || !(row.generation instanceof Uint8Array)) throw new Error('MATERIALIZER_PEER_GENERATIONS_INVALID')
+    if (context?.attemptGenerations === undefined) throw new Error('MATERIALIZER_PEER_GENERATION_MISSING')
+    const generation = expected?.get(bytesToHex(row.transaction_id))
+    // Excluded suffix records need not appear in the newly selected history.
+    if (generation !== undefined && !equalBytes(generation, row.generation)) throw new Error('MATERIALIZER_PEER_GENERATION_CONFLICT')
+  }
 }
 
 export function peerControlFor(context: PeerExecutionControls, transaction: ReplayProposal): PeerExecutionControl {
