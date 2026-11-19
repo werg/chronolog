@@ -138,6 +138,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   get deviceId(): string { return this.#options.device.identity.publicKey }
   get applicationId(): string { return this.#participant.descriptor.applicationId }
   get historyId(): string { return this.#participant.descriptor.historyId }
+  /** The currently selected, authenticated control kept by this participant. */
+  get authority(): AuthorityBundle { this.#assertOpen(); return this.#participant.authority }
   get storageId(): string { return this.#options.device.storageId }
   get participation(): ApplicationParticipation | undefined { return this.#participation }
   get status(): SessionStatus {

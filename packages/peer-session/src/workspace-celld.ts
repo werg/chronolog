@@ -10,6 +10,10 @@ import { celldGroupSocketStream, readCelldGroupAddress, writeCelldGroupAddress, 
 import type { ApplicationPeerLink } from './network.js'
 import type { CommandOptions, QueryParameter } from './session-types.js'
 import type { PeerRevision } from '@chronolog/peer-generation'
+import {
+  signCelldWorkspacePublication, verifyCelldWorkspacePublication,
+  type CelldWorkspacePublication, type SignedCelldWorkspacePublication,
+} from './celld-workspace-publication.js'
 
 export const CHRONOLOG_WORKSPACE_OBJECT = 'chronolog'
 const internal = 'x-chronolog-node-token'
@@ -27,6 +31,8 @@ type GroupInput =
   | { action: 'describe'; publicKey: string; group: string }
   | { action: 'review'; program: string }
   | { action: 'transact'; principal: Principal; group: string; operationId: string; program: string; basedOn?: PeerRevision }
+  | { action: 'sign-publication'; principal: Principal; group: string; transition: CelldWorkspacePublication }
+  | { action: 'verify-publication'; group: string; previousHead: string; proposedHead: string; proof: SignedCelldWorkspacePublication }
   | { action: 'outcome'; publicKey: string; group: string; txId: string }
   | { action: 'query' | 'subscribe'; publicKey: string; group: string; sql: string; bindings?: QueryParameter[]; revision?: PeerRevision }
 interface DirectoryStorage {
@@ -247,6 +253,32 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
           return reply(grant?.reader === true ? {
             group: session.applicationId, name: session.historyId, writer: grant.writer, publisher: grant.publisher, administrator: grant.administrator,
           } : null)
+        }
+        if (input.action === 'sign-publication' || input.action === 'verify-publication') {
+          const origin = await group.origin()
+          if (origin !== null) {
+            await this.#ensureLink(group)
+            const link = this.#links.get(origin.publicKey)
+            if (link === undefined) throw new Error('CELLD_GROUP_COORDINATOR_UNAVAILABLE')
+            await link.synchronize()
+          }
+          const authority = session.authority
+          if (input.action === 'sign-publication') {
+            const publisher = await principal(input.principal)
+            if (!session.memberGrant(publisher.publicKey)?.publisher) return denied()
+            const proof = await signCelldWorkspacePublication({ authority, transition: input.transition, publisher })
+            if (session.authority.generations.at(-1)?.id !== proof.payload.generation)
+              throw new Error('CELLD_WORKSPACE_PUBLICATION_AUTHORITY_CHANGED')
+            return reply(proof)
+          }
+          const publisher = await verifyCelldWorkspacePublication({ authority,
+            transition: { destinationNodeId: this.env.CHRONOLOG_P2P.nodeId, workspaceId: this.env.WORKSPACE_ID,
+              previousHead: input.previousHead, proposedHead: input.proposedHead },
+            publication: input.proof,
+          })
+          if (session.authority.generations.at(-1)?.id !== input.proof.payload.generation)
+            throw new Error('CELLD_WORKSPACE_PUBLICATION_AUTHORITY_CHANGED')
+          return reply({ publisher })
         }
         const data = celldGroupData(session)
         if (input.action === 'transact') {
