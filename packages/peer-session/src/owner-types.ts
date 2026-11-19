@@ -43,7 +43,9 @@ export interface ApplicationAttachmentPolicy {
   readonly queries?: readonly string[]
   readonly context?: ApplicationEndpointContext
   readonly contextEvidence?: 'caller-asserted' | 'owner-validated'
+  /** Includes automatic diagnostics observers. Diagnostics attachments require a spare request slot. */
   readonly maxRequests?: number
+  /** Status/recovery and optional participation each occupy one stream; keep a spare for application use. */
   readonly maxStreams?: number
   readonly maxViews?: number
 }
