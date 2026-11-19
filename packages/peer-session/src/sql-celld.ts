@@ -28,3 +28,6 @@ export function openCelldSqlApplication<const D extends ApplicationDefinition>(o
 export { celldGroupData, type CelldGroupQueryResult } from './celld-group-data.js'
 export { encodeChangeProgram, decodeChangeProgram, type ChangeProgram } from '@chronolog/protocol'
 export { CelldGroupControl, type CelldGroupInvitation, type CelldGroupNode, type CelldGroupRole } from './celld-group-control.js'
+export {
+  celldGroupSocketStream, readCelldGroupAddress, writeCelldGroupAddress, type CelldGroupSocket,
+} from './celld-group-stream.js'
