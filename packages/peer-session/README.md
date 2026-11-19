@@ -147,6 +147,23 @@ different key prevents resume. The same imported identity can sign
 generation selections through `openCelldApplicationControl` where it
 matches that application's registered control key.
 
+### Invite a device
+
+After the control object selects a generation with the member's reader
+grant, an admitted administrator can sign a celld invitation with
+`signCelldApplicationInvitation({ authority, memberPublicKey, endpoint, inviter })`.
+Use the administrator device's Ed25519 identity and its actual Iroh
+endpoint. The signed invitation carries the selected authority and
+endpoint. Epoch keys remain on the authenticated peer link.
+
+On the invited device, call
+`acceptCelldApplicationInvitation(device, invitation)`. It checks the exact
+member key, signature and signed control history, and retains the authority
+before opening the application. Pass the returned `authority` to
+`openCelldApplication` and use the returned `peer` and `endpoint` with
+`createCelldPeerTransport`. The application session authenticates that peer
+and synchronizes the selected history over the connection.
+
 ## SQL as an explicit engine capability
 
 SQL uses the same application session, signed schema, commands, views and

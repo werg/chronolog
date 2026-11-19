@@ -30,6 +30,7 @@ export const DOMAINS = {
   epochPayload: 'chronolog/epoch-payload/v1',
   drillEvidence: 'chronolog/drill-evidence/v1',
   peerDescriptor: 'chronolog/peer-generation/descriptor/v1',
+  celldApplicationInvitation: 'chronolog/celld/application-invitation/v1',
   peerSchema: 'chronolog/peer-generation/schema/v1',
   peerPublication: 'chronolog/publication/v1',
   peerControl: 'chronolog/peer-generation/control/v1',

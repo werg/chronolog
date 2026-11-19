@@ -11,6 +11,10 @@ export {
   createCelldPeerTransport, frameCelldPeerStream,
   type CelldPeerBinding, type CelldPeerEndpoint, type CelldPeerStream,
 } from './celld-peer.js'
+export {
+  acceptCelldApplicationInvitation, signCelldApplicationInvitation,
+  type CelldApplicationInvitation, type AcceptedCelldApplicationInvitation,
+} from './celld-invitation.js'
 export { CelldBytesStore, type CelldBytesStorage, type CelldBytesStoreOptions } from '@chronolog/records/celld'
 
 /** Import a per-class secret against the public key admitted by the host. */
