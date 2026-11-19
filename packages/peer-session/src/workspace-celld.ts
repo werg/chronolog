@@ -22,7 +22,7 @@ type GroupInput =
   | { action: 'identity'; publicKey: string }
   | { action: 'list'; publicKey: string }
   | { action: 'create'; principal: Principal; operationId: string; name: string; schema: string }
-  | { action: 'join'; publicKey: string; offer: CelldGroupInvitation }
+  | { action: 'join'; group: string; publicKey: string; offer: CelldGroupInvitation }
   | { action: 'invite'; publicKey: string; group: string; operationId: string; member: string; role: CelldGroupRole; node: CelldGroupNode }
   | { action: 'describe'; publicKey: string; group: string }
   | { action: 'review'; program: string }
@@ -144,7 +144,8 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
             return await this.#install(group, input)
           }
           case 'join':
-            return await this.#install(input.offer.invitation.payload.authority.descriptor.payload.applicationId, input)
+            if (input.group !== input.offer.invitation.payload.authority.descriptor.payload.applicationId) throw new Error('CELLD_GROUP_INVITATION_MISMATCH')
+            return await this.#install(input.group, input)
           default: {
             if (!key.test(input.group) || !await this.state.storage.get(`group:${input.group}`)) throw new Error('CELLD_GROUP_NOT_FOUND')
             return await submit(this.env, input.group, input)
