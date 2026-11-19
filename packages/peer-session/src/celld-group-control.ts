@@ -221,6 +221,11 @@ export class CelldGroupControl {
     })
   }
 
+  async origin(): Promise<CelldGroupNode | null> {
+    const record = await this.#record()
+    return record?.kind === 'joined' ? record.creator : null
+  }
+
   async peer(nodeId: string): Promise<CelldGroupNode | null> {
     const record = await this.#record()
     if (record?.kind === 'joined') return record.creator.endpoint.nodeId === nodeId ? record.creator : null
