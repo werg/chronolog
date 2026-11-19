@@ -335,6 +335,8 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
             if (input.transition.sourceNodeId !== this.env.CHRONOLOG_P2P.nodeId)
               throw new Error('CELLD_WORKSPACE_PUBLICATION_TRANSITION_MISMATCH')
             if (!session.memberGrant(publisher.publicKey)?.publisher) return denied()
+            if (await group.peer(input.transition.destinationNodeId) === null)
+              throw new Error('CELLD_WORKSPACE_HISTORY_DESTINATION_NOT_ADMITTED')
             const proof = await signCelldWorkspacePublication({ authority, transition: input.transition, publisher })
             if (session.authority.generations.at(-1)?.id !== proof.payload.generation)
               throw new Error('CELLD_WORKSPACE_PUBLICATION_AUTHORITY_CHANGED')
