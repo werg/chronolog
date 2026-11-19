@@ -130,6 +130,23 @@ within the Durable Object. Pass `frameCelldPeerStream(stream)` as the
 by the same object. The session authenticates the peer's application
 identity. The Iroh node ID identifies the transport endpoint.
 
+For a host-managed device, declare the Ed25519 private key as a class
+secret. Use the admitted public key and the secret's lowercase PKCS#8 hex
+value on every activation.
+
+```ts
+import { importCelldSigningIdentity, openCelldDevice } from '@chronolog/peer-session/celld'
+
+const managedSigner = await importCelldSigningIdentity(admittedPublicKey, env.CHRONOLOG_SIGNER_PKCS8)
+const device = await openCelldDevice({ storage: ctx.storage, managedSigner })
+```
+
+Pass `create: true` on the initial managed enrollment. The device metadata
+keeps only the public identity and its storage binding. A missing or
+different key prevents resume. The same imported identity can sign
+generation selections through `openCelldApplicationControl` where it
+matches that application's registered control key.
+
 ## SQL as an explicit engine capability
 
 SQL uses the same application session, signed schema, commands, views and
