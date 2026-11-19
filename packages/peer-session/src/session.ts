@@ -94,7 +94,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       subscribe: listener => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener) } },
       get data() { return session.#data?.replica.closed === false ? session.#data : undefined }, openData: () => this.#openData(),
     }
-    const signals = new SignalChannel({ scope: this.applicationId,
+    const signals = new SignalChannel({ ...options.signals?.limits, scope: this.applicationId,
+      relay: options.signals?.delivery === 'application', localEcho: options.signals?.localEcho === true,
       identity: { publicKeyBytes: hexToBytes(this.deviceId), privateKey: options.device.identity.privateKey },
       authorize: ({ scope, authorId }) => scope === this.applicationId && this.#participant.grant(bytesToHex(authorId))?.reader === true })
     this.signals = signals

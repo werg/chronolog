@@ -201,3 +201,42 @@ application history and its applied revision unchanged.
 
 See [owned participation](../peer-session/README.md#owned-participation-and-recovery)
 for the common native and browser lifecycle.
+
+### Concurrent endpoint and run streams
+
+Use the versioned signed stream context when several runs or local endpoints share
+one signing participant and topic:
+
+```ts
+await signals.send('progress', { completed: 3 }, {
+  stream: { streamId: retainedRunId, endpointId, endpointIncarnation, target: 'reviewer' },
+});
+for await (const progress of signals.subscribe({
+  topics: ['progress'], streams: [{ streamId: retainedRunId }], mode: 'latest',
+})) { /* Update only this run. */ }
+```
+
+Selectors are an OR of at most 64 exact field matches and run **before** queueing
+or coalescing. Replacement keys include verified author, channel session, topic,
+endpoint/incarnation, stream ID and recipient scope. A stream cannot replace a
+sibling run's pending progress. The existing per-subscription cardinality and byte
+budgets still apply. Endpoint ID and incarnation must be supplied together. A
+session owner replaces client-supplied endpoint fields with its actual port binding;
+a standalone signer attests its own context. Context is not an independent identity
+grant or a privacy boundary.
+
+Unaddressed frames retain the v1 wire format. Addressed stream frames use
+`chronolog/signal/v2` and sign the complete bounded context. Receiving and
+forwarding preserve the original signer. Unsupported older readers reject v2;
+applications must negotiate a compatible artifact instead of silently discarding
+stream attribution.
+
+`SignalChannel.delivery` reports `neighbors` by default, or `application` when
+bounded forwarding is explicitly enabled using `relay: true`. Forwarding preserves
+expiry and replay checks and never creates a durable delivery guarantee. One route
+accepting dispatch does not prove all intended recipients received it. An owner can
+opt into `localEcho: true` for local attachments, including signal-only operation
+without a network route. It uses the same bounded subscriber queues. In a peer
+session, configure these deliberately through `openPeerApplication({ signals:
+{ delivery: 'neighbors', localEcho: true } })`; `delivery: 'application'` explicitly
+enables the forwarding mode. Durable results belong in application history.
