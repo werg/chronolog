@@ -854,3 +854,14 @@ is cleared before publication; retained generation evidence prevents changing an
 existing attempt's interpretation. This changes the SQL execution manifest and
 requires a fresh compatible application/schema tuple; it does not silently migrate
 old SQL stores or grant exclusive execution to events-only projections.
+
+### Captured-view attachment authority
+
+An attached facade can capture a view with either the `queries` or `events`
+capability. Raw `view.query(sql, parameters)` requires `queries` and is rejected
+when the owner installs any named-query allowlist: a SQL string cannot prove it is
+one of those approved queries. Use the ordinary named `session.query(name, input)`
+under that policy. `view.readEvents()` separately requires `events`; an unrestricted
+query-only attachment does not receive the event capability just to capture SQL.
+Releasing a captured view remains permitted cleanup after a read denial. These
+checks occur inside the owner before calling the captured storage view.

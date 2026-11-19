@@ -594,9 +594,33 @@ describe('many endpoints attached to one owner', () => {
     await expect(connectApplicationOwner(endpoint.port2, { applicationId: f.a.applicationId, definitionId: definition.id, definitionVersion: 'incompatible', timeoutMs: 5000 })).rejects.toThrow('CONTRACT_INCOMPATIBLE')
     const client = await connect()
     await expect(client.command('say', 'forbidden', { operationId: 'denied' })).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
-    await expect(client.readView()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    const captured = await client.readView()
+    await expect(captured.query('SELECT 1')).rejects.toThrow('APPLICATION_ATTACHMENT_QUERY_FORBIDDEN')
+    await expect(captured.readEvents()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    await captured.release()
     expect((await client.query('messages', null)).value.events).toHaveLength(0)
     expect(owner.endpoints()).toHaveLength(1)
+  })
+
+  it('keeps raw captured SQL, named query scopes, event reads and view cleanup under independent grants', async () => {
+    const f = await fixture(), read = f.a.readView.bind(f.a), rawQuery = vi.fn(() => ({ columns: [{ name: 'value' }], rows: [[7]] }))
+    vi.spyOn(f.a, 'readView').mockImplementation(async () => ({ ...await read(), query: rawQuery }))
+    const { connect } = await owned(f.a, { authorize: handshake => handshake.context?.documentPath === '/named'
+      ? { capabilities: ['queries', 'events'], queries: ['messages'] }
+      : handshake.context?.documentPath === '/events' ? { capabilities: ['events'] } : { capabilities: ['queries'] } })
+    const named = await connect({ documentPath: '/named' }), events = await connect({ documentPath: '/events' }), sql = await connect({ documentPath: '/sql' })
+    const namedView = await named.readView(), eventsView = await events.readView(), sqlView = await sql.readView()
+    await expect(namedView.query('SELECT private_data FROM secret')).rejects.toThrow('APPLICATION_ATTACHMENT_QUERY_FORBIDDEN')
+    await expect(eventsView.query('SELECT private_data FROM secret')).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    expect(rawQuery).not.toHaveBeenCalled()
+    expect((await named.query('messages', null)).value.events).toHaveLength(0)
+    expect((await eventsView.readEvents()).events).toHaveLength(0)
+    await expect(sqlView.readEvents()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    expect((await sqlView.query('SELECT 7 AS value')).rows).toEqual([[7]])
+    expect(rawQuery).toHaveBeenCalledOnce()
+    await Promise.all([namedView.release(), eventsView.release(), sqlView.release()])
+    // A denial leaves the held-view reservation releasable and the owner live.
+    const again = await sql.readView(); await again.release(); expect(f.a.signal.aborted).toBe(false)
   })
 
   it('releases an attachment projection without closing another observer or owner registration', async () => {

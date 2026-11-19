@@ -113,7 +113,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     if (['adopt', 'recovery.takeover', 'recovery.handover', 'participation.approve', 'participation.close'].includes(method)) allowed('ownerAdmin')
     if (method.startsWith('operation.') || ['retry', 'resume'].includes(method)) allowed('operations')
     if (method.startsWith('content.')) allowed('content')
-    if (method.startsWith('view.') || method.startsWith('projection.')) allowed('events')
+    if (method.startsWith('projection.')) allowed('events')
     if (method === 'signals.send') allowed('signals')
     switch (method) {
       case 'authority': allowed('diagnostics'); return session.authority()
@@ -148,6 +148,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
           ...(binding === undefined ? {} : { stream: { ...input.stream, streamId: input.stream?.streamId ?? binding.context.runId ?? 'default', endpointId: binding.endpointId, endpointIncarnation: binding.endpointIncarnation } }) })
       }
       case 'view.open': {
+        if (options.capabilities !== undefined && !options.capabilities.some(value => value === 'queries' || value === 'events')) throw new Error('APPLICATION_ATTACHMENT_FORBIDDEN')
         if (views.size + openingViews >= (options.maxViews ?? 16)) throw new Error('APPLICATION_WORKER_VIEW_LIMIT')
         const release = reserve('views'); openingViews++
         let captured: ApplicationReadView
@@ -156,8 +157,13 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
         const id = ++nextView; views.set(id, { handle: captured, requestId, release })
         return { id, revision: captured.revision }
       }
-      case 'view.query': return view(args[0]).query(args[1] as string, args[2] as readonly QueryParameter[])
-      case 'view.events': return view(args[0]).readEvents(args[1] as ApplicationEventOptions)
+      case 'view.query':
+        allowed('queries')
+        // A raw SQL string has no approved named-query identity. It must not
+        // bypass the owner's allowlist merely because a view was captured.
+        if (options.queries !== undefined) throw new Error('APPLICATION_ATTACHMENT_QUERY_FORBIDDEN')
+        return view(args[0]).query(args[1] as string, args[2] as readonly QueryParameter[])
+      case 'view.events': allowed('events'); return view(args[0]).readEvents(args[1] as ApplicationEventOptions)
       case 'view.release': { const captured = views.get(args[0] as number); views.delete(args[0] as number); captured?.handle.release(); captured?.release(); return null }
       case 'projection.open': return captureProjection(args[0] as string)
       case 'projection.read': return projection(args[0]).read({ signal })
