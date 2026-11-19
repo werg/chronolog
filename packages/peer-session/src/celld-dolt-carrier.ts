@@ -96,6 +96,8 @@ export async function serveCelldDoltPublication(stream: CelldPeerStream, authori
       !Number.isSafeInteger(request.size) || request.size < 0 || request.size > maxBody ||
       (request.kind === 'grant' ? request.size !== 0 : request.size === 0) ||
       request.proof === null || typeof request.proof !== 'object') throw new Error('CELLD_DOLT_REQUEST_INVALID')
+    if (request.proof.payload?.sourceNodeId !== stream.remoteNodeId)
+      throw new Error('CELLD_WORKSPACE_PUBLICATION_SOURCE_MISMATCH')
     const handler = await authorize({ peer: stream.remoteNodeId, proof: request.proof, kind: request.kind, bytes: request.size })
     const bytes = request.kind === 'push' ? await reader.read(request.size) : undefined
     await reader.eof()

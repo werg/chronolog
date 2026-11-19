@@ -1,8 +1,9 @@
 import { encodePeerValue, verifyAuthorityBundle, type AuthorityBundle, type PeerIdentity } from '@chronolog/peer-generation/control'
 import { bytesToHex, DOMAINS, hexToBytes, signDomain, verifyDomain } from '@chronolog/protocol'
 
-/** The destination's exact canonical ref transition. */
+/** The exact canonical ref transition between two authenticated workspace nodes. */
 export interface CelldWorkspacePublication {
+  readonly sourceNodeId: string
   readonly destinationNodeId: string
   readonly workspaceId: string
   readonly previousHead: string
@@ -21,7 +22,7 @@ export interface SignedCelldWorkspacePublication {
   readonly signature: string
 }
 
-const publicationFields = ['destinationNodeId', 'workspaceId', 'previousHead', 'proposedHead'] as const
+const publicationFields = ['sourceNodeId', 'destinationNodeId', 'workspaceId', 'previousHead', 'proposedHead'] as const
 const payloadFields = ['version', 'applicationId', 'generation', 'publisherPublicKey', ...publicationFields] as const
 
 function exactKeys(value: unknown, keys: readonly string[]): boolean {
@@ -34,7 +35,7 @@ function hex(value: unknown, length: number): value is string {
 }
 
 function validatePublication(value: CelldWorkspacePublication): void {
-  if (!hex(value.destinationNodeId, 64) || typeof value.workspaceId !== 'string' ||
+  if (!hex(value.sourceNodeId, 64) || !hex(value.destinationNodeId, 64) || value.sourceNodeId === value.destinationNodeId || typeof value.workspaceId !== 'string' ||
       !/^[a-zA-Z0-9_-]{1,128}$/u.test(value.workspaceId) ||
       !hex(value.previousHead, 40) || !hex(value.proposedHead, 40) || value.previousHead === value.proposedHead) {
     throw new Error('CELLD_WORKSPACE_PUBLICATION_TRANSITION_INVALID')

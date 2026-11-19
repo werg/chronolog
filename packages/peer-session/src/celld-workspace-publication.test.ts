@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 import { signCelldWorkspacePublication, verifyCelldWorkspacePublication } from './celld-workspace-publication.js'
 
 const transition = {
-  destinationNodeId: 'b1'.repeat(32), workspaceId: 'ws_application',
+  sourceNodeId: 'a2'.repeat(32), destinationNodeId: 'b1'.repeat(32), workspaceId: 'ws_application',
   previousHead: 'c2'.repeat(20), proposedHead: 'd3'.repeat(20),
 }
 
@@ -35,14 +35,14 @@ async function fixture() {
 }
 
 describe('celld workspace publication authority', () => {
-  it('requires a publisher and proves the exact destination and both heads', async () => {
+  it('requires a publisher and proves the exact source, destination and both heads', async () => {
     const { admin, authority, publisher } = await fixture()
     await expect(signCelldWorkspacePublication({ authority, transition, publisher: admin }))
       .rejects.toThrow('CELLD_WORKSPACE_PUBLICATION_FORBIDDEN')
     const publication = await signCelldWorkspacePublication({ authority, transition, publisher })
     await expect(verifyCelldWorkspacePublication({ authority, transition, publication })).resolves.toBe(publisher.publicKey)
     for (const different of [
-      { destinationNodeId: 'ff'.repeat(32) }, { workspaceId: 'ws_other' },
+      { sourceNodeId: '11'.repeat(32) }, { destinationNodeId: 'ff'.repeat(32) }, { workspaceId: 'ws_other' },
       { previousHead: 'aa'.repeat(20) }, { proposedHead: 'ee'.repeat(20) },
     ]) {
       await expect(verifyCelldWorkspacePublication({ authority, transition: { ...transition, ...different }, publication }))

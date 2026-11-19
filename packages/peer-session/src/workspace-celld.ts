@@ -33,7 +33,7 @@ type GroupInput =
   | { action: 'review'; program: string }
   | { action: 'transact'; principal: Principal; group: string; operationId: string; program: string; basedOn?: PeerRevision }
   | { action: 'sign-publication'; principal: Principal; group: string; transition: CelldWorkspacePublication }
-  | { action: 'verify-publication'; group: string; previousHead: string; proposedHead: string; proof: SignedCelldWorkspacePublication }
+  | { action: 'verify-publication'; group: string; sourceNodeId: string; previousHead: string; proposedHead: string; proof: SignedCelldWorkspacePublication }
   | { action: 'outcome'; publicKey: string; group: string; txId: string }
   | { action: 'query' | 'subscribe'; publicKey: string; group: string; sql: string; bindings?: QueryParameter[]; revision?: PeerRevision }
 interface DirectoryStorage {
@@ -285,6 +285,8 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
           const authority = session.authority
           if (input.action === 'sign-publication') {
             const publisher = await principal(input.principal)
+            if (input.transition.sourceNodeId !== this.env.CHRONOLOG_P2P.nodeId)
+              throw new Error('CELLD_WORKSPACE_PUBLICATION_TRANSITION_MISMATCH')
             if (!session.memberGrant(publisher.publicKey)?.publisher) return denied()
             const proof = await signCelldWorkspacePublication({ authority, transition: input.transition, publisher })
             if (session.authority.generations.at(-1)?.id !== proof.payload.generation)
@@ -292,7 +294,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
             return reply(proof)
           }
           const publisher = await verifyCelldWorkspacePublication({ authority,
-            transition: { destinationNodeId: this.env.CHRONOLOG_P2P.nodeId, workspaceId: this.env.WORKSPACE_ID,
+            transition: { sourceNodeId: input.sourceNodeId, destinationNodeId: this.env.CHRONOLOG_P2P.nodeId, workspaceId: this.env.WORKSPACE_ID,
               previousHead: input.previousHead, proposedHead: input.proposedHead },
             publication: input.proof,
           })
