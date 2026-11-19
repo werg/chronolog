@@ -51,6 +51,16 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           const approved = options.authorize?.(structuredClone(handshake)) ?? {}
           validatePolicy(approved)
           const policy = mergePolicy(fixed, approved)
+          // The page automatically holds status and recovery observers, plus
+          // participation when present. Each uses one stream and a passive
+          // stream.next request. Reject incompatible owner-side limits before
+          // publishing a ready facade instead of accepting one that immediately
+          // closes when its built-in observers hit a quota.
+          if ((policy.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES).includes('diagnostics')) {
+            const observers = session.participation === undefined ? 2 : 3
+            if ((policy.maxStreams ?? 8) <= observers || (policy.maxRequests ?? 16) <= observers ||
+                bounds.streams <= observers || bounds.requests <= observers) throw new Error('APPLICATION_ATTACHMENT_OBSERVER_LIMIT')
+          }
           const claimedContext = checkedContext(policy.context ?? handshake.context ?? {})
           // A duplicate tab can copy its storage; it cannot acquire another live view's drafts.
           const requestedView = claimedContext.viewId
