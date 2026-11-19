@@ -4,6 +4,7 @@ import { openApplicationDevice, type ApplicationDevice } from './device.js'
 
 export { openPeerApplication as openCelldApplication } from './runtime.js'
 export type { OpenPeerApplicationOptions } from './runtime.js'
+export { frameCelldPeerStream, type CelldPeerStream } from './celld-peer.js'
 export { CelldBytesStore, type CelldBytesStorage, type CelldBytesStoreOptions } from '@chronolog/records/celld'
 
 /** Open one device under its celld object, optionally using a SQLite facet for application data. */

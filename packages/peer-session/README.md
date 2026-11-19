@@ -125,7 +125,10 @@ const session = await openCelldApplication({ device, definition, authority })
 Pass `create: true` during explicit device setup. Later activations reopen
 the retained signer and history. Provide `openDataStorage` to open a
 separate SQLite facet on demand. Closing the device releases its handles
-within the Durable Object.
+within the Durable Object. Pass `frameCelldPeerStream(stream)` as the
+`connection` to `session.connectPeer()` for streams opened or accepted
+by the same object. The session authenticates the peer's application
+identity. The Iroh node ID identifies the transport endpoint.
 
 ## SQL as an explicit engine capability
 
