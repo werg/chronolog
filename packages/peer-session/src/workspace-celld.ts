@@ -41,7 +41,8 @@ interface WorkspaceEnvironment {
   readonly WORKSPACE_ID: string
   readonly CHRONOLOG_PUBLIC_KEY: string
   readonly CHRONOLOG_SIGNING_KEY: string
-  readonly CHRONOLOG_TOKEN: string
+  readonly CHRONOLOG_ROOT_TOKEN: string
+  readonly CHRONOLOG_GROUP_TOKEN: string
   readonly CHRONOLOG_ADDRS?: readonly string[]
   readonly CHRONOLOG_P2P: CelldPeerBinding & { readonly nodeId: string }
   readonly CHRONOLOG_GROUPS: Namespace
@@ -87,11 +88,11 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
   })
   const nodeIdentity = (env: WorkspaceEnvironment): Promise<PeerIdentity> =>
     importCelldSigningIdentity(env.CHRONOLOG_PUBLIC_KEY, env.CHRONOLOG_SIGNING_KEY)
-  const authorized = (env: WorkspaceEnvironment, request: Request) =>
-    typeof env.CHRONOLOG_TOKEN === 'string' && env.CHRONOLOG_TOKEN.length > 0 && request.headers.get(internal) === env.CHRONOLOG_TOKEN
+  const authorized = (token: string, request: Request) =>
+    typeof token === 'string' && token.length > 0 && request.headers.get(internal) === token
   const submit = (env: WorkspaceEnvironment, group: string, input: GroupInput) =>
     env.CHRONOLOG_GROUPS.getByName(group).fetch(new Request('http://chronolog/group', {
-      method: 'POST', headers: { [internal]: env.CHRONOLOG_TOKEN, 'content-type': 'application/json' },
+      method: 'POST', headers: { [internal]: env.CHRONOLOG_ROOT_TOKEN, 'content-type': 'application/json' },
       body: encode(input),
     }))
 
@@ -105,7 +106,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
         const { group, stream } = await readCelldGroupAddress(raw)
         if (!await this.state.storage.get(`group:${group}`)) throw new Error('CELLD_GROUP_NOT_FOUND')
         const forwarded = await this.env.CHRONOLOG_GROUPS.getByName(group).fetch(new Request('http://chronolog/carrier', {
-          headers: { 'upgrade': 'websocket', [internal]: this.env.CHRONOLOG_TOKEN, [remote]: stream.remoteNodeId },
+          headers: { 'upgrade': 'websocket', [internal]: this.env.CHRONOLOG_ROOT_TOKEN, [remote]: stream.remoteNodeId },
         }))
         const socket = forwarded.webSocket
         if (socket === undefined) throw new Error('CELLD_GROUP_STREAM_DENIED')
@@ -117,7 +118,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
     }
 
     async fetch(request: Request): Promise<Response> {
-      if (!authorized(this.env, request) || request.method !== 'POST') return denied()
+      if (!authorized(this.env.CHRONOLOG_ROOT_TOKEN, request) || request.method !== 'POST') return denied()
       try {
         const input = decode(await request.text()) as GroupInput
         switch (input.action) {
@@ -214,7 +215,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
     }
 
     async fetch(request: Request): Promise<Response> {
-      if (!authorized(this.env, request)) return denied()
+      if (!authorized(this.env.CHRONOLOG_GROUP_TOKEN, request)) return denied()
       try {
         const group = await this.#group()
         if (new URL(request.url).pathname === '/carrier') {
