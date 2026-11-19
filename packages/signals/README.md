@@ -161,11 +161,19 @@ If every route is busy or explicitly returns `false`, public `send` rejects with
 healthy routes or interrupt durable replication. A new send is a fresh
 observation, and the channel never retries a discarded one. `true` and `false`
 are the only valid transport results. A transport exception or invalid result
-retires that route and invokes its optional `close()` callback; the connection
-owner should close its underlying session there. A dispatched write that ignores
-cancellation is also retired. Some routes may have dispatched before an attempt
-later rejects, and cancellation cannot recall those bytes. Reconnect never
-resends prior messages.
+retires that route and invokes its optional `close(reason)` callback with the
+original error; the connection owner should close that underlying connection.
+
+Caller cancellation ends the send's observation immediately and forwards its
+abort signal, while an admitted write retains its busy slot and original dispatch
+deadline until it actually settles. Cancellation cannot retire a healthy shared
+route merely because asynchronous encryption settles on a later event-loop turn.
+A write still outstanding at its own deadline is retired with
+`SIGNAL_SEND_TIMEOUT`; it continues to occupy the route budget until settlement.
+An actual transport failure arriving after the caller stopped waiting still
+retires the route with that failure. Some routes may have dispatched before an
+attempt later rejects, and cancellation cannot recall those bytes. Reconnect
+never resends prior messages.
 
 ## Owned application sessions
 

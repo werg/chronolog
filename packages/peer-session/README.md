@@ -532,11 +532,14 @@ retained evidence. A recovering receiver stays unavailable until the selected
 inherited prefix is complete.
 
 A congested live lane refuses the current send without queuing it or closing
-the reliable connection. Ending that lane retires its live route. A dispatched
-write that ignores cancellation retires the physical connection, preventing
-late work from surviving into its replacement. Connecting the same authenticated
-peer again closes its previous connection. Signal sends always use routes
-available when that attempt began; reconnecting never replays missed signals.
+the reliable connection. Ending that lane retires its live route. Cancelling one
+caller's signal observation preserves the shared reliable connection while an
+admitted encryption/write settles; the write retains its bounded busy slot and
+original deadline. Only an actual transport failure or a write still outstanding
+at that deadline retires the physical connection, preserving its original error
+or `SIGNAL_SEND_TIMEOUT` as the connection's abort reason. Connecting the same
+authenticated peer again closes its previous connection. Signal sends always use
+routes available when that attempt began; reconnecting never replays missed signals.
 
 The `/webrtc` entry provides `connectApplicationWebRtc(session, options)` for a
 runtime with a usable RTC factory. The optional `/webrtc-native` entry supplies

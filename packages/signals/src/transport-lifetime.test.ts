@@ -1,5 +1,5 @@
 import { assertCanonicalCbor, encodeCanonicalCbor, generateEd25519KeyPair } from '@chronolog/protocol'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { SignalChannel, type SignalTransport } from './index.js'
 
@@ -60,18 +60,19 @@ describe('authorized ephemeral peer signals', () => {
 
   it.each(['exception', 'unmarked backpressure exception', 'invalid result'] as const)('retires a route after a transport %s without treating it as a dispatch refusal', async kind => {
     const f = await fixture()
-    let closed = 0
+    const retired: unknown[] = []
     const channel = new SignalChannel({ scope: 'room', identity: f.options.identity, authorize: () => true })
     channel.attachRoute({ trySend: (async () => {
       if (kind === 'exception') throw new Error('transport failed')
       if (kind === 'unmarked backpressure exception') throw Object.assign(new Error('SIGNAL_BACKPRESSURE'), { code: 'SIGNAL_BACKPRESSURE' })
       return { unexpected: 'result' }
-    }) as unknown as SignalTransport['trySend'], close() { closed++ } })
+    }) as unknown as SignalTransport['trySend'], close(reason) { retired.push(reason) } })
     try {
       const reason = kind === 'exception' ? 'transport failed'
         : kind === 'unmarked backpressure exception' ? 'SIGNAL_BACKPRESSURE' : 'SIGNAL_TRANSPORT_RESULT_INVALID'
       await expect(channel.send('typing', 1)).rejects.toThrow(reason)
-      expect(closed).toBe(1)
+      expect(retired).toHaveLength(1); expect(retired[0]).toBeInstanceOf(Error)
+      expect((retired[0] as Error).message).toBe(reason)
       await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
     } finally { channel.close(); f.sender.close(); f.receiver.close() }
   })
@@ -114,20 +115,48 @@ describe('authorized ephemeral peer signals', () => {
     channel.close(); f.sender.close(); f.receiver.close()
   })
 
-  it('retires an aborted noncooperative route instead of starting unlimited background sends', async () => {
-    const f = await fixture()
-    let calls = 0, entered!: () => void
-    const started = new Promise<void>(resolve => { entered = resolve })
-    const channel = new SignalChannel({ ...f.options, async trySend() { calls++; entered(); return await new Promise<never>(() => {}) } })
+  it('keeps a cancelled write reserved until settlement or its own deadline without admitting replacement work', async () => {
+    const f = await fixture(), { trySend: _send, ...options } = f.options
+    let calls = 0, entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const retired: unknown[] = [], channel = new SignalChannel({ ...options, maxRoutes: 1, sendTimeoutMs: 25 })
+    channel.attachRoute({ async trySend() { calls++; entered(); await gate; return true }, close(reason) { retired.push(reason) } })
+    vi.useFakeTimers()
+    try {
+      const abort = new AbortController(), reason = new Error('cancelled'), pending = channel.send('typing', 1, { signal: abort.signal })
+      await started
+      const refused = expect(pending).rejects.toBe(reason)
+      abort.abort(reason); await refused
+      await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_BACKPRESSURE')
+      await vi.advanceTimersByTimeAsync(24); expect(retired).toHaveLength(0)
+      expect(() => channel.attachRoute({ async trySend() { return true } })).toThrow('SIGNAL_ROUTE_QUOTA_EXCEEDED')
+      await vi.advanceTimersByTimeAsync(1)
+      expect(retired).toHaveLength(1); expect(retired[0]).toMatchObject({ code: 'SIGNAL_SEND_TIMEOUT' })
+      await expect(channel.send('typing', 3)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+      expect(() => channel.attachRoute({ async trySend() { return true } })).toThrow('SIGNAL_ROUTE_QUOTA_EXCEEDED')
+      expect(calls).toBe(1)
+      release(); await vi.advanceTimersByTimeAsync(0)
+      channel.attachRoute({ async trySend() { return true } })
+      await channel.send('typing', 4); expect(retired).toHaveLength(1)
+    } finally { release(); channel.close(); f.sender.close(); f.receiver.close(); vi.useRealTimers() }
+  })
+
+  it('preserves an actual transport failure that arrives after its caller stopped observing', async () => {
+    const f = await fixture(), { trySend: _send, ...options } = f.options
+    let entered!: () => void, fail!: (reason: unknown) => void
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<never>((_resolve, reject) => { fail = reject })
+    const retired: unknown[] = [], channel = new SignalChannel(options)
+    channel.attachRoute({ async trySend() { entered(); return gate }, close(reason) { retired.push(reason) } })
     const abort = new AbortController(), pending = channel.send('typing', 1, { signal: abort.signal })
-    await started
-    const refused = expect(pending).rejects.toThrow('cancelled')
-    abort.abort(new Error('cancelled')); await refused
-    // Give a cooperative cancellation one turn before retiring an outstanding write.
-    await new Promise(resolve => { setTimeout(resolve, 5) })
-    await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
-    expect(calls).toBe(1)
-    channel.close(); f.sender.close(); f.receiver.close()
+    try {
+      await started
+      const reason = new Error('caller stopped'), refused = expect(pending).rejects.toBe(reason)
+      abort.abort(reason); await refused
+      const failure = new Error('physical transport failed after caller abort'); fail(failure)
+      await expect.poll(() => retired.length).toBe(1)
+      expect(retired[0]).toBe(failure)
+      await expect(channel.send('typing', 2)).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+    } finally { channel.close(); f.sender.close(); f.receiver.close() }
   })
 
   it.each(['authorize', 'credential'] as const)('keeps cancelled %s work counted until it settles', async stage => {

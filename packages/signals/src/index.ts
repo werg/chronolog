@@ -69,8 +69,8 @@ export interface SignalPolicyContext { readonly signal: AbortSignal }
 export interface SignalTransport {
   /** False refuses congestion before queueing or dispatching. Actual failures throw. Honor cancellation. */
   trySend(frame: Uint8Array, options: { readonly signal: AbortSignal }): Promise<boolean>
-  /** Retire an underlying connection that cannot complete a dispatched write. */
-  close?(): void | Promise<void>
+  /** Retire an underlying connection on its actual failure or dispatch deadline. */
+  close?(reason?: unknown): void | Promise<void>
 }
 export interface SignalRoute {
   /**
@@ -110,7 +110,7 @@ export interface SignalLimits {
 }
 
 interface SessionProgress { readonly seen: Map<number, number> }
-interface Route extends SignalTransport { readonly lifetime: AbortController; busy: boolean }
+interface Route extends SignalTransport { readonly lifetime: AbortController; busy: boolean; retired: boolean }
 interface QueuedSignal { readonly value: EphemeralSignal; readonly bytes: number; readonly key: string }
 interface Subscription {
   readonly topics: ReadonlySet<string> | null
@@ -188,7 +188,7 @@ export class SignalChannel implements Signals {
     this.#assertOpen()
     if (typeof transport.trySend !== 'function') throw new SignalError('SIGNAL_TRANSPORT_INVALID')
     if (this.#routes.size + this.#retiring.size >= this.#maxRoutes) throw new SignalError('SIGNAL_ROUTE_QUOTA_EXCEEDED')
-    const route: Route = { trySend: transport.trySend.bind(transport), lifetime: new AbortController(), busy: false,
+    const route: Route = { trySend: transport.trySend.bind(transport), lifetime: new AbortController(), busy: false, retired: false,
       ...(transport.close === undefined ? {} : { close: transport.close.bind(transport) }) }
     this.#routes.add(route)
     return { receive: frame => this.#enqueueReceive(frame, route), close: () => this.#detach(route) }
@@ -332,8 +332,11 @@ export class SignalChannel implements Signals {
       route.busy = true
       let handedOff = false, settled = false
       const deadline = new AbortController()
-      const timer = setTimeout(() => deadline.abort(new SignalError('SIGNAL_SEND_TIMEOUT')),
-        Math.max(1, Math.min(this.#sendTimeout, verified.value.expiresAtMs - this.#now())))
+      const timer = setTimeout(() => {
+        const reason = new SignalError('SIGNAL_SEND_TIMEOUT')
+        deadline.abort(reason)
+        if (handedOff && !settled) this.#detach(route, true, reason)
+      }, Math.max(1, Math.min(this.#sendTimeout, verified.value.expiresAtMs - this.#now())))
       const lifetime = AbortSignal.any([signal, route.lifetime.signal, deadline.signal])
       const operation = (async () => {
         await this.#authorize(verified.authorization, lifetime)
@@ -344,14 +347,17 @@ export class SignalChannel implements Signals {
           throw new SignalError('SIGNAL_TRANSPORT_RESULT_INVALID')
         }
         return result
-      })().finally(() => { settled = true; route.busy = false; this.#retiring.delete(route) })
-      return interrupted(operation, lifetime).catch(async (error: unknown) => {
-        // Give cooperative cancellation its microtask turn. A route whose write
-        // remains outstanding cannot admit another write or survive indefinitely.
-        if (handedOff && lifetime.aborted && !settled) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
-        if (handedOff && (!lifetime.aborted || !settled)) this.#detach(route, true)
+      })().catch((error: unknown) => {
+        // Inspect the actual transport result even if this send's observer has
+        // already cancelled. A caller's abort is not a shared-route failure.
+        if (handedOff && (!lifetime.aborted || error !== lifetime.reason)) this.#detach(route, true, error)
         throw error
-      }).finally(() => { clearTimeout(timer) })
+      }).finally(() => { settled = true; route.busy = false; this.#retiring.delete(route); clearTimeout(timer) })
+      // Caller cancellation releases its waiter immediately, but cannot release
+      // this admitted write's capacity or deadline. WebCrypto can settle on a
+      // later event-loop turn; only settlement or the write's own deadline ends
+      // that ownership. A permanently stuck callback remains bounded per route.
+      return interrupted(operation, lifetime)
     })
     // Healthy routes progress without waiting for a slow peer. Each route keeps
     // its own deadline and at most one unsettled dispatch after this resolves.
@@ -500,10 +506,13 @@ export class SignalChannel implements Signals {
     this.#subscriptions.clear(); this.#sessions.clear(); this.#remembered = 0
   }
 
-  #detach(route: Route, retire = false): void {
+  #detach(route: Route, retire = false, reason: unknown = new SignalError('SIGNAL_ROUTE_CLOSED')): void {
     if (route.busy) this.#retiring.add(route)
-    this.#routes.delete(route); route.lifetime.abort(new SignalError('SIGNAL_ROUTE_CLOSED'))
-    if (retire) { try { void Promise.resolve(route.close?.()).catch(() => undefined) } catch { /* The route is already retired. */ } }
+    this.#routes.delete(route); route.lifetime.abort(reason)
+    if (retire && !route.retired) {
+      route.retired = true
+      try { void Promise.resolve(route.close?.(reason)).catch(() => undefined) } catch { /* The route is already retired. */ }
+    }
   }
   #assertOpen(): void { this.#lifetime.signal.throwIfAborted() }
   #assertFresh(value: EphemeralSignal): void {

@@ -236,7 +236,7 @@ class NetworkPeer implements ApplicationPeerLink {
       }, this)
       if (this.#channel.connection.live !== undefined) {
         const lane = this.#channel.connection.live
-        this.#route = this.#port.signals.attachRoute({ close: () => this.close(), trySend: async (frame, { signal }) => {
+        this.#route = this.#port.signals.attachRoute({ close: reason => this.#dispose(reason), trySend: async (frame, { signal }) => {
           signal.throwIfAborted(); this.#reader()
           const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
           this.#reader(); return accepted
