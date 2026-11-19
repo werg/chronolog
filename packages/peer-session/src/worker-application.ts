@@ -138,6 +138,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   get status(): SessionStatus { return { ...this.#snapshot.status } }
   get revision(): PeerRevision | null { return structuredClone(this.#snapshot.revision) }
   describe(): Description { return structuredClone(this.#description) }
+  authority(): Promise<AuthorityBundle> { return this.#call('authority', []) }
   onStatus(listener: (status: SessionStatus) => void): () => void {
     this.#statusListeners.add(listener)
     try { listener(this.status) } catch { /* Observation does not own the session. */ }

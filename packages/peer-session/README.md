@@ -105,6 +105,19 @@ schemas and semantic version. Obtain the event execution manifest with
 `eventExecutionManifest()`. Materializers consume verified order through one
 execution pipeline; transport roles do not change execution semantics.
 
+`await session.authority()` reads a cloned snapshot of the current public signed
+`AuthorityBundle` already verified and retained by this session. It includes the
+descriptor, controls/grants, and selected-generation evidence; it contains no
+private signing or decryption keys. This works while the database is idle and
+does not contact the control service or activate application storage. Use it for
+membership and roster rendering, then combine it with separately observed live
+presence. Mutating the returned object cannot change the owner's authority.
+The Worker and attached native facades expose the same asynchronous method;
+delegated attachments need the `diagnostics` capability. The snapshot describes
+the last verified local authority and does not claim that an offline participant
+has learned a newer remote revocation. Transport delivery and presence never grant
+membership rights.
+
 Only first device setup passes `{ create: true }`. Ordinary reopening omits it.
 The session owns one signed attempt journal in the device store. A disconnected
 command remains `saved`; connecting resumes its exact original attempt.

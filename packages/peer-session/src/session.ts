@@ -149,6 +149,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       generation: this.#participant.generation.id, coordinator, connectedPeers: this.#peers.size }
   }
   describe() { return { ...describeApplication(this.#options.definition), capabilities: this.capabilities } }
+  /** Public signed authority already verified by this owner; no data activation or host request. */
+  async authority(): Promise<AuthorityBundle> {
+    this.#assertOpen()
+    return structuredClone(this.#participant.authority)
+  }
   onStatus(listener: (status: SessionStatus) => void): () => void {
     this.#statusListeners.add(listener)
     try { listener(this.status) } catch { /* Observers cannot change ownership. */ }

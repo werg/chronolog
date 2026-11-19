@@ -507,6 +507,23 @@ describe('many endpoints attached to one owner', () => {
     return { owner, endpoint, connect }
   }
 
+  it('reads cloned verified authority without storage demand and checks the attachment diagnostics grant', async () => {
+    const openStorage = vi.fn(async () => ({ store: new MemoryBytesStore(), close: () => undefined }))
+    const f = await fixture({ data: false, openStorageA: openStorage }), first = await owned(f.a)
+    const client = await first.connect(), authority = await client.authority()
+    expect(authority).toEqual(await f.registry.read())
+    Object.assign(authority.controls[0]!.payload, { grants: [] })
+    expect((await client.authority()).controls[0]!.payload.grants).toHaveLength(2)
+    expect((await f.a.authority()).controls[0]!.payload.grants).toHaveLength(2)
+    expect(openStorage).not.toHaveBeenCalled(); expect(f.a.status.database).toBe('idle')
+    const restricted = await owned(f.b, { authorize: () => ({ capabilities: ['signals'] }) })
+    const endpoint = await restricted.connect()
+    await expect(endpoint.authority()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    expect(f.b.status.database).toBe('idle')
+    await endpoint.detach()
+    expect((await client.authority()).descriptor.payload.applicationId).toBe(client.applicationId)
+  })
+
   it('binds independent endpoints to one lazy session; detach preserves sibling and signed work', async () => {
     const openStorage = vi.fn(async () => ({ store: new MemoryBytesStore(), close: () => undefined }))
     const f = await fixture({ data: false, openStorageA: openStorage }), { owner, connect } = await owned(f.a)

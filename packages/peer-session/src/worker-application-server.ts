@@ -116,6 +116,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     if (method.startsWith('view.') || method.startsWith('projection.')) allowed('events')
     if (method === 'signals.send') allowed('signals')
     switch (method) {
+      case 'authority': allowed('diagnostics'); return session.authority()
       case 'command': return (await session.command(args[0] as string, preparedInput(args[0] as string, args[1]), args[2] as CommandOptions)).operationId
       case 'reapply': return (await session.reapply(args[0] as string, args[1] as string, preparedInput(args[1] as string, args[2]), args[3] as CommandOptions)).operationId
       case 'query': {
