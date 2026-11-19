@@ -234,9 +234,10 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
     async #prepareData(group: CelldGroupControl, session: ApplicationSession): Promise<void> {
       const origin = await group.origin()
       if (origin === null) return
-      await session.keys.missing()
-      if (session.revision === null) {
+      const missing = await session.keys.missing()
+      if (session.revision === null || missing.length !== 0) {
         await this.#synchronizeOrigin(group, origin)
+        await session.keys.ensure()
       } else {
         // A previously synchronized workspace may read retained data and save
         // new signed attempts while the selected coordinator is offline.
