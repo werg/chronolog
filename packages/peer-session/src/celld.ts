@@ -15,6 +15,10 @@ export {
   acceptCelldApplicationInvitation, signCelldApplicationInvitation,
   type CelldApplicationInvitation, type AcceptedCelldApplicationInvitation,
 } from './celld-invitation.js'
+export {
+  signCelldWorkspacePublication, verifyCelldWorkspacePublication,
+  type CelldWorkspacePublication, type SignedCelldWorkspacePublication,
+} from './celld-workspace-publication.js'
 export { CelldBytesStore, type CelldBytesStorage, type CelldBytesStoreOptions } from '@chronolog/records/celld'
 
 /** Import a per-class secret against the public key admitted by the host. */

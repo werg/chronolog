@@ -31,6 +31,7 @@ export const DOMAINS = {
   drillEvidence: 'chronolog/drill-evidence/v1',
   peerDescriptor: 'chronolog/peer-generation/descriptor/v1',
   celldApplicationInvitation: 'chronolog/celld/application-invitation/v1',
+  celldWorkspacePublication: 'chronolog/celld/workspace-publication/v1',
   peerSchema: 'chronolog/peer-generation/schema/v1',
   peerPublication: 'chronolog/publication/v1',
   peerControl: 'chronolog/peer-generation/control/v1',
