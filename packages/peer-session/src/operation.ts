@@ -1,6 +1,8 @@
 import type { AppliedResult, OperationState, SignedRetainedCoverage } from '@chronolog/peer-generation'
 import type { ApplicationSession } from './session.js'
 
+export type ApplicationSubmission = ApplicationOperation & { readonly attemptId: string }
+
 /** A saved immutable attempt. Cancelling a waiter never cancels its command. */
 export class ApplicationOperation {
   constructor(readonly session: ApplicationSession, readonly operationId: string, readonly author?: string) {}

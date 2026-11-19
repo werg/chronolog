@@ -208,7 +208,9 @@ class Replica implements PeerReplica {
         const result = decodePeerValue<AppliedResult>(resultBytes)
         check(result.status === 'applied' && result.attemptId === command.attempt.id && result.generation === generation.id &&
           result.sequence === index && result.operationId === command.receipt.payload.operationId &&
-          result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected'), 'PEER_RESULT_JOURNAL_INVALID')
+          result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected') &&
+          (result.failingStatementIndex === undefined || result.outcome === 'rejected' &&
+            Number.isSafeInteger(result.failingStatementIndex) && result.failingStatementIndex >= 0), 'PEER_RESULT_JOURNAL_INVALID')
         this.#lastOutcomes.set(command.attempt.id, result)
       }
     }
@@ -335,10 +337,14 @@ class Replica implements PeerReplica {
       check(outcome !== null, 'PEER_OUTCOME_MISSING')
       const result: AppliedResult = { status: 'applied', attemptId: attempt.id, operationId: receipt.payload.operationId,
         author: receipt.payload.author, generation: receipt.payload.generation, sequence: receipt.payload.sequence,
-        outcome: outcome.outcome, rejectionCode: outcome.rejectionCode }
+        outcome: outcome.outcome, rejectionCode: outcome.rejectionCode,
+        ...(outcome.failingStatementIndex === null ? {} : { failingStatementIndex: outcome.failingStatementIndex }) }
       const previous = this.#lastOutcomes.get(attempt.id)
-      check(previous === undefined || samePeerValue(previous, result), 'PEER_REPLAY_OUTCOME_CONFLICT')
-      if (previous === undefined) await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
+      // Older journals saved the outcome code alone. Recover its precise step from replay.
+      const restoreStep = previous !== undefined && previous.failingStatementIndex === undefined && result.failingStatementIndex !== undefined
+      check(previous === undefined || samePeerValue(restoreStep ? { ...previous, failingStatementIndex: result.failingStatementIndex } : previous, result),
+        'PEER_REPLAY_OUTCOME_CONFLICT')
+      if (previous === undefined || restoreStep) await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
       this.#lastOutcomes.set(attempt.id, result)
     }
   }
@@ -529,6 +535,13 @@ class Replica implements PeerReplica {
   }
   operation(operationId: string, author = this.device.publicKey): Promise<OperationState | null> {
     return this.#serial.run(async () => { this.#assertReady(); const id = this.#operations.get(operationKey(author, operationId)); return id === undefined ? null : this.#state(this.#attempts.get(id)!) })
+  }
+  operationByAttempt(attemptId: string, author: string): Promise<OperationState | null> {
+    return this.#serial.run(async () => {
+      this.#assertReady()
+      const attempt = this.#attempts.get(attemptId)
+      return attempt?.payload.header.author === author ? this.#state(attempt) : null
+    })
   }
   attempt(operationId: string, author = this.device.publicKey): Promise<SignedAttempt | null> {
     return this.#serial.run(async () => { this.#assertOpen(); const id = this.#operations.get(operationKey(author, operationId)); return structuredClone(id === undefined ? null : this.#attempts.get(id)!) })

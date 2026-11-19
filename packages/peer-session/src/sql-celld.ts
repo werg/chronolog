@@ -24,3 +24,6 @@ export function openCelldSqlApplication<const D extends ApplicationDefinition>(o
     createEngine: () => createCelldSqlEngine(sqlStorage, engineOptions),
   })
 }
+
+export { celldGroupData, type CelldGroupQueryResult } from './celld-group-data.js'
+export { encodeChangeProgram, decodeChangeProgram, type ChangeProgram } from '@chronolog/protocol'

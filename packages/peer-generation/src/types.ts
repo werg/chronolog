@@ -45,6 +45,8 @@ export interface AppliedResult {
   readonly sequence: number
   readonly outcome: 'accepted' | 'rejected'
   readonly rejectionCode: string | null
+  /** Zero-based failing program step, when the materializer can identify it. */
+  readonly failingStatementIndex?: number
 }
 export type OperationState =
   | { readonly status: 'saved'; readonly attemptId: string; readonly operationId: string; readonly generation: string }
@@ -128,6 +130,7 @@ export interface PeerReplica {
   synchronize(authority: AuthorityBundle, commands: readonly OrderedCommand[] | AsyncIterable<readonly OrderedCommand[]>, options?: { readonly at?: PeerRevision }): Promise<RecoveryNotice | null>
   receiveHistory(authority: AuthorityBundle, commands: readonly OrderedCommand[]): Promise<HistoryReceiveResult>
   operation(operationId: string, author?: string): Promise<OperationState | null>
+  operationByAttempt(attemptId: string, author: string): Promise<OperationState | null>
   attempt(operationId: string, author?: string): Promise<SignedAttempt | null>
   capture(): Promise<CapturedPeerView>
   /** Validate the current complete prefix, or a complete selected ancestor while newer inherited bodies are unavailable. Does not publish a recovering view. */

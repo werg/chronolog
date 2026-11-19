@@ -12,7 +12,7 @@ import type { ApplicationDataPort } from './participant-types.js'
 import { APPLICATION_EVENT_CURSOR_LIMIT, type ApplicationChange, type ApplicationEvent, type ApplicationEventBatch,
   type ApplicationEventOptions, type ApplicationReadView, type CommandOptions, type QueryParameter } from './session-types.js'
 import { AbandonedOperationError, RecoveredViewError } from './errors.js'
-import { ApplicationOperation } from './operation.js'
+import { ApplicationOperation, type ApplicationSubmission } from './operation.js'
 import { ApplicationRecovery } from './recovery.js'
 import { ApplicationContent } from './content.js'
 import { ApplicationKeyring } from './keys.js'
@@ -78,12 +78,12 @@ export class ApplicationData<D extends ApplicationDefinition = ApplicationDefini
     return new ApplicationOperation(this.#session, options.operationId)
   }
 
-  async submitProgramAs(program: ChangeProgram, author: PeerIdentity, options: CommandOptions): Promise<ApplicationOperation> {
+  async submitProgramAs(program: ChangeProgram, author: PeerIdentity, options: CommandOptions): Promise<ApplicationSubmission> {
     this.#assertOpen()
-    const { payload: { header } } = await this.#replica.prepareAs({ operationId: options.operationId, program,
+    const { id: attemptId, payload: { header } } = await this.#replica.prepareAs({ operationId: options.operationId, program,
       ...(options.basedOn === undefined ? {} : { basedOn: options.basedOn }) }, author)
     void this.retry(header.operationId, header.author).catch(() => undefined)
-    return new ApplicationOperation(this.#session, header.operationId, header.author)
+    return Object.assign(new ApplicationOperation(this.#session, header.operationId, header.author), { attemptId })
   }
 
   async reapply<Name extends keyof D['commands'] & string>(operationId: string, name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions & { readonly originalAuthor?: string }): Promise<ApplicationOperation> {
