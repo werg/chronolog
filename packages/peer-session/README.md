@@ -739,3 +739,77 @@ owner, projection owner or OPFS implementation before a dynamic data demand.
 It also checks that browser entries import no native runtime even when the archive
 contains the native adapter. Shared chunks
 retain one session and one materializer class across all entries.
+
+## Multiple local clients, one session owner
+
+The owner/attachment protocol is `chronolog/peer-session/owner/v2`. It is independent
+of the immutable application definition and selected history generation. The
+existing dedicated `serveApplicationWorker` / `connectApplicationWorker` pair is
+still a single-client lifetime; use the owner API for concurrent tabs or tools.
+
+```ts
+// Worker entrypoint: acquire protocol ownership before opening profile identity.
+import { acquireApplicationOwnerLock, createApplicationOwner } from '@chronolog/peer-session/worker';
+const lease = await acquireApplicationOwnerLock(retainedProfileId);
+const session = await openTheRetainedApplication();
+const owner = createApplicationOwner(session, {
+  lastClient: 'keep-alive',
+  prepareCommand(endpoint, name, input) {
+    return bindApplicationSource(input, endpoint); // Optional product validation.
+  },
+});
+// SharedWorker: every onconnect port accepts isolated application attachments.
+self.onconnect = event => owner.attach(event.ports[0]);
+// On deliberate shutdown: await owner.close(); await lease.close();
+```
+
+```ts
+import { connectApplicationOwner } from '@chronolog/peer-session/browser';
+const attached = await connectApplicationOwner(sharedWorker.port, {
+  applicationId, definitionId: definition.id, definitionVersion: definition.version,
+  context: { viewId: retainedViewId, documentPath: '/review.html', publicationId },
+});
+const actualViewId = attached.endpoint.context.viewId;
+await attached.command('review', input, { operationId: retainedOperationId });
+await attached.detach(); // Does not close the session, journal, or sibling clients.
+```
+
+One owner allocates a fresh endpoint ID and incarnation for each exact port. The
+owner supplies these fields on live signals and passes them to its optional command
+composition callback. A caller cannot choose another endpoint ID. Document, run and
+publication context is marked `caller-asserted` unless the trusted owner policy
+validates it. A duplicated live `viewId` receives a new view ID; after detach the
+original view can be deliberately restored with a new endpoint incarnation.
+`endpoint.suspend` and `resumeAttachment` preserve the incarnation only while that
+exact original binding survives. A replaced port must reconnect and reconcile its
+original operation references.
+
+Each attachment has its own RPC IDs, cancel scopes, captured views, projection
+handles and bounded streams. Bad frames and detach dispose only that attachment.
+Projection close releases the caller's handle and streams without closing the
+owner's shared projection registration. Ordinary clients cannot adopt authority,
+recover, close participation, or shut down the owner. A trusted `owner.attach(port,
+{ capabilities: [...] })` or `authorize(handshake)` policy can grant ownerAdmin,
+restrict declared commands/queries, and set smaller quotas; client metadata never
+grants capabilities. Query restrictions should omit `events`/`content` when raw
+reads must be unavailable. These are same-profile delegation controls, not a
+sandbox between mutually hostile scripts sharing one origin and signer.
+
+Default bounds are 32 attachments, 16 active requests / 8 streams / 8 held views
+per attachment, and 512 requests / 256 streams / 128 views across the owner.
+Releases, cancellation and detach retain cleanup capacity when passive waiters fill
+ordinary admission. Congestion rejects explicitly before dispatch instead of
+creating another command queue. Configure the session's signal subscription budget
+to match the chosen profile. `signals: { localEcho: true, limits:
+{ maxSubscriptions: 256 } }` permits local live fan-out without requiring a remote
+peer. Attaching, status observations, endpoint inspection, and signals leave the
+application database lazy; a data read or command opens it once.
+
+The lightweight `chronolog-owner:<profileId>` Web Lock is separate from the real
+`chronolog:<profileId>` durable storage lock. Neither is stolen after a heartbeat
+or suspension timeout. Hold the owner lease until session shutdown has released
+its resources. A failed acquisition returns `OWNER_BUSY`; missing Web Locks returns
+`APPLICATION_OWNER_LOCK_UNAVAILABLE`. Do not create a replacement signing identity
+as a fallback. SharedWorker and elected-context compositions must negotiate one
+compatible immutable owner artifact and use the same profile lease; transport/RTC
+host handoff remains an explicit product composition responsibility.

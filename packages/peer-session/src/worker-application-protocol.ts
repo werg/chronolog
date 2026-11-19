@@ -2,6 +2,7 @@ import type { OperationState, PeerRevision } from '@chronolog/peer-generation'
 import type { ApplicationSession } from './session.js'
 import type { SessionStatus } from './session-types.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
+import type { ApplicationEndpointBinding, APPLICATION_OWNER_PROTOCOL } from './owner-types.js'
 import type { ApplicationParticipationStatus } from './participation-types.js'
 
 export const PROTOCOL = 'chronolog/peer-session/worker-application/v1'
@@ -15,9 +16,11 @@ export interface Snapshot {
   readonly participation: ApplicationParticipationStatus | null
 }
 export interface Metadata extends Snapshot {
-  readonly protocol: typeof PROTOCOL
+  readonly protocol: typeof PROTOCOL | typeof APPLICATION_OWNER_PROTOCOL
   readonly applicationId: string; readonly historyId: string; readonly deviceId: string; readonly storageId: string
   readonly description: Description
+  readonly endpoint?: ApplicationEndpointBinding
+  readonly signalDelivery?: 'neighbors' | 'application'
 }
 export interface WireError { readonly name: string; readonly message: string; readonly code?: string; readonly operation?: OperationState; readonly revision?: PeerRevision }
 export interface Request { readonly id: number; readonly method: string; readonly args: readonly unknown[] }

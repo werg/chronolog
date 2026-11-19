@@ -235,8 +235,12 @@ export class SignalChannel implements Signals {
           this.#assertFresh(value)
           if (!this.#remember(value)) throw new SignalError('SIGNAL_BACKPRESSURE')
           const local = this.#options.localEcho === true
-          if (local) this.#deliver(value, frame.length)
-          if (routes.length > 0 ? !await this.#dispatch({ value, authorization, frame }, routes, signal, !local) && !local : !local) {
+          if (local) {
+            this.#deliver(value, frame.length)
+            // Local attachments must not wait behind an unavailable network route.
+            if (routes.length > 0) void this.#dispatch({ value, authorization, frame }, routes, signal, false).catch(() => undefined)
+          }
+          if (!local && !await this.#dispatch({ value, authorization, frame }, routes, signal, true)) {
             // Every route explicitly refused before dispatch. No future loop can
             // replay this intent; retain its sequence but release replay budget.
             this.#forget(value)
