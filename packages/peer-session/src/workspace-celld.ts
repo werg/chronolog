@@ -219,21 +219,28 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
       } catch (error) { await connection.close(); throw error }
     }
 
-    async #ensureLink(group: CelldGroupControl): Promise<void> {
-      const creator = await group.origin()
-      if (creator === null || this.#links.has(creator.publicKey)) return
-      return this.#dial ??= this.#attach(creator, group).finally(() => { this.#dial = undefined })
+    async #ensureLink(group: CelldGroupControl, origin: CelldGroupNode): Promise<void> {
+      if (this.#links.has(origin.publicKey)) return
+      return this.#dial ??= this.#attach(origin, group).finally(() => { this.#dial = undefined })
+    }
+
+    async #synchronizeOrigin(group: CelldGroupControl, origin: CelldGroupNode): Promise<void> {
+      await this.#ensureLink(group, origin)
+      const link = this.#links.get(origin.publicKey)
+      if (link === undefined) throw new Error('CELLD_GROUP_COORDINATOR_UNAVAILABLE')
+      await link.synchronize()
     }
 
     async #prepareData(group: CelldGroupControl, session: ApplicationSession): Promise<void> {
-      if (await group.origin() === null) return
+      const origin = await group.origin()
+      if (origin === null) return
       await session.keys.missing()
       if (session.revision === null) {
-        await this.#ensureLink(group)
+        await this.#synchronizeOrigin(group, origin)
       } else {
         // A previously synchronized workspace may read retained data and save
         // new signed attempts while the selected coordinator is offline.
-        void this.#ensureLink(group).catch(() => undefined)
+        void this.#ensureLink(group, origin).catch(() => undefined)
       }
     }
 
@@ -273,12 +280,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
         }
         if (input.action === 'sign-publication' || input.action === 'verify-publication') {
           const origin = await group.origin()
-          if (origin !== null) {
-            await this.#ensureLink(group)
-            const link = this.#links.get(origin.publicKey)
-            if (link === undefined) throw new Error('CELLD_GROUP_COORDINATOR_UNAVAILABLE')
-            await link.synchronize()
-          }
+          if (origin !== null) await this.#synchronizeOrigin(group, origin)
           const authority = session.authority
           if (input.action === 'sign-publication') {
             const publisher = await principal(input.principal)
