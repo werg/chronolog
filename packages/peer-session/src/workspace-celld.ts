@@ -193,7 +193,8 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
             const origin = this.env.CHRONOLOG_P2P.nodeId
             if (binding === undefined || input.proof.payload.sourceNodeId !== origin ||
                 input.proof.payload.destinationNodeId !== input.destination.nodeId) return denied()
-            if (!await this.state.storage.get(`group:${input.proof.payload.applicationId}`)) return denied()
+            const group = await this.state.storage.get<string>('shared-history')
+            if (group === undefined || group !== input.proof.payload.applicationId) return denied()
             const carrier = celldDoltPublicationPeer(binding, input.destination, input.proof)
             switch (input.kind) {
               case 'grant': return reply(await carrier.grant())
@@ -218,6 +219,11 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
             this.#binding = binding.catch(() => undefined)
             await binding
             return reply({ group: input.group })
+          }
+          case 'sign-publication': {
+            const group = await this.state.storage.get<string>('shared-history')
+            if (group === undefined || group !== input.group) return denied()
+            return await submit(this.env, input.group, input)
           }
           case 'create': {
             const group = await peerDigest(['chronolog/workspace/group/v1', this.env.WORKSPACE_ID, input.principal.publicKey, input.operationId])
@@ -350,7 +356,8 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
         if (input.action === 'bind-history') {
           const origin = await group.origin()
           if (origin !== null) await this.#synchronizeOrigin(group, origin)
-          return session.memberGrant(input.publicKey)?.administrator === true ? reply(true) : denied()
+          const grant = session.memberGrant(input.publicKey)
+          return grant?.administrator === true || grant?.publisher === true ? reply(true) : denied()
         }
         if (input.action === 'sign-publication' || input.action === 'verify-publication') {
           const origin = await group.origin()

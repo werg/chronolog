@@ -3,8 +3,9 @@ import {
   signApplicationDescriptor, signControlRevision, signTransitionRequest,
 } from '@chronolog/peer-generation/control'
 import { MemoryBytesStore } from '@chronolog/records'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { signCelldWorkspacePublication, verifyCelldWorkspacePublication } from './celld-workspace-publication.js'
+import { createCelldWorkspaceClasses } from './workspace-celld.js'
 
 const transition = {
   sourceNodeId: 'a2'.repeat(32), destinationNodeId: 'b1'.repeat(32), workspaceId: 'ws_application',
@@ -61,5 +62,49 @@ describe('celld workspace publication authority', () => {
       .rejects.toThrow('CELLD_WORKSPACE_PUBLICATION_AUTHORITY_CHANGED')
     await expect(signCelldWorkspacePublication({ authority: current, transition, publisher }))
       .rejects.toThrow('CELLD_WORKSPACE_PUBLICATION_FORBIDDEN')
+  })
+
+  it('allows signing and sending workspace history only for the selected sharing group', async () => {
+    const { authority, publisher } = await fixture()
+    const proof = await signCelldWorkspacePublication({ authority, transition, publisher })
+    const group = proof.payload.applicationId, other = 'de'.repeat(32)
+    const records = new Map<string, unknown>([[`group:${group}`, true], [`group:${other}`, true]])
+    const groupRequest = vi.fn(async (request: Request) => {
+      const { action } = await request.json() as { action: string }
+      return Response.json(action === 'sign-publication' ? proof : true)
+    })
+    const connect = vi.fn(async () => { throw new Error('TEST_DIALED') })
+    const { ChronologWorkspaceDO } = createCelldWorkspaceClasses({
+      DurableObject: class {}, socketPair: () => { throw new Error('Unexpected socket pair') },
+      encode: JSON.stringify, decode: JSON.parse, publication: () => async () => { throw new Error('Unexpected incoming request') },
+    })
+    const workspace = new ChronologWorkspaceDO({ storage: {
+      async get<T>(name: string) { return records.get(name) as T | undefined },
+      async put(name, value) { records.set(name, value) },
+      async list<T>() { return new Map<string, T>() },
+    } }, {
+      WORKSPACE_ID: transition.workspaceId, CHRONOLOG_PUBLIC_KEY: publisher.publicKey,
+      CHRONOLOG_SIGNING_KEY: '', CHRONOLOG_ROOT_TOKEN: 'root-token', CHRONOLOG_GROUP_TOKEN: 'group-token',
+      CHRONOLOG_P2P: { nodeId: transition.sourceNodeId, connect }, CHRONOLOG_HISTORY_P2P: { connect },
+      CHRONOLOG_GROUPS: { getByName: () => ({ fetch: groupRequest }) },
+    })
+    const request = (input: Record<string, unknown>) => workspace.fetch(new Request('http://chronolog/', {
+      method: 'POST', headers: { 'x-chronolog-node-token': 'root-token' }, body: JSON.stringify(input),
+    }))
+    const sign = (group: string) => request({ action: 'sign-publication', group, transition })
+    const transfer = (proof: Awaited<ReturnType<typeof signCelldWorkspacePublication>>) => request({
+      action: 'history-transfer', destination: { nodeId: transition.destinationNodeId }, proof, kind: 'grant',
+    })
+    expect((await sign(group)).status).toBe(403)
+    expect((await transfer(proof)).status).toBe(403)
+    expect(groupRequest).not.toHaveBeenCalled()
+    expect(connect).not.toHaveBeenCalled()
+    expect((await request({ action: 'bind-history', group, publicKey: publisher.publicKey })).ok).toBe(true)
+    expect((await sign(other)).status).toBe(403)
+    expect((await transfer({ ...proof, payload: { ...proof.payload, applicationId: other } })).status).toBe(403)
+    expect(connect).not.toHaveBeenCalled()
+    await expect((await sign(group)).json()).resolves.toEqual(proof)
+    expect((await transfer(proof)).status).toBe(409)
+    expect(connect).toHaveBeenCalledOnce()
   })
 })
