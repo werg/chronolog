@@ -94,7 +94,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       subscribe: listener => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener) } },
       get data() { return session.#data?.replica.closed === false ? session.#data : undefined }, openData: () => this.#openData(),
     }
-    const signals = new SignalChannel({ scope: this.applicationId,
+    const signals = new SignalChannel({ ...options.signals?.limits, scope: this.applicationId,
+      relay: options.signals?.delivery === 'application', localEcho: options.signals?.localEcho === true,
       identity: { publicKeyBytes: hexToBytes(this.deviceId), privateKey: options.device.identity.privateKey },
       authorize: ({ scope, authorId }) => scope === this.applicationId && this.#participant.grant(bytesToHex(authorId))?.reader === true })
     this.signals = signals
@@ -138,8 +139,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   get deviceId(): string { return this.#options.device.identity.publicKey }
   get applicationId(): string { return this.#participant.descriptor.applicationId }
   get historyId(): string { return this.#participant.descriptor.historyId }
-  /** The currently selected, authenticated control kept by this participant. */
-  get authority(): AuthorityBundle { this.#assertOpen(); return this.#participant.authority }
   get storageId(): string { return this.#options.device.storageId }
   get participation(): ApplicationParticipation | undefined { return this.#participation }
   get status(): SessionStatus {
@@ -150,6 +149,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       generation: this.#participant.generation.id, coordinator, connectedPeers: this.#peers.size }
   }
   describe() { return { ...describeApplication(this.#options.definition), capabilities: this.capabilities } }
+  /** Public signed authority already verified by this owner; no data activation or host request. */
+  async authority(): Promise<AuthorityBundle> {
+    this.#assertOpen()
+    return structuredClone(this.#participant.authority)
+  }
   onStatus(listener: (status: SessionStatus) => void): () => void {
     this.#statusListeners.add(listener)
     try { listener(this.status) } catch { /* Observers cannot change ownership. */ }

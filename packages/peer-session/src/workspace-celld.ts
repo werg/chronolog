@@ -362,7 +362,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
         if (input.action === 'sign-publication' || input.action === 'verify-publication') {
           const origin = await group.origin()
           if (origin !== null) await this.#synchronizeOrigin(group, origin)
-          const authority = session.authority
+          const authority = await session.authority()
           if (input.action === 'sign-publication') {
             const publisher = await principal(input.principal)
             if (input.transition.sourceNodeId !== this.env.CHRONOLOG_P2P.nodeId)
@@ -371,7 +371,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
             if (await group.peer(input.transition.destinationNodeId) === null)
               throw new Error('CELLD_WORKSPACE_HISTORY_DESTINATION_NOT_ADMITTED')
             const proof = await signCelldWorkspacePublication({ authority, transition: input.transition, publisher })
-            if (session.authority.generations.at(-1)?.id !== proof.payload.generation)
+            if ((await session.authority()).generations.at(-1)?.id !== proof.payload.generation)
               throw new Error('CELLD_WORKSPACE_PUBLICATION_AUTHORITY_CHANGED')
             return reply(proof)
           }
@@ -380,7 +380,7 @@ export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode,
               previousHead: input.previousHead, proposedHead: input.proposedHead },
             publication: input.proof,
           })
-          if (session.authority.generations.at(-1)?.id !== input.proof.payload.generation)
+          if ((await session.authority()).generations.at(-1)?.id !== input.proof.payload.generation)
             throw new Error('CELLD_WORKSPACE_PUBLICATION_AUTHORITY_CHANGED')
           return reply({ publisher })
         }

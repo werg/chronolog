@@ -20,7 +20,7 @@ const definition = defineApplication({ id: 'network', version: '1', commands: {
 }, queries: {} })
 const closing: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of closing.splice(0).reverse()) await close() })
-async function fixture(options: { readerOnly?: boolean; relay?: true } = {}) {
+async function fixture(options: { readerOnly?: boolean; relay?: true; localEcho?: boolean } = {}) {
   const host = await createPeerIdentity(), account = await createPeerIdentity(), a = await openApplicationDevice({ store: new MemoryBytesStore(), create: true }),
     b = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
@@ -40,6 +40,7 @@ async function fixture(options: { readerOnly?: boolean; relay?: true } = {}) {
     coordinator: a.identity.publicKey, requester: a.identity.publicKey, controlRevision: 0, reason: 'create', base: null }, a.identity))
   const openCold = async (device: typeof a, epochKeys = keys, createMaterializer?: OpenPeerApplicationOptions['createMaterializer']) => {
     const session = await openPeerApplication({ device, definition, authority: await registry.read(), epochKeys,
+      ...(options.localEcho === undefined ? {} : { signals: { localEcho: options.localEcho } }),
       ...(createMaterializer === undefined ? {} : { createMaterializer }) })
     closing.push(() => session.close()); return session
   }
@@ -67,6 +68,64 @@ function rewriteParticipant(connection: FramedPeerConnection, identity: string, 
 }
 
 describe('authenticated peer application connections', () => {
+  it('keeps shared replication alive when a local-echo caller aborts during asynchronous live encryption', async () => {
+    const f = await fixture({ localEcho: true }), a = await f.open(f.a), b = await f.open(f.b)
+    const [left, right] = createFramedPeerConnectionPair(), frames: Uint8Array[] = []
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: { ...right,
+      live: { ...right.live!, async trySend(frame, options) { frames.push(frame); return right.live!.trySend(frame, options) } },
+    } })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize()))
+    let entered!: () => void, release!: () => void, finished!: () => void, hold = true
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve }),
+      encrypted = new Promise<void>(resolve => { finished = resolve })
+    const actualEncrypt = crypto.subtle.encrypt.bind(crypto.subtle)
+    const encryption = vi.spyOn(crypto.subtle, 'encrypt').mockImplementation((algorithm, key, data) => {
+      const result = actualEncrypt(algorithm, key, data)
+      const aad = typeof algorithm === 'object' && 'additionalData' in algorithm ? algorithm.additionalData : undefined
+      // Execute real WebCrypto, then control its asynchronous completion. Only
+      // this live lane is held; encrypted reliable RPC remains independent.
+      if (hold && aad instanceof ArrayBuffer && new Uint8Array(aad)[1] === 2) {
+        hold = false; entered()
+        return result.then(async value => { await gate; finished(); return value })
+      }
+      return result
+    })
+    const reviewer = new AbortController(), reason = new Error('reviewer finished after local progress')
+    const turn = async (): Promise<void> => new Promise(resolve => { setTimeout(resolve, 0) })
+    try {
+      const echoed = await b.signals.send('progress', { runId: 'reviewer', completed: 1 }, { signal: reviewer.signal, ttlMs: 5000 })
+      expect(echoed.payload).toEqual({ runId: 'reviewer', completed: 1 }); await started
+      reviewer.abort(reason); await turn(); await turn()
+      expect(links.map(link => link.signal.reason)).toEqual([undefined, undefined])
+      expect(frames).toHaveLength(0)
+      const sibling = await b.command('say', 'sibling durable work survives a reviewer cancellation', { operationId: 'after-reviewer-abort' })
+      await sibling.applied({ signal: AbortSignal.timeout(5000) }); await links[0].synchronize()
+      const view = await a.readView()
+      expect(view.readEvents().events.map(event => event.payload)).toContainEqual({ text: 'sibling durable work survives a reviewer cancellation' })
+      view.release()
+      release(); await encrypted; await turn()
+      expect(frames).toHaveLength(0)
+      const observations = a.signals.subscribe({ topics: ['progress'], signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), received = observations.next()
+      const fresh = await b.signals.send('progress', { runId: 'sibling', completed: 1 })
+      expect((await received).value).toEqual(fresh); await observations.return?.()
+      expect(frames).toHaveLength(1); expect(links.every(link => !link.signal.aborted)).toBe(true)
+    } finally { release(); encryption.mockRestore() }
+  })
+
+  it('preserves the actual live transport retirement reason without closing the application session', async () => {
+    const f = await fixture({ localEcho: true }), a = await f.openCold(f.a), b = await f.openCold(f.b)
+    const [left, right] = createFramedPeerConnectionPair(), failure = new Error('physical live dispatch failed')
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: { ...right,
+      live: { ...right.live!, async trySend() { throw failure } },
+    } })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await b.signals.send('progress', { completed: 1 })
+    await expect.poll(() => links[1].signal.aborted).toBe(true)
+    expect(links[1].signal.reason).toBe(failure)
+    expect(a.signal.aborted).toBe(false); expect(b.signal.aborted).toBe(false)
+  })
+
   it('keeps authentication, state and live traffic cold, then adds data on the same connection only after local demand', async () => {
     const f = await fixture(), openA = vi.fn(() => f.a.openStorage()), openB = vi.fn(() => f.b.openStorage())
     const a = await f.openCold({ ...f.a, openStorage: openA }), b = await f.openCold({ ...f.b, openStorage: openB })
@@ -209,7 +268,9 @@ describe('authenticated peer application connections', () => {
     closing.push(async () => { await Promise.all(links.map(link => link.close())) })
     await Promise.all(links.map(link => link.synchronize())); inject = true
     await expect(links[1].synchronize()).rejects.toThrow('APPLICATION_NETWORK_CURSOR_INVALID')
-    await expect.poll(() => links[1].signal.aborted).toBe(true)
+    // Explicit synchronization fences invalid input before returning its error;
+    // correctness cannot depend on a coincident background hint sharing the pull.
+    expect(links[1].signal.aborted).toBe(true)
     expect(openA).not.toHaveBeenCalled(); expect(openB).not.toHaveBeenCalled()
   })
 

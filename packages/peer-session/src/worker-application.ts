@@ -1,3 +1,4 @@
+import { APPLICATION_OWNER_PROTOCOL, type ApplicationOwnerHandshake, type ApplicationEndpointBinding, type ApplicationEndpointState } from './owner-types.js'
 import type { AuthorityBundle, AppliedResult, OperationState, PeerRevision, PrefixProof, RecoveryNotice, SignedAttempt, SignedRetainedCoverage } from '@chronolog/peer-generation'
 import { PEER_GENERATION_CAPABILITIES, validateApplicationDescription } from '@chronolog/peer-generation/metadata'
 import type { EphemeralSignal, Signals } from '@chronolog/signals'
@@ -41,6 +42,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   readonly historyId: string
   readonly deviceId: string
   readonly storageId: string
+  readonly endpoint: ApplicationEndpointBinding | undefined
   readonly capabilities: Description['capabilities']
   readonly participation: ApplicationParticipation | undefined
   readonly operations = {
@@ -63,9 +65,9 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
     },
   }
   readonly signals: Signals = {
-    send: (topic, payload, options = {}) => this.#call('signals.send', [topic, payload, options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }], options.signal),
+    send: (topic, payload, options = {}) => this.#call('signals.send', [topic, payload, { ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }), ...(options.stream === undefined ? {} : { stream: options.stream }) }], options.signal),
     subscribe: (options = {}) => this.#stream<EphemeralSignal>('signals', [{ ...(options.topics === undefined ? {} : { topics: options.topics }),
-      ...(options.mode === undefined ? {} : { mode: options.mode }) }], options.signal),
+      ...(options.mode === undefined ? {} : { mode: options.mode }), ...(options.streams === undefined ? {} : { streams: options.streams }) }], options.signal),
   }
   readonly content = {
     stage: async (options: { readonly bytes: number; readonly mediaType?: string }): Promise<ContentUpload> => this.#upload(await this.#call('content.stage', [options])),
@@ -95,6 +97,10 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   constructor(port: MessagePort, metadata: Metadata, timeoutMs: number, signal?: AbortSignal) {
     this.#port = port; this.#timeoutMs = timeoutMs; this.#snapshot = metadata
     this.applicationId = metadata.applicationId; this.historyId = metadata.historyId; this.deviceId = metadata.deviceId; this.storageId = metadata.storageId
+    this.endpoint = metadata.endpoint === undefined ? undefined : Object.freeze({ ...metadata.endpoint,
+      context: Object.freeze({ ...metadata.endpoint.context }), capabilities: Object.freeze([...metadata.endpoint.capabilities]),
+      ...(metadata.endpoint.identity === undefined ? {} : { identity: Object.freeze({ ...metadata.endpoint.identity }) }) })
+    Object.defineProperty(this.signals, 'delivery', { value: metadata.signalDelivery ?? 'neighbors', enumerable: true })
     this.capabilities = Object.freeze({ ...metadata.description.capabilities })
     this.#description = { ...metadata.description, capabilities: this.capabilities }
     if (metadata.participation !== null) {
@@ -120,16 +126,19 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
     }
     // Every response carries the current coherent snapshot; an older coalesced
     // callback value must not replace that newer observed status.
+    if (this.endpoint === undefined || this.endpoint.capabilities.includes('diagnostics')) {
     void this.#observe('status', () => {}).catch(error => this.#fail(error))
     void this.#observe('recovery', notice => {
       for (const listener of this.#recoveryListeners) { try { listener(notice as RecoveryNotice) } catch { /* Observers cannot change application progress. */ } }
     }).catch(error => this.#fail(error))
     if (this.participation !== undefined) void this.#observe('participation', () => {}).catch(error => this.#fail(error))
+    }
   }
   get signal(): AbortSignal { return this.#lifetime.signal }
   get status(): SessionStatus { return { ...this.#snapshot.status } }
   get revision(): PeerRevision | null { return structuredClone(this.#snapshot.revision) }
   describe(): Description { return structuredClone(this.#description) }
+  authority(): Promise<AuthorityBundle> { return this.#call('authority', []) }
   onStatus(listener: (status: SessionStatus) => void): () => void {
     this.#statusListeners.add(listener)
     try { listener(this.status) } catch { /* Observation does not own the session. */ }
@@ -187,6 +196,11 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       release: async () => { if (released) return; released = true; await this.#call('view.release', [captured.id]) },
     }
   }
+  /** Detach cancels this endpoint's observation only; the owner's journal survives. */
+  detach(): Promise<void> { return this.close() }
+  suspend(): Promise<void> { return this.#call('endpoint.suspend', []) }
+  resumeAttachment(): Promise<ApplicationEndpointBinding | null> { return this.#call('endpoint.resume', []) }
+  endpoints(): Promise<readonly (ApplicationEndpointBinding & { readonly state: ApplicationEndpointState })[]> { return this.#call('endpoints.list', []) }
   close(): Promise<void> {
     if (this.#closing !== undefined) return this.#closing
     this.#closing = (async () => {
@@ -331,6 +345,16 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
 export function connectApplicationWorker<D extends ApplicationDefinition = ApplicationDefinition>(endpoint: Endpoint, options: {
   readonly signal?: AbortSignal; readonly timeoutMs?: number
 } = {}): Promise<WorkerApplicationSession<D>> {
+  return connect<D>(endpoint, options, PROTOCOL)
+}
+/** Attach to an existing owner without opening a signer store or creating a session. */
+export function connectApplicationOwner<D extends ApplicationDefinition = ApplicationDefinition>(endpoint: Endpoint,
+  options: ApplicationOwnerHandshake & { readonly signal?: AbortSignal; readonly timeoutMs?: number }): Promise<WorkerApplicationSession<D>> {
+  const { signal, timeoutMs, ...handshake } = options
+  return connect<D>(endpoint, { ...(signal === undefined ? {} : { signal }), ...(timeoutMs === undefined ? {} : { timeoutMs }) }, APPLICATION_OWNER_PROTOCOL, handshake)
+}
+function connect<D extends ApplicationDefinition>(endpoint: Endpoint, options: { readonly signal?: AbortSignal; readonly timeoutMs?: number },
+  protocol: Metadata['protocol'], handshake?: ApplicationOwnerHandshake): Promise<WorkerApplicationSession<D>> {
   const timeoutMs = options.timeoutMs ?? 30_000
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) return Promise.reject(new Error('APPLICATION_WORKER_TIMEOUT_INVALID'))
   if (options.signal?.aborted) return Promise.reject(options.signal.reason)
@@ -349,7 +373,7 @@ export function connectApplicationWorker<D extends ApplicationDefinition = Appli
         const value = event.data as { ready?: Metadata; ended?: WireError }
         if (value.ended !== undefined) { fail(fromError(value.ended)); return }
         const metadata = value.ready
-        if (metadata === undefined || metadata.protocol !== PROTOCOL || !/^[0-9a-f]{64}$/u.test(metadata.applicationId) || !/^[0-9a-f]{64}$/u.test(metadata.deviceId) ||
+        if (metadata === undefined || metadata.protocol !== protocol || !/^[0-9a-f]{64}$/u.test(metadata.applicationId) || !/^[0-9a-f]{64}$/u.test(metadata.deviceId) ||
             typeof metadata.storageId !== 'string' || typeof metadata.historyId !== 'string') {
           throw new Error('APPLICATION_WORKER_METADATA_INVALID')
         }
@@ -360,13 +384,14 @@ export function connectApplicationWorker<D extends ApplicationDefinition = Appli
           throw new Error('APPLICATION_WORKER_METADATA_INVALID')
         }
         validateApplicationDescription(description)
+        if (handshake !== undefined && (metadata.applicationId !== handshake.applicationId || description.id !== handshake.definitionId || description.version !== handshake.definitionVersion || !validEndpoint(metadata.endpoint))) throw new Error('CONTRACT_INCOMPATIBLE')
         validateStatus(metadata.status); validateParticipation(metadata.participation)
         clean(); resolve(new WorkerApplicationSession<D>(port, metadata, timeoutMs, options.signal))
       } catch (error) { fail(error) }
     }
     const timer = setTimeout(() => fail(new Error('APPLICATION_WORKER_READY_TIMEOUT')), timeoutMs)
     options.signal?.addEventListener('abort', abort, { once: true }); port.addEventListener('message', ready); port.start()
-    try { endpoint.postMessage({ protocol: PROTOCOL, port: channel.port2 }, [channel.port2]) }
+    try { endpoint.postMessage({ protocol, port: channel.port2, ...(handshake === undefined ? {} : { handshake }) }, [channel.port2]) }
     catch (error) { fail(error) }
   })
 }
@@ -401,4 +426,12 @@ function validateStatus(value: unknown): asserts value is SessionStatus {
       !/^[0-9a-f]{64}$/u.test(status.generation) || typeof status.coordinator !== 'string' ||
       !/^[0-9a-f]{64}$/u.test(status.coordinator) || !Number.isSafeInteger(status.connectedPeers) ||
       status.connectedPeers < 0 || status.connectedPeers > 8) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+}
+
+function validEndpoint(value: ApplicationEndpointBinding | undefined): value is ApplicationEndpointBinding {
+  return value !== undefined && ['ownerInstanceId', 'endpointId', 'endpointIncarnation'].every(key =>
+    typeof value[key as keyof ApplicationEndpointBinding] === 'string' && /^[A-Za-z0-9-]{1,128}$/u.test(value[key as keyof ApplicationEndpointBinding] as string)) &&
+    value.evidence === 'owner-bound' && ['caller-asserted', 'owner-validated'].includes(value.contextEvidence) &&
+    value.context !== null && typeof value.context === 'object' && Array.isArray(value.capabilities) &&
+    value.capabilities.length <= 8 && value.capabilities.every((item: unknown) => typeof item === 'string' && ['commands', 'queries', 'events', 'content', 'signals', 'operations', 'diagnostics', 'ownerAdmin'].includes(item))
 }

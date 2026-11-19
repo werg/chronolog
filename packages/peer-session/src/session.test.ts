@@ -160,6 +160,13 @@ describe('public peer application sessions', () => {
     const reopened = await f.open(await openNativeDevice({ path: join(f.directory, 'b.sqlite') }), { data: false, authority: initial })
     expect(reopened.status).toMatchObject({ database: 'idle', generation: selected, coordinator: reopened.deviceId })
     expect(reopened.revision).toBeNull()
+    const authority = await reopened.authority()
+    expect(authority.generations.at(-1)?.id).toBe(selected)
+    Object.assign(authority.descriptor.payload, { applicationId: '00'.repeat(32) })
+    expect((await reopened.authority()).descriptor.payload.applicationId).toBe(reopened.applicationId)
+    expect(reopened.status.database).toBe('idle')
+    await reopened.close()
+    await expect(reopened.authority()).rejects.toThrow('APPLICATION_SESSION_CLOSED')
   })
 
   it('seeds a fresh peer with the selected inherited prefix before its application view is ready', async () => {

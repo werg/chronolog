@@ -41,6 +41,7 @@ export function createApplicationBackend(options: {
     capabilities: Object.freeze(['events', 'revision-views', 'operation-status', 'recovery',
       ...(session.capabilities.sql ? ['sql'] : []), ...(options.eventCommand === undefined ? [] : ['event-publication'])]),
     get status() { return session.status },
+    get endpoint() { return 'endpoint' in session ? session.endpoint : undefined },
     onStatus: session.onStatus.bind(session),
     submit,
     changes(input: ViewOptions & { readonly signal?: AbortSignal } = {}) {
