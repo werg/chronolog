@@ -13,13 +13,15 @@ import ts from 'typescript';
 const root = resolve(import.meta.dirname, '..');
 const { values } = parseArgs({ options: { output: { type: 'string', default: 'artifacts/peer-session' },
   'allow-dirty': { type: 'boolean', default: false }, 'native-rtc': { type: 'boolean', default: false },
-  'sql-native': { type: 'boolean', default: false }, 'sql-browser': { type: 'boolean', default: false } } });
+  'sql-native': { type: 'boolean', default: false }, 'sql-browser': { type: 'boolean', default: false },
+  'sql-celld': { type: 'boolean', default: false } } });
 const output = resolve(values.output), packageRoot = join(output, 'package');
-const sqlEnabled = values['sql-native'] || values['sql-browser'];
+const sqlEnabled = values['sql-native'] || values['sql-browser'] || values['sql-celld'];
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 const engineImport = '#chronolog-peer-native-engine';
 const entries = Object.fromEntries(['index', 'native', 'celld', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(values['native-rtc'] ? ['webrtc-native'] : []),
-  ...(sqlEnabled ? ['sql'] : []), ...(values['sql-native'] ? ['sql-native'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]
+  ...(sqlEnabled ? ['sql'] : []), ...(values['sql-native'] ? ['sql-native'] : []), ...(values['sql-browser'] ? ['sql-browser'] : []),
+  ...(values['sql-celld'] ? ['sql-celld'] : [])]
   .map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
   // Shared chunks preserve class identity and session ownership across all entrypoints.
@@ -38,7 +40,8 @@ assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).e
   'The session artifact must not fetch external runtime dependencies');
 // The common SQL path and browser adapter must stay independently browser-loadable,
 // even when the same archive also contains the optional native engine.
-for (const entry of ['index', 'celld', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(sqlEnabled ? ['sql'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]) {
+for (const entry of ['index', 'celld', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(sqlEnabled ? ['sql'] : []),
+  ...(values['sql-browser'] ? ['sql-browser'] : []), ...(values['sql-celld'] ? ['sql-celld'] : [])]) {
   const output = Object.entries(bundled.metafile.outputs).find(([, value]) => value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(output, `Missing bundled entry: ${entry}`);
   const visited = new Set();
@@ -87,7 +90,7 @@ const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.js
   ...(values['sql-native'] ? ['patches/@dolthub__doltlite@0.11.29.patch'] : [])])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('PEER_SESSION_PACKAGE_REQUIRES_CLEAN_INPUTS');
-const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}${values['native-rtc'] ? '-rtc' : ''}${values['sql-native'] ? '-sql' : ''}${values['sql-browser'] ? '-wasm' : ''}`, version = `0.0.0-g${suffix}`;
+const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}${values['native-rtc'] ? '-rtc' : ''}${values['sql-native'] ? '-sql' : ''}${values['sql-browser'] ? '-wasm' : ''}${values['sql-celld'] ? '-celld' : ''}`, version = `0.0.0-g${suffix}`;
 await rm(packageRoot, { force: true, recursive: true });
 await mkdir(packageRoot, { recursive: true });
 const files = new Map();

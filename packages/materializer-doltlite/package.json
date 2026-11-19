@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./browser": "./src/browser.ts",
+    "./celld": "./src/celld-engine.ts",
     "./testing": "./src/test-fixtures.ts"
   },
   "dependencies": {

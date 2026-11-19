@@ -40,6 +40,9 @@
       "@chronolog/materializer-doltlite/browser": [
         "packages/materializer-doltlite/src/browser.ts"
       ],
+      "@chronolog/materializer-doltlite/celld": [
+        "packages/materializer-doltlite/src/celld-engine.ts"
+      ],
       "@chronolog/signals": [
         "packages/signals/src/index.ts"
       ],
@@ -87,6 +90,9 @@
       ],
       "@chronolog/peer-session/sql-native": [
         "packages/peer-session/src/sql-native.ts"
+      ],
+      "@chronolog/peer-session/sql-celld": [
+        "packages/peer-session/src/sql-celld.ts"
       ],
       "@chronolog/peer-session/tendriller": [
         "packages/peer-session/src/tendriller.ts"

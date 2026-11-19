@@ -186,6 +186,14 @@ export class SqlProfileError extends Error {
   }
 }
 
+/** A deterministic refusal from the host's native SQL profile. */
+export class NativeSqlRejection extends Error {
+  constructor(readonly code: string) {
+    super(code)
+    this.name = 'NativeSqlRejection'
+  }
+}
+
 export function normalizeSqlRuntimeLimits(input: Partial<SqlRuntimeLimits> = {}): SqlRuntimeLimits {
   const limits = { ...DEFAULT_SQL_RUNTIME_LIMITS, ...input }
   for (const [name, value] of Object.entries(limits)) {
@@ -289,6 +297,11 @@ export function withProfiledStatement<T>(
   const limits = normalizeSqlRuntimeLimits(inputLimits)
   validateSqlSource(sql, limits)
   if (mode === 'consensus' || mode === 'local_read') assertProfilePragma(sql, mode)
+  if (database.nativeProfile !== undefined) {
+    if (mode !== 'platform' && mode !== 'local_read') throw new Error('MATERIALIZER_NATIVE_PROFILE_API_REQUIRED')
+    const statement = database.nativeProfile.prepare(sql, mode, limits)
+    try { return operation(statement) } finally { statement.finalize?.() }
+  }
   const phase: StatementPhase = { stepping: false }
   return withProfileControls(database, mode, limits, authorization, () => {
     let statement: StatementLike
@@ -315,6 +328,9 @@ export function withAuthorizer<T>(
   operation: () => T,
   authorization: SqlAuthorizationOptions = {},
 ): T {
+  // Native bootstrap uses fixed platform SQL through the host's own
+  // profiled transaction. Signed SQL never enters that capability.
+  if (database.nativeProfile !== undefined && mode === 'internal_bootstrap') return operation()
   database.setAuthorizer(createAuthorizer(mode, authorization))
   try {
     return operation()

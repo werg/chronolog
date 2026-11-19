@@ -170,7 +170,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         if (branch.name.startsWith('chronolog_read_')) opened.database.doltDeleteBranch(branch.name)
       }
 
-      const readerOpened = openDatabase(options)
+      const readerOpened = openDatabase(options, true)
       reader = readerOpened.database
       if (!bytesEqual(readerOpened.backend.engineDigest, options.engine.executionManifest.engineDigest)) {
         throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
@@ -185,7 +185,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       const finalPublished = discoverFinalRef(opened.database) ?? publishFinalRef(
         opened.database, 0n, [], checkpoints.find((checkpoint) => checkpoint.prefixLength === 0)!.doltCommitHash,
       )
-      finalReader = openDatabase(options).database
+      finalReader = openDatabase(options, true).database
       finalReader.doltCheckout(finalPublished.branchRef)
       verifyDatabaseState(finalReader, expected)
       const finalLog = readSystemLog(finalReader)
@@ -293,7 +293,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     const branch = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
     this.#writer.doltBranch(branch, published.doltCommitHash)
     let reader: DatabaseLike | undefined
-    try { reader = openDatabase(this.#sourceOptions).database; reader.doltCheckout(branch) }
+    try { reader = openDatabase(this.#sourceOptions, true).database; reader.doltCheckout(branch) }
     catch (error) { try { reader?.close() } finally { removeBranchIfPresent(this.#writer, branch) }; throw error }
     let released = false
     const release = (): void => {
@@ -391,7 +391,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       if (nextPublished.contentHash !== contentHash) throw new Error('MATERIALIZER_REVISION_CONTENT_MISMATCH')
       this.#publicationFault('after_revision_ref_created')
 
-      const candidateOpened = openDatabase(this.#sourceOptions)
+      const candidateOpened = openDatabase(this.#sourceOptions, true)
       candidateReader = candidateOpened.database
       candidateReader.doltCheckout(revisionBranch)
       verifyDatabaseState(candidateReader, this.#expected)
@@ -510,7 +510,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       }
       // Read and validate the exact SQL commit before publishing its final ref.
       const temporary = replayBranch ?? this.#published.branchRef
-      reader = openDatabase(this.#sourceOptions).database
+      reader = openDatabase(this.#sourceOptions, true).database
       reader.doltCheckout(temporary)
       verifyDatabaseState(reader, this.#expected)
       const log = readSystemLog(reader)
@@ -574,8 +574,14 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       // Roll back to the savepoint rather than the outer transaction: a full
       // ROLLBACK after checking out a replay branch can restore DoltLite's
       // previous branch working set, resurrecting later log rows.
-      if (rejection !== null) this.#writer.exec('ROLLBACK TO SAVEPOINT chronolog_program')
-      this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
+      if (rejection !== null && !this.#writer.inTransaction) {
+        // A native write interrupt has rolled back the whole program.
+        // Record the deterministic refusal in a new transaction.
+        this.#writer.exec('BEGIN IMMEDIATE')
+      } else {
+        if (rejection !== null) this.#writer.exec('ROLLBACK TO SAVEPOINT chronolog_program')
+        this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
+      }
       insertSystemLogRow(this.#writer, logRow(transaction, orderIndex, rejection))
       this.#writer.exec('COMMIT')
     } catch (error) {
@@ -663,6 +669,7 @@ function isFreshRepository(database: DatabaseLike): boolean {
      WHERE type IN ('table', 'view', 'trigger', 'index')
        AND name NOT LIKE 'sqlite_%'
        AND name NOT LIKE 'dolt_%'
+       ${database.nativeProfile === undefined ? '' : "AND name NOT GLOB '_cf_*'"}
      LIMIT 1
   `).get() === undefined
 }
@@ -746,8 +753,8 @@ async function validateTransactionSet(
   }
 }
 
-function openDatabase(options: MaterializerOptions): ReturnType<MaterializerOptions['engine']['openDatabase']> {
-  return options.engine.openDatabase({ path: options.path })
+function openDatabase(options: MaterializerOptions, readOnly = false): ReturnType<MaterializerOptions['engine']['openDatabase']> {
+  return options.engine.openDatabase({ path: options.path, ...(readOnly ? { readOnly } : {}) })
 }
 
 function verifyFinalTransactions(final: readonly TransactionLogRow[], transactions: readonly ReplayProposal[]): void {

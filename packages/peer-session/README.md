@@ -784,6 +784,14 @@ Use `--native-rtc` to include the optional native RTC entry. That archive declar
 the exact `werift@0.27.0` peer dependency; the default archive has no runtime
 package dependencies and remains SQL-free.
 
+`--sql-celld` includes `/sql-celld`, which opens a signed SQL application
+with `openCelldSqlApplication({ sqlStorage, device, definition, authority,
+schema })`. Bind `sqlStorage` to the application-owned Dolt cell with
+`sqlite_vec` enabled. Keep the device records outside the replicated SQL
+image. Use `createCelldSqlEngine(sqlStorage)` with `prepareSqlApplication`
+when signing the schema. Participants must use the same execution manifest,
+which includes the native engine build and its enabled module.
+
 `--sql-native` includes `/sql`, the thin native engine adapter and the exact
 compiled addon. `--sql-browser` includes `/sql` and the verified browser
 loader/factory without embedding an engine build. Both flags can be combined.

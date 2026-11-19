@@ -665,6 +665,7 @@ export class PlatformSession {
     const vecTables = new Map<string, number>()
     for (const object of objects) {
       const name = String(object.name)
+      if (this.#database.nativeProfile !== undefined && name.toLowerCase().startsWith('_cf_')) continue
       const sql = typeof object.sql === 'string' ? object.sql : ''
       if (object.type === 'table') tables.set(name.toLowerCase(), name)
       if (object.type === 'virtual') {

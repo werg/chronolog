@@ -38,7 +38,10 @@ export const SYSTEM_LOG_SQL = `
   `
 
 export function initializeSystemLog(database: DatabaseLike): void {
-  database.exec(SYSTEM_LOG_SQL)
+  if (database.nativeProfile === undefined) database.exec(SYSTEM_LOG_SQL)
+  // The celld profile runs one statement at a time. This fixed schema
+  // contains only CREATE statements with no internal semicolons.
+  else for (const statement of SYSTEM_LOG_SQL.split(';')) database.exec(statement)
 }
 
 export function insertExecutionManifest(database: DatabaseLike, manifest: StoredExecutionManifest): void {
@@ -57,14 +60,12 @@ export function readExecutionManifest(database: DatabaseLike): StoredExecutionMa
 }
 
 export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
-  const statement = database.prepare(`
+  const select = `
     SELECT tx_id, order_index, author_id, operation_id, author_timestamp_ms,
            candidate_digest, canonical_candidate, outcome, rejection_code, failing_statement_index
       FROM ${TRANSACTION_LOG_TABLE}
-     ORDER BY order_index
-  `)
-  statement.setReadBigInts?.(true)
-  return statement.all().map((raw) => {
+  `
+  const decode = (raw: Record<string, unknown> | unknown[]): TransactionLogRow => {
     if (Array.isArray(raw)) throw new Error('MATERIALIZER_EXPECTED_OBJECT_ROW')
     const outcome = raw.outcome
     if (outcome !== 'accepted' && outcome !== 'rejected') throw new Error('MATERIALIZER_CORRUPT_OUTCOME')
@@ -84,7 +85,34 @@ export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {
       rejectionCode: raw.rejection_code === null ? null : asString(raw.rejection_code),
       failingStatementIndex: raw.failing_statement_index === null ? null : Number(asBigint(raw.failing_statement_index)),
     }
-  })
+  }
+  if (database.nativeProfile === undefined) {
+    const statement = database.prepare(`${select} ORDER BY order_index`)
+    statement.setReadBigInts?.(true)
+    return statement.all().map(decode)
+  }
+  const rows: TransactionLogRow[] = []
+  let after: bigint | null = null
+  for (;;) {
+    const where = after === null ? '' : 'WHERE order_index > ?'
+    const statement = database.prepare(`${select} ${where} ORDER BY order_index LIMIT ?`)
+    // The native result byte budget also bounds reads from long histories.
+    // Retry the same cursor with a smaller page if large candidates filled it.
+    let limit = 32
+    let page: TransactionLogRow[]
+    for (;;) {
+      try {
+        page = statement.all(...(after === null ? [limit] : [after, limit])).map(decode)
+        break
+      } catch (error) {
+        if (limit === 1 || (error as { code?: unknown } | null)?.code !== 'SQL_RESULT_LIMIT') throw error
+        limit = Math.floor(limit / 2)
+      }
+    }
+    rows.push(...page)
+    if (page.length < limit) return rows
+    after = BigInt(page.at(-1)!.orderIndex)
+  }
 }
 
 export function insertSystemLogRow(database: DatabaseLike, row: Omit<TransactionLogRow, 'orderKey'>): void {

@@ -9,6 +9,7 @@
     "./celld": "./src/celld.ts",
     "./browser": "./src/browser.ts",
     "./sql-native": "./src/sql-native.ts",
+    "./sql-celld": "./src/sql-celld.ts",
     "./webrtc": "./src/webrtc.ts",
     "./webrtc-native": "./src/webrtc-native.ts",
     "./tendriller": "./src/tendriller.ts",
