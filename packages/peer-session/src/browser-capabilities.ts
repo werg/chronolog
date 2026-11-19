@@ -4,6 +4,7 @@ import { probeOpfsWritable } from '@chronolog/records/browser'
 export interface BrowserCapabilityReport {
   readonly secureContext: boolean
   readonly dedicatedWorker: boolean
+  readonly sharedWorker: boolean
   readonly indexedDb: { readonly supported: boolean; readonly writable: boolean }
   readonly webLocks: boolean
   readonly opfs: { readonly directory: boolean; readonly createWritable: boolean; readonly syncAccessHandle: boolean }
@@ -61,6 +62,8 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
   const secureContext = globalThis.isSecureContext === true
   const dedicatedWorker = typeof document === 'undefined' && typeof self !== 'undefined' &&
     typeof (self as { postMessage?: unknown }).postMessage === 'function'
+  const sharedWorker = typeof document === 'undefined' && typeof self !== 'undefined' && 'onconnect' in self
+  const ownerWorker = dedicatedWorker || sharedWorker
   const webLocks = typeof navigator !== 'undefined' && typeof navigator.locks?.request === 'function'
   const indexedSupported = typeof indexedDB !== 'undefined'
   const wasm = typeof WebAssembly !== 'undefined'
@@ -79,20 +82,20 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
     reason = error instanceof Error ? error.name + ': ' + error.message : String(error)
   }
   const backend = reason === undefined && directory ? (opfsWritable ? 'opfs' : idbWritable ? 'indexeddb' : null) : null
-  const supported = secureContext && dedicatedWorker && webLocks && ed && x && idbWritable && backend !== null
-  const unavailable = reason ?? (!secureContext ? 'Secure context required' : !dedicatedWorker ? 'Dedicated owner Worker required'
+  const supported = secureContext && ownerWorker && webLocks && ed && x && idbWritable && backend !== null
+  const unavailable = reason ?? (!secureContext ? 'Secure context required' : !ownerWorker ? 'Dedicated or shared owner Worker required'
     : !webLocks ? 'Web Locks unavailable' : !ed || !x ? 'Required native WebCrypto algorithms unavailable'
     : !idbWritable ? 'Writable IndexedDB is required for device metadata'
       : !directory ? 'The OPFS directory must be inspectable before choosing a record backend'
       : backend === null ? 'Neither durable record backend is writable' : undefined)
   let sqlError: string | undefined
-  if (directory && dedicatedWorker && wasm) {
+  if (directory && ownerWorker && wasm) {
     try { syncHandle = await syncOpfsHandle() }
     catch (error) { sqlError = error instanceof Error ? error.name + ': ' + error.message : String(error) }
   }
-  const eligible = dedicatedWorker && wasm && syncHandle
+  const eligible = ownerWorker && wasm && syncHandle
   return {
-    secureContext, dedicatedWorker, indexedDb: { supported: indexedSupported, writable: idbWritable },
+    secureContext, dedicatedWorker, sharedWorker, indexedDb: { supported: indexedSupported, writable: idbWritable },
     webLocks, opfs: { directory, createWritable: opfsWritable, syncAccessHandle: syncHandle },
     crypto: { ed25519: ed, x25519: x }, wasm,
     events: { supported, backend: supported ? backend : null, ...(supported ? {} : { reason: unavailable ?? 'Event prerequisites unavailable' }) },

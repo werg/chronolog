@@ -297,7 +297,7 @@ describe('authenticated application transport', () => {
     expect((await (await b.command('say', 'healthy', { operationId: 'after-pressure' })).applied()).outcome).toBe('accepted')
   })
 
-  it('retires the physical owner when a dispatched live write ignores cancellation', async () => {
+  it('retires a cancelled nonsettling physical write only at its original dispatch deadline', async () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1), channels = pair()
     const entered = deferred(), release = deferred(), controller = new AbortController()
     const right: FramedPeerConnection = { ...channels[1], live: { ...channels[1].live!,
@@ -305,12 +305,15 @@ describe('authenticated application transport', () => {
     } }
     const links = await connect(a, b, [channels[0], right])
     const failure = new Error('cancel the live attempt')
-    const sending = b.signals.send('typing', { active: true }, { signal: controller.signal })
+    const sending = b.signals.send('typing', { active: true }, { signal: controller.signal, ttlMs: 1000 })
     const rejected = expect(sending).rejects.toBe(failure)
     try {
       await entered.promise; controller.abort(failure)
       await rejected
-      await expect.poll(() => links[1].signal.aborted).toBe(true)
+      expect(links[1].signal.aborted).toBe(false)
+      await expect(b.signals.send('typing', { active: false })).rejects.toThrow('SIGNAL_BACKPRESSURE')
+      await expect.poll(() => links[1].signal.aborted, { timeout: 3000 }).toBe(true)
+      expect(links[1].signal.reason).toMatchObject({ code: 'SIGNAL_SEND_TIMEOUT' })
       expect(channels[1].signal.aborted).toBe(true)
     } finally { release.resolve() }
   })

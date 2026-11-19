@@ -1,4 +1,5 @@
 import type { AuthorityBundle } from '@chronolog/peer-generation/control'
+import type { SignalLimits } from '@chronolog/signals'
 import type { ChronologMaterializationRuntime } from '@chronolog/materializer'
 import { applicationDefinitionDigest, type ApplicationDefinition } from './definition.js'
 import { claimApplicationDevice, type ApplicationDevice } from './device.js'
@@ -13,6 +14,8 @@ export interface OpenPeerApplicationOptions<D extends ApplicationDefinition = Ap
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>
   /** Invoked only on durable demand. Import the SQL implementation inside this factory. */
   readonly createMaterializer?: (options: { readonly signal: AbortSignal }) => ChronologMaterializationRuntime | Promise<ChronologMaterializationRuntime>
+  /** Explicit live reach. Application mode forwards signed frames with bounded replay protection. */
+  readonly signals?: { readonly delivery?: 'neighbors' | 'application'; readonly localEcho?: boolean; readonly limits?: SignalLimits }
   readonly maxRecords?: number
   readonly maxHistoryBytes?: number
 }

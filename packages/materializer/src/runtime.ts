@@ -65,6 +65,8 @@ export interface PeerExecutionControl {
   readonly members: readonly { readonly publicKey: Uint8Array; readonly role: 'member' | 'admin' }[]
 }
 export interface PeerExecutionControls {
+  /** Authenticated attempt generations supplied by the history owner, never command input. */
+  readonly attemptGenerations?: readonly { readonly attemptId: Uint8Array; readonly generation: Uint8Array }[]
   readonly applicationId: Uint8Array
   readonly currentRevision: number
   readonly revisions: readonly PeerExecutionControl[]

@@ -161,11 +161,19 @@ If every route is busy or explicitly returns `false`, public `send` rejects with
 healthy routes or interrupt durable replication. A new send is a fresh
 observation, and the channel never retries a discarded one. `true` and `false`
 are the only valid transport results. A transport exception or invalid result
-retires that route and invokes its optional `close()` callback; the connection
-owner should close its underlying session there. A dispatched write that ignores
-cancellation is also retired. Some routes may have dispatched before an attempt
-later rejects, and cancellation cannot recall those bytes. Reconnect never
-resends prior messages.
+retires that route and invokes its optional `close(reason)` callback with the
+original error; the connection owner should close that underlying connection.
+
+Caller cancellation ends the send's observation immediately and forwards its
+abort signal, while an admitted write retains its busy slot and original dispatch
+deadline until it actually settles. Cancellation cannot retire a healthy shared
+route merely because asynchronous encryption settles on a later event-loop turn.
+A write still outstanding at its own deadline is retired with
+`SIGNAL_SEND_TIMEOUT`; it continues to occupy the route budget until settlement.
+An actual transport failure arriving after the caller stopped waiting still
+retires the route with that failure. Some routes may have dispatched before an
+attempt later rejects, and cancellation cannot recall those bytes. Reconnect
+never resends prior messages.
 
 ## Owned application sessions
 
@@ -201,3 +209,42 @@ application history and its applied revision unchanged.
 
 See [owned participation](../peer-session/README.md#owned-participation-and-recovery)
 for the common native and browser lifecycle.
+
+### Concurrent endpoint and run streams
+
+Use the versioned signed stream context when several runs or local endpoints share
+one signing participant and topic:
+
+```ts
+await signals.send('progress', { completed: 3 }, {
+  stream: { streamId: retainedRunId, endpointId, endpointIncarnation, target: 'reviewer' },
+});
+for await (const progress of signals.subscribe({
+  topics: ['progress'], streams: [{ streamId: retainedRunId }], mode: 'latest',
+})) { /* Update only this run. */ }
+```
+
+Selectors are an OR of at most 64 exact field matches and run **before** queueing
+or coalescing. Replacement keys include verified author, channel session, topic,
+endpoint/incarnation, stream ID and recipient scope. A stream cannot replace a
+sibling run's pending progress. The existing per-subscription cardinality and byte
+budgets still apply. Endpoint ID and incarnation must be supplied together. A
+session owner replaces client-supplied endpoint fields with its actual port binding;
+a standalone signer attests its own context. Context is not an independent identity
+grant or a privacy boundary.
+
+Unaddressed frames retain the v1 wire format. Addressed stream frames use
+`chronolog/signal/v2` and sign the complete bounded context. Receiving and
+forwarding preserve the original signer. Unsupported older readers reject v2;
+applications must negotiate a compatible artifact instead of silently discarding
+stream attribution.
+
+`SignalChannel.delivery` reports `neighbors` by default, or `application` when
+bounded forwarding is explicitly enabled using `relay: true`. Forwarding preserves
+expiry and replay checks and never creates a durable delivery guarantee. One route
+accepting dispatch does not prove all intended recipients received it. An owner can
+opt into `localEcho: true` for local attachments, including signal-only operation
+without a network route. It uses the same bounded subscriber queues. In a peer
+session, configure these deliberately through `openPeerApplication({ signals:
+{ delivery: 'neighbors', localEcho: true } })`; `delivery: 'application'` explicitly
+enables the forwarding mode. Durable results belong in application history.

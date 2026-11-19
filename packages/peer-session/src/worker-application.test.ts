@@ -1,3 +1,6 @@
+import { createApplicationBackend } from './tendriller.js'
+import { createApplicationOwner } from './session-owner.js'
+import { connectApplicationOwner } from './worker-application.js'
 import { serveApplicationWorker } from './worker-application-server.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -487,5 +490,157 @@ describe('owned browser application facade', () => {
       capabilities: { ...description.capabilities, sql: 'yes' as unknown as boolean } })
     try { await expect(facade(f.a)).rejects.toThrow('APPLICATION_WORKER_METADATA_INVALID') }
     finally { metadata.mockRestore() }
+  })
+})
+
+describe('many endpoints attached to one owner', () => {
+  async function owned(session: ApplicationSession, options: Parameters<typeof createApplicationOwner>[1] = {}) {
+    const endpoint = new MessageChannel(), owner = createApplicationOwner(session, options)
+    cleanup.push(() => { endpoint.port1.close(); endpoint.port2.close() }); cleanup.push(() => owner.close())
+    owner.attach(endpoint.port1)
+    const connect = async (context: { viewId?: string; documentPath?: string; runId?: string } = {}) => {
+      const client = await connectApplicationOwner<typeof definition>(endpoint.port2, {
+        applicationId: session.applicationId, definitionId: definition.id, definitionVersion: definition.version, context, timeoutMs: 5000,
+      })
+      cleanup.push(() => client.detach()); return client
+    }
+    return { owner, endpoint, connect }
+  }
+
+  it('reads cloned verified authority without storage demand and checks the attachment diagnostics grant', async () => {
+    const openStorage = vi.fn(async () => ({ store: new MemoryBytesStore(), close: () => undefined }))
+    const f = await fixture({ data: false, openStorageA: openStorage }), first = await owned(f.a)
+    const client = await first.connect(), authority = await client.authority()
+    expect(authority).toEqual(await f.registry.read())
+    Object.assign(authority.controls[0]!.payload, { grants: [] })
+    expect((await client.authority()).controls[0]!.payload.grants).toHaveLength(2)
+    expect((await f.a.authority()).controls[0]!.payload.grants).toHaveLength(2)
+    expect(openStorage).not.toHaveBeenCalled(); expect(f.a.status.database).toBe('idle')
+    const restricted = await owned(f.b, { authorize: () => ({ capabilities: ['signals'] }) })
+    const endpoint = await restricted.connect()
+    await expect(endpoint.authority()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    expect(f.b.status.database).toBe('idle')
+    await endpoint.detach()
+    expect((await client.authority()).descriptor.payload.applicationId).toBe(client.applicationId)
+  })
+
+  it('binds independent endpoints to one lazy session; detach preserves sibling and signed work', async () => {
+    const openStorage = vi.fn(async () => ({ store: new MemoryBytesStore(), close: () => undefined }))
+    const f = await fixture({ data: false, openStorageA: openStorage }), { owner, connect } = await owned(f.a)
+    const [left, right] = await Promise.all([connect({ viewId: 'draft-a', documentPath: '/board.html' }), connect({ viewId: 'draft-b', documentPath: '/review.html' })])
+    expect(left.deviceId).toBe(right.deviceId)
+    expect(left.endpoint?.ownerInstanceId).toBe(right.endpoint?.ownerInstanceId)
+    expect(left.endpoint?.endpointId).not.toBe(right.endpoint?.endpointId)
+    expect(left.endpoint?.endpointIncarnation).not.toBe(right.endpoint?.endpointIncarnation)
+    const backend = createApplicationBackend({ id: f.a.applicationId, session: left })
+    expect(backend.endpoint).toBe(left.endpoint)
+    expect(Object.isFrozen(backend.endpoint?.context)).toBe(true)
+    expect(openStorage).not.toHaveBeenCalled(); expect(f.a.status.database).toBe('idle')
+    expect(owner.endpoints()).toHaveLength(2)
+    const [one, two] = await Promise.all([
+      left.command('say', 'left document', { operationId: 'left' }), right.command('say', 'right document', { operationId: 'right' }),
+    ])
+    await Promise.all([one.applied(), two.applied()]); await left.detach()
+    expect(f.a.signal.aborted).toBe(false); expect(owner.endpoints()).toHaveLength(1)
+    expect((await right.query('messages', null)).value.events.map(event => event.payload)).toEqual([{ text: 'left document' }, { text: 'right document' }])
+    expect((await right.operations.inspect('left'))?.state.status).toBe('applied')
+    await right.detach(); expect(f.a.signal.aborted).toBe(false)
+    await owner.close(); expect(f.a.signal.aborted).toBe(true)
+  })
+
+  it('keeps two signal-only attachments cold and injects endpoint identity over forged options', async () => {
+    const openStorage = vi.fn(async () => ({ store: new MemoryBytesStore(), close: () => undefined }))
+    const f = await fixture({ data: false, openStorageA: openStorage }), link = await connectApplications(f.a, f.b)
+    cleanup.push(() => link.close())
+    const { connect } = await owned(f.a), [one, two] = await Promise.all([connect({ runId: 'run-one' }), connect({ runId: 'run-two' })])
+    const signals = f.b.signals.subscribe({ topics: ['progress'], mode: 'latest' })[Symbol.asyncIterator](), first = signals.next()
+    await one.signals.send('progress', 1, { stream: { streamId: 'run-one', endpointId: 'forged', endpointIncarnation: 'forged' } })
+    const observed = (await first).value!
+    expect(observed.stream?.endpointId).toBe(one.endpoint?.endpointId)
+    expect(observed.stream?.endpointIncarnation).toBe(one.endpoint?.endpointIncarnation)
+    await one.signals.send('progress', 2, { stream: { streamId: 'run-one' } })
+    await two.signals.send('progress', 3, { stream: { streamId: 'run-two' } })
+    expect((await signals.next()).value?.payload).toBe(2); expect((await signals.next()).value?.payload).toBe(3)
+    await signals.return?.(); expect(openStorage).not.toHaveBeenCalled(); expect(f.b.status.database).toBe('idle')
+  })
+
+  it('isolates malformed clients and never grants owner management from a page field', async () => {
+    const f = await fixture(), { endpoint, owner, connect } = await owned(f.a)
+    let malicious: MessagePort | undefined
+    endpoint.port1.addEventListener('message', event => { malicious ??= (event.data as { port: MessagePort }).port })
+    const first = await connect(), sibling = await connect()
+    await expect(first.participation?.close() ?? first.adopt(await f.registry.read())).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    malicious!.dispatchEvent(new MessageEvent('message', { data: { id: -1, method: 'query', args: [] } }))
+    await vi.waitFor(() => expect(first.signal.aborted).toBe(true))
+    expect(f.a.signal.aborted).toBe(false); expect(owner.endpoints()).toHaveLength(1)
+    expect((await sibling.query('messages', null)).value.events).toHaveLength(0)
+  })
+
+  it('gives duplicated live views independent drafts and permits explicit restore after detach', async () => {
+    const f = await fixture({ data: false }), { connect } = await owned(f.a)
+    const first = await connect({ viewId: 'retained-view' }), duplicate = await connect({ viewId: 'retained-view' })
+    expect(first.endpoint?.context.viewId).toBe('retained-view')
+    expect(duplicate.endpoint?.context.viewId).not.toBe('retained-view')
+    await first.suspend(); expect((await duplicate.endpoints()).find(value => value.endpointId === first.endpoint?.endpointId)?.state).toBe('suspended')
+    expect((await first.resumeAttachment())?.endpointIncarnation).toBe(first.endpoint?.endpointIncarnation)
+    await first.detach()
+    const restored = await connect({ viewId: 'retained-view' })
+    expect(restored.endpoint?.context.viewId).toBe('retained-view')
+    expect(restored.endpoint?.endpointIncarnation).not.toBe(first.endpoint?.endpointIncarnation)
+  })
+
+  it('rejects incompatible applications and grants only owner-configured capabilities', async () => {
+    const f = await fixture(), { endpoint, owner, connect } = await owned(f.a, { authorize: () => ({ capabilities: ['queries', 'diagnostics'], queries: ['messages'] }) })
+    await expect(connectApplicationOwner(endpoint.port2, { applicationId: f.a.applicationId, definitionId: definition.id, definitionVersion: 'incompatible', timeoutMs: 5000 })).rejects.toThrow('CONTRACT_INCOMPATIBLE')
+    const client = await connect()
+    await expect(client.command('say', 'forbidden', { operationId: 'denied' })).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    const captured = await client.readView()
+    await expect(captured.query('SELECT 1')).rejects.toThrow('APPLICATION_ATTACHMENT_QUERY_FORBIDDEN')
+    await expect(captured.readEvents()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    await captured.release()
+    expect((await client.query('messages', null)).value.events).toHaveLength(0)
+    expect(owner.endpoints()).toHaveLength(1)
+  })
+
+  it('keeps raw captured SQL, named query scopes, event reads and view cleanup under independent grants', async () => {
+    const f = await fixture(), read = f.a.readView.bind(f.a), rawQuery = vi.fn(() => ({ columns: [{ name: 'value' }], rows: [[7]] }))
+    vi.spyOn(f.a, 'readView').mockImplementation(async () => ({ ...await read(), query: rawQuery }))
+    const { connect } = await owned(f.a, { authorize: handshake => handshake.context?.documentPath === '/named'
+      ? { capabilities: ['queries', 'events'], queries: ['messages'] }
+      : handshake.context?.documentPath === '/events' ? { capabilities: ['events'] } : { capabilities: ['queries'] } })
+    const named = await connect({ documentPath: '/named' }), events = await connect({ documentPath: '/events' }), sql = await connect({ documentPath: '/sql' })
+    const namedView = await named.readView(), eventsView = await events.readView(), sqlView = await sql.readView()
+    await expect(namedView.query('SELECT private_data FROM secret')).rejects.toThrow('APPLICATION_ATTACHMENT_QUERY_FORBIDDEN')
+    await expect(eventsView.query('SELECT private_data FROM secret')).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    expect(rawQuery).not.toHaveBeenCalled()
+    expect((await named.query('messages', null)).value.events).toHaveLength(0)
+    expect((await eventsView.readEvents()).events).toHaveLength(0)
+    await expect(sqlView.readEvents()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    expect((await sqlView.query('SELECT 7 AS value')).rows).toEqual([[7]])
+    expect(rawQuery).toHaveBeenCalledOnce()
+    await Promise.all([namedView.release(), eventsView.release(), sqlView.release()])
+    // A denial leaves the held-view reservation releasable and the owner live.
+    const again = await sql.readView(); await again.release(); expect(f.a.signal.aborted).toBe(false)
+  })
+
+  it('releases an attachment projection without closing another observer or owner registration', async () => {
+    const f = await fixture(), { connect } = await owned(f.a)
+    f.a.project<number>({ id: 'shared-counter', version: '1', initial: 0, reduce: value => value + 1 })
+    const first = await connect(), second = await connect(), one = first.projection<number>('shared-counter'), two = second.projection<number>('shared-counter')
+    await Promise.all([one.read(), two.read()]); await one.close()
+    expect((await two.read()).state).toBe(0)
+    await first.detach()
+    await (await second.command('say', 'still owned', { operationId: 'projection-sibling' })).applied()
+    expect((await two.read()).state).toBe(1)
+    expect(f.a.projection('shared-counter').id).toBe('shared-counter')
+  })
+
+  it('bounds views and attachments without sacrificing sibling progress', async () => {
+    const f = await fixture(), { connect } = await owned(f.a, { maxAttachments: 2, authorize: () => ({ maxViews: 1 }) })
+    const [one, two] = await Promise.all([connect(), connect()]); await expect(connect()).rejects.toThrow('APPLICATION_OWNER_ATTACHMENT_LIMIT')
+    const held = await one.readView(); await expect(one.readView()).rejects.toThrow('APPLICATION_WORKER_VIEW_LIMIT')
+    expect((await two.query('messages', null)).value.events).toHaveLength(0)
+    await one.detach(); expect((await held.release().catch(() => undefined))).toBeUndefined()
+    const third = await connect(); expect((await third.query('messages', null)).value.events).toHaveLength(0)
   })
 })

@@ -3,6 +3,7 @@ import { assertSignalTopic, canonicalSignalPayload, type SignalPayload } from '.
 export { assertSignalTopic, canonicalSignalPayload, type SignalPayload } from './payload.js'
 
 export const SIGNAL_DOMAIN = 'chronolog/signal/v1'
+export const SIGNAL_STREAM_DOMAIN = 'chronolog/signal/v2'
 export const MAX_SIGNAL_BYTES = 16_384
 
 export interface SignalIdentity { readonly publicKeyBytes: Uint8Array; readonly privateKey: CryptoKey }
@@ -20,14 +21,35 @@ export interface EphemeralSignal {
   readonly payload: SignalPayload
   readonly issuedAtMs: number
   readonly expiresAtMs: number
+  /** Signer-attested stream context; owners bind endpoint fields to the actual attachment. */
+  readonly stream?: SignalStream
 }
-export interface SignalSendOptions { readonly ttlMs?: number; readonly signal?: AbortSignal }
+export interface SignalStream {
+  readonly streamId: string
+  readonly endpointId?: string
+  readonly endpointIncarnation?: string
+  /** An application-defined recipient scope; routing is not a confidentiality boundary. */
+  readonly target?: string
+}
+export interface SignalStreamSelector {
+  readonly authorId?: string
+  readonly sessionId?: string
+  readonly streamId?: string
+  readonly endpointId?: string
+  readonly endpointIncarnation?: string
+  readonly target?: string
+}
+export interface SignalSendOptions { readonly ttlMs?: number; readonly signal?: AbortSignal; readonly stream?: SignalStream }
 export interface SignalSubscribeOptions {
   readonly topics?: readonly string[]
+  /** OR of bounded exact selectors, applied before latest coalescing. */
+  readonly streams?: readonly SignalStreamSelector[]
   readonly mode?: 'all' | 'latest'
   readonly signal?: AbortSignal
 }
 export interface Signals {
+  /** Dispatch scope; no send receipt claims every recipient received or processed it. */
+  readonly delivery?: 'neighbors' | 'application'
   send(topic: string, payload: SignalPayload, options?: SignalSendOptions): Promise<EphemeralSignal>
   subscribe(options?: SignalSubscribeOptions): AsyncIterable<EphemeralSignal>
 }
@@ -40,14 +62,15 @@ export interface SignalAuthorization {
   readonly authorId: Uint8Array
   readonly topic: string
   readonly credential: Uint8Array | null
+  readonly stream?: SignalStream
 }
 /** Lifetime of this attempt, including caller cancellation, channel close and its deadline. */
 export interface SignalPolicyContext { readonly signal: AbortSignal }
 export interface SignalTransport {
   /** False refuses congestion before queueing or dispatching. Actual failures throw. Honor cancellation. */
   trySend(frame: Uint8Array, options: { readonly signal: AbortSignal }): Promise<boolean>
-  /** Retire an underlying connection that cannot complete a dispatched write. */
-  close?(): void | Promise<void>
+  /** Retire an underlying connection on its actual failure or dispatch deadline. */
+  close?(reason?: unknown): void | Promise<void>
 }
 export interface SignalRoute {
   /**
@@ -66,6 +89,8 @@ export interface SignalChannelOptions extends SignalLimits {
   /** Optional standalone outgoing transport. Attach routes for bidirectional relay. */
   readonly trySend?: SignalTransport['trySend']
   readonly relay?: boolean
+  /** Allow explicitly configured local-owner fan-out without opening a network route. */
+  readonly localEcho?: boolean
   readonly now?: () => number
 }
 /** Independent live-resource budgets; no database or finality configuration. */
@@ -85,10 +110,11 @@ export interface SignalLimits {
 }
 
 interface SessionProgress { readonly seen: Map<number, number> }
-interface Route extends SignalTransport { readonly lifetime: AbortController; busy: boolean }
+interface Route extends SignalTransport { readonly lifetime: AbortController; busy: boolean; retired: boolean }
 interface QueuedSignal { readonly value: EphemeralSignal; readonly bytes: number; readonly key: string }
 interface Subscription {
   readonly topics: ReadonlySet<string> | null
+  readonly streams: readonly SignalStreamSelector[] | null
   readonly mode: 'all' | 'latest'
   readonly pending: QueuedSignal[]
   readonly latest: Map<string, { readonly sequence: number; readonly retainThroughMs: number }>
@@ -156,11 +182,13 @@ export class SignalChannel implements Signals {
     if (options.trySend !== undefined) this.attachRoute({ trySend: options.trySend })
   }
 
+  get delivery(): 'neighbors' | 'application' { return this.#options.relay === true ? 'application' : 'neighbors' }
+
   attachRoute(transport: SignalTransport): SignalRoute {
     this.#assertOpen()
     if (typeof transport.trySend !== 'function') throw new SignalError('SIGNAL_TRANSPORT_INVALID')
     if (this.#routes.size + this.#retiring.size >= this.#maxRoutes) throw new SignalError('SIGNAL_ROUTE_QUOTA_EXCEEDED')
-    const route: Route = { trySend: transport.trySend.bind(transport), lifetime: new AbortController(), busy: false,
+    const route: Route = { trySend: transport.trySend.bind(transport), lifetime: new AbortController(), busy: false, retired: false,
       ...(transport.close === undefined ? {} : { close: transport.close.bind(transport) }) }
     this.#routes.add(route)
     return { receive: frame => this.#enqueueReceive(frame, route), close: () => this.#detach(route) }
@@ -170,11 +198,12 @@ export class SignalChannel implements Signals {
     try {
       if (typeof options !== 'object' || options === null) throw new SignalError('SIGNAL_OPTIONS_INVALID')
       this.#assertOpen(); options.signal?.throwIfAborted()
-      if (this.#routes.size === 0) throw new SignalError('SIGNAL_ROUTE_UNAVAILABLE')
+      if (this.#routes.size === 0 && this.#options.localEcho !== true) throw new SignalError('SIGNAL_ROUTE_UNAVAILABLE')
       const routes = [...this.#routes]
       if (this.#pendingSends >= this.#maxSends) throw new SignalError('SIGNAL_BACKPRESSURE')
       assertSignalTopic(topic)
       const encodedPayload = canonicalSignalPayload(payload)
+      const stream = options.stream === undefined ? undefined : checkedStream(options.stream)
       const ttlMs = bound(options.ttlMs ?? Math.min(5_000, this.#ttl), 1, this.#ttl, 'SIGNAL_TTL_INVALID')
       // Queueing does not refresh a transient intent's lifetime.
       const issuedAtMs = this.#now(), expiresAtMs = issuedAtMs + ttlMs
@@ -190,22 +219,28 @@ export class SignalChannel implements Signals {
         const operation = (async () => {
           const configured = this.#options.credential
           const credential = credentialBytes(typeof configured === 'function' ? await configured(topic, { signal }) : configured)
-          const authorization: SignalAuthorization = { scope: this.#options.scope, authorId: this.#options.identity.publicKeyBytes.slice(), topic, credential: credential ?? null }
+          const authorization: SignalAuthorization = { scope: this.#options.scope, authorId: this.#options.identity.publicKeyBytes.slice(), topic, credential: credential ?? null, ...(stream === undefined ? {} : { stream }) }
           await this.#authorize(authorization, signal)
           if (this.#sequence >= Number.MAX_SAFE_INTEGER) throw new SignalError('SIGNAL_SEQUENCE_EXHAUSTED')
           const sequence = ++this.#sequence
-          const fields = [1n, SIGNAL_DOMAIN, this.#options.scope, this.#options.identity.publicKeyBytes, credential ?? null, this.#session,
-            BigInt(sequence), BigInt(issuedAtMs), BigInt(expiresAtMs), topic, encodedPayload] as const
+          const fields = [stream === undefined ? 1n : 2n, stream === undefined ? SIGNAL_DOMAIN : SIGNAL_STREAM_DOMAIN, this.#options.scope, this.#options.identity.publicKeyBytes, credential ?? null, this.#session,
+            BigInt(sequence), BigInt(issuedAtMs), BigInt(expiresAtMs), topic, encodedPayload, ...(stream === undefined ? [] : [JSON.stringify(stream)])] as const
           const signature = new Uint8Array(await crypto.subtle.sign('Ed25519', this.#options.identity.privateKey,
             encodeCanonicalCbor(fields).slice().buffer))
           const frame = encodeCanonicalCbor([...fields, signature])
           if (frame.length > MAX_SIGNAL_BYTES) throw new SignalError('SIGNAL_FRAME_TOO_LARGE')
           const value: EphemeralSignal = { scope: this.#options.scope, authorId: this.#authorId, sessionId: bytesToHex(this.#session),
-            sequence, topic, payload: JSON.parse(encodedPayload) as SignalPayload, issuedAtMs, expiresAtMs }
+            sequence, topic, payload: JSON.parse(encodedPayload) as SignalPayload, issuedAtMs, expiresAtMs, ...(stream === undefined ? {} : { stream }) }
           await this.#authorize(authorization, signal)
           this.#assertFresh(value)
           if (!this.#remember(value)) throw new SignalError('SIGNAL_BACKPRESSURE')
-          if (!await this.#dispatch({ value, authorization, frame }, routes, signal, true)) {
+          const local = this.#options.localEcho === true
+          if (local) {
+            this.#deliver(value, frame.length)
+            // Local attachments must not wait behind an unavailable network route.
+            if (routes.length > 0) void this.#dispatch({ value, authorization, frame }, routes, signal, false).catch(() => undefined)
+          }
+          if (!local && !await this.#dispatch({ value, authorization, frame }, routes, signal, true)) {
             // Every route explicitly refused before dispatch. No future loop can
             // replay this intent; retain its sequence but release replay budget.
             this.#forget(value)
@@ -248,27 +283,28 @@ export class SignalChannel implements Signals {
   }
 
   async #verify(bytes: Uint8Array, signal: AbortSignal): Promise<VerifiedSignal | null> {
-    const frame = assertCanonicalCbor(bytes, { maxBytes: MAX_SIGNAL_BYTES, maxDepth: 2, maxArrayItems: 12,
+    const frame = assertCanonicalCbor(bytes, { maxBytes: MAX_SIGNAL_BYTES, maxDepth: 2, maxArrayItems: 13,
       maxMapItems: 0, maxTextBytes: MAX_SIGNAL_BYTES, maxBlobBytes: 1024 })
-    if (!Array.isArray(frame) || frame.length !== 12 || frame[0] !== 1n || frame[1] !== SIGNAL_DOMAIN || frame[2] !== this.#options.scope ||
+    if (!Array.isArray(frame) || !(frame.length === 12 && frame[0] === 1n && frame[1] === SIGNAL_DOMAIN || frame.length === 13 && frame[0] === 2n && frame[1] === SIGNAL_STREAM_DOMAIN) || frame[2] !== this.#options.scope ||
         !(frame[3] instanceof Uint8Array) || frame[3].length !== 32 ||
         (frame[4] !== null && (!(frame[4] instanceof Uint8Array) || frame[4].length > 1024)) ||
         !(frame[5] instanceof Uint8Array) || frame[5].length !== 32 ||
         typeof frame[6] !== 'bigint' || typeof frame[7] !== 'bigint' || typeof frame[8] !== 'bigint' ||
         typeof frame[9] !== 'string' || typeof frame[10] !== 'string' ||
-        !(frame[11] instanceof Uint8Array) || frame[11].length !== 64) throw new SignalError('SIGNAL_FRAME_INVALID')
+        !(frame[frame.length - 1] instanceof Uint8Array) || (frame[frame.length - 1] as Uint8Array).length !== 64) throw new SignalError('SIGNAL_FRAME_INVALID')
     assertSignalTopic(frame[9])
+    const stream = frame.length === 13 ? decodeStream(frame[11]) : undefined
     const payload = JSON.parse(frame[10]) as SignalPayload
     if (canonicalSignalPayload(payload) !== frame[10]) throw new SignalError('SIGNAL_PAYLOAD_INVALID')
     const value: EphemeralSignal = { scope: this.#options.scope, authorId: bytesToHex(frame[3]), sessionId: bytesToHex(frame[5]),
-      sequence: Number(frame[6]), issuedAtMs: Number(frame[7]), expiresAtMs: Number(frame[8]), topic: frame[9], payload }
+      sequence: Number(frame[6]), issuedAtMs: Number(frame[7]), expiresAtMs: Number(frame[8]), topic: frame[9], payload, ...(stream === undefined ? {} : { stream }) }
     this.#assertClock(value)
     const key = await crypto.subtle.importKey('raw', frame[3].slice().buffer, 'Ed25519', false, ['verify'])
-    if (!await crypto.subtle.verify('Ed25519', key, frame[11].slice().buffer, encodeCanonicalCbor(frame.slice(0, 11)).slice().buffer)) {
+    if (!await crypto.subtle.verify('Ed25519', key, (frame[frame.length - 1] as Uint8Array).slice().buffer, encodeCanonicalCbor(frame.slice(0, -1)).slice().buffer)) {
       throw new SignalError('SIGNAL_SIGNATURE_INVALID')
     }
     const credential = frame[4] as Uint8Array | null
-    const authorization: SignalAuthorization = { scope: value.scope, authorId: frame[3].slice(), topic: value.topic, credential: credential?.slice() ?? null }
+    const authorization: SignalAuthorization = { scope: value.scope, authorId: frame[3].slice(), topic: value.topic, credential: credential?.slice() ?? null, ...(stream === undefined ? {} : { stream }) }
     if (!await this.#allowed(authorization, signal)) return null
     this.#assertClock(value)
     if (value.expiresAtMs <= this.#now()) return null
@@ -296,8 +332,11 @@ export class SignalChannel implements Signals {
       route.busy = true
       let handedOff = false, settled = false
       const deadline = new AbortController()
-      const timer = setTimeout(() => deadline.abort(new SignalError('SIGNAL_SEND_TIMEOUT')),
-        Math.max(1, Math.min(this.#sendTimeout, verified.value.expiresAtMs - this.#now())))
+      const timer = setTimeout(() => {
+        const reason = new SignalError('SIGNAL_SEND_TIMEOUT')
+        deadline.abort(reason)
+        if (handedOff && !settled) this.#detach(route, true, reason)
+      }, Math.max(1, Math.min(this.#sendTimeout, verified.value.expiresAtMs - this.#now())))
       const lifetime = AbortSignal.any([signal, route.lifetime.signal, deadline.signal])
       const operation = (async () => {
         await this.#authorize(verified.authorization, lifetime)
@@ -308,14 +347,17 @@ export class SignalChannel implements Signals {
           throw new SignalError('SIGNAL_TRANSPORT_RESULT_INVALID')
         }
         return result
-      })().finally(() => { settled = true; route.busy = false; this.#retiring.delete(route) })
-      return interrupted(operation, lifetime).catch(async (error: unknown) => {
-        // Give cooperative cancellation its microtask turn. A route whose write
-        // remains outstanding cannot admit another write or survive indefinitely.
-        if (handedOff && lifetime.aborted && !settled) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
-        if (handedOff && (!lifetime.aborted || !settled)) this.#detach(route, true)
+      })().catch((error: unknown) => {
+        // Inspect the actual transport result even if this send's observer has
+        // already cancelled. A caller's abort is not a shared-route failure.
+        if (handedOff && (!lifetime.aborted || error !== lifetime.reason)) this.#detach(route, true, error)
         throw error
-      }).finally(() => { clearTimeout(timer) })
+      }).finally(() => { settled = true; route.busy = false; this.#retiring.delete(route); clearTimeout(timer) })
+      // Caller cancellation releases its waiter immediately, but cannot release
+      // this admitted write's capacity or deadline. WebCrypto can settle on a
+      // later event-loop turn; only settlement or the write's own deadline ends
+      // that ownership. A permanently stuck callback remains bounded per route.
+      return interrupted(operation, lifetime)
     })
     // Healthy routes progress without waiting for a slow peer. Each route keeps
     // its own deadline and at most one unsettled dispatch after this resolves.
@@ -366,12 +408,13 @@ export class SignalChannel implements Signals {
   #deliver(value: EphemeralSignal, bytes: number): void {
     for (const subscriber of this.#subscriptions) {
       if (subscriber.topics !== null && !subscriber.topics.has(value.topic)) continue
+      if (subscriber.streams !== null && !subscriber.streams.some(selector => matchesStream(value, selector))) continue
       const now = this.#now()
       for (let index = subscriber.pending.length - 1; index >= 0; index -= 1) {
         if (subscriber.pending[index]!.value.expiresAtMs <= now) subscriber.bytes -= subscriber.pending.splice(index, 1)[0]!.bytes
       }
       for (const [id, latest] of subscriber.latest) if (latest.retainThroughMs <= now) subscriber.latest.delete(id)
-      const key = `${value.authorId}/${value.sessionId}/${value.topic}`
+      const key = JSON.stringify([value.authorId, value.sessionId, value.topic, value.stream?.endpointId ?? null, value.stream?.endpointIncarnation ?? null, value.stream?.streamId ?? null, value.stream?.target ?? null])
       if (subscriber.mode === 'latest') {
         const previous = subscriber.latest.get(key)
         if (previous !== undefined && previous.sequence >= value.sequence) continue
@@ -424,8 +467,9 @@ export class SignalChannel implements Signals {
         assertSignalTopic(topic)
       }
     }
+    const streams = options.streams === undefined ? null : checkedSelectors(options.streams)
     if (this.#subscriptions.size >= this.#maxSubscriptions) throw new SignalError('SIGNAL_SUBSCRIPTION_QUOTA_EXCEEDED')
-    const subscriber: Subscription = { topics: options.topics === undefined ? null : new Set(options.topics), mode,
+    const subscriber: Subscription = { topics: options.topics === undefined ? null : new Set(options.topics), streams, mode,
       pending: [], latest: new Map(), bytes: 0, error: null, wake: null, clean: () => undefined }
     this.#subscriptions.add(subscriber)
     const signal = options.signal
@@ -462,10 +506,13 @@ export class SignalChannel implements Signals {
     this.#subscriptions.clear(); this.#sessions.clear(); this.#remembered = 0
   }
 
-  #detach(route: Route, retire = false): void {
+  #detach(route: Route, retire = false, reason: unknown = new SignalError('SIGNAL_ROUTE_CLOSED')): void {
     if (route.busy) this.#retiring.add(route)
-    this.#routes.delete(route); route.lifetime.abort(new SignalError('SIGNAL_ROUTE_CLOSED'))
-    if (retire) { try { void Promise.resolve(route.close?.()).catch(() => undefined) } catch { /* The route is already retired. */ } }
+    this.#routes.delete(route); route.lifetime.abort(reason)
+    if (retire && !route.retired) {
+      route.retired = true
+      try { void Promise.resolve(route.close?.(reason)).catch(() => undefined) } catch { /* The route is already retired. */ }
+    }
   }
   #assertOpen(): void { this.#lifetime.signal.throwIfAborted() }
   #assertFresh(value: EphemeralSignal): void {
@@ -502,4 +549,43 @@ function interrupted<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> 
     void operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
     if (signal.aborted) abort()
   })
+}
+
+function checkedStream(value: SignalStream): SignalStream {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).some(key => !['streamId', 'endpointId', 'endpointIncarnation', 'target'].includes(key)) ||
+      !boundedLabel(value.streamId) ||
+      (value.endpointId === undefined) !== (value.endpointIncarnation === undefined) ||
+      value.endpointId !== undefined && !boundedLabel(value.endpointId) ||
+      value.endpointIncarnation !== undefined && !boundedLabel(value.endpointIncarnation) ||
+      value.target !== undefined && !boundedLabel(value.target)) throw new SignalError('SIGNAL_STREAM_INVALID')
+  return { streamId: value.streamId, ...(value.endpointId === undefined ? {} : { endpointId: value.endpointId, endpointIncarnation: value.endpointIncarnation! }),
+    ...(value.target === undefined ? {} : { target: value.target }) }
+}
+function decodeStream(value: unknown): SignalStream {
+  if (typeof value !== 'string' || value.length > 2048) throw new SignalError('SIGNAL_STREAM_INVALID')
+  let parsed: unknown
+  try { parsed = JSON.parse(value) as unknown } catch { throw new SignalError('SIGNAL_STREAM_INVALID') }
+  const stream = checkedStream(parsed as SignalStream)
+  if (JSON.stringify(stream) !== value) throw new SignalError('SIGNAL_STREAM_INVALID')
+  return stream
+}
+function boundedLabel(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$/u.test(value)
+}
+function checkedSelectors(value: readonly SignalStreamSelector[]): readonly SignalStreamSelector[] {
+  const keys = ['authorId', 'sessionId', 'streamId', 'endpointId', 'endpointIncarnation', 'target']
+  if (!Array.isArray(value) || value.length > 64 || value.some((selector: unknown) => selector === null || typeof selector !== 'object' ||
+      Array.isArray(selector) || Object.entries(selector as Record<string, unknown>).some(([key, item]) => !keys.includes(key) || !boundedLabel(item)))) {
+    throw new SignalError('SIGNAL_STREAM_FILTER_INVALID')
+  }
+  return structuredClone(value as readonly SignalStreamSelector[])
+}
+function matchesStream(value: EphemeralSignal, selector: SignalStreamSelector): boolean {
+  return (selector.authorId === undefined || selector.authorId === value.authorId) &&
+    (selector.sessionId === undefined || selector.sessionId === value.sessionId) &&
+    (selector.streamId === undefined || selector.streamId === value.stream?.streamId) &&
+    (selector.endpointId === undefined || selector.endpointId === value.stream?.endpointId) &&
+    (selector.endpointIncarnation === undefined || selector.endpointIncarnation === value.stream?.endpointIncarnation) &&
+    (selector.target === undefined || selector.target === value.stream?.target)
 }

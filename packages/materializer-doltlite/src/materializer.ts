@@ -34,7 +34,7 @@ import {
   type PublishedRef,
 } from './checkpoints.js'
 import { withAuthorizer } from './sql-profile.js'
-import { applyPeerExecutionControl, hasCurrentPeerControl, hasPeerExecutionControl, peerControlFor, validatePeerExecutionControls } from './peer-controls.js'
+import { applyPeerExecutionControl, hasCurrentPeerControl, hasPeerExecutionControl, peerControlFor, peerGenerationFor, validateStoredAttemptGenerations, validatePeerExecutionControls } from './peer-controls.js'
 import { executeTransactionProgram, SqlRejection } from './sql-executor.js'
 import { executeLocalSql } from './sql-values.js'
 import {
@@ -330,6 +330,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       const transactions = orderedTransactions.map(cloneTransaction)
       if (peerControls === undefined && hasPeerExecutionControl(this.#writer)) throw new Error('MATERIALIZER_CONTROLS_REQUIRED')
       const controls = peerControls === undefined ? undefined : validatePeerExecutionControls(peerControls, transactions)
+      validateStoredAttemptGenerations(this.#writer, controls)
       // Rows of the published log were fully verified when they were read;
       // byte-identical rows are not re-verified, so an append costs O(1)
       // verification work instead of O(history).
@@ -364,7 +365,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       for (let index = replayFrom; index < transactions.length; index += 1) {
         verifyNextLogIndex(this.#writer, index)
         if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, peerControlFor(controls, transactions[index]!))
-        this.#applyTransaction(transactions[index]!, index)
+        this.#applyTransaction(transactions[index]!, index, peerGenerationFor(controls, transactions[index]!))
       }
 
       if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, controls.revisions[controls.currentRevision]!)
@@ -479,6 +480,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       const transactions = prefix.map(row => ({ txId: row.txId, candidateDigest: row.candidateDigest,
         canonicalCandidate: row.canonicalCandidate, core: decodeTransactionCore(row.canonicalCandidate) }))
       const controls = peerControls === undefined ? undefined : validatePeerExecutionControls(peerControls, transactions)
+      validateStoredAttemptGenerations(this.#writer, controls)
       if (controls !== undefined && !hasCurrentPeerControl(this.#writer, controls)) throw new Error('MATERIALIZER_CONTROL_PROJECTION_UNPUBLISHED')
       let commitHash: string
       if (prefixLength === this.#log.length) {
@@ -500,7 +502,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         for (let index = base.prefixLength; index < prefixLength; index += 1) {
           const transaction = transactions[index]!
           if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, peerControlFor(controls, transaction))
-          this.#applyTransaction(transaction, index)
+          this.#applyTransaction(transaction, index, peerGenerationFor(controls, transaction))
         }
         if (controls !== undefined) applyPeerExecutionControl(this.#writer, controls.applicationId, controls.revisions[controls.currentRevision]!)
         verifyFinalPrefix(prefix, readSystemLog(this.#writer))
@@ -549,8 +551,10 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#writer.close()
   }
 
-  #applyTransaction(transaction: ReplayProposal, orderIndex: number): void {
+  #applyTransaction(transaction: ReplayProposal, orderIndex: number, generation?: Uint8Array): void {
     this.#writer.exec('BEGIN IMMEDIATE')
+    this.#writer.exec('DELETE FROM chronolog_execution_context')
+    if (generation !== undefined) this.#writer.prepare('INSERT INTO chronolog_execution_context (singleton, transaction_id, application_id, generation) VALUES (1, ?, ?, ?)').run(transaction.txId, transaction.core.groupId, generation)
     this.#writer.exec('SAVEPOINT chronolog_program')
     let rejection: { readonly code: string; readonly statementIndex: number | null } | null = null
     try {
@@ -576,6 +580,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       // previous branch working set, resurrecting later log rows.
       if (rejection !== null) this.#writer.exec('ROLLBACK TO SAVEPOINT chronolog_program')
       this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
+      this.#writer.exec('DELETE FROM chronolog_execution_context')
+      if (generation !== undefined) this.#writer.prepare('INSERT INTO chronolog_attempt_generations (transaction_id, generation) VALUES (?, ?)').run(transaction.txId, generation)
       insertSystemLogRow(this.#writer, logRow(transaction, orderIndex, rejection))
       this.#writer.exec('COMMIT')
     } catch (error) {

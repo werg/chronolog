@@ -1,3 +1,5 @@
+import type { ApplicationAttachmentCapability, ApplicationAttachmentPolicy, ApplicationEndpointBinding, ApplicationEndpointState } from './owner-types.js'
+import { APPLICATION_OWNER_PROTOCOL } from './owner-types.js'
 import type { AuthorityBundle } from '@chronolog/peer-generation/control'
 import type { RecoveryNotice } from '@chronolog/peer-generation'
 import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
@@ -11,27 +13,48 @@ import { APPLICATION_PROJECTION_LIMITS, type ApplicationProjectionHandle } from 
 import { PROTOCOL, MAX_REQUESTS, MAX_RELEASES, MAX_STREAMS, releasesResource, bounded,
   type Endpoint, type Metadata, type Snapshot, type WireError, type Request, type Response } from './worker-application-protocol.js'
 
-interface Stream { readonly iterator: AsyncIterator<unknown>; readonly controller: AbortController; busy: boolean }
+interface Stream { readonly iterator: AsyncIterator<unknown>; readonly controller: AbortController; readonly release: () => void; readonly projectionId?: number; busy: boolean }
+
+export interface ApplicationWorkerServerOptions extends ApplicationAttachmentPolicy {
+  readonly host?: ApplicationControlHost
+  readonly closeSession?: boolean
+  readonly initialPort?: MessagePort
+  readonly binding?: ApplicationEndpointBinding
+  readonly prepareCommand?: (endpoint: ApplicationEndpointBinding, name: string, input: unknown) => unknown
+  readonly reserve?: (kind: 'requests' | 'streams' | 'views') => () => void
+  readonly onClose?: () => void
+  readonly onState?: (state: ApplicationEndpointState) => void
+  readonly listEndpoints?: () => unknown
+  readonly shutdown?: () => Promise<void>
+}
 
 /**
  * Serve one page facade beside the owned application. A dedicated port isolates
  * application RPC from RTC handoff and application-owned UI messages. The same
  * pull/cancel contract keeps streams bounded within that one owner.
  */
-export function serveApplicationWorker(session: ApplicationSession, endpoint: Endpoint, options: {
-  readonly host?: ApplicationControlHost
-} = {}): { close(): Promise<void> } {
-  let port: MessagePort | undefined, closed = false, lastId = 0, nextView = 0, nextProjection = 0
+export function serveApplicationWorker(session: ApplicationSession, endpoint: Endpoint, options: ApplicationWorkerServerOptions = {}): { close(): Promise<void> } {
+  let port: MessagePort | undefined, closed = false, lastId = 0, nextView = 0, nextProjection = 0, openingViews = 0
   let closing: Promise<void> | undefined
   const calls = new Map<number, { readonly controller: AbortController; readonly release: boolean }>(), streams = new Map<number, Stream>()
-  const views = new Map<number, { readonly handle: ApplicationReadView; readonly requestId: number }>()
+  const views = new Map<number, { readonly handle: ApplicationReadView; readonly requestId: number; readonly release: () => void }>()
   const projections = new Map<number, ApplicationProjectionHandle>()
+  const protocol = options.binding === undefined ? PROTOCOL : APPLICATION_OWNER_PROTOCOL
+  const reserve = (kind: 'requests' | 'streams' | 'views'): (() => void) => options.reserve?.(kind) ?? (() => undefined)
+  const allowed = (capability: ApplicationAttachmentCapability): void => {
+    if (options.capabilities !== undefined && !options.capabilities.includes(capability)) throw new Error('APPLICATION_ATTACHMENT_FORBIDDEN')
+  }
+  const preparedInput = (name: string, input: unknown): never => {
+    allowed('commands')
+    if (options.commands !== undefined && !options.commands.includes(name)) throw new Error('APPLICATION_ATTACHMENT_COMMAND_FORBIDDEN')
+    return (options.binding === undefined || options.prepareCommand === undefined ? input : options.prepareCommand(options.binding, name, input)) as never
+  }
   const send = (value: unknown): void => { bounded(value); port?.postMessage(value) }
   const respond = (id: number, value: unknown): void => { send({ id, value, snapshot: snapshot(session) } satisfies Response) }
   const cancelStream = async (id: number): Promise<void> => {
     const stream = streams.get(id)
     if (stream === undefined) return
-    streams.delete(id); stream.controller.abort(new Error('APPLICATION_WORKER_CANCELLED'))
+    streams.delete(id); stream.release(); stream.controller.abort(new Error('APPLICATION_WORKER_CANCELLED'))
     await stream.iterator.return?.().catch(() => undefined)
   }
   const stop = (reason: unknown): Promise<void> => {
@@ -40,16 +63,16 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     endpoint.removeEventListener('message', connect)
     session.signal.removeEventListener('abort', aborted)
     for (const call of calls.values()) call.controller.abort(reason)
-    for (const view of views.values()) view.handle.release()
+    for (const view of views.values()) { view.handle.release(); view.release() }
     views.clear(); projections.clear()
     port?.removeEventListener('message', receive); port?.removeEventListener('messageerror', messageError)
     closing = Promise.allSettled([...streams.keys()].map(cancelStream)).then(async () => {
-      try { await session.close() }
+      try { if (options.closeSession !== false) await session.close() }
       finally {
         // A page can reopen the device immediately after close resolves: send
         // the terminal observation only after the owning store released its lock.
         try { send({ ended: errorValue(reason) }) } catch { /* An unavailable page cannot keep the Worker alive. */ }
-        port?.close()
+        port?.close(); options.onClose?.()
       }
     })
     return closing
@@ -87,10 +110,24 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     return handle
   }
   const invoke = async (method: string, args: readonly unknown[], signal: AbortSignal, requestId: number): Promise<unknown> => {
+    if (['adopt', 'recovery.takeover', 'recovery.handover', 'participation.approve', 'participation.close'].includes(method)) allowed('ownerAdmin')
+    if (method.startsWith('operation.') || ['retry', 'resume'].includes(method)) allowed('operations')
+    if (method.startsWith('content.')) allowed('content')
+    if (method.startsWith('projection.')) allowed('events')
+    if (method === 'signals.send') allowed('signals')
     switch (method) {
-      case 'command': return (await session.command(args[0] as string, args[1] as never, args[2] as CommandOptions)).operationId
-      case 'reapply': return (await session.reapply(args[0] as string, args[1] as string, args[2] as never, args[3] as CommandOptions)).operationId
-      case 'query': return session.query(args[0] as string, args[1] as never)
+      case 'authority': allowed('diagnostics'); return session.authority()
+      case 'command': return (await session.command(args[0] as string, preparedInput(args[0] as string, args[1]), args[2] as CommandOptions)).operationId
+      case 'reapply': return (await session.reapply(args[0] as string, args[1] as string, preparedInput(args[1] as string, args[2]), args[3] as CommandOptions)).operationId
+      case 'query': {
+        allowed('queries')
+        if (options.queries !== undefined && !options.queries.includes(args[0] as string)) throw new Error('APPLICATION_ATTACHMENT_QUERY_FORBIDDEN')
+        return session.query(args[0] as string, args[1] as never)
+      }
+      case 'endpoint.suspend': options.onState?.('suspended'); return null
+      case 'endpoint.resume': options.onState?.('active'); return options.binding ?? null
+      case 'endpoints.list': allowed('diagnostics'); return options.listEndpoints?.() ?? []
+      case 'owner.shutdown': allowed('ownerAdmin'); await options.shutdown?.(); return null
       case 'operation.get': return session.operations.get(args[0] as string, args[1] as { author?: string })
       case 'operation.inspect': return session.operations.inspect(args[0] as string, args[1] as { author?: string })
       case 'operation.wait': return session.operations.wait(args[0] as string, { ...args[1] as { author?: string }, signal })
@@ -105,21 +142,36 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'recovery.handover': return session.recovery.handover(controlHost(), { ...args[0] as { coordinator: string; transitionId?: string }, signal })
       case 'participation.approve': return participation().approveRecovery(args[0] as string)
       case 'participation.close': return participation().close()
-      case 'signals.send': return session.signals.send(args[0] as string, args[1] as SignalPayload, { ...args[2] as SignalSendOptions, signal })
+      case 'signals.send': {
+        const input = args[2] as SignalSendOptions, binding = options.binding
+        return session.signals.send(args[0] as string, args[1] as SignalPayload, { ...input, signal,
+          ...(binding === undefined ? {} : { stream: { ...input.stream, streamId: input.stream?.streamId ?? binding.context.runId ?? 'default', endpointId: binding.endpointId, endpointIncarnation: binding.endpointIncarnation } }) })
+      }
       case 'view.open': {
-        const captured = await session.readView()
-        if (signal.aborted) { captured.release(); signal.throwIfAborted() }
-        const id = ++nextView; views.set(id, { handle: captured, requestId })
+        if (options.capabilities !== undefined && !options.capabilities.some(value => value === 'queries' || value === 'events')) throw new Error('APPLICATION_ATTACHMENT_FORBIDDEN')
+        if (views.size + openingViews >= (options.maxViews ?? 16)) throw new Error('APPLICATION_WORKER_VIEW_LIMIT')
+        const release = reserve('views'); openingViews++
+        let captured: ApplicationReadView
+        try { captured = await session.readView() } catch (error) { release(); throw error } finally { openingViews-- }
+        if (signal.aborted) { captured.release(); release(); signal.throwIfAborted() }
+        const id = ++nextView; views.set(id, { handle: captured, requestId, release })
         return { id, revision: captured.revision }
       }
-      case 'view.query': return view(args[0]).query(args[1] as string, args[2] as readonly QueryParameter[])
-      case 'view.events': return view(args[0]).readEvents(args[1] as ApplicationEventOptions)
-      case 'view.release': { const captured = views.get(args[0] as number); views.delete(args[0] as number); captured?.handle.release(); return null }
+      case 'view.query':
+        allowed('queries')
+        // A raw SQL string has no approved named-query identity. It must not
+        // bypass the owner's allowlist merely because a view was captured.
+        if (options.queries !== undefined) throw new Error('APPLICATION_ATTACHMENT_QUERY_FORBIDDEN')
+        return view(args[0]).query(args[1] as string, args[2] as readonly QueryParameter[])
+      case 'view.events': allowed('events'); return view(args[0]).readEvents(args[1] as ApplicationEventOptions)
+      case 'view.release': { const captured = views.get(args[0] as number); views.delete(args[0] as number); captured?.handle.release(); captured?.release(); return null }
       case 'projection.open': return captureProjection(args[0] as string)
       case 'projection.read': return projection(args[0]).read({ signal })
       case 'projection.close': {
         const id = args[0] as number, captured = projections.get(id)
-        await captured?.close(); projections.delete(id); return null
+        if (options.closeSession !== false) await captured?.close()
+        for (const [streamId, stream] of streams) if (stream.projectionId === id) await cancelStream(streamId)
+        projections.delete(id); return null
       }
       case 'content.stage': return (await session.content.stage(args[0] as { bytes: number; mediaType?: string })).id
       case 'content.resume': return (await session.content.resume(args[0] as string)).id
@@ -133,6 +185,10 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     }
   }
   const openStream = (name: unknown, args: readonly unknown[], signal: AbortSignal): AsyncIterator<unknown> => {
+    if (name === 'signals') allowed('signals')
+    else if (name === 'content') allowed('content')
+    else if (name === 'changes' || name === 'projection') allowed('events')
+    else allowed('diagnostics')
     switch (name) {
       case 'changes': return session.changes({ signal })[Symbol.asyncIterator]()
       case 'signals': return session.signals.subscribe({ ...args[0] as SignalSubscribeOptions, signal })[Symbol.asyncIterator]()
@@ -154,14 +210,17 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
     if (request.method === 'close') { await stop(new Error('APPLICATION_SESSION_CLOSED')); return }
     // Bounded cleanup capacity cannot be consumed by passive application waits.
     const release = releasesResource(request.method)
-    if ([...calls.values()].filter(call => call.release === release).length >= (release ? MAX_RELEASES : MAX_REQUESTS)) throw new Error('APPLICATION_WORKER_REQUEST_LIMIT')
+    if ([...calls.values()].filter(call => call.release === release).length >= (release ? MAX_RELEASES : options.maxRequests ?? MAX_REQUESTS)) throw new Error('APPLICATION_WORKER_REQUEST_LIMIT')
+    const releaseRequest = release ? () => undefined : reserve('requests')
     const controller = new AbortController(); calls.set(request.id, { controller, release })
     try {
       let result: unknown
       if (request.method === 'stream.open') {
-        if (streams.size >= MAX_STREAMS) throw new Error('APPLICATION_WORKER_STREAM_LIMIT')
-        const iterator = openStream(request.args[0], request.args.slice(1), controller.signal)
-        streams.set(request.id, { iterator, controller, busy: false }); result = request.id
+        if (streams.size >= (options.maxStreams ?? MAX_STREAMS)) throw new Error('APPLICATION_WORKER_STREAM_LIMIT')
+        const releaseStream = reserve('streams')
+        let iterator: AsyncIterator<unknown>
+        try { iterator = openStream(request.args[0], request.args.slice(1), controller.signal) } catch (error) { releaseStream(); throw error }
+        streams.set(request.id, { iterator, controller, release: releaseStream, busy: false, ...(request.args[0] === 'projection' ? { projectionId: request.args[1] as number } : {}) }); result = request.id
       } else if (request.method === 'stream.next') {
         const stream = streams.get(request.args[0] as number)
         if (stream === undefined) throw new Error('APPLICATION_WORKER_STREAM_CLOSED')
@@ -172,7 +231,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
         if ((result as IteratorResult<unknown>).done) await cancelStream(request.args[0] as number)
       } else result = await invoke(request.method, request.args, controller.signal, request.id)
       if (!closed && !controller.signal.aborted) respond(request.id, result)
-    } finally { calls.delete(request.id) }
+    } finally { calls.delete(request.id); releaseRequest() }
   }
   const receive = (event: MessageEvent): void => {
     const input = event.data as Partial<Request> & { cancel?: unknown }
@@ -185,7 +244,7 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
         // A captured view can outlive the request that created it. If its reply
         // crossed a cancelled page waiter, that request still owns its disposal.
         for (const [id, captured] of views) {
-          if (captured.requestId === input.cancel) { views.delete(id); captured.handle.release() }
+          if (captured.requestId === input.cancel) { views.delete(id); captured.handle.release(); captured.release() }
         }
         return
       }
@@ -203,18 +262,20 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
   }
   const connect = (event: MessageEvent): void => {
     const input = event.data as { protocol?: unknown; port?: MessagePort } | null
-    if (input?.protocol !== PROTOCOL || !input.port || typeof input.port.postMessage !== 'function') return
+    if (input?.protocol !== protocol || !input.port || typeof input.port.postMessage !== 'function') return
     if (closed || port !== undefined) {
       input.port.postMessage({ ended: errorValue(new Error(closed ? 'APPLICATION_SESSION_CLOSED' : 'APPLICATION_WORKER_CLIENT_IN_USE')) })
       input.port.close(); return
     }
     port = input.port
     port.addEventListener('message', receive); port.addEventListener('messageerror', messageError); port.start()
-    try { send({ ready: { ...snapshot(session), protocol: PROTOCOL, applicationId: session.applicationId, historyId: session.historyId,
-      deviceId: session.deviceId, storageId: session.storageId, description: session.describe() } satisfies Metadata }) }
+    try { send({ ready: { ...snapshot(session), protocol, applicationId: session.applicationId, historyId: session.historyId,
+      deviceId: session.deviceId, storageId: session.storageId, description: session.describe(),
+      ...(options.binding === undefined ? {} : { endpoint: options.binding }), signalDelivery: session.signals.delivery ?? 'neighbors' } satisfies Metadata }) }
     catch (error) { void stop(error).catch(() => undefined) }
   }
-  endpoint.addEventListener('message', connect); endpoint.start?.()
+  if (options.initialPort === undefined) { endpoint.addEventListener('message', connect); endpoint.start?.() }
+  else connect({ data: { protocol, port: options.initialPort } } as MessageEvent)
   session.signal.addEventListener('abort', aborted, { once: true })
   if (session.signal.aborted) aborted()
   return { close: () => stop(new Error('APPLICATION_SESSION_CLOSED')) }
