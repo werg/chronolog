@@ -62,8 +62,17 @@ async function principal(value: Principal) {
   return importCelldSigningIdentity(value.publicKey, value.pkcs8Hex)
 }
 
+interface WorkspaceRuntimeClasses {
+  readonly ChronologWorkspaceDO: new (state: { storage: DirectoryStorage }, env: WorkspaceEnvironment) => {
+    fetch(request: Request): Promise<Response>
+    onp2pstream(stream: CelldPeerStream): void
+  }
+  readonly ChronologGroupDO: new (state: { id: { name?: string }; storage: CelldPrivateBytesStorage & CelldSqlStorage },
+    env: WorkspaceEnvironment) => { fetch(request: Request): Promise<Response> }
+}
+
 /** Share one private node directory and Iroh listener among independently stored groups. */
-export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode, decode }: WorkerAdapter) {
+export function createCelldWorkspaceClasses({ DurableObject, socketPair, encode, decode }: WorkerAdapter): WorkspaceRuntimeClasses {
   const reply = (value: unknown) => new Response(encode(value), {
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
   })
