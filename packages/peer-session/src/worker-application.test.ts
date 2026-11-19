@@ -524,6 +524,34 @@ describe('many endpoints attached to one owner', () => {
     expect((await client.authority()).descriptor.payload.applicationId).toBe(client.applicationId)
   })
 
+  it('rejects observer-incompatible attachment quotas before ready without harming subsequent clients', async () => {
+    const f = await fixture()
+    const observers = f.a.participation === undefined ? 2 : 3
+    const { owner, connect } = await owned(f.a, { authorize: handshake => {
+      if (handshake.context?.documentPath === '/streams') return { maxStreams: observers }
+      if (handshake.context?.documentPath === '/requests') return { maxRequests: observers }
+      return { capabilities: ['signals'], maxStreams: 1, maxRequests: 1 }
+    } })
+    await expect(connect({ documentPath: '/streams' })).rejects.toThrow('APPLICATION_ATTACHMENT_OBSERVER_LIMIT')
+    await expect(connect({ documentPath: '/requests' })).rejects.toThrow('APPLICATION_ATTACHMENT_OBSERVER_LIMIT')
+    expect(owner.endpoints()).toHaveLength(0)
+    const lean = await connect({ documentPath: '/signals' })
+    expect(lean.signal.aborted).toBe(false)
+    expect(owner.endpoints()).toHaveLength(1)
+    await lean.suspend()
+    expect((await lean.resumeAttachment())?.endpointId).toBe(lean.endpoint?.endpointId)
+    await expect(lean.authority()).rejects.toThrow('APPLICATION_ATTACHMENT_FORBIDDEN')
+    expect(lean.signal.aborted).toBe(false)
+  })
+
+  it('rejects inadequate global observer budgets before accepting an endpoint', async () => {
+    const f = await fixture()
+    const { owner, connect } = await owned(f.a, { maxStreams: 1, maxRequests: 1 })
+    await expect(connect()).rejects.toThrow('APPLICATION_ATTACHMENT_OBSERVER_LIMIT')
+    expect(owner.endpoints()).toHaveLength(0)
+    expect(f.a.signal.aborted).toBe(false)
+  })
+
   it('binds independent endpoints to one lazy session; detach preserves sibling and signed work', async () => {
     const openStorage = vi.fn(async () => ({ store: new MemoryBytesStore(), close: () => undefined }))
     const f = await fixture({ data: false, openStorageA: openStorage }), { owner, connect } = await owned(f.a)
