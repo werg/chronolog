@@ -225,7 +225,8 @@ equality against the saved intent. As with other device metadata, it relies on
 local storage integrity: the manifest is signed, but the host's version number
 is an acknowledgement rather than a separately signed proof of acceptance.
 
-A submission, receipt validation, receipt retention or selected-head failure
+After the submitted manifest and any retained receipt pass verification, a
+submission, new receipt validation, receipt retention or selected-head failure
 rejects with `ApplicationPublicationError`. Its `phase` is respectively
 `submission`, `receipt`, `retention` or `selection`, and its original `cause` is
 preserved. `operationId` and `publicationId` always identify the submitted signed
@@ -233,6 +234,8 @@ intent. With no valid acknowledgement, `outcome` is `unknown`, `receipt` is `nul
 and `code` is `APPLICATION_PUBLICATION_OUTCOME_UNKNOWN`. Once a valid receipt is
 known, `outcome` is `committed`, `receipt` carries it and `code` is
 `APPLICATION_PUBLICATION_COMMITTED`, even if verification or a later retry fails.
+Preflight manifest and retained-record verification errors remain unchanged and
+cannot establish a new receipt or dispatch a publication request.
 Invalid signatures, stale authority and invalid selected chains still fail;
 `committed` does not mean the publication is currently selected. A receipt
 retention failure includes the valid in-memory receipt in the error, but cannot
