@@ -234,8 +234,14 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
       if (previous !== null) await verifyPublicationManifest(previous.publication, authority)
       // Storage versions are host acknowledgements, but each manifest must keep
       // the same version across its receipt, selected head and retained history.
-      const checkVersion = (receipt: ApplicationPublication): void => {
-        for (const expected of [previous, acknowledged]) {
+      const checkVersion = async (receipt: ApplicationPublication): Promise<void> => {
+        const publication = receipt.publication
+        // The candidate manifest was verified against this application's authority.
+        // Bind its exact journal receipt before trusting the saved storage version,
+        // including when an earlier failed selection never established a checkpoint.
+        const retained = await this.#store.get(`${this.#publicationReceipts}/${publication.payload.author}/${await peerDigest(publication.payload.operationId)}`)
+        const saved = retained === null ? null : await verifyPublicationReceipt(decodePeerValue<unknown>(retained), publication)
+        for (const expected of [previous, acknowledged, saved]) {
           if (expected != null && receipt.publication.id === expected.publication.id && receipt.version !== expected.version) {
             throw new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH')
           }
@@ -243,7 +249,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
       }
       let cursor = current.publication
       await verifyPublicationManifest(cursor, authority)
-      checkVersion(current)
+      await checkVersion(current)
       if (previous !== null && (cursor.payload.revision < previous.publication.payload.revision ||
         cursor.payload.revision === previous.publication.payload.revision && cursor.id !== previous.publication.id)) {
         throw new Error('APPLICATION_PUBLICATION_REGRESSION')
@@ -259,7 +265,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
           throw new Error('APPLICATION_PUBLICATION_CHAIN_INVALID')
         }
         await verifyPublicationManifest(prior.publication, authority)
-        checkVersion(prior)
+        await checkVersion(prior)
         cursor = prior.publication
         previousSeen ||= cursor.id === previous?.publication.id
         acknowledgedSeen ||= cursor.id === acknowledged?.publication.id

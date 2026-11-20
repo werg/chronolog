@@ -253,6 +253,8 @@ manifest and the previously verified selected head. A changed version fails
 with `APPLICATION_PUBLICATION_REPLY_MISMATCH`; it cannot silently replace the
 retained receipt or advance the selected checkpoint. This is consistency of the
 host's acknowledgement, not a signature over that storage version.
+Standalone reads also check the matching retained receipt after reopen, even
+when the first selection failed before any head was checkpointed.
 
 After a timeout, disconnect or cancellation, reopen the same device store and
 inspect the original operation ID. Reuse the saved manifest and exact assets for

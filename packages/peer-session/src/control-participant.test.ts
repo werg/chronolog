@@ -442,6 +442,37 @@ describe('session-owned control participant', () => {
     expect(await resumed.publication()).toEqual(receipt)
   })
 
+  it('binds standalone reads to a retained receipt after selection failed before its first checkpoint', async () => {
+    const f = await fixture(), a = await f.open(0)
+    const selectionFailure = new Error('FIRST_SELECTION_UNAVAILABLE')
+    let published = false, failSelection = true, corruptVersion = false
+    const exchange = async (request: ParticipantRequest) => {
+      if (published && failSelection && request.facet === 'control' && request.action === 'read') throw selectionFailure
+      const response = await f.exchange(request)
+      if (request.facet === 'publication' && request.action === 'publish') published = true
+      if (corruptVersion && request.facet === 'publication' && request.action === 'read') {
+        return createParticipantResponse(request, { publication: (await f.publications.read()).at(-1), version: 99 })
+      }
+      return response
+    }
+    const host = a.connectControlParticipant({ exchange }), bytes = new TextEncoder().encode('<main>retained version</main>')
+    const publication = await host.preparePublication({ operationId: 'retained-version', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    const receipt = { publication, version: 1 }
+    await expect(host.publish(publication, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'selection', receipt,
+      cause: selectionFailure })
+    await a.close()
+    failSelection = false; corruptVersion = true
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange })
+    await expect(resumed.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+    expect(await resumed.publicationOperation('retained-version')).toEqual({ publication, receipt })
+    corruptVersion = false
+    expect(await resumed.publish(publication, [])).toEqual(receipt)
+    expect(await resumed.publication()).toEqual(receipt)
+    expect(await f.publications.read()).toEqual([publication])
+    expect(f.storageOpens).toEqual([0, 0])
+  })
+
   it.each(['version', 'signature', 'operation'] as const)('revalidates a retained receipt with corrupt %s after reopen', async field => {
     const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
     const bytes = new TextEncoder().encode('<main>local receipt</main>')
