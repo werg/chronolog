@@ -399,7 +399,11 @@ unchanged subscription callback does no hosted work. A settled healthy controlle
 has no recurring timer, advertisement, directory read or synchronization, even
 when below its maximum peer count. Late peers are discovered through notifications.
 Unhealthy coordination and failed active operations retain bounded deadlines,
-grace and exponential retry backoff. Ordinary commands and live signals do not
+grace and exponential retry backoff. After the first ready, a notification outage
+does not block verified recovery of a missing coordinator; an already healthy
+participant does no recovery reads just because the notification transport failed.
+Notification errors, early stream termination and invalid event shapes are surfaced
+and resubscribed with capped backoff. A new stream must start with ready again. Ordinary commands and live signals do not
 cause control-service requests; changed retained history does update discoverability. A relayed
 connection does carry their ciphertext through its WebSockets.
 

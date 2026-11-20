@@ -66,8 +66,10 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   #nextScan = Infinity
   #nextAdvertisement = Infinity
   #discoveryReady = false
+  #hasDiscoveryReady = false
   #discoveryError: string | null = null
   #advertiseRetry = 0
+  #advertisementError: string | null = null
   #stateKey: string
   #missingSince: number | null = null
   #retry = 0
@@ -172,18 +174,18 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       if (replica === undefined || this.#healthy()) { this.#missingSince = null; this.#proposal = null; this.#approved = null }
       else this.#missingSince ??= now
       // No hosted work may race ahead of the subscription's initial ready.
-      if (!this.#discoveryReady) { this.#publish(); await this.#wait(Infinity); continue }
-      if (now >= this.#nextAdvertisement) {
+      if (!this.#discoveryReady && (!this.#hasDiscoveryReady || this.#healthy())) { this.#publish(); await this.#wait(Infinity); continue }
+      if (this.#discoveryReady && now >= this.#nextAdvertisement) {
         this.#nextAdvertisement = Infinity
         try {
           await this.#call('advertise', signal => this.#options.discovery.advertise(this.#advertisement(), { signal }))
-          this.#advertiseRetry = 0
+          this.#advertiseRetry = 0; this.#advertisementError = null
         } catch (error) {
-          this.#error = message(error)
+          this.#advertisementError = message(error)
           this.#nextAdvertisement = Math.min(this.#nextAdvertisement, Date.now() + this.#backoff(this.#advertiseRetry++))
         }
       }
-      if (this.#discoveryReady && Date.now() >= this.#nextScan) {
+      if (Date.now() >= this.#nextScan) {
         // Clear before awaiting: a notification or real state change during the scan must survive it.
         this.#nextScan = Infinity
         let failed = false
@@ -194,7 +196,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
         else this.#retry = 0
       }
       this.#publish()
-      await this.#wait(this.#discoveryReady ? Math.max(1, Math.min(this.#nextScan, this.#nextAdvertisement) - Date.now()) : Infinity)
+      await this.#wait(Math.max(1, Math.min(this.#nextScan, this.#discoveryReady ? this.#nextAdvertisement : Infinity) - Date.now()))
     }
   }
 
@@ -216,10 +218,10 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
           const next = await awaitOwnedTask(this.signal, () => iterator!.next())
           if (next.done) throw new Error('APPLICATION_DISCOVERY_NOTIFICATIONS_ENDED')
           const value: unknown = next.value
-          if (value === null || typeof value !== 'object' || Object.keys(value).length !== 1 || !('type' in value) ||
+          if (value === null || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).join() !== 'type' || !('type' in value) ||
               value.type !== 'ready' && value.type !== 'changed' || !ready && value.type !== 'ready') throw new Error('APPLICATION_DISCOVERY_NOTIFICATION_INVALID')
           if (value.type === 'ready') {
-            ready = true; this.#discoveryReady = true; this.#discoveryError = null; failures = 0
+            ready = true; this.#discoveryReady = true; this.#hasDiscoveryReady = true; this.#discoveryError = null; failures = 0
             this.#nextAdvertisement = 0
           }
           this.#nextScan = 0; this.#wake()
@@ -439,7 +441,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   #backoff(attempt: number): number { return Math.max(1, Math.round(Math.min(this.#maximumRetry, this.#initialRetry * 2 ** Math.min(attempt, 20)) * (0.75 + Math.random() * 0.25))) }
   #publish(phase?: ApplicationParticipationStatus['phase']): void {
     const replica = this.#owner.participant.data?.replica
-    const error = this.#discoveryError ?? this.#error ?? (replica !== undefined && this.#links().some(link => link.peerId === replica.generation.payload.coordinator && link.data === 'unavailable')
+    const error = this.#discoveryError ?? this.#advertisementError ?? this.#error ?? (replica !== undefined && this.#links().some(link => link.peerId === replica.generation.payload.coordinator && link.data === 'unavailable')
       ? 'APPLICATION_DATA_UNAVAILABLE' : null)
     const next: ApplicationParticipationStatus = {
       phase: phase ?? (this.signal.aborted ? 'closed' : this.#proposal !== null && this.#approved !== this.#proposal.id ? 'approval-required'
