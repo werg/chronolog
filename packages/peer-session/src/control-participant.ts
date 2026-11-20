@@ -209,7 +209,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
         phase = 'selection'
         // An exact old retry may return its original receipt after a newer release.
         // Refresh the selected head instead of making that old receipt current.
-        await this.#readPublication()
+        await this.#readPublication(acknowledged.publication)
         return receipt
       } catch (cause) {
         throw new ApplicationPublicationError(publication, phase, cause, receipt)
@@ -217,12 +217,13 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     })
   }
 
-  async #readPublication(): Promise<ApplicationPublication | null> {
+  async #readPublication(acknowledged?: SignedPublication): Promise<ApplicationPublication | null> {
     await this.application()
     const authority = await verifyAuthorityBundle(this.#participant.authority)
     const current = await this.#request<ApplicationPublication | null>('publication', 'read', {})
     if (current === null) {
       if (await this.#store.get(this.#publicationKey) !== null) throw new Error('APPLICATION_PUBLICATION_REGRESSION')
+      if (acknowledged !== undefined) throw new Error('APPLICATION_PUBLICATION_NOT_SELECTED')
       this.#signal.throwIfAborted()
       return null
     }
@@ -237,8 +238,10 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
         cursor.payload.revision === previous.publication.payload.revision && cursor.id !== previous.publication.id)) {
         throw new Error('APPLICATION_PUBLICATION_REGRESSION')
       }
+      let previousSeen = cursor.id === previous?.publication.id
+      let acknowledgedSeen = acknowledged === undefined || cursor.id === acknowledged.id
       let remaining = PUBLICATION_LIMITS.revisions
-      while (cursor.id !== previous?.publication.id && cursor.payload.previous !== null) {
+      while ((previous === null || !previousSeen || !acknowledgedSeen) && cursor.payload.previous !== null) {
         if (--remaining < 0) throw new Error('APPLICATION_PUBLICATION_HISTORY_LIMIT')
         const prior = await this.#request<ApplicationPublication | null>('publication', 'read', { id: cursor.payload.previous })
         if (prior === null || prior.publication.id !== cursor.payload.previous || prior.publication.payload.revision !== cursor.payload.revision - 1) {
@@ -246,8 +249,11 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
         }
         await verifyPublicationManifest(prior.publication, authority)
         cursor = prior.publication
+        previousSeen ||= cursor.id === previous?.publication.id
+        acknowledgedSeen ||= cursor.id === acknowledged?.id
       }
-      if (previous !== null && cursor.id !== previous.publication.id) throw new Error('APPLICATION_PUBLICATION_REGRESSION')
+      if (previous !== null && !previousSeen) throw new Error('APPLICATION_PUBLICATION_REGRESSION')
+      if (!acknowledgedSeen) throw new Error('APPLICATION_PUBLICATION_NOT_SELECTED')
       this.#signal.throwIfAborted()
       return encodePeerValue(current)
     })

@@ -238,6 +238,14 @@ Invalid signatures, stale authority and invalid selected chains still fail;
 retention failure includes the valid in-memory receipt in the error, but cannot
 guarantee that a subsequent process will find it locally.
 
+The refreshed selected chain must contain the acknowledged manifest. A missing,
+older or divergent selected chain fails with
+`APPLICATION_PUBLICATION_NOT_SELECTED` as the selection error's cause (or the
+existing regression/verification error when a previously trusted head is
+violated). That failure preserves the receipt without advancing the remembered
+head. A newer selected release is allowed after an exact old retry, provided its
+verified ancestry includes that retry's original publication.
+
 After a timeout, disconnect or cancellation, reopen the same device store and
 inspect the original operation ID. Reuse the saved manifest and exact assets for
 an explicit retry; do not replace an uncertain operation with newly signed
