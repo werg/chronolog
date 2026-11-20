@@ -14,23 +14,29 @@ import { connectApplications, type ApplicationSession } from './session.js'
 import type { ApplicationControlHost } from './recovery.js'
 import type {
   ApplicationDiscoveryPort, ApplicationParticipationOptions, ApplicationPeerHint, ApplicationPeerInvitation, ApplicationTransportPort,
-  ApplicationPeerAdvertisement,
+  ApplicationPeerAdvertisement, ApplicationDiscoveryNotification,
 } from './participation-types.js'
 
 const definition = defineApplication({ id: 'participation', version: '1', commands: {
   say: defineCommand({ description: 'Post a message', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
 }, queries: {} })
 const closing: Array<() => void | Promise<void>> = []
-afterEach(async () => { for (const close of closing.splice(0).reverse()) await close(); vi.restoreAllMocks() })
+afterEach(async () => { vi.useRealTimers(); for (const close of closing.splice(0).reverse()) await close(); vi.restoreAllMocks() })
 
 /** Delivery only: real session handshakes, signed authority and history run on these framed pairs. */
 class Introductions {
   readonly directory = new Map<string, ApplicationPeerHint>()
   readonly advertised = new Map<string, ApplicationPeerAdvertisement>()
   readonly #listeners = new Map<string, (value: ApplicationPeerInvitation) => void>()
+  readonly notices = new Map<string, (value: ApplicationDiscoveryNotification) => void>()
   readonly #connections = new Map<string, FramedPeerConnection>()
-  readonly counts = { reads: 0, advertisements: 0, withdrawals: 0, opens: 0 }
+  readonly counts = { reads: 0, advertisements: 0, withdrawals: 0, opens: 0, frames: 0 }
   unavailable = false
+  counted(connection: FramedPeerConnection): FramedPeerConnection {
+    return { signal: connection.signal, ...(connection.live === undefined ? {} : { live: connection.live }),
+      send: (frame, options) => { this.counts.frames++; return connection.send(frame, options) },
+      frames: signal => connection.frames(signal), close: () => connection.close() }
+  }
   ports(identity: string): { discovery: ApplicationDiscoveryPort; transport: ApplicationTransportPort } {
     const hub = this
     return {
@@ -38,10 +44,30 @@ class Introductions {
         async read({ signal }) { signal.throwIfAborted(); hub.counts.reads++; if (hub.unavailable) throw new Error('DIRECTORY_OFFLINE'); return [...hub.directory.values()] },
         async advertise(value, { signal }) {
           signal.throwIfAborted(); hub.counts.advertisements++; if (hub.unavailable) throw new Error('DIRECTORY_OFFLINE')
+          const changed = JSON.stringify(hub.advertised.get(identity)) !== JSON.stringify(value)
           hub.advertised.set(identity, structuredClone(value))
           hub.directory.set(identity, { identity: value.identity, route: value.identity })
+          if (changed) for (const notify of hub.notices.values()) notify({ type: 'changed' })
         },
-        async withdraw({ signal }) { signal.throwIfAborted(); hub.counts.withdrawals++; hub.directory.delete(identity) },
+        async withdraw({ signal }) {
+          signal.throwIfAborted(); hub.counts.withdrawals++; hub.advertised.delete(identity)
+          if (hub.directory.delete(identity)) for (const notify of hub.notices.values()) notify({ type: 'changed' })
+        },
+        async *notifications({ signal }) {
+          const queue: ApplicationDiscoveryNotification[] = [{ type: 'ready' }]
+          let notify = (): void => {}
+          const accept = (value: ApplicationDiscoveryNotification): void => { queue.push(value); notify() }
+          hub.notices.set(identity, accept)
+          try {
+            while (!signal.aborted) {
+              if (queue.length === 0) await new Promise<void>(resolve => {
+                const done = (): void => { signal.removeEventListener('abort', done); resolve() }
+                notify = done; signal.addEventListener('abort', done, { once: true }); if (signal.aborted) done()
+              })
+              const value = queue.shift(); if (value !== undefined) yield value
+            }
+          } finally { if (hub.notices.get(identity) === accept) hub.notices.delete(identity) }
+        },
         async *invitations({ signal }) {
           const queue: ApplicationPeerInvitation[] = []
           let notify = (): void => {}
@@ -65,14 +91,14 @@ class Introductions {
             if (typeof input.invitation !== 'string') throw new Error('INVITATION_INVALID')
             const connection = hub.#connections.get(input.invitation)
             if (connection === undefined) throw new Error('INVITATION_EXPIRED')
-            hub.#connections.delete(input.invitation); return connection
+            hub.#connections.delete(input.invitation); return hub.counted(connection)
           }
           const target = hub.#listeners.get(input.peer.identity)
           if (target === undefined) throw new Error('PEER_UNAVAILABLE')
           const [left, right] = createFramedPeerConnectionPair(), token = crypto.randomUUID()
           hub.#connections.set(token, right)
           target({ peer: { identity, route: identity }, token })
-          return left
+          return hub.counted(left)
         },
       },
     }
@@ -119,7 +145,7 @@ async function fixture(options: { omitC?: boolean } = {}) {
   }
   const participate = (session: ApplicationSession, overrides: Partial<ApplicationParticipationOptions> = {}) => session.participate({
     control: host, ...hub.ports(session.deviceId), recovery: { graceMs: 25, freshnessMs: 300_000 },
-    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 2000, advertiseMs: 15_000 }, ...overrides,
+    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 2000 }, ...overrides,
   })
   return { a, b, c, stores, registry, hub, host, counts, requests, open, openCold, participate, signer, descriptor, control,
     offline(value: boolean) { offline = value }, loseSelection() { loseSelection = true } }
@@ -128,9 +154,9 @@ async function fixture(options: { omitC?: boolean } = {}) {
 async function until(check: () => boolean | Promise<boolean>, timeout = 5000): Promise<void> {
   await vi.waitFor(async () => { expect(await check()).toBe(true) }, { timeout, interval: 5 })
 }
-async function post(session: ApplicationSession<typeof definition>, id: string) {
+async function post(session: ApplicationSession<typeof definition>, id: string, timeoutMs = 5000) {
   const operation = await session.command('say', id, { operationId: id })
-  await operation.applied({ signal: AbortSignal.timeout(5000) }); return operation
+  await operation.applied({ signal: AbortSignal.timeout(timeoutMs) }); return operation
 }
 
 function gate() {
@@ -159,7 +185,7 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
       }
       return connection
     } },
-    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 5000, advertiseMs: 15_000 },
+    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 5000 },
   })
   closing.push(() => { directory.resolve(); release.resolve() })
   await until(() => participation.status.phase === 'following')
@@ -173,6 +199,225 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
 }
 
 describe('owned application participation', () => {
+  it('starts notifications before its first advertisement and waits for initial ready', async () => {
+    const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId), ready = gate()
+    let subscribed = false, returned = false
+    const participation = f.participate(a, { discovery: { ...ports.discovery,
+      async *notifications(options) {
+        subscribed = true
+        try { await ready.promise; yield* ports.discovery.notifications(options) } finally { returned = true }
+      },
+      async advertise(value, options) { expect(subscribed).toBe(true); await ports.discovery.advertise(value, options) },
+    } })
+    await until(() => subscribed)
+    expect(f.hub.counts.advertisements).toBe(0); expect(f.hub.counts.reads).toBe(0); expect(f.counts.reads).toBe(0)
+    expect(participation.status.phase).toBe('connecting')
+    ready.resolve(); await until(() => participation.status.phase === 'coordinating')
+    await participation.close(); expect(returned).toBe(true); expect(f.hub.notices.size).toBe(0)
+  })
+
+  it('leaves a healthy underfilled coordinator completely idle for 48 virtual hours', async () => {
+    const f = await fixture(), a = await f.open(f.a)
+    vi.useFakeTimers()
+    const participation = f.participate(a)
+    await until(() => participation.status.phase === 'coordinating')
+    await vi.advanceTimersByTimeAsync(100)
+    await until(() => vi.getTimerCount() === 0)
+    const before = { host: { ...f.counts }, discovery: { ...f.hub.counts } }
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect({ host: { ...f.counts }, discovery: { ...f.hub.counts } }).toEqual(before)
+    expect(vi.getTimerCount()).toBe(0); expect(participation.status.phase).toBe('coordinating')
+  })
+
+  it('does not advertise for changed notifications and re-announces exactly once after ready', async () => {
+    const f = await fixture(), a = await f.open(f.a), participation = f.participate(a)
+    await until(() => participation.status.phase === 'coordinating')
+    await new Promise(resolve => setTimeout(resolve, 25))
+    const before = { ...f.hub.counts }
+    f.hub.notices.get(a.deviceId)!({ type: 'changed' })
+    await until(() => f.hub.counts.reads > before.reads)
+    expect(f.hub.counts.advertisements).toBe(before.advertisements)
+    f.hub.notices.get(a.deviceId)!({ type: 'ready' })
+    await until(() => f.hub.counts.advertisements === before.advertisements + 1)
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(f.hub.counts.advertisements).toBe(before.advertisements + 1)
+    expect(f.counts.selections).toBe(0)
+  })
+
+  it('discovers a late peer after 48 idle hours without a lease renewal', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    vi.useFakeTimers()
+    const first = f.participate(a)
+    await until(() => first.status.phase === 'coordinating'); await vi.advanceTimersByTimeAsync(100)
+    const ads = f.hub.counts.advertisements
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect(f.hub.counts.advertisements).toBe(ads)
+    // Real crypto/transport work must finish under real deadlines; virtual time only measures settled idle.
+    vi.useRealTimers()
+    const second = f.participate(b)
+    await until(() => second.status.phase === 'following' && first.status.connectedPeers.includes(b.deviceId))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    vi.useFakeTimers()
+    await vi.advanceTimersByTimeAsync(100)
+    await until(() => vi.getTimerCount() === 0)
+    const before = { host: { ...f.counts }, discovery: { ...f.hub.counts } }
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect({ host: { ...f.counts }, discovery: { ...f.hub.counts } }).toEqual(before)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('cancels and returns an uncooperative notification iterator without advertising or waiting for it', async () => {
+    const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId)
+    let deliver!: (value: IteratorResult<ApplicationDiscoveryNotification>) => void
+    const returned = vi.fn(async () => ({ done: true as const, value: undefined }))
+    const next = vi.fn(() => new Promise<IteratorResult<ApplicationDiscoveryNotification>>(resolve => { deliver = resolve }))
+    const participation = f.participate(a, { discovery: { ...ports.discovery, notifications: () => ({ [Symbol.asyncIterator]: () => ({ next, return: returned }) }) } })
+    await until(() => next.mock.calls.length === 1)
+    await participation.close(); expect(returned).toHaveBeenCalledTimes(1)
+    deliver({ done: false, value: { type: 'ready' } }); await new Promise(resolve => setTimeout(resolve, 10))
+    expect(f.hub.counts.advertisements).toBe(0); expect(f.hub.counts.reads).toBe(0); expect(participation.status.phase).toBe('closed')
+  })
+
+  it.each(['ended', 'failed', 'changed-before-ready', 'payload'] as const)('backs off and resubscribes after notification %s without accepting invalid readiness', async failure => {
+    const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId), resume = gate()
+    let attempts = 0, cleanup = 0
+    closing.push(() => resume.resolve())
+    const participation = f.participate(a, { discovery: { ...ports.discovery, async *notifications(options) {
+      const attempt = ++attempts
+      try {
+        if (attempt === 1) {
+          if (failure === 'failed') throw new Error('NOTIFICATION_TRANSPORT_OFFLINE')
+          if (failure === 'changed-before-ready') yield { type: 'changed' }
+          if (failure === 'payload') yield { type: 'ready', data: 'untrusted' } as ApplicationDiscoveryNotification
+          return
+        }
+        await resume.promise; yield* ports.discovery.notifications(options)
+      } finally { cleanup++ }
+    } } })
+    await until(() => attempts === 2)
+    expect(cleanup).toBe(1); expect(f.hub.counts.advertisements).toBe(0); expect(f.hub.counts.reads).toBe(0)
+    expect(participation.status.error).toMatch(/NOTIFICATION/)
+    resume.resolve(); await until(() => participation.status.phase === 'coordinating' && participation.status.error === null && f.hub.counts.advertisements > 0)
+    expect(participation.status.error).toBeNull(); await participation.close(); expect(cleanup).toBe(2)
+  })
+
+  it('serializes scans and retains notifications delivered during an awaited scan', async () => {
+    const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId), release = gate()
+    let reading = 0, maximum = 0, reads = 0
+    closing.push(() => release.resolve())
+    const participation = f.participate(a, { discovery: { ...ports.discovery, async read(options) {
+      reading++; maximum = Math.max(maximum, reading)
+      try { if (++reads === 1) await release.promise; return await ports.discovery.read(options) } finally { reading-- }
+    }, async advertise(value, options) { expect(reading).toBe(0); return ports.discovery.advertise(value, options) } } })
+    await until(() => reads === 1)
+    f.hub.notices.get(a.deviceId)!({ type: 'changed' }); f.hub.notices.get(a.deviceId)!({ type: 'ready' })
+    release.resolve(); await until(() => reads >= 2 && participation.status.phase === 'coordinating')
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(maximum).toBe(1); expect(f.hub.counts.advertisements).toBe(2)
+  })
+
+  it('retries a failed active advertisement with capped backoff and becomes timer-free after repair', async () => {
+    const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId)
+    let attempts = 0, repaired = false
+    vi.useFakeTimers(); vi.spyOn(Math, 'random').mockReturnValue(0.99)
+    const participation = f.participate(a, { discovery: { ...ports.discovery, async advertise(value, options) {
+      attempts++; if (!repaired) throw new Error('ADVERTISE_OFFLINE'); return ports.discovery.advertise(value, options)
+    } } })
+    await until(() => attempts >= 3)
+    expect(participation.status.error).toBe('ADVERTISE_OFFLINE')
+    const before = attempts; await vi.advanceTimersByTimeAsync(100)
+    expect(attempts - before).toBeLessThanOrEqual(6)
+    repaired = true; await until(() => participation.status.error === null && f.hub.counts.advertisements === 1)
+    await until(() => vi.getTimerCount() === 0)
+    const settled = attempts; await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect(attempts).toBe(settled); expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('rechecks signed recovery revocation before a notification-driven approved selection', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), participation = f.participate(b)
+    await until(() => participation.status.phase === 'approval-required')
+    const proposal = participation.status.recovery!
+    const control = await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control),
+      grants: f.control.payload.grants.map(grant => grant.publicKey === b.deviceId ? { ...grant, recovery: false } : grant),
+    }, f.signer)
+    await f.registry.select(await signTransitionRequest({ applicationId: a.applicationId, profile: 'peer-generation-v1', policy: 'eligible-members-v1',
+      expectedGeneration: a.revision!.generation, coordinator: a.deviceId, requester: a.deviceId, controlRevision: 1,
+      base: await a.recoveryPoint(), transitionId: 'revoke-recovery', reason: 'control-change',
+    }, f.a.identity), { control })
+    f.hub.notices.get(b.deviceId)!({ type: 'changed' })
+    await participation.approveRecovery(proposal.id)
+    await until(() => participation.status.error === 'PEER_RECOVERY_FORBIDDEN')
+    expect(f.requests).toHaveLength(0)
+    expect(await b.recovery.inspect()).toEqual([])
+    await expect(participation.approveRecovery(proposal.id)).rejects.toThrow('APPLICATION_RECOVERY_APPROVAL_STALE')
+  })
+
+  it('preserves coordinator-loss grace and recovery while a previously ready notification transport is down', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(b.deviceId)
+    const outage = gate(), restore = gate()
+    let attempts = 0
+    closing.push(() => { outage.resolve(); restore.resolve() })
+    const first = f.participate(a), second = f.participate(b, { discovery: { ...ports.discovery, async *notifications(options) {
+      if (++attempts === 1) { yield { type: 'ready' }; await outage.promise; throw new Error('WATCH_OFFLINE') }
+      await restore.promise; yield* ports.discovery.notifications(options)
+    } } })
+    await until(() => second.status.phase === 'following')
+    await until(async () => await f.b.store.get(`peer-session/coordinator-observation/${b.applicationId}`) !== null)
+    outage.resolve(); await until(() => attempts >= 2)
+    await first.close()
+    await until(() => second.status.phase === 'coordinating')
+    expect(f.requests).toHaveLength(1)
+    expect(f.requests[0]!.payload.coordinator).toBe(b.deviceId)
+    expect(second.status.error).toBe('WATCH_OFFLINE')
+  })
+
+  it.each([false, true])('never resubscribes or performs hosted work for 48 hours after terminal discovery (ready: %s)', async ready => {
+    const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId), fatal = gate()
+    let subscriptions = 0, returned = 0
+    closing.push(() => fatal.resolve())
+    const participation = f.participate(a, { discovery: { ...ports.discovery, async *notifications() {
+      subscriptions++
+      try { if (ready) yield { type: 'ready' }; await fatal.promise; throw Object.assign(new Error('PARTICIPANT_REPLACED'), { retryable: false }) }
+      finally { returned++ }
+    } } })
+    await until(() => subscriptions === 1 && (!ready || f.hub.counts.advertisements > 0))
+    fatal.resolve(); await until(() => participation.status.phase === 'unavailable')
+    expect(participation.status.error).toBe('PARTICIPANT_REPLACED'); expect(returned).toBe(1)
+    expect(a.signal.aborted).toBe(false)
+    await expect((await post(a, 'native-still-running')).get()).resolves.toMatchObject({ status: 'applied' })
+    vi.useFakeTimers()
+    const before = { host: { ...f.counts }, discovery: { ...f.hub.counts } }
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect(subscriptions).toBe(1); expect(vi.getTimerCount()).toBe(0)
+    expect({ host: { ...f.counts }, discovery: { ...f.hub.counts } }).toEqual(before)
+    await participation.close(); expect(f.hub.counts.withdrawals).toBe(0)
+    expect(a.signal.aborted).toBe(false)
+  })
+
+  it('fences missing-coordinator recovery after terminal discovery without closing existing peer links', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(b.deviceId), fatal = gate()
+    let subscriptions = 0
+    closing.push(() => fatal.resolve())
+    const first = f.participate(a), second = f.participate(b, { discovery: { ...ports.discovery, async *notifications() {
+      subscriptions++; yield { type: 'ready' }; await fatal.promise
+      throw Object.assign(new Error('ACCESS_REVOKED'), { retryable: false })
+    } } })
+    await until(() => second.status.phase === 'following')
+    fatal.resolve(); await until(() => second.status.phase === 'unavailable')
+    expect(second.status.connectedPeers).toContain(a.deviceId)
+    // Terminal host discovery is independent of the already authenticated data connection.
+    await (await post(b, 'still-replicates')).shared({ signal: AbortSignal.timeout(5000) })
+    await first.close(); await new Promise(resolve => setTimeout(resolve, 25))
+    vi.useFakeTimers()
+    const before = { host: { ...f.counts }, discovery: { ...f.hub.counts } }
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect({ host: { ...f.counts }, discovery: { ...f.hub.counts } }).toEqual(before)
+    expect(subscriptions).toBe(1); expect(f.requests).toHaveLength(0); expect(vi.getTimerCount()).toBe(0)
+    expect(b.signal.aborted).toBe(false); expect(second.status.phase).toBe('unavailable')
+  })
+
   it('keeps discovery, authenticated live traffic and controls active without recovery until local data use', async () => {
     const f = await fixture(), openB = vi.fn(() => f.b.openStorage()), openC = vi.fn(() => f.c.openStorage())
     const b = await f.openCold({ ...f.b, openStorage: openB }), c = await f.openCold({ ...f.c, openStorage: openC })
@@ -222,15 +467,25 @@ describe('owned application participation', () => {
     expect(a.status.database).toBe('failed')
   })
 
-  it('discovers authenticated peers and saves ordinary commands without command-correlated host traffic', async () => {
+  it('replicates many ordinary commands without advertisements, directory reads or control traffic', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const first = f.participate(a), second = f.participate(b)
     await until(() => first.status.phase === 'coordinating' && second.status.phase === 'following')
     expect(second.status.connectedPeers).toContain(a.deviceId)
-    const before = { ...f.counts, ...f.hub.counts }
-    const operation = await post(b, 'once')
-    await operation.shared({ signal: AbortSignal.timeout(5000) })
-    expect({ ...f.counts, ...f.hub.counts }).toEqual(before)
+    await new Promise(resolve => setTimeout(resolve, 25))
+    const before = { control: { ...f.counts }, delivery: { ...f.hub.counts } }
+    for (let index = 0; index < 16; index++) {
+      const operation = await post(index % 2 === 0 ? b : a, `ordinary-${index}`, 15000)
+      await operation.shared({ signal: AbortSignal.timeout(15000) })
+    }
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(a.revision!.point.sequence).toBe(16); expect(b.revision!.point).toEqual(a.revision!.point)
+    expect(f.counts).toEqual(before.control)
+    expect(f.hub.counts.advertisements).toBe(before.delivery.advertisements)
+    expect(f.hub.counts.reads).toBe(before.delivery.reads)
+    expect(f.hub.counts.withdrawals).toBe(before.delivery.withdrawals)
+    expect(f.hub.counts.opens).toBe(before.delivery.opens)
+    expect(f.hub.counts.frames).toBeGreaterThan(before.delivery.frames)
     expect(() => f.participate(b)).toThrow('APPLICATION_PARTICIPATION_ALREADY_STARTED')
     await second.close()
     expect(b.participation).toBe(second); expect(second.status.phase).toBe('closed')

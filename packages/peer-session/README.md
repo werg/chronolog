@@ -439,10 +439,34 @@ The default controller owns at most four connections, with a hard maximum of
 eight. Attempts have a 15-second deadline and bounded exponential backoff with
 jitter, starting at one second and capped at 30 seconds. A transport that ignores
 cancellation continues to occupy its bounded opening slot; a late connection is
-closed rather than attached. Discoverability leases renew every 60 seconds.
-Healthy peers synchronize on that coarse cadence, and directory reads occur
-only while the graph is underfilled or the coordinator is absent. Ordinary
-commands and live signals do not cause control-service requests. A relayed
+closed rather than attached. Discovery requires
+`notifications({ signal }): AsyncIterable<{ type: 'ready' | 'changed' }>`.
+Start the authenticated notification transport before advertising; its first event
+must be `ready`. A `ready` event (including after reconnect) re-advertises once and
+scans; `changed` invalidates routing and scans without re-advertising. Advertisements
+have no lease TTL: the discovery service ties presence to its authenticated
+notification transport and explicit withdrawal. There is no polling compatibility
+mode or `connections.advertiseMs` option.
+
+Real selected-generation/control changes and data activation/availability changes
+coalesce an advertisement and scan. Materialized head/point changes do not: peer
+replication owns ordinary command updates. An advertisement samples its untrusted
+point only when presence or those lifecycle events require an advertisement. An
+unchanged subscription callback does no hosted work. A settled healthy controller
+has no recurring timer, advertisement, directory read or synchronization, even
+when below its maximum peer count. Late peers are discovered through notifications.
+Unhealthy coordination and failed active operations retain bounded deadlines,
+grace and exponential retry backoff. After the first ready, a notification outage
+does not block verified recovery of a missing coordinator; an already healthy
+participant does no recovery reads just because the notification transport failed.
+Retryable notification errors and early stream termination are surfaced and
+resubscribed with capped backoff. A new stream must start with ready again.
+A provider-neutral error carrying `retryable === false` is terminal (for example
+revocation, participant replacement or a protocol rejection). It fences hosted
+participation calls, notification/invitation resubscription and withdrawal; the
+application and already authenticated peer links stay alive. Discovery becomes
+unavailable rather than racing a replacement owner. There is no polling fallback. Ordinary commands and live signals do not
+cause control-service requests, advertisements or directory reads. A relayed
 connection does carry their ciphertext through its WebSockets.
 
 After coordinator loss, the controller first gives reconnection its configured
@@ -487,7 +511,8 @@ changing their signed meaning. There is no second application queue.
 
 `session.participation` exposes the one handle for the session's lifetime.
 `participation.close()` fences timers, pending replies and invitations, closes
-its peer connections and attempts a bounded lease withdrawal. The closed handle
+its peer connections and attempts a bounded presence withdrawal. Notification and
+invitation iterators are cancelled and returned; late delivery cannot restart work. The closed handle
 remains inspectable; starting a second controller is rejected. Closing the
 session also closes participation before releasing its durable store.
 Control reads and selections carry the operation's cancellation signal, so a late
@@ -584,7 +609,7 @@ refer to an exact locally held prefix. Both directions exchange available histor
 including when a fresh device is still recovering an inherited generation.
 Explicit synchronization observes a fresh head after any older background pull.
 Local history/control changes trigger coalesced peer hints. Owned participation
-adds coarse discoverability renewal and peer synchronization, without an
+scans and synchronizes on routing notifications or authority/data lifecycle changes, without an
 application-data HTTP fallback. Pending commands use the session's
 existing immutable attempt journal, and retry after reconnection preserves those
 original bytes.
