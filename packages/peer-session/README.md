@@ -209,8 +209,42 @@ delivery; the common signed verifier supplies authority.
 `control.preparePublication({ operationId, entry, files })` saves the exact signed
 code or page manifest. `control.publish(manifest, assets)` submits it with bounded,
 hash-verified assets, and `control.publication()` verifies the selected chain.
-Retries preserve the original signed intent and receipt. The selected publication
-head persists outside recoverable application history and cannot move backward.
+Successful publication still returns `{ publication, version }`. Before checking
+the selected head, the participant validates and retains that host acknowledgement
+separately from the signed intent. Closing the session drains this receipt write
+before releasing device storage. The selected publication head persists outside
+recoverable application history and cannot move backward.
+
+`control.publicationOperation(operationId)` reads this device's saved
+`{ publication, receipt }`, or `null` when it has no saved operation. It performs
+no host request and does not open application data. The receipt is either
+`{ publication, version }` or `null`; a missing receipt means the outcome is
+unknown, not that the host rejected or failed to commit the operation. The read
+revalidates the signed manifest, application/device/operation scope and receipt
+equality against the saved intent. As with other device metadata, it relies on
+local storage integrity: the manifest is signed, but the host's version number
+is an acknowledgement rather than a separately signed proof of acceptance.
+
+A submission, receipt validation, receipt retention or selected-head failure
+rejects with `ApplicationPublicationError`. Its `phase` is respectively
+`submission`, `receipt`, `retention` or `selection`, and its original `cause` is
+preserved. `operationId` and `publicationId` always identify the submitted signed
+intent. With no valid acknowledgement, `outcome` is `unknown`, `receipt` is `null`
+and `code` is `APPLICATION_PUBLICATION_OUTCOME_UNKNOWN`. Once a valid receipt is
+known, `outcome` is `committed`, `receipt` carries it and `code` is
+`APPLICATION_PUBLICATION_COMMITTED`, even if verification or a later retry fails.
+Invalid signatures, stale authority and invalid selected chains still fail;
+`committed` does not mean the publication is currently selected. A receipt
+retention failure includes the valid in-memory receipt in the error, but cannot
+guarantee that a subsequent process will find it locally.
+
+After a timeout, disconnect or cancellation, reopen the same device store and
+inspect the original operation ID. Reuse the saved manifest and exact assets for
+an explicit retry; do not replace an uncertain operation with newly signed
+intent. A late reply delivered after the cancelled request has settled cannot
+establish a local receipt. Exact retries retain their original receipt even when
+a newer release is selected, and never regress the remembered selected head.
+
 Signing a release requires an explicit `publisher` grant. Administration and
 application-data access do not confer publication rights. The hosted control
 participant serves approved releases without publisher or application-reader

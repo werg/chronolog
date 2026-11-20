@@ -19,6 +19,31 @@ export interface ControlParticipantOptions {
   readonly timeoutMs?: number
 }
 export interface ApplicationPublication { readonly publication: SignedPublication; readonly version: number }
+export interface ApplicationPublicationOperation {
+  readonly publication: SignedPublication
+  /** A retained acknowledgement, not a claim that this publication is still selected. */
+  readonly receipt: ApplicationPublication | null
+}
+export type ApplicationPublicationPhase = 'submission' | 'receipt' | 'retention' | 'selection'
+
+/** A failed publication call can still have a confirmed, retry-stable host receipt. */
+export class ApplicationPublicationError extends Error {
+  readonly code: 'APPLICATION_PUBLICATION_OUTCOME_UNKNOWN' | 'APPLICATION_PUBLICATION_COMMITTED'
+  readonly outcome: 'unknown' | 'committed'
+  readonly operationId: string
+  readonly publicationId: string
+  readonly receipt: ApplicationPublication | null
+
+  constructor(publication: SignedPublication, readonly phase: ApplicationPublicationPhase, cause: unknown,
+    receipt: ApplicationPublication | null = null) {
+    const code = receipt === null ? 'APPLICATION_PUBLICATION_OUTCOME_UNKNOWN' : 'APPLICATION_PUBLICATION_COMMITTED'
+    super(`${code}${cause instanceof Error ? `: ${cause.message}` : ''}`, { cause })
+    this.name = 'ApplicationPublicationError'; this.code = code
+    this.outcome = receipt === null ? 'unknown' : 'committed'
+    this.operationId = publication.payload.operationId; this.publicationId = publication.id
+    this.receipt = receipt === null ? null : structuredClone(receipt)
+  }
+}
 export interface PublishedApplicationDefinition {
   readonly descriptor: SignedApplicationDescriptor
   readonly definition: ApplicationDescription
@@ -40,6 +65,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
   readonly #timeoutMs: number
   readonly #publicationKey: string
   readonly #publicationAttempts: string
+  readonly #publicationReceipts: string
   #tail: Promise<unknown> = Promise.resolve()
 
   constructor(participant: ControlOwner, store: BytesStore, signal: AbortSignal, options: ControlParticipantOptions) {
@@ -50,6 +76,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     this.#transport = createParticipantTransport({ applicationId: participant.descriptor.applicationId, exchange: options.exchange })
     this.#publicationKey = `peer-session/publication/${participant.descriptor.applicationId}`
     this.#publicationAttempts = `peer-session/publication-attempt/${participant.descriptor.applicationId}`
+    this.#publicationReceipts = `peer-session/publication-receipt/${participant.descriptor.applicationId}`
   }
   get signal(): AbortSignal { return this.#signal }
   get policy() { return this.#transport.policy }
@@ -102,6 +129,25 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     return this.#serial(() => this.#readPublication())
   }
 
+  /** Inspect this device's saved intent and receipt without contacting the host or opening application data. */
+  publicationOperation(operationId: string): Promise<ApplicationPublicationOperation | null> {
+    return this.#serial(async () => {
+      const key = await peerDigest(operationId), author = this.#participant.device.publicKey
+      const attempt = await this.#store.get(`${this.#publicationAttempts}/${key}`)
+      const retained = await this.#store.get(`${this.#publicationReceipts}/${author}/${key}`)
+      if (attempt === null && retained === null) { this.#signal.throwIfAborted(); return null }
+      const receipt = retained === null ? null : readPublicationReceipt(decodePeerValue<unknown>(retained))
+      const publication = attempt === null ? receipt!.publication : decodePeerValue<SignedPublication>(attempt)
+      await verifyPublicationManifest(publication, await verifyAuthorityBundle(this.#participant.authority))
+      if (publication.payload.author !== author || publication.payload.operationId !== operationId) {
+        throw new Error('PEER_PUBLICATION_OPERATION_REUSED')
+      }
+      if (receipt !== null) await verifyPublicationReceipt(receipt, publication)
+      this.#signal.throwIfAborted()
+      return structuredClone({ publication, receipt })
+    })
+  }
+
   /** Save the exact signed code update before returning; retrying its identity never signs new intent. */
   preparePublication(input: {
     readonly operationId: string; readonly entry: string; readonly files: readonly PublicationFile[]
@@ -140,14 +186,34 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     const publication = structuredClone(input), capturedAssets = structuredClone(assets)
     return this.#serial(async () => {
       await verifyPublicationManifest(publication, await verifyAuthorityBundle(this.#participant.authority))
-      const receipt = await this.#request<ApplicationPublication>('publication', 'publish', { publication, assets: capturedAssets })
-      if (await peerDigest(receipt.publication) !== await peerDigest(publication) || !Number.isSafeInteger(receipt.version) || receipt.version < 1) {
-        throw new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+      const key = `${this.#publicationReceipts}/${publication.payload.author}/${await peerDigest(publication.payload.operationId)}`
+      const stored = await this.#store.get(key)
+      // Previously confirmed acceptance must not become unknown on a later retry.
+      let receipt = stored === null ? null : await verifyPublicationReceipt(decodePeerValue<unknown>(stored), publication)
+      let phase: ApplicationPublicationPhase = 'submission'
+      try {
+        const reply = await this.#request<unknown>('publication', 'publish', { publication, assets: capturedAssets })
+        phase = 'receipt'
+        const acknowledged = await verifyPublicationReceipt(reply, publication)
+        if (receipt !== null && receipt.version !== acknowledged.version) throw new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+        receipt = acknowledged
+        phase = 'retention'
+        // Once the reply is validated, drain its journal write even if the session
+        // closes. Session close retains storage ownership until this task settles.
+        await updateDeviceMetadata(this.#store, key, async current => {
+          if (current !== null && await peerDigest(decodePeerValue<unknown>(current)) !== await peerDigest(acknowledged)) {
+            throw new Error('APPLICATION_PUBLICATION_RECEIPT_CONFLICT')
+          }
+          return encodePeerValue(acknowledged)
+        })
+        phase = 'selection'
+        // An exact old retry may return its original receipt after a newer release.
+        // Refresh the selected head instead of making that old receipt current.
+        await this.#readPublication()
+        return receipt
+      } catch (cause) {
+        throw new ApplicationPublicationError(publication, phase, cause, receipt)
       }
-      // An exact old retry may return its original receipt after a newer release.
-      // Refresh the selected head instead of making that old receipt current.
-      await this.#readPublication()
-      return receipt
     })
   }
 
@@ -206,4 +272,18 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     try { return await awaitOwnedTask(signal, () => this.#transport.request<T>(facet, action, payload, { signal })) }
     finally { clearTimeout(timer) }
   }
+}
+
+async function verifyPublicationReceipt(input: unknown, publication: SignedPublication): Promise<ApplicationPublication> {
+  const receipt = readPublicationReceipt(input)
+  if (await peerDigest(receipt.publication) !== await peerDigest(publication)) throw new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+  return { publication: structuredClone(publication), version: receipt.version }
+}
+
+function readPublicationReceipt(input: unknown): ApplicationPublication {
+  if (input === null || typeof input !== 'object' || !('publication' in input) || !('version' in input) ||
+    typeof input.version !== 'number' || !Number.isSafeInteger(input.version) || input.version < 1) {
+    throw new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+  }
+  return { publication: input.publication as SignedPublication, version: input.version }
 }
