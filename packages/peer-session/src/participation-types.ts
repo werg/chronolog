@@ -19,9 +19,13 @@ export interface ApplicationPeerAdvertisement {
   readonly data: boolean
   readonly point: HistoryPoint | null
 }
+/** Routing invalidation only, never application state or authority. Each connection starts with ready. */
+export interface ApplicationDiscoveryNotification { readonly type: 'ready' | 'changed' }
 export interface ApplicationDiscoveryPort {
+  /** Start before advertising. ready means the authenticated transport is connected; emit it again after reconnect. */
+  notifications(options: { readonly signal: AbortSignal }): AsyncIterable<ApplicationDiscoveryNotification>
   read(options: { readonly signal: AbortSignal }): Promise<readonly ApplicationPeerHint[]>
-  advertise(value: ApplicationPeerAdvertisement, options: { readonly ttlMs: number; readonly signal: AbortSignal }): Promise<void>
+  advertise(value: ApplicationPeerAdvertisement, options: { readonly signal: AbortSignal }): Promise<void>
   withdraw(options: { readonly signal: AbortSignal }): Promise<void>
   invitations(options: { readonly signal: AbortSignal }): AsyncIterable<ApplicationPeerInvitation>
 }
@@ -44,8 +48,6 @@ export interface ApplicationParticipationOptions {
     readonly retryInitialMs?: number
     readonly retryMaxMs?: number
     readonly timeoutMs?: number
-    /** Coarse discoverability lease renewal. Defaults to 60 seconds. */
-    readonly advertiseMs?: number
   }
 }
 export interface ApplicationRecoveryProposal {

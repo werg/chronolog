@@ -14,7 +14,7 @@ import { connectApplications, type ApplicationSession } from './session.js'
 import type { ApplicationControlHost } from './recovery.js'
 import type {
   ApplicationDiscoveryPort, ApplicationParticipationOptions, ApplicationPeerHint, ApplicationPeerInvitation, ApplicationTransportPort,
-  ApplicationPeerAdvertisement,
+  ApplicationPeerAdvertisement, ApplicationDiscoveryNotification,
 } from './participation-types.js'
 
 const definition = defineApplication({ id: 'participation', version: '1', commands: {
@@ -28,6 +28,7 @@ class Introductions {
   readonly directory = new Map<string, ApplicationPeerHint>()
   readonly advertised = new Map<string, ApplicationPeerAdvertisement>()
   readonly #listeners = new Map<string, (value: ApplicationPeerInvitation) => void>()
+  readonly notices = new Map<string, (value: ApplicationDiscoveryNotification) => void>()
   readonly #connections = new Map<string, FramedPeerConnection>()
   readonly counts = { reads: 0, advertisements: 0, withdrawals: 0, opens: 0 }
   unavailable = false
@@ -38,10 +39,30 @@ class Introductions {
         async read({ signal }) { signal.throwIfAborted(); hub.counts.reads++; if (hub.unavailable) throw new Error('DIRECTORY_OFFLINE'); return [...hub.directory.values()] },
         async advertise(value, { signal }) {
           signal.throwIfAborted(); hub.counts.advertisements++; if (hub.unavailable) throw new Error('DIRECTORY_OFFLINE')
+          const changed = JSON.stringify(hub.advertised.get(identity)) !== JSON.stringify(value)
           hub.advertised.set(identity, structuredClone(value))
           hub.directory.set(identity, { identity: value.identity, route: value.identity })
+          if (changed) for (const notify of hub.notices.values()) notify({ type: 'changed' })
         },
-        async withdraw({ signal }) { signal.throwIfAborted(); hub.counts.withdrawals++; hub.directory.delete(identity) },
+        async withdraw({ signal }) {
+          signal.throwIfAborted(); hub.counts.withdrawals++; hub.advertised.delete(identity)
+          if (hub.directory.delete(identity)) for (const notify of hub.notices.values()) notify({ type: 'changed' })
+        },
+        async *notifications({ signal }) {
+          const queue: ApplicationDiscoveryNotification[] = [{ type: 'ready' }]
+          let notify = (): void => {}
+          const accept = (value: ApplicationDiscoveryNotification): void => { queue.push(value); notify() }
+          hub.notices.set(identity, accept)
+          try {
+            while (!signal.aborted) {
+              if (queue.length === 0) await new Promise<void>(resolve => {
+                const done = (): void => { signal.removeEventListener('abort', done); resolve() }
+                notify = done; signal.addEventListener('abort', done, { once: true }); if (signal.aborted) done()
+              })
+              const value = queue.shift(); if (value !== undefined) yield value
+            }
+          } finally { if (hub.notices.get(identity) === accept) hub.notices.delete(identity) }
+        },
         async *invitations({ signal }) {
           const queue: ApplicationPeerInvitation[] = []
           let notify = (): void => {}
@@ -119,7 +140,7 @@ async function fixture(options: { omitC?: boolean } = {}) {
   }
   const participate = (session: ApplicationSession, overrides: Partial<ApplicationParticipationOptions> = {}) => session.participate({
     control: host, ...hub.ports(session.deviceId), recovery: { graceMs: 25, freshnessMs: 300_000 },
-    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 2000, advertiseMs: 15_000 }, ...overrides,
+    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 2000 }, ...overrides,
   })
   return { a, b, c, stores, registry, hub, host, counts, requests, open, openCold, participate, signer, descriptor, control,
     offline(value: boolean) { offline = value }, loseSelection() { loseSelection = true } }
@@ -159,7 +180,7 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
       }
       return connection
     } },
-    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 5000, advertiseMs: 15_000 },
+    connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 5000 },
   })
   closing.push(() => { directory.resolve(); release.resolve() })
   await until(() => participation.status.phase === 'following')
@@ -222,15 +243,18 @@ describe('owned application participation', () => {
     expect(a.status.database).toBe('failed')
   })
 
-  it('discovers authenticated peers and saves ordinary commands without command-correlated host traffic', async () => {
+  it('re-advertises real history changes without reopening peers or calling the control service', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const first = f.participate(a), second = f.participate(b)
     await until(() => first.status.phase === 'coordinating' && second.status.phase === 'following')
     expect(second.status.connectedPeers).toContain(a.deviceId)
-    const before = { ...f.counts, ...f.hub.counts }
+    const before = { control: { ...f.counts }, delivery: { ...f.hub.counts } }
     const operation = await post(b, 'once')
     await operation.shared({ signal: AbortSignal.timeout(5000) })
-    expect({ ...f.counts, ...f.hub.counts }).toEqual(before)
+    await until(() => [a, b].every(session => JSON.stringify(f.hub.advertised.get(session.deviceId)?.point) === JSON.stringify(session.revision!.point)))
+    expect(f.counts).toEqual(before.control)
+    expect(f.hub.counts.advertisements).toBeGreaterThan(before.delivery.advertisements)
+    expect(f.hub.counts.opens).toBe(before.delivery.opens)
     expect(() => f.participate(b)).toThrow('APPLICATION_PARTICIPATION_ALREADY_STARTED')
     await second.close()
     expect(b.participation).toBe(second); expect(second.status.phase).toBe('closed')

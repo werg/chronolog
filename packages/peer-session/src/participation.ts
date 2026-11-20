@@ -10,7 +10,7 @@ import type { ApplicationParticipant } from './participant-types.js'
 import { awaitOwnedTask } from './lifetime.js'
 import type {
   ApplicationParticipation, ApplicationParticipationOptions, ApplicationParticipationStatus,
-  ApplicationPeerHint, ApplicationPeerInvitation, ApplicationRecoveryProposal,
+  ApplicationPeerHint, ApplicationPeerInvitation, ApplicationRecoveryProposal, ApplicationPeerAdvertisement, ApplicationDiscoveryNotification,
 } from './participation-types.js'
 
 interface Owner {
@@ -41,7 +41,6 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   readonly #maxPeers: number
   readonly #initialRetry: number
   readonly #maximumRetry: number
-  readonly #advertiseMs: number
   readonly #graceMs: number
   readonly #freshnessMs: number
   readonly #timeoutMs: number
@@ -54,6 +53,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   readonly #watchedLinks = new Map<ApplicationPeerLink, () => void>()
   readonly #task: Promise<void>
   readonly #invitations: Promise<void>
+  readonly #notifications: Promise<void>
   readonly #unsubscribe: () => void
   #status: ApplicationParticipationStatus = { phase: 'connecting', connectedPeers: [], recovery: null, error: null }
   #observation: Observation | null = null
@@ -63,8 +63,12 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   #approved: string | null = null
   #wakePending = false
   #wakeWait: (() => void) | undefined
-  #nextScan = 0
-  #nextAdvertisement = 0
+  #nextScan = Infinity
+  #nextAdvertisement = Infinity
+  #discoveryReady = false
+  #discoveryError: string | null = null
+  #advertiseRetry = 0
+  #stateKey: string
   #missingSince: number | null = null
   #retry = 0
   #initial = true
@@ -81,13 +85,13 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       control: { application: options => this.#delivery('control:read', () => application(options)),
         selectGeneration: (request, options) => this.#delivery('control:select', () => selectGeneration(request, options)) },
       discovery: { read: input.discovery.read.bind(input.discovery), advertise: input.discovery.advertise.bind(input.discovery),
+        notifications: input.discovery.notifications.bind(input.discovery),
         withdraw: input.discovery.withdraw.bind(input.discovery), invitations: input.discovery.invitations.bind(input.discovery) },
       transport: { open: input.transport.open.bind(input.transport) },
     }
     this.#maxPeers = bound(input.connections?.maxPeers, 4, 1, 8)
     this.#initialRetry = bound(input.connections?.retryInitialMs, 1000, 1, 60_000)
     this.#maximumRetry = bound(input.connections?.retryMaxMs, 30_000, this.#initialRetry, 600_000)
-    this.#advertiseMs = bound(input.connections?.advertiseMs, 60_000, 15_000, 300_000)
     this.#timeoutMs = bound(input.connections?.timeoutMs, 15_000, 1, 120_000)
     this.#graceMs = bound(input.recovery?.graceMs, 3000, 1, 600_000)
     this.#freshnessMs = bound(input.recovery?.freshnessMs, 300_000, 1, 86_400_000)
@@ -95,11 +99,19 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     this.#dataActive = owner.participant.data !== undefined
     this.#observationKey = `peer-session/coordinator-observation/${owner.participant.descriptor.applicationId}`
     this.signal = AbortSignal.any([owner.signal, this.#lifetime.signal])
+    this.#stateKey = this.#snapshotKey()
     this.#unsubscribe = owner.participant.subscribe(() => {
+      const key = this.#snapshotKey()
+      if (key === this.#stateKey) return
+      this.#stateKey = key
+      this.#nextScan = 0; this.#nextAdvertisement = 0
       if (!this.#dataActive && owner.participant.data !== undefined) {
         this.#dataActive = true; this.#missingSince = null; this.#nextScan = 0; this.#nextAdvertisement = 0
       }
       this.#wake()
+    })
+    this.#notifications = Promise.resolve().then(() => this.#watchDiscovery()).catch(error => {
+      if (!this.signal.aborted) { this.#discoveryError = message(error); this.#publish('unavailable') }
     })
     this.#invitations = Promise.resolve().then(() => this.#listen()).catch(error => { if (!this.signal.aborted) this.#error = message(error) })
     this.#task = Promise.resolve().then(() => this.#run()).catch(error => {
@@ -159,23 +171,67 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       this.#observeGeneration()
       if (replica === undefined || this.#healthy()) { this.#missingSince = null; this.#proposal = null; this.#approved = null }
       else this.#missingSince ??= now
-      if (this.#healthy()) this.#retry = 0
+      // No hosted work may race ahead of the subscription's initial ready.
+      if (!this.#discoveryReady) { this.#publish(); await this.#wait(Infinity); continue }
       if (now >= this.#nextAdvertisement) {
-        this.#nextAdvertisement = now + this.#advertiseMs
+        this.#nextAdvertisement = Infinity
         try {
-          await this.#call('advertise', signal => this.#options.discovery.advertise({ identity: participant.device.publicKey,
-            storageId: participant.storageId, generation: participant.generation.id, data: replica !== undefined, point: replica?.ready === true ? replica.revision.point : null },
-          { ttlMs: 2 * this.#advertiseMs, signal }))
-        } catch (error) { this.#error = message(error) }
+          await this.#call('advertise', signal => this.#options.discovery.advertise(this.#advertisement(), { signal }))
+          this.#advertiseRetry = 0
+        } catch (error) {
+          this.#error = message(error)
+          this.#nextAdvertisement = Math.min(this.#nextAdvertisement, Date.now() + this.#backoff(this.#advertiseRetry++))
+        }
       }
-      if (Date.now() >= this.#nextScan) {
+      if (this.#discoveryReady && Date.now() >= this.#nextScan) {
+        // Clear before awaiting: a notification or real state change during the scan must survive it.
+        this.#nextScan = Infinity
+        let failed = false
         try { await this.#scan(); this.#error = null }
-        catch (error) { this.#error = message(error) }
+        catch (error) { failed = true; this.#error = message(error) }
         this.signal.throwIfAborted()
-        this.#nextScan = Date.now() + (this.#healthy() ? this.#advertiseMs : this.#backoff(this.#retry++))
+        if (failed || !this.#healthy()) this.#nextScan = Math.min(this.#nextScan, Date.now() + this.#backoff(this.#retry++))
+        else this.#retry = 0
       }
       this.#publish()
-      await this.#wait(Math.max(1, Math.min(this.#nextScan, this.#nextAdvertisement) - Date.now()))
+      await this.#wait(this.#discoveryReady ? Math.max(1, Math.min(this.#nextScan, this.#nextAdvertisement) - Date.now()) : Infinity)
+    }
+  }
+
+  #advertisement(): ApplicationPeerAdvertisement {
+    const participant = this.#owner.participant, replica = participant.data?.replica
+    return { identity: participant.device.publicKey, storageId: participant.storageId, generation: participant.generation.id,
+      data: replica !== undefined, point: replica?.ready === true ? replica.revision.point : null }
+  }
+  #snapshotKey(): string { return JSON.stringify([this.#advertisement(), this.#owner.participant.authority]) }
+
+  async #watchDiscovery(): Promise<void> {
+    let failures = 0
+    while (!this.signal.aborted) {
+      let iterator: AsyncIterator<ApplicationDiscoveryNotification> | undefined
+      let ready = false
+      try {
+        iterator = this.#options.discovery.notifications({ signal: this.signal })[Symbol.asyncIterator]()
+        while (!this.signal.aborted) {
+          const next = await awaitOwnedTask(this.signal, () => iterator!.next())
+          if (next.done) throw new Error('APPLICATION_DISCOVERY_NOTIFICATIONS_ENDED')
+          const value: unknown = next.value
+          if (value === null || typeof value !== 'object' || Object.keys(value).length !== 1 || !('type' in value) ||
+              value.type !== 'ready' && value.type !== 'changed' || !ready && value.type !== 'ready') throw new Error('APPLICATION_DISCOVERY_NOTIFICATION_INVALID')
+          if (value.type === 'ready') {
+            ready = true; this.#discoveryReady = true; this.#discoveryError = null; failures = 0
+            this.#nextAdvertisement = 0
+          }
+          this.#nextScan = 0; this.#wake()
+        }
+      } catch (error) {
+        if (!this.signal.aborted) {
+          this.#discoveryReady = false; this.#discoveryError = message(error); this.#wake()
+        }
+      } finally {
+        try { void Promise.resolve(iterator?.return?.()).catch(() => undefined) } catch { /* Cleanup cannot own lifetime. */ }
+      }
+      if (!this.signal.aborted) await delay(this.#backoff(failures++), this.signal)
     }
   }
 
@@ -383,7 +439,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   #backoff(attempt: number): number { return Math.max(1, Math.round(Math.min(this.#maximumRetry, this.#initialRetry * 2 ** Math.min(attempt, 20)) * (0.75 + Math.random() * 0.25))) }
   #publish(phase?: ApplicationParticipationStatus['phase']): void {
     const replica = this.#owner.participant.data?.replica
-    const error = this.#error ?? (replica !== undefined && this.#links().some(link => link.peerId === replica.generation.payload.coordinator && link.data === 'unavailable')
+    const error = this.#discoveryError ?? this.#error ?? (replica !== undefined && this.#links().some(link => link.peerId === replica.generation.payload.coordinator && link.data === 'unavailable')
       ? 'APPLICATION_DATA_UNAVAILABLE' : null)
     const next: ApplicationParticipationStatus = {
       phase: phase ?? (this.signal.aborted ? 'closed' : this.#proposal !== null && this.#approved !== this.#proposal.id ? 'approval-required'
@@ -400,7 +456,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     if (this.#wakePending) { this.#wakePending = false; return Promise.resolve() }
     return new Promise(resolve => {
       const finish = (): void => { clearTimeout(timer); this.signal.removeEventListener('abort', finish); this.#wakeWait = undefined; this.#wakePending = false; resolve() }
-      const timer = setTimeout(finish, ms)
+      const timer = Number.isFinite(ms) ? setTimeout(finish, ms) : undefined
       this.#wakeWait = finish; this.signal.addEventListener('abort', finish, { once: true })
       if (this.signal.aborted) finish()
     })
@@ -431,7 +487,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     for (const [link, dispose] of this.#watchedLinks) link.signal.removeEventListener('abort', dispose)
     this.#watchedLinks.clear(); this.#publish('closed'); this.#listeners.clear()
     void (async () => {
-      await Promise.allSettled([this.#task, this.#invitations, ...links.map(link => link.close())])
+      await Promise.allSettled([this.#task, this.#notifications, this.#invitations, ...links.map(link => link.close())])
       await this.#persistence
       const cleanup = AbortSignal.timeout(Math.min(this.#timeoutMs, 1000))
       await awaitOwnedTask(cleanup, () => this.#options.discovery.withdraw({ signal: cleanup })).catch(() => undefined)
