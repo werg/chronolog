@@ -13,7 +13,7 @@ import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, vali
 import { PEER_MAX_RECORDS, PEER_MAX_HISTORY_BYTES } from './control-types.js'
 import type {
   AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, HistoryReceiveResult, OperationState, OrderedCommand,
-  PeerGrant, PeerReplica, PeerReplicaOptions, PeerRevision, PrefixProof, PrepareCommand,
+  PeerGrant, PeerReplica, PeerReplicaOptions, PeerRevision, PeerOrderingPause, PrefixProof, PrepareCommand,
   RecoveryNotice, SignedAttempt, SignedGeneration, SignedRetainedCoverage,
 } from './types.js'
 
@@ -31,6 +31,7 @@ interface PendingRecovery {
   readonly knownAttemptId: string | null
 }
 interface StoredSelection { readonly authority: AuthorityBundle; readonly recovery: PendingRecovery | null }
+interface StoredOrderingPause extends PeerOrderingPause { readonly applicationId: string; readonly author: string }
 const activeOwners = new WeakMap<BytesStore, Set<string>>()
 const operationKey = (author: string, operationId: string): string => `${author}\u0000${operationId}`
 
@@ -45,6 +46,7 @@ class Replica implements PeerReplica {
   #ready = false
   #publishedRevision: PeerRevision | null = null
   #pendingRecovery: PendingRecovery | null = null
+  #orderingPause: StoredOrderingPause | null = null
   #journalHead = 0
   #retainedBytes = 0
   readonly #heads = new Map<string, Head>()
@@ -137,6 +139,19 @@ class Replica implements PeerReplica {
       this.#remember(attempt)
     }
     for (const generation of this.#authority.bundle.generations) await this.#loadGeneration(generation, this.#authority)
+    const pauseBytes = await this.#options.store.get(`${this.#prefix}/ordering-pause`)
+    if (pauseBytes !== null) {
+      const pause = decodePeerValue<StoredOrderingPause | null>(pauseBytes)
+      if (pause !== null) {
+        object(pause, ['operationId', 'applicationId', 'author', 'generation', 'base'])
+        boundedText(pause.operationId); hex(pause.generation)
+        check(pause.applicationId === this.descriptor.applicationId && pause.author === this.device.publicKey &&
+          this.#authority.generation(pause.generation).payload.coordinator === pause.author &&
+          pause.base.point.generation === pause.generation, 'PEER_ORDERING_PAUSE_INVALID')
+        await this.#authority.verifyPrefix(pause.base)
+        this.#orderingPause = pause
+      }
+    }
     const previousGeneration = previous?.current
     if (previous !== undefined && previousGeneration !== null && previousGeneration !== undefined && previousGeneration.id !== this.generation.id && this.#pendingRecovery === null) {
       const known = this.#selectedHistory(previous, false).at(-1)?.command.attempt.id ?? null
@@ -426,6 +441,7 @@ class Replica implements PeerReplica {
         check(this.#selectedIds.has(attempt.id), 'PEER_ATTEMPT_ABANDONED')
         return structuredClone(existing)
       }
+      check(this.#orderingPause === null, 'PEER_ORDERING_PAUSED')
       check(attempt.payload.header.generation === this.generation.id, 'PEER_ATTEMPT_NEEDS_REAPPLY')
       if (attempt.payload.header.basedOn !== null) this.#checkView(attempt.payload.header.basedOn)
       const head = this.#heads.get(this.generation.id)!
@@ -582,6 +598,43 @@ class Replica implements PeerReplica {
       // unchanged until an authorized successor actually adopts this prefix.
       return proof
     })
+  }
+  pauseOrdering(operationId: string): Promise<PeerOrderingPause> {
+    return this.#serial.run(async () => {
+      this.#assertOpen(); boundedText(operationId)
+      if (this.#orderingPause !== null) {
+        check(this.#orderingPause.operationId === operationId, 'PEER_ORDERING_PAUSE_IN_USE')
+        return this.#publicOrderingPause(this.#orderingPause)
+      }
+      this.#assertReady(); check(this.isCoordinator, 'PEER_NOT_COORDINATOR')
+      check(!this.#fenced.has(this.generation.id), 'PEER_COORDINATOR_FENCED')
+      const pause: StoredOrderingPause = { operationId, applicationId: this.descriptor.applicationId,
+        author: this.device.publicKey, generation: this.generation.id, base: await this.#proof(this.revision.point) }
+      // This write precedes the returned proof. A failed write fences this owner;
+      // a process restart reloads a successfully retained pause before ordering.
+      await this.#write(`${this.#prefix}/ordering-pause`, encodePeerValue(pause))
+      this.#orderingPause = pause
+      return this.#publicOrderingPause(pause)
+    })
+  }
+  orderingPause(): Promise<PeerOrderingPause | null> {
+    return this.#serial.run(async () => { this.#assertOpen(); return this.#orderingPause === null ? null : this.#publicOrderingPause(this.#orderingPause) })
+  }
+  resumeOrdering(operationId: string): Promise<void> {
+    return this.#serial.run(async () => {
+      this.#assertReady(); boundedText(operationId)
+      const pause = this.#orderingPause
+      check(pause !== null && pause.operationId === operationId, 'PEER_ORDERING_PAUSE_MISMATCH')
+      // Resuming must not hide a separately selected history which lost the
+      // reviewed prefix. Such a recovery requires its own explicit policy.
+      check(this.#pointAvailable(pause.base.point) && this.#authority.atOrAfter(this.revision.point, pause.base.point),
+        'PEER_ORDERING_PAUSE_RECOVERY_REQUIRED')
+      await this.#write(`${this.#prefix}/ordering-pause`, encodePeerValue(null))
+      this.#orderingPause = null
+    })
+  }
+  #publicOrderingPause(pause: StoredOrderingPause): PeerOrderingPause {
+    return structuredClone({ operationId: pause.operationId, generation: pause.generation, base: pause.base })
   }
   prefixProof(point: HistoryPoint): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(point) }) }
   exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly maxBytes?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
