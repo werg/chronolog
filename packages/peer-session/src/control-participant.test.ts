@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  bytesDigest, createGenerationRegistry, createParticipantResponse, createPeerIdentity, createPublicationRegistry,
-  MemoryBytesStore, participantGrant, signApplicationDescriptor, signControlRevision, signTransitionRequest,
+  bytesDigest, createGenerationRegistry, createParticipantResponse, createPeerIdentity, createPublicationRegistry, decodePeerValue, encodePeerValue,
+  MemoryBytesStore, participantGrant, signApplicationDescriptor, signControlRevision, signPublicationManifest, signTransitionRequest,
   type AuthorityBundle, type ParticipantRequest, type SignedPublication, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
@@ -10,6 +10,7 @@ import { applicationDefinitionDigest, defineApplication, defineCommand, describe
 import { openApplicationDevice } from './device.js'
 import { openPeerApplication } from './runtime.js'
 import { connectApplications } from './session.js'
+import { ApplicationPublicationError, type ApplicationPublication } from '@chronolog/peer-session'
 
 const definition = defineApplication({ id: 'participant', version: '1', commands: {
   say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', { text })) }),
@@ -189,8 +190,15 @@ describe('session-owned control participant', () => {
     const bytes = new TextEncoder().encode('export const version = 1;'), hash = await bytesDigest(bytes)
     const input = { operationId: 'release-one', entry: 'page.mjs', files: [{ path: 'page.mjs', hash, size: bytes.length, type: 'text/javascript' }] }
     const first = await host.preparePublication(input)
+    expect(await host.publicationOperation('missing')).toBeNull()
+    expect(await host.publicationOperation(input.operationId)).toEqual({ publication: first, receipt: null })
     f.faults.losePublication = true
-    await expect(host.publish(first, [])).rejects.toThrow('LOST_PUBLICATION_REPLY')
+    await expect(host.publish(first, [])).rejects.toMatchObject({
+      name: 'ApplicationPublicationError', code: 'APPLICATION_PUBLICATION_OUTCOME_UNKNOWN', outcome: 'unknown',
+      phase: 'submission', operationId: input.operationId, publicationId: first.id, receipt: null,
+      cause: new Error('LOST_PUBLICATION_REPLY'),
+    })
+    expect(await host.publicationOperation(input.operationId)).toEqual({ publication: first, receipt: null })
     expect(await host.preparePublication(input)).toEqual(first)
     await host.publish(first, [])
     const second = await host.preparePublication({ ...input, operationId: 'release-two' })
@@ -201,11 +209,290 @@ describe('session-owned control participant', () => {
     await a.close()
     const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
     expect(await resumed.preparePublication(input)).toEqual(first)
+    f.traffic.length = 0
+    expect(await resumed.publicationOperation(input.operationId)).toEqual({ publication: first, receipt: { publication: first, version: 1 } })
+    expect(f.traffic).toEqual([])
     f.faults.stalePublication = first
     await expect(resumed.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REGRESSION')
+    await expect(resumed.publish(first, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'selection',
+      receipt: { publication: first, version: 1 }, cause: new Error('APPLICATION_PUBLICATION_REGRESSION') })
+    expect(await resumed.publicationOperation(input.operationId)).toEqual({ publication: first, receipt: { publication: first, version: 1 } })
+    delete f.faults.stalePublication
+    expect((await resumed.publication())?.publication).toEqual(second)
     expect(reopened.revision).toBeNull()
     expect(reopened.status.database).toBe('idle')
     expect(f.storageOpens).toEqual([0, 0])
+  })
+
+  it('retains an acknowledged receipt when selected-head verification fails and a later retry is offline', async () => {
+    const f = await fixture(), a = await f.open(0)
+    const verificationFailure = new Error('POST_PUBLICATION_READ_UNAVAILABLE')
+    let published = false
+    const host = a.connectControlParticipant({ async exchange(request) {
+      if (published && request.facet === 'control' && request.action === 'read') throw verificationFailure
+      const response = await f.exchange(request)
+      if (request.facet === 'publication' && request.action === 'publish') published = true
+      return response
+    } })
+    const bytes = new TextEncoder().encode('<main>receipt</main>')
+    const input = { operationId: 'committed', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] }
+    const publication = await host.preparePublication(input), receipt = { publication, version: 1 }
+    const failed = await host.publish(publication, []).catch((error: unknown) => error)
+    expect(failed).toBeInstanceOf(ApplicationPublicationError)
+    expect(failed).toMatchObject({ code: 'APPLICATION_PUBLICATION_COMMITTED', outcome: 'committed', phase: 'selection',
+      operationId: input.operationId, publicationId: publication.id, receipt, cause: verificationFailure })
+    expect((failed as ApplicationPublicationError).cause).toBe(verificationFailure)
+    await a.close()
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    f.faults.offline = true; f.traffic.length = 0
+    expect(await resumed.publicationOperation(input.operationId)).toEqual({ publication, receipt })
+    expect(f.traffic).toEqual([])
+    await expect(resumed.publish(publication, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'submission', receipt,
+      cause: new Error('HOST_UNAVAILABLE') })
+    f.faults.offline = false
+    expect(await resumed.preparePublication(input)).toEqual(publication)
+    expect(await resumed.publish(publication, [])).toEqual(receipt)
+    expect(await f.publications.read()).toEqual([publication])
+    expect(f.storageOpens).toEqual([0, 0])
+  })
+
+  it('drains a validated receipt write across session closure and recovers it after reopen', async () => {
+    const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('<main>closing</main>')
+    const publication = await host.preparePublication({ operationId: 'closing-receipt', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    const receipt = { publication, version: 1 }, store = f.devices[0]!.store, put = store.put.bind(store)
+    let entered!: () => void, release!: () => void
+    const writing = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    vi.spyOn(store, 'put').mockImplementation(async (key, value) => {
+      if (key.startsWith('peer-session/publication-receipt/')) { entered(); await gate }
+      await put(key, value)
+    })
+    const pending = host.publish(publication, [])
+    const rejected = expect(pending).rejects.toMatchObject({ outcome: 'committed', phase: 'selection', receipt,
+      cause: new Error('APPLICATION_SESSION_CLOSED') })
+    await writing
+    let closed = false
+    const closing = a.close().then(() => { closed = true })
+    try {
+      await Promise.resolve(); expect(closed).toBe(false)
+    } finally { release(); await Promise.all([closing, rejected]) }
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    expect(await resumed.publicationOperation('closing-receipt')).toEqual({ publication, receipt })
+    expect(await f.publications.read()).toEqual([publication])
+  })
+
+  it('keeps a delayed acknowledgement unknown after timeout and retries the original operation on reopen', async () => {
+    const f = await fixture(), a = await f.open(0)
+    let entered!: () => void, release!: () => void
+    const submitted = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const host = a.connectControlParticipant({ timeoutMs: 1_000, async exchange(request) {
+      const response = await f.exchange(request)
+      if (request.facet === 'publication' && request.action === 'publish') { entered(); await gate }
+      return response
+    } })
+    const bytes = new TextEncoder().encode('<main>late</main>')
+    const input = { operationId: 'delayed', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] }
+    const publication = await host.preparePublication(input)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const pending = host.publish(publication, [])
+      const rejected = expect(pending).rejects.toMatchObject({ outcome: 'unknown', phase: 'submission', receipt: null,
+        operationId: input.operationId, publicationId: publication.id, cause: new Error('APPLICATION_CONTROL_TIMEOUT') })
+      await submitted; await vi.advanceTimersByTimeAsync(1_000); await rejected
+      release()
+    } finally { release(); vi.useRealTimers() }
+    expect(await host.publicationOperation(input.operationId)).toEqual({ publication, receipt: null })
+    await a.close()
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    expect(await resumed.preparePublication(input)).toEqual(publication)
+    expect(await resumed.publish(publication, [])).toEqual({ publication, version: 1 })
+    expect(await f.publications.read()).toEqual([publication])
+  })
+
+  it.each(['missing', 'invalid-version', 'mismatched-publication'] as const)('does not retain a receipt with %s as committed', async fault => {
+    const f = await fixture(), a = await f.open(0)
+    const host = a.connectControlParticipant({ async exchange(request) {
+      const response = await f.exchange(request)
+      if (request.facet !== 'publication' || request.action !== 'publish') return response
+      const publication = (request.payload as { publication: SignedPublication }).publication
+      const result = fault === 'missing' ? null : fault === 'invalid-version' ? { publication, version: 0 }
+        : { publication: { ...publication, signature: '00'.repeat(64) }, version: 1 }
+      return createParticipantResponse(request, result)
+    } })
+    const bytes = new TextEncoder().encode('<main>untrusted</main>')
+    const publication = await host.preparePublication({ operationId: 'invalid-reply', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    await expect(host.publish(publication, [])).rejects.toMatchObject({ outcome: 'unknown', phase: 'receipt', receipt: null,
+      cause: new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH') })
+    expect(await host.publicationOperation('invalid-reply')).toEqual({ publication, receipt: null })
+  })
+
+  it('keeps canonical verification errors after a confirmed commit as failures', async () => {
+    const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('<main>verification</main>')
+    const files = [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }]
+    const first = await host.preparePublication({ operationId: 'verified-one', entry: 'index.html', files })
+    await host.publish(first, [])
+    const second = await host.preparePublication({ operationId: 'verified-two', entry: 'index.html', files })
+    f.faults.stalePublication = { ...first, signature: '00'.repeat(64) }
+    await expect(host.publish(second, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'selection',
+      receipt: { publication: second, version: 2 }, cause: { message: 'PEER_SIGNATURE_INVALID', code: 'PEER_SIGNATURE_INVALID' } })
+    f.traffic.length = 0
+    await expect(host.publish({ ...second, signature: '00'.repeat(64) }, [])).rejects.toThrow('PEER_SIGNATURE_INVALID')
+    expect(f.traffic).toEqual([])
+    expect(await host.publicationOperation('verified-two')).toEqual({ publication: second, receipt: { publication: second, version: 2 } })
+  })
+
+  it.each(['missing', 'older', 'divergent'] as const)('rejects %s selected history that excludes the acknowledged publication', async selected => {
+    const f = await fixture(), a = await f.open(0)
+    let hideSelected = false
+    const host = a.connectControlParticipant({ exchange(request) {
+      if (hideSelected && request.facet === 'publication' && request.action === 'read') return Promise.resolve(createParticipantResponse(request, null))
+      return f.exchange(request)
+    } })
+    const bytes = new TextEncoder().encode('<main>selected</main>')
+    const files = [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }]
+    let first: SignedPublication | undefined
+    if (selected !== 'missing') {
+      first = await host.preparePublication({ operationId: 'selected-first', entry: 'index.html', files })
+      await host.publish(first, [])
+    }
+    const publication = await host.preparePublication({ operationId: 'acknowledged', entry: 'index.html', files })
+    if (selected === 'missing') hideSelected = true
+    else if (selected === 'older') f.faults.stalePublication = first!
+    else f.faults.stalePublication = await signPublicationManifest({ ...publication.payload, operationId: 'different-intent' }, f.devices[0]!.identity)
+    const receipt = { publication, version: publication.payload.revision + 1 }
+    await expect(host.publish(publication, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'selection', receipt,
+      cause: new Error('APPLICATION_PUBLICATION_NOT_SELECTED') })
+    expect(await host.publicationOperation('acknowledged')).toEqual({ publication, receipt })
+    hideSelected = false; delete f.faults.stalePublication
+    expect((await host.publication())?.publication).toEqual(publication)
+    expect(await host.publish(publication, [])).toEqual(receipt)
+    expect(await f.publications.read()).toHaveLength(publication.payload.revision + 1)
+  })
+
+  it('exposes the in-memory receipt when local retention fails without claiming it was saved', async () => {
+    const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('<main>storage</main>')
+    const publication = await host.preparePublication({ operationId: 'failed-retention', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    const store = f.devices[0]!.store, put = store.put.bind(store), failure = new Error('RECEIPT_STORE_UNAVAILABLE')
+    const fault = vi.spyOn(store, 'put').mockImplementation(async (key, value) => {
+      if (key.startsWith('peer-session/publication-receipt/')) throw failure
+      await put(key, value)
+    })
+    await expect(host.publish(publication, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'retention',
+      receipt: { publication, version: 1 }, cause: failure })
+    expect(await host.publicationOperation('failed-retention')).toEqual({ publication, receipt: null })
+    fault.mockRestore(); await a.close()
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    expect(await resumed.publish(publication, [])).toEqual({ publication, version: 1 })
+    expect(await f.publications.read()).toEqual([publication])
+  })
+
+  it.each(['selected', 'ancestor'] as const)('rejects a changed storage version for the acknowledged %s publication', async selected => {
+    const f = await fixture(), a = await f.open(0)
+    let mismatchedId: string | null = null
+    const host = a.connectControlParticipant({ async exchange(request) {
+      const response = await f.exchange(request)
+      if (request.facet !== 'publication' || request.action !== 'read' || mismatchedId === null) return response
+      const records = await f.publications.read(), id = (request.payload as { id?: string }).id
+      const publication = id === undefined ? records.at(-1) : records.find(value => value.id === id)
+      return publication?.id === mismatchedId ? createParticipantResponse(request, { publication, version: 99 }) : response
+    } })
+    const bytes = new TextEncoder().encode('<main>version binding</main>')
+    const files = [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }]
+    const first = await host.preparePublication({ operationId: 'bound-version', entry: 'index.html', files })
+    const receipt = { publication: first, version: 1 }
+    if (selected === 'ancestor') {
+      await host.publish(first, [])
+      const second = await host.preparePublication({ operationId: 'newer-version', entry: 'index.html', files })
+      await host.publish(second, [])
+    }
+    mismatchedId = first.id
+    await expect(host.publish(first, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'selection', receipt,
+      cause: new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH') })
+    expect(await host.publicationOperation('bound-version')).toEqual({ publication: first, receipt })
+    mismatchedId = null
+    expect(await host.publish(first, [])).toEqual(receipt)
+    expect(await f.publications.read()).toHaveLength(selected === 'ancestor' ? 2 : 1)
+  })
+
+  it('preserves the selected checkpoint when a read changes its acknowledged storage version', async () => {
+    const f = await fixture(), a = await f.open(0)
+    let corruptVersion = false
+    const host = a.connectControlParticipant({ async exchange(request) {
+      const response = await f.exchange(request)
+      if (!corruptVersion || request.facet !== 'publication' || request.action !== 'read') return response
+      return createParticipantResponse(request, { publication: (await f.publications.read()).at(-1), version: 2 })
+    } })
+    const bytes = new TextEncoder().encode('<main>selected checkpoint</main>')
+    const publication = await host.preparePublication({ operationId: 'selected-version', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    const receipt = await host.publish(publication, [])
+    corruptVersion = true
+    await expect(host.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+    corruptVersion = false
+    expect(await host.publication()).toEqual(receipt)
+    await a.close()
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    expect(await resumed.publication()).toEqual(receipt)
+  })
+
+  it('binds standalone reads to a retained receipt after selection failed before its first checkpoint', async () => {
+    const f = await fixture(), a = await f.open(0)
+    const selectionFailure = new Error('FIRST_SELECTION_UNAVAILABLE')
+    let published = false, failSelection = true, corruptVersion = false
+    const exchange = async (request: ParticipantRequest) => {
+      if (published && failSelection && request.facet === 'control' && request.action === 'read') throw selectionFailure
+      const response = await f.exchange(request)
+      if (request.facet === 'publication' && request.action === 'publish') published = true
+      if (corruptVersion && request.facet === 'publication' && request.action === 'read') {
+        return createParticipantResponse(request, { publication: (await f.publications.read()).at(-1), version: 99 })
+      }
+      return response
+    }
+    const host = a.connectControlParticipant({ exchange }), bytes = new TextEncoder().encode('<main>retained version</main>')
+    const publication = await host.preparePublication({ operationId: 'retained-version', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    const receipt = { publication, version: 1 }
+    await expect(host.publish(publication, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'selection', receipt,
+      cause: selectionFailure })
+    await a.close()
+    failSelection = false; corruptVersion = true
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange })
+    await expect(resumed.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+    expect(await resumed.publicationOperation('retained-version')).toEqual({ publication, receipt })
+    corruptVersion = false
+    expect(await resumed.publish(publication, [])).toEqual(receipt)
+    expect(await resumed.publication()).toEqual(receipt)
+    expect(await f.publications.read()).toEqual([publication])
+    expect(f.storageOpens).toEqual([0, 0])
+  })
+
+  it.each(['version', 'signature', 'operation'] as const)('revalidates a retained receipt with corrupt %s after reopen', async field => {
+    const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
+    const bytes = new TextEncoder().encode('<main>local receipt</main>')
+    const publication = await host.preparePublication({ operationId: 'retained', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    await host.publish(publication, []); await a.close()
+    const store = f.devices[0]!.store, get = store.get.bind(store)
+    vi.spyOn(store, 'get').mockImplementation(async key => {
+      const bytes = await get(key)
+      if (bytes === null || !key.startsWith('peer-session/publication-receipt/')) return bytes
+      const receipt = decodePeerValue<ApplicationPublication>(bytes)
+      return encodePeerValue(field === 'version' ? { ...receipt, version: 0 } : { ...receipt,
+        publication: field === 'signature' ? { ...receipt.publication, signature: '00'.repeat(64) }
+          : { ...receipt.publication, payload: { ...receipt.publication.payload, operationId: 'substituted' } } })
+    })
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    f.traffic.length = 0
+    await expect(resumed.publicationOperation('retained')).rejects.toThrow('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+    await expect(resumed.publish(publication, [])).rejects.toThrow('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+    expect(f.traffic).toEqual([])
   })
 
   it('verifies every skipped publication before remembering the new selected head', async () => {

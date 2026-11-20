@@ -59,6 +59,23 @@ async function applied(session: ApplicationSession<typeof definition>, text: str
 }
 
 describe('public peer application sessions', () => {
+  it('keeps local and remote saved commands unordered during a durable coordinator pause', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const link = await connectApplications(a, b); cleanup.push(() => link.close())
+    const pause = await a.pauseOrdering('pairing:review')
+    expect(await a.orderingPause()).toEqual(pause)
+    const local = await a.command('say', 'local pending', { operationId: 'pause-local' })
+    const remote = await b.command('say', 'remote pending', { operationId: 'pause-remote' })
+    expect(await local.get()).toMatchObject({ status: 'saved' })
+    expect(await remote.get()).toMatchObject({ status: 'saved' })
+    expect((await a.query('messages', null)).value.events).toHaveLength(0)
+    await a.resumeOrdering(pause.operationId)
+    await local.retry(); await remote.retry(); await link.synchronize()
+    expect((await a.query('messages', null)).value.events).toHaveLength(2)
+    expect((await local.applied({ signal: AbortSignal.timeout(5000) })).status).toBe('applied')
+    expect((await remote.applied({ signal: AbortSignal.timeout(5000) })).status).toBe('applied')
+  })
+
   it('owns a single saved attempt, exposes authenticated current results and isolates cancelled waiters', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const operation = await b.command('say', 'saved offline', { operationId: 'once' })

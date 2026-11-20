@@ -41,6 +41,52 @@ async function fixture() {
 const event = (name: string) => program(emit('message', { name }))
 
 describe('peer-owned encrypted history and tolerant recovery', () => {
+  it('drains ordering into a durable reviewed prefix and retains its pause across reopen', async () => {
+    const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store), b = await f.open(f.b)
+    const first = await a.prepare({ operationId: 'before-pause', program: event('first') })
+    const pending = await b.prepare({ operationId: 'while-paused', program: event('pending') })
+    const ordering = a.order(first), pausing = a.pauseOrdering('pairing:one')
+    await ordering
+    const pause = await pausing
+    expect(pause.base.point.sequence).toBe(1)
+    expect(await a.pauseOrdering('pairing:one')).toEqual(pause)
+    await expect(a.pauseOrdering('pairing:two')).rejects.toThrow('PEER_ORDERING_PAUSE_IN_USE')
+    await expect(b.pauseOrdering('not-coordinator')).rejects.toThrow('PEER_NOT_COORDINATOR')
+    await expect(a.order(pending)).rejects.toThrow('PEER_ORDERING_PAUSED')
+    expect(await a.order(first)).toEqual((await a.exportCommands())[0])
+    expect((await a.exportCommands()).length).toBe(1)
+    await a.close()
+    const reopened = await f.open(f.a, store)
+    expect(await reopened.orderingPause()).toEqual(pause)
+    await expect(reopened.order(pending)).rejects.toThrow('PEER_ORDERING_PAUSED')
+    await expect(reopened.resumeOrdering('wrong')).rejects.toThrow('PEER_ORDERING_PAUSE_MISMATCH')
+    await reopened.resumeOrdering('pairing:one')
+    await reopened.order(pending)
+    expect((await reopened.exportCommands()).map(item => item.attempt.payload.header.operationId)).toEqual(['before-pause', 'while-paused'])
+    await reopened.close()
+    expect(await (await f.open(f.a, store)).orderingPause()).toBeNull()
+  })
+
+  it('does not release a reviewed pause after a different recovery discards its prefix', async () => {
+    const f = await fixture(), a = await f.open(f.a)
+    const initial = await a.recoveryPoint()
+    await a.order(await a.prepare({ operationId: 'must-survive', program: event('retained') }))
+    const pause = await a.pauseOrdering('pairing:preserve')
+    await f.select(f.a, initial, 'separate-lossy-recovery'); await a.adopt(await f.registry.read())
+    await expect(a.resumeOrdering(pause.operationId)).rejects.toThrow('PEER_ORDERING_PAUSE_RECOVERY_REQUIRED')
+    expect(await a.orderingPause()).toEqual(pause)
+  })
+
+  it('rejects a corrupted retained ordering pause before opening its coordinator', async () => {
+    const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store)
+    const pause = await a.pauseOrdering('pairing:private')
+    await a.close()
+    await store.put(`peer-generation/replica/${a.descriptor.applicationId}/ordering-pause`, encodePeerValue({
+      ...pause, applicationId: a.descriptor.applicationId, author: f.b.publicKey,
+    }))
+    await expect(f.open(f.a, store)).rejects.toThrow('PEER_ORDERING_PAUSE_INVALID')
+  })
+
   it('executes delegated order without altering author times and replays identically', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const first = await a.prepare({ operationId: 'first', program: event('first'), authorTimestampMs: 500n })

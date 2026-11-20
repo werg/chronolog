@@ -102,6 +102,13 @@ export interface CapturedPeerView {
   release(): void
 }
 
+/** One durable coordinator pause; only explicit reconciliation may resume ordering. */
+export interface PeerOrderingPause {
+  readonly operationId: string
+  readonly generation: string
+  readonly base: PrefixProof
+}
+
 /** All replication is peer-to-peer. Authority refresh is an explicit lifecycle action. */
 export interface PeerReplica {
   readonly queryCapabilities: MaterializedQueryCapabilities
@@ -135,6 +142,11 @@ export interface PeerReplica {
   capture(): Promise<CapturedPeerView>
   /** Validate the current complete prefix, or a complete selected ancestor while newer inherited bodies are unavailable. Does not publish a recovering view. */
   recoveryPoint(): Promise<PrefixProof>
+  /** Drain prior ordering and retain its exact prefix before a reviewed control change. */
+  pauseOrdering(operationId: string): Promise<PeerOrderingPause>
+  orderingPause(): Promise<PeerOrderingPause | null>
+  /** Caller must first reconcile any submitted control mutation; cancellation alone is insufficient. */
+  resumeOrdering(operationId: string): Promise<void>
   prefixProof(point: HistoryPoint): Promise<PrefixProof>
   /** The contiguous retained selected prefix, including evidence available while recovery is pending. */
   exportCommands(options?: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly maxBytes?: number; readonly at?: PeerRevision }): Promise<readonly OrderedCommand[]>

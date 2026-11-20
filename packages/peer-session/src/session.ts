@@ -2,7 +2,7 @@ import {
   PEER_GENERATION_CAPABILITIES, assertAuthorityExtension, verifyAuthorityBundle,
   type AuthorityBundle, type PeerAuthority, type PeerGrant, type PeerIdentity,
 } from '@chronolog/peer-generation/control'
-import type { PeerRevision, AppliedResult, OperationState, RecoveryNotice, SignedAttempt, SignedRetainedCoverage, PrefixProof } from '@chronolog/peer-generation'
+import type { PeerRevision, AppliedResult, OperationState, RecoveryNotice, SignedAttempt, SignedRetainedCoverage, PeerOrderingPause, PrefixProof } from '@chronolog/peer-generation'
 import { bytesToHex, hexToBytes, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import { SignalChannel, type Signals } from '@chronolog/signals'
 import { describeApplication, type ApplicationCommand, type ApplicationDefinition, type ApplicationQuery } from './definition.js'
@@ -270,6 +270,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
   async inspectRecovery(): Promise<readonly RecoveryNotice[]> { return (await this.#requireData()).inspectRecovery() }
   async recoveryPoint(): Promise<PrefixProof> { return (await this.#requireData()).recoveryPoint() }
+  /** Durable pause covers local and remote coordinator ordering; closing does not release it. */
+  async pauseOrdering(operationId: string): Promise<PeerOrderingPause> { return (await this.#requireData()).replica.pauseOrdering(operationId) }
+  async orderingPause(): Promise<PeerOrderingPause | null> { return (await this.#requireData()).replica.orderingPause() }
+  /** Reconcile the original control operation before resuming; a lost reply is not cancellation. */
+  async resumeOrdering(operationId: string): Promise<void> { return (await this.#requireData()).replica.resumeOrdering(operationId) }
   async adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> {
     const data = await this.#requireData(), notice = await this.#adoptAuthority(authority)
     this.#assertDataAvailable()

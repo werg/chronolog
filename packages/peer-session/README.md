@@ -263,8 +263,60 @@ delivery; the common signed verifier supplies authority.
 `control.preparePublication({ operationId, entry, files })` saves the exact signed
 code or page manifest. `control.publish(manifest, assets)` submits it with bounded,
 hash-verified assets, and `control.publication()` verifies the selected chain.
-Retries preserve the original signed intent and receipt. The selected publication
-head persists outside recoverable application history and cannot move backward.
+Successful publication still returns `{ publication, version }`. Before checking
+the selected head, the participant validates and retains that host acknowledgement
+separately from the signed intent. Closing the session drains this receipt write
+before releasing device storage. The selected publication head persists outside
+recoverable application history and cannot move backward.
+
+`control.publicationOperation(operationId)` reads this device's saved
+`{ publication, receipt }`, or `null` when it has no saved operation. It performs
+no host request and does not open application data. The receipt is either
+`{ publication, version }` or `null`; a missing receipt means the outcome is
+unknown, not that the host rejected or failed to commit the operation. The read
+revalidates the signed manifest, application/device/operation scope and receipt
+equality against the saved intent. As with other device metadata, it relies on
+local storage integrity: the manifest is signed, but the host's version number
+is an acknowledgement rather than a separately signed proof of acceptance.
+
+After the submitted manifest and any retained receipt pass verification, a
+submission, new receipt validation, receipt retention or selected-head failure
+rejects with `ApplicationPublicationError`. Its `phase` is respectively
+`submission`, `receipt`, `retention` or `selection`, and its original `cause` is
+preserved. `operationId` and `publicationId` always identify the submitted signed
+intent. With no valid acknowledgement, `outcome` is `unknown`, `receipt` is `null`
+and `code` is `APPLICATION_PUBLICATION_OUTCOME_UNKNOWN`. Once a valid receipt is
+known, `outcome` is `committed`, `receipt` carries it and `code` is
+`APPLICATION_PUBLICATION_COMMITTED`, even if verification or a later retry fails.
+Preflight manifest and retained-record verification errors remain unchanged and
+cannot establish a new receipt or dispatch a publication request.
+Invalid signatures, stale authority and invalid selected chains still fail;
+`committed` does not mean the publication is currently selected. A receipt
+retention failure includes the valid in-memory receipt in the error, but cannot
+guarantee that a subsequent process will find it locally.
+
+The refreshed selected chain must contain the acknowledged manifest. A missing,
+older or divergent selected chain fails with
+`APPLICATION_PUBLICATION_NOT_SELECTED` as the selection error's cause (or the
+existing regression/verification error when a previously trusted head is
+violated). That failure preserves the receipt without advancing the remembered
+head. A newer selected release is allowed after an exact old retry, provided its
+verified ancestry includes that retry's original publication.
+Each read must also preserve the host storage version of an acknowledged
+manifest and the previously verified selected head. A changed version fails
+with `APPLICATION_PUBLICATION_REPLY_MISMATCH`; it cannot silently replace the
+retained receipt or advance the selected checkpoint. This is consistency of the
+host's acknowledgement, not a signature over that storage version.
+Standalone reads also check the matching retained receipt after reopen, even
+when the first selection failed before any head was checkpointed.
+
+After a timeout, disconnect or cancellation, reopen the same device store and
+inspect the original operation ID. Reuse the saved manifest and exact assets for
+an explicit retry; do not replace an uncertain operation with newly signed
+intent. A late reply delivered after the cancelled request has settled cannot
+establish a local receipt. Exact retries retain their original receipt even when
+a newer release is selected, and never regress the remembered selected head.
+
 Signing a release requires an explicit `publisher` grant. Administration and
 application-data access do not confer publication rights. The hosted control
 participant serves approved releases without publisher or application-reader
@@ -315,6 +367,36 @@ a definition change or an interrupted checkpoint. An external dispatch journal
 must preserve provider outcomes independently and use an explicitly protected
 action policy; ordinary applied events and projection progress supply no such
 guarantee.
+
+## Retain a coordinator prefix during reviewed control work
+
+An owned coordinator session can call `await session.pauseOrdering(operationId)`
+before publishing a control proposal for human review. The result contains the
+same `operationId`, selected `generation` and exact `base` prefix proof. The
+replica drains prior ordering, saves one bounded pause record and then returns
+that proof. New local and remote commands remain saved but cannot be ordered;
+existing results and queries remain readable. An exact already-ordered retry can
+still return its existing receipt without advancing the prefix.
+
+`await session.orderingPause()` inspects the retained pause. Repeating
+`pauseOrdering` with the same ID returns its original proof; another ID is refused.
+The pause survives session closure and same-device reopen, and is loaded before
+new ordering. A corrupt or mismatched record fails closed. This is an owned
+session API, not a new permission granted to attached browser/terminal facades.
+
+Use `await session.resumeOrdering(operationId)` only after reconciling the exact
+review/control operation. Before submission, a verified rejection or expiry can
+end the pause. After submission, a cancelled waiter or lost reply does not prove
+that the control mutation was cancelled: preserve the pause, inspect or retry
+the original request, verify and adopt its selected authority, then resume.
+There is no automatic timeout release. The call refuses a different ID and a
+selected recovery that discarded the reviewed prefix. Such recovery needs its
+own explicit policy; do not erase the pause record or create another signer.
+
+This local ordering boundary does not prevent another authorized participant
+from selecting a competing generation and does not provide irreversible finality.
+Applications must also enforce the reviewed authority, proposal digest, expiry,
+and durable exact-request outcome at their control-service boundary.
 
 ## Owned participation and recovery
 
