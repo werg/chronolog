@@ -314,6 +314,36 @@ must preserve provider outcomes independently and use an explicitly protected
 action policy; ordinary applied events and projection progress supply no such
 guarantee.
 
+## Retain a coordinator prefix during reviewed control work
+
+An owned coordinator session can call `await session.pauseOrdering(operationId)`
+before publishing a control proposal for human review. The result contains the
+same `operationId`, selected `generation` and exact `base` prefix proof. The
+replica drains prior ordering, saves one bounded pause record and then returns
+that proof. New local and remote commands remain saved but cannot be ordered;
+existing results and queries remain readable. An exact already-ordered retry can
+still return its existing receipt without advancing the prefix.
+
+`await session.orderingPause()` inspects the retained pause. Repeating
+`pauseOrdering` with the same ID returns its original proof; another ID is refused.
+The pause survives session closure and same-device reopen, and is loaded before
+new ordering. A corrupt or mismatched record fails closed. This is an owned
+session API, not a new permission granted to attached browser/terminal facades.
+
+Use `await session.resumeOrdering(operationId)` only after reconciling the exact
+review/control operation. Before submission, a verified rejection or expiry can
+end the pause. After submission, a cancelled waiter or lost reply does not prove
+that the control mutation was cancelled: preserve the pause, inspect or retry
+the original request, verify and adopt its selected authority, then resume.
+There is no automatic timeout release. The call refuses a different ID and a
+selected recovery that discarded the reviewed prefix. Such recovery needs its
+own explicit policy; do not erase the pause record or create another signer.
+
+This local ordering boundary does not prevent another authorized participant
+from selecting a competing generation and does not provide irreversible finality.
+Applications must also enforce the reviewed authority, proposal digest, expiry,
+and durable exact-request outcome at their control-service boundary.
+
 ## Owned participation and recovery
 
 Call `session.participate()` once after opening the session. It owns discovery,
