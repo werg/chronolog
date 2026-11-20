@@ -248,6 +248,11 @@ existing regression/verification error when a previously trusted head is
 violated). That failure preserves the receipt without advancing the remembered
 head. A newer selected release is allowed after an exact old retry, provided its
 verified ancestry includes that retry's original publication.
+Each read must also preserve the host storage version of an acknowledged
+manifest and the previously verified selected head. A changed version fails
+with `APPLICATION_PUBLICATION_REPLY_MISMATCH`; it cannot silently replace the
+retained receipt or advance the selected checkpoint. This is consistency of the
+host's acknowledgement, not a signature over that storage version.
 
 After a timeout, disconnect or cancellation, reopen the same device store and
 inspect the original operation ID. Reuse the saved manifest and exact assets for

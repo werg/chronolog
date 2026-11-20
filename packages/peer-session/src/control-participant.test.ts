@@ -393,6 +393,55 @@ describe('session-owned control participant', () => {
     expect(await f.publications.read()).toEqual([publication])
   })
 
+  it.each(['selected', 'ancestor'] as const)('rejects a changed storage version for the acknowledged %s publication', async selected => {
+    const f = await fixture(), a = await f.open(0)
+    let mismatchedId: string | null = null
+    const host = a.connectControlParticipant({ async exchange(request) {
+      const response = await f.exchange(request)
+      if (request.facet !== 'publication' || request.action !== 'read' || mismatchedId === null) return response
+      const records = await f.publications.read(), id = (request.payload as { id?: string }).id
+      const publication = id === undefined ? records.at(-1) : records.find(value => value.id === id)
+      return publication?.id === mismatchedId ? createParticipantResponse(request, { publication, version: 99 }) : response
+    } })
+    const bytes = new TextEncoder().encode('<main>version binding</main>')
+    const files = [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }]
+    const first = await host.preparePublication({ operationId: 'bound-version', entry: 'index.html', files })
+    const receipt = { publication: first, version: 1 }
+    if (selected === 'ancestor') {
+      await host.publish(first, [])
+      const second = await host.preparePublication({ operationId: 'newer-version', entry: 'index.html', files })
+      await host.publish(second, [])
+    }
+    mismatchedId = first.id
+    await expect(host.publish(first, [])).rejects.toMatchObject({ outcome: 'committed', phase: 'selection', receipt,
+      cause: new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH') })
+    expect(await host.publicationOperation('bound-version')).toEqual({ publication: first, receipt })
+    mismatchedId = null
+    expect(await host.publish(first, [])).toEqual(receipt)
+    expect(await f.publications.read()).toHaveLength(selected === 'ancestor' ? 2 : 1)
+  })
+
+  it('preserves the selected checkpoint when a read changes its acknowledged storage version', async () => {
+    const f = await fixture(), a = await f.open(0)
+    let corruptVersion = false
+    const host = a.connectControlParticipant({ async exchange(request) {
+      const response = await f.exchange(request)
+      if (!corruptVersion || request.facet !== 'publication' || request.action !== 'read') return response
+      return createParticipantResponse(request, { publication: (await f.publications.read()).at(-1), version: 2 })
+    } })
+    const bytes = new TextEncoder().encode('<main>selected checkpoint</main>')
+    const publication = await host.preparePublication({ operationId: 'selected-version', entry: 'index.html',
+      files: [{ path: 'index.html', hash: await bytesDigest(bytes), size: bytes.length, type: 'text/html' }] })
+    const receipt = await host.publish(publication, [])
+    corruptVersion = true
+    await expect(host.publication()).rejects.toThrow('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+    corruptVersion = false
+    expect(await host.publication()).toEqual(receipt)
+    await a.close()
+    const reopened = await f.open(0, true), resumed = reopened.connectControlParticipant({ exchange: f.exchange })
+    expect(await resumed.publication()).toEqual(receipt)
+  })
+
   it.each(['version', 'signature', 'operation'] as const)('revalidates a retained receipt with corrupt %s after reopen', async field => {
     const f = await fixture(), a = await f.open(0), host = a.connectControlParticipant({ exchange: f.exchange })
     const bytes = new TextEncoder().encode('<main>local receipt</main>')

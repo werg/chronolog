@@ -209,7 +209,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
         phase = 'selection'
         // An exact old retry may return its original receipt after a newer release.
         // Refresh the selected head instead of making that old receipt current.
-        await this.#readPublication(acknowledged.publication)
+        await this.#readPublication(acknowledged)
         return receipt
       } catch (cause) {
         throw new ApplicationPublicationError(publication, phase, cause, receipt)
@@ -217,40 +217,52 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
     })
   }
 
-  async #readPublication(acknowledged?: SignedPublication): Promise<ApplicationPublication | null> {
+  async #readPublication(acknowledged?: ApplicationPublication): Promise<ApplicationPublication | null> {
     await this.application()
     const authority = await verifyAuthorityBundle(this.#participant.authority)
-    const current = await this.#request<ApplicationPublication | null>('publication', 'read', {})
+    const reply = await this.#request<unknown>('publication', 'read', {})
+    const current = reply === null ? null : readPublicationReceipt(reply)
     if (current === null) {
       if (await this.#store.get(this.#publicationKey) !== null) throw new Error('APPLICATION_PUBLICATION_REGRESSION')
       if (acknowledged !== undefined) throw new Error('APPLICATION_PUBLICATION_NOT_SELECTED')
       this.#signal.throwIfAborted()
       return null
     }
-    if (!Number.isSafeInteger(current.version) || current.version < 1) throw new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH')
     await updateDeviceMetadata(this.#store, this.#publicationKey, async stored => {
       this.#signal.throwIfAborted()
-      const previous = stored === null ? null : decodePeerValue<ApplicationPublication>(stored)
+      const previous = stored === null ? null : readPublicationReceipt(decodePeerValue<unknown>(stored))
       if (previous !== null) await verifyPublicationManifest(previous.publication, authority)
+      // Storage versions are host acknowledgements, but each manifest must keep
+      // the same version across its receipt, selected head and retained history.
+      const checkVersion = (receipt: ApplicationPublication): void => {
+        for (const expected of [previous, acknowledged]) {
+          if (expected != null && receipt.publication.id === expected.publication.id && receipt.version !== expected.version) {
+            throw new Error('APPLICATION_PUBLICATION_REPLY_MISMATCH')
+          }
+        }
+      }
       let cursor = current.publication
       await verifyPublicationManifest(cursor, authority)
+      checkVersion(current)
       if (previous !== null && (cursor.payload.revision < previous.publication.payload.revision ||
         cursor.payload.revision === previous.publication.payload.revision && cursor.id !== previous.publication.id)) {
         throw new Error('APPLICATION_PUBLICATION_REGRESSION')
       }
       let previousSeen = cursor.id === previous?.publication.id
-      let acknowledgedSeen = acknowledged === undefined || cursor.id === acknowledged.id
+      let acknowledgedSeen = acknowledged === undefined || cursor.id === acknowledged.publication.id
       let remaining = PUBLICATION_LIMITS.revisions
       while ((previous === null || !previousSeen || !acknowledgedSeen) && cursor.payload.previous !== null) {
         if (--remaining < 0) throw new Error('APPLICATION_PUBLICATION_HISTORY_LIMIT')
-        const prior = await this.#request<ApplicationPublication | null>('publication', 'read', { id: cursor.payload.previous })
+        const response = await this.#request<unknown>('publication', 'read', { id: cursor.payload.previous })
+        const prior = response === null ? null : readPublicationReceipt(response)
         if (prior === null || prior.publication.id !== cursor.payload.previous || prior.publication.payload.revision !== cursor.payload.revision - 1) {
           throw new Error('APPLICATION_PUBLICATION_CHAIN_INVALID')
         }
         await verifyPublicationManifest(prior.publication, authority)
+        checkVersion(prior)
         cursor = prior.publication
         previousSeen ||= cursor.id === previous?.publication.id
-        acknowledgedSeen ||= cursor.id === acknowledged?.id
+        acknowledgedSeen ||= cursor.id === acknowledged?.publication.id
       }
       if (previous !== null && !previousSeen) throw new Error('APPLICATION_PUBLICATION_REGRESSION')
       if (!acknowledgedSeen) throw new Error('APPLICATION_PUBLICATION_NOT_SELECTED')
