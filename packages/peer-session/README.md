@@ -760,7 +760,16 @@ observe updates, while `inspectRecovery()` loads retained recovery notices.
 If the Worker configured participation, `session.participation` exposes its
 `status`, `onStatus()`, `approveRecovery()` and `close()` without moving policy or
 credentials into the page.
-`readView()` holds one coherent SQL/event view until `release()` resolves.
+`readView()` holds one coherent SQL/event view until `release()` resolves. SQL captures
+lease the immutable reader owned by that local or final publication; capture and
+release do not open databases, check out branches, or list branches. Existing
+leases preserve their SQL/log/revision when publication advances or recovery
+replays another prefix. A retired reader closes when its last lease releases;
+publication/startup cleanup reclaims its private branch while protecting every
+live reader. Restart discards process-owned leases. The materializer permits 16
+captured handles; the application session retains its stricter eight-view limit.
+Closing invalidates all views and attempts all resource closes even if one fails.
+
 Only the Worker holds signing keys and the durable command journal. Cancelling
 a page waiter ends that observation and leaves the saved command inspectable.
 

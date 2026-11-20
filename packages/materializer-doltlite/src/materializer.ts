@@ -73,11 +73,20 @@ export class MaterializerInputError extends Error {
   }
 }
 
+interface PublishedReader {
+  readonly database: DatabaseLike
+  readonly branchRef: string
+  leases: number
+  retired: boolean
+}
+
 export class DeterministicMaterializer implements MaterializerSqlBackend {
   readonly #readLeases = new Set<() => void>()
   readonly #writer: DatabaseLike
-  #reader: DatabaseLike
-  #finalReader: DatabaseLike
+  readonly #readers = new Set<PublishedReader>()
+  #reader: PublishedReader
+  #finalReader: PublishedReader
+  #writerClosed = false
   #finalPublished: PublishedRef
   #finalLog: TransactionLogRow[]
   readonly #sourceOptions: MaterializerOptions
@@ -97,7 +106,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
   private constructor(
     writer: DatabaseLike,
-    reader: DatabaseLike,
+    reader: PublishedReader,
     options: MaterializerOptions,
     backend: MaterializerBackendInfo,
     executionManifest: ExecutionManifest,
@@ -105,13 +114,15 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     published: PublishedRef,
     checkpoints: MaterializerCheckpointInfo[],
     log: TransactionLogRow[],
-    finalReader: DatabaseLike,
+    finalReader: PublishedReader,
     finalPublished: PublishedRef,
     finalLog: TransactionLogRow[],
   ) {
     this.#writer = writer
     this.#reader = reader
     this.#finalReader = finalReader
+    this.#readers.add(reader)
+    this.#readers.add(finalReader)
     this.#finalPublished = finalPublished
     this.#finalLog = finalLog
     this.#sourceOptions = options
@@ -146,8 +157,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     const expected: ExpectedState = { artifacts, rootAdministrator: options.rootAdministrator, bootstrapProgram }
     const bootstrapIdentity = await hashDomain(DOMAINS.peerSchema, bootstrapProgram)
     const opened = openDatabase(options)
-    let reader: DatabaseLike | null = null
-    let finalReader: DatabaseLike | null = null
+    let reader: PublishedReader | null = null
+    let finalReader: PublishedReader | null = null
     try {
       if (!bytesEqual(opened.backend.engineDigest, options.engine.executionManifest.engineDigest)) {
         throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
@@ -163,32 +174,22 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       const log = readSystemLog(opened.database)
       verifyPublishedLog(published, log)
       const checkpoints = validateCheckpointRefs(opened.database, published, log, artifacts)
+      // No process-owned read lease survives reopening the sole storage owner.
       cleanupOrphanBranches(opened.database, published, checkpoints)
-      // Read leases are process-owned. No lease can survive reopening the sole
-      // storage owner, so crash leftovers can be reclaimed before new readers.
-      for (const branch of opened.database.doltBranches()) {
-        if (branch.name.startsWith('chronolog_read_')) opened.database.doltDeleteBranch(branch.name)
-      }
 
-      const readerOpened = openDatabase(options)
-      reader = readerOpened.database
-      if (!bytesEqual(readerOpened.backend.engineDigest, options.engine.executionManifest.engineDigest)) {
-        throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
-      }
-      reader.doltCheckout(published.branchRef)
-      verifyDatabaseState(reader, expected)
-      const readerLog = readSystemLog(reader)
+      reader = openPublishedReader(options, opened.database, published.doltCommitHash)
+      verifyDatabaseState(reader.database, expected)
+      const readerLog = readSystemLog(reader.database)
       verifyPublishedLog(published, readerLog)
-      if (reader.doltHashOf(published.branchRef) !== published.contentHash) {
+      if (reader.database.doltHashOf(reader.branchRef) !== published.contentHash) {
         throw new Error('MATERIALIZER_READER_CONTENT_MISMATCH')
       }
       const finalPublished = discoverFinalRef(opened.database) ?? publishFinalRef(
         opened.database, 0n, [], checkpoints.find((checkpoint) => checkpoint.prefixLength === 0)!.doltCommitHash,
       )
-      finalReader = openDatabase(options).database
-      finalReader.doltCheckout(finalPublished.branchRef)
-      verifyDatabaseState(finalReader, expected)
-      const finalLog = readSystemLog(finalReader)
+      finalReader = openPublishedReader(options, opened.database, finalPublished.doltCommitHash)
+      verifyDatabaseState(finalReader.database, expected)
+      const finalLog = readSystemLog(finalReader.database)
       verifyPublishedLog(finalPublished, finalLog)
       verifyFinalPrefix(finalLog, readerLog)
       return new DeterministicMaterializer(
@@ -206,8 +207,8 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         finalLog,
       )
     } catch (error) {
-      reader?.close()
-      finalReader?.close()
+      reader?.database.close()
+      finalReader?.database.close()
       opened.database.close()
       throw error
     }
@@ -257,7 +258,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     if (options.atRevision !== undefined && options.atRevision !== revision) {
       throw new MaterializerInputError('MATERIALIZER_REVISION_UNAVAILABLE')
     }
-    const result = executeLocalSql(final ? this.#finalReader : this.#reader, sql, parameters)
+    const result = executeLocalSql((final ? this.#finalReader : this.#reader).database, sql, parameters)
     return { revision, orderLength: final ? this.finalOrderLength : this.orderLength, view: final ? 'final' : 'local', finalOrderLength: this.finalOrderLength, ...result }
   }
 
@@ -289,24 +290,23 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     if (this.#readLeases.size >= 16) throw new Error('MATERIALIZER_SNAPSHOT_LIMIT')
     const application = this.captureApplication(options)
     const { view, revision, orderLength, finalOrderLength } = application
-    const published = view === 'final' ? this.#finalPublished : this.#published
-    const branch = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
-    this.#writer.doltBranch(branch, published.doltCommitHash)
-    let reader: DatabaseLike | undefined
-    try { reader = openDatabase(this.#sourceOptions).database; reader.doltCheckout(branch) }
-    catch (error) { try { reader?.close() } finally { removeBranchIfPresent(this.#writer, branch) }; throw error }
+    // Each publication owns one immutable pinned reader. Captures share it;
+    // neither capture nor release creates, checks out or lists SQL branches.
+    const reader = view === 'final' ? this.#finalReader : this.#reader
+    reader.leases++
     let released = false
     const release = (): void => {
       if (released) return
       released = true
-      try { reader.close() }
-      finally { try { removeBranchIfPresent(this.#writer, branch) } finally { this.#readLeases.delete(release) } }
+      this.#readLeases.delete(release)
+      reader.leases--
+      if (!this.#closed) this.#closeRetiredReader(reader)
     }
     this.#readLeases.add(release)
     return { ...application,
       query(sql, parameters = []) {
         if (released) throw new Error('MATERIALIZER_SNAPSHOT_RELEASED')
-        return { revision, orderLength, finalOrderLength, view, ...executeLocalSql(reader, sql, parameters) }
+        return { revision, orderLength, finalOrderLength, view, ...executeLocalSql(reader.database, sql, parameters) }
       }, release }
   }
 
@@ -323,7 +323,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     let replayBranch: string | null = null
     let revisionBranch: string | null = null
     let newCheckpoint: MaterializerCheckpointInfo | null = null
-    let candidateReader: DatabaseLike | null = null
+    let candidateReader: PublishedReader | null = null
     let publishedMoved = false
     let replayBaseRef: string | null = null
     try {
@@ -392,13 +392,11 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       if (nextPublished.contentHash !== contentHash) throw new Error('MATERIALIZER_REVISION_CONTENT_MISMATCH')
       this.#publicationFault('after_revision_ref_created')
 
-      const candidateOpened = openDatabase(this.#sourceOptions)
-      candidateReader = candidateOpened.database
-      candidateReader.doltCheckout(revisionBranch)
-      verifyDatabaseState(candidateReader, this.#expected)
-      const readerLog = readSystemLog(candidateReader)
+      candidateReader = openPublishedReader(this.#sourceOptions, this.#writer, nextPublished.doltCommitHash)
+      verifyDatabaseState(candidateReader.database, this.#expected)
+      const readerLog = readSystemLog(candidateReader.database)
       verifyPublishedLog(nextPublished, readerLog)
-      if (candidateReader.doltHashOf(revisionBranch) !== contentHash) {
+      if (candidateReader.database.doltHashOf(candidateReader.branchRef) !== contentHash) {
         throw new Error('MATERIALIZER_CANDIDATE_READER_CONTENT_MISMATCH')
       }
 
@@ -409,18 +407,20 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
       const oldReader = this.#reader
       this.#reader = candidateReader
+      this.#readers.add(candidateReader)
       candidateReader = null
       this.#published = nextPublished
       this.#log = readerLog
       this.#order = transactions.map((transaction) => copyBytes(transaction.txId))
-      oldReader.close()
+      oldReader.retired = true
+      this.#closeRetiredReader(oldReader)
       this.#publicationFault('after_reader_swap')
 
       try {
         this.#writer.doltCheckout(HEAD_BRANCH)
         const retained = newCheckpoint === null ? retainedBeforeInsertion : [...retainedBeforeInsertion, newCheckpoint]
         this.#checkpoints = this.#pruneCheckpoints(retained)
-        cleanupOrphanBranches(this.#writer, nextPublished, this.#checkpoints)
+        cleanupOrphanBranches(this.#writer, nextPublished, this.#checkpoints, [...this.#readers].map(reader => reader.branchRef))
         this.#checkpointError = null
       } catch (error) {
         this.#checkpointError = nonThrowingDiagnostic(error, 'CHECKPOINT_CLEANUP_FAILED')
@@ -443,7 +443,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       }
       return event
     } catch (error) {
-      candidateReader?.close()
+      candidateReader?.database.close()
       rollbackIfActive(this.#writer)
       if (!publishedMoved) {
         try {
@@ -473,7 +473,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     let replayBranch: string | null = null
     let replayBaseRef: string | null = null
     let replayCommitted = false
-    let reader: DatabaseLike | null = null
+    let reader: PublishedReader | null = null
     try {
       const prefix = this.#log.slice(0, prefixLength)
       if (peerControls === undefined && hasPeerExecutionControl(this.#writer)) throw new Error('MATERIALIZER_CONTROLS_REQUIRED')
@@ -511,24 +511,23 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         replayCommitted = true
       }
       // Read and validate the exact SQL commit before publishing its final ref.
-      const temporary = replayBranch ?? this.#published.branchRef
-      reader = openDatabase(this.#sourceOptions).database
-      reader.doltCheckout(temporary)
-      verifyDatabaseState(reader, this.#expected)
-      const log = readSystemLog(reader)
+      reader = openPublishedReader(this.#sourceOptions, this.#writer, commitHash)
+      verifyDatabaseState(reader.database, this.#expected)
+      const log = readSystemLog(reader.database)
       if (log.length !== prefixLength) throw new Error('MATERIALIZER_FINAL_LOG_LENGTH_MISMATCH')
       verifyFinalPrefix(prefix, log)
       const published = publishFinalRef(this.#writer, this.finalRevision + 1n, log, commitHash)
-      reader.doltCheckout(published.branchRef)
       const oldReader = this.#finalReader
       this.#finalReader = reader
+      this.#readers.add(reader)
       reader = null
       this.#finalPublished = published
       this.#finalLog = log
-      oldReader.close()
+      oldReader.retired = true
+      this.#closeRetiredReader(oldReader)
     } finally {
       try {
-        reader?.close()
+        reader?.database.close()
         rollbackIfActive(this.#writer)
         // Successful SQL transactions can precede a failed candidate commit.
         // Discard that private working set before returning to the local head.
@@ -537,18 +536,40 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         }
         this.#writer.doltCheckout(HEAD_BRANCH)
         if (replayBranch !== null) removeBranchIfPresent(this.#writer, replayBranch)
+        try {
+          cleanupOrphanBranches(this.#writer, this.#published, this.#checkpoints, [...this.#readers].map(reader => reader.branchRef))
+          this.#checkpointError = null
+        } catch (error) {
+          this.#checkpointError = nonThrowingDiagnostic(error, 'CHECKPOINT_CLEANUP_FAILED')
+        }
       } finally { this.#materializing = false }
     }
   }
 
   close(): void {
-    if (this.#closed) return
-    for (const release of [...this.#readLeases]) release()
     this.#closed = true
     this.#subscribers.clear()
-    this.#reader.close()
-    this.#finalReader.close()
-    this.#writer.close()
+    // Invalidate every handle even if one database close fails. A subsequent
+    // close retries only resources whose close did not succeed.
+    for (const release of [...this.#readLeases]) release()
+    const errors: unknown[] = []
+    for (const reader of this.#readers) {
+      try { reader.database.close(); this.#readers.delete(reader) }
+      catch (error) { errors.push(error) }
+    }
+    if (!this.#writerClosed) {
+      try { this.#writer.close(); this.#writerClosed = true }
+      catch (error) { errors.push(error) }
+    }
+    if (errors.length === 1) throw errors[0]
+    if (errors.length > 1) throw new AggregateError(errors, 'MATERIALIZER_CLOSE_FAILED')
+  }
+
+  #closeRetiredReader(reader: PublishedReader): void {
+    if (!reader.retired || reader.leases !== 0) return
+    reader.database.close()
+    this.#readers.delete(reader)
+    // Branch reclamation belongs to publication/startup cleanup, not a read.
   }
 
   #applyTransaction(transaction: ReplayProposal, orderIndex: number, generation?: Uint8Array): void {
@@ -619,6 +640,29 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   #assertOpen(): void { if (this.#closed) throw new Error('MATERIALIZER_CLOSED') }
+}
+
+/** Private read refs avoid retaining duplicate revision markers after rollback.
+ * They are immutable for the reader's lifetime and reclaimed after retirement
+ * or at startup, when no process-owned leases can survive.
+ */
+function openPublishedReader(options: MaterializerOptions, writer: DatabaseLike, commit: string): PublishedReader {
+  const branchRef = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
+  writer.doltBranch(branchRef, commit)
+  let database: DatabaseLike | undefined
+  try {
+    const opened = openDatabase(options)
+    database = opened.database
+    if (!bytesEqual(opened.backend.engineDigest, options.engine.executionManifest.engineDigest)) {
+      throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
+    }
+    database.doltCheckout(branchRef)
+    return { database, branchRef, leases: 0, retired: false }
+  } catch (error) {
+    try { database?.close() } catch { /* Preserve the reader-opening failure. */ }
+    try { removeBranchIfPresent(writer, branchRef) } catch { /* Startup reclaims crash leftovers. */ }
+    throw error
+  }
 }
 
 interface ExpectedState {

@@ -159,10 +159,12 @@ export function cleanupOrphanBranches(
   database: DatabaseLike,
   published: PublishedRef,
   retainedCheckpoints: readonly MaterializerCheckpointInfo[],
+  retainedReaders: readonly string[] = [],
 ): void {
   const retained = new Set([
     HEAD_BRANCH,
     published.branchRef,
+    ...retainedReaders,
     ...retainedCheckpoints.map((checkpoint) => checkpoint.branchRef),
   ])
   const active = database.doltActiveBranch()
@@ -170,7 +172,7 @@ export function cleanupOrphanBranches(
     if (
       branch.name !== active &&
       !retained.has(branch.name) &&
-      (branch.name.startsWith(REPLAY_PREFIX) || branch.name.startsWith(REVISION_PREFIX))
+      (branch.name.startsWith(REPLAY_PREFIX) || branch.name.startsWith(REVISION_PREFIX) || branch.name.startsWith('chronolog_read_'))
     ) {
       database.doltDeleteBranch(branch.name)
     }

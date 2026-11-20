@@ -157,7 +157,7 @@ async function instrumented(checkpointEvery: number) {
             },
             prepare(sql) {
               if (!isWriter && fault === 'reader-validation' && sql.includes('SELECT manifest_digest, canonical_manifest, bootstrap_program') &&
-                  native.doltActiveBranch().startsWith('chronolog_replay_')) {
+                  native.doltActiveBranch().startsWith('chronolog_read_')) {
                 fault = undefined
                 throw new Error('FINAL_REPLAY_reader-validation')
               }
