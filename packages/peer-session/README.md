@@ -394,7 +394,10 @@ have no lease TTL: the discovery service ties presence to its authenticated
 notification transport and explicit withdrawal. There is no polling compatibility
 mode or `connections.advertiseMs` option.
 
-Real local authority/data/head changes coalesce an advertisement and scan. An
+Real selected-generation/control changes and data activation/availability changes
+coalesce an advertisement and scan. Materialized head/point changes do not: peer
+replication owns ordinary command updates. An advertisement samples its untrusted
+point only when presence or those lifecycle events require an advertisement. An
 unchanged subscription callback does no hosted work. A settled healthy controller
 has no recurring timer, advertisement, directory read or synchronization, even
 when below its maximum peer count. Late peers are discovered through notifications.
@@ -402,9 +405,14 @@ Unhealthy coordination and failed active operations retain bounded deadlines,
 grace and exponential retry backoff. After the first ready, a notification outage
 does not block verified recovery of a missing coordinator; an already healthy
 participant does no recovery reads just because the notification transport failed.
-Notification errors, early stream termination and invalid event shapes are surfaced
-and resubscribed with capped backoff. A new stream must start with ready again. Ordinary commands and live signals do not
-cause control-service requests; changed retained history does update discoverability. A relayed
+Retryable notification errors and early stream termination are surfaced and
+resubscribed with capped backoff. A new stream must start with ready again.
+A provider-neutral error carrying `retryable === false` is terminal (for example
+revocation, participant replacement or a protocol rejection). It fences hosted
+participation calls, notification/invitation resubscription and withdrawal; the
+application and already authenticated peer links stay alive. Discovery becomes
+unavailable rather than racing a replacement owner. There is no polling fallback. Ordinary commands and live signals do not
+cause control-service requests, advertisements or directory reads. A relayed
 connection does carry their ciphertext through its WebSockets.
 
 After coordinator loss, the controller first gives reconnection its configured
@@ -547,7 +555,7 @@ refer to an exact locally held prefix. Both directions exchange available histor
 including when a fresh device is still recovering an inherited generation.
 Explicit synchronization observes a fresh head after any older background pull.
 Local history/control changes trigger coalesced peer hints. Owned participation
-scans and synchronizes on routing notifications or real local changes, without an
+scans and synchronizes on routing notifications or authority/data lifecycle changes, without an
 application-data HTTP fallback. Pending commands use the session's
 existing immutable attempt journal, and retry after reconnection preserves those
 original bytes.

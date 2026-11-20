@@ -22,7 +22,10 @@ export interface ApplicationPeerAdvertisement {
 /** Routing invalidation only, never application state or authority. Each connection starts with ready. */
 export interface ApplicationDiscoveryNotification { readonly type: 'ready' | 'changed' }
 export interface ApplicationDiscoveryPort {
-  /** Start before advertising. ready means the authenticated transport is connected; emit it again after reconnect. */
+  /** Start before advertising. ready means the authenticated transport is connected; emit it again after reconnect.
+   * Throw an error with retryable === false for terminal revocation, replacement or invalid protocol.
+   * Terminal discovery fences hosted participation work without closing the application session.
+   */
   notifications(options: { readonly signal: AbortSignal }): AsyncIterable<ApplicationDiscoveryNotification>
   read(options: { readonly signal: AbortSignal }): Promise<readonly ApplicationPeerHint[]>
   advertise(value: ApplicationPeerAdvertisement, options: { readonly signal: AbortSignal }): Promise<void>

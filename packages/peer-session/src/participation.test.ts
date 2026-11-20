@@ -154,9 +154,9 @@ async function fixture(options: { omitC?: boolean } = {}) {
 async function until(check: () => boolean | Promise<boolean>, timeout = 5000): Promise<void> {
   await vi.waitFor(async () => { expect(await check()).toBe(true) }, { timeout, interval: 5 })
 }
-async function post(session: ApplicationSession<typeof definition>, id: string) {
+async function post(session: ApplicationSession<typeof definition>, id: string, timeoutMs = 5000) {
   const operation = await session.command('say', id, { operationId: id })
-  await operation.applied({ signal: AbortSignal.timeout(5000) }); return operation
+  await operation.applied({ signal: AbortSignal.timeout(timeoutMs) }); return operation
 }
 
 function gate() {
@@ -211,6 +211,7 @@ describe('owned application participation', () => {
     } })
     await until(() => subscribed)
     expect(f.hub.counts.advertisements).toBe(0); expect(f.hub.counts.reads).toBe(0); expect(f.counts.reads).toBe(0)
+    expect(participation.status.phase).toBe('connecting')
     ready.resolve(); await until(() => participation.status.phase === 'coordinating')
     await participation.close(); expect(returned).toBe(true); expect(f.hub.notices.size).toBe(0)
   })
@@ -372,6 +373,51 @@ describe('owned application participation', () => {
     expect(second.status.error).toBe('WATCH_OFFLINE')
   })
 
+  it.each([false, true])('never resubscribes or performs hosted work for 48 hours after terminal discovery (ready: %s)', async ready => {
+    const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId), fatal = gate()
+    let subscriptions = 0, returned = 0
+    closing.push(() => fatal.resolve())
+    const participation = f.participate(a, { discovery: { ...ports.discovery, async *notifications() {
+      subscriptions++
+      try { if (ready) yield { type: 'ready' }; await fatal.promise; throw Object.assign(new Error('PARTICIPANT_REPLACED'), { retryable: false }) }
+      finally { returned++ }
+    } } })
+    await until(() => subscriptions === 1 && (!ready || f.hub.counts.advertisements > 0))
+    fatal.resolve(); await until(() => participation.status.phase === 'unavailable')
+    expect(participation.status.error).toBe('PARTICIPANT_REPLACED'); expect(returned).toBe(1)
+    expect(a.signal.aborted).toBe(false)
+    await expect((await post(a, 'native-still-running')).get()).resolves.toMatchObject({ status: 'applied' })
+    vi.useFakeTimers()
+    const before = { host: { ...f.counts }, discovery: { ...f.hub.counts } }
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect(subscriptions).toBe(1); expect(vi.getTimerCount()).toBe(0)
+    expect({ host: { ...f.counts }, discovery: { ...f.hub.counts } }).toEqual(before)
+    await participation.close(); expect(f.hub.counts.withdrawals).toBe(0)
+    expect(a.signal.aborted).toBe(false)
+  })
+
+  it('fences missing-coordinator recovery after terminal discovery without closing existing peer links', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(b.deviceId), fatal = gate()
+    let subscriptions = 0
+    closing.push(() => fatal.resolve())
+    const first = f.participate(a), second = f.participate(b, { discovery: { ...ports.discovery, async *notifications() {
+      subscriptions++; yield { type: 'ready' }; await fatal.promise
+      throw Object.assign(new Error('ACCESS_REVOKED'), { retryable: false })
+    } } })
+    await until(() => second.status.phase === 'following')
+    fatal.resolve(); await until(() => second.status.phase === 'unavailable')
+    expect(second.status.connectedPeers).toContain(a.deviceId)
+    // Terminal host discovery is independent of the already authenticated data connection.
+    await (await post(b, 'still-replicates')).shared({ signal: AbortSignal.timeout(5000) })
+    await first.close(); await new Promise(resolve => setTimeout(resolve, 25))
+    vi.useFakeTimers()
+    const before = { host: { ...f.counts }, discovery: { ...f.hub.counts } }
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect({ host: { ...f.counts }, discovery: { ...f.hub.counts } }).toEqual(before)
+    expect(subscriptions).toBe(1); expect(f.requests).toHaveLength(0); expect(vi.getTimerCount()).toBe(0)
+    expect(b.signal.aborted).toBe(false); expect(second.status.phase).toBe('unavailable')
+  })
+
   it('keeps discovery, authenticated live traffic and controls active without recovery until local data use', async () => {
     const f = await fixture(), openB = vi.fn(() => f.b.openStorage()), openC = vi.fn(() => f.c.openStorage())
     const b = await f.openCold({ ...f.b, openStorage: openB }), c = await f.openCold({ ...f.c, openStorage: openC })
@@ -421,18 +467,25 @@ describe('owned application participation', () => {
     expect(a.status.database).toBe('failed')
   })
 
-  it('re-advertises real history changes without reopening peers or calling the control service', async () => {
+  it('replicates many ordinary commands without advertisements, directory reads or control traffic', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const first = f.participate(a), second = f.participate(b)
     await until(() => first.status.phase === 'coordinating' && second.status.phase === 'following')
     expect(second.status.connectedPeers).toContain(a.deviceId)
+    await new Promise(resolve => setTimeout(resolve, 25))
     const before = { control: { ...f.counts }, delivery: { ...f.hub.counts } }
-    const operation = await post(b, 'once')
-    await operation.shared({ signal: AbortSignal.timeout(5000) })
-    await until(() => [a, b].every(session => JSON.stringify(f.hub.advertised.get(session.deviceId)?.point) === JSON.stringify(session.revision!.point)))
+    for (let index = 0; index < 16; index++) {
+      const operation = await post(index % 2 === 0 ? b : a, `ordinary-${index}`, 15000)
+      await operation.shared({ signal: AbortSignal.timeout(15000) })
+    }
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(a.revision!.point.sequence).toBe(16); expect(b.revision!.point).toEqual(a.revision!.point)
     expect(f.counts).toEqual(before.control)
-    expect(f.hub.counts.advertisements).toBeGreaterThan(before.delivery.advertisements)
+    expect(f.hub.counts.advertisements).toBe(before.delivery.advertisements)
+    expect(f.hub.counts.reads).toBe(before.delivery.reads)
+    expect(f.hub.counts.withdrawals).toBe(before.delivery.withdrawals)
     expect(f.hub.counts.opens).toBe(before.delivery.opens)
+    expect(f.hub.counts.frames).toBeGreaterThan(before.delivery.frames)
     expect(() => f.participate(b)).toThrow('APPLICATION_PARTICIPATION_ALREADY_STARTED')
     await second.close()
     expect(b.participation).toBe(second); expect(second.status.phase).toBe('closed')
