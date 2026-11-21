@@ -252,27 +252,27 @@ class NetworkPeer implements ApplicationPeerLink {
     finally { handshake.cancel() }
   }
   #prepareLive(): void {
-  if (this.#channel.connection.live !== undefined) {
-    const lane = this.#channel.connection.live
-    this.#route = this.#port.signals.attachRoute({ close: reason => this.#dispose(reason), trySend: async (frame, { signal }) => {
-      signal.throwIfAborted(); this.#reader()
-      if (this.#retiring || this.#owner.peers.get(this.peerId) !== this) return false
-      const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
-      if (accepted) this.#sentLiveBytes += frame.length
-      this.#reader(); return accepted
-    } })
-    const route = this.#route
-    let closed = false
-    const dispose = (): void => {
-      if (closed) return
-      closed = true; route.close(); lane.signal.removeEventListener('abort', dispose)
-      void lane.close().catch(() => undefined)
+    if (this.#channel.connection.live !== undefined) {
+      const lane = this.#channel.connection.live
+      this.#route = this.#port.signals.attachRoute({ close: reason => this.#dispose(reason), trySend: async (frame, { signal }) => {
+        signal.throwIfAborted(); this.#reader()
+        if (this.#retiring || this.#owner.peers.get(this.peerId) !== this) return false
+        const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
+        if (accepted) this.#sentLiveBytes += frame.length
+        this.#reader(); return accepted
+      } })
+      const route = this.#route
+      let closed = false
+      const dispose = (): void => {
+        if (closed) return
+        closed = true; route.close(); lane.signal.removeEventListener('abort', dispose)
+        void lane.close().catch(() => undefined)
+      }
+      this.#disposeLive = dispose
+      lane.signal.addEventListener('abort', dispose, { once: true })
+      if (lane.signal.aborted) dispose()
+      void this.#readLive(lane, route).catch(error => this.#fail(error)).finally(dispose)
     }
-    this.#disposeLive = dispose
-    lane.signal.addEventListener('abort', dispose, { once: true })
-    if (lane.signal.aborted) dispose()
-    void this.#readLive(lane, route).catch(error => this.#fail(error)).finally(dispose)
-  }
   }
   #attachData(): boolean {
     const data = this.#port.participant.data
