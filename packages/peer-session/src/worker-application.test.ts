@@ -322,10 +322,11 @@ describe('owned browser application facade', () => {
       if (id !== status.recovery?.id) throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
       status = { ...status, phase: 'coordinating', recovery: null }; publish()
     })
+    const diagnostics = vi.fn(async () => []), reconsiderConnections = vi.fn(async () => {})
     const participation: ApplicationParticipation = {
       get status() { return status }, signal: lifetime.signal,
       onStatus(listener) { listeners.add(listener); listener(status); return () => { listeners.delete(listener) } },
-      approveRecovery, diagnostics: vi.fn(async () => []), reconsiderConnections: vi.fn(async () => {}),
+      approveRecovery, diagnostics, reconsiderConnections,
       async close() { lifetime.abort(); status = { ...status, phase: 'closed' }; publish() },
     }
     const getter = vi.spyOn(f.a, 'participation', 'get').mockReturnValue(participation)
@@ -334,8 +335,8 @@ describe('owned browser application facade', () => {
     expect(client.participation?.status).toEqual(status)
     expect(await client.participation!.diagnostics()).toEqual([])
     await client.participation!.reconsiderConnections()
-    expect(participation.diagnostics).toHaveBeenCalledTimes(1)
-    expect(participation.reconsiderConnections).toHaveBeenCalledTimes(1)
+    expect(diagnostics).toHaveBeenCalledTimes(1)
+    expect(reconsiderConnections).toHaveBeenCalledTimes(1)
     const observations: string[] = []
     client.participation!.onStatus(value => observations.push(value.phase))
     await expect(client.participation!.approveRecovery('stale-proposal')).rejects.toThrow('APPLICATION_RECOVERY_PROPOSAL_CHANGED')

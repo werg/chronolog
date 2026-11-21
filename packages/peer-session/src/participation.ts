@@ -517,7 +517,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     const key = JSON.stringify(links.map(link => {
       let id = this.#connectionIds.get(link)
       if (id === undefined) { id = ++this.#nextConnectionId; this.#connectionIds.set(link, id) }
-      return [link.peerId, id, this.#transports.get(link) ?? null]
+      return [link.peerId, id, this.#transports.get(link) ?? null] as const
     }).sort((left, right) => String(left[0]).localeCompare(String(right[0]))))
     if (key !== this.#connectionKey) { this.#connectionKey = key; this.#connectionRevision++ }
     const next: ApplicationParticipationStatus = {
