@@ -421,9 +421,20 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     this.signal.throwIfAborted(); this.#discoveryFence.signal.throwIfAborted()
     const peer = this.#hints([input.peer])[0]
     if (peer === undefined) return
-    let current = this.#links().find(link => link.peerId === peer.identity)
-    if (input.upgrade ? current === undefined || this.#transports.get(current)?.kind !== 'relay' || this.#options.transport.upgrade === undefined : current !== undefined) return
+    const current = this.#links().find(link => link.peerId === peer.identity)
     const incoming = input.invitation !== undefined
+    // An ordinary invitation may be the same device restarting while its old
+    // physical route still looks alive. Only the network handshake can prove
+    // replacement authority; keep that route until reciprocal readiness.
+    const canConnect = (): boolean => {
+      const latest = this.#links().find(link => link.peerId === peer.identity)
+      // A newer authenticated winner owns this identity after any await.
+      if (latest !== undefined && latest !== current) return false
+      return input.upgrade
+        ? latest !== undefined && this.#transports.get(latest)?.kind === 'relay' && this.#options.transport.upgrade !== undefined
+        : incoming || latest === undefined
+    }
+    if (!canConnect()) return
     let superseded = false
     // Supersession awaits release of the old attempt. Re-read ownership after
     // every await: multiple invitations must never overwrite one another's slot.
@@ -442,11 +453,11 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       previous.controller.abort(new Error('APPLICATION_CONNECTION_SUPERSEDED'))
       await awaitOwnedTask(this.signal, () => previous.finished)
       this.signal.throwIfAborted(); this.#discoveryFence.signal.throwIfAborted()
-      if (input.upgrade ? !this.#links().some(link => link.peerId === peer.identity && this.#transports.get(link)?.kind === 'relay') : this.#links().some(link => link.peerId === peer.identity)) return
+      if (!canConnect()) return
     }
-    current = this.#links().find(link => link.peerId === peer.identity)
-    if (input.upgrade ? current === undefined || this.#transports.get(current)?.kind !== 'relay' : current !== undefined) return
-    if (this.#physicalOpenings.size >= this.#maxPeers || !input.upgrade && this.#links().length + this.#physicalOpenings.size >= this.#maxPeers) return
+    if (!canConnect()) return
+    const logicalPeers = new Set([...this.#links().map(link => link.peerId), ...this.#joining.keys()])
+    if (this.#physicalOpenings.size >= this.#maxPeers || !logicalPeers.has(peer.identity) && logicalPeers.size >= this.#maxPeers) return
     // maxPeers bounds logical peers and concurrent physical candidates separately.
     // A candidate replacing an existing link cannot consume a second logical slot.
     if (input.upgrade) this.#lastUpgrade.set(peer.identity, Date.now())
@@ -475,7 +486,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     try {
       connection = await awaitOwnedTask(signal, () => opening)
       signal.throwIfAborted()
-      if (input.upgrade && this.#links().some(link => link.peerId === peer.identity && this.#transports.get(link)?.kind === 'direct')) {
+      if (!canConnect()) {
         await connection.close(); return
       }
       const description = this.#options.transport.describe?.(connection) ?? { kind: 'unknown' as const }

@@ -11,6 +11,7 @@ import { openApplicationDevice } from './device.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
 import { createFramedPeerConnectionPair, type FramedPeerConnection } from './network.js'
 import { connectApplications, type ApplicationSession } from './session.js'
+import { observePeerWire } from './network.test-helpers.js'
 import type { ApplicationControlHost } from './recovery.js'
 import type {
   ApplicationDiscoveryPort, ApplicationParticipationOptions, ApplicationPeerHint, ApplicationPeerInvitation, ApplicationTransportPort,
@@ -211,6 +212,67 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
 }
 
 describe('owned application participation', () => {
+  it.each(['direct', 'relay'] as const)('accepts an ordinary incoming restart over a still-live %s link without upgrade cooldown', async kind => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    f.hub.kind = kind
+    const ports = f.hub.ports(a.deviceId), accepted: Awaited<ReturnType<typeof a.connectPeer>>[] = []
+    const connect = a.connectPeer.bind(a)
+    vi.spyOn(a, 'connectPeer').mockImplementation(async input => { const link = await connect(input); accepted.push(link); return link })
+    const ap = f.participate(a, { ...ports, connections: { maxPeers: 1, timeoutMs: 2000 } })
+    const join = async () => {
+      const connection = await f.hub.ports(b.deviceId).transport.open({ peer: { identity: a.deviceId, route: null } }, { signal: b.signal })
+      const link = await b.connectPeer({ connection, peerIdentity: a.deviceId, handshakeTimeoutMs: 2000 })
+      await link.synchronize(); return link
+    }
+    await until(() => f.hub.directory.has(a.deviceId))
+    const old = await join()
+    await until(() => accepted.length === 1)
+    await post(b, 'before-incoming-restart')
+    const revision = ap.status.connectionRevision, generation = b.status.generation
+    if (kind === 'relay') {
+      f.hub.directAvailable = false
+      await ap.reconsiderConnections()
+      expect(f.hub.upgradeAttempts).toBe(1)
+    }
+    // No explicit close: both endpoints still report the old connection alive.
+    expect(old.signal.aborted).toBe(false); expect(accepted[0]!.signal.aborted).toBe(false)
+    const fresh = await join()
+    await until(() => ap.status.connectionRevision > revision)
+    expect(accepted).toHaveLength(2)
+    expect(ap.status.connectedPeers).toEqual([b.deviceId])
+    expect((await ap.diagnostics())[0]?.kind).toBe(kind)
+    expect(fresh.signal.aborted).toBe(false)
+    await post(b, 'after-incoming-restart')
+    expect(b.status.generation).toBe(generation); expect(f.counts.selections).toBe(0)
+    expect(f.hub.upgradeAttempts).toBe(kind === 'relay' ? 1 : 0)
+  })
+
+  it('preserves the working peer while an incoming restart proof is pending and then invalid', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const ap = f.participate(a), remote = f.hub.ports(b.deviceId)
+    const join = async () => b.connectPeer({
+      connection: await remote.transport.open({ peer: { identity: a.deviceId, route: null } }, { signal: b.signal }),
+      peerIdentity: a.deviceId, handshakeTimeoutMs: 2000,
+    })
+    await until(() => f.hub.directory.has(a.deviceId))
+    const old = await join(); await old.synchronize()
+    const revision = ap.status.connectionRevision, entered = gate(), release = gate()
+    closing.push(() => release.resolve())
+    observePeerWire(b.deviceId, async packet => {
+      if (packet.kind === 'proof') { entered.resolve(); await release.promise; return { ...packet, signature: '00'.repeat(64) } }
+    })
+    const candidate = join(), rejected = expect(candidate).rejects.toThrow()
+    await entered.promise
+    expect(ap.status.connectedPeers).toEqual([b.deviceId]); expect(old.signal.aborted).toBe(false)
+    await post(b, 'working-during-invalid-candidate')
+    release.resolve(); await rejected
+    await until(() => ap.status.error !== null)
+    expect(ap.status.connectionRevision).toBe(revision)
+    expect(old.signal.aborted).toBe(false)
+    await post(b, 'working-after-invalid-candidate')
+    expect(f.counts.selections).toBe(0)
+  })
+
   it('preserves commands, history and live traffic on an upgraded direct peer after terminal discovery failure', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), terminal = gate()
     f.hub.kind = 'relay'
