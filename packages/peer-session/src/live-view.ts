@@ -172,8 +172,8 @@ export function createLiveView<Name extends string, Input = null, Value = unknow
     closed = true
     owned.removeEventListener('abort', close)
     lifetime.abort(new Error('Live view is closed.'))
-    stopStatus()
-    stopRecovery()
+    try { stopStatus() } catch { /* Continue releasing the remaining owned subscriptions. */ }
+    try { stopRecovery() } catch { /* A faulty unsubscriber cannot strand waiters. */ }
     listeners.clear()
     settle(owned.reason, undefined, true)
     settleInitial(true, owned.reason)
@@ -199,12 +199,13 @@ export function createLiveView<Name extends string, Input = null, Value = unknow
         stopStatus()
       } else {
         stopRecovery = session.onRecovery(notice => { notify(onRecovery, notice); invalidate() })
+        if (closed) { stopRecovery(); return result() }
         iterator = session.changes({ signal: owned })[Symbol.asyncIterator]()
         void (async () => {
           try {
             while (!closed) {
               const change = await iterator.next()
-              if (change.done === true) break
+              if (change.done === true) { close(); break }
               invalidate()
             }
           } catch (failure) {
@@ -213,6 +214,7 @@ export function createLiveView<Name extends string, Input = null, Value = unknow
               hasError = true
               if (!isRecovering(failure)) settleInitial(true, failure)
               notify(onError, failure)
+              lifetime.abort(failure)
             }
           }
         })()
@@ -224,7 +226,7 @@ export function createLiveView<Name extends string, Input = null, Value = unknow
     }
   }
 
-  return Object.freeze({
+  function result(): LiveView<Value> { return Object.freeze({
     refresh,
     ready,
     subscribe,
@@ -232,5 +234,6 @@ export function createLiveView<Name extends string, Input = null, Value = unknow
     get snapshot() { return snapshot },
     get status() { return status },
     get error() { return currentError },
-  })
+  }) }
+  return result()
 }
