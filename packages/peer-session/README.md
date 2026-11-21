@@ -886,9 +886,16 @@ source files and import edges so downstream builds can verify actual requested
 code against the lazy boundary.
 `--allow-dirty` produces an explicitly marked development artifact. Native and
 browser entries share session classes and ownership state through those chunks.
-Use `--native-rtc` to include the optional native RTC entry. That archive declares
-the exact `werift@0.27.0` peer dependency; the default archive has no runtime
-package dependencies and remains SQL-free.
+The standard archive includes `/webrtc-native` and declares exact
+`werift@0.27.0` as a normal runtime dependency. Installing the session archive
+installs that dependency automatically; there is no extra RTC flag or manual
+peer-dependency step. The default remains SQL-free. The browser and Worker
+import closures do not load Werift or Node built-ins. Provenance records
+`nativeRtc: true`; it describes emitted code, not an optional packaging mode.
+The native factory defaults STUN gathering to 1,000 ms per peer, leaving room
+for both descriptions and framing within a five-second direct attempt. Explicit
+`NativeRtcOptions.iceStunGatherTimeout` overrides remain available; Werift
+expresses this option in seconds (the default is `1`), not milliseconds.
 
 `--sql-native` includes `/sql`, the thin native engine adapter and the exact
 compiled addon. `--sql-browser` includes `/sql` and the verified browser

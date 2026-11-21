@@ -23,7 +23,7 @@ for (const [input, [environment, source]] of Object.entries(companions)) {
 
 test('the workflow packages its own kernel checkout, distinct from the host test build', () => {
   assert.match(workflow, /- uses: actions\/checkout@v6\n {6}- uses: pnpm\/action-setup/u);
-  assert.ok(workflow.includes('node tools/package-peer-session.mjs --native-rtc'));
+  assert.ok(workflow.includes('node tools/package-peer-session.mjs'));
   assert.ok(workflow.includes('node tools/package-peer-session.mjs --sql-native'));
   assert.ok(workflow.includes('Build independent host test artifacts (not for deployment)'));
   assert.ok(workflow.includes('node --test tools/test-companion-workflow-pins.mjs'));
