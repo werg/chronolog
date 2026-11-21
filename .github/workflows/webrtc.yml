@@ -27,8 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      HOST_REF: ${{ inputs.host_ref || 'df022330a4afb0b7659fecefdd45a9cfa58f9a2d' }}
-      CONTRIB_REF: ${{ inputs.contrib_ref || '589eca2a14481363d56a5e266ee4e0f5f16899d1' }}
+      HOST_REF: ${{ inputs.host_ref || '069ede9d48e2cd5294707daec4758d1dfde86438' }}
+      CONTRIB_REF: ${{ inputs.contrib_ref || '254fcd52b005c620cac15678148799fd724b703e' }}
     steps:
       - name: Require immutable companion commits
         shell: bash
@@ -43,6 +43,8 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - name: Check companion source selection
+        run: node --test tools/test-companion-workflow-pins.mjs
       - run: pnpm install --frozen-lockfile
       - name: Check out exact independent consumers
         uses: actions/checkout@v6
@@ -68,7 +70,10 @@ jobs:
         run: |
           node tools/package-peer-session.mjs --native-rtc --output artifacts/session-rtc
           node tools/package-peer-session.mjs --sql-native --output artifacts/session-sql
-      - name: Build public host artifacts
+      # This is an independent interoperability build, never a deployment graph.
+      # Package the actual checked-out kernel, including workflow-only revisions;
+      # the host may intentionally embed an earlier qualified kernel revision.
+      - name: Build independent host test artifacts (not for deployment)
         id: host_artifacts
         working-directory: artifacts/host-source
         run: |

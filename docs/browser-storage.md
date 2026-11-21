@@ -114,3 +114,12 @@ events-only round trip, old-build interrupted-write behavior, long-term storage
 quota/performance, and SQL coexistence each require additional real-device/fault
 qualification before a wider support claim. Preserve per-repository commit
 SHAs, artifact digests and actual browser versions in the qualification record.
+
+The independent application workflow builds the selected host source for local
+interoperability tests; those artifacts are not a promoted deployment graph.
+It packages the kernel revision actually checked out by the workflow. A later
+workflow-only commit therefore has its own test provenance and does not replace
+an earlier qualified kernel pin in a published host graph. Dispatch with explicit
+`host_ref` and `contrib_ref` values to qualify a particular companion pair.
+The normal PR/main quality gate and the application qualification job both
+check the selected immutable companion pins.
