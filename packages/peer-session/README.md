@@ -755,7 +755,11 @@ const result = await operation.applied()
 The returned `WorkerApplicationSession` provides the same declared commands,
 queries, operation inspection, retry, explicit reapplication, changes, live
 signals and content handles. `status` and nullable `revision` are synchronous snapshots;
-`describe()` returns the application contract. `onStatus()` and `onRecovery()`
+`describe()` returns the application contract. `boundedRequest` is the oldest finite
+facade call's `{ startedAt, deadline }` in the page's `performance.now()` clock,
+or `null`. It excludes passive stream/applied/shared waits and exposes no RPC
+method, input, identity or operation ID. It describes the caller's existing
+deadline, not owner admission, execution, progress, or a renewable lease. `onStatus()` and `onRecovery()`
 observe updates, while `inspectRecovery()` loads retained recovery notices.
 If the Worker configured participation, `session.participation` exposes its
 `status`, `onStatus()`, `approveRecovery()` and `close()` without moving policy or

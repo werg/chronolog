@@ -672,3 +672,68 @@ describe('many endpoints attached to one owner', () => {
     const third = await connect(); expect((await third.query('messages', null)).value.events).toHaveLength(0)
   })
 })
+
+
+it('exposes only finite facade deadlines and clears them on timeout, response and close', async () => {
+  const f = await fixture(), { client } = await facade(f.a, undefined, { timeoutMs: 30000 })
+  await vi.waitFor(() => expect(client.boundedRequest).toBeNull())
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const query = vi.spyOn(f.a, 'query').mockImplementation(async () => { await gate; return { revision: f.a.revision!, value: [] } })
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+  try {
+    const first = client.query('messages', null), firstRejected = first.catch(error => error as unknown)
+    expect(client.boundedRequest).toEqual({ startedAt: 0, deadline: 30000 })
+    const copy = client.boundedRequest!
+    Reflect.set(copy, 'deadline', Infinity)
+    expect(client.boundedRequest!.deadline).toBe(30000)
+    await vi.advanceTimersByTimeAsync(1000)
+    const second = client.query('messages', null), secondRejected = second.catch(error => error as unknown)
+    expect(client.boundedRequest!.startedAt).toBe(0)
+    await vi.advanceTimersByTimeAsync(16000)
+    expect(client.signal.aborted).toBe(false)
+    expect(client.boundedRequest!.deadline).toBe(30000)
+    await vi.advanceTimersByTimeAsync(13000)
+    expect(await firstRejected).toMatchObject({ message: 'APPLICATION_WORKER_TIMEOUT' })
+    expect(client.boundedRequest).toEqual({ startedAt: 1000, deadline: 31000 })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(await secondRejected).toMatchObject({ message: 'APPLICATION_WORKER_TIMEOUT' })
+    expect(client.boundedRequest).toBeNull()
+  } finally { release(); query.mockRestore(); vi.useRealTimers() }
+  await client.query('messages', null)
+  expect(client.boundedRequest).toBeNull()
+  await client.close()
+  expect(client.boundedRequest).toBeNull()
+})
+
+it('excludes passive applied and change waits from bounded facade activity', async () => {
+  const f = await fixture(), { client } = await facade(f.a, undefined, { timeoutMs: 30000 })
+  await vi.waitFor(() => expect(client.boundedRequest).toBeNull())
+  await f.a.pauseOrdering('bounded-request-test')
+  const operation = await client.command('say', 'saved', { operationId: 'passive-deadline' })
+  const controller = new AbortController()
+  const waiting = operation.applied({ signal: controller.signal }).catch(() => undefined)
+  const stream = client.changes({ signal: controller.signal })[Symbol.asyncIterator]()
+  await stream.next()
+  const next = stream.next()
+  await vi.waitFor(() => expect(client.boundedRequest).toBeNull())
+  controller.abort(Error('TEST_CANCELLED'))
+  await waiting; await next; await stream.return?.()
+  expect(client.boundedRequest).toBeNull()
+})
+
+it('withdraws finite request metadata immediately on caller cancellation', async () => {
+  const f = await fixture(), { client } = await facade(f.a, undefined, { timeoutMs: 30000 })
+  await vi.waitFor(() => expect(client.boundedRequest).toBeNull())
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const send = vi.spyOn(f.a.signals, 'send').mockImplementation(async () => { await gate; throw Error('CANCELLED_TEST_WORK') })
+  const controller = new AbortController()
+  try {
+    const result = client.signals.send('held', { value: true }, { signal: controller.signal }).catch(error => error as unknown)
+    expect(client.boundedRequest?.deadline).toBeGreaterThan(performance.now())
+    controller.abort(Error('CALLER_CANCELLED'))
+    expect(client.boundedRequest).toBeNull()
+    expect(await result).toMatchObject({ message: 'CALLER_CANCELLED' })
+  } finally { release(); send.mockRestore() }
+})

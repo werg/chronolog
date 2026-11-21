@@ -17,7 +17,7 @@ import { PROTOCOL, MAX_REQUESTS, MAX_RELEASES, MAX_STREAMS, releasesResource, bo
 type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
 type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
 type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
-interface Pending { readonly release: boolean; resolve(value: unknown): void; reject(reason: unknown): void }
+interface Pending { readonly bounded?: { readonly startedAt: number; readonly deadline: number }; readonly release: boolean; resolve(value: unknown): void; reject(reason: unknown): void }
 
 /** Captured SQL/events stay in the Worker until explicitly released. */
 export interface WorkerApplicationReadView {
@@ -134,6 +134,17 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
     if (this.participation !== undefined) void this.#observe('participation', () => {}).catch(error => this.#fail(error))
     }
   }
+  /** Oldest finite facade call, in this realm's performance.now() clock.
+   * Passive stream/operation waits never count. This is a caller deadline,
+   * not evidence that the owner received or began executing the request.
+   */
+  get boundedRequest(): { readonly startedAt: number; readonly deadline: number } | null {
+    let oldest: Pending['bounded']
+    for (const request of this.#pending.values()) {
+      if (request.bounded !== undefined && (oldest === undefined || request.bounded.startedAt < oldest.startedAt)) oldest = request.bounded
+    }
+    return oldest === undefined ? null : { ...oldest }
+  }
   get signal(): AbortSignal { return this.#lifetime.signal }
   get status(): SessionStatus { return { ...this.#snapshot.status } }
   get revision(): PeerRevision | null { return structuredClone(this.#snapshot.revision) }
@@ -225,7 +236,8 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       const abort = (): void => {
         clean(); this.#pending.delete(id); this.#cancel(id); reject(signal?.reason ?? new Error('APPLICATION_WORKER_TIMEOUT'))
       }
-      this.#pending.set(id, { release, resolve: value => { clean(); resolve(value as T) }, reject: error => { clean(); reject(error) } })
+      const startedAt = performance.now()
+      this.#pending.set(id, { ...(passive ? {} : { bounded: { startedAt, deadline: startedAt + this.#timeoutMs } }), release, resolve: value => { clean(); resolve(value as T) }, reject: error => { clean(); reject(error) } })
       signal?.addEventListener('abort', abort, { once: true })
       if (!passive) timer = setTimeout(abort, this.#timeoutMs)
       try { this.#port.postMessage(request) } catch (error) { this.#pending.delete(id); clean(); reject(error) }
