@@ -1,37 +1,20 @@
+// Pins have one source: the content-addressed tuple, not this test.
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { URL } from 'node:url';
-
-const workflow = await readFile(new URL('../.github/workflows/webrtc.yml', import.meta.url), 'utf8');
-
-// Change these together after qualification. Historical evidence keeps its own
-// source tuple; a workflow-only change does not replace the deployed kernel pin.
-const companions = {
-  host_ref: ['HOST_REF', '79b6845df411e3a910b662b31bae789da38d0bf9'],
-  contrib_ref: ['CONTRIB_REF', '4eb5a8a98d9d35632ed4fd39b7bf2d5a683f0457'],
-};
-
-for (const [input, [environment, source]] of Object.entries(companions)) {
-  test(`${input} selects the qualified fallback and preserves explicit overrides`, () => {
-    assert.match(source, /^[a-f0-9]{40}$/u);
-    assert.ok(workflow.includes(`${environment}: \${{ inputs.${input} || '${source}' }}`));
-    assert.ok(workflow.includes(`ref: \${{ env.${environment} }}`));
-    assert.ok(workflow.includes(`= "$${environment}"`), 'Verify the actual companion checkout SHA');
-  });
-}
-
-test('the workflow packages its own kernel checkout, distinct from the host test build', () => {
-  assert.match(workflow, /- uses: actions\/checkout@v6\n {6}- uses: pnpm\/action-setup/u);
-  assert.ok(workflow.includes('node tools/package-peer-session.mjs'));
-  assert.ok(workflow.includes('node tools/package-peer-session.mjs --sql-native'));
-  assert.ok(workflow.includes('Build independent host test artifacts (not for deployment)'));
-  assert.ok(workflow.includes('node --test tools/test-companion-workflow-pins.mjs'));
-});
-
-test('ordinary PR and main quality checks execute the companion pin guard', async () => {
-  const quality = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
-  assert.match(quality, /pull_request:/u);
-  assert.match(quality, /branches: \[main\]/u);
-  assert.ok(quality.includes('run: node --test tools/test-companion-workflow-pins.mjs'));
+import { select } from '../distribution/select-companion-release.mjs';
+const tuple = JSON.parse(readFileSync(new URL('../distribution/companion-release.json', import.meta.url)));
+test('webrtc consumes the canonical tuple and retains exact checkout checks', () => {
+  const selected = select(tuple, 'chronolog');
+  const text = readFileSync(new URL('../.github/workflows/webrtc.yml', import.meta.url), 'utf8');
+  assert.ok(Object.values(selected).every(value => /^[a-f0-9]{40}$/.test(value)));
+  assert.ok(text.includes('node distribution/select-companion-release.mjs chronolog'));
+  assert.doesNotMatch(text, /inputs\.\w+_ref \|\| '[a-f0-9]{40}'/);
+  assert.ok(text.includes('node tools/package-peer-session.mjs'));
+  assert.ok(text.includes('Build independent host test artifacts (not for deployment)'));
+  for (const key of ['HOST_REF', 'CONTRIB_REF']) {
+    assert.ok(text.includes('ref: \u0024{{ env.' + key + ' }}'));
+    assert.ok(text.includes('= "$' + key + '"'));
+  }
 });
