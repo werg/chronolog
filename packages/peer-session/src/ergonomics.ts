@@ -137,7 +137,7 @@ export async function submitBatch(
   }
   const lifetime = AbortSignal.any([...(session.signal === undefined ? [] : [session.signal]), ...(options.signal === undefined ? [] : [options.signal])])
   lifetime.throwIfAborted()
-  const items = structuredClone(entries)
+  const items = structuredClone(entries as readonly BatchCommandEntry[])
   const seen = new Set<string>()
   if (options.wait !== undefined && !['recorded', 'applied'].includes(options.wait)) throw new Error('BATCH_WAIT_INVALID')
   for (const entry of items) {

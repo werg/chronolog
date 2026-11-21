@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -136,6 +136,7 @@ describe('ergonomics, batch submission, checkpoints, and disposable storage', ()
         secret: rawKey,
         applicationId: '22'.repeat(32),
         deviceId: originalPublicKey,
+        persist: async checkpoint => { await writeFile(join(dir, 'checkpoint.bin'), checkpoint.bytes, { mode: 0o600 }) },
         outbox: [{ operationId: 'pending-op-1', command: 'addItem', createdAt: new Date().toISOString() }],
       })
       expect(exported.retiredSource).toBe(true)

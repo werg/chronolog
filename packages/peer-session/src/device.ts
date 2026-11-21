@@ -1,3 +1,4 @@
+import { useDeviceStore } from './checkpoint-lifecycle.js'
 import type { BytesStore } from '@chronolog/records'
 import { createPeerIdentity, type PeerIdentity } from '@chronolog/peer-generation/control'
 import { assertCanonicalCbor, encodeCanonicalCbor, exportEd25519PrivateKey, hexToBytes, importEd25519PrivateKey, importEd25519PublicKey } from '@chronolog/protocol'
@@ -31,6 +32,8 @@ export async function openApplicationDevice(options: {
   readonly openStorage?: () => ApplicationStorage | Promise<ApplicationStorage>
   readonly close?: () => void | Promise<void>
 }): Promise<ApplicationDevice> {
+  const releaseOpening = useDeviceStore(options.store)
+  try {
   await assertDeviceNotRetired(options.store)
   let raw = await options.store.get(DEVICE_KEY), binding = await options.store.get(DEVICE_BINDING)
   // Atomic initialization can commit between these separate metadata reads.
@@ -110,10 +113,12 @@ export async function openApplicationDevice(options: {
       return closing
     },
   })
+  } finally { releaseOpening() }
 }
 export function claimApplicationDevice(device: ApplicationDevice): () => void {
   if (claimed.has(device)) throw new Error('APPLICATION_DEVICE_IN_USE')
+  const release = useDeviceStore(device.store)
   claimed.add(device)
-  return () => { claimed.delete(device) }
+  return () => { claimed.delete(device); release() }
 }
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean { return a.length === b.length && a.every((byte, index) => byte === b[index]) }

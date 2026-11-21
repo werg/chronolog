@@ -1,3 +1,4 @@
+import { reserveCheckpointStore, retireDeviceStore } from './checkpoint-lifecycle.js'
 import type { BytesStore, BytesStoreEntry } from '@chronolog/records'
 import { bytesToHex, hexToBytes } from '@chronolog/protocol'
 
@@ -34,6 +35,8 @@ export interface ExportCheckpointOptions {
   readonly outbox?: readonly CheckpointOutboxRecord[]
   /** Mark the exported source store retired (default: true) to prevent split-brain active copies. */
   readonly retireSource?: boolean
+  /** Durably retain the encrypted checkpoint before retiring its source. Required for moves. */
+  readonly persist?: (checkpoint: Readonly<{ bytes: Uint8Array; metadata: CheckpointMetadata }>) => void | Promise<void>
 }
 
 export interface ExportedCheckpoint {
@@ -54,7 +57,9 @@ const SALT_BYTES = 16
 const IV_BYTES = 12
 const PBKDF2_ITERATIONS = 100_000
 const encoder = new TextEncoder()
-const decoder = new TextDecoder()
+const decoder = new TextDecoder('utf-8', { fatal: true })
+const MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024
+const MAX_ENTRIES = 4096
 
 function fail(code: string, message: string): Error {
   return Object.assign(new Error(message), { code })
@@ -93,6 +98,7 @@ function encodeBase64(bytes: Uint8Array): string {
 
 function decodeBase64(value: string): Uint8Array {
   const binary = atob(value)
+  if (btoa(binary) !== value) throw fail('CHECKPOINT_CORRUPT', 'Invalid base64 checkpoint data.')
   const out = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
   return out
@@ -105,10 +111,27 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 }
 
 async function manifestDigest(entries: readonly BytesStoreEntry[], sqlBytes: Uint8Array | null, outbox: readonly CheckpointOutboxRecord[]): Promise<string> {
-  const entryDigests = await Promise.all(entries.map(async e => [e.key, await sha256Hex(e.value), e.value.byteLength] as const))
+  const entryDigests = []
+  for (const entry of entries) entryDigests.push([entry.key, await sha256Hex(entry.value), entry.value.byteLength])
   const sqlDigest = sqlBytes === null ? null : [await sha256Hex(sqlBytes), sqlBytes.byteLength] as const
   const canonical = JSON.stringify({ entries: entryDigests, sql: sqlDigest, outbox })
   return sha256Hex(encoder.encode(canonical))
+}
+
+function validateMetadata(metadata: CheckpointMetadata, outbox: readonly CheckpointOutboxRecord[]): void {
+  if (typeof metadata.createdAt !== 'string' || !Number.isFinite(Date.parse(metadata.createdAt)) ||
+      [metadata.applicationId, metadata.deviceId].some(id => id !== null && (typeof id !== 'string' || !/^[a-f0-9]{64}$/u.test(id))) ||
+      typeof metadata.manifestSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(metadata.manifestSha256) || outbox.length > 1024) throw fail('CHECKPOINT_CORRUPT', 'Invalid checkpoint metadata.')
+  const seen = new Set<string>()
+  for (const entry of outbox) {
+    if (!entry || typeof entry.operationId !== 'string' || !entry.operationId || entry.operationId.length > 512 ||
+        [...entry.operationId].some(c => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127) || seen.has(entry.operationId) ||
+        typeof entry.createdAt !== 'string' || !Number.isFinite(Date.parse(entry.createdAt)) ||
+        entry.command !== undefined && (typeof entry.command !== 'string' || !entry.command || entry.command.length > 128) ||
+        entry.payloadHash !== undefined && (typeof entry.payloadHash !== 'string' || !/^[a-f0-9]{64}$/u.test(entry.payloadHash)) ||
+        entry.status !== undefined && (typeof entry.status !== 'string' || entry.status.length > 128)) throw fail('CHECKPOINT_CORRUPT', 'Invalid retained outbox record.')
+    seen.add(entry.operationId)
+  }
 }
 
 /** Check whether a store has been retired by an earlier checkpoint export. */
@@ -136,19 +159,27 @@ export async function assertDeviceNotRetired(store: BytesStore): Promise<void> {
 }
 
 /**
- * Atomically export an encrypted, integrity-checked device checkpoint from any BytesStore
+ * Export a quiesced store under the local device/checkpoint fence
  * (Node SQLite, Browser IndexedDB/OPFS, or Serverless KV) and optionally retire the source store.
  */
 export async function exportDeviceCheckpoint(store: BytesStore, options: ExportCheckpointOptions): Promise<ExportedCheckpoint> {
+  if (options.retireSource !== false && typeof options.persist !== 'function') throw fail('CHECKPOINT_PERSISTENCE_REQUIRED', 'Durably persist the encrypted handoff before source retirement.')
+  options = { ...options, secret: options.secret instanceof Uint8Array ? options.secret.slice() : options.secret }
+  const release = reserveCheckpointStore(store)
+  try {
   if (typeof store.entries !== 'function') {
     throw fail('CHECKPOINT_ENUMERATION_UNSUPPORTED', 'The supplied BytesStore does not support deterministic checkpoint enumeration.')
   }
   await assertDeviceNotRetired(store)
   const rawEntries = (await store.entries())
     .filter(entry => entry.key !== DEVICE_RETIRED_KEY)
+    .map(entry => ({ key: entry.key, value: entry.value.slice() }))
     .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
-  const sqlBytes = options.sqlDatabaseBytes ?? null
-  const outbox = [...(options.outbox ?? [])]
+  const sqlBytes = options.sqlDatabaseBytes?.slice() ?? null
+  const outbox = structuredClone(options.outbox ?? [])
+  if (rawEntries.length > MAX_ENTRIES || rawEntries.reduce((size, entry) => size + entry.value.byteLength, sqlBytes?.byteLength ?? 0) > MAX_CHECKPOINT_BYTES / 2) {
+    throw fail('CHECKPOINT_LIMIT_EXCEEDED', 'Checkpoint data exceeds the bounded handoff limit.')
+  }
   const createdAt = new Date().toISOString()
   const manifestSha256 = await manifestDigest(rawEntries, sqlBytes, outbox)
   const metadata: CheckpointMetadata = Object.freeze({
@@ -161,6 +192,7 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
     outboxCount: outbox.length,
     manifestSha256,
   })
+  validateMetadata(metadata, outbox)
   const plaintext = encoder.encode(JSON.stringify({
     metadata,
     entries: rawEntries.map(entry => ({ key: entry.key, value: encodeBase64(entry.value) })),
@@ -168,6 +200,7 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
     outbox,
   }))
 
+  if (plaintext.byteLength > MAX_CHECKPOINT_BYTES - 64) throw fail('CHECKPOINT_LIMIT_EXCEEDED', 'Encoded checkpoint exceeds the bounded handoff limit.')
   const isRawKey = options.secret instanceof Uint8Array
   const salt = isRawKey ? new Uint8Array(SALT_BYTES) : crypto.getRandomValues(new Uint8Array(SALT_BYTES))
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES))
@@ -184,37 +217,38 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
   out.set(iv, offset); offset += IV_BYTES
   out.set(ciphertext, offset)
 
+  await options.persist?.(Object.freeze({ bytes: out.slice(), metadata }))
   const retireSource = options.retireSource !== false
   if (retireSource) {
     await store.put(DEVICE_RETIRED_KEY, encoder.encode(JSON.stringify({ retiredAt: createdAt, manifestSha256 })))
+    retireDeviceStore(store)
   }
   return Object.freeze({ bytes: out, metadata, retiredSource: retireSource })
+  } finally { release() }
 }
 
 /**
  * Decrypt, authenticate, and restore an atomic device checkpoint into a clean target BytesStore.
- * Refuses to overwrite a non-empty target store unless `allowNonEmpty: true` is explicitly passed.
+ * Requires atomic empty-store initialization. Existing identity is never overwritten.
  */
 export async function restoreDeviceCheckpoint(
   targetStore: BytesStore,
   encryptedBytes: Uint8Array,
-  options: { readonly secret: Uint8Array | string; readonly allowNonEmpty?: boolean },
+  options: { readonly secret: Uint8Array | string },
 ): Promise<RestoredCheckpoint> {
+  if (typeof targetStore.entries !== 'function' || typeof targetStore.putAllIfEmpty !== 'function') throw fail('CHECKPOINT_RESTORE_UNSUPPORTED', 'Restore requires atomic empty-store initialization and enumeration.')
+  const release = reserveCheckpointStore(targetStore)
+  try {
   const headerLength = MAGIC.length + 1 + SALT_BYTES + IV_BYTES
-  if (!(encryptedBytes instanceof Uint8Array) || encryptedBytes.byteLength <= headerLength + 16) {
+  if (!(encryptedBytes instanceof Uint8Array) || encryptedBytes.byteLength <= headerLength + 16 || encryptedBytes.byteLength > MAX_CHECKPOINT_BYTES) {
     throw fail('CHECKPOINT_CORRUPT', 'Encrypted checkpoint is truncated or invalid.')
   }
   for (let i = 0; i < MAGIC.length; i++) {
     if (encryptedBytes[i] !== MAGIC[i]) throw fail('CHECKPOINT_FORMAT_UNSUPPORTED', 'Unrecognized checkpoint header.')
   }
-  if (options.allowNonEmpty !== true && typeof targetStore.entries === 'function') {
-    const existing = await targetStore.entries()
-    if (existing.length > 0) {
-      throw fail('CHECKPOINT_TARGET_NOT_EMPTY', 'Target device store is not empty; restore into a fresh store to avoid overwriting retained identity.')
-    }
-  }
   let offset = MAGIC.length
   const flags = encryptedBytes[offset++]!
+  if (flags !== 0 && flags !== 1) throw fail('CHECKPOINT_CORRUPT', 'Unrecognized checkpoint flags.')
   const expectRaw = (flags & 1) === 1
   if (expectRaw !== (options.secret instanceof Uint8Array)) {
     throw fail('CHECKPOINT_KEY_MISMATCH', expectRaw ? 'This checkpoint requires a 32-byte raw key.' : 'This checkpoint requires a passphrase.')
@@ -230,30 +264,36 @@ export async function restoreDeviceCheckpoint(
   } catch {
     throw fail('CHECKPOINT_DECRYPT_FAILED', 'Checkpoint authentication or decryption failed (wrong key or tampered bytes).')
   }
-  const decoded = JSON.parse(decoder.decode(new Uint8Array(plaintext))) as {
-    metadata: CheckpointMetadata
-    entries: { key: string; value: string }[]
-    sqlDatabaseBase64: string | null
-    outbox: CheckpointOutboxRecord[]
-  }
-  if (decoded.metadata?.format !== CHECKPOINT_FORMAT || !Array.isArray(decoded.entries) || !Array.isArray(decoded.outbox)) {
-    throw fail('CHECKPOINT_CORRUPT', 'Decrypted checkpoint payload is malformed.')
-  }
-  const entries: BytesStoreEntry[] = decoded.entries
-    .filter(item => item.key !== DEVICE_RETIRED_KEY)
-    .map(item => ({ key: item.key, value: decodeBase64(item.value) }))
-    .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
-  const sqlDatabaseBytes = typeof decoded.sqlDatabaseBase64 === 'string' ? decodeBase64(decoded.sqlDatabaseBase64) : null
+  let decoded: { metadata: CheckpointMetadata; entries: { key: string; value: string }[]; sqlDatabaseBase64: string | null; outbox: CheckpointOutboxRecord[] }
+  try {
+    decoded = JSON.parse(decoder.decode(new Uint8Array(plaintext))) as typeof decoded
+    if (decoded?.metadata?.format !== CHECKPOINT_FORMAT || !Array.isArray(decoded.entries) || decoded.entries.length > MAX_ENTRIES ||
+        !Array.isArray(decoded.outbox) || decoded.outbox.length > 1024 ||
+        decoded.metadata.entryCount !== decoded.entries.length || decoded.metadata.outboxCount !== decoded.outbox.length ||
+        decoded.metadata.hasSqlDatabase !== (decoded.sqlDatabaseBase64 !== null) ||
+        !(decoded.sqlDatabaseBase64 === null || typeof decoded.sqlDatabaseBase64 === 'string')) throw new Error()
+    validateMetadata(decoded.metadata, decoded.outbox)
+    const seen = new Set<string>()
+    for (const entry of decoded.entries) {
+      if (!entry || typeof entry.key !== 'string' || entry.key.length === 0 || entry.key.length > 2048 ||
+          [...entry.key].some(c => c.charCodeAt(0) < 32) || typeof entry.value !== 'string' || seen.has(entry.key) || entry.key === DEVICE_RETIRED_KEY) throw new Error()
+      seen.add(entry.key)
+    }
+  } catch { throw fail('CHECKPOINT_CORRUPT', 'Decrypted checkpoint payload is malformed.') }
+  let entries: BytesStoreEntry[], sqlDatabaseBytes: Uint8Array | null
+  try {
+    entries = decoded.entries.map(item => ({ key: item.key, value: decodeBase64(item.value) }))
+      .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+    sqlDatabaseBytes = decoded.sqlDatabaseBase64 === null ? null : decodeBase64(decoded.sqlDatabaseBase64)
+  } catch { throw fail('CHECKPOINT_CORRUPT', 'Invalid encoded checkpoint data.') }
   const actualDigest = await manifestDigest(entries, sqlDatabaseBytes, decoded.outbox)
   if (actualDigest !== decoded.metadata.manifestSha256) {
     throw fail('CHECKPOINT_INTEGRITY_MISMATCH', 'Checkpoint manifest SHA-256 verification failed.')
   }
-  for (const entry of entries) {
-    await targetStore.put(entry.key, entry.value)
-  }
+  if (!await targetStore.putAllIfEmpty(entries)) throw fail('CHECKPOINT_TARGET_NOT_EMPTY', 'Restore requires a fresh target; existing identity is never overwritten.')
   // Verify readback integrity on the restored store.
   if (typeof targetStore.entries === 'function') {
-    const readback = (await targetStore.entries()).filter(entry => entry.key !== DEVICE_RETIRED_KEY)
+    const readback = [...await targetStore.entries()].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
     const readbackDigest = await manifestDigest(readback, sqlDatabaseBytes, decoded.outbox)
     if (readbackDigest !== actualDigest) {
       throw fail('CHECKPOINT_RESTORE_VERIFICATION_FAILED', 'Restored store contents did not match the checkpoint manifest.')
@@ -265,6 +305,7 @@ export async function restoreDeviceCheckpoint(
     outbox: Object.freeze(decoded.outbox),
     restoredEntries: entries.length,
   })
+  } finally { release() }
 }
 
 export function generateCheckpointKey(): Uint8Array {
