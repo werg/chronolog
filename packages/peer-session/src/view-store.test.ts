@@ -68,3 +68,20 @@ it('references and local storage preserve printable 512-character operation iden
     expect(() => operationReference({ applicationId: 'app', historyId: 'history', deviceId: f.reference.author }, id)).toThrowError(expect.objectContaining({ code: 'INVALID_IDENTITY' }))
   }
 })
+
+
+it('applies a view scope prefix once and retains the full protocol-sized canonical operation identity', () => {
+  const f = fixture(), prefix = `view:${'v'.repeat(128)}:`
+  const session = { applicationId: 'app', historyId: 'history', deviceId: f.reference.author,
+    scopeOperationId: (localId: string) => prefix + localId }
+  for (const local of ['local'.repeat(41), 'x'.repeat(512 - prefix.length)]) {
+    const canonical = prefix + local
+    const reference = operationReference(session, local, { operationId: canonical, author: session.deviceId, attemptId: 'b'.repeat(64) })
+    expect(reference.operationId).toBe(canonical); expect(canonical.length).toBeGreaterThan(200)
+    f.store.retainOperation(reference)
+    expect(f.store.inspectOperation(reference)?.reference).toEqual(reference)
+  }
+  expect(f.store.pending()).toHaveLength(2)
+  expect(() => operationReference(session, 'x'.repeat(513 - prefix.length))).toThrowError(expect.objectContaining({ code: 'INVALID_IDENTITY' }))
+  expect(() => createViewStore({ storage: f.storage, applicationId: 'app', profileId: 'p'.repeat(201), viewId: 'v' })).toThrow('Invalid identity')
+})

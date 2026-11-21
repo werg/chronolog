@@ -185,7 +185,7 @@ describe('peer-session central pipe extensions', () => {
     const session = await openTestSession()
     try {
       const scoped = createScopedApplicationTools(session, { commands: ['addNote'] })
-      for (const id of ['invoice#42', 'a'.repeat(201), 'b'.repeat(512), 'job 42 🧪']) {
+      for (const id of ['invoice#42', 'a'.repeat(201), 'b'.repeat(512), 'job 42 🧪', `view:${'v'.repeat(128)}:${'local'.repeat(41)}`]) {
         const written = await scoped.execute({ kind: 'command', name: 'addNote', input: { text: id }, operationId: id }) as { operationReference: { operationId: string; attemptId: string } }
         expect(written.operationReference.operationId).toBe(id)
         await session.operations.wait(id)
