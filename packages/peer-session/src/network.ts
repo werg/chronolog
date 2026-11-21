@@ -246,30 +246,33 @@ class NetworkPeer implements ApplicationPeerLink {
         await this.#request('submit', attempt)
         this.#reader(); await this.synchronize()
       }, this)
-      if (this.#channel.connection.live !== undefined) {
-        const lane = this.#channel.connection.live
-        this.#route = this.#port.signals.attachRoute({ close: reason => this.#dispose(reason), trySend: async (frame, { signal }) => {
-          signal.throwIfAborted(); this.#reader()
-          const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
-          if (accepted) this.#sentLiveBytes += frame.length
-          this.#reader(); return accepted
-        } })
-        const route = this.#route
-        let closed = false
-        const dispose = (): void => {
-          if (closed) return
-          closed = true; route.close(); lane.signal.removeEventListener('abort', dispose)
-          void lane.close().catch(() => undefined)
-        }
-        this.#disposeLive = dispose
-        lane.signal.addEventListener('abort', dispose, { once: true })
-        if (lane.signal.aborted) dispose()
-        void this.#readLive(lane, route).catch(error => this.#fail(error)).finally(dispose)
-      }
       this.#unsubscribe = participant.subscribe(() => this.#changed())
       this.#changed()
     } catch (error) { this.#fail(error); throw error }
     finally { handshake.cancel() }
+  }
+  #prepareLive(): void {
+  if (this.#channel.connection.live !== undefined) {
+    const lane = this.#channel.connection.live
+    this.#route = this.#port.signals.attachRoute({ close: reason => this.#dispose(reason), trySend: async (frame, { signal }) => {
+      signal.throwIfAborted(); this.#reader()
+      if (this.#retiring || this.#owner.peers.get(this.peerId) !== this) return false
+      const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
+      if (accepted) this.#sentLiveBytes += frame.length
+      this.#reader(); return accepted
+    } })
+    const route = this.#route
+    let closed = false
+    const dispose = (): void => {
+      if (closed) return
+      closed = true; route.close(); lane.signal.removeEventListener('abort', dispose)
+      void lane.close().catch(() => undefined)
+    }
+    this.#disposeLive = dispose
+    lane.signal.addEventListener('abort', dispose, { once: true })
+    if (lane.signal.aborted) dispose()
+    void this.#readLive(lane, route).catch(error => this.#fail(error)).finally(dispose)
+  }
   }
   #attachData(): boolean {
     const data = this.#port.participant.data
@@ -344,8 +347,9 @@ class NetworkPeer implements ApplicationPeerLink {
         await this.#channel.accept(message.encapsulatedKey, this.#remote, this.#local)
         await interruptible(this.#proofSent, this.signal)
         this.#reader(); this.#authenticated = true
-        // Reciprocal confirmation prevents a one-sided proof failure from
-        // displacing a healthy route on the side that verified first.
+        this.#prepareLive()
+        // Reserve candidate routing before reciprocal confirmation. A failed
+        // proof or local route quota must preserve both working endpoints.
         // Keep reading while the write is backpressured by the remote reader.
         void this.#wire.send({ kind: 'ready' }).catch(error => this.#fail(error))
       } else {
@@ -405,7 +409,7 @@ class NetworkPeer implements ApplicationPeerLink {
       for await (const frame of lane.frames(AbortSignal.any([this.signal, lane.signal]))) {
         this.#reader(); requireNetwork(frame instanceof Uint8Array && frame.length <= MAX_SIGNAL_BYTES, 'APPLICATION_NETWORK_LIVE_LIMIT')
         this.#receivedLiveBytes += frame.length
-        if (!this.#retiring) await route.receive(frame)
+        if (!this.#retiring && this.#owner.peers.get(this.peerId) === this) await route.receive(frame)
         this.#reader()
       }
     } catch (error) { if (!this.signal.aborted && !lane.signal.aborted) throw error }
