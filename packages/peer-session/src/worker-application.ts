@@ -417,6 +417,7 @@ function validateParticipation(value: unknown): asserts value is ApplicationPart
   if (value === null) return
   if (value === undefined || typeof value !== 'object') throw new Error('APPLICATION_WORKER_METADATA_INVALID')
   const status = value as ApplicationParticipationStatus
+  if (!Number.isSafeInteger(status.connectionRevision) || status.connectionRevision < 0) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
   if (!['connecting', 'connected', 'following', 'coordinating', 'recovering', 'approval-required', 'unavailable', 'closed'].includes(status.phase) ||
       !Array.isArray(status.connectedPeers) || status.connectedPeers.length > 8 ||
       status.connectedPeers.some(peer => typeof peer !== 'string' || !/^[0-9a-f]{64}$/u.test(peer)) ||

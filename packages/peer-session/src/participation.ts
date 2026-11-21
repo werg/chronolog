@@ -56,12 +56,16 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   readonly #transports = new WeakMap<ApplicationPeerLink, ApplicationTransportDescription>()
   readonly #lastUpgrade = new Map<string, number>()
   #upgradeTask: Promise<void> | undefined
+  readonly #connectionIds = new WeakMap<ApplicationPeerLink, number>()
+  #nextConnectionId = 0
+  #connectionRevision = 0
+  #connectionKey = '[]' 
   readonly #watchedLinks = new Map<ApplicationPeerLink, () => void>()
   readonly #task: Promise<void>
   readonly #invitations: Promise<void>
   readonly #notifications: Promise<void>
   readonly #unsubscribe: () => void
-  #status: ApplicationParticipationStatus = { phase: 'connecting', connectedPeers: [], recovery: null, error: null }
+  #status: ApplicationParticipationStatus = { connectionRevision: 0, phase: 'connecting', connectedPeers: [], recovery: null, error: null }
   #observation: Observation | null = null
   #pendingObservation: Observation | null = null
   #persistence: Promise<void> | undefined
@@ -508,7 +512,15 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     const replica = this.#owner.participant.data?.replica
     const error = this.#discoveryError ?? this.#error ?? this.#advertisementError ?? (replica !== undefined && this.#links().some(link => link.peerId === replica.generation.payload.coordinator && link.data === 'unavailable')
       ? 'APPLICATION_DATA_UNAVAILABLE' : null)
+    const links = this.#links()
+    const key = JSON.stringify(links.map(link => {
+      let id = this.#connectionIds.get(link)
+      if (id === undefined) { id = ++this.#nextConnectionId; this.#connectionIds.set(link, id) }
+      return [link.peerId, id, this.#transports.get(link) ?? null]
+    }).sort((left, right) => String(left[0]).localeCompare(String(right[0]))))
+    if (key !== this.#connectionKey) { this.#connectionKey = key; this.#connectionRevision++ }
     const next: ApplicationParticipationStatus = {
+      connectionRevision: this.#connectionRevision,
       phase: this.signal.aborted ? 'closed' : this.#discoveryTerminal ? 'unavailable' : !this.#hasDiscoveryReady ? error === null ? 'connecting' : 'unavailable' : phase ?? (this.#proposal !== null && this.#approved !== this.#proposal.id ? 'approval-required'
         : replica === undefined ? error !== null ? 'unavailable' : this.#links().length > 0 ? 'connected' : 'connecting'
           : !replica.ready ? 'recovering' : replica.isCoordinator ? 'coordinating' : this.#healthy() ? 'following' : error !== null ? 'unavailable' : 'connecting'),

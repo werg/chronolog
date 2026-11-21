@@ -314,7 +314,7 @@ describe('owned browser application facade', () => {
   it('observes the owner participation policy and forwards exact broader-recovery approval', async () => {
     const f = await fixture(), lifetime = new AbortController()
     const listeners = new Set<(status: ApplicationParticipationStatus) => void>()
-    let status: ApplicationParticipationStatus = { phase: 'approval-required', connectedPeers: [], error: null,
+    let status: ApplicationParticipationStatus = { connectionRevision:0, phase: 'approval-required', connectedPeers: [], error: null,
       recovery: { id: 'one-proposal', coordinator: f.a.deviceId, point: f.a.revision!.point,
         reason: 'freshness-unknown', observedAt: null, ageMs: null } }
     const publish = (): void => { for (const listener of listeners) listener(status) }
@@ -325,13 +325,17 @@ describe('owned browser application facade', () => {
     const participation: ApplicationParticipation = {
       get status() { return status }, signal: lifetime.signal,
       onStatus(listener) { listeners.add(listener); listener(status); return () => { listeners.delete(listener) } },
-      approveRecovery, diagnostics: async () => [], reconsiderConnections: vi.fn(async () => {}),
+      approveRecovery, diagnostics: vi.fn(async () => []), reconsiderConnections: vi.fn(async () => {}),
       async close() { lifetime.abort(); status = { ...status, phase: 'closed' }; publish() },
     }
     const getter = vi.spyOn(f.a, 'participation', 'get').mockReturnValue(participation)
     cleanup.push(() => { getter.mockRestore() })
     const { client } = await facade(f.a)
     expect(client.participation?.status).toEqual(status)
+    expect(await client.participation!.diagnostics()).toEqual([])
+    await client.participation!.reconsiderConnections()
+    expect(participation.diagnostics).toHaveBeenCalledTimes(1)
+    expect(participation.reconsiderConnections).toHaveBeenCalledTimes(1)
     const observations: string[] = []
     client.participation!.onStatus(value => observations.push(value.phase))
     await expect(client.participation!.approveRecovery('stale-proposal')).rejects.toThrow('APPLICATION_RECOVERY_PROPOSAL_CHANGED')

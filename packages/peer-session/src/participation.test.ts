@@ -212,7 +212,7 @@ describe('owned application participation', () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     f.hub.kind = 'relay'
     const ap = f.participate(a), bp = f.participate(b)
-    await until(() => bp.status.phase === 'following')
+    await vi.waitFor(() => expect(bp.status).toMatchObject({phase:'following',error:null}),{timeout:5000,interval:5})
     await until(async () => (await bp.diagnostics())[0]?.kind === 'relay')
     const generation = b.status.generation
     await post(b, 'before-upgrade')
@@ -234,7 +234,7 @@ describe('owned application participation', () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     f.hub.kind = 'relay'; f.hub.directAvailable = false
     f.participate(a); const bp = f.participate(b)
-    await until(() => bp.status.phase === 'following')
+    await vi.waitFor(() => expect(bp.status).toMatchObject({phase:'following',error:null}),{timeout:5000,interval:5})
     await Promise.all(Array.from({length:20}, () => bp.reconsiderConnections()))
     expect(f.hub.upgradeAttempts).toBe(1)
     await post(b, 'still-relayed')
@@ -245,10 +245,40 @@ describe('owned application participation', () => {
     expect(f.counts.selections).toBe(0)
   })
 
+  it('waits for a later real event after cooldown rather than probing during 48 idle hours', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    f.hub.kind = 'relay'; f.hub.directAvailable = false
+    f.participate(a); const bp = f.participate(b)
+    await vi.waitFor(() => expect(bp.status).toMatchObject({phase:'following',error:null}),{timeout:5000,interval:5})
+    await bp.reconsiderConnections()
+    vi.useFakeTimers()
+    await vi.advanceTimersByTimeAsync(100)
+    const before = {host:{...f.counts},discovery:{...f.hub.counts},upgrades:f.hub.upgradeAttempts}
+    await vi.advanceTimersByTimeAsync(48 * 60 * 60 * 1000)
+    expect({host:{...f.counts},discovery:{...f.hub.counts},upgrades:f.hub.upgradeAttempts}).toEqual(before)
+    f.hub.directAvailable = true
+    await bp.reconsiderConnections()
+    await until(async () => (await bp.diagnostics())[0]?.kind === 'direct')
+    expect(f.hub.upgradeAttempts).toBeGreaterThan(before.upgrades)
+    expect(f.counts.selections).toBe(0)
+  })
+
+  it('coalesces simultaneous network events at both participants without duplicate logical peers', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    f.hub.kind = 'relay'
+    const ap = f.participate(a), bp = f.participate(b)
+    await vi.waitFor(() => expect(bp.status).toMatchObject({phase:'following',error:null}),{timeout:5000,interval:5})
+    await Promise.all([ap.reconsiderConnections(),bp.reconsiderConnections(),ap.reconsiderConnections(),bp.reconsiderConnections()])
+    await until(async () => (await ap.diagnostics())[0]?.kind === 'direct' && (await bp.diagnostics())[0]?.kind === 'direct')
+    expect(ap.status.connectedPeers).toEqual([b.deviceId]);expect(bp.status.connectedPeers).toEqual([a.deviceId])
+    await post(b,'simultaneous-upgrade')
+    expect(f.counts.selections).toBe(0)
+  })
+
   it('does not probe an already direct link and returns isolated diagnostics', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     f.participate(a); const bp = f.participate(b)
-    await until(() => bp.status.phase === 'following')
+    await vi.waitFor(() => expect(bp.status).toMatchObject({phase:'following',error:null}),{timeout:5000,interval:5})
     await bp.reconsiderConnections()
     expect(f.hub.upgradeAttempts).toBe(0)
     const first = await bp.diagnostics()

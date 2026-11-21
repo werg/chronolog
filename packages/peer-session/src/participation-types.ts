@@ -86,6 +86,8 @@ export interface ApplicationRecoveryProposal {
   readonly ageMs: number | null
 }
 export interface ApplicationParticipationStatus {
+  /** Local route revision; changes only when authenticated active links change. */
+  readonly connectionRevision: number
   readonly phase: 'connecting' | 'connected' | 'following' | 'coordinating' | 'recovering' | 'approval-required' | 'unavailable' | 'closed'
   readonly connectedPeers: readonly string[]
   readonly recovery: ApplicationRecoveryProposal | null
