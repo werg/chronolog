@@ -318,15 +318,18 @@ describe('authenticated application transport', () => {
     } finally { release.resolve() }
   })
 
-  it('closes the previous physical connection when the same authenticated peer reconnects', async () => {
+  it('retires the previous physical connection while the same authenticated peer reconnects', async () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
     const previous = await connect(a, b), replacement = await connect(a, b)
-    expect(previous.every(link => link.signal.aborted)).toBe(true)
+    expect(previous.every(link => !link.signal.aborted)).toBe(true)
     expect(replacement.every(link => !link.signal.aborted)).toBe(true)
     expect(a.status.connectedPeers).toBe(1)
     expect(b.status.connectedPeers).toBe(1)
     const operation = await b.command('say', 'replacement', { operationId: 'replacement' })
     expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
+    await a.close()
+    expect(previous.every(link => link.signal.aborted)).toBe(true)
+    expect(replacement.every(link => link.signal.aborted)).toBe(true)
   })
 
   it('fully verifies a captured 65-command history in three bounded pages', async () => {
