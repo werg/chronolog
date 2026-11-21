@@ -186,7 +186,7 @@ async function incomingFixture({ maxPeers = 1, timeoutMs = 2000, beforeConnect }
 } = {}) {
   const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(a.deviceId)
   const terminal = gate(), accepted: Awaited<ReturnType<typeof a.connectPeer>>[] = []
-  let incoming = 0, delivered = 0, expired = 0, stale = false
+  let incoming = 0, delivered = 0, stale = false
   let opening = async (connection: FramedPeerConnection): Promise<FramedPeerConnection> => connection
   let promoted = async (): Promise<void> => {}
   const connect = a.connectPeer.bind(a)
@@ -200,9 +200,7 @@ async function incomingFixture({ maxPeers = 1, timeoutMs = 2000, beforeConnect }
       throw Object.assign(new Error('HOST_REVOKED'), { retryable: false })
     } },
     transport: { ...ports.transport, async open(input, options) {
-      let connection: FramedPeerConnection
-      try { connection = await ports.transport.open(input, options) }
-      catch (error) { if (error instanceof Error && error.message === 'INVITATION_EXPIRED') expired++; throw error }
+      const connection = await ports.transport.open(input, options)
       if (input.invitation !== undefined) incoming++
       if (incoming === 1) return { ...connection,
         async send(bytes, options) { if (!stale) await connection.send(bytes, options) },
@@ -222,7 +220,7 @@ async function incomingFixture({ maxPeers = 1, timeoutMs = 2000, beforeConnect }
   await until(() => accepted.length === 1 && ap.status.connectedPeers.includes(b.deviceId))
   closing.push(() => terminal.resolve())
   return { ...f, a, b, ap, accepted, old, invite, terminal,
-    incoming: () => incoming, delivered: () => delivered, expired: () => expired,
+    incoming: () => incoming, delivered: () => delivered,
     promoted(value: typeof promoted) { promoted = value },
     stale() { stale = true },
     opening(value: typeof opening) { opening = value },
@@ -278,7 +276,7 @@ describe('owned application participation', () => {
     }
     await until(() => f.hub.directory.has(a.deviceId))
     const old = await join()
-    await until(() => accepted.length === 1)
+    await until(() => accepted.length === 1 && ap.status.connectedPeers.includes(b.deviceId))
     await post(b, 'before-incoming-restart')
     const revision = ap.status.connectionRevision, generation = b.status.generation
     if (kind === 'relay') {
@@ -308,6 +306,7 @@ describe('owned application participation', () => {
     })
     await until(() => f.hub.directory.has(a.deviceId))
     const old = await join(); await old.synchronize()
+    await until(() => ap.status.connectedPeers.includes(b.deviceId))
     const revision = ap.status.connectionRevision, entered = gate(), release = gate()
     closing.push(() => release.resolve())
     observePeerWire(b.deviceId, async packet => {
@@ -382,7 +381,7 @@ describe('owned application participation', () => {
     await post(h.b, 'after-candidate-slot-release')
   })
 
-  it('coalesces a duplicate pending invitation and consumes a replay without churning the authenticated winner', async () => {
+  it('coalesces duplicate invitations and preserves the authenticated winner on replay', async () => {
     const h = await incomingFixture(), opened = gate(), release = gate(), before = h.ap.status.connectionRevision
     h.opening(async connection => { opened.resolve(); await release.promise; return connection })
     closing.push(() => release.resolve())
@@ -391,12 +390,15 @@ describe('owned application participation', () => {
     expect(h.incoming()).toBe(2)
     release.resolve(); const fresh = await invitation.connect(); await fresh.synchronize()
     await until(() => { expect(h.accepted.length, 'candidate accepted').toBe(2); expect(h.ap.status.connectionRevision, 'candidate published').toBeGreaterThan(before); return true })
+    await post(h.b, 'winner-usable-before-invitation-replay')
     const revision = h.ap.status.connectionRevision
     h.hub.repeat(h.a.deviceId)
-    await until(() => h.expired() === 1)
+    // Dispatch is the barrier: a replay can coalesce with the finishing join
+    // or fail on its consumed token. Neither path may promote a second route.
+    await until(() => h.delivered() === 4)
+    await post(h.b, 'winner-survives-invitation-replay')
     expect(h.ap.status.connectionRevision).toBe(revision)
     expect(h.accepted).toHaveLength(2); expect(fresh.signal.aborted).toBe(false)
-    await post(h.b, 'winner-survives-invitation-replay')
   })
 
   it('discards a raw incoming candidate if another authenticated route wins while open is awaited', async () => {
@@ -591,6 +593,9 @@ describe('owned application participation', () => {
       remoteParticipation.status.phase === (remote === a ? 'coordinating' : 'following'))
     await until(async () => (await participation.diagnostics())[0]?.kind === 'relay')
     await post(b, 'before-incoming-supersession')
+    // Keep the deliberately blocked close inside its one-second cleanup fence
+    // regardless of coverage/host scheduling; advance only at explicit waits.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const outgoing = participation.reconsiderConnections()
     await started.promise
     try {
