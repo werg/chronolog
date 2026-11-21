@@ -1,3 +1,4 @@
+import { awaitOwnedTask } from './lifetime.js'
 import type { AppliedResult, OperationState, PeerRevision } from '@chronolog/peer-generation'
 
 export type OperationLifecycleState = 'recorded' | 'submitted' | 'applied' | 'rejected' | 'unknown'
@@ -39,6 +40,7 @@ export interface BatchSubmitOptions {
 }
 
 export interface ErgonomicSession {
+  readonly signal?: AbortSignal
   readonly applicationId: string
   readonly deviceId: string
   readonly historyId?: string
@@ -99,7 +101,7 @@ export function describeOperationLifecycle(
       status: 'saved',
       outcome: null,
       sequence: null,
-      generation: null,
+      generation: state.generation,
       errorCode: null,
       reason: null,
       safeToReconcile: true,
@@ -110,9 +112,9 @@ export function describeOperationLifecycle(
     operationId,
     lifecycle: 'rejected',
     status: state.status,
-    outcome: 'rejected',
+    outcome: null,
     sequence: null,
-    generation: null,
+    generation: state.generation,
     errorCode: state.status === 'abandoned' ? 'OPERATION_ABANDONED' : 'OPERATION_NEEDS_REAPPLY',
     reason: state.status === 'abandoned'
       ? 'Operation was excluded by a generation recovery; review and deliberately reapply if still needed.'
@@ -133,69 +135,45 @@ export async function submitBatch(
   if (!Array.isArray(entries) || entries.length > 64) {
     throw Object.assign(new Error('Batch must contain between 0 and 64 commands.'), { code: 'BATCH_LIMIT_EXCEEDED' })
   }
-  const items: readonly BatchCommandEntry[] = entries
+  const lifetime = AbortSignal.any([...(session.signal === undefined ? [] : [session.signal]), ...(options.signal === undefined ? [] : [options.signal])])
+  lifetime.throwIfAborted()
+  const items = structuredClone(entries)
   const seen = new Set<string>()
+  if (options.wait !== undefined && !['recorded', 'applied'].includes(options.wait)) throw new Error('BATCH_WAIT_INVALID')
   for (const entry of items) {
-    if (typeof entry.operationId !== 'string' || entry.operationId.length === 0 || entry.operationId.length > 256) {
-      throw Object.assign(new Error('Each batched command requires a stable non-empty operationId.'), { code: 'OPERATION_ID_INVALID' })
+    if (entry === null || typeof entry !== 'object' || typeof entry.command !== 'string' || entry.command.length === 0 ||
+        typeof entry.operationId !== 'string' || entry.operationId.length === 0 || entry.operationId.length > 512 ||
+        [...entry.operationId].some(c => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) {
+      throw Object.assign(new Error('Each batched command requires a stable command and protocol operationId.'), { code: 'OPERATION_ID_INVALID' })
     }
-    if (seen.has(entry.operationId)) {
-      throw Object.assign(new Error(`Duplicate operationId in batch: ${entry.operationId}`), { code: 'BATCH_DUPLICATE_OPERATION_ID' })
-    }
+    if (seen.has(entry.operationId)) throw Object.assign(new Error('Duplicate operationId in batch.'), { code: 'BATCH_DUPLICATE_OPERATION_ID' })
     seen.add(entry.operationId)
   }
   const results: BatchCommandResult[] = []
-  const waitMode = options.wait ?? 'applied'
   for (const entry of items) {
-    options.signal?.throwIfAborted()
-    if (options.beforeSubmit !== undefined) await options.beforeSubmit(entry)
+    lifetime.throwIfAborted()
+    if (options.beforeSubmit !== undefined) await awaitOwnedTask(lifetime, () => options.beforeSubmit!(structuredClone(entry)))
+    lifetime.throwIfAborted()
     try {
-      const handle = await session.command(entry.command, entry.input, {
-        operationId: entry.operationId,
-        ...(entry.basedOn === undefined ? {} : { basedOn: entry.basedOn }),
-      })
-      if (waitMode === 'recorded') {
-        const state = await handle.get()
-        const summary = describeOperationLifecycle(entry.operationId, state, { transmitted: true })
-        results.push(Object.freeze({ operationId: entry.operationId, command: entry.command, lifecycle: summary.lifecycle, applied: null, state, error: null }))
-        continue
-      }
-      try {
-        const applied = await handle.applied(options.signal === undefined ? undefined : { signal: options.signal })
-        const state = await handle.get()
-        const summary = describeOperationLifecycle(entry.operationId, state)
-        results.push(Object.freeze({ operationId: entry.operationId, command: entry.command, lifecycle: summary.lifecycle, applied, state, error: null }))
-        if (options.stopOnError === true && applied.outcome === 'rejected') break
-      } catch (waitError) {
-        const state = await session.operations.get(entry.operationId).catch(() => null)
-        const err = waitError as { code?: unknown; message?: unknown }
-        results.push(Object.freeze({
-          operationId: entry.operationId,
-          command: entry.command,
-          lifecycle: state?.status === 'applied' ? (state.outcome === 'rejected' ? 'rejected' : 'applied') : 'unknown',
-          applied: null,
-          state,
-          error: {
-            code: typeof err?.code === 'string' ? err.code : 'OPERATION_OUTCOME_UNKNOWN',
-            message: typeof err?.message === 'string' ? err.message : 'Operation wait did not complete.',
-          },
-        }))
-        if (options.stopOnError === true) break
-      }
-    } catch (error) {
-      const err = error as { code?: unknown; message?: unknown }
-      results.push(Object.freeze({
-        operationId: entry.operationId,
-        command: entry.command,
-        lifecycle: 'rejected',
-        applied: null,
-        state: null,
-        error: {
-          code: typeof err?.code === 'string' ? err.code : 'COMMAND_SUBMISSION_FAILED',
-          message: typeof err?.message === 'string' ? err.message : String(error),
-        },
+      const handle = await awaitOwnedTask(lifetime, () => session.command(entry.command, entry.input, {
+        operationId: entry.operationId, ...(entry.basedOn === undefined ? {} : { basedOn: entry.basedOn }),
       }))
-      if (options.stopOnError === true) break
+      const applied = options.wait === 'recorded' ? null : await awaitOwnedTask(lifetime, () => handle.applied({ signal: lifetime }))
+      const state = await awaitOwnedTask(lifetime, () => handle.get())
+      const summary = describeOperationLifecycle(entry.operationId, state ?? applied)
+      results.push(Object.freeze({ operationId: entry.operationId, command: entry.command, lifecycle: summary.lifecycle, applied, state, error: null }))
+      if (options.stopOnError === true && (summary.lifecycle === 'rejected' || summary.lifecycle === 'unknown')) break
+    } catch (error) {
+      // A rejected call is not evidence that preparation/submission never happened.
+      const state = await awaitOwnedTask(lifetime, () => session.operations.get(entry.operationId)).catch(() => null)
+      const summary = describeOperationLifecycle(entry.operationId, state, { error })
+      const err = error as { code?: unknown; message?: unknown } | null
+      results.push(Object.freeze({ operationId: entry.operationId, command: entry.command, lifecycle: summary.lifecycle,
+        applied: state?.status === 'applied' ? state : null, state,
+        error: { code: typeof err?.code === 'string' ? err.code : 'OPERATION_OUTCOME_UNKNOWN',
+          message: typeof err?.message === 'string' ? err.message : String(error) },
+      }))
+      if (lifetime.aborted || options.stopOnError === true) break
     }
   }
   return Object.freeze(results)
@@ -224,6 +202,9 @@ export function createAppClient(
     readonly close?: () => void | Promise<void>
   } = {},
 ): UnifiedAppClient {
+  const lifetime = new AbortController()
+  const signal = AbortSignal.any([lifetime.signal, ...(session.signal === undefined ? [] : [session.signal])])
+  let closing: Promise<void> | undefined
   const client: UnifiedAppClient = {
     applicationId: session.applicationId,
     deviceId: session.deviceId,
@@ -231,7 +212,7 @@ export function createAppClient(
     async submitCommand(entry, callOptions = {}) {
       const [result] = await submitBatch(session, [entry], {
         ...(callOptions.wait === undefined ? {} : { wait: callOptions.wait }),
-        ...(callOptions.signal === undefined ? {} : { signal: callOptions.signal }),
+        signal: callOptions.signal === undefined ? signal : AbortSignal.any([signal, callOptions.signal]),
         ...(options.beforeSubmit === undefined ? {} : { beforeSubmit: options.beforeSubmit }),
       })
       return result!
@@ -240,21 +221,25 @@ export function createAppClient(
       return submitBatch(session, entries, {
         ...(options.beforeSubmit === undefined ? {} : { beforeSubmit: options.beforeSubmit }),
         ...callOptions,
+        signal: callOptions.signal === undefined ? signal : AbortSignal.any([signal, callOptions.signal]),
       })
     },
     async inspectOperation(operationId) {
-      const state = await session.operations.get(operationId)
+      const state = await awaitOwnedTask(signal, () => session.operations.get(operationId))
       return describeOperationLifecycle(operationId, state)
     },
-    query(name, input = null) {
-      return session.query(name, input)
+    async query(name, input = null) {
+      return awaitOwnedTask(signal, () => session.query(name, input))
     },
     async flush() {
-      if (options.flush !== undefined) await options.flush()
+      await awaitOwnedTask(signal, () => options.flush?.())
     },
-    async close() {
-      if (options.close !== undefined) await options.close()
-      else await session.close?.()
+    close() {
+      lifetime.abort(new Error('APPLICATION_CLIENT_CLOSED'))
+      return closing ??= Promise.resolve().then(async () => {
+        if (options.close !== undefined) await options.close()
+        else await session.close?.()
+      })
     },
   }
   return Object.freeze(client)
