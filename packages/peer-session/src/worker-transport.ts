@@ -1,246 +1,232 @@
 import {
-  frameRtcPeerChannels, negotiateWebRtc, WEBRTC_LIMITS,
-  type PeerDescription, type RtcPeerConnection, type WebRtcOptions, type WebRtcSession, type WebRtcRoute,
+  openWebRtcConnection, WEBRTC_LIMITS,
+  type PeerDescription, type RtcPeerConnection, type WebRtcOptions, type WebRtcRoute,
 } from '@chronolog/transport-webrtc'
 import type { FramedPeerConnection } from '@chronolog/records'
 import { awaitOwnedTask } from './lifetime.js'
+import { workerRtcLanes, type Lane } from './worker-transport-lanes.js'
 
-const NEGOTIATE = 'chronolog/peer-session/rtc-negotiation/v1'
+const PROTOCOL = 'chronolog/peer-session/rtc-endpoint/v1'
 const MAX_CONNECTIONS = 8
-/** A DedicatedWorker or its owning global scope; application RPC has its own namespace. */
+/** Ordered, authenticated endpoint: Worker, started SharedWorker port, or a virtual endpoint.
+ * The RTC bridge calls postMessage with one argument only; it transfers no resources.
+ * Optional transfer is used by the separate application-RPC API, not this protocol. */
 export interface ApplicationWorkerEndpoint {
-  postMessage(message: unknown, transfer: Transferable[]): void
+  postMessage(message: unknown, transfer?: Transferable[]): void
   addEventListener(type: 'message', listener: (event: MessageEvent) => void): void
   removeEventListener(type: 'message', listener: (event: MessageEvent) => void): void
 }
-export interface WorkerWebRtcConnection extends FramedPeerConnection {
-  /** Selected ICE pair without exposing addresses to the application. */
-  getRoute(): Promise<WebRtcRoute>
+export interface WorkerWebRtcConnection extends FramedPeerConnection { getRoute(): Promise<WebRtcRoute> }
+type Wire = Record<string, unknown>
+const clients = new WeakMap<ApplicationWorkerEndpoint, Set<string>>()
+const validId = (id: unknown): id is string => typeof id === 'string' && /^[0-9a-f-]{36}$/u.test(id)
+const payload = ({ type: _type, id: _id, from: _from, ...value }: Wire): Wire => value
+const envelope = (data: unknown, from: string): Wire | null => {
+  const value = message(data)
+  return value?.type === PROTOCOL && value.from === from && validId(value.id) ? value : null
 }
 
-/**
- * Page-side RTC mechanics. The Worker chooses peers, owns signaling and policy,
- * and receives both channels before they cease to be transferable. The page
- * never attaches an application peer, authenticates history or chooses recovery.
- */
+/** Page-side RTC and raw framing only. Peer crypto, keys and state stay in the owner.
+ * Opaque frames use bounded multiplexed messages; no RTCDataChannel/MessagePort transfer. */
 export function serveWorkerWebRtcConnections(endpoint: ApplicationWorkerEndpoint, options: {
   readonly createPeerConnection?: (configuration: RTCConfiguration) => RtcPeerConnection
   readonly signal?: AbortSignal
 } = {}): { close(): Promise<void> } {
-  const active = new Set<(reason?: unknown) => Promise<void>>()
+  const active = new Map<string, { receive(value: Wire): void; close(reason?: unknown): Promise<void> }>()
   let closing: Promise<void> | undefined, closed = false
-  const receive = (event: MessageEvent): void => {
-    const data = message(event.data)
-    if (data?.type !== NEGOTIATE) return
-    const port = data.port as MessagePort | undefined
-    if (port === undefined || typeof port.postMessage !== 'function') return
-    const reject = (error: string): void => {
-      try { port.postMessage({ type: 'ended', error }) } finally { port.close() }
-    }
-    if (closed || active.size >= MAX_CONNECTIONS) {
-      reject(closed ? 'APPLICATION_WORKER_CLOSED' : 'APPLICATION_PEER_LIMIT'); return
-    }
-    if (!['offerer', 'answerer'].includes(String(data.role)) || !validTimeout(data.timeoutMs) || !validConfiguration(data.configuration)) {
-      reject('APPLICATION_WORKER_OPTIONS_INVALID'); return
+  const post = (id: string, value: Wire) => endpoint.postMessage({ ...value, type: PROTOCOL, id, from: 'page' })
+  const receive = (event: MessageEvent) => {
+    const data = envelope(event.data, 'worker')
+    if (data === null || closed) return
+    const id = data.id as string, existing = active.get(id)
+    if (existing !== undefined) { existing.receive(payload(data)); return }
+    if (data.action !== 'open') return // Late callbacks from retired connection IDs.
+    if (active.size >= MAX_CONNECTIONS) { post(id, { action: 'ended', error: 'APPLICATION_PEER_LIMIT' }); return }
+    if (!['offerer', 'answerer'].includes(String(data.role)) || !validTimeout(data.timeoutMs) || !validGatheringTimeout(data.gatheringTimeoutMs, data.timeoutMs) || !validConfiguration(data.configuration)) {
+      post(id, { action: 'ended', error: 'APPLICATION_WORKER_OPTIONS_INVALID' }); return
     }
     const lifetime = new AbortController(), received = deferred<PeerDescription>(), sent = deferred<void>(), signalingClosed = deferred<void>()
-    let rtc: WebRtcSession | undefined, stopping: Promise<void> | undefined
+    let rtc: Awaited<ReturnType<typeof openWebRtcConnection>> | undefined, stopping: Promise<void> | undefined
     let remoteSeen = false, sendRequested = false, sendAcknowledged = false, closeRequested = false, closeAcknowledged = false
     let lastRoute = 0, routePending = false
     const end = (reason: unknown = new Error('APPLICATION_RTC_CLOSED')): Promise<void> => {
       if (stopping !== undefined) return stopping
-      stopping = Promise.resolve().then(async () => { try { await rtc?.close() } finally { port.close() } })
+      stopping = Promise.resolve().then(async () => { await rtc?.close() })
       void stopping.catch(() => undefined)
-      lifetime.abort(reason)
-      received.reject(reason); sent.reject(reason); signalingClosed.reject(reason)
-      active.delete(end); port.removeEventListener('message', request)
-      try { port.postMessage({ type: 'ended', error: errorMessage(reason) }) } catch { /* The Worker may have stopped. */ }
+      lifetime.abort(reason); received.reject(reason); sent.reject(reason); signalingClosed.reject(reason)
+      active.delete(id)
+      try { post(id, { action: 'ended', error: errorMessage(reason) }) } catch { /* Endpoint retired. */ }
       return stopping
     }
-    const request = (event: MessageEvent): void => {
+    const lanes = workerRtcLanes(value => post(id, value), lifetime.signal, error => { void end(error) }, data.timeoutMs,
+      async (lane, bytes) => {
+        if (rtc === undefined) throw new Error('APPLICATION_WORKER_NOT_READY')
+        if (lane === 'live') return rtc.live.trySend(bytes, { signal: lifetime.signal })
+        await rtc.send(bytes, { signal: lifetime.signal }); return true
+      })
+    const request = (input: Wire) => {
       try {
-        const input = message(event.data)
-        if (input?.type === 'close') { void end(); return }
-        if (input?.type === 'description' && !remoteSeen) {
-          remoteSeen = true
-          received.resolve(description(input.description, data.role === 'offerer' ? 'answer' : 'offer')); return
+        if (input.action === 'close') { void end(); return }
+        if (input.action === 'frame' || input.action === 'ack') { lanes.receive(input); return }
+        if (input.action === 'description' && !remoteSeen) {
+          remoteSeen = true; received.resolve(description(input.description, data.role === 'offerer' ? 'answer' : 'offer')); return
         }
-        if (input?.type === 'sent' && sendRequested && !sendAcknowledged) { sendAcknowledged = true; sent.resolve(); return }
-        if (input?.type === 'signaling-closed' && closeRequested && !closeAcknowledged) {
-          closeAcknowledged = true; signalingClosed.resolve(); return
-        }
-        if (input?.type === 'route' && rtc !== undefined && !routePending && Number.isSafeInteger(input.id) && Number(input.id) > lastRoute) {
-          lastRoute = Number(input.id); routePending = true
-          void awaitOwnedTask(lifetime.signal, () => rtc!.getRoute()).then(value => {
-            lifetime.signal.throwIfAborted(); port.postMessage({ type: 'route', id: input.id, value })
+        if (input.action === 'sent' && sendRequested && !sendAcknowledged) { sendAcknowledged = true; sent.resolve(); return }
+        if (input.action === 'signaling-closed' && closeRequested && !closeAcknowledged) { closeAcknowledged = true; signalingClosed.resolve(); return }
+        if (input.action === 'route' && rtc !== undefined && !routePending && Number.isSafeInteger(input.request) && Number(input.request) > lastRoute) {
+          lastRoute = Number(input.request); routePending = true
+          void awaitOwnedTask(lifetime.signal, () => rtc!.session.getRoute()).then(value => {
+            lifetime.signal.throwIfAborted(); post(id, { action: 'route', request: input.request, value: route(value) })
           }, error => {
-            if (!lifetime.signal.aborted) port.postMessage({ type: 'route', id: input.id, error: errorMessage(error) })
-          }).catch(error => { void end(error) }).finally(() => { routePending = false })
-          return
+            if (!lifetime.signal.aborted) post(id, { action: 'route', request: input.request, error: errorMessage(error) })
+          }).catch(error => { void end(error) }).finally(() => { routePending = false }); return
         }
         throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
       } catch (error) { void end(error) }
     }
-    active.add(end); port.addEventListener('message', request); port.start()
+    active.set(id, { receive: request, close: end })
     void (async () => {
       try {
-        const candidate = await negotiateWebRtc({
-          role: data.role as WebRtcOptions['role'],
+        const candidate = await openWebRtcConnection({ role: data.role as WebRtcOptions['role'],
           ...(data.configuration === undefined ? {} : { configuration: data.configuration as RTCConfiguration }),
           ...(options.createPeerConnection === undefined ? {} : { createPeerConnection: options.createPeerConnection }),
           timeoutMs: data.timeoutMs as number, signal: lifetime.signal,
+          ...(data.gatheringTimeoutMs === undefined ? {} : { gatheringTimeoutMs: data.gatheringTimeoutMs as number }),
           signaling: {
             messages: { async *[Symbol.asyncIterator]() { yield await awaitOwnedTask(lifetime.signal, () => received.promise) } },
             async send(value) {
               lifetime.signal.throwIfAborted()
               if (sendRequested) throw new Error('APPLICATION_WORKER_DESCRIPTION_REPEATED')
-              sendRequested = true; port.postMessage({ type: 'send', description: value })
-              await awaitOwnedTask(lifetime.signal, () => sent.promise)
+              sendRequested = true; post(id, { action: 'send', description: value }); await awaitOwnedTask(lifetime.signal, () => sent.promise)
             },
             async close() {
               lifetime.signal.throwIfAborted()
-              if (!closeRequested) { closeRequested = true; port.postMessage({ type: 'close-signaling' }) }
+              if (!closeRequested) { closeRequested = true; post(id, { action: 'close-signaling' }) }
               await awaitOwnedTask(lifetime.signal, () => signalingClosed.promise)
             },
-          },
-          onDataChannels(channels) {
-            lifetime.signal.throwIfAborted()
-            port.postMessage({ type: 'channels', reliable: channels.reliable, live: channels.live },
-              [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel])
           },
         })
         rtc = candidate
         if (lifetime.signal.aborted) { await candidate.close(); return }
         candidate.signal.addEventListener('abort', () => { void end(candidate.signal.reason) }, { once: true })
-        if (candidate.signal.aborted) { await end(candidate.signal.reason); return }
-        port.postMessage({ type: 'ready' })
+        candidate.session.signal.addEventListener('abort', () => { void end(candidate.session.signal.reason) }, { once: true })
+        if (candidate.signal.aborted || candidate.session.signal.aborted) { await end(candidate.signal.reason ?? candidate.session.signal.reason); return }
+        post(id, { action: 'ready' })
+        const forward = async (lane: Lane) => {
+          const source = lane === 'reliable' ? candidate : candidate.live
+          for await (const bytes of source.frames(lifetime.signal)) {
+            lifetime.signal.throwIfAborted()
+            await lanes[lane].send(bytes, lifetime.signal)
+          }
+          if (!lifetime.signal.aborted) await end(new Error('APPLICATION_RTC_ENDED'))
+        }
+        void forward('reliable').catch(error => { void end(error) })
+        void forward('live').catch(error => { void end(error) })
       } catch (error) { await end(error) }
     })().catch(() => undefined)
   }
-  const abort = (): void => { void close() }
+  const abort = () => { void close() }
   const close = (): Promise<void> => {
     if (closing !== undefined) return closing
-    closed = true; endpoint.removeEventListener('message', receive)
-    options.signal?.removeEventListener('abort', abort)
-    closing = Promise.allSettled([...active].map(end => end(new Error('APPLICATION_WORKER_CLOSED')))).then(() => undefined)
+    closed = true; endpoint.removeEventListener('message', receive); options.signal?.removeEventListener('abort', abort)
+    closing = Promise.allSettled([...active.values()].map(value => value.close(new Error('APPLICATION_WORKER_CLOSED')))).then(() => undefined)
     return closing
   }
-  endpoint.addEventListener('message', receive)
-  options.signal?.addEventListener('abort', abort, { once: true })
+  endpoint.addEventListener('message', receive); options.signal?.addEventListener('abort', abort, { once: true })
   if (options.signal?.aborted === true) abort()
   return { close }
 }
 
-/**
- * Worker-side raw transport for session.participate(). Only bounded SDP crosses
- * the control port. Framing, peer authentication, history and live data all stay
- * beside the owned session and use its ordinary connectPeer path.
- */
+/** Owner-side framed connection. Only bounded signaling and opaque peer frames cross the endpoint. */
 export async function openWorkerWebRtcConnection(endpoint: ApplicationWorkerEndpoint,
   options: Omit<WebRtcOptions, 'createPeerConnection'>): Promise<WorkerWebRtcConnection> {
   const timeoutMs = options.timeoutMs ?? 30_000
-  if (!validTimeout(timeoutMs) || !['offerer', 'answerer'].includes(options.role)) throw new Error('APPLICATION_WORKER_OPTIONS_INVALID')
+  if (!validTimeout(timeoutMs) || !validGatheringTimeout(options.gatheringTimeoutMs, timeoutMs) || !['offerer', 'answerer'].includes(options.role) || !validConfiguration(options.configuration)) throw new Error('APPLICATION_WORKER_OPTIONS_INVALID')
   options.signal?.throwIfAborted()
-  const channel = new MessageChannel(), port = channel.port1, lifetime = new AbortController()
-  const negotiated = deferred<void>()
-  let framed: ReturnType<typeof frameRtcPeerChannels> | undefined, closing: Promise<void> | undefined
-  let signalingClose: Promise<void> | undefined, sendSeen = false, readySeen = false, closeSeen = false
+  let owned = clients.get(endpoint)
+  if (owned === undefined) clients.set(endpoint, owned = new Set())
+  if (owned.size >= MAX_CONNECTIONS) throw new Error('APPLICATION_PEER_LIMIT')
+  const id = crypto.randomUUID(), lifetime = new AbortController(), negotiated = deferred<void>()
+  owned.add(id)
+  const post = (value: Wire) => endpoint.postMessage({ ...value, type: PROTOCOL, id, from: 'worker' })
+  let closing: Promise<void> | undefined, signalingClose: Promise<void> | undefined, sendSeen = false, closeSeen = false, readySeen = false
   let routeId = 0, routePending: { id: number; result: ReturnType<typeof deferred<WebRtcRoute>>; timer: ReturnType<typeof setTimeout> } | undefined
   const stopSignaling = (): Promise<void> => {
-    signalingClose ??= Promise.resolve().then(() => options.signaling.close())
-    void signalingClose.catch(() => undefined)
-    return signalingClose
+    signalingClose ??= Promise.resolve().then(() => options.signaling.close()); void signalingClose.catch(() => undefined); return signalingClose
   }
   const close = (reason: unknown = new Error('APPLICATION_RTC_CLOSED')): Promise<void> => {
     if (closing !== undefined) return closing
-    closing = Promise.resolve().then(async () => { try { await framed?.close() } finally { port.close(); channel.port2.close() } })
-    void closing.catch(() => undefined)
-    lifetime.abort(reason); clearTimeout(timer); options.signal?.removeEventListener('abort', abort)
-    negotiated.reject(reason)
+    closing = Promise.resolve()
+    lifetime.abort(reason); clearTimeout(timer); options.signal?.removeEventListener('abort', abort); negotiated.reject(reason)
+    owned.delete(id); if (!owned.size) clients.delete(endpoint)
     if (routePending !== undefined) { clearTimeout(routePending.timer); routePending.result.reject(reason); routePending = undefined }
-    try { port.postMessage({ type: 'close' }) } catch { /* The page may have stopped. */ }
-    port.removeEventListener('message', receive)
-    // A misbehaving signaling cleanup cannot hold the owning session open.
-    void stopSignaling()
-    return closing
+    try { post({ action: 'close' }) } catch { /* Endpoint retired. */ }
+    endpoint.removeEventListener('message', receive); void stopSignaling(); return closing
   }
-  const fail = (error: unknown): void => { void close(error) }
-  const abort = (): void => { fail(options.signal?.reason) }
-  const receive = (event: MessageEvent): void => {
-    const value = message(event.data)
+  const fail = (error: unknown) => { void close(error) }
+  const lanes = workerRtcLanes(post, lifetime.signal, fail, timeoutMs)
+  const abort = () => fail(options.signal?.reason)
+  const receive = (event: MessageEvent) => {
+    const value = envelope(event.data, 'page')
+    if (value?.id !== id || lifetime.signal.aborted) return
     try {
-      if (value?.type === 'ended') throw new Error(typeof value.error === 'string' ? value.error : 'APPLICATION_RTC_CLOSED')
-      if (value?.type === 'channels') {
-        if (framed !== undefined || lifetime.signal.aborted) { retireTransferred(value); throw new Error('APPLICATION_WORKER_CHANNELS_REPEATED') }
-        try { framed = frameRtcPeerChannels({ reliable: value.reliable as RTCDataChannel, live: value.live as RTCDataChannel }) }
-        catch (error) { retireTransferred(value); throw error }
-        framed.signal.addEventListener('abort', () => fail(framed!.signal.reason), { once: true })
-        if (framed.signal.aborted) fail(framed.signal.reason)
-        return
+      if (value.action === 'ended') throw new Error(errorMessage(value.error ?? 'APPLICATION_RTC_CLOSED'))
+      if (value.action === 'frame' || value.action === 'ack') {
+        if (!readySeen) throw new Error('APPLICATION_WORKER_NOT_READY')
+        lanes.receive(payload(value)); return
       }
-      if (value?.type === 'send' && !sendSeen) {
+      if (value.action === 'send' && !sendSeen) {
         sendSeen = true
         const outgoing = description(value.description, options.role === 'offerer' ? 'offer' : 'answer')
         void awaitOwnedTask(lifetime.signal, () => options.signaling.send(outgoing)).then(() => {
-          lifetime.signal.throwIfAborted(); port.postMessage({ type: 'sent' })
-        }).catch(fail)
-        return
+          lifetime.signal.throwIfAborted(); post({ action: 'sent' })
+        }).catch(fail); return
       }
-      if (value?.type === 'close-signaling' && !closeSeen && sendSeen) {
+      if (value.action === 'close-signaling' && !closeSeen && sendSeen) {
         closeSeen = true
         void awaitOwnedTask(lifetime.signal, stopSignaling).then(() => {
-          lifetime.signal.throwIfAborted(); port.postMessage({ type: 'signaling-closed' })
-        }).catch(fail)
-        return
+          lifetime.signal.throwIfAborted(); post({ action: 'signaling-closed' })
+        }).catch(fail); return
       }
-      if (value?.type === 'ready' && !readySeen && framed !== undefined && closeSeen) {
-        readySeen = true; negotiated.resolve(); return
-      }
-      if (value?.type === 'route' && routePending !== undefined && value.id === routePending.id) {
-        const pending = routePending
-        const selected = value.error === undefined ? route(value.value) : undefined
+      if (value.action === 'ready' && !readySeen && closeSeen && sendSeen) { readySeen = true; negotiated.resolve(); return }
+      if (value.action === 'route' && routePending !== undefined && value.request === routePending.id) {
+        const pending = routePending, selected = value.error === undefined ? route(value.value) : undefined
         routePending = undefined; clearTimeout(pending.timer)
         if (selected !== undefined) pending.result.resolve(selected)
-        else pending.result.reject(new Error(typeof value.error === 'string' ? value.error : 'APPLICATION_WORKER_ROUTE_INVALID'))
-        return
+        else pending.result.reject(new Error(errorMessage(value.error))); return
       }
       throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
     } catch (error) { fail(error) }
   }
   const timer = setTimeout(() => fail(new Error('APPLICATION_WORKER_CONNECTION_TIMEOUT')), timeoutMs)
-  port.addEventListener('message', receive); port.start()
-  options.signal?.addEventListener('abort', abort, { once: true })
+  endpoint.addEventListener('message', receive); options.signal?.addEventListener('abort', abort, { once: true })
   let descriptions: AsyncIterator<PeerDescription> | undefined
   try {
-    descriptions = options.signaling.messages[Symbol.asyncIterator]()
-    lifetime.signal.throwIfAborted()
-    endpoint.postMessage({ type: NEGOTIATE, role: options.role, timeoutMs, configuration: options.configuration, port: channel.port2 }, [channel.port2])
+    descriptions = options.signaling.messages[Symbol.asyncIterator](); lifetime.signal.throwIfAborted()
+    post({ action: 'open', role: options.role, timeoutMs, configuration: options.configuration, gatheringTimeoutMs: options.gatheringTimeoutMs })
     void awaitOwnedTask(lifetime.signal, () => descriptions!.next()).then(item => {
       lifetime.signal.throwIfAborted()
       if (item.done) throw new Error('APPLICATION_WORKER_SIGNALING_ENDED')
-      port.postMessage({ type: 'description', description: description(item.value, options.role === 'offerer' ? 'answer' : 'offer') })
+      post({ action: 'description', description: description(item.value, options.role === 'offerer' ? 'answer' : 'offer') })
     }).catch(fail)
-    await awaitOwnedTask(lifetime.signal, () => negotiated.promise)
-    const connection = framed!
-    await awaitOwnedTask(lifetime.signal, () => connection.ready)
-    lifetime.signal.throwIfAborted(); clearTimeout(timer)
-    return { signal: lifetime.signal, live: connection.live,
-      send: (bytes, sendOptions) => connection.send(bytes, sendOptions), frames: signal => connection.frames(signal), close: () => close(),
+    await awaitOwnedTask(lifetime.signal, () => negotiated.promise); lifetime.signal.throwIfAborted(); clearTimeout(timer)
+    return { signal: lifetime.signal, send: async (bytes, sendOptions) => { await lanes.reliable.send(bytes, sendOptions?.signal) },
+      frames: signal => lanes.reliable.frames(signal), close: () => close(),
+      live: { signal: lifetime.signal, trySend: (bytes, sendOptions) => lanes.live.send(bytes, sendOptions?.signal),
+        frames: signal => lanes.live.frames(signal), close: () => close() },
       getRoute() {
         lifetime.signal.throwIfAborted()
         if (routePending !== undefined) return routePending.result.promise
-        const id = ++routeId
-        if (!Number.isSafeInteger(id)) throw new Error('APPLICATION_WORKER_REQUEST_ID_EXHAUSTED')
-        const result = deferred<WebRtcRoute>()
-        const timer = setTimeout(() => fail(new Error('APPLICATION_WORKER_ROUTE_TIMEOUT')), timeoutMs)
-        routePending = { id, result, timer }
-        port.postMessage({ type: 'route', id })
+        const request = ++routeId
+        if (!Number.isSafeInteger(request)) throw new Error('APPLICATION_WORKER_REQUEST_ID_EXHAUSTED')
+        const result = deferred<WebRtcRoute>(), timer = setTimeout(() => fail(new Error('APPLICATION_WORKER_ROUTE_TIMEOUT')), timeoutMs)
+        routePending = { id: request, result, timer }
+        try { post({ action: 'route', request }) } catch (error) { fail(error) }
         return result.promise
       } }
   } catch (error) { await close(error); throw error }
   finally { void Promise.resolve().then(() => descriptions?.return?.()).catch(() => undefined) }
 }
-
 function validTimeout(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= 120_000
 }
@@ -273,10 +259,8 @@ function deferred<T>() {
   void promise.catch(() => undefined)
   return { promise, resolve, reject }
 }
-function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error) }
-function retireTransferred(value: Record<string, unknown>): void {
-  for (const key of ['reliable', 'live']) {
-    const channel = value[key] as { close?: () => void } | undefined
-    try { channel?.close?.() } catch { /* Closing an already retired channel is harmless. */ }
-  }
+function errorMessage(error: unknown): string { return (error instanceof Error ? error.message : String(error)).slice(0, 256) }
+
+function validGatheringTimeout(value: unknown, timeoutMs: number): boolean {
+  return value === undefined || validTimeout(value) && value <= timeoutMs
 }

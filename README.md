@@ -106,7 +106,6 @@ Package the supported composition from clean source:
 
 ```sh
 node tools/package-peer-session.mjs
-node tools/package-peer-session.mjs --native-rtc --output artifacts/peer-session-rtc
 node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
 node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-session-sql-browser
 node tools/package-peer-generation-control.mjs
@@ -114,7 +113,7 @@ node tools/package-peer-generation-control.mjs
 
 Archives include self-contained declarations, shared ESM chunks and exact source,
 tree, input and artifact hashes. Native SQL packaging requires the exact patched
-engine. The default browser/native session archive remains SQL-free. A development
+engine. The standard browser/native session archive includes the pinned native RTC dependency and remains SQL-free; browser entries do not load the native dependency. A development
 archive requires explicit `--allow-dirty` and records that fact.
 
 The [independent Tendriller recipes](https://github.com/werg/tendriller-contrib/tree/refactor/owned-peer-data-plane/cookbooks/run-a-peer-application)

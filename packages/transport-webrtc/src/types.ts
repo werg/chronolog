@@ -32,7 +32,7 @@ export interface RtcPeerConnection {
 
 export interface PeerDescription { readonly type: 'offer' | 'answer'; readonly sdp: string }
 
-/** Signaling carries exactly one complete SDP per peer and never application bytes. */
+/** Signaling carries exactly one bounded batch SDP per peer and never application bytes. */
 export interface PeerSignaling {
   readonly messages: AsyncIterable<PeerDescription>
   send(description: PeerDescription): Promise<void>
@@ -46,6 +46,10 @@ export interface WebRtcOptions {
   readonly createPeerConnection?: (configuration: RTCConfiguration) => RtcPeerConnection
   readonly signal?: AbortSignal
   readonly timeoutMs?: number
+  /** Batch ICE budget; defaults to WEBRTC_LIMITS.gatheringMs, within timeoutMs.
+   * Current usable candidates are published if gathering is still incomplete.
+   * Later candidates are not trickled; choose a longer budget when required. */
+  readonly gatheringTimeoutMs?: number
 }
 
 /** Two independent SCTP streams belonging to one authenticated peer session. */

@@ -82,35 +82,25 @@ An established RTC connection continues after the signaling endpoint stops.
 Closing the introduction handler explicitly closes the peers it accepted.
 
 A hosted rendezvous can also implement `PeerSignaling` by exposing
-`messages`, `send(description)` and `close()`. It carries the two complete SDP
+`messages`, `send(description)` and `close()`. It carries the two bounded batch SDP
 descriptions. Application frames always use the resulting peer connection.
 
 ## Browser ownership
 
-The Window owns `RTCPeerConnection` negotiation. Transfer both untouched channels
-synchronously to the exclusive Chronolog Worker; that Worker owns keys, storage,
-authentication and all application work:
+The Window owns `RTCPeerConnection` and raw framing through
+`openWebRtcConnection`. The maintained Worker bridge is
+`serveWorkerWebRtcConnections(endpoint)` on the page and
+`openWorkerWebRtcConnection(endpoint, options)` in the owning Worker, exported by
+`@chronolog/peer-session/webrtc`. It sends bounded opaque frames and ACKs over an
+ordered authenticated endpoint, without creating or transferring ports or
+RTCDataChannels. This works with DedicatedWorkers, started SharedWorker ports and
+virtual authenticated endpoints. Keys, storage, peer authentication and
+application state remain in the Worker. The raw RTC callbacks do not move an
+application participant onto the page.
 
-```ts
-// Window.
-const rtc = await negotiateWebRtc({
-  role, signaling, configuration: { iceServers }, signal: windowLifetime,
-  onDataChannels(channels) {
-    worker.postMessage({ type: 'peer-channels', channels },
-      [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel])
-  },
-})
-
-// DedicatedWorker, handling the transferred channels.
-const connection = frameRtcPeerChannels(channels)
-await connection.ready
-const peer = await session.connectPeer({ connection, signal: workerLifetime })
-```
-
-The handoff callback must not await, defer transfer or use either channel first.
-Unsupported channel transfer fails explicitly. The Window's RTC lifetime and
-the Worker's authenticated peer lifetime must end together. Every replacement
-connection performs a fresh Chronolog handshake.
+See [the portable endpoint contract](../peer-session/README.md#owned-participation-and-recovery)
+for endpoint ownership, bounds, cancellation, route diagnostics and actual browser
+qualification. Each replacement connection performs a fresh Chronolog handshake.
 
 ## Connection lifecycle and retry
 
@@ -129,8 +119,25 @@ for the common native and browser lifecycle contract.
 
 ## Bounded reliable and live lanes
 
-Negotiation exchanges one complete SDP per peer, with a 64 KiB maximum, a
-deadline and cancellation. Fixed negotiated SCTP channels use protocol
+Negotiation exchanges one bounded batch SDP per peer, with a 64 KiB maximum,
+a whole-attempt deadline and cancellation. Gathering waits for completion or
+`gatheringTimeoutMs`, whichever comes first. The exported `WEBRTC_LIMITS.gatheringMs`
+is the single default (1,000 ms); the native adapter derives its default Werift
+STUN timeout from that constant in seconds. An explicit batch budget must be a
+positive integer within `timeoutMs`. The owning-Worker bridge forwards this option.
+
+If gathering is incomplete at the budget, negotiation publishes the current SDP
+only when it contains a usable candidate allowed by `iceTransportPolicy`; otherwise
+it fails with `WEBRTC_ICE_CANDIDATES_UNAVAILABLE`. The entire current SDP is kept,
+including host, server-reflexive and relay candidates already gathered. STUN/TURN
+configuration is preserved. This is batch signaling, not trickle ICE: candidates
+arriving after publication are not exchanged. A network needing slower STUN/TURN
+must choose a longer batch and whole-attempt budget (and, for the native factory,
+an appropriate explicit `iceStunGatherTimeout`/TURN connect timeout). A host-only
+partial batch does not establish public-NAT reachability. No polling or additional
+signaling service is introduced.
+
+Fixed negotiated SCTP channels use protocol
 `chronolog.peer.v2`: stream 0 is reliable and ordered; stream 1 is unordered with
 `maxRetransmits: 0`. Unexpected remotely opened channels are refused.
 
@@ -169,7 +176,7 @@ pnpm exec vitest run packages/transport-webrtc/src
 
 The maintained application qualification uses the packed common session through
 `tools/test-peer-session-webrtc.ts` and the contrib native/browser fixtures.
-Browser qualification transfers both RTC channels into the owning Worker,
+Browser qualification bridges opaque RTC frames to the owning Worker,
 continues application work after the host stops, verifies retained history and
 checks signals and encrypted content through that same session. Loopback gates
 do not establish Internet NAT success rates or TURN interoperability.

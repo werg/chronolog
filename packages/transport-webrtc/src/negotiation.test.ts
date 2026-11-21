@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { WEBRTC_LIMITS } from './channel.js'
 import { negotiateWebRtc, openWebRtcConnection } from './negotiation.js'
-import type { PeerSignaling, RtcDataChannel, RtcPeerConnection, WebRtcChannels } from './types.js'
+import type { PeerDescription, PeerSignaling, RtcDataChannel, RtcPeerConnection, WebRtcChannels } from './types.js'
 
 class Channel extends EventTarget implements RtcDataChannel {
   readonly maxPacketLifeTime = null
@@ -37,6 +38,8 @@ function fixture() {
     async send() {}, close() { closed = true } }
   return { peer, signaling, closed: () => closed, options: { role: 'offerer' as const, signaling, createPeerConnection: () => peer } }
 }
+
+afterEach(() => { vi.useRealTimers() })
 
 describe('WebRTC session lifecycle', () => {
   it('hands off both independently configured lanes together before SDP negotiation', async () => {
@@ -143,5 +146,53 @@ describe('WebRTC session lifecycle', () => {
     }, onDataChannels() {} })).rejects.toThrow('reader already owned')
     expect(value.peer.closed).toBe(true)
     expect(value.closed()).toBe(true)
+  })
+})
+
+
+describe('bounded batch ICE gathering', () => {
+  const host = 'a=candidate:1 1 udp 2122260223 peer.local 49152 typ host'
+  const srflx = 'a=candidate:2 1 udp 1686052607 203.0.113.1 49153 typ srflx raddr 10.0.0.1 rport 49152'
+  function gathering() {
+    const value = fixture()
+    value.peer.iceGatheringState = 'gathering'
+    value.peer.createOffer = async () => ({ type: 'offer', sdp: `v=0\r\n${host}\r\n${srflx}\r\n` })
+    const sent: PeerDescription[] = []
+    return { ...value, sent, options: { ...value.options, timeoutMs: 5000,
+      signaling: { ...value.signaling, async send(description: PeerDescription) { sent.push(description) } } } }
+  }
+  it('publishes all current candidates at the shared budget despite incomplete gathering', async () => {
+    vi.useFakeTimers(); const value = gathering()
+    const opening = negotiateWebRtc({ ...value.options, onDataChannels() {} })
+    await vi.advanceTimersByTimeAsync(WEBRTC_LIMITS.gatheringMs - 1); expect(value.sent).toHaveLength(0)
+    await vi.advanceTimersByTimeAsync(1); const session = await opening
+    expect(value.peer.iceGatheringState).toBe('gathering')
+    expect(value.sent).toEqual([{ type: 'offer', sdp: `v=0\r\n${host}\r\n${srflx}\r\n` }])
+    expect(vi.getTimerCount()).toBe(0); await session.close()
+  })
+  it('publishes immediately when gathering completes early and disposes its phase timer', async () => {
+    vi.useFakeTimers(); const value = gathering()
+    const opening = negotiateWebRtc({ ...value.options, onDataChannels() {} })
+    await vi.advanceTimersByTimeAsync(10)
+    value.peer.iceGatheringState = 'complete'; value.peer.dispatchEvent(new Event('icegatheringstatechange'))
+    const session = await opening; expect(value.sent).toHaveLength(1); expect(vi.getTimerCount()).toBe(0); await session.close()
+  })
+  it.each(['none', 'unspecified', 'relay-policy'] as const)('fails bounded partial gathering with no usable allowed candidate (%s)', async reason => {
+    vi.useFakeTimers(); const value = gathering()
+    if (reason === 'none') value.peer.createOffer = async () => ({ type: 'offer', sdp: 'v=0\r\n' })
+    if (reason === 'unspecified') value.peer.createOffer = async () => ({ type: 'offer', sdp: 'v=0\r\na=candidate:1 1 udp 1 0.0.0.0 0 typ host\r\n' })
+    if (reason === 'relay-policy') value.peer.createOffer = async () => ({ type: 'offer', sdp: `v=0\r\n${host}\r\n` })
+    const opening = negotiateWebRtc({ ...value.options, ...(reason === 'relay-policy' ? { configuration: { iceTransportPolicy: 'relay' as const } } : {}), onDataChannels() {} })
+    const rejected = expect(opening).rejects.toThrow('WEBRTC_ICE_CANDIDATES_UNAVAILABLE')
+    await vi.advanceTimersByTimeAsync(WEBRTC_LIMITS.gatheringMs); await rejected
+    expect(value.sent).toHaveLength(0); expect(value.peer.closed).toBe(true); expect(value.closed()).toBe(true); expect(vi.getTimerCount()).toBe(0)
+  })
+  it('honors an explicit longer batch budget and preserves cancellation without publishing', async () => {
+    vi.useFakeTimers(); const value = gathering(), abort = new AbortController()
+    const opening = negotiateWebRtc({ ...value.options, gatheringTimeoutMs: 2500, signal: abort.signal, onDataChannels() {} })
+    const rejected = expect(opening).rejects.toThrow('cancel gather')
+    await vi.advanceTimersByTimeAsync(2000); expect(value.sent).toHaveLength(0)
+    abort.abort(Error('cancel gather')); await rejected; expect(vi.getTimerCount()).toBe(0); expect(value.peer.closed).toBe(true)
+    for (const gatheringTimeoutMs of [0, -1, 1.5, 5001]) await expect(negotiateWebRtc({ ...value.options, gatheringTimeoutMs, onDataChannels() {} })).rejects.toThrow('WEBRTC_GATHERING_TIMEOUT_INVALID')
   })
 })

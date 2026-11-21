@@ -32,7 +32,7 @@ jobs:
       - run: pnpm package:signals
       - run: pnpm test:signals-package
       - run: pnpm package:control
-      - run: node tools/package-peer-session.mjs --native-rtc --sql-native
+      - run: node tools/package-peer-session.mjs --sql-native
       - name: Verify native SQL package
         shell: bash
         run: |

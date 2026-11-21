@@ -676,17 +676,48 @@ connections; exact saved commands resume through ordinary participation when a
 route becomes available. Direct connections can continue without the relay.
 TURN is not required by this fallback architecture.
 
-In a browser, the page serves `serveWorkerWebRtcConnections(worker)`. The owning
-Worker calls `openWorkerWebRtcConnection(self, options)` through its raw transport
-opener. The Worker owns discovery, signaling and recovery policy; the page performs
-RTC negotiation and synchronously transfers both negotiated channels back. The
-common session then authenticates the connection and verifies the selected
-history. The page retains the peer connection for ICE lifecycle and route
-diagnostics. This API requires a
-browser that supports transferring RTC data channels; unsupported browsers fail
-explicitly. Actual browser qualification is separate from native stream tests.
+In a browser, the page serves `serveWorkerWebRtcConnections(endpoint)`. The
+owning Worker calls `openWorkerWebRtcConnection(endpoint, options)` through its
+raw transport opener. Both APIs accept an ordered, authenticated endpoint with
+`postMessage(message)` and `addEventListener` / `removeEventListener('message',
+listener)`. A DedicatedWorker, an already-started SharedWorker port, or a virtual
+endpoint over an authenticated BroadcastChannel can supply it. Authenticate and
+route virtual endpoints before delivering their messages to this API; a channel
+name or connection ID is not authentication.
 
-The WebRTC CI workflow runs `tools/test-peer-session-webrtc.ts` with actual
+The page uses `openWebRtcConnection` for RTC and raw framing. Only bounded SDP,
+opaque framed peer bytes, acknowledgments and sanitized route classifications
+cross the multiplexed endpoint. The Worker retains keys, peer authentication,
+history and recovery policy. The bridge creates no MessageChannel, transfers no
+ports or RTCDataChannels, and needs no transfer support in a SharedWorker.
+Connection IDs and direction fields isolate simultaneous routes and other RPC
+namespaces; a replacement route performs a fresh Chronolog handshake.
+
+Reliable and live lanes have independent count and byte bounds, including held
+frames and pending dispatch acknowledgments. Reliable sends fail before exceeding
+those bounds; live congestion returns false without queueing a retry. Worker
+receive credit is returned only when its frame reader advances, and page dispatch
+credit only after the underlying raw send settles. Active negotiation, send and
+route requests have finite deadlines; idle connections emit no heartbeat or poll.
+Close/abort settles readers and sends, retires the exact RTC connection, and
+suppresses late signaling, frame and route callbacks. `getRoute()` reports the
+selected ICE route without exposing addresses.
+
+`pnpm exec tsx tools/test-worker-webrtc-endpoint.ts` runs actual Chromium
+SharedWorker, DedicatedWorker and BroadcastChannel endpoint fixtures. Each checks
+bidirectional direct RTC, 3 MiB of ordered reliable frames, disposable frames and
+quiet idle. It also runs a five-second SharedWorker attempt with the real
+Cloudflare STUN server and an additional unreachable STUN address, requiring usable
+partial candidate batches and complete bidirectional traffic before declaring
+success. `gatheringTimeoutMs` bounds each active batch (default
+`WEBRTC_LIMITS.gatheringMs`, exported by `/webrtc`); it preserves gathered candidate
+types and leaves STUN configured. Later candidates are not trickled. Choose a
+longer budget explicitly for networks that need slower STUN/TURN gathering.
+The report includes source and emitted-bundle hashes. It qualifies
+raw transport on loopback ICE; its BroadcastChannel case tests endpoint routing,
+not application authorization or authentication of the channel itself.
+
+The WebRTC CI workflow also runs `tools/test-peer-session-webrtc.ts` with actual
 Chromium, a DedicatedWorker holding OPFS, and a native SQLite peer. Its separate
 source-bound report checks authenticated reconnection with the original saved
 attempt, peer commands, signed live signals and encrypted content after the page
@@ -862,9 +893,16 @@ source files and import edges so downstream builds can verify actual requested
 code against the lazy boundary.
 `--allow-dirty` produces an explicitly marked development artifact. Native and
 browser entries share session classes and ownership state through those chunks.
-Use `--native-rtc` to include the optional native RTC entry. That archive declares
-the exact `werift@0.27.0` peer dependency; the default archive has no runtime
-package dependencies and remains SQL-free.
+The standard archive includes `/webrtc-native` and declares exact
+`werift@0.27.0` as a normal runtime dependency. Installing the session archive
+installs that dependency automatically; there is no extra RTC flag or manual
+peer-dependency step. The default remains SQL-free. The browser and Worker
+import closures do not load Werift or Node built-ins. Provenance records
+`nativeRtc: true`; it describes emitted code, not an optional packaging mode.
+The native factory defaults STUN gathering to 1,000 ms per peer, leaving room
+for both descriptions and framing within a five-second direct attempt. Explicit
+`NativeRtcOptions.iceStunGatherTimeout` overrides remain available; Werift
+expresses this option in seconds (the default is `1`), not milliseconds.
 
 `--sql-native` includes `/sql`, the thin native engine adapter and the exact
 compiled addon. `--sql-browser` includes `/sql` and the verified browser

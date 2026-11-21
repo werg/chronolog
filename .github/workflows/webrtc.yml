@@ -27,8 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      HOST_REF: ${{ inputs.host_ref || '7fa2bdd7e72b7ad85d2c0bc6edcb4167e96678e8' }}
-      CONTRIB_REF: ${{ inputs.contrib_ref || '087c9793cb6e12229aaa27aa1e35408f29b7b3af' }}
+      HOST_REF: ${{ inputs.host_ref || '726376618060183e448a62043e283f7a74964ebe' }}
+      CONTRIB_REF: ${{ inputs.contrib_ref || '4e34d310a2b62ba66c98ce59dc18275c9669976a' }}
     steps:
       - name: Require immutable companion commits
         shell: bash
@@ -68,8 +68,13 @@ jobs:
       - name: Build clean public session artifacts
         id: session_artifacts
         run: |
-          node tools/package-peer-session.mjs --native-rtc --output artifacts/session-rtc
+          node tools/package-peer-session.mjs --output artifacts/session-rtc
           node tools/package-peer-session.mjs --sql-native --output artifacts/session-sql
+      - name: Verify the standard archive installs and closes native RTC without extra dependencies
+        run: |
+          archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node tools/test-peer-session-package.mjs --artifact "${archives[0]}" --output artifacts/default-session-package-check
       # This is an independent interoperability build, never a deployment graph.
       # Package the actual checked-out kernel, including workflow-only revisions;
       # the host may intentionally embed an earlier qualified kernel revision.
@@ -105,6 +110,9 @@ jobs:
         id: chromium
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify portable SharedWorker and DedicatedWorker RTC endpoints
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        run: pnpm exec tsx tools/test-worker-webrtc-endpoint.ts
       - name: Qualify both browser record stores and pinned ownership
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: pnpm exec tsx tools/test-browser-storage.ts
@@ -157,6 +165,9 @@ jobs:
             artifacts/session-sql/*.tgz
             artifacts/session-sql/package/provenance.json
             artifacts/peer-session-sql-check/report.json
+            artifacts/default-session-package-check/report.json
+            artifacts/default-session-package-check/native-process.json
+            artifacts/default-session-package-check/consumer/package-lock.json
             artifacts/qualification/**/report.json
             artifacts/qualification/**/summary.json
             artifacts/qualification/**/host-artifacts.json

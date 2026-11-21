@@ -8,8 +8,8 @@ const workflow = await readFile(new URL('../.github/workflows/webrtc.yml', impor
 // Change these together after qualification. Historical evidence keeps its own
 // source tuple; a workflow-only change does not replace the deployed kernel pin.
 const companions = {
-  host_ref: ['HOST_REF', '7fa2bdd7e72b7ad85d2c0bc6edcb4167e96678e8'],
-  contrib_ref: ['CONTRIB_REF', '087c9793cb6e12229aaa27aa1e35408f29b7b3af'],
+  host_ref: ['HOST_REF', '726376618060183e448a62043e283f7a74964ebe'],
+  contrib_ref: ['CONTRIB_REF', '4e34d310a2b62ba66c98ce59dc18275c9669976a'],
 };
 
 for (const [input, [environment, source]] of Object.entries(companions)) {
@@ -23,7 +23,7 @@ for (const [input, [environment, source]] of Object.entries(companions)) {
 
 test('the workflow packages its own kernel checkout, distinct from the host test build', () => {
   assert.match(workflow, /- uses: actions\/checkout@v6\n {6}- uses: pnpm\/action-setup/u);
-  assert.ok(workflow.includes('node tools/package-peer-session.mjs --native-rtc'));
+  assert.ok(workflow.includes('node tools/package-peer-session.mjs'));
   assert.ok(workflow.includes('node tools/package-peer-session.mjs --sql-native'));
   assert.ok(workflow.includes('Build independent host test artifacts (not for deployment)'));
   assert.ok(workflow.includes('node --test tools/test-companion-workflow-pins.mjs'));

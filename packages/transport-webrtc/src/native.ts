@@ -1,6 +1,7 @@
 import { RTCPeerConnection } from 'werift'
 import type { PeerConfig, RTCDataChannel } from 'werift'
 
+import { WEBRTC_LIMITS } from './channel.js'
 import type { RtcDataChannel, RtcPeerConnection } from './types.js'
 
 export type NativeRtcOptions = Partial<Pick<PeerConfig,
@@ -10,7 +11,11 @@ export type NativeRtcOptions = Partial<Pick<PeerConfig,
 /** Explicit native entrypoint: no Node or Werift bytes enter browser bundles. */
 export function createNativePeerConnection(configuration: RTCConfiguration = {}, native: NativeRtcOptions = {}): RtcPeerConnection {
   if (configuration.certificates !== undefined) throw new Error('WEBRTC_NATIVE_CERTIFICATES_UNSUPPORTED')
-  const peer = new RTCPeerConnection({ ...native, iceUseDefaultStunServer: false, certificateScope: 'peerConnection',
+  // Offer and answer gather serially before framing. Keep default STUN
+  // gathering within a five-second direct attempt. Werift's timeout uses
+  // seconds, not milliseconds; callers may override it.
+  const peer = new RTCPeerConnection({ ...native, iceStunGatherTimeout: native.iceStunGatherTimeout ?? WEBRTC_LIMITS.gatheringMs / 1000,
+    iceUseDefaultStunServer: false, certificateScope: 'peerConnection',
     iceServers: configuration.iceServers?.map(server => ({ urls: server.urls,
       ...(server.username === undefined ? {} : { username: server.username }),
       ...(server.credential === undefined ? {} : { credential: server.credential }) })) ?? [],

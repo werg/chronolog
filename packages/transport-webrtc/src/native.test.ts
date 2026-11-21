@@ -77,3 +77,31 @@ describe('native WebRTC interoperability', () => {
   })
 
 })
+
+
+describe('native STUN gathering budget', () => {
+  it('keeps an unreachable configured STUN server within the five-second direct attempt', async () => {
+    const signals = signalingPair(), stop = new AbortController(), started = performance.now()
+    const configuration: RTCConfiguration = { iceServers: [{ urls: 'stun:127.0.0.1:9' }] }
+    Object.freeze(configuration.iceServers); Object.freeze(configuration)
+    const factory = (configuration: RTCConfiguration) => createNativePeerConnection(configuration, {
+      iceInterfaceAddresses: { udp4: '127.0.0.1' }, iceAdditionalHostAddresses: ['127.0.0.1'], iceUseIpv6: false, iceUseTcp: false,
+    })
+    const opening = [
+      openWebRtcConnection({ role: 'offerer', signaling: signals.a, configuration, createPeerConnection: factory, timeoutMs: 5000, signal: stop.signal }),
+      openWebRtcConnection({ role: 'answerer', signaling: signals.b, configuration, createPeerConnection: factory, timeoutMs: 5000, signal: stop.signal }),
+    ] as const
+    try {
+      const [left, right] = await Promise.all(opening)
+      expect(performance.now() - started).toBeLessThan(5000)
+      const reader = right.frames()[Symbol.asyncIterator]()
+      await left.send(new Uint8Array([1, 2, 3]))
+      expect((await reader.next()).value).toEqual(new Uint8Array([1, 2, 3]))
+      await reader.return?.()
+    } finally {
+      stop.abort()
+      const settled = await Promise.allSettled(opening)
+      await Promise.all(settled.filter(value => value.status === 'fulfilled').map(value => value.value.close()))
+    }
+  })
+})
