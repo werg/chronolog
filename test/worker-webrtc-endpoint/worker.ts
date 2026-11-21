@@ -6,7 +6,7 @@ import type { PeerDescription } from '@chronolog/transport-webrtc'
 function attach(endpoint: ApplicationWorkerEndpoint & { start?(): void }) {
   endpoint.start?.()
   let connection: WorkerWebRtcConnection | undefined, remote: PeerDescription | undefined, wake = () => {}
-  let received = 0, liveReceived = 0, bytes = 0, error: string | undefined
+  let received = 0, liveReceived = 0, bytes = 0, error: string | undefined, changed = () => {}
   let broadcast: BroadcastChannel | undefined
   const signaling = { messages: { async *[Symbol.asyncIterator]() {
     if (remote === undefined) await new Promise<void>(resolve => { wake = resolve })
@@ -29,8 +29,9 @@ function attach(endpoint: ApplicationWorkerEndpoint & { start?(): void }) {
                 if (!frame.every((byte, index) => index < 4 || byte === sequence % 251)) throw Error('FRAME_CONTENT_CHANGED')
                 if (live) liveReceived++
                 else { if (sequence !== received + 1) throw Error('FRAME_ORDER_CHANGED'); received++; bytes += frame.length }
+                changed()
               }
-            } catch (cause) { if (!connection!.signal.aborted) error = String(cause) }
+            } catch (cause) { if (!connection!.signal.aborted) error = String(cause); changed() }
           }
           void read(false); void read(true)
           return { worker: typeof document === 'undefined', route: await connection.getRoute() }
@@ -45,8 +46,17 @@ function attach(endpoint: ApplicationWorkerEndpoint & { start?(): void }) {
           const frame = new Uint8Array(1024).fill(1); new DataView(frame.buffer).setUint32(0, 1)
           return connection!.live!.trySend(frame)
         }
+        case 'received':
+          while (received < value.count || liveReceived < 1) {
+            if (error !== undefined) throw Error(error)
+            connection!.signal.throwIfAborted()
+            await new Promise<void>(resolve => { changed = resolve })
+          }
+          if (error !== undefined) throw Error(error)
+          return { received, liveReceived, bytes }
+        case 'route': return connection!.getRoute()
         case 'state': if (error !== undefined) throw Error(error); return { received, liveReceived, bytes }
-        case 'close': await connection?.close(); broadcast?.close(); return true
+        case 'close': await connection?.close(); changed(); broadcast?.close(); return true
         default: throw Error('FIXTURE_COMMAND_INVALID')
       }
     }
