@@ -27,8 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      HOST_REF: ${{ inputs.host_ref || '7fa2bdd7e72b7ad85d2c0bc6edcb4167e96678e8' }}
-      CONTRIB_REF: ${{ inputs.contrib_ref || '087c9793cb6e12229aaa27aa1e35408f29b7b3af' }}
+      HOST_REF: ${{ inputs.host_ref || '726376618060183e448a62043e283f7a74964ebe' }}
+      CONTRIB_REF: ${{ inputs.contrib_ref || '4e34d310a2b62ba66c98ce59dc18275c9669976a' }}
     steps:
       - name: Require immutable companion commits
         shell: bash
