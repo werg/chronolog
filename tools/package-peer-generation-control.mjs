@@ -16,7 +16,7 @@ const sourceTree = execFileSync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: root
 const result = await build({ entryPoints: entries, outdir: output, outExtension: { '.js': '.mjs' }, bundle: true,
   platform: 'browser', format: 'esm', target: 'es2022', metafile: true, logLevel: 'warning', absWorkingDir: root });
 const inputs = [...Object.keys(result.metafile.inputs), 'tools/package-peer-generation-control.mjs', 'packages/peer-generation/package.json'].sort();
-if (inputs.some(path => /(?:materializer|transport-ssb|node-core\/src\/node\.ts|peer-session|node:)/u.test(path)))
+if (inputs.some(path => /(?:materializer|peer-session|node:)/u.test(path)))
   throw new Error('The generation control artifact must not import SQL, application sessions or native transports');
 const participant = Object.entries(result.metafile.outputs).find(([path]) => path.endsWith('/participant.mjs'))?.[1];
 if (!participant || Object.keys(participant.inputs).some(path => path !== 'packages/peer-generation/src/participant.ts'))

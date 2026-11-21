@@ -1,34 +1,11 @@
 import { sha256 } from '@chronolog/canonical'
 
-import { concatBytes, equalBytes, utf8 } from './bytes.js'
-import type { CborValue } from './cbor.js'
-import { encodeCanonicalCbor } from './cbor.js'
+import { concatBytes, utf8 } from './bytes.js'
 import { ProtocolError, protocolInvariant } from './errors.js'
 
 export const DOMAINS = {
   transaction: 'chronolog/transaction-core/v1',
-  transactionDigest: 'chronolog/transaction-digest/v1',
-  attestation: 'chronolog/transaction-attestation/v1',
-  heartbeat: 'chronolog/validator-heartbeat/v1',
-  envelope: 'chronolog/envelope/v1',
-  canonicalResult: 'chronolog/sql-result/v1',
-  genesis: 'chronolog/genesis/v2',
-  capabilityRevision: 'chronolog/capability-revision/v1',
-  capabilityGrant: 'chronolog/capability-grant/v1',
-  validationPolicy: 'chronolog/validation-policy/v1',
-  capabilitySnapshot: 'chronolog/capability-snapshot/v1',
-  enrollmentRequest: 'chronolog/enrollment-request/v1',
-  enrollmentApproval: 'chronolog/enrollment-approval/v1',
-  publisherRequest: 'chronolog/publisher-request/v1',
-  publisherApproval: 'chronolog/publisher-approval/v1',
-  governanceClosure: 'chronolog/governance-closure/v1',
-  snapshotManifest: 'chronolog/snapshot-manifest/v1',
   materializedLog: 'chronolog/materialized-log/v1',
-  epochManifest: 'chronolog/epoch-manifest/v1',
-  epochKey: 'chronolog/epoch-key/v1',
-  epochWrap: 'chronolog/epoch-wrap/v1',
-  epochPayload: 'chronolog/epoch-payload/v1',
-  drillEvidence: 'chronolog/drill-evidence/v1',
   peerDescriptor: 'chronolog/peer-generation/descriptor/v1',
   peerSchema: 'chronolog/peer-generation/schema/v1',
   peerPublication: 'chronolog/publication/v1',
@@ -39,10 +16,6 @@ export const DOMAINS = {
   peerOrder: 'chronolog/peer-generation/order/v1',
   peerCoverage: 'chronolog/peer-generation/coverage/v1',
   peerConnection: 'chronolog/peer-generation/connection/v1',
-  releasePolicy: 'chronolog/release/policy/v1',
-  releaseManifest: 'chronolog/release/manifest/v1',
-  releaseRequest: 'chronolog/release/activation-request/v1',
-  releaseActivation: 'chronolog/release/activation/v1',
 } as const
 
 export type ProtocolDomain = (typeof DOMAINS)[keyof typeof DOMAINS]
@@ -53,10 +26,6 @@ export function domainSeparatedBytes(domain: ProtocolDomain, payload: Uint8Array
 
 export async function hashDomain(domain: ProtocolDomain, payload: Uint8Array): Promise<Uint8Array> {
   return sha256(domainSeparatedBytes(domain, payload))
-}
-
-export async function hashCanonical(domain: ProtocolDomain, value: CborValue): Promise<Uint8Array> {
-  return hashDomain(domain, encodeCanonicalCbor(value))
 }
 
 export interface Ed25519KeyPair {
@@ -133,12 +102,4 @@ export async function verifyDomain(
   } catch {
     return false
   }
-}
-
-export async function assertDigest(
-  domain: ProtocolDomain,
-  payload: Uint8Array,
-  expected: Uint8Array,
-): Promise<void> {
-  protocolInvariant(equalBytes(await hashDomain(domain, payload), expected), 'DIGEST_MISMATCH', 'Protocol digest does not match payload')
 }

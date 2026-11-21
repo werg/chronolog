@@ -9,6 +9,5 @@ export * from './program.js'
 export * from './sql.js'
 
 export * from './events.js'
-export * from './views.js'
 export * from './sealed.js'
 export * from './row-key.js'

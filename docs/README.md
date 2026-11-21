@@ -1,18 +1,10 @@
 # Chronolog documentation
 
-The public application composition is the [owned session](../packages/peer-session/README.md).
-Every participant uses its operation, query, replication and recovery contracts.
-
-- [Architecture and authority](peer-generation-v1.md): selected history,
-  participant roles, control, publication, recovery and bounded retention.
-- [Deterministic SQL](implementation-specs/10-deterministic-sql-transactions.md):
-  programs, limits, execution identity, original authorship and atomic outcomes.
-- [Row ownership](design-owner-rows.md): data authorization independent of
-  sequencing and control rights.
-- [Sealed values](sealed-data.md): explicit reader encryption and its limits.
-- [Qualification](release-hardening.md): current test, artifact and deployment gates.
-- [Browser record storage](browser-storage.md): OPFS/IndexedDB backend pinning, diagnostics, browser qualification and recovery limits.
-
-Superseded daemon, hosted application, RPC and finality application guides have
-been removed. Git history retains past implementations and their evidence. They
-are not supported alternative compositions.
+- [Session API reference](../packages/peer-session/README.md): definitions, devices, commands, queries, participation, recovery, browser Workers, content, and tools.
+- [Architecture and authority](peer-generation-v1.md): generations, participant roles, controls, publications, ancestry, and storage bounds.
+- [Deterministic SQL](implementation-specs/10-deterministic-sql-transactions.md): change programs, limits, execution identity, and atomic outcomes.
+- [Row ownership](design-owner-rows.md): SQL data ownership and collective membership.
+- [Sealed values](sealed-data.md): explicit recipient encryption for private fields.
+- [Browser storage](browser-storage.md): OPFS/IndexedDB selection, locking, and capability probing.
+- [Qualification](release-hardening.md): test suites, packaging, and verification gates.
+- [Materializer](../packages/materializer/README.md) | [Signals](../packages/signals/README.md) | [WebRTC transport](../packages/transport-webrtc/README.md)

@@ -30,9 +30,8 @@ const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: 
   } }] : [],
   outExtension: { '.js': '.mjs' }, chunkNames: 'chunks/[name]-[hash]' });
 const runtimeInputs = Object.keys(bundled.metafile.inputs).sort();
-assert(runtimeInputs.every(path => !/(?:transport-ssb|agent-service|control-store|runtime-browser|testkit)\//u.test(path) &&
-  (sqlEnabled || !path.includes('materializer-doltlite/'))),
-  'The default session artifact must not contain SQL, legacy native services or fixtures');
+assert(runtimeInputs.every(path => sqlEnabled || !path.includes('materializer-doltlite/')),
+  'The default session artifact must not contain SQL engine code');
 assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).every(value => !value.external || value.path.startsWith('node:') ||
   value.path === 'werift' || values['sql-native'] && value.path === engineImport),
   'The session artifact may import only its declared native runtime dependencies');

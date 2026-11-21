@@ -1,97 +1,59 @@
 # Chronolog
 
-Chronolog is an owned application session for browser Workers and native peers.
-One eligible peer orders commands. All readers verify the original author,
-selected order and execution contract, then materialize the same history.
+Chronolog is an owned, peer-to-peer application session for browser Workers and Node.js peers. One eligible peer orders commands per generation; every peer verifies original authorship, selected order, and the execution contract before materializing state locally.
 
-The application API has one command journal, one query and event model, and one
-replication and recovery lifecycle. Participant roles determine what a participant
-may receive or do. Transports deliver those same scoped messages. A server can
-participate in control, discovery and signed code publication without receiving
-application bodies or executing ordinary commands. Its separate WebSocket relay
-capability forwards opaque peer ciphertext when a direct WebRTC route is
-unavailable. Both routes use the same authenticated encrypted channel and session.
+## Core model
 
-This is prerelease software. Breaking changes update every maintained consumer;
-there are no alternate legacy applications, profile selectors or migration layers.
+- **Signed command journal**: `command()` durably stores one signed, encrypted attempt before dispatch. Retrying preserves the original bytes and operation identity.
+- **Explicit outcomes**: `applied()` resolves with acceptance or rejection at a `(generation, sequence)`. `shared()` observes independent peer retention.
+- **Coherent views**: `query()` and `readView()` expose consistent SQL, events, outcomes, and revision. Recovery switches all of them together.
+- **Replaceable coordination**: Signed control transitions select a successor coordinator and adopt a verified prefix. Excluded work stays inspectable and requires explicit reapplication.
+- **Monotonic authority**: Reader, writer, coordinator, recovery, administration, and publication grants are explicit and never roll back with data recovery.
+- **Unified session**: Live ephemeral signals and encrypted chunked content share the same identity, authorization, and lifetime.
+- **Transport independence**: Direct WebRTC and WebSocket relay share one framed, authenticated, encrypted channel. Control services participate only in authority, discovery, and signed code publication—never application payloads.
 
-## Application contract
+## Quick start
 
-- `command()` saves one signed, encrypted attempt before sending it. An exact
-  retry preserves the original bytes and operation identity.
-- `applied()` reports acceptance or rejection at a generation and sequence.
-  `shared()` reports independently retained copies of that prefix.
-- `query()` and `readView()` capture coherent state. SQL, events, outcomes and
-  revision switch together during recovery.
-- A signed control transition selects a replacement coordinator. It may adopt
-  an earlier surviving prefix. Excluded work remains inspectable and requires
-  deliberate reapplication with a new linked identity.
-- Revocation and other control state do not roll back with application data.
-  Reader, writer, coordinator, recovery and administration rights are explicit.
-- Live signals and encrypted chunked content use the same session identity,
-  ownership and lifetime. They do not create another outbox or execution path.
-- Irreversible external effects require an explicit protected service. Applying
-  an ordinary command never dispatches such an effect automatically.
-
-A healthy generation on direct peer connections continues with every host
-endpoint blocked. Relayed connections require their forwarding service, while
-control-service outages do not interrupt an already selected generation. If both the
-coordinator and control service are unavailable, commands stay saved locally.
-The system does not fabricate a successor or promise that all data copies survive.
-
-## Start with the public session
-
-See the [session guide](packages/peer-session/README.md) for application
-definitions, owned storage, enrollment, network connections, Worker ownership,
-control attachment, publication, content, recovery and local agent tools.
+See the [session reference](packages/peer-session/README.md) for the complete API.
 
 ```ts
+import { openNativeApplication, openNativeDevice } from '@chronolog/peer-session/native'
+
 const session = await openNativeApplication({ device, definition, authority })
 const control = session.connectControlParticipant({ exchange })
 try {
   const before = await session.query('messages', null)
-  const operation = await session.command('say', { text: 'Hello' }, {
-    operationId: crypto.randomUUID(), basedOn: before.revision,
+  const op = await session.command('say', { text: 'Hello' }, {
+    operationId: crypto.randomUUID(),
+    basedOn: before.revision,
   })
-  const result = await operation.applied()
+  const result = await op.applied()
   console.log(result.generation, result.sequence, result.outcome)
 } finally {
   await session.close()
 }
 ```
 
-`definition` is the shared schema-validated command/query declaration. `device`
-is explicitly created or enrolled and then resumed; missing keys never silently
-create a replacement identity. `authority` is the signed descriptor, controls and
-generation chain. `exchange` is the hosted participant transport. Attaching it
-performs no I/O and does not give the host reader access.
+Native peers store data in SQLite under an exclusive writer lock; browser peers run the same session inside an owning Worker using OPFS or IndexedDB under an exclusive Web Lock.
 
-A browser uses the same session in an owning Worker, with OPFS and a Web Lock.
-Native storage uses SQLite and an exclusive writer lock. The page facade forwards
-to that owner. Closing the session releases owned transports, streams and storage.
-
-## Package boundaries
+## Packages
 
 | Package | Responsibility |
 | --- | --- |
-| `peer-session` | Public lifecycle, commands, queries, operation journal, recovery, content, keys and tools |
-| `peer-generation` | Signed authority, ordering, selected ancestry, replica verification and participant protocol |
-| `records` | Shared byte store, native/browser ownership and bounded transport framing |
-| `materializer` | Execution contract and SQL-free event implementation |
-| `materializer-doltlite` | Deterministic SQL execution with native and WASM engine adapters |
-| `transport-webrtc` | RTC connections, bounded delivery and signaling mechanics |
-| `transport-websocket` | Two independent binary sockets using the same bounded message framing |
-| `signals` | Replaceable, bounded ephemeral application signals |
-| `protocol`, `crypto`, `canonical` | Programs, canonical encodings, digests and cryptography |
-| `conformance` | Execution equivalence, crash/reopen and resource qualification |
+| `peer-session` | Public session lifecycle, commands, queries, recovery, content, keys, participation, and tools |
+| `peer-generation` | Signed authority, generation ordering, ancestry verification, replica replay, and publications |
+| `records` | Bounded byte stores (native SQLite, browser OPFS/IndexedDB), framing, and flow-controlled channels |
+| `materializer` | Execution contract and SQL-free event materializer |
+| `materializer-doltlite` | Deterministic SQL execution over native and WASM DoltLite engines |
+| `transport-webrtc` | Browser and native WebRTC negotiation, reliable/live channels, and HTTP introductions |
+| `transport-websocket` | Dual-socket reliable/live WebSocket transport |
+| `signals` | Bounded, signed ephemeral JSON signals |
+| `protocol`, `crypto`, `canonical` | Deterministic CBOR, domain hashing, Ed25519/HPKE/AES-GCM, programs, and SQL validation |
+| `conformance` | Cross-engine execution equivalence, crash/reopen, and soak qualification |
 
-`peer-generation-v1` is the immutable signed record format identifier. It does
-not select a different application runtime or public API. SQL availability is an
-explicit engine capability; participant transport and role do not alter replay.
+## Build, test, and package
 
-## Build and qualify
-
-Use Node 24 and the pinned package manager:
+Requires Node 22+ (Node 24 for native SQLite/packaging checks) and pnpm 10:
 
 ```sh
 corepack pnpm install --frozen-lockfile
@@ -102,7 +64,7 @@ corepack pnpm build
 corepack pnpm docs:check
 ```
 
-Package the supported composition from clean source:
+Package clean standalone archives:
 
 ```sh
 node tools/package-peer-session.mjs
@@ -111,18 +73,12 @@ node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-sessio
 node tools/package-peer-generation-control.mjs
 ```
 
-Archives include self-contained declarations, shared ESM chunks and exact source,
-tree, input and artifact hashes. Native SQL packaging requires the exact patched
-engine. The standard browser/native session archive includes the pinned native RTC dependency and remains SQL-free; browser entries do not load the native dependency. A development
-archive requires explicit `--allow-dirty` and records that fact.
+## Documentation
 
-The [independent Tendriller recipes](https://github.com/werg/tendriller-contrib/tree/refactor/owned-peer-data-plane/cookbooks/run-a-peer-application)
-consume these packages and qualify conversation, guarded tasks, native RTC,
-browser ownership, WebSocket fallback and actual hosted control/publication. CI
-pins exact consumer commits. Loopback and local Worker results do not establish
-Internet reachability, browser suspension or provider cost savings. TURN is not
-required; relay bandwidth and availability remain explicit operating costs.
-
-Read the [architecture](docs/peer-generation-v1.md), [SQL contract](docs/implementation-specs/10-deterministic-sql-transactions.md)
-and [qualification guide](docs/release-hardening.md) for the trust and operating
-limits. There is no mandatory permanent resident or hosted command executor.
+- [Session API reference](packages/peer-session/README.md)
+- [Architecture and authority](docs/peer-generation-v1.md)
+- [Deterministic SQL](docs/implementation-specs/10-deterministic-sql-transactions.md)
+- [Row ownership](docs/design-owner-rows.md)
+- [Sealed values](docs/sealed-data.md)
+- [Browser storage](docs/browser-storage.md)
+- [Qualification](docs/release-hardening.md)

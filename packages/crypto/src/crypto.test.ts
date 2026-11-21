@@ -1,12 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { DOMAINS, generateEd25519KeyPair, utf8, verifyDomain } from '@chronolog/protocol'
+import { utf8 } from '@chronolog/protocol'
 import {
-  MemoryKeyStore,
-  createEpochManifest,
-  decodeSignedEpochManifest,
   decryptEpochPayload,
   encryptEpochPayload,
-  encodeSignedEpochManifest,
   exportX25519PrivateKey,
   generateX25519KeyPair,
   hpkeOpenBase,
@@ -14,8 +10,6 @@ import {
   hpkeSendExportBase,
   hpkeReceiveExportBase,
   importX25519PrivateKey,
-  unwrapEpochKey,
-  verifyEpochManifest,
 } from './index.js'
 
 const bytes = (value: number, length = 32) => new Uint8Array(length).fill(value)
@@ -41,7 +35,6 @@ describe('RFC 9180 base-mode adapter', () => {
   })
 
   it('opens the published CFRG X25519/HKDF-SHA256/AES-256-GCM vector', async () => {
-    // CFRG source vector: https://github.com/cfrg/draft-irtf-cfrg-hpke/blob/master/test-vectors.json
     const privateKey = await importX25519PrivateKey(hex(
       '302e020100300506032b656e04220420' +
       '497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d',
@@ -58,7 +51,6 @@ describe('RFC 9180 base-mode adapter', () => {
   })
 
   it('matches all published CFRG AES-256-GCM exported-secret vectors', async () => {
-    // https://github.com/cfrg/draft-irtf-cfrg-hpke/blob/master/test-vectors.json
     const privateKey = await importX25519PrivateKey(hex('302e020100300506032b656e04220420' +
       '497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d'))
     for (const [context, expected] of [
@@ -107,19 +99,7 @@ describe('RFC 9180 base-mode adapter', () => {
   })
 })
 
-describe('signed encryption epochs', () => {
-  it('signs an epoch with no recipients after the final reader is removed', async () => {
-    const signer = await generateEd25519KeyPair(), removed = await generateX25519KeyPair()
-    const created = await createEpochManifest({ groupId: bytes(1), epoch: 5n, membershipRevision: bytes(2),
-      createdAtMs: 100n, recipients: [], signerPublicKey: signer.publicKeyBytes, signerPrivateKey: signer.privateKey })
-    const signedManifest = decodeSignedEpochManifest(encodeSignedEpochManifest(created.signedManifest))
-    expect(signedManifest.manifest.wraps).toEqual([])
-    expect(created.contentKey).toHaveLength(32)
-    expect(await verifyEpochManifest(signedManifest, signer.publicKeyBytes)).toBe(true)
-    await expect(unwrapEpochKey({ signedManifest, trustedSigner: signer.publicKeyBytes,
-      recipientId: bytes(20), recipientPrivateKey: removed.privateKey })).rejects.toMatchObject({ code: 'INVALID_KEY' })
-  })
-
+describe('epoch payload encryption', () => {
   it('encrypts and decrypts exactly the supplied pooled Buffer views', async () => {
     const key = Buffer.from(bytes(9))
     const backing = Buffer.allocUnsafe(96).fill(0xa5)
@@ -137,60 +117,11 @@ describe('signed encryption epochs', () => {
     expect(Uint8Array.from(plaintext)).toEqual(expected)
   })
 
-  it('owns its supplied Buffer content key rather than aliasing caller storage', async () => {
-    const signer = await generateEd25519KeyPair()
-    const recipient = await generateX25519KeyPair()
-    const contentKey = Buffer.from(bytes(9))
-    const expected = Uint8Array.from(contentKey)
-    const created = await createEpochManifest({
-      groupId: bytes(1), epoch: 1n, membershipRevision: bytes(2), createdAtMs: 100n,
-      recipients: [{ recipientId: bytes(20), publicKey: recipient.publicKeyBytes }],
-      signerPublicKey: signer.publicKeyBytes, signerPrivateKey: signer.privateKey, contentKey,
-    })
-    contentKey.fill(0xa5)
-    expect(created.contentKey.byteLength).toBe(32)
-    expect(created.contentKey).toEqual(expected)
-    expect(await unwrapEpochKey({ signedManifest: created.signedManifest, trustedSigner: signer.publicKeyBytes, recipientId: bytes(20), recipientPrivateKey: recipient.privateKey })).toEqual(expected)
-  })
-
-  it('wraps one content key independently to every active reader', async () => {
-    const signer = await generateEd25519KeyPair()
-    const first = await generateX25519KeyPair()
-    const second = await generateX25519KeyPair()
-    const created = await createEpochManifest({
-      groupId: bytes(1), epoch: 4n, membershipRevision: bytes(2), createdAtMs: 100n,
-      recipients: [
-        { recipientId: bytes(20), publicKey: first.publicKeyBytes },
-        { recipientId: bytes(21), publicKey: second.publicKeyBytes },
-      ],
-      signerPublicKey: signer.publicKeyBytes, signerPrivateKey: signer.privateKey,
-    })
-    const signedManifest = decodeSignedEpochManifest(encodeSignedEpochManifest(created.signedManifest))
-    expect(await verifyEpochManifest(signedManifest, signer.publicKeyBytes)).toBe(true)
-    expect(await unwrapEpochKey({ signedManifest, trustedSigner: signer.publicKeyBytes, recipientId: bytes(20), recipientPrivateKey: first.privateKey })).toEqual(created.contentKey)
-    expect(await unwrapEpochKey({ signedManifest: created.signedManifest, trustedSigner: signer.publicKeyBytes, recipientId: bytes(21), recipientPrivateKey: second.privateKey })).toEqual(created.contentKey)
-    await expect(unwrapEpochKey({ signedManifest: created.signedManifest, trustedSigner: bytes(99), recipientId: bytes(20), recipientPrivateKey: first.privateKey })).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
-  })
-
   it('encrypts payloads with the epoch and caller routing header bound as AAD', async () => {
     const key = bytes(9)
     const encrypted = await encryptEpochPayload(key, 12n, utf8('private transaction'), utf8('visible header'))
     expect(await decryptEpochPayload(key, encrypted, utf8('visible header'))).toEqual(utf8('private transaction'))
     await expect(decryptEpochPayload(key, encrypted, utf8('different header'))).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
     await expect(decryptEpochPayload(key, { ...encrypted, epoch: 13n }, utf8('visible header'))).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
-  })
-})
-
-describe('key-store abstraction', () => {
-  it('purpose-separates signing and recipient keys without exporting secrets', async () => {
-    const store = new MemoryKeyStore()
-    const signer = await store.create('device-signing', 'signing')
-    await store.create('device-hpke', 'hpke-recipient')
-    const signature = await store.sign('device-signing', DOMAINS.transaction, utf8('payload'))
-    expect(await verifyDomain(DOMAINS.transaction, utf8('payload'), signature, signer.publicKey)).toBe(true)
-    await expect(store.sign('device-hpke', DOMAINS.transaction, utf8('payload'))).rejects.toMatchObject({ code: 'INVALID_KEY' })
-    expect(await store.list()).toHaveLength(2)
-    await store.delete('device-signing')
-    await expect(store.exportPublic('device-signing')).rejects.toMatchObject({ code: 'INVALID_KEY' })
   })
 })

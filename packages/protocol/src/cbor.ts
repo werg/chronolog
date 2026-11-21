@@ -14,7 +14,7 @@ import { ProtocolError } from './errors.js'
 export type { CborMapKey, CborValue }
 export { encodeCanonicalCbor }
 
-/** Backward-compatible protocol limit names over the shared bounded decoder. */
+/** Protocol CBOR decode limits mapped onto the shared bounded decoder. */
 export interface CborDecodeLimits {
   readonly maxBytes?: number
   readonly maxDepth?: number

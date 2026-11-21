@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  DEFAULT_DECODE_LIMITS, HASH_DOMAINS, assertCanonicalCbor, bytesToHex, bytesToInt64,
-  bytesToUint32, bytesToUint64, decodeCanonicalCbor, domainSeparatedBytes, encodeCanonicalCbor,
-  hashDomain, int64Bytes, sha256, uint32Bytes, uint64Bytes, utf8,
+  DEFAULT_DECODE_LIMITS, HASH_DOMAINS, assertCanonicalCbor, bytesToHex,
+  decodeCanonicalCbor, domainSeparatedBytes, encodeCanonicalCbor,
+  hashDomain, sha256, utf8,
 } from './index.js'
 
 describe('canonical primitives', () => {
@@ -50,12 +50,6 @@ describe('canonical primitives', () => {
 
   it('rejects unpaired UTF-16 surrogates', () => {
     expect(() => utf8('\ud800')).toThrow(/surrogate|UTF-8/i)
-  })
-
-  it('round-trips fixed-width integer boundaries', () => {
-    expect(bytesToUint32(uint32Bytes(0xffff_ffff))).toBe(0xffff_ffff)
-    expect(bytesToUint64(uint64Bytes((1n << 64n) - 1n))).toBe((1n << 64n) - 1n)
-    expect(bytesToInt64(int64Bytes(-(1n << 63n)))).toBe(-(1n << 63n))
   })
 
   it('uses a unique typed, length-prefixed hash domain registry', async () => {

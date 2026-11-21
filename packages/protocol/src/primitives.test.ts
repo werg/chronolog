@@ -18,14 +18,14 @@ describe('domain-separated protocol cryptography', () => {
     const signature = await signDomain(DOMAINS.transaction, payload, pair.privateKey)
     expect(signature).toHaveLength(64)
     expect(await verifyDomain(DOMAINS.transaction, payload, signature, pair.publicKeyBytes)).toBe(true)
-    expect(await verifyDomain(DOMAINS.attestation, payload, signature, pair.publicKeyBytes)).toBe(false)
+    expect(await verifyDomain(DOMAINS.peerOrder, payload, signature, pair.publicKeyBytes)).toBe(false)
     expect(await verifyDomain(DOMAINS.transaction, utf8('changed'), signature, pair.publicKeyBytes)).toBe(false)
   })
 
   it('separates hashes for identical bytes in different structures', async () => {
     const payload = utf8('same')
-    expect(await hashDomain(DOMAINS.transactionDigest, payload)).not.toEqual(
-      await hashDomain(DOMAINS.canonicalResult, payload),
+    expect(await hashDomain(DOMAINS.materializedLog, payload)).not.toEqual(
+      await hashDomain(DOMAINS.peerDescriptor, payload),
     )
   })
 
