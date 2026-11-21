@@ -7,7 +7,7 @@ import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from
 import type { ContentReference, ContentRetention, ContentUpload } from './content.js'
 import type { ApplicationRecoveryExpectation, ApplicationTransition } from './recovery.js'
 import type { ApplicationChange, ApplicationEventBatch, ApplicationEventOptions, CommandOptions, QueryParameter, QueryRows, SessionStatus } from './session-types.js'
-import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
+import type { ApplicationParticipation, ApplicationParticipationStatus, ApplicationConnectionDiagnostic } from './participation-types.js'
 import type { ApplicationProjectionHandle, ApplicationProjectionSnapshot } from './projection-types.js'
 import { AbandonedOperationError, RecoveredViewError } from './errors.js'
 import { awaitOwnedTask } from './lifetime.js'
@@ -113,6 +113,11 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
           try { listener(structuredClone(owner.#snapshot.participation!)) } catch { /* Observation does not own participation. */ }
           return () => { owner.#participationListeners.delete(listener) }
         },
+        diagnostics: async () => {
+          const value: unknown = await this.#call('participation.diagnostics', [])
+          validateConnectionDiagnostics(value); return value
+        },
+        reconsiderConnections: () => this.#call('participation.reconsider', []),
         approveRecovery: id => this.#call('participation.approve', [id]),
         close: () => this.#call('participation.close', []),
       }
@@ -446,4 +451,22 @@ function validEndpoint(value: ApplicationEndpointBinding | undefined): value is 
     value.evidence === 'owner-bound' && ['caller-asserted', 'owner-validated'].includes(value.contextEvidence) &&
     value.context !== null && typeof value.context === 'object' && Array.isArray(value.capabilities) &&
     value.capabilities.length <= 8 && value.capabilities.every((item: unknown) => typeof item === 'string' && ['commands', 'queries', 'events', 'content', 'signals', 'operations', 'diagnostics', 'ownerAdmin'].includes(item))
+}
+
+function validateConnectionDiagnostics(value: unknown): asserts value is readonly ApplicationConnectionDiagnostic[] {
+  if (!Array.isArray(value) || value.length > 8) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+  const peers = new Set<string>()
+  for (const item of value as unknown[]) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+    const record = item as Record<string, unknown>
+    const counts = ['sentBytes', 'receivedBytes', 'sentReliableBytes', 'receivedReliableBytes', 'sentLiveBytes', 'receivedLiveBytes', 'sentRequests', 'receivedRequests']
+    if (Object.keys(record).some(key => !['peerId', 'kind', 'reason', ...counts].includes(key)) ||
+        typeof record.peerId !== 'string' || !/^[0-9a-f]{64}$/u.test(record.peerId) || peers.has(record.peerId) ||
+        !['direct', 'relay', 'unknown'].includes(record.kind as string) ||
+        record.reason !== undefined && !['direct_failed', 'direct_timeout'].includes(record.reason as string) ||
+        counts.some(key => !Number.isSafeInteger(record[key]) || (record[key] as number) < 0) ||
+        record.sentBytes !== (record.sentReliableBytes as number) + (record.sentLiveBytes as number) ||
+        record.receivedBytes !== (record.receivedReliableBytes as number) + (record.receivedLiveBytes as number)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+    peers.add(record.peerId)
+  }
 }

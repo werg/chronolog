@@ -32,13 +32,34 @@ class Introductions {
   readonly #connections = new Map<string, FramedPeerConnection>()
   readonly counts = { reads: 0, advertisements: 0, withdrawals: 0, opens: 0, frames: 0 }
   unavailable = false
-  counted(connection: FramedPeerConnection): FramedPeerConnection {
-    return { signal: connection.signal, ...(connection.live === undefined ? {} : { live: connection.live }),
+  kind: 'direct' | 'relay' = 'direct'
+  directAvailable = true
+  upgradeAttempts = 0
+  readonly descriptions = new WeakMap<FramedPeerConnection, { kind: 'direct' | 'relay' }>()
+  counted(connection: FramedPeerConnection, kind = this.kind): FramedPeerConnection {
+    const value: FramedPeerConnection = { signal: connection.signal, ...(connection.live === undefined ? {} : { live: connection.live }),
       send: (frame, options) => { this.counts.frames++; return connection.send(frame, options) },
       frames: signal => connection.frames(signal), close: () => connection.close() }
+    this.descriptions.set(value, {kind}); return value
   }
   ports(identity: string): { discovery: ApplicationDiscoveryPort; transport: ApplicationTransportPort } {
     const hub = this
+    const open = async (input: Parameters<ApplicationTransportPort['open']>[0], { signal }: {signal:AbortSignal}, upgrade: boolean): Promise<FramedPeerConnection> => {
+          signal.throwIfAborted(); hub.counts.opens++
+          if (input.invitation !== undefined) {
+            if (typeof input.invitation !== 'string') throw new Error('INVITATION_INVALID')
+            const connection = hub.#connections.get(input.invitation)
+            if (connection === undefined) throw new Error('INVITATION_EXPIRED')
+            hub.#connections.delete(input.invitation); return connection
+          }
+          const target = hub.#listeners.get(input.peer.identity)
+          if (target === undefined) throw new Error('PEER_UNAVAILABLE')
+          const [left, right] = createFramedPeerConnectionPair(), token = crypto.randomUUID()
+          const kind = upgrade ? 'direct' : hub.kind
+          hub.#connections.set(token, hub.counted(right, kind))
+          target({ peer: { identity, route: identity }, token, ...(upgrade ? {upgrade:true as const} : {}) })
+          return hub.counted(left, kind)
+    }
     return {
       discovery: {
         async read({ signal }) { signal.throwIfAborted(); hub.counts.reads++; if (hub.unavailable) throw new Error('DIRECTORY_OFFLINE'); return [...hub.directory.values()] },
@@ -85,21 +106,9 @@ class Introductions {
         },
       },
       transport: {
-        async open(input, { signal }) {
-          signal.throwIfAborted(); hub.counts.opens++
-          if (input.invitation !== undefined) {
-            if (typeof input.invitation !== 'string') throw new Error('INVITATION_INVALID')
-            const connection = hub.#connections.get(input.invitation)
-            if (connection === undefined) throw new Error('INVITATION_EXPIRED')
-            hub.#connections.delete(input.invitation); return hub.counted(connection)
-          }
-          const target = hub.#listeners.get(input.peer.identity)
-          if (target === undefined) throw new Error('PEER_UNAVAILABLE')
-          const [left, right] = createFramedPeerConnectionPair(), token = crypto.randomUUID()
-          hub.#connections.set(token, right)
-          target({ peer: { identity, route: identity }, token })
-          return hub.counted(left)
-        },
+        open: (input, options) => open(input, options, false),
+        upgrade: (input, options) => { hub.upgradeAttempts++; if (!hub.directAvailable) return Promise.reject(new Error('UDP_BLOCKED')); return open(input, options, true) },
+        describe: connection => hub.descriptions.get(connection) ?? {kind:'unknown'},
       },
     }
   }
@@ -199,6 +208,54 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
 }
 
 describe('owned application participation', () => {
+  it('upgrades a working relay on a real event, retaining its identity, generation and commands', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    f.hub.kind = 'relay'
+    const ap = f.participate(a), bp = f.participate(b)
+    await until(() => bp.status.phase === 'following')
+    await until(async () => (await bp.diagnostics())[0]?.kind === 'relay')
+    const generation = b.status.generation
+    await post(b, 'before-upgrade')
+    await bp.reconsiderConnections()
+    await until(async () => (await bp.diagnostics())[0]?.kind === 'direct' && (await ap.diagnostics())[0]?.kind === 'direct')
+    await post(b, 'after-upgrade')
+    expect(b.status.generation).toBe(generation)
+    expect(f.counts.selections).toBe(0)
+    expect(bp.status.connectedPeers).toEqual([a.deviceId])
+    const counters = await bp.diagnostics()
+    expect(counters[0]).toMatchObject({kind:'direct',peerId:a.deviceId})
+    expect(counters[0]!.sentBytes).toBeGreaterThan(0)
+    const counts = {...f.hub.counts}
+    await bp.diagnostics(); await bp.diagnostics()
+    expect(f.hub.counts).toEqual(counts)
+  })
+
+  it('coalesces failed upgrades and preserves the working relay without scheduled retry', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    f.hub.kind = 'relay'; f.hub.directAvailable = false
+    f.participate(a); const bp = f.participate(b)
+    await until(() => bp.status.phase === 'following')
+    await Promise.all(Array.from({length:20}, () => bp.reconsiderConnections()))
+    expect(f.hub.upgradeAttempts).toBe(1)
+    await post(b, 'still-relayed')
+    expect((await bp.diagnostics())[0]?.kind).toBe('relay')
+    await bp.reconsiderConnections()
+    expect(f.hub.upgradeAttempts).toBe(1)
+    expect(bp.status.phase).toBe('following')
+    expect(f.counts.selections).toBe(0)
+  })
+
+  it('does not probe an already direct link and returns isolated diagnostics', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    f.participate(a); const bp = f.participate(b)
+    await until(() => bp.status.phase === 'following')
+    await bp.reconsiderConnections()
+    expect(f.hub.upgradeAttempts).toBe(0)
+    const first = await bp.diagnostics()
+    ;(first[0] as {kind:string}).kind = 'relay'
+    expect((await bp.diagnostics())[0]?.kind).toBe('direct')
+  })
+
   it('starts notifications before its first advertisement and waits for initial ready', async () => {
     const f = await fixture(), a = await f.open(f.a), ports = f.hub.ports(a.deviceId), ready = gate()
     let subscribed = false, returned = false

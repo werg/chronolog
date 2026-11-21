@@ -140,6 +140,8 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'recovery.inspect': return session.recovery.inspect()
       case 'recovery.takeover': return session.recovery.takeover(controlHost(), { ...args[0] as { coordinator?: string; transitionId?: string; expected?: ApplicationRecoveryExpectation }, signal })
       case 'recovery.handover': return session.recovery.handover(controlHost(), { ...args[0] as { coordinator: string; transitionId?: string }, signal })
+      case 'participation.diagnostics': allowed('diagnostics'); return participation().diagnostics()
+      case 'participation.reconsider': allowed('diagnostics'); return participation().reconsiderConnections()
       case 'participation.approve': return participation().approveRecovery(args[0] as string)
       case 'participation.close': return participation().close()
       case 'signals.send': {

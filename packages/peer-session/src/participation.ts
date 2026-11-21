@@ -11,6 +11,7 @@ import { awaitOwnedTask } from './lifetime.js'
 import type {
   ApplicationParticipation, ApplicationParticipationOptions, ApplicationParticipationStatus,
   ApplicationPeerHint, ApplicationPeerInvitation, ApplicationRecoveryProposal, ApplicationPeerAdvertisement, ApplicationDiscoveryNotification,
+  ApplicationTransportDescription, ApplicationConnectionDiagnostic,
 } from './participation-types.js'
 
 interface Owner {
@@ -44,6 +45,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   readonly #maximumRetry: number
   readonly #graceMs: number
   readonly #freshnessMs: number
+  readonly #upgradeCooldownMs: number
   readonly #timeoutMs: number
   readonly #observationKey: string
   readonly #listeners = new Set<(status: ApplicationParticipationStatus) => void>()
@@ -51,6 +53,9 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
   readonly #joining = new Map<string, Joining>()
   readonly #physicalOpenings = new Set<symbol>()
   readonly #ownedLinks = new Set<ApplicationPeerLink>()
+  readonly #transports = new WeakMap<ApplicationPeerLink, ApplicationTransportDescription>()
+  readonly #lastUpgrade = new Map<string, number>()
+  #upgradeTask: Promise<void> | undefined
   readonly #watchedLinks = new Map<ApplicationPeerLink, () => void>()
   readonly #task: Promise<void>
   readonly #invitations: Promise<void>
@@ -91,12 +96,15 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       discovery: { read: input.discovery.read.bind(input.discovery), advertise: input.discovery.advertise.bind(input.discovery),
         notifications: input.discovery.notifications.bind(input.discovery),
         withdraw: input.discovery.withdraw.bind(input.discovery), invitations: input.discovery.invitations.bind(input.discovery) },
-      transport: { open: input.transport.open.bind(input.transport) },
+      transport: { open: input.transport.open.bind(input.transport),
+        ...(input.transport.upgrade === undefined ? {} : { upgrade: input.transport.upgrade.bind(input.transport) }),
+        ...(input.transport.describe === undefined ? {} : { describe: input.transport.describe.bind(input.transport) }) },
     }
     this.#maxPeers = bound(input.connections?.maxPeers, 4, 1, 8)
     this.#initialRetry = bound(input.connections?.retryInitialMs, 1000, 1, 60_000)
     this.#maximumRetry = bound(input.connections?.retryMaxMs, 30_000, this.#initialRetry, 600_000)
     this.#timeoutMs = bound(input.connections?.timeoutMs, 15_000, 1, 120_000)
+    this.#upgradeCooldownMs = bound(input.connections?.upgradeCooldownMs, 30_000, 1_000, 600_000)
     this.#graceMs = bound(input.recovery?.graceMs, 3000, 1, 600_000)
     this.#freshnessMs = bound(input.recovery?.freshnessMs, 300_000, 1, 86_400_000)
     this.#generation = owner.participant.generation.id
@@ -127,6 +135,27 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     this.#listeners.add(listener)
     try { listener(this.status) } catch { /* Observation never owns progress. */ }
     return () => { this.#listeners.delete(listener) }
+  }
+  diagnostics(): Promise<readonly ApplicationConnectionDiagnostic[]> {
+    return Promise.resolve(this.#links().map(link => { const stats = link.stats; return { peerId: link.peerId,
+      ...(this.#transports.get(link) ?? { kind: 'unknown' as const }), ...stats,
+      sentReliableBytes: stats.sentBytes, receivedReliableBytes: stats.receivedBytes,
+      sentBytes: stats.sentBytes + stats.sentLiveBytes, receivedBytes: stats.receivedBytes + stats.receivedLiveBytes,
+    } }).sort((left, right) => left.peerId.localeCompare(right.peerId)))
+  }
+  reconsiderConnections(): Promise<void> {
+    if (this.signal.aborted || this.#discoveryTerminal || this.#options.transport.upgrade === undefined) return Promise.resolve()
+    if (this.#upgradeTask !== undefined) return this.#upgradeTask
+    const candidates = this.#links().filter(link => this.#transports.get(link)?.kind === 'relay')
+    const now = Date.now(), current = new Set(this.#links().map(link => link.peerId))
+    for (const peerId of this.#lastUpgrade.keys()) if (!current.has(peerId)) this.#lastUpgrade.delete(peerId)
+    const work = candidates.filter(link => now - (this.#lastUpgrade.get(link.peerId) ?? -Infinity) >= this.#upgradeCooldownMs)
+    if (work.length === 0) return Promise.resolve()
+    for (const link of work) this.#lastUpgrade.set(link.peerId, now)
+    const task = Promise.allSettled(work.map(link => this.#connect({ peer: { identity: link.peerId, route: null }, upgrade: true })))
+      .then(() => undefined).finally(() => { if (this.#upgradeTask === task) this.#upgradeTask = undefined })
+    this.#upgradeTask = task
+    return task
   }
   async approveRecovery(proposalId: string): Promise<void> {
     this.signal.throwIfAborted()
@@ -231,6 +260,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
           if (value.type === 'ready') {
             ready = true; this.#discoveryReady = true; this.#hasDiscoveryReady = true; this.#discoveryError = null; failures = 0
             this.#nextAdvertisement = 0
+            void this.reconsiderConnections()
           }
           this.#nextScan = 0; this.#wake()
         }
@@ -373,9 +403,9 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
           if (next.done) break
           const value = createParticipantRequest({ applicationId: this.#owner.participant.descriptor.applicationId,
             requestId: 'invitation', facet: 'ephemeral', action: 'invite', payload: next.value }).payload as ApplicationPeerInvitation
-          if (value === null || typeof value !== 'object' || Object.keys(value).length !== 2 || !Object.hasOwn(value, 'token')) throw new Error('APPLICATION_INVITATION_INVALID')
+          if (value === null || typeof value !== 'object' || (Object.keys(value).length !== 2 && !(Object.keys(value).length === 3 && value.upgrade === true)) || !Object.hasOwn(value, 'token')) throw new Error('APPLICATION_INVITATION_INVALID')
           const peer = this.#hints([value.peer])[0]
-          if (peer !== undefined) void this.#connect({ peer, invitation: value.token }).catch(error => { this.#error = message(error); this.#wake() })
+          if (peer !== undefined) void this.#connect({ peer, invitation: value.token, ...(value.upgrade ? { upgrade: true } : {}) }).catch(error => { if (!value.upgrade) { this.#error = message(error); this.#wake() } })
           failures = 0
         }
       } catch (error) { if (!signal.aborted) this.#error = message(error) }
@@ -384,11 +414,18 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     }
   }
 
-  async #connect(input: { readonly peer: ApplicationPeerHint; readonly invitation?: unknown }): Promise<void> {
+  async #connect(input: { readonly peer: ApplicationPeerHint; readonly invitation?: unknown; readonly upgrade?: true }): Promise<void> {
     this.signal.throwIfAborted(); this.#discoveryFence.signal.throwIfAborted()
     const peer = this.#hints([input.peer])[0]
-    if (peer === undefined || this.#links().some(link => link.peerId === peer.identity)) return
+    if (peer === undefined) return
+    const current = this.#links().find(link => link.peerId === peer.identity)
+    if (input.upgrade ? current === undefined || this.#transports.get(current)?.kind !== 'relay' || this.#options.transport.upgrade === undefined : current !== undefined) return
     const previous = this.#joining.get(peer.identity), incoming = input.invitation !== undefined
+    if (input.upgrade && incoming && previous === undefined) {
+      const last = this.#lastUpgrade.get(peer.identity)
+      if (last !== undefined && Date.now() - last < this.#upgradeCooldownMs) return
+      this.#lastUpgrade.set(peer.identity, Date.now())
+    }
     if (previous !== undefined) {
       if (!incoming) {
         // Discovery joins the already owned attempt, including an invitation.
@@ -398,25 +435,34 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       if (previous.incoming || this.#owner.participant.device.publicKey < peer.identity) return
       previous.controller.abort(new Error('APPLICATION_CONNECTION_SUPERSEDED'))
       await awaitOwnedTask(this.signal, () => previous.finished)
+      if (input.upgrade && !this.#links().some(link => link.peerId === peer.identity && this.#transports.get(link)?.kind === 'relay')) return
     }
-    if (this.#links().length + this.#physicalOpenings.size >= this.#maxPeers) return
+    if (this.#physicalOpenings.size >= this.#maxPeers || !input.upgrade && this.#links().length + this.#physicalOpenings.size >= this.#maxPeers) return
     const token = Symbol(), controller = new AbortController()
-    const signal = AbortSignal.any([this.signal, controller.signal])
+    const signal = AbortSignal.any([this.signal, controller.signal, ...(input.upgrade ? [this.#discoveryFence.signal] : [])])
     let finished!: () => void, settled = false, link: ApplicationPeerLink | undefined, connection: FramedPeerConnection | undefined
     const joining: Joining = { controller, incoming, finished: new Promise(resolve => { finished = resolve }) }
     this.#joining.set(peer.identity, joining); this.#physicalOpenings.add(token)
     const timer = setTimeout(() => controller.abort(new Error('APPLICATION_CONNECTION_TIMEOUT')), this.#timeoutMs)
     const opening = Promise.resolve().then(() => {
       signal.throwIfAborted()
-      return this.#options.transport.open({ peer, ...(incoming ? { invitation: structuredClone(input.invitation) } : {}) }, { signal })
+      const value = { peer, ...(incoming ? { invitation: structuredClone(input.invitation) } : {}) }
+      return input.upgrade ? this.#options.transport.upgrade!(value, { signal }) : this.#options.transport.open(value, { signal })
     })
     void opening.then(value => { if (signal.aborted) return value.close() }, () => undefined).catch(() => undefined)
     void opening.finally(() => { settled = true; if (signal.aborted) this.#physicalOpenings.delete(token) }).catch(() => undefined)
     try {
       connection = await awaitOwnedTask(signal, () => opening)
       signal.throwIfAborted()
+      if (input.upgrade && this.#links().some(link => link.peerId === peer.identity && this.#transports.get(link)?.kind === 'direct')) {
+        await connection.close(); return
+      }
+      const description = this.#options.transport.describe?.(connection) ?? { kind: 'unknown' as const }
+      if (!['direct', 'relay', 'unknown'].includes(description.kind) || description.reason !== undefined && !['direct_failed', 'direct_timeout'].includes(description.reason) ||
+          input.upgrade && description.kind !== 'direct') throw new Error('APPLICATION_TRANSPORT_DESCRIPTION_INVALID')
       link = await this.#owner.connect({ connection, peerIdentity: peer.identity, signal,
         handshakeTimeoutMs: this.#timeoutMs, requestTimeoutMs: this.#timeoutMs, transferTimeoutMs: this.#timeoutMs })
+      this.#transports.set(link, { kind: description.kind, ...(description.reason === undefined ? {} : { reason: description.reason }) })
       try { await awaitOwnedTask(signal, () => link!.synchronize()) }
       catch (error) { if (!isPeerDataUnavailable(error)) throw error }
       signal.throwIfAborted(); this.#ownedLinks.add(link); this.#watchLinks()
@@ -508,7 +554,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     for (const [link, dispose] of this.#watchedLinks) link.signal.removeEventListener('abort', dispose)
     this.#watchedLinks.clear(); this.#publish('closed'); this.#listeners.clear()
     void (async () => {
-      await Promise.allSettled([this.#task, this.#notifications, this.#invitations, ...links.map(link => link.close())])
+      await Promise.allSettled([this.#task, this.#notifications, this.#invitations, this.#upgradeTask, ...links.map(link => link.close())])
       await this.#persistence
       if (this.#discoveryTerminal) return
       const cleanup = AbortSignal.timeout(Math.min(this.#timeoutMs, 1000))

@@ -325,7 +325,7 @@ describe('owned browser application facade', () => {
     const participation: ApplicationParticipation = {
       get status() { return status }, signal: lifetime.signal,
       onStatus(listener) { listeners.add(listener); listener(status); return () => { listeners.delete(listener) } },
-      approveRecovery,
+      approveRecovery, diagnostics: async () => [], reconsiderConnections: vi.fn(async () => {}),
       async close() { lifetime.abort(); status = { ...status, phase: 'closed' }; publish() },
     }
     const getter = vi.spyOn(f.a, 'participation', 'get').mockReturnValue(participation)

@@ -10,6 +10,8 @@ export interface ApplicationPeerHint {
 export interface ApplicationPeerInvitation {
   readonly peer: ApplicationPeerHint
   readonly token: unknown
+  /** A bounded direct-only replacement hint; never authority. */
+  readonly upgrade?: true
 }
 export interface ApplicationPeerAdvertisement {
   readonly identity: string
@@ -32,9 +34,29 @@ export interface ApplicationDiscoveryPort {
   withdraw(options: { readonly signal: AbortSignal }): Promise<void>
   invitations(options: { readonly signal: AbortSignal }): AsyncIterable<ApplicationPeerInvitation>
 }
+export interface ApplicationTransportDescription {
+  readonly kind: 'direct' | 'relay' | 'unknown'
+  readonly reason?: 'direct_failed' | 'direct_timeout'
+}
+export interface ApplicationConnectionDiagnostic extends ApplicationTransportDescription {
+  readonly peerId: string
+  /** Application framing for this authenticated link, excluding encryption/socket overhead and SDP. */
+  readonly sentBytes: number
+  readonly receivedBytes: number
+  readonly sentReliableBytes: number
+  readonly receivedReliableBytes: number
+  readonly sentLiveBytes: number
+  readonly receivedLiveBytes: number
+  readonly sentRequests: number
+  readonly receivedRequests: number
+}
 /** Opens bytes only. Authentication, authority and recovery remain in the session. */
 export interface ApplicationTransportPort {
   open(input: { readonly peer: ApplicationPeerHint; readonly invitation?: unknown }, options: { readonly signal: AbortSignal }): Promise<FramedPeerConnection>
+  /** Never fall back to another relay when improving a working link. */
+  upgrade?(input: { readonly peer: ApplicationPeerHint; readonly invitation?: unknown }, options: { readonly signal: AbortSignal }): Promise<FramedPeerConnection>
+  /** Local routing metadata only; a selection is not authentication. */
+  describe?(connection: FramedPeerConnection): ApplicationTransportDescription
 }
 export interface ApplicationParticipationOptions {
   readonly control: ApplicationControlHost
@@ -51,6 +73,8 @@ export interface ApplicationParticipationOptions {
     readonly retryInitialMs?: number
     readonly retryMaxMs?: number
     readonly timeoutMs?: number
+    /** Minimum between event-triggered upgrades per peer; no timer is scheduled. Defaults to 30 seconds. */
+    readonly upgradeCooldownMs?: number
   }
 }
 export interface ApplicationRecoveryProposal {
@@ -71,6 +95,10 @@ export interface ApplicationParticipation {
   readonly status: ApplicationParticipationStatus
   readonly signal: AbortSignal
   onStatus(listener: (status: ApplicationParticipationStatus) => void): () => void
+  /** Local authenticated link snapshot. Does not scan, synchronize or contact a host. */
+  diagnostics(): Promise<readonly ApplicationConnectionDiagnostic[]>
+  /** Coalesces actual network/provider changes into bounded direct-only attempts. */
+  reconsiderConnections(): Promise<void>
   /** Approves only the currently displayed complete prefix; changed authority invalidates it. */
   approveRecovery(proposalId: string): Promise<void>
   close(): Promise<void>
