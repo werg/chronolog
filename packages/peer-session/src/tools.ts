@@ -2,6 +2,7 @@ import { validatePeerRevision, type PeerRevision } from '@chronolog/peer-generat
 import type { ApplicationControlHost } from './recovery.js'
 import type { ApplicationChange, ApplicationSession } from './session.js'
 import { awaitOwnedTask } from './lifetime.js'
+import { operationReference } from './view-store.js'
 
 export interface ApplicationTool {
   readonly name: string
@@ -175,7 +176,10 @@ export function createScopedApplicationTools(session: ApplicationSession, option
   return Object.freeze({
     allowed: Object.freeze({ queries: Object.freeze([...allowedQueries]), commands: Object.freeze([...allowedCommands]) }),
     async execute(call: ScopedApplicationToolCall, callOptions: { readonly signal?: AbortSignal } = {}): Promise<unknown> {
+      if (call === null || typeof call !== 'object') throw new Error('APPLICATION_TOOL_INPUT_INVALID')
       const { kind, name, input, operationId, basedOn, originalOperationId, originalAuthor, generation } = call
+      const signal = callOptions.signal === undefined ? session.signal : AbortSignal.any([session.signal, callOptions.signal])
+      signal.throwIfAborted()
       const journal = kind === 'operation' || kind === 'retry' || kind === 'wait'
       const write = kind === 'command' || kind === 'reapply'
       if (!(journal || write || kind === 'query') || !(kind === 'query' ? allowedQueries : allowedCommands).has(name)) {
@@ -183,6 +187,20 @@ export function createScopedApplicationTools(session: ApplicationSession, option
       }
       if (generation !== undefined && generation !== session.status.generation) {
         throw Object.assign(new Error('APPLICATION_TOOL_GENERATION_CHANGED'), { code: 'APPLICATION_TOOL_GENERATION_CHANGED' })
+      }
+      // An allowed label cannot grant access to a different command's journal.
+      // Inspect only within the owned identity, except an explicitly selected reapply author.
+      if (journal || kind === 'reapply') {
+        const id = kind === 'reapply' ? originalOperationId : operationId
+        if (typeof id !== 'string') throw new Error('APPLICATION_TOOL_INPUT_INVALID')
+        const original = await awaitOwnedTask(signal, () => session.operations.inspect(id,
+          kind === 'reapply' && originalAuthor !== undefined ? { author: originalAuthor } : {}))
+        if (original === null || (journal ? original.attempt.payload.header.command !== name : !allowedCommands.has(original.attempt.payload.header.command))) {
+          throw Object.assign(new Error('APPLICATION_TOOL_NOT_ALLOWED'), { code: 'APPLICATION_TOOL_NOT_ALLOWED' })
+        }
+        if (generation !== undefined && generation !== session.status.generation) {
+          throw Object.assign(new Error('APPLICATION_TOOL_GENERATION_CHANGED'), { code: 'APPLICATION_TOOL_GENERATION_CHANGED' })
+        }
       }
       const args: Record<string, unknown> = journal
         ? { operationId }
@@ -202,12 +220,8 @@ export function createScopedApplicationTools(session: ApplicationSession, option
       if (raw !== null && raw !== undefined && typeof raw === 'object' && (write || journal)) {
         return {
           ...(raw as Record<string, unknown>),
-          operationReference: {
-            applicationId: session.applicationId,
-            historyId: session.historyId,
-            deviceId: session.deviceId,
-            operationId,
-          },
+          operationReference: operationReference(session, operationId!,
+            (journal && kind === 'operation' ? (raw as Awaited<ReturnType<typeof session.operations.inspect>>)?.state : raw)),
         }
       }
       return raw

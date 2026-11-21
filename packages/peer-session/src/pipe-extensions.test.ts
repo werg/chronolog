@@ -149,18 +149,36 @@ describe('peer-session central pipe extensions', () => {
         input: { text: 'scoped' },
         operationId: 'scoped-1',
         generation: session.status.generation,
-      }) as { operationReference: { applicationId: string; historyId: string; deviceId: string; operationId: string } }
-      expect(written.operationReference).toEqual({
+      }) as { operationReference: { applicationId: string; historyId: string; author: string; operationId: string } }
+      expect(written.operationReference).toMatchObject({
         applicationId: session.applicationId,
         historyId: session.historyId,
-        deviceId: session.deviceId,
+        author: session.deviceId,
         operationId: 'scoped-1',
       })
+      for (const kind of ['operation', 'retry', 'wait'] as const) {
+        const own = await scoped.execute({ kind, name: 'addNote', operationId: 'scoped-1' }) as { operationReference: { author: string; attemptId: string } }
+        expect(own.operationReference.author).toBe(session.deviceId)
+        expect(own.operationReference.attemptId).toMatch(/^[0-9a-f]{64}$/u)
+      }
       const read = await scoped.execute({ kind: 'query', name: 'notes', input: null, generation: session.status.generation }) as { value: unknown }
       expect(read.value).toEqual([{ text: 'scoped' }])
     } finally {
       await session.close()
     }
+  })
+
+  it('cannot use an allowed label to inspect, retry, wait for or reapply a forbidden command', async () => {
+    const session = await openTestSession()
+    try {
+      await (await session.command('adminNote', 'private', { operationId: 'admin-op' })).applied()
+      const scoped = createScopedApplicationTools(session, { commands: ['addNote'] })
+      for (const kind of ['operation', 'retry', 'wait', 'reapply'] as const) {
+        await expect(scoped.execute({ kind, name: 'addNote', operationId: kind === 'reapply' ? 'replacement' : 'admin-op',
+          originalOperationId: 'admin-op', input: { text: 'forged label' } })).rejects.toThrow('APPLICATION_TOOL_NOT_ALLOWED')
+      }
+      expect(await session.operations.get('replacement')).toBeNull()
+    } finally { await session.close() }
   })
 
   it('createViewStore and operationReference isolate views and reject conflicting retained intents', () => {
