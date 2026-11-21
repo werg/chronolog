@@ -155,7 +155,6 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     for (const peerId of this.#lastUpgrade.keys()) if (!current.has(peerId)) this.#lastUpgrade.delete(peerId)
     const work = candidates.filter(link => now - (this.#lastUpgrade.get(link.peerId) ?? -Infinity) >= this.#upgradeCooldownMs)
     if (work.length === 0) return Promise.resolve()
-    for (const link of work) this.#lastUpgrade.set(link.peerId, now)
     const task = Promise.allSettled(work.map(link => this.#connect({ peer: { identity: link.peerId, route: null }, upgrade: true })))
       .then(() => undefined).finally(() => { if (this.#upgradeTask === task) this.#upgradeTask = undefined })
     this.#upgradeTask = task
@@ -425,10 +424,9 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     const current = this.#links().find(link => link.peerId === peer.identity)
     if (input.upgrade ? current === undefined || this.#transports.get(current)?.kind !== 'relay' || this.#options.transport.upgrade === undefined : current !== undefined) return
     const previous = this.#joining.get(peer.identity), incoming = input.invitation !== undefined
-    if (input.upgrade && incoming && previous === undefined) {
+    if (input.upgrade && previous === undefined) {
       const last = this.#lastUpgrade.get(peer.identity)
       if (last !== undefined && Date.now() - last < this.#upgradeCooldownMs) return
-      this.#lastUpgrade.set(peer.identity, Date.now())
     }
     if (previous !== undefined) {
       if (!incoming) {
@@ -442,6 +440,9 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       if (input.upgrade && !this.#links().some(link => link.peerId === peer.identity && this.#transports.get(link)?.kind === 'relay')) return
     }
     if (this.#physicalOpenings.size >= this.#maxPeers || !input.upgrade && this.#links().length + this.#physicalOpenings.size >= this.#maxPeers) return
+    // maxPeers bounds logical peers and concurrent physical candidates separately.
+    // A candidate replacing an existing link cannot consume a second logical slot.
+    if (input.upgrade) this.#lastUpgrade.set(peer.identity, Date.now())
     const token = Symbol(), controller = new AbortController()
     const signal = AbortSignal.any([this.signal, controller.signal, ...(input.upgrade ? [this.#discoveryFence.signal] : [])])
     let finished!: () => void, settled = false, link: ApplicationPeerLink | undefined, connection: FramedPeerConnection | undefined

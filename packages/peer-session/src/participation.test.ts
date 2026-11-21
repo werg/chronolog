@@ -54,7 +54,9 @@ class Introductions {
           }
           const target = hub.#listeners.get(input.peer.identity)
           if (target === undefined) throw new Error('PEER_UNAVAILABLE')
-          const [left, right] = createFramedPeerConnectionPair(), token = crypto.randomUUID()
+          const [left, right] = createFramedPeerConnectionPair()
+          const token = typeof input.peer.route === 'object' && input.peer.route !== null && 'channel' in input.peer.route && typeof input.peer.route.channel === 'string'
+            ? input.peer.route.channel : crypto.randomUUID()
           const kind = upgrade ? 'direct' : hub.kind
           hub.#connections.set(token, hub.counted(right, kind))
           target({ peer: { identity, route: identity }, token, ...(upgrade ? {upgrade:true as const} : {}) })
@@ -179,6 +181,7 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
   const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(b.deviceId)
   const opened = gate(), release = gate(), directory = gate(),
     scanned = gate(), selected = gate()
+  const heldChannel = crypto.randomUUID()
   let reconnecting = false, incoming = 0, attemptSignal: AbortSignal | undefined
   const first = f.participate(a), participation = f.participate(b, {
     control: { ...f.host, async selectGeneration(request, options) { selected.resolve(); return f.host.selectGeneration(request, options) } },
@@ -189,7 +192,7 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
     } },
     transport: { async open(input, options) {
       const connection = await ports.transport.open(input, options)
-      if (reconnecting && input.invitation !== undefined) {
+      if (reconnecting && input.invitation === heldChannel) {
         incoming++; attemptSignal = options.signal; opened.resolve(); await release.promise
       }
       return connection
@@ -197,11 +200,11 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
     connections: { maxPeers: 2, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 5000 },
   })
   closing.push(() => { directory.resolve(); release.resolve() })
-  await until(() => participation.status.phase === 'following')
+  await vi.waitFor(() => expect(participation.status).toMatchObject({phase:'following',error:null}),{timeout:5000,interval:5})
   await until(async () => await f.b.store.get(`peer-session/coordinator-observation/${b.applicationId}`) !== null)
   const generation = b.revision!.generation
   reconnecting = true; await first.close()
-  const connection = await f.hub.ports(a.deviceId).transport.open({ peer: { identity: b.deviceId, route: b.deviceId } }, { signal: a.signal })
+  const connection = await f.hub.ports(a.deviceId).transport.open({ peer: { identity: b.deviceId, route: {channel:heldChannel} } }, { signal: a.signal })
   closing.push(() => connection.close())
   await opened.promise; directory.resolve(); await scanned.promise
   return { f, a, b, participation, connection, generation, release, selected, incoming: () => incoming, attemptSignal: () => attemptSignal }
@@ -251,6 +254,12 @@ describe('owned application participation', () => {
     f.participate(a); const bp = f.participate(b)
     await vi.waitFor(() => expect(bp.status).toMatchObject({phase:'following',error:null}),{timeout:5000,interval:5})
     await bp.reconsiderConnections()
+    // Begin the idle observation only after initial hints/synchronization settle.
+    await until(async () => {
+      const before = JSON.stringify(f.hub.counts)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      return before === JSON.stringify(f.hub.counts)
+    })
     vi.useFakeTimers()
     await vi.advanceTimersByTimeAsync(100)
     const before = {host:{...f.counts},discovery:{...f.hub.counts},upgrades:f.hub.upgradeAttempts}
@@ -635,7 +644,7 @@ describe('owned application participation', () => {
     expect(h.f.requests[0]?.payload).toMatchObject({ reason: 'takeover', coordinator: h.b.deviceId, expectedGeneration: h.generation })
     // The noncooperative factory remains physically owned until it returns.
     h.release.resolve()
-    await until(() => h.connection.signal.aborted)
+    await vi.waitFor(() => expect({physicalClosed:h.connection.signal.aborted,attemptClosed:h.attemptSignal()?.aborted,incoming:h.incoming(),phase:h.participation.status.phase}).toMatchObject({physicalClosed:true}),{timeout:5000,interval:5})
   })
 
   it('closes discovery while its incoming coordinator opening remains pending', async () => {
@@ -644,7 +653,7 @@ describe('owned application participation', () => {
     expect(h.participation.status.phase).toBe('closed'); expect(h.f.requests).toHaveLength(0)
     expect(h.b.revision!.generation).toBe(h.generation)
     h.release.resolve()
-    await until(() => h.connection.signal.aborted)
+    await vi.waitFor(() => expect({physicalClosed:h.connection.signal.aborted,attemptClosed:h.attemptSignal()?.aborted,incoming:h.incoming(),phase:h.participation.status.phase}).toMatchObject({physicalClosed:true}),{timeout:5000,interval:5})
   })
 
   it('requires explicit approval for an unknown complete prefix and keeps saved commands during host outage', async () => {
