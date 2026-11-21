@@ -149,6 +149,72 @@ export function createApplicationTools(session: ApplicationSession, options: { r
   }
 }
 
+export interface ScopedApplicationToolCall {
+  readonly kind: 'query' | 'command' | 'reapply' | 'operation' | 'retry' | 'wait'
+  readonly name: string
+  readonly input?: unknown
+  readonly operationId?: string
+  readonly basedOn?: PeerRevision
+  readonly originalOperationId?: string
+  readonly originalAuthor?: string
+  readonly generation?: string
+}
+
+/**
+ * Capability-scoped, generation-pinned tool pipe for limited external transports
+ * (e.g. an OAuth/MCP gateway or sandboxed agent bridge) over the owned session.
+ */
+export function createScopedApplicationTools(session: ApplicationSession, options: {
+  readonly queries?: readonly string[]
+  readonly commands?: readonly string[]
+  readonly host?: ApplicationControlHost
+} = {}) {
+  const allowedQueries = new Set(options.queries ?? [])
+  const allowedCommands = new Set(options.commands ?? [])
+  const tools = createApplicationTools(session, options.host === undefined ? {} : { host: options.host })
+  return Object.freeze({
+    allowed: Object.freeze({ queries: Object.freeze([...allowedQueries]), commands: Object.freeze([...allowedCommands]) }),
+    async execute(call: ScopedApplicationToolCall, callOptions: { readonly signal?: AbortSignal } = {}): Promise<unknown> {
+      const { kind, name, input, operationId, basedOn, originalOperationId, originalAuthor, generation } = call
+      const journal = kind === 'operation' || kind === 'retry' || kind === 'wait'
+      const write = kind === 'command' || kind === 'reapply'
+      if (!(journal || write || kind === 'query') || !(kind === 'query' ? allowedQueries : allowedCommands).has(name)) {
+        throw Object.assign(new Error('APPLICATION_TOOL_NOT_ALLOWED'), { code: 'APPLICATION_TOOL_NOT_ALLOWED' })
+      }
+      if (generation !== undefined && generation !== session.status.generation) {
+        throw Object.assign(new Error('APPLICATION_TOOL_GENERATION_CHANGED'), { code: 'APPLICATION_TOOL_GENERATION_CHANGED' })
+      }
+      const args: Record<string, unknown> = journal
+        ? { operationId }
+        : {
+          name,
+          input,
+          ...(write ? {
+            operationId,
+            ...(basedOn === undefined ? {} : { basedOn }),
+            ...(kind === 'reapply' ? { originalOperationId, ...(originalAuthor === undefined ? {} : { originalAuthor }) } : {}),
+          } : {}),
+        }
+      const raw = await tools.call(kind, args, callOptions)
+      if (generation !== undefined && generation !== session.status.generation) {
+        throw Object.assign(new Error('APPLICATION_TOOL_GENERATION_CHANGED'), { code: 'APPLICATION_TOOL_GENERATION_CHANGED' })
+      }
+      if (raw !== null && raw !== undefined && typeof raw === 'object' && (write || journal)) {
+        return {
+          ...(raw as Record<string, unknown>),
+          operationReference: {
+            applicationId: session.applicationId,
+            historyId: session.historyId,
+            deviceId: session.deviceId,
+            operationId,
+          },
+        }
+      }
+      return raw
+    },
+  })
+}
+
 /** JSON-lines/CLI formatting preserves exact SQL integers and binary values explicitly. */
 export function formatApplicationToolResult(value: unknown): string {
   return JSON.stringify(value, (_key, item: unknown) => {

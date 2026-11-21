@@ -6,10 +6,10 @@ Public application session for Node.js and browser Workers. Owns device identity
 
 | Import | Purpose |
 | --- | --- |
-| `@chronolog/peer-session` | Definitions, session types, tools, control participant, owner lock, and authority helpers |
+| `@chronolog/peer-session` | Definitions, session types, tools (`createApplicationTools`, `createScopedApplicationTools`), `createLiveView`, `forwardSessionEvents`, `createViewStore`, `operationReference`, `SessionError`, `canonicalJson`, control participant, owner lock, and authority helpers |
 | `@chronolog/peer-session/native` | `openNativeDevice`, `openNativeApplication`, `NativeBytesStore` |
 | `@chronolog/peer-session/worker` | `openBrowserDevice`, `openBrowserApplication`, `serveApplicationWorker`, `probeBrowserCapabilities`, `createApplicationOwner` |
-| `@chronolog/peer-session/browser` | Page-side facade: `connectApplicationWorker`, `connectApplicationOwner` (no keys or storage) |
+| `@chronolog/peer-session/browser` | Page-side facade: `connectApplicationWorker`, `connectApplicationOwner`, `createLiveView`, `createViewStore`, `operationReference`, `SessionError` (no keys or durable storage) |
 | `@chronolog/peer-session/webrtc` | `openWebRtcConnection`, `connectApplicationWebRtc`, Worker RTC bridge |
 | `@chronolog/peer-session/webrtc-native` | `createNativePeerConnection`, `connectNativeApplicationWebRtc` |
 | `@chronolog/peer-session/websocket` | Dual-socket WebSocket peer connection |
@@ -27,19 +27,19 @@ import { defineApplication, defineCommand, defineQuery, emit, program } from '@c
 
 export const notesApp = defineApplication({
   id: 'notes-v1',
-  version: 1,
+  version: '1',
   commands: {
     addNote: defineCommand({
       description: 'Add a note',
       input: { type: 'object', properties: { text: { type: 'string', minLength: 1 } }, required: ['text'], additionalProperties: false },
-      program: ({ text }) => program([emit('note', { text })]),
+      prepare: ({ text }) => program(emit('note', { text })),
     }),
   },
   queries: {
     notes: defineQuery({
       description: 'List notes',
       input: { type: 'null' },
-      read: async view => (await view.readEvents({ topics: ['note'] })).events,
+      read: view => view.readEvents({ topics: ['note'] }).events,
     }),
   },
 })
