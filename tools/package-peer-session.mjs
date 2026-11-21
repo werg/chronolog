@@ -15,7 +15,7 @@ const { values } = parseArgs({ options: { output: { type: 'string', default: 'ar
   'allow-dirty': { type: 'boolean', default: false },
   'no-native-rtc': { type: 'boolean', default: false },
   'sql-native': { type: 'boolean', default: false }, 'sql-browser': { type: 'boolean', default: false },
-  'sql-wasm': { type: 'boolean', default: false } } });
+  'sql-wasm': { type: 'boolean', default: false }, 'wasm-dir': { type: 'string' } } });
 const output = resolve(values.output), packageRoot = join(output, 'package');
 const nativeRtc = !values['no-native-rtc'];
 const sqlEnabled = values['sql-native'] || values['sql-browser'] || values['sql-wasm'];
@@ -107,6 +107,20 @@ if (values['sql-native']) {
     node: process.version, manifest: engine.chronologNativeManifest(),
     patchSha256: hash(await readFile(join(root, 'patches/@dolthub__doltlite@0.11.29.patch'))) };
 }
+let wasmEngine;
+if (values['wasm-dir']) {
+  assert(values['sql-wasm'] || values['sql-browser'], '--wasm-dir requires --sql-wasm or --sql-browser');
+  const wasmDir = resolve(values['wasm-dir']);
+  const manifestBytes = await readFile(join(wasmDir, 'manifest.json'));
+  const wasmBytes = await readFile(join(wasmDir, 'sqlite3.wasm'));
+  const loaderBytes = await readFile(join(wasmDir, 'sqlite3.mjs'));
+  const manifest = JSON.parse(manifestBytes.toString('utf8'));
+  assert.equal(hash(wasmBytes), manifest.wasmSha256, 'WASM binary digest mismatch against manifest.json');
+  files.set('wasm/manifest.json', manifestBytes);
+  files.set('wasm/sqlite3.wasm', wasmBytes);
+  files.set('wasm/sqlite3.mjs', loaderBytes);
+  wasmEngine = { toolchain: manifest.toolchain, wasmSha256: manifest.wasmSha256, wasmBytes: wasmBytes.byteLength };
+}
 for (const file of bundled.outputFiles) files.set(relative(packageRoot, file.path).replaceAll('\\', '/'), file.contents);
 for (const [path, content] of declaration.files) files.set(path, content);
 for (const name of Object.keys(entries)) files.set(`${name}.d.ts`, `export * from './types/packages/peer-session/src/${name}.js';\n`);
@@ -114,7 +128,8 @@ files.set('README.md', await readFile(join(root, 'packages/peer-session/README.m
 files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', version, type: 'module',
   description: 'Authenticated movable-peer application sessions with explicit recovery and applied outcomes',
   exports: Object.fromEntries(Object.keys(entries).map(name => [name === 'index' ? '.' : `./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
-  files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json', ...(values['sql-native'] ? ['engine'] : [])],
+  files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json',
+    ...(values['sql-native'] ? ['engine'] : []), ...(wasmEngine ? ['wasm'] : [])],
   ...(nativeRtc ? { dependencies: { werift: '0.27.0' } } : {}), engines: { node: '>=22.15' },
   ...(values['sql-native'] ? { imports: { [engineImport]: './engine/index.cjs' }, os: [process.platform], cpu: [process.arch] } : {}),
 }, null, 2) + '\n');
@@ -125,7 +140,7 @@ const sha256 = Object.fromEntries([...files].map(([path, content]) => [path, has
 await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: 'chronolog-peer-session-package/v1',
   repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
   inputs, runtimeInputs, runtimeModules, nativeRtc, sqlEngines: [
-    ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : []), ...(values['sql-wasm'] ? ['wasm-node'] : [])], nativeEngine, sha256 }, null, 2) + '\n');
+    ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : []), ...(values['sql-wasm'] ? ['wasm-node'] : [])], nativeEngine, wasmEngine, sha256 }, null, 2) + '\n');
 const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 }))[0];

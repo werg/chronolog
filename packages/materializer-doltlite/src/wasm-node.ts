@@ -1,22 +1,84 @@
-import { existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, closeSync } from 'node:fs'
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { randomBytes } from 'node:crypto'
 import type { ExecutionLimits } from '@chronolog/protocol'
 import type { SqlEngine } from './types.js'
 import { createBrowserSqlEngine, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
 
-export interface NodeWasmFsApi {
-  readonly analyzePath?: (path: string) => { readonly exists: boolean }
-  readonly mkdir?: (path: string) => void
-  readonly readFile: (path: string) => Uint8Array
-  readonly writeFile: (path: string, data: Uint8Array) => void
-  readonly unlink?: (path: string) => void
-  readonly mount?: (type: unknown, opts: { readonly root: string }, mountpoint: string) => void
-  readonly filesystems?: { readonly NODEFS?: unknown }
+interface SqliteStruct {
+  readonly pointer: number
+  $iVersion: number
+  $szOsFile?: number
+  $mxPathname?: number
+  $zName?: number
+  $pMethods?: number
+  installMethods(methods: Record<string, (...args: never[]) => unknown>, checkArgc?: boolean): void
+  registerVfs?(asDefault: boolean): void
+  addOnDispose?(...items: unknown[]): void
+  dispose(): void
+}
+
+interface SqliteStructCtor {
+  new (pointer?: number): SqliteStruct
+  readonly structInfo: { readonly sizeof: number }
 }
 
 export interface NodeChronologWasmModule extends ChronologWasmModule {
-  readonly FS?: NodeWasmFsApi
+  readonly capi: ChronologWasmModule['capi'] & {
+    readonly sqlite3_vfs?: SqliteStructCtor
+    readonly sqlite3_io_methods?: SqliteStructCtor
+    readonly sqlite3_file?: SqliteStructCtor
+    readonly sqlite3_vfs_find?: (name: string) => number
+    readonly SQLITE_OK?: number
+    readonly SQLITE_IOERR?: number
+    readonly SQLITE_IOERR_READ?: number
+    readonly SQLITE_IOERR_SHORT_READ?: number
+    readonly SQLITE_IOERR_WRITE?: number
+    readonly SQLITE_IOERR_FSYNC?: number
+    readonly SQLITE_IOERR_TRUNCATE?: number
+    readonly SQLITE_IOERR_FSTAT?: number
+    readonly SQLITE_IOERR_DELETE?: number
+    readonly SQLITE_CANTOPEN?: number
+    readonly SQLITE_NOTFOUND?: number
+    readonly SQLITE_OPEN_READONLY?: number
+    readonly SQLITE_OPEN_READWRITE?: number
+    readonly SQLITE_OPEN_CREATE?: number
+    readonly SQLITE_OPEN_DELETEONCLOSE?: number
+    readonly SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN?: number
+  }
+  readonly wasm: ChronologWasmModule['wasm'] & {
+    readonly allocCString?: (value: string) => number
+    readonly cstrToJs?: (pointer: number) => string
+    readonly poke?: (pointer: number, value: number | bigint, type?: string) => void
+    readonly poke32?: (pointer: number, value: number) => void
+    readonly poke64?: (pointer: number, value: bigint) => void
+    readonly pokePtr?: (pointer: number, value: number) => void
+    readonly peek8?: (pointer: number) => number
+    readonly jstrlen?: (value: string) => number
+  }
+  readonly vfs?: {
+    installVfs(options: {
+      readonly io?: { readonly struct: SqliteStruct; readonly methods: Record<string, (...args: never[]) => unknown> }
+      readonly vfs?: { readonly struct: SqliteStruct; readonly methods: Record<string, (...args: never[]) => unknown>; readonly asDefault?: boolean }
+    }): unknown
+  }
 }
 
 export interface LoadedNodeWasmEngine {
@@ -33,6 +95,9 @@ export interface NodeWasmMemoryBudget {
   readonly maxTempStoreKiB?: number
 }
 
+const NODE_FS_VFS_NAME = 'chronolog-node-fs'
+const installedVfsModules = new WeakSet<NodeChronologWasmModule>()
+
 function unavailable(reason: string, cause?: unknown): Error {
   return Object.assign(new Error(`SQL_ENGINE_UNAVAILABLE: ${reason}`, cause === undefined ? undefined : { cause }), {
     code: 'SQL_ENGINE_UNAVAILABLE',
@@ -40,9 +105,17 @@ function unavailable(reason: string, cause?: unknown): Error {
   })
 }
 
+function syncDirectoryBestEffort(dir: string): void {
+  try {
+    const dirFd = openSync(dir, 'r')
+    try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
+  } catch {
+    // Directory fsync is unsupported on some platforms (e.g. Windows); file fsync + atomic rename still holds.
+  }
+}
+
 /**
- * Atomic, fsyncSync-backed host file persistence helper bridging synchronous WASM VFS writes
- * to crash-safe Node filesystem commits without partial writes or un-synced sidecars.
+ * Atomic, fsyncSync-backed host file persistence helper for crash-safe Node filesystem commits.
  */
 export function writeFileAtomicSync(targetPath: string, bytes: Uint8Array): void {
   const dir = dirname(targetPath)
@@ -61,12 +134,239 @@ export function writeFileAtomicSync(targetPath: string, bytes: Uint8Array): void
     try { unlinkSync(tempPath) } catch { /* ignore cleanup */ }
     throw error
   }
-  try {
-    const dirFd = openSync(dir, 'r')
-    try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
-  } catch {
-    // Directory fsync is unsupported on some platforms (e.g. Windows); file fsync + atomic rename still holds.
+  syncDirectoryBestEffort(dir)
+}
+
+interface OpenNodeFile {
+  readonly fd: number
+  readonly path: string
+  readonly deleteOnClose: boolean
+}
+
+/**
+ * Install a synchronous, fsyncSync-backed Node.js filesystem VFS (`chronolog-node-fs`) into the
+ * compiled DoltLite SQLite WASM module. All reads/writes go directly to real host files with zero
+ * in-memory double-buffering and full DoltLite chunk-store compatibility across Linux/macOS/Windows.
+ */
+export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE_FS_VFS_NAME): string {
+  if (installedVfsModules.has(module)) return vfsName
+  const { capi, wasm, vfs } = module
+  if (!vfs?.installVfs || !capi.sqlite3_vfs || !capi.sqlite3_io_methods || !capi.sqlite3_file ||
+      !wasm.allocCString || !wasm.cstrToJs || !wasm.poke32 || !wasm.poke64 || !wasm.pokePtr || !wasm.poke) {
+    throw unavailable('WASM module does not expose sqlite3.vfs.installVfs APIs required for Node host persistence.')
   }
+  if (capi.sqlite3_vfs_find?.(vfsName)) {
+    installedVfsModules.add(module)
+    return vfsName
+  }
+
+  const SQLITE_OK = capi.SQLITE_OK ?? 0
+  const SQLITE_IOERR = capi.SQLITE_IOERR ?? 10
+  const SQLITE_IOERR_READ = capi.SQLITE_IOERR_READ ?? 266
+  const SQLITE_IOERR_SHORT_READ = capi.SQLITE_IOERR_SHORT_READ ?? 522
+  const SQLITE_IOERR_WRITE = capi.SQLITE_IOERR_WRITE ?? 778
+  const SQLITE_IOERR_FSYNC = capi.SQLITE_IOERR_FSYNC ?? 1034
+  const SQLITE_IOERR_TRUNCATE = capi.SQLITE_IOERR_TRUNCATE ?? 1546
+  const SQLITE_IOERR_FSTAT = capi.SQLITE_IOERR_FSTAT ?? 1802
+  const SQLITE_IOERR_DELETE = capi.SQLITE_IOERR_DELETE ?? 2570
+  const SQLITE_CANTOPEN = capi.SQLITE_CANTOPEN ?? 14
+  const SQLITE_NOTFOUND = capi.SQLITE_NOTFOUND ?? 12
+  const SQLITE_OPEN_READONLY = capi.SQLITE_OPEN_READONLY ?? 0x00000001
+  const SQLITE_OPEN_CREATE = capi.SQLITE_OPEN_CREATE ?? 0x00000004
+  const SQLITE_OPEN_DELETEONCLOSE = capi.SQLITE_OPEN_DELETEONCLOSE ?? 0x00000008
+  const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN = capi.SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN ?? 0x00000800
+
+  const openFiles = new Map<number, OpenNodeFile>()
+  const vfsStruct = new capi.sqlite3_vfs()
+  const ioStruct = new capi.sqlite3_io_methods()
+  ioStruct.$iVersion = 1
+  vfsStruct.$iVersion = 2
+  vfsStruct.$szOsFile = capi.sqlite3_file.structInfo.sizeof
+  vfsStruct.$mxPathname = 4096
+  vfsStruct.$zName = wasm.allocCString(vfsName)
+  vfsStruct.addOnDispose?.('$zName', vfsStruct.$zName, ioStruct)
+
+  const ioMethods: Record<string, (...args: never[]) => unknown> = {
+    xClose(pFile: number) {
+      const entry = openFiles.get(pFile)
+      if (!entry) return SQLITE_OK
+      openFiles.delete(pFile)
+      try {
+        closeSync(entry.fd)
+        if (entry.deleteOnClose) {
+          try { unlinkSync(entry.path) } catch { /* ignore */ }
+        }
+        return SQLITE_OK
+      } catch {
+        return SQLITE_IOERR
+      }
+    },
+    xRead(pFile: number, pDest: number, n: number, offset64: bigint | number) {
+      const entry = openFiles.get(pFile)
+      if (!entry) return SQLITE_IOERR_READ
+      try {
+        const heap = wasm.heap8u()
+        const start = Number(pDest)
+        const target = heap.subarray(start, start + n)
+        let total = 0
+        let pos = Number(offset64)
+        while (total < n) {
+          const got = readSync(entry.fd, target, total, n - total, pos)
+          if (got === 0) break
+          total += got
+          pos += got
+        }
+        if (total < n) {
+          heap.fill(0, start + total, start + n)
+          return SQLITE_IOERR_SHORT_READ
+        }
+        return SQLITE_OK
+      } catch {
+        return SQLITE_IOERR_READ
+      }
+    },
+    xWrite(pFile: number, pSrc: number, n: number, offset64: bigint | number) {
+      const entry = openFiles.get(pFile)
+      if (!entry) return SQLITE_IOERR_WRITE
+      try {
+        const heap = wasm.heap8u()
+        const start = Number(pSrc)
+        const slice = heap.subarray(start, start + n)
+        let written = 0
+        let pos = Number(offset64)
+        while (written < n) {
+          const put = writeSync(entry.fd, slice, written, n - written, pos)
+          if (put <= 0) return SQLITE_IOERR_WRITE
+          written += put
+          pos += put
+        }
+        return SQLITE_OK
+      } catch {
+        return SQLITE_IOERR_WRITE
+      }
+    },
+    xTruncate(pFile: number, size64: bigint | number) {
+      const entry = openFiles.get(pFile)
+      if (!entry) return SQLITE_IOERR_TRUNCATE
+      try {
+        ftruncateSync(entry.fd, Number(size64))
+        return SQLITE_OK
+      } catch {
+        return SQLITE_IOERR_TRUNCATE
+      }
+    },
+    xSync(pFile: number) {
+      const entry = openFiles.get(pFile)
+      if (!entry) return SQLITE_IOERR_FSYNC
+      try {
+        fsyncSync(entry.fd)
+        return SQLITE_OK
+      } catch {
+        return SQLITE_IOERR_FSYNC
+      }
+    },
+    xFileSize(pFile: number, pOutSize: number) {
+      const entry = openFiles.get(pFile)
+      if (!entry) return SQLITE_IOERR_FSTAT
+      try {
+        const stats = fstatSync(entry.fd)
+        wasm.poke64!(pOutSize, BigInt(stats.size))
+        return SQLITE_OK
+      } catch {
+        return SQLITE_IOERR_FSTAT
+      }
+    },
+    xLock() { return SQLITE_OK },
+    xUnlock() { return SQLITE_OK },
+    xCheckReservedLock(_pFile: number, pOut: number) {
+      wasm.poke32!(pOut, 0)
+      return SQLITE_OK
+    },
+    xFileControl() { return SQLITE_NOTFOUND },
+    xSectorSize() { return 4096 },
+    xDeviceCharacteristics() { return SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN },
+  }
+
+  const encoder = new TextEncoder()
+  const vfsMethods: Record<string, (...args: never[]) => unknown> = {
+    xOpen(_pVfs: number, zName: number, pFile: number, flags: number, pOutFlags: number) {
+      try {
+        const hasName = zName !== 0 && (wasm.peek8?.(zName) ?? 1) !== 0
+        const filePath = hasName
+          ? resolve(wasm.cstrToJs!(zName))
+          : join(tmpdir(), `chronolog-wasm-tmp-${process.pid}-${randomBytes(8).toString('hex')}.db`)
+        const readOnly = (flags & SQLITE_OPEN_READONLY) !== 0
+        const create = (flags & SQLITE_OPEN_CREATE) !== 0
+        const deleteOnClose = !hasName || (flags & SQLITE_OPEN_DELETEONCLOSE) !== 0
+        if (!readOnly) mkdirSync(dirname(filePath), { recursive: true })
+        let openFlags = readOnly ? fsConstants.O_RDONLY : fsConstants.O_RDWR
+        if (!readOnly && create) openFlags |= fsConstants.O_CREAT
+        const fd = openSync(filePath, openFlags, 0o600)
+        openFiles.set(pFile, { fd, path: filePath, deleteOnClose })
+        wasm.pokePtr!(pFile, ioStruct.pointer)
+        if (pOutFlags) wasm.poke32!(pOutFlags, flags)
+        return SQLITE_OK
+      } catch {
+        wasm.pokePtr!(pFile, 0)
+        return SQLITE_CANTOPEN
+      }
+    },
+    xDelete(_pVfs: number, zName: number, syncDir: number) {
+      try {
+        const filePath = resolve(wasm.cstrToJs!(zName))
+        if (existsSync(filePath)) unlinkSync(filePath)
+        if (syncDir) syncDirectoryBestEffort(dirname(filePath))
+        return SQLITE_OK
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        return code === 'ENOENT' ? SQLITE_OK : SQLITE_IOERR_DELETE
+      }
+    },
+    xAccess(_pVfs: number, zName: number, _flags: number, pResOut: number) {
+      try {
+        const filePath = resolve(wasm.cstrToJs!(zName))
+        wasm.poke32!(pResOut, existsSync(filePath) ? 1 : 0)
+      } catch {
+        wasm.poke32!(pResOut, 0)
+      }
+      return SQLITE_OK
+    },
+    xFullPathname(_pVfs: number, zName: number, nOut: number, pOut: number) {
+      const full = resolve(wasm.cstrToJs!(zName))
+      const encoded = encoder.encode(full)
+      if (encoded.byteLength + 1 > nOut) return SQLITE_CANTOPEN
+      const heap = wasm.heap8u()
+      const start = Number(pOut)
+      heap.set(encoded, start)
+      heap[start + encoded.byteLength] = 0
+      return SQLITE_OK
+    },
+    xRandomness(_pVfs: number, nByte: number, zOut: number) {
+      const bytes = randomBytes(nByte)
+      wasm.heap8u().set(bytes, Number(zOut))
+      return nByte
+    },
+    xSleep(_pVfs: number, microseconds: number) {
+      const ms = Math.max(0, Math.ceil(microseconds / 1000))
+      if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+      return microseconds
+    },
+    xCurrentTime(_pVfs: number, pOut: number) {
+      wasm.poke!(pOut, 2440587.5 + Date.now() / 86_400_000, 'double')
+      return SQLITE_OK
+    },
+    xCurrentTimeInt64(_pVfs: number, pOut: number) {
+      wasm.poke64!(pOut, BigInt(Math.round(2440587.5 * 86_400_000)) + BigInt(Date.now()))
+      return SQLITE_OK
+    },
+  }
+
+  vfs.installVfs({
+    io: { struct: ioStruct, methods: ioMethods },
+    vfs: { struct: vfsStruct, methods: vfsMethods, asDefault: false },
+  })
+  installedVfsModules.add(module)
+  return vfsName
 }
 
 /**
@@ -116,9 +416,8 @@ export async function loadNodeWasmEngine(directory: string): Promise<LoadedNodeW
 }
 
 /**
- * Production Node WASM SQL engine with synchronous fsyncSync-backed persistence.
- * Uses Emscripten NODEFS when mounted or mirrors the virtual file atomically to disk on flush/close,
- * applying bounded page cache limits so peak RSS stays within constrained sandbox budgets (< 512 MB).
+ * Production Node WASM SQL engine backed by synchronous `node:fs` (`chronolog-node-fs` VFS)
+ * with `fsyncSync` durability and bounded SQLite page cache for constrained sandbox RSS budgets.
  */
 export function createNodeWasmSqlEngine(options: {
   readonly module: NodeChronologWasmModule
@@ -131,13 +430,13 @@ export function createNodeWasmSqlEngine(options: {
   if (!Number.isSafeInteger(cacheSizeKiB) || cacheSizeKiB < 256 || cacheSizeKiB > 131_072) {
     throw unavailable('Invalid WASM SQL memory budget cacheSizeKiB (must be 256..131072).')
   }
+  const vfsName = options.vfs ?? installNodeFsVfs(options.module)
   const base = createBrowserSqlEngine({
     module: options.module,
     manifest: options.manifest,
-    vfs: options.vfs ?? 'unix-none',
+    vfs: vfsName,
     ...(options.limits === undefined ? {} : { limits: options.limits }),
   })
-  const fs = options.module.FS
   return Object.freeze({
     executionManifest: base.executionManifest,
     openDatabase(openOptions: Parameters<SqlEngine['openDatabase']>[0]) {
@@ -145,44 +444,14 @@ export function createNodeWasmSqlEngine(options: {
         throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
       }
       const hostPath = resolve(openOptions.path)
-      const virtualPath = `/chronolog-node-${Buffer.from(hostPath).toString('hex').slice(0, 48)}.sqlite`
       mkdirSync(dirname(hostPath), { recursive: true })
-      if (fs !== undefined && existsSync(hostPath)) {
-        fs.writeFile(virtualPath, new Uint8Array(readFileSync(hostPath)))
-      }
-      const opened = base.openDatabase({ ...openOptions, path: fs !== undefined ? virtualPath : openOptions.path })
+      const opened = base.openDatabase({ ...openOptions, path: hostPath })
       try {
         opened.database.exec(`PRAGMA cache_size = -${cacheSizeKiB}`)
       } catch {
         // Authorizer or read-only configuration may disallow PRAGMA; keep engine operational.
       }
-      const originalClose = opened.database.close.bind(opened.database)
-      const syncToHost = (): void => {
-        if (fs === undefined) return
-        try {
-          if (fs.analyzePath?.(virtualPath).exists === false) return
-          const snapshot = fs.readFile(virtualPath)
-          writeFileAtomicSync(hostPath, snapshot)
-        } catch (error) {
-          throw unavailable(`Failed to flush WASM SQL database to ${hostPath}.`, error)
-        }
-      }
-      const proxiedDatabase = new Proxy(opened.database, {
-        get(target, prop, receiver) {
-          if (prop === 'close') {
-            return () => {
-              try {
-                originalClose()
-              } finally {
-                syncToHost()
-              }
-            }
-          }
-          const value: unknown = Reflect.get(target, prop, receiver)
-          return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value
-        },
-      })
-      return { ...opened, database: proxiedDatabase }
+      return opened
     },
   })
 }

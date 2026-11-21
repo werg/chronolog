@@ -36,7 +36,7 @@ jobs:
       - name: Compare native and WASM through one materializer
         env:
           CHRONOLOG_REQUIRE_WASM: '1'
-        run: pnpm exec vitest run packages/materializer-doltlite/src/wasm-conformance.test.ts
+        run: pnpm exec vitest run packages/materializer-doltlite/src/wasm-conformance.test.ts packages/materializer-doltlite/src/wasm-node.test.ts
       - uses: actions/upload-artifact@v6
         if: always()
         with:
