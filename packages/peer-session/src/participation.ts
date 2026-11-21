@@ -23,7 +23,7 @@ interface Owner {
   resume(): Promise<void>
 }
 interface Observation { readonly generation: string; readonly point: HistoryPoint; readonly observedAt: number }
-interface Joining { readonly controller: AbortController; readonly incoming: boolean; readonly finished: Promise<void> }
+interface Joining { readonly controller: AbortController; readonly incoming: boolean; readonly upgrade: boolean; readonly finished: Promise<void> }
 const identity = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value)
 const samePoint = (left: HistoryPoint, right: HistoryPoint): boolean => left.generation === right.generation && left.sequence === right.sequence && left.root === right.root
 const message = (error: unknown): string => error instanceof Error ? error.message : 'APPLICATION_PARTICIPATION_FAILED'
@@ -275,7 +275,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
             this.#proposal = null; this.#approved = null
             this.#discoveryFence.abort(error)
             for (const [peerId, joining] of this.#joining) {
-              if (!this.#links().some(link => link.peerId === peerId && link.data === 'active')) joining.controller.abort(error)
+              if (!joining.upgrade && !this.#links().some(link => link.peerId === peerId && link.data === 'active')) joining.controller.abort(error)
             }
             this.#wake(); break
           }
@@ -421,32 +421,48 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     this.signal.throwIfAborted(); this.#discoveryFence.signal.throwIfAborted()
     const peer = this.#hints([input.peer])[0]
     if (peer === undefined) return
-    const current = this.#links().find(link => link.peerId === peer.identity)
+    let current = this.#links().find(link => link.peerId === peer.identity)
     if (input.upgrade ? current === undefined || this.#transports.get(current)?.kind !== 'relay' || this.#options.transport.upgrade === undefined : current !== undefined) return
-    const previous = this.#joining.get(peer.identity), incoming = input.invitation !== undefined
-    if (input.upgrade && previous === undefined) {
-      const last = this.#lastUpgrade.get(peer.identity)
-      if (last !== undefined && Date.now() - last < this.#upgradeCooldownMs) return
-    }
-    if (previous !== undefined) {
-      if (!incoming) {
-        // Discovery joins the already owned attempt, including an invitation.
-        await awaitOwnedTask(this.signal, () => previous.finished)
-        return
+    const incoming = input.invitation !== undefined
+    let superseded = false
+    // Supersession awaits release of the old attempt. Re-read ownership after
+    // every await: multiple invitations must never overwrite one another's slot.
+    while (true) {
+      const previous = this.#joining.get(peer.identity)
+      if (previous === undefined) {
+        if (input.upgrade && !superseded) {
+          const last = this.#lastUpgrade.get(peer.identity)
+          if (last !== undefined && Date.now() - last < this.#upgradeCooldownMs) return
+        }
+        break
       }
+      if (!incoming) { await awaitOwnedTask(this.signal, () => previous.finished); return }
       if (previous.incoming || this.#owner.participant.device.publicKey < peer.identity) return
+      superseded = true
       previous.controller.abort(new Error('APPLICATION_CONNECTION_SUPERSEDED'))
       await awaitOwnedTask(this.signal, () => previous.finished)
-      if (input.upgrade && !this.#links().some(link => link.peerId === peer.identity && this.#transports.get(link)?.kind === 'relay')) return
+      this.signal.throwIfAborted(); this.#discoveryFence.signal.throwIfAborted()
+      if (input.upgrade ? !this.#links().some(link => link.peerId === peer.identity && this.#transports.get(link)?.kind === 'relay') : this.#links().some(link => link.peerId === peer.identity)) return
     }
+    current = this.#links().find(link => link.peerId === peer.identity)
+    if (input.upgrade ? current === undefined || this.#transports.get(current)?.kind !== 'relay' : current !== undefined) return
     if (this.#physicalOpenings.size >= this.#maxPeers || !input.upgrade && this.#links().length + this.#physicalOpenings.size >= this.#maxPeers) return
     // maxPeers bounds logical peers and concurrent physical candidates separately.
     // A candidate replacing an existing link cannot consume a second logical slot.
     if (input.upgrade) this.#lastUpgrade.set(peer.identity, Date.now())
     const token = Symbol(), controller = new AbortController()
-    const signal = AbortSignal.any([this.signal, controller.signal, ...(input.upgrade ? [this.#discoveryFence.signal] : [])])
+    const signal = AbortSignal.any([this.signal, controller.signal])
+    // Hosted discovery may fence an opening, never an authenticated replacement.
+    // The network owner promotes synchronously before its connect promise resumes.
+    const fenceUpgrade = (): void => {
+      if (!this.#links().some(value => value.peerId === peer.identity && value !== current)) controller.abort(this.#discoveryFence.signal.reason)
+    }
+    if (input.upgrade) {
+      this.#discoveryFence.signal.addEventListener('abort', fenceUpgrade, { once: true })
+      if (this.#discoveryFence.signal.aborted) fenceUpgrade()
+    }
     let finished!: () => void, settled = false, link: ApplicationPeerLink | undefined, connection: FramedPeerConnection | undefined
-    const joining: Joining = { controller, incoming, finished: new Promise(resolve => { finished = resolve }) }
+    const joining: Joining = { controller, incoming, upgrade: input.upgrade === true, finished: new Promise(resolve => { finished = resolve }) }
     this.#joining.set(peer.identity, joining); this.#physicalOpenings.add(token)
     const timer = setTimeout(() => controller.abort(new Error('APPLICATION_CONNECTION_TIMEOUT')), this.#timeoutMs)
     const opening = Promise.resolve().then(() => {
@@ -467,6 +483,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
           input.upgrade && description.kind !== 'direct') throw new Error('APPLICATION_TRANSPORT_DESCRIPTION_INVALID')
       link = await this.#owner.connect({ connection, peerIdentity: peer.identity, signal,
         handshakeTimeoutMs: this.#timeoutMs, requestTimeoutMs: this.#timeoutMs, transferTimeoutMs: this.#timeoutMs })
+      this.#discoveryFence.signal.removeEventListener('abort', fenceUpgrade)
       this.#transports.set(link, { kind: description.kind, ...(description.reason === undefined ? {} : { reason: description.reason }) })
       try { await awaitOwnedTask(signal, () => link!.synchronize()) }
       catch (error) { if (!isPeerDataUnavailable(error)) throw error }
@@ -479,6 +496,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       throw error
     } finally {
       clearTimeout(timer)
+      this.#discoveryFence.signal.removeEventListener('abort', fenceUpgrade)
       if (settled) this.#physicalOpenings.delete(token)
       if (this.#joining.get(peer.identity) === joining) this.#joining.delete(peer.identity)
       finished()

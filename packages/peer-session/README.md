@@ -357,8 +357,8 @@ A transport may implement `upgrade()` (direct-only) and `describe(connection)`.
 `participation.reconsiderConnections()` coalesces real network/provider events
 into bounded replacement attempts for existing relay links. The default per-peer
 cooldown is 30 seconds and schedules no timer. A failed candidate preserves the
-working relay; authenticated replacements drain the old connection for a fixed
-five-second grace, preserving in-flight RPC replies while routing new work on the
+working relay; authenticated replacements drain the old connection for one fixed
+grace window (five seconds by default), preserving in-flight RPC replies while routing new work on the
 replacement. The physical candidate and draining resource bounds remain finite.
 Host applications should forward actual OS/browser network events, never poll.
 The Worker facade exposes both methods under the attachment's diagnostic grant.
