@@ -105,6 +105,9 @@ jobs:
         id: chromium
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
         run: pnpm exec playwright install --with-deps chromium
+      - name: Qualify portable SharedWorker and DedicatedWorker RTC endpoints
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        run: pnpm exec tsx tools/test-worker-webrtc-endpoint.ts
       - name: Qualify both browser record stores and pinned ownership
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: pnpm exec tsx tools/test-browser-storage.ts

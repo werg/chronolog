@@ -87,30 +87,20 @@ descriptions. Application frames always use the resulting peer connection.
 
 ## Browser ownership
 
-The Window owns `RTCPeerConnection` negotiation. Transfer both untouched channels
-synchronously to the exclusive Chronolog Worker; that Worker owns keys, storage,
-authentication and all application work:
+The Window owns `RTCPeerConnection` and raw framing through
+`openWebRtcConnection`. The maintained Worker bridge is
+`serveWorkerWebRtcConnections(endpoint)` on the page and
+`openWorkerWebRtcConnection(endpoint, options)` in the owning Worker, exported by
+`@chronolog/peer-session/webrtc`. It sends bounded opaque frames and ACKs over an
+ordered authenticated endpoint, without creating or transferring ports or
+RTCDataChannels. This works with DedicatedWorkers, started SharedWorker ports and
+virtual authenticated endpoints. Keys, storage, peer authentication and
+application state remain in the Worker. The raw RTC callbacks do not move an
+application participant onto the page.
 
-```ts
-// Window.
-const rtc = await negotiateWebRtc({
-  role, signaling, configuration: { iceServers }, signal: windowLifetime,
-  onDataChannels(channels) {
-    worker.postMessage({ type: 'peer-channels', channels },
-      [channels.reliable as RTCDataChannel, channels.live as RTCDataChannel])
-  },
-})
-
-// DedicatedWorker, handling the transferred channels.
-const connection = frameRtcPeerChannels(channels)
-await connection.ready
-const peer = await session.connectPeer({ connection, signal: workerLifetime })
-```
-
-The handoff callback must not await, defer transfer or use either channel first.
-Unsupported channel transfer fails explicitly. The Window's RTC lifetime and
-the Worker's authenticated peer lifetime must end together. Every replacement
-connection performs a fresh Chronolog handshake.
+See [the portable endpoint contract](../peer-session/README.md#owned-participation-and-recovery)
+for endpoint ownership, bounds, cancellation, route diagnostics and actual browser
+qualification. Each replacement connection performs a fresh Chronolog handshake.
 
 ## Connection lifecycle and retry
 
@@ -169,7 +159,7 @@ pnpm exec vitest run packages/transport-webrtc/src
 
 The maintained application qualification uses the packed common session through
 `tools/test-peer-session-webrtc.ts` and the contrib native/browser fixtures.
-Browser qualification transfers both RTC channels into the owning Worker,
+Browser qualification bridges opaque RTC frames to the owning Worker,
 continues application work after the host stops, verifies retained history and
 checks signals and encrypted content through that same session. Loopback gates
 do not establish Internet NAT success rates or TURN interoperability.
