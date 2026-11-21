@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      AUTOMATION_SOURCE: '9a781f34343a90690df027080af8cf087f358057'
+      AUTOMATION_SOURCE: '5d239ce0dc2e90fb8db0ff3fa738fa2a81e36f46'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: werg/tendriller
-          ref: '9a781f34343a90690df027080af8cf087f358057'
+          ref: '5d239ce0dc2e90fb8db0ff3fa738fa2a81e36f46'
           path: .release-planner
           sparse-checkout-cone-mode: false
           sparse-checkout: |

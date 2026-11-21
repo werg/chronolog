@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { URL } from 'node:url';
 import { select } from '../distribution/select-companion-release.mjs';
 const tuple = JSON.parse(readFileSync(new URL('../distribution/companion-release.json', import.meta.url)));
 test('webrtc consumes the canonical tuple and retains exact checkout checks', () => {
@@ -14,6 +15,6 @@ test('webrtc consumes the canonical tuple and retains exact checkout checks', ()
   assert.ok(text.includes('Build independent host test artifacts (not for deployment)'));
   for (const key of ['HOST_REF', 'CONTRIB_REF']) {
     assert.ok(text.includes('ref: \u0024{{ env.' + key + ' }}'));
-    assert.ok(text.includes('= \"\u0024' + key + '\"'));
+    assert.ok(text.includes('= "$' + key + '"'));
   }
 });
