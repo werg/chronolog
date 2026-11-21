@@ -30,6 +30,15 @@ export function identifier(value: unknown, name = 'identity'): string {
   return value
 }
 
+// Match the journal's boundedText operation identity, not UI/profile identifiers.
+function operationIdentity(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 512 ||
+      [...value].some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
+    throw new SessionError('INVALID_IDENTITY', 'Invalid operation')
+  }
+  return value
+}
+
 export function signerId(value: unknown): string {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value)) {
     throw new SessionError('INVALID_SIGNER', 'A verified signing public key is required')
@@ -137,7 +146,7 @@ export function operationReference(
     applicationId,
     historyId,
     author,
-    operationId: identifier(scopedId, 'operation'),
+    operationId: operationIdentity(scopedId),
     ...(state?.attemptId === undefined ? {} : { attemptId: state.attemptId }),
     ...(state?.generation === undefined ? {} : { generation: state.generation }),
   })
@@ -198,7 +207,7 @@ export function createViewStore<Draft = unknown>(options: {
       const digest = reference[field]
       if (digest !== undefined && (typeof digest !== 'string' || !/^[0-9a-f]{64}$/u.test(digest))) throw new SessionError('OPERATION_REFERENCE_INVALID')
     }
-    return `${prefix}operation:${historySegment(reference.historyId)}:${signerId(reference.author)}:${segment(reference.operationId)}:view:${segment(retainedViewId)}`
+    return `${prefix}operation:${historySegment(reference.historyId)}:${signerId(reference.author)}:${encodeURIComponent(operationIdentity(reference.operationId))}:view:${segment(retainedViewId)}`
   }
 
   function readRetained(key: string): RetainedOperation | null {

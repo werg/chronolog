@@ -181,6 +181,23 @@ describe('peer-session central pipe extensions', () => {
     } finally { await session.close() }
   })
 
+  it('preserves every supported journal operation ID through saved commands, inspection and retry', async () => {
+    const session = await openTestSession()
+    try {
+      const scoped = createScopedApplicationTools(session, { commands: ['addNote'] })
+      for (const id of ['invoice#42', 'a'.repeat(201), 'b'.repeat(512), 'job 42 🧪']) {
+        const written = await scoped.execute({ kind: 'command', name: 'addNote', input: { text: id }, operationId: id }) as { operationReference: { operationId: string; attemptId: string } }
+        expect(written.operationReference.operationId).toBe(id)
+        await session.operations.wait(id)
+        for (const kind of ['operation', 'retry', 'wait'] as const) {
+          const result = await scoped.execute({ kind, name: 'addNote', operationId: id }) as typeof written
+          expect(result.operationReference.operationId).toBe(id)
+          expect(result.operationReference.attemptId).toBe(written.operationReference.attemptId)
+        }
+      }
+    } finally { await session.close() }
+  })
+
   it('createViewStore and operationReference isolate views and reject conflicting retained intents', () => {
     const data = new Map<string, string>()
     const storage = {

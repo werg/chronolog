@@ -1,5 +1,5 @@
 import { expect, it, vi } from 'vitest'
-import { canonicalJson, createViewStore, type OperationReference } from './view-store.js'
+import { canonicalJson, createViewStore, operationReference, type OperationReference } from './view-store.js'
 
 function fixture() {
   const data = new Map<string, string>()
@@ -53,4 +53,18 @@ it('separates payload validation failures from storage write failures', () => {
   expect(() => f.store.writeDraft({ bad: undefined })).toThrow('INVALID_PAYLOAD')
   f.storage.setItem = () => { throw Error('quota exceeded') }
   expect(() => f.store.writeDraft({ valid: true })).toThrow('Could not retain the local record: quota exceeded')
+})
+
+
+it('references and local storage preserve printable 512-character operation identities without key collisions', () => {
+  const f = fixture()
+  for (const operationId of ['invoice#42', 'a'.repeat(201), 'b'.repeat(512), 'job 42 🧪', 'a/b', 'a%2Fb']) {
+    const reference = operationReference({ applicationId: 'app', historyId: 'history', deviceId: f.reference.author }, operationId)
+    f.store.retainOperation(reference)
+    expect(f.store.inspectOperation(reference)?.reference).toEqual(reference)
+  }
+  expect(f.store.pending()).toHaveLength(6)
+  for (const id of ['', 'x'.repeat(513), 'line\nbreak', 'bad\u007f']) {
+    expect(() => operationReference({ applicationId: 'app', historyId: 'history', deviceId: f.reference.author }, id)).toThrowError(expect.objectContaining({ code: 'INVALID_IDENTITY' }))
+  }
 })

@@ -74,7 +74,7 @@ async function observeChange(session: ApplicationSession, after: PeerRevision | 
 
 /** Local agent tools execute against the same owned session, identity and journal as the UI. */
 export function createApplicationTools(session: ApplicationSession, options: { readonly host?: ApplicationControlHost } = {}) {
-  const description = session.describe(), operationId = { type: 'string', minLength: 1, maxLength: 256 }
+  const description = session.describe(), operationId = { type: 'string', minLength: 1, maxLength: 512 }
   const object = (properties: Record<string, unknown>, required: readonly string[] = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false })
   const entries = (kind: 'commands' | 'queries', fields: Record<string, unknown>, required = Object.keys(fields)) => ({ oneOf: description[kind].map(entry => object({
     name: { type: 'string', const: entry.name, description: entry.description }, input: entry.input, ...fields,
