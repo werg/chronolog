@@ -1,0 +1,109 @@
+{
+  "format": "tendriller-companion-release/v1",
+  "stage": "qualified",
+  "core": {
+    "repository": "werg/tendriller",
+    "source": "79b6845df411e3a910b662b31bae789da38d0bf9",
+    "sourceTree": "b65c3c10a86b293a156e51c32509d926d67c889e",
+    "dirty": false
+  },
+  "release": {
+    "sourceCommit": "79b6845df411e3a910b662b31bae789da38d0bf9",
+    "coreRelease": "0.3.0-rc.17",
+    "runtimeId": "7c73ccf86b70ad5601090156b9d21083c91889338140ad3811252ac491ac73ff",
+    "compositionId": "4cb993542c9ece388a3342aa0a9503b192879b1e8903cf7b8f7bacb866423d13",
+    "manifestSha256": "c363cec748336abc0cc6f4af10ca9752a1d71207c249c6c318ee4247dd465742"
+  },
+  "kernel": {
+    "repository": "werg/chronolog-db",
+    "source": "e802f1658cef71ab12711e0921cdc802bbb8d2d0",
+    "sourceTree": "ddcb170f4c842ded088f60e472e5b77aaea23d6c",
+    "dirty": false,
+    "archive": {
+      "role": "session",
+      "file": "chronolog-peer-session-e802f1658cef71ab12711e0921cdc802bbb8d2d0.tgz",
+      "sha256": "0dd11c0762614f92b7c08cc79e624ff647fc4e14ffe688a1512cd1ec98982db9",
+      "size": 216667
+    }
+  },
+  "contrib": {
+    "repository": "werg/tendriller-contrib",
+    "source": "549be02e818a2c3e0c9e7f80e171a30671703958",
+    "sourceTree": "ee36122c9ff72c7d02b1c84928be1ee89bce8c50",
+    "dirty": false,
+    "gates": [
+      {
+        "workflow": "ci.yml",
+        "run": 44904147743,
+        "attempt": 1,
+        "artifacts": [
+          {
+            "id": 14707191222,
+            "name": "cookbook-content",
+            "sha256": "ec2f305f9c949ee35c7b2e614ea5d3c5b8efc22b08608bca8d6af34fcd9ea013"
+          }
+        ]
+      },
+      {
+        "workflow": "peer-generation.yml",
+        "run": 44904147732,
+        "attempt": 1,
+        "artifacts": [
+          {
+            "id": 14707820079,
+            "name": "independent-peer-generation-relay-evidence",
+            "sha256": "8e738fd3bf1b75ca2e19ac0c737299f3753483ff28b58b0cc34cad14f58a4675"
+          },
+          {
+            "id": 14707720348,
+            "name": "independent-peer-generation-browser-relay-evidence",
+            "sha256": "2203148408dc64fd795157b2f99da5783fb4721bebfaeecec70cbd87e7c631df"
+          },
+          {
+            "id": 14707695531,
+            "name": "independent-peer-generation-hosted-evidence",
+            "sha256": "063144377d91ecb41dd649efa85a788de4d75b384874a4eb376084b768aba22d"
+          },
+          {
+            "id": 14707171548,
+            "name": "independent-peer-generation-native-sql-evidence",
+            "sha256": "6cb0544ce96fc338ceac3a7cfb2efb22d79029ba084f5c88442d687e971c2a43"
+          },
+          {
+            "id": 14706982283,
+            "name": "qualified-local-peer-composition",
+            "sha256": "3482315e647ec4ed1667afe91ab9ee1897d4f6aa8e90927a0ecd887f7c1170a4"
+          },
+          {
+            "id": 14706902433,
+            "name": "independent-peer-generation-browser-native-evidence",
+            "sha256": "f405bdce37d96da71c2d9b5423dd2691e9e183fb7a156bfb9d19debb9f827540"
+          },
+          {
+            "id": 14706817486,
+            "name": "independent-peer-generation-native-rtc-evidence",
+            "sha256": "4611e82ccaf334912a881822cd46f00bb01663b6246abd966dbd292107b239e5"
+          },
+          {
+            "id": 14706729288,
+            "name": "independent-peer-generation-direct-evidence",
+            "sha256": "d7299bda7cc6a135253149afeb185a43f998862ce4593581fce2060b0f4c2e80"
+          }
+        ]
+      },
+      {
+        "workflow": "collaboration.yml",
+        "run": 44904147768,
+        "attempt": 1,
+        "artifacts": [
+          {
+            "id": 14706989865,
+            "name": "collaboration-549be02e818a2c3e0c9e7f80e171a30671703958-evidence",
+            "sha256": "cf7ab961e36a60fe52a72ce6a70fb41cff465ce706aff5258c3aaaf3174e9ef1"
+          }
+        ]
+      }
+    ]
+  },
+  "id": "161df0630f00b537deb2c56c471a523eae40b721fa7c724d4770fa5a2677df70"
+}

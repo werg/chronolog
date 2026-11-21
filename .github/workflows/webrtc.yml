@@ -1,4 +1,5 @@
 name: Independent application qualification
+run-name: "Companion core=${{ inputs.host_ref || 'tuple' }} contrib=${{ inputs.contrib_ref || 'tuple' }}"
 
 on:
   pull_request:
@@ -26,10 +27,16 @@ jobs:
   qualify:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      HOST_REF: ${{ inputs.host_ref || '79b6845df411e3a910b662b31bae789da38d0bf9' }}
-      CONTRIB_REF: ${{ inputs.contrib_ref || '4eb5a8a98d9d35632ed4fd39b7bf2d5a683f0457' }}
     steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Select verified companion tuple
+        env:
+          TENDRILLER_REF: ${{ inputs.host_ref }}
+          CONTRIB_REF_INPUT: ${{ inputs.contrib_ref }}
+        run: node distribution/select-companion-release.mjs chronolog >> "$GITHUB_ENV"
       - name: Require immutable companion commits
         shell: bash
         run: |
@@ -37,7 +44,6 @@ jobs:
           [[ "$CONTRIB_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'contrib_ref must be a full commit SHA'; exit 1; }
           echo "Core: $HOST_REF"
           echo "Cookbooks: $CONTRIB_REF"
-      - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
