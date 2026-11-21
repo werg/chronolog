@@ -398,8 +398,13 @@ session. The session owns authentication, synchronization and every later retry;
 transport fallback creates no second operation journal or recovery controller.
 WebSockets are available in the owning Worker directly and need no page bridge.
 
-The default controller owns at most four connections, with a hard maximum of
-eight. Attempts have a 15-second deadline and bounded exponential backoff with
+The default controller admits four distinct peers, configurable up to eight.
+Ordinary openings share that budget with active links. A direct replacement may
+retain its existing link while occupying one of the separately bounded candidate
+slots (at most `maxPeers` concurrent physical openings). Authenticated handover
+retains at most one draining connection per peer, up to eight overall, for one
+fixed deadline. Candidates, active links and drains therefore have explicit
+separate finite bounds. Attempts have a 15-second deadline and bounded exponential backoff with
 jitter, starting at one second and capped at 30 seconds. A transport that ignores
 cancellation continues to occupy its bounded opening slot; a late connection is
 closed rather than attached. Discovery requires
