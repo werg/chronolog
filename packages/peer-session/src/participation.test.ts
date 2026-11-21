@@ -211,6 +211,143 @@ async function holdIncomingCoordinator({ advertised = true } = {}) {
 }
 
 describe('owned application participation', () => {
+  it('preserves commands, history and live traffic on an upgraded direct peer after terminal discovery failure', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), terminal = gate()
+    f.hub.kind = 'relay'
+    const ap = f.participate(a), ports = f.hub.ports(b.deviceId)
+    const bp = f.participate(b, { discovery: { ...ports.discovery, async *notifications() {
+      yield { type: 'ready' as const }
+      await terminal.promise
+      throw Object.assign(new Error('HOST_REVOKED'), { retryable: false })
+    } } })
+    await until(() => bp.status.phase === 'following')
+    const generation = b.status.generation
+    await post(b, 'before-host-terminal')
+    await bp.reconsiderConnections()
+    await until(async () => (await ap.diagnostics())[0]?.kind === 'direct' && (await bp.diagnostics())[0]?.kind === 'direct')
+    terminal.resolve()
+    await until(() => bp.status.phase === 'unavailable')
+    expect(bp.status.connectedPeers).toEqual([a.deviceId])
+    expect((await bp.diagnostics())[0]?.kind).toBe('direct')
+    await post(b, 'direct-survives-host-terminal')
+    const observations = a.signals.subscribe({ topics: ['terminal-test'], signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator]()
+    try {
+      const received = observations.next(), sent = await b.signals.send('terminal-test', { connected: true })
+      expect((await received).value).toEqual(sent)
+    } finally { await observations.return?.() }
+    for (const session of [a, b]) {
+      const view = await session.readView()
+      try { expect(view.readEvents().events.map(event => event.operationId)).toEqual(['before-host-terminal', 'direct-survives-host-terminal']) }
+      finally { view.release() }
+    }
+    expect(b.status.generation).toBe(generation); expect(f.counts.selections).toBe(0)
+  })
+
+  it('cancels a pending direct candidate on terminal discovery while preserving relay commands and live traffic', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), terminal = gate(), opened = gate(), release = gate()
+    f.hub.kind = 'relay'
+    const ap = f.participate(a), ports = f.hub.ports(b.deviceId)
+    let attemptSignal: AbortSignal | undefined, candidate: FramedPeerConnection | undefined
+    const bp = f.participate(b, {
+      discovery: { ...ports.discovery, async *notifications() {
+        yield { type: 'ready' as const }
+        await terminal.promise
+        throw Object.assign(new Error('HOST_REVOKED'), { retryable: false })
+      } },
+      transport: { ...ports.transport, async upgrade(input, options) {
+        candidate = await ports.transport.upgrade!(input, options)
+        attemptSignal = options.signal; opened.resolve()
+        await release.promise
+        return candidate
+      } },
+    })
+    closing.push(() => { release.resolve(); terminal.resolve() })
+    await until(() => bp.status.phase === 'following')
+    const generation = b.status.generation, upgrading = bp.reconsiderConnections()
+    await opened.promise
+    try {
+      terminal.resolve()
+      await until(() => bp.status.phase === 'unavailable' && attemptSignal?.aborted === true)
+      await upgrading
+      expect(bp.status.connectedPeers).toEqual([a.deviceId])
+      expect((await bp.diagnostics())[0]?.kind).toBe('relay')
+      expect((await ap.diagnostics())[0]?.kind).toBe('relay')
+      await post(b, 'relay-survives-candidate-cancel')
+      const observations = a.signals.subscribe({ topics: ['terminal-test'], signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator]()
+      try {
+        const received = observations.next(), sent = await b.signals.send('terminal-test', { relayed: true })
+        expect((await received).value).toEqual(sent)
+      } finally { await observations.return?.() }
+      release.resolve()
+      await until(() => candidate?.signal.aborted === true)
+      const attempts = f.hub.upgradeAttempts
+      await bp.reconsiderConnections()
+      expect(f.hub.upgradeAttempts).toBe(attempts)
+      expect(b.status.generation).toBe(generation); expect(f.counts.selections).toBe(0)
+      expect((await bp.diagnostics())[0]?.kind).toBe('relay')
+    } finally { release.resolve() }
+  })
+
+  it('reserves only one incoming upgrade after concurrent invitations supersede the same outgoing attempt', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    const target = a.deviceId > b.deviceId ? a : b, remote = target === a ? b : a
+    const started = gate(), closingCandidate = gate(), releaseClose = gate(), bothDelivered = gate()
+    const targetPorts = f.hub.ports(target.deviceId), remotePorts = f.hub.ports(remote.deviceId)
+    const [stalled, unused] = createFramedPeerConnectionPair()
+    let delivered = 0, incomingOpenings = 0
+    const candidate: FramedPeerConnection = { ...stalled,
+      async send(frame, options) { started.resolve(); await stalled.send(frame, options) },
+      async close() { closingCandidate.resolve(); await releaseClose.promise; await stalled.close() },
+    }
+    f.hub.descriptions.set(candidate, { kind: 'direct' })
+    closing.push(() => { releaseClose.resolve(); return unused.close() })
+    f.hub.kind = 'relay'
+    const remoteParticipation = f.participate(remote)
+    const participation = f.participate(target, {
+      discovery: { ...targetPorts.discovery, async *invitations(options) {
+        for await (const invitation of targetPorts.discovery.invitations(options)) {
+          if (invitation.upgrade) delivered++
+          yield invitation
+          // Resuming after yield means #listen has dispatched this invitation.
+          if (delivered === 2) bothDelivered.resolve()
+        }
+      } },
+      transport: { ...targetPorts.transport, async upgrade(input, options) {
+        if (input.invitation === undefined) return candidate
+        incomingOpenings++
+        return targetPorts.transport.upgrade!(input, options)
+      } },
+      connections: { maxPeers: 4, retryInitialMs: 5, retryMaxMs: 20, timeoutMs: 2000 },
+    })
+    await until(() => participation.status.phase === (target === a ? 'coordinating' : 'following') &&
+      remoteParticipation.status.phase === (remote === a ? 'coordinating' : 'following'))
+    await until(async () => (await participation.diagnostics())[0]?.kind === 'relay')
+    await post(b, 'before-incoming-supersession')
+    const outgoing = participation.reconsiderConnections()
+    await started.promise
+    try {
+      const first = await remotePorts.transport.upgrade!({ peer: { identity: target.deviceId, route: null } }, { signal: remote.signal })
+      closing.push(() => first.close())
+      await closingCandidate.promise
+      const second = await remotePorts.transport.upgrade!({ peer: { identity: target.deviceId, route: null } }, { signal: remote.signal })
+      closing.push(() => second.close())
+      await bothDelivered.promise
+      // Both incoming tasks have reached the same still-pending predecessor.
+      expect(incomingOpenings).toBe(0)
+      releaseClose.resolve(); await outgoing
+      await until(() => incomingOpenings > 0)
+      expect(incomingOpenings).toBe(1)
+      const winner = await remote.connectPeer({ connection: first, peerIdentity: target.deviceId })
+      closing.push(() => winner.close())
+      await winner.synchronize()
+      await until(async () => (await participation.diagnostics())[0]?.kind === 'direct')
+      expect(incomingOpenings).toBe(1)
+      expect([a.status.connectedPeers, b.status.connectedPeers]).toEqual([1, 1])
+      await post(b, 'one-incoming-upgrade-wins')
+      expect(f.counts.selections).toBe(0)
+    } finally { releaseClose.resolve() }
+  })
+
   it('upgrades a working relay on a real event, retaining its identity, generation and commands', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     f.hub.kind = 'relay'
