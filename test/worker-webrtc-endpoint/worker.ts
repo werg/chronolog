@@ -14,14 +14,14 @@ function attach(endpoint: ApplicationWorkerEndpoint & { start?(): void }) {
   } }, async send(description: PeerDescription) { endpoint.postMessage({ fixture: 'description', description }) }, close() { wake() } }
   endpoint.addEventListener('message', event => {
     const value = event.data as { fixture?: string; id: number; action: string; role: 'offerer' | 'answerer'; description: PeerDescription;
-      count: number; size: number; broadcast?: string }
+      count: number; size: number; broadcast?: string; configuration?: RTCConfiguration; timeoutMs?: number }
     if (value.fixture !== 'command') return
     if (value.action === 'remote') { remote = value.description; wake(); return }
     const run = async () => {
       switch (value.action) {
         case 'open': {
           const transport = value.broadcast === undefined ? endpoint : (broadcast = new BroadcastChannel(value.broadcast))
-          connection = await openWorkerWebRtcConnection(transport, { role: value.role, signaling, configuration: { iceServers: [] }, timeoutMs: 15_000 })
+          connection = await openWorkerWebRtcConnection(transport, { role: value.role, signaling, configuration: value.configuration ?? { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] }, timeoutMs: value.timeoutMs ?? 15_000 })
           const read = async (live: boolean) => {
             try {
               for await (const frame of (live ? connection!.live! : connection!).frames()) {

@@ -7,14 +7,16 @@ const PROTOCOL = 'chronolog.peer.v2'
 
 /**
  * Both fixed negotiated channels are created synchronously on each endpoint.
- * The callback transfers them together to their owning Worker before either
- * ceases to be transferable. Only negotiation remains on the page.
+ * The callback attaches raw framing synchronously. The portable Worker bridge
+ * forwards opaque frames; it does not transfer these channels.
  */
 export async function negotiateWebRtc(options: WebRtcOptions & {
   readonly onDataChannels: (channels: WebRtcChannels) => void
 }): Promise<WebRtcSession> {
   const timeoutMs = options.timeoutMs ?? 30_000
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error('WEBRTC_TIMEOUT_INVALID')
+  const gatheringMs = options.gatheringTimeoutMs ?? Math.min(WEBRTC_LIMITS.gatheringMs, timeoutMs)
+  if (!Number.isSafeInteger(gatheringMs) || gatheringMs < 1 || gatheringMs > timeoutMs) throw new Error('WEBRTC_GATHERING_TIMEOUT_INVALID')
   let connection: RtcPeerConnection
   try {
     options.signal?.throwIfAborted()
@@ -68,8 +70,11 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     return description
   }
   const publish = async (type: PeerDescription['type']): Promise<void> => {
-    await waitFor(connection, 'icegatheringstatechange', () => connection.iceGatheringState === 'complete', signal)
+    const complete = await gatherBatch(connection, gatheringMs, signal)
     const description = validateDescription(connection.localDescription, type)
+    // Only locally generated SDP is inspected here. Preserve every candidate and
+    // SDP attribute; a slow server must not block a usable batch until full ICE.
+    if (!complete && !usableCandidate(description.sdp, options.configuration?.iceTransportPolicy)) throw new Error('WEBRTC_ICE_CANDIDATES_UNAVAILABLE')
     await interruptible(options.signaling.send(description), signal)
     sentMessages += 1; sentBytes += new TextEncoder().encode(description.sdp).length
   }
@@ -156,5 +161,28 @@ function waitFor(connection: RtcPeerConnection, event: string, complete: () => b
     const check = (): void => { if (complete()) { cleanup(); resolve() } }
     const abort = (): void => { cleanup(); reject(signal.reason) }
     connection.addEventListener(event, check); signal.addEventListener('abort', abort, { once: true }); check()
+  })
+}
+
+/** Event-driven batch gathering. Only this active phase owns a timer. */
+function gatherBatch(connection: RtcPeerConnection, budgetMs: number, signal: AbortSignal): Promise<boolean> {
+  signal.throwIfAborted()
+  if (connection.iceGatheringState === 'complete') return Promise.resolve(true)
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { clearTimeout(timer); connection.removeEventListener('icegatheringstatechange', check); signal.removeEventListener('abort', abort) }
+    const finish = () => { cleanup(); resolve(connection.iceGatheringState === 'complete') }
+    const check = () => { if (connection.iceGatheringState === 'complete') finish() }
+    const abort = () => { cleanup(); reject(signal.reason) }
+    const timer = setTimeout(finish, budgetMs)
+    connection.addEventListener('icegatheringstatechange', check); signal.addEventListener('abort', abort, { once: true }); check()
+  })
+}
+function usableCandidate(sdp: string, policy?: RTCIceTransportPolicy): boolean {
+  return sdp.split(/\r?\n/u).some(line => {
+    const fields = line.trim().split(/\s+/u), port = Number(fields[5])
+    return fields[0]?.startsWith('a=candidate:') === true && fields[6] === 'typ' &&
+      ['udp', 'tcp'].includes(fields[2]?.toLowerCase() ?? '') && Number.isInteger(port) && port > 0 && port <= 65535 &&
+      fields[4] !== undefined && !['0.0.0.0', '::', '0:0:0:0:0:0:0:0'].includes(fields[4]) &&
+      ['host', 'srflx', 'prflx', 'relay'].includes(fields[7] ?? '') && (policy !== 'relay' || fields[7] === 'relay')
   })
 }

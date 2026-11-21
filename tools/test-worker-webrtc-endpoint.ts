@@ -29,7 +29,7 @@ const address = server.address(); assert(address !== null && typeof address !== 
 const browser = await chromium.launch({ ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH === undefined ? {} : { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH }) })
 const results: Array<Awaited<ReturnType<typeof qualify>>> = []
 try {
-  for (const mode of ['shared', 'dedicated', 'broadcast'] as const) {
+  for (const mode of ['shared', 'dedicated', 'broadcast', 'shared-unreachable-stun'] as const) {
     const page = await browser.newPage()
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
@@ -42,6 +42,12 @@ try {
       assert(result.ready.every(value => (value as { worker: boolean; route: { route: string } }).worker && (value as { route: { route: string } }).route.route === 'direct'))
       assert.deepEqual(result.live, [true, true]); assert.equal(result.idleMessages, 0)
       assert.deepEqual(result.state, [{ received: 24, liveReceived: 1, bytes: 24 * 65_536 }, { received: 24, liveReceived: 1, bytes: 24 * 65_536 }])
+      if (mode === 'shared-unreachable-stun') {
+        assert(result.negotiationMs < 5000, 'Unreachable STUN must not consume the whole direct attempt')
+        assert.equal(result.descriptions.length, 2)
+        assert(result.descriptions.every(value => value.candidates > 0 && value.servers === 2), 'Keep real STUN configured and publish usable candidate batches')
+        assert(result.descriptions.some(value => value.gathering !== 'complete'), 'Exercise actual incomplete ICE gathering, not an already completed gather')
+      }
       results.push(result); console.log(`${mode}: bidirectional reliable/live direct RTC, ordered 3 MiB, quiet idle PASS`)
     } finally { clearTimeout(timer); await page.close() }
   }

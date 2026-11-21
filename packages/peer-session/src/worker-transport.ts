@@ -42,7 +42,7 @@ export function serveWorkerWebRtcConnections(endpoint: ApplicationWorkerEndpoint
     if (existing !== undefined) { existing.receive(payload(data)); return }
     if (data.action !== 'open') return // Late callbacks from retired connection IDs.
     if (active.size >= MAX_CONNECTIONS) { post(id, { action: 'ended', error: 'APPLICATION_PEER_LIMIT' }); return }
-    if (!['offerer', 'answerer'].includes(String(data.role)) || !validTimeout(data.timeoutMs) || !validConfiguration(data.configuration)) {
+    if (!['offerer', 'answerer'].includes(String(data.role)) || !validTimeout(data.timeoutMs) || !validGatheringTimeout(data.gatheringTimeoutMs, data.timeoutMs) || !validConfiguration(data.configuration)) {
       post(id, { action: 'ended', error: 'APPLICATION_WORKER_OPTIONS_INVALID' }); return
     }
     const lifetime = new AbortController(), received = deferred<PeerDescription>(), sent = deferred<void>(), signalingClosed = deferred<void>()
@@ -91,6 +91,7 @@ export function serveWorkerWebRtcConnections(endpoint: ApplicationWorkerEndpoint
           ...(data.configuration === undefined ? {} : { configuration: data.configuration as RTCConfiguration }),
           ...(options.createPeerConnection === undefined ? {} : { createPeerConnection: options.createPeerConnection }),
           timeoutMs: data.timeoutMs as number, signal: lifetime.signal,
+          ...(data.gatheringTimeoutMs === undefined ? {} : { gatheringTimeoutMs: data.gatheringTimeoutMs as number }),
           signaling: {
             messages: { async *[Symbol.asyncIterator]() { yield await awaitOwnedTask(lifetime.signal, () => received.promise) } },
             async send(value) {
@@ -140,7 +141,7 @@ export function serveWorkerWebRtcConnections(endpoint: ApplicationWorkerEndpoint
 export async function openWorkerWebRtcConnection(endpoint: ApplicationWorkerEndpoint,
   options: Omit<WebRtcOptions, 'createPeerConnection'>): Promise<WorkerWebRtcConnection> {
   const timeoutMs = options.timeoutMs ?? 30_000
-  if (!validTimeout(timeoutMs) || !['offerer', 'answerer'].includes(options.role) || !validConfiguration(options.configuration)) throw new Error('APPLICATION_WORKER_OPTIONS_INVALID')
+  if (!validTimeout(timeoutMs) || !validGatheringTimeout(options.gatheringTimeoutMs, timeoutMs) || !['offerer', 'answerer'].includes(options.role) || !validConfiguration(options.configuration)) throw new Error('APPLICATION_WORKER_OPTIONS_INVALID')
   options.signal?.throwIfAborted()
   let owned = clients.get(endpoint)
   if (owned === undefined) clients.set(endpoint, owned = new Set())
@@ -202,7 +203,7 @@ export async function openWorkerWebRtcConnection(endpoint: ApplicationWorkerEndp
   let descriptions: AsyncIterator<PeerDescription> | undefined
   try {
     descriptions = options.signaling.messages[Symbol.asyncIterator](); lifetime.signal.throwIfAborted()
-    post({ action: 'open', role: options.role, timeoutMs, configuration: options.configuration })
+    post({ action: 'open', role: options.role, timeoutMs, configuration: options.configuration, gatheringTimeoutMs: options.gatheringTimeoutMs })
     void awaitOwnedTask(lifetime.signal, () => descriptions!.next()).then(item => {
       lifetime.signal.throwIfAborted()
       if (item.done) throw new Error('APPLICATION_WORKER_SIGNALING_ENDED')
@@ -259,3 +260,7 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 function errorMessage(error: unknown): string { return (error instanceof Error ? error.message : String(error)).slice(0, 256) }
+
+function validGatheringTimeout(value: unknown, timeoutMs: number): boolean {
+  return value === undefined || validTimeout(value) && value <= timeoutMs
+}

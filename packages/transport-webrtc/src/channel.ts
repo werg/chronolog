@@ -5,7 +5,7 @@ import {
 import type { RtcDataChannel, WebRtcChannels } from './types.js'
 import { requireRtcLiveChannel } from './live.js'
 
-export const WEBRTC_LIMITS = Object.freeze({ ...PEER_MESSAGE_LIMITS, sdpBytes: 64 * 1024 })
+export const WEBRTC_LIMITS = Object.freeze({ ...PEER_MESSAGE_LIMITS, sdpBytes: 64 * 1024, gatheringMs: 1000 })
 export type DataChannelStats = MessageChannelStats
 export type DataChannelConnection = MessageConnection
 export type PeerDataChannelConnection = PeerMessageConnection

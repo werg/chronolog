@@ -63,8 +63,9 @@ describe('portable Worker RTC endpoint', () => {
   it('uses page raw framing, opaque bidirectional lanes and dispatch ACKs without any transfers', async () => {
     const pair = endpoints(), connection = rtc(), observed = signaling(); negotiate(connection)
     const page = serveWorkerWebRtcConnections(pair.page); cleanup.push(() => page.close())
-    const opened = await openWorkerWebRtcConnection(pair.worker, { role: 'offerer', signaling: observed, timeoutMs: 5000 })
+    const opened = await openWorkerWebRtcConnection(pair.worker, { role: 'offerer', signaling: observed, timeoutMs: 5000, gatheringTimeoutMs: 750 })
     cleanup.push(() => opened.close())
+    expect(vi.mocked(openWebRtcConnection).mock.calls[0]?.[0].gatheringTimeoutMs).toBe(750)
     expect(observed.send).toHaveBeenCalledWith({ type: 'offer', sdp: 'local SDP' }); expect(observed.close).toHaveBeenCalledOnce()
     await opened.send(new Uint8Array([9]))
     // eslint-disable-next-line @typescript-eslint/unbound-method -- Test spy at raw boundary.

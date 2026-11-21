@@ -1,6 +1,7 @@
 import { RTCPeerConnection } from 'werift'
 import type { PeerConfig, RTCDataChannel } from 'werift'
 
+import { WEBRTC_LIMITS } from './channel.js'
 import type { RtcDataChannel, RtcPeerConnection } from './types.js'
 
 export type NativeRtcOptions = Partial<Pick<PeerConfig,
@@ -13,7 +14,7 @@ export function createNativePeerConnection(configuration: RTCConfiguration = {},
   // Offer and answer gather serially before framing. Keep default STUN
   // gathering within a five-second direct attempt. Werift's timeout uses
   // seconds, not milliseconds; callers may override it.
-  const peer = new RTCPeerConnection({ ...native, iceStunGatherTimeout: native.iceStunGatherTimeout ?? 1,
+  const peer = new RTCPeerConnection({ ...native, iceStunGatherTimeout: native.iceStunGatherTimeout ?? WEBRTC_LIMITS.gatheringMs / 1000,
     iceUseDefaultStunServer: false, certificateScope: 'peerConnection',
     iceServers: configuration.iceServers?.map(server => ({ urls: server.urls,
       ...(server.username === undefined ? {} : { username: server.username }),

@@ -82,7 +82,7 @@ An established RTC connection continues after the signaling endpoint stops.
 Closing the introduction handler explicitly closes the peers it accepted.
 
 A hosted rendezvous can also implement `PeerSignaling` by exposing
-`messages`, `send(description)` and `close()`. It carries the two complete SDP
+`messages`, `send(description)` and `close()`. It carries the two bounded batch SDP
 descriptions. Application frames always use the resulting peer connection.
 
 ## Browser ownership
@@ -119,8 +119,25 @@ for the common native and browser lifecycle contract.
 
 ## Bounded reliable and live lanes
 
-Negotiation exchanges one complete SDP per peer, with a 64 KiB maximum, a
-deadline and cancellation. Fixed negotiated SCTP channels use protocol
+Negotiation exchanges one bounded batch SDP per peer, with a 64 KiB maximum,
+a whole-attempt deadline and cancellation. Gathering waits for completion or
+`gatheringTimeoutMs`, whichever comes first. The exported `WEBRTC_LIMITS.gatheringMs`
+is the single default (1,000 ms); the native adapter derives its default Werift
+STUN timeout from that constant in seconds. An explicit batch budget must be a
+positive integer within `timeoutMs`. The owning-Worker bridge forwards this option.
+
+If gathering is incomplete at the budget, negotiation publishes the current SDP
+only when it contains a usable candidate allowed by `iceTransportPolicy`; otherwise
+it fails with `WEBRTC_ICE_CANDIDATES_UNAVAILABLE`. The entire current SDP is kept,
+including host, server-reflexive and relay candidates already gathered. STUN/TURN
+configuration is preserved. This is batch signaling, not trickle ICE: candidates
+arriving after publication are not exchanged. A network needing slower STUN/TURN
+must choose a longer batch and whole-attempt budget (and, for the native factory,
+an appropriate explicit `iceStunGatherTimeout`/TURN connect timeout). A host-only
+partial batch does not establish public-NAT reachability. No polling or additional
+signaling service is introduced.
+
+Fixed negotiated SCTP channels use protocol
 `chronolog.peer.v2`: stream 0 is reliable and ordered; stream 1 is unordered with
 `maxRetransmits: 0`. Unexpected remotely opened channels are refused.
 

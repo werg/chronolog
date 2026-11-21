@@ -4,7 +4,7 @@ import type { ApplicationPeerLink } from './network.js'
 import type { ApplicationSession } from './session.js'
 
 export type { WebRtcOptions, PeerSignaling, PeerDescription, RtcPeerConnection } from '@chronolog/transport-webrtc'
-export { openWebRtcConnection } from '@chronolog/transport-webrtc'
+export { openWebRtcConnection, WEBRTC_LIMITS } from '@chronolog/transport-webrtc'
 export { serveWorkerWebRtcConnections, openWorkerWebRtcConnection, type ApplicationWorkerEndpoint, type WorkerWebRtcConnection } from './worker-transport.js'
 
 /** The maintained browser/native composition owns both RTC lanes and peer authentication. */

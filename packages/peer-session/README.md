@@ -706,7 +706,14 @@ selected ICE route without exposing addresses.
 `pnpm exec tsx tools/test-worker-webrtc-endpoint.ts` runs actual Chromium
 SharedWorker, DedicatedWorker and BroadcastChannel endpoint fixtures. Each checks
 bidirectional direct RTC, 3 MiB of ordered reliable frames, disposable frames and
-quiet idle. The report includes source and emitted-bundle hashes. It qualifies
+quiet idle. It also runs a five-second SharedWorker attempt with the real
+Cloudflare STUN server and an additional unreachable STUN address, requiring usable
+partial candidate batches and complete bidirectional traffic before declaring
+success. `gatheringTimeoutMs` bounds each active batch (default
+`WEBRTC_LIMITS.gatheringMs`, exported by `/webrtc`); it preserves gathered candidate
+types and leaves STUN configured. Later candidates are not trickled. Choose a
+longer budget explicitly for networks that need slower STUN/TURN gathering.
+The report includes source and emitted-bundle hashes. It qualifies
 raw transport on loopback ICE; its BroadcastChannel case tests endpoint routing,
 not application authorization or authentication of the channel itself.
 
