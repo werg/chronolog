@@ -8,8 +8,8 @@ const workflow = await readFile(new URL('../.github/workflows/webrtc.yml', impor
 // Change these together after qualification. Historical evidence keeps its own
 // source tuple; a workflow-only change does not replace the deployed kernel pin.
 const companions = {
-  host_ref: ['HOST_REF', '726376618060183e448a62043e283f7a74964ebe'],
-  contrib_ref: ['CONTRIB_REF', '4e34d310a2b62ba66c98ce59dc18275c9669976a'],
+  host_ref: ['HOST_REF', '79b6845df411e3a910b662b31bae789da38d0bf9'],
+  contrib_ref: ['CONTRIB_REF', '4eb5a8a98d9d35632ed4fd39b7bf2d5a683f0457'],
 };
 
 for (const [input, [environment, source]] of Object.entries(companions)) {
