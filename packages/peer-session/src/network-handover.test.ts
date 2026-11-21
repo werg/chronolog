@@ -90,6 +90,90 @@ function proof(connection: FramedPeerConnection, run: (value: Record<string, unk
 async function synchronize(links: readonly ApplicationPeerLink[]) { await Promise.all(links.map(link => link.synchronize())) }
 
 describe('bounded authenticated link handover', () => {
+  it('has no idle heartbeats or idle timers once a connection is authenticated', async () => {
+    const f = await fixture()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const links = await f.connect(); await synchronize(links)
+    await vi.waitFor(() => { expect(vi.getTimerCount()).toBe(0) }, { interval: 1, timeout: 1000 })
+    const before = links.map(link => link.stats)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(links.map(link => link.stats)).toEqual(before)
+    expect(links.every(link => !link.signal.aborted)).toBe(true)
+  })
+
+  it('preserves the old route when authenticated candidate route preparation fails', async () => {
+    const f = await fixture(), old = await f.connect(); await synchronize(old)
+    const routes = vi.spyOn(f.left.value.signals, 'attachRoute').mockImplementationOnce(() => { throw new Error('SIGNAL_ROUTE_QUOTA_EXCEEDED') })
+    await expect(f.connect()).rejects.toThrow(/SIGNAL_ROUTE_QUOTA_EXCEEDED|APPLICATION_NETWORK_CLOSED/u)
+    routes.mockRestore()
+    expect(old.every(link => !link.signal.aborted)).toBe(true)
+    expect(connectedApplicationPeers(f.left.value)).toEqual([old[0]])
+    expect(connectedApplicationPeers(f.right.value)).toEqual([old[1]])
+    await synchronize(old)
+  })
+
+  it('counts control framing and only accepted live sends and actual received live frames, retaining stats after close', async () => {
+    const f = await fixture(), [left, right] = createFramedPeerConnectionPair()
+    let accept = true, attempts = 0
+    const links = await f.connect([left, { ...right, live: { ...right.live!, async trySend(frame, options) {
+      attempts++
+      return accept && await right.live!.trySend(frame, options)
+    } } }])
+    await synchronize(links)
+    expect(links.every(link => link.stats.sentBytes > 0 && link.stats.receivedBytes > 0 && link.stats.sentRequests > 0)).toBe(true)
+    expect(links.map(link => [link.stats.sentLiveBytes, link.stats.receivedLiveBytes])).toEqual([[0, 0], [0, 0]])
+    const observations = f.left.value.signals.subscribe({ signal: AbortSignal.timeout(2000) })[Symbol.asyncIterator]()
+    const received = observations.next()
+    await f.right.value.signals.send('progress', { completed: 1 }); await received; await observations.return?.()
+    const sent = links[1].stats.sentLiveBytes, receivedBytes = links[0].stats.receivedLiveBytes
+    expect(sent).toBeGreaterThan(0); expect(receivedBytes).toBe(sent)
+    accept = false
+    await expect(f.right.value.signals.send('progress', { completed: 2 })).rejects.toThrow('SIGNAL_BACKPRESSURE')
+    expect(attempts).toBe(2)
+    expect(links[1].stats.sentLiveBytes).toBe(sent); expect(links[0].stats.receivedLiveBytes).toBe(receivedBytes)
+    await Promise.all(links.map(link => link.close()))
+    expect(links[1].stats.sentLiveBytes).toBe(sent); expect(links[0].stats.receivedLiveBytes).toBe(receivedBytes)
+    await expect(f.right.value.signals.send('progress', { completed: 3 })).rejects.toThrow('SIGNAL_ROUTE_UNAVAILABLE')
+    expect(attempts).toBe(2)
+  })
+
+  it('expires a stalled old RPC at the drain deadline and keeps the new route usable', async () => {
+    const f = await fixture(), entered = gate(), release = gate()
+    let hold = false
+    observePeerWire(f.a.publicKey, async packet => {
+      if (hold && packet.kind === 'response' && packet.message?.action === 'state') {
+        hold = false; entered.release(); await release.promise
+      }
+    })
+    const old = await f.connect(undefined, { drainTimeoutMs: 1000 }); await synchronize(old)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    hold = true
+    const pending = old[1].synchronize(), rejected = expect(pending).rejects.toThrow('APPLICATION_NETWORK_CLOSED')
+    await entered.promise
+    try {
+      const fresh = await f.connect(); await synchronize(fresh)
+      await vi.advanceTimersByTimeAsync(999)
+      expect(old.every(link => !link.signal.aborted)).toBe(true)
+      await vi.advanceTimersByTimeAsync(1); await rejected
+      expect(old.every(link => link.signal.aborted)).toBe(true)
+      await synchronize(fresh)
+    } finally { release.release() }
+  })
+
+  it('rechecks revoked grants during drain and cancels all retirement resources immediately', async () => {
+    const f = await fixture(), old = await f.connect(); await synchronize(old)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const fresh = await f.connect(); await synchronize(fresh)
+    const original = f.left.value.participant.grant.bind(f.left.value.participant)
+    vi.spyOn(f.left.value.participant, 'grant').mockImplementation(key => key === f.b.publicKey ? null : original(key))
+    for (const listener of f.left.listeners) listener()
+    expect(old[0].signal.reason).toEqual(new Error('APPLICATION_PEER_NOT_AUTHORIZED'))
+    expect(fresh[0].signal.reason).toEqual(new Error('APPLICATION_PEER_NOT_AUTHORIZED'))
+    await Promise.all([...old, ...fresh].map(link => link.close()))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('finishes a real pending RPC on the old connection while new routing and live delivery are active', async () => {
     const f = await fixture(), entered = gate(), release = gate()
     let hold = false
@@ -105,9 +189,12 @@ describe('bounded authenticated link handover', () => {
     expect(old.every(link => !link.signal.aborted)).toBe(true)
     expect(connectedApplicationPeers(f.left.value)).toEqual([fresh[0]])
     expect(connectedApplicationPeers(f.right.value)).toEqual([fresh[1]])
+    const oldLive = old.map(link => [link.stats.sentLiveBytes, link.stats.receivedLiveBytes])
     const observations = f.left.value.signals.subscribe({ signal: AbortSignal.timeout(2000) })[Symbol.asyncIterator]()
     const received = observations.next(), signal = await f.right.value.signals.send('typing', { active: true })
     expect((await received).value).toEqual(signal); await observations.return?.()
+    expect(old.map(link => [link.stats.sentLiveBytes, link.stats.receivedLiveBytes])).toEqual(oldLive)
+    expect(fresh[1].stats.sentLiveBytes).toBe(fresh[0].stats.receivedLiveBytes)
     release.release(); await pending
     await synchronize(fresh)
     expect(old[1].stats.receivedBytes).toBeGreaterThan(0)
