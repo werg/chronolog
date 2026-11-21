@@ -12,19 +12,19 @@ import ts from 'typescript';
 
 const root = resolve(import.meta.dirname, '..');
 const { values } = parseArgs({ options: { output: { type: 'string', default: 'artifacts/peer-session' },
-  'allow-dirty': { type: 'boolean', default: false }, 'native-rtc': { type: 'boolean', default: false },
+  'allow-dirty': { type: 'boolean', default: false },
   'sql-native': { type: 'boolean', default: false }, 'sql-browser': { type: 'boolean', default: false } } });
 const output = resolve(values.output), packageRoot = join(output, 'package');
 const sqlEnabled = values['sql-native'] || values['sql-browser'];
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 const engineImport = '#chronolog-peer-native-engine';
-const entries = Object.fromEntries(['index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(values['native-rtc'] ? ['webrtc-native'] : []),
+const entries = Object.fromEntries(['index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', 'webrtc-native',
   ...(sqlEnabled ? ['sql'] : []), ...(values['sql-native'] ? ['sql-native'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]
   .map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
   // Shared chunks preserve class identity and session ownership across all entrypoints.
   splitting: true, platform: 'neutral', conditions: ['import', 'default'], mainFields: ['module', 'main'],
-  format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root, external: ['node:*', ...(values['native-rtc'] ? ['werift'] : [])],
+  format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root, external: ['node:*', 'werift'],
   plugins: values['sql-native'] ? [{ name: 'pinned-native-engine', setup(plugin) {
     plugin.onResolve({ filter: /^@dolthub\/doltlite$/ }, () => ({ path: engineImport, external: true }));
   } }] : [],
@@ -34,8 +34,8 @@ assert(runtimeInputs.every(path => !/(?:transport-ssb|agent-service|control-stor
   (sqlEnabled || !path.includes('materializer-doltlite/'))),
   'The default session artifact must not contain SQL, legacy native services or fixtures');
 assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).every(value => !value.external || value.path.startsWith('node:') ||
-  values['native-rtc'] && value.path === 'werift' || values['sql-native'] && value.path === engineImport),
-  'The session artifact must not fetch external runtime dependencies');
+  value.path === 'werift' || values['sql-native'] && value.path === engineImport),
+  'The session artifact may import only its declared native runtime dependencies');
 // The common SQL path and browser adapter must stay independently browser-loadable,
 // even when the same archive also contains the optional native engine.
 for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', ...(sqlEnabled ? ['sql'] : []), ...(values['sql-browser'] ? ['sql-browser'] : [])]) {
@@ -87,7 +87,7 @@ const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.js
   ...(values['sql-native'] ? ['patches/@dolthub__doltlite@0.11.29.patch'] : [])])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('PEER_SESSION_PACKAGE_REQUIRES_CLEAN_INPUTS');
-const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}${values['native-rtc'] ? '-rtc' : ''}${values['sql-native'] ? '-sql' : ''}${values['sql-browser'] ? '-wasm' : ''}`, version = `0.0.0-g${suffix}`;
+const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}${values['sql-native'] ? '-sql' : ''}${values['sql-browser'] ? '-wasm' : ''}`, version = `0.0.0-g${suffix}`;
 await rm(packageRoot, { force: true, recursive: true });
 await mkdir(packageRoot, { recursive: true });
 const files = new Map();
@@ -110,9 +110,8 @@ files.set('README.md', await readFile(join(root, 'packages/peer-session/README.m
 files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', version, type: 'module',
   description: 'Authenticated movable-peer application sessions with explicit recovery and applied outcomes',
   exports: Object.fromEntries(Object.keys(entries).map(name => [name === 'index' ? '.' : `./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
-  files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json', ...(values['sql-native'] ? ['engine'] : [])], dependencies: {}, engines: { node: '>=22.15' },
+  files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json', ...(values['sql-native'] ? ['engine'] : [])], dependencies: { werift: '0.27.0' }, engines: { node: '>=22.15' },
   ...(values['sql-native'] ? { imports: { [engineImport]: './engine/index.cjs' }, os: [process.platform], cpu: [process.arch] } : {}),
-  ...(values['native-rtc'] ? { peerDependencies: { werift: '0.27.0' }, peerDependenciesMeta: { werift: { optional: true } } } : {}),
 }, null, 2) + '\n');
 for (const [path, content] of files) { await mkdir(dirname(join(packageRoot, path)), { recursive: true }); await writeFile(join(packageRoot, path), content); }
 assert.equal(git(['rev-parse', 'HEAD']).trim(), source, 'Source commit changed during packaging');
@@ -120,7 +119,7 @@ assert.equal(git(['status', '--porcelain', '--untracked-files=all', '--', ...inp
 const sha256 = Object.fromEntries([...files].map(([path, content]) => [path, hash(content)]));
 await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: 'chronolog-peer-session-package/v1',
   repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
-  inputs, runtimeInputs, runtimeModules, optionalNativeRtc: values['native-rtc'], sqlEngines: [
+  inputs, runtimeInputs, runtimeModules, nativeRtc: true, sqlEngines: [
     ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : [])], nativeEngine, sha256 }, null, 2) + '\n');
 const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
@@ -154,7 +153,7 @@ function declarations(entryPoints) {
       return `${quote}${local}${quote}`;
     });
     const imports = ts.preProcessFile(rewritten, true).importedFiles.map(value => value.fileName);
-    assert(imports.every(name => name.startsWith('.') || values['native-rtc'] && name === 'werift'), `Declarations must be self-contained: ${relative(root, path)} -> ${imports}`);
+    assert(imports.every(name => name.startsWith('.') || name === 'werift'), `Declarations must be self-contained: ${relative(root, path)} -> ${imports}`);
     files.set(relative(packageRoot, path).replaceAll('\\', '/'), rewritten);
   });
   assert(!result.emitSkipped, 'Peer session declaration emit failed');

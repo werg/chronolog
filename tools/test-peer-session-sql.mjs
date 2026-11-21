@@ -13,7 +13,7 @@ const artifact = resolve(values.artifact), output = resolve(values.output);
 await mkdir(output, { recursive: true });
 const consumer = await mkdtemp(join(output, 'consumer-'));
 await writeFile(join(consumer, 'package.json'), JSON.stringify({ name: 'independent-peer-sql-consumer', private: true, type: 'module' }));
-execFileSync('npm', ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', join(consumer, 'cache'), artifact], {
+execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', join(consumer, 'cache'), artifact], {
   cwd: consumer, stdio: ['ignore', 'pipe', 'pipe'],
 });
 const packageRoot = join(consumer, 'node_modules/@chronolog/peer-session');

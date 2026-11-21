@@ -68,8 +68,13 @@ jobs:
       - name: Build clean public session artifacts
         id: session_artifacts
         run: |
-          node tools/package-peer-session.mjs --native-rtc --output artifacts/session-rtc
+          node tools/package-peer-session.mjs --output artifacts/session-rtc
           node tools/package-peer-session.mjs --sql-native --output artifacts/session-sql
+      - name: Verify the standard archive installs and closes native RTC without extra dependencies
+        run: |
+          archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
+          test "${#archives[@]}" -eq 1
+          node tools/test-peer-session-package.mjs --artifact "${archives[0]}" --output artifacts/default-session-package-check
       # This is an independent interoperability build, never a deployment graph.
       # Package the actual checked-out kernel, including workflow-only revisions;
       # the host may intentionally embed an earlier qualified kernel revision.
@@ -157,6 +162,9 @@ jobs:
             artifacts/session-sql/*.tgz
             artifacts/session-sql/package/provenance.json
             artifacts/peer-session-sql-check/report.json
+            artifacts/default-session-package-check/report.json
+            artifacts/default-session-package-check/native-process.json
+            artifacts/default-session-package-check/consumer/package-lock.json
             artifacts/qualification/**/report.json
             artifacts/qualification/**/summary.json
             artifacts/qualification/**/host-artifacts.json
