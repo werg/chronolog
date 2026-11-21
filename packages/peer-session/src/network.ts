@@ -24,8 +24,11 @@ export interface ApplicationPeerLink {
   readonly data: 'idle' | 'active' | 'unavailable'
   readonly signal: AbortSignal
   readonly completion: Promise<void>
-  readonly stats: { readonly sentBytes: number; readonly receivedBytes: number; readonly sentRequests: number; readonly receivedRequests: number }
+  /** Local application framing bytes; excludes channel encryption and transport/billing overhead. */
+  readonly stats: { readonly sentBytes: number; readonly receivedBytes: number; readonly sentLiveBytes: number; readonly receivedLiveBytes: number; readonly sentRequests: number; readonly receivedRequests: number }
   synchronize(): Promise<void>
+  /** Stop routing new work and retain authenticated RPC traffic until the bounded drain deadline. */
+  retire(): Promise<void>
   close(): Promise<void>
 }
 /** Internal owner port: every attachment has already proved the remote key. */
@@ -33,7 +36,7 @@ export interface ApplicationPeerPort {
   readonly participant: ApplicationParticipant
   readonly signals: SignalChannel
   readonly signal: AbortSignal
-  attach(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): Promise<void> }): () => void
+  attach(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): Promise<void>; retire?(): Promise<void> }): () => void
   resume(): Promise<void>
   /** A complete head received through this authenticated coordinator link. */
   observeHead?(peerId: string, revision: PeerRevision, requestedAt: number): void
@@ -45,6 +48,8 @@ export interface ApplicationPeerConnectOptions {
   readonly handshakeTimeoutMs?: number
   readonly requestTimeoutMs?: number
   readonly transferTimeoutMs?: number
+  /** Replacement drain budget, measured once from retirement (default 5 seconds). */
+  readonly drainTimeoutMs?: number
 }
 interface Hello { readonly application: string; readonly profile: 'peer-generation-v1'; readonly descriptor: string; readonly author: string; readonly nonce: string; readonly authority: AuthorityBundle; readonly channel: ApplicationChannelHello }
 interface RemoteState { readonly authority: AuthorityBundle; readonly data: boolean; readonly point: HistoryPoint | null; readonly revision: PeerRevision | null }
@@ -57,7 +62,7 @@ const interests: Readonly<Record<Method, ParticipantInterest>> = {
   contentRetained: { facet: 'content', action: 'retained' }, contentObserveRetention: { facet: 'content', action: 'observeRetention' },
 }
 interface Pending { readonly method: Method; readonly request: ParticipantRequest; resolve(value: unknown): void; reject(error: unknown): void; cancel(): void }
-interface Owner { next: number; readonly openings: Map<NetworkPeer, number>; readonly accepted: Map<string, number>; readonly peers: Map<string, NetworkPeer> }
+interface Owner { next: number; readonly openings: Map<NetworkPeer, number>; readonly accepted: Map<string, number>; readonly peers: Map<string, NetworkPeer>; readonly retiring: Map<string, NetworkPeer> }
 const owners = new WeakMap<ApplicationPeerPort, Owner>()
 const hexadecimal = (value: unknown, length = 64): value is string => typeof value === 'string' && value.length === length && /^[0-9a-f]+$/u.test(value)
 const same = (a: unknown, b: unknown): boolean => bytesToHex(encodePeerValue(a)) === bytesToHex(encodePeerValue(b))
@@ -149,6 +154,9 @@ class NetworkPeer implements ApplicationPeerLink {
   readonly #pending = new Map<number, Pending>()
   readonly #requestMs: number
   readonly #handshakeMs: number
+  readonly #drainMs: number
+  #retiring = false
+  #drainTimer: ReturnType<typeof setTimeout> | undefined
   readonly #ready: Promise<void>
   readonly completion: Promise<void>
   #readyResolve!: () => void
@@ -158,8 +166,11 @@ class NetworkPeer implements ApplicationPeerLink {
   #local: Hello | undefined
   #remote: Hello | undefined
   #authenticated = false
+  #confirmed = false
   #nextRequest = 0
   #lastRemoteRequest = 0
+  #sentLiveBytes = 0
+  #receivedLiveBytes = 0
   #sentRequests = 0
   #receivedRequests = 0
   #incoming = 0
@@ -185,6 +196,7 @@ class NetworkPeer implements ApplicationPeerLink {
   constructor(port: ApplicationPeerPort, input: ApplicationPeerConnectOptions, owner: Owner, attempt: number) {
     this.#port = port; this.#input = input; this.#owner = owner; this.#attempt = attempt
     this.#requestMs = deadline(input.requestTimeoutMs, 120_000); this.#handshakeMs = deadline(input.handshakeTimeoutMs, 10_000)
+    this.#drainMs = deadline(input.drainTimeoutMs, 5000)
     this.#channel = new ApplicationSecureChannel(input.connection, this.signal)
     this.#wire = new ApplicationMessageWire(this.#channel.connection, this.signal, deadline(input.transferTimeoutMs, 30_000), () => {
       if (this.#authenticated) this.#reader()
@@ -203,7 +215,7 @@ class NetworkPeer implements ApplicationPeerLink {
   get data(): ApplicationPeerLink['data'] { return this.#remoteData === true ? 'active' : this.#remoteDataFailure === undefined ? 'idle' : 'unavailable' }
   get signal(): AbortSignal { return this.#controller.signal }
   get stats(): ApplicationPeerLink['stats'] {
-    return { ...this.#wire.stats, sentRequests: this.#sentRequests, receivedRequests: this.#receivedRequests }
+    return { ...this.#wire.stats, sentLiveBytes: this.#sentLiveBytes, receivedLiveBytes: this.#receivedLiveBytes, sentRequests: this.#sentRequests, receivedRequests: this.#receivedRequests }
   }
   #reader(): void {
     this.signal.throwIfAborted()
@@ -227,40 +239,44 @@ class NetworkPeer implements ApplicationPeerLink {
       requireNetwork(this.#owner.peers.size < LIMITS.peers || this.#owner.peers.has(this.peerId), 'APPLICATION_PEER_LIMIT')
       const previous = this.#owner.peers.get(this.peerId)
       this.#owner.accepted.set(this.peerId, this.#attempt); this.#owner.peers.set(this.peerId, this)
-      if (previous !== undefined) void previous.close()
+      if (previous !== undefined) void previous.retire().catch(() => undefined)
       this.#detach = this.#port.attach(this.peerId, async attempt => {
         this.#reader()
         requireNetwork(attempt.payload.header.author === participant.device.publicKey && grant(participant, participant.device.publicKey, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
         await this.#request('submit', attempt)
         this.#reader(); await this.synchronize()
       }, this)
-      if (this.#channel.connection.live !== undefined) {
-        const lane = this.#channel.connection.live
-        this.#route = this.#port.signals.attachRoute({ close: reason => this.#dispose(reason), trySend: async (frame, { signal }) => {
-          signal.throwIfAborted(); this.#reader()
-          const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
-          this.#reader(); return accepted
-        } })
-        const route = this.#route
-        let closed = false
-        const dispose = (): void => {
-          if (closed) return
-          closed = true; route.close(); lane.signal.removeEventListener('abort', dispose)
-          void lane.close().catch(() => undefined)
-        }
-        this.#disposeLive = dispose
-        lane.signal.addEventListener('abort', dispose, { once: true })
-        if (lane.signal.aborted) dispose()
-        void this.#readLive(lane, route).catch(error => this.#fail(error)).finally(dispose)
-      }
       this.#unsubscribe = participant.subscribe(() => this.#changed())
       this.#changed()
     } catch (error) { this.#fail(error); throw error }
     finally { handshake.cancel() }
   }
+  #prepareLive(): void {
+    if (this.#channel.connection.live !== undefined) {
+      const lane = this.#channel.connection.live
+      this.#route = this.#port.signals.attachRoute({ close: reason => this.#dispose(reason), trySend: async (frame, { signal }) => {
+        signal.throwIfAborted(); this.#reader()
+        if (this.#retiring || this.#owner.peers.get(this.peerId) !== this) return false
+        const accepted = await lane.trySend(frame, { signal: AbortSignal.any([signal, this.signal]) })
+        if (accepted) this.#sentLiveBytes += frame.length
+        this.#reader(); return accepted
+      } })
+      const route = this.#route
+      let closed = false
+      const dispose = (): void => {
+        if (closed) return
+        closed = true; route.close(); lane.signal.removeEventListener('abort', dispose)
+        void lane.close().catch(() => undefined)
+      }
+      this.#disposeLive = dispose
+      lane.signal.addEventListener('abort', dispose, { once: true })
+      if (lane.signal.aborted) dispose()
+      void this.#readLive(lane, route).catch(error => this.#fail(error)).finally(dispose)
+    }
+  }
   #attachData(): boolean {
     const data = this.#port.participant.data
-    if (data === undefined || data === this.#data) return false
+    if (this.#retiring || data === undefined || data === this.#data) return false
     this.#data = data
     this.#detachContent = data.content.attachSource(this.peerId, {
       manifest: async reference => await this.#request('contentManifest', reference) as ContentManifest | null,
@@ -330,9 +346,21 @@ class NetworkPeer implements ApplicationPeerLink {
         this.#reader()
         await this.#channel.accept(message.encapsulatedKey, this.#remote, this.#local)
         await interruptible(this.#proofSent, this.signal)
-        this.#reader(); this.#authenticated = true; this.#readyResolve()
+        this.#reader(); this.#authenticated = true
+        this.#prepareLive()
+        // Reserve candidate routing before reciprocal confirmation. A failed
+        // proof or local route quota must preserve both working endpoints.
+        // Keep reading while the write is backpressured by the remote reader.
+        void this.#wire.send({ kind: 'ready' }).catch(error => this.#fail(error))
       } else {
         requireNetwork(this.#authenticated, 'APPLICATION_PEER_AUTHENTICATION_REQUIRED'); this.#reader()
+        if (kind === 'ready') {
+          record(value, ['kind'])
+          requireNetwork(!this.#confirmed, 'APPLICATION_NETWORK_HANDSHAKE_ORDER')
+          this.#confirmed = true; this.#readyResolve()
+          continue
+        }
+        requireNetwork(this.#confirmed, 'APPLICATION_NETWORK_HANDSHAKE_ORDER')
         if (kind === 'request') {
           const message = record(value, ['kind', 'message'])
           const request = this.#incomingMessage(message.message), id = Number(request.requestId)
@@ -380,12 +408,19 @@ class NetworkPeer implements ApplicationPeerLink {
     try {
       for await (const frame of lane.frames(AbortSignal.any([this.signal, lane.signal]))) {
         this.#reader(); requireNetwork(frame instanceof Uint8Array && frame.length <= MAX_SIGNAL_BYTES, 'APPLICATION_NETWORK_LIVE_LIMIT')
-        await route.receive(frame); this.#reader()
+        this.#receivedLiveBytes += frame.length
+        if (!this.#retiring && this.#owner.peers.get(this.peerId) === this) await route.receive(frame)
+        this.#reader()
       }
     } catch (error) { if (!this.signal.aborted && !lane.signal.aborted) throw error }
   }
   #request(method: Method, value: unknown): Promise<unknown> {
     this.#reader()
+    if (this.#retiring) {
+      const current = this.#owner.peers.get(this.peerId)
+      requireNetwork(current !== undefined && current !== this, 'APPLICATION_PEER_RETIRED')
+      return current.#request(method, value)
+    }
     if (method !== 'state' && method !== 'openData' && !this.#remoteData)
       return this.#openRemoteData().then(() => this.#request(method, value))
     requireNetwork(this.#pending.size < LIMITS.pendingRequests && this.#nextRequest < Number.MAX_SAFE_INTEGER, 'APPLICATION_NETWORK_BACKPRESSURE')
@@ -525,6 +560,11 @@ class NetworkPeer implements ApplicationPeerLink {
   }
   synchronize(): Promise<void> {
     this.#reader()
+    if (this.#retiring) {
+      const current = this.#owner.peers.get(this.peerId)
+      requireNetwork(current !== undefined && current !== this, 'APPLICATION_PEER_RETIRED')
+      return current.synchronize()
+    }
     if (this.#sync === undefined) return this.#startPull()
     if (this.#nextSync !== undefined) return this.#nextSync
     // An explicit barrier must observe a head advertised after this call. Joining
@@ -542,8 +582,8 @@ class NetworkPeer implements ApplicationPeerLink {
       throw error
     }).finally(() => {
       if (this.#sync === task) this.#sync = undefined
-      if (this.#syncAgain && this.#nextSync === undefined && !this.signal.aborted) { this.#syncAgain = false; this.#kick() }
-      if (!this.signal.aborted && this.#port.participant.data?.replica.ready === true) void this.#port.resume().catch(() => undefined)
+      if (this.#syncAgain && this.#nextSync === undefined && !this.signal.aborted && !this.#retiring) { this.#syncAgain = false; this.#kick() }
+      if (!this.signal.aborted && !this.#retiring && this.#port.participant.data?.replica.ready === true) void this.#port.resume().catch(() => undefined)
     })
     this.#sync = task; return task
   }
@@ -632,7 +672,7 @@ class NetworkPeer implements ApplicationPeerLink {
     })
   }
   #kick(): void {
-    if (this.signal.aborted) return
+    if (this.signal.aborted || this.#retiring) return
     if (this.#sync !== undefined) { this.#syncAgain = true; return }
     void this.#startPull().then(() => { this.#stateRetries = 0 }).catch(error => {
       if (isPeerDataUnavailable(error)) return
@@ -643,6 +683,7 @@ class NetworkPeer implements ApplicationPeerLink {
   #changed(): void {
     try {
       this.#reader()
+      if (this.#retiring) return
       const activated = this.#attachData(), participant = this.#port.participant, replica = participant.data?.replica
       const key = `${participant.generation.id}/${participant.authority.controls.at(-1)!.payload.revision}/${replica === undefined ? 'inactive' : 'active'}/${availablePoint(replica)?.root ?? ''}/${replica?.ready ?? false}`
       if (key !== this.#lastHint) { this.#lastHint = key; this.#sendHint() }
@@ -650,12 +691,12 @@ class NetworkPeer implements ApplicationPeerLink {
     } catch (error) { this.#fail(error) }
   }
   #sendHint(): void {
-    if (this.#hintPending || this.signal.aborted) return
+    if (this.#hintPending || this.signal.aborted || this.#retiring) return
     this.#hintPending = true
     const advertised = this.#lastHint
     const message = createParticipantRequest({ applicationId: this.#port.participant.descriptor.applicationId,
       requestId: 'hint', facet: 'ephemeral', action: 'hint', payload: null }, PEER_PARTICIPANT_POLICY)
-    void Promise.resolve().then(() => this.#wire.send({ kind: 'hint', message })).catch(error => this.#fail(error)).finally(() => {
+    void Promise.resolve().then(() => { if (!this.#retiring) return this.#wire.send({ kind: 'hint', message }) }).catch(error => this.#fail(error)).finally(() => {
       this.#hintPending = false
       // A response may have captured an older head while this write completed.
       if (this.#lastHint !== advertised) this.#sendHint()
@@ -667,6 +708,9 @@ class NetworkPeer implements ApplicationPeerLink {
     let closed!: () => void
     this.#closeTask = new Promise(resolve => { closed = resolve })
     const reason = error ?? networkError('APPLICATION_NETWORK_CLOSED')
+    if (this.#drainTimer !== undefined) clearTimeout(this.#drainTimer)
+    this.#drainTimer = undefined
+    if (this.#owner.retiring.get(this.peerId) === this) this.#owner.retiring.delete(this.peerId)
     this.#controller.abort(reason); this.#channel.clear(); this.#readyReject(reason)
     for (const pending of this.#pending.values()) { pending.cancel(); pending.reject(reason) }
     this.#pending.clear(); this.#detach?.(); this.#detachContent?.(); this.#detachKeys?.(); this.#unsubscribe?.(); this.#route?.close(); this.#disposeLive?.()
@@ -681,6 +725,30 @@ class NetworkPeer implements ApplicationPeerLink {
       .catch(() => undefined).finally(() => { deadline.cancel(); closed() })
     return this.#closeTask
   }
+  retire(): Promise<void> {
+    if (this.#closeTask !== undefined) return this.#closeTask
+    if (this.#retiring) return this.completion
+    this.#reader(); this.#retiring = true; this.#syncAgain = false
+    // One draining connection per identity and at most LIMITS.peers overall.
+    // Churn may evict an earlier drain, but can never grow an unbounded tail.
+    const previous = this.#owner.retiring.get(this.peerId)
+    if (previous !== undefined && previous !== this) void previous.close()
+    if (this.#owner.retiring.size >= LIMITS.peers) void this.#owner.retiring.values().next().value?.close()
+    this.#owner.retiring.set(this.peerId, this)
+    if (this.#owner.peers.get(this.peerId) === this) this.#owner.peers.delete(this.peerId)
+    // Detach before publishing the replacement's sources/live route. The
+    // authority subscription stays until close so revocation still fences RPCs.
+    this.#detach?.(); this.#detach = undefined
+    this.#detachContent?.(); this.#detachContent = undefined
+    this.#detachKeys?.(); this.#detachKeys = undefined
+    this.#route?.close()
+    // Keep the physical live lane until final close: transports may share its
+    // lifetime with reliable RPC. Retired receive loops discard live frames.
+    // Even a locally idle link may have a remote request or reply in transit.
+    // A single absolute deadline covers that race without heartbeats or polling.
+    this.#drainTimer = setTimeout(() => { void this.#dispose() }, this.#drainMs)
+    return this.completion
+  }
   close(): Promise<void> { return this.#dispose() }
 }
 
@@ -690,7 +758,7 @@ export function connectedApplicationPeers(port: ApplicationPeerPort): readonly A
 
 export async function connectApplicationPeer(port: ApplicationPeerPort, input: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
   let owner = owners.get(port)
-  if (owner === undefined) { owner = { next: 0, openings: new Map(), accepted: new Map(), peers: new Map() }; owners.set(port, owner) }
+  if (owner === undefined) { owner = { next: 0, openings: new Map(), accepted: new Map(), peers: new Map(), retiring: new Map() }; owners.set(port, owner) }
   requireNetwork(owner.openings.size < LIMITS.peers && owner.next < Number.MAX_SAFE_INTEGER, 'APPLICATION_PEER_LIMIT')
   const attempt = ++owner.next, peer = new NetworkPeer(port, input, owner, attempt)
   owner.openings.set(peer, attempt)

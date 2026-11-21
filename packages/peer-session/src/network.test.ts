@@ -67,6 +67,39 @@ function rewriteParticipant(connection: FramedPeerConnection, identity: string, 
 }
 
 describe('authenticated peer application connections', () => {
+  it('preserves a submitted command and its pending reply across authenticated replacement without duplicating history', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    let entered!: () => void, release!: () => void, hold = false
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    observePeerWire(a.deviceId, async packet => {
+      if (hold && packet.kind === 'response' && packet.message?.action === 'submit') {
+        hold = false; entered(); await gate
+      }
+    })
+    const connect = async () => {
+      const [left, right] = createFramedPeerConnectionPair()
+      const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+      closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+      await Promise.all(links.map(link => link.synchronize())); return links
+    }
+    const old = await connect(); hold = true
+    const operation = await b.command('say', 'pending handover', { operationId: 'handover' })
+    await started
+    try {
+      const fresh = await connect()
+      expect(old.every(link => !link.signal.aborted)).toBe(true)
+      expect([a.status.connectedPeers, b.status.connectedPeers]).toEqual([1, 1])
+      release()
+      expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
+      await Promise.all(fresh.map(link => link.synchronize()))
+      for (const session of [a, b]) {
+        const view = await session.readView()
+        expect(view.readEvents().events.map(event => event.payload)).toEqual([{ text: 'pending handover' }]); view.release()
+      }
+      expect(await b.operations.get('handover')).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    } finally { release() }
+  })
+
   it('keeps shared replication alive when a local-echo caller aborts during asynchronous live encryption', async () => {
     const f = await fixture({ localEcho: true }), a = await f.open(f.a), b = await f.open(f.b)
     const [left, right] = createFramedPeerConnectionPair(), frames: Uint8Array[] = []

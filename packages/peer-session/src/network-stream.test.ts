@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { frameLivePeerStream, framePeerStream } from '@chronolog/records'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
@@ -318,15 +318,28 @@ describe('authenticated application transport', () => {
     } finally { release.resolve() }
   })
 
-  it('closes the previous physical connection when the same authenticated peer reconnects', async () => {
+  it('retires the previous physical connection while the same authenticated peer reconnects', async () => {
     const f = await fixture(), a = await f.open(0), b = await f.open(1)
-    const previous = await connect(a, b), replacement = await connect(a, b)
-    expect(previous.every(link => link.signal.aborted)).toBe(true)
-    expect(replacement.every(link => !link.signal.aborted)).toBe(true)
-    expect(a.status.connectedPeers).toBe(1)
-    expect(b.status.connectedPeers).toBe(1)
-    const operation = await b.command('say', 'replacement', { operationId: 'replacement' })
-    expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
+    const previous = await connect(a, b)
+    // Authentication and synchronization use real crypto/I/O; only deadline
+    // callbacks are controlled so scheduler contention cannot consume the drain.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const replacement = await connect(a, b)
+      expect(previous.every(link => !link.signal.aborted)).toBe(true)
+      expect(replacement.every(link => !link.signal.aborted)).toBe(true)
+      expect(a.status.connectedPeers).toBe(1)
+      expect(b.status.connectedPeers).toBe(1)
+      await vi.advanceTimersByTimeAsync(4999)
+      expect(previous.every(link => !link.signal.aborted)).toBe(true)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(previous.every(link => link.signal.aborted)).toBe(true)
+      expect(replacement.every(link => !link.signal.aborted)).toBe(true)
+      const operation = await b.command('say', 'replacement', { operationId: 'replacement' })
+      expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
+      await a.close()
+      expect(replacement.every(link => link.signal.aborted)).toBe(true)
+    } finally { vi.useRealTimers() }
   })
 
   it('fully verifies a captured 65-command history in three bounded pages', async () => {

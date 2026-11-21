@@ -346,6 +346,23 @@ and durable exact-request outcome at their control-service boundary.
 
 ## Owned participation and recovery
 
+`participation.diagnostics()` returns a local snapshot of authenticated active
+connections with transport kind, a bounded fallback reason and reliable/live
+application framing counters. It never scans discovery, synchronizes history or
+contacts a host. It does not include encryption, signaling or socket overhead;
+these numbers are not transport billing counters. Unknown custom transports stay
+`unknown` rather than claiming a direct route.
+
+A transport may implement `upgrade()` (direct-only) and `describe(connection)`.
+`participation.reconsiderConnections()` coalesces real network/provider events
+into bounded replacement attempts for existing relay links. The default per-peer
+cooldown is 30 seconds and schedules no timer. A failed candidate preserves the
+working relay; authenticated replacements drain the old connection for one fixed
+grace window (five seconds by default), preserving in-flight RPC replies while routing new work on the
+replacement. The physical candidate and draining resource bounds remain finite.
+Host applications should forward actual OS/browser network events, never poll.
+The Worker facade exposes both methods under the attachment's diagnostic grant.
+
 Call `session.participate()` once after opening the session. It owns discovery,
 invitations, authenticated peer connections, reconnect backoff and recovery policy.
 The supplied ports deliver routing hints and raw framed connections; they cannot
