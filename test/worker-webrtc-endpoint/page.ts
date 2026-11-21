@@ -37,18 +37,12 @@ export async function qualify(mode: 'shared' | 'dedicated' | 'broadcast') {
       broadcast: (endpoint as ApplicationWorkerEndpoint & { fixtureBroadcast?: string }).fixtureBroadcast })))
     await Promise.all([command(0, 'send', { count: 24, size: 65_536 }), command(1, 'send', { count: 24, size: 65_536 })])
     const live = await Promise.all([command(0, 'live'), command(1, 'live')])
-    const settle = async () => {
-      for (let attempt = 0; attempt < 100; attempt++) {
-        const state = await Promise.all([command(0, 'state'), command(1, 'state')])
-        if (state.every(s => (s as { liveReceived: number }).liveReceived === 1)) return state
-        await new Promise(resolve => setTimeout(resolve, 10)) // Fixture observation only.
-      }
-      throw Error('FIXTURE_LIVE_NOT_RECEIVED')
-    }
-    const state = await settle()
-    // Drain ACK callbacks before taking the quiet boundary; fixture observation
-    // waits are not protocol heartbeats or reconnect behavior.
-    await new Promise(resolve => setTimeout(resolve, 100))
+    // send() establishes local dispatch only. Wait for the exact independently
+    // received reliable/live frames, rather than using the faster lane as a fence.
+    const state = await Promise.all([command(0, 'received', { count: 24 }), command(1, 'received', { count: 24 })])
+    // Route requests share the ordered bridge with frame ACKs, so their replies
+    // drain both directions before the quiet-idle boundary, including BroadcastChannel.
+    await Promise.all([command(0, 'route'), command(1, 'route')])
     const before = wire; await new Promise(resolve => setTimeout(resolve, 300))
     return { mode, ready, live, state, idleMessages: wire - before }
   } finally {
