@@ -131,6 +131,36 @@ const participation = session.participate({
 - **Agent tools**: `createApplicationTools(session)` exposes declared commands/queries as schema-validated tool descriptors for local or remote assistants.
 - **Multi-client ownership**: `createApplicationOwner()` and `acquireApplicationOwnerLock()` allow multiple tabs or local attachments to share one owning session while keeping operation scopes, bounded RPC deadlines (`boundedRequest`), and read-view authority isolated.
 
+## Owned view and tool helpers
+
+`createLiveView(session, { query, input })` subscribes before its initial coherent
+read. `ready({ signal, timeoutMs })` bounds initial readiness; `refresh()` waits
+for the next accepted snapshot. Call `close()` to release subscriptions. Session
+closure, stream termination and cancellation also release them and reject pending
+reads. Late query replies cannot reopen a closed observer.
+
+`forwardSessionEvents({ session, checkpoint, project, deliver, signal })` releases
+each captured view before invoking external delivery. It saves the batch cursor
+only after all projections and deliveries succeed. Failures leave the last saved
+cursor for at-least-once replay, so delivery must deduplicate by event identity.
+Recovery during processing stops the forwarder for explicit review; it never
+silently resets an old cursor. Cancellation fences later callbacks and checkpoints;
+it cannot undo delivery or a checkpoint write already started by the caller.
+
+`createScopedApplicationTools(session, { queries, commands })` defaults to no
+permissions. Journal inspection, retry and wait verify the saved signed command
+against the allowed name; reapplication requires permission for both the original
+and replacement commands. Write/journal results use `operationReference()`'s
+application/history/author/operation/attempt/generation identity. A `generation`
+argument checks before and after execution; use `basedOn` for an atomic command
+revision guard. An error after a write begins does not imply that it was cancelled:
+inspect the same operation ID before retrying.
+
+`createViewStore()` retains per-view drafts and operation intent in caller-owned
+storage. It validates retained records against their storage-key scope and refuses
+to overwrite corrupt or conflicting evidence. It is local bookkeeping, not an
+authorization source or a replacement for the session's signed journal.
+
 ## Packaging
 
 ```sh

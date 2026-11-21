@@ -38,14 +38,23 @@ export function signerId(value: unknown): string {
 }
 
 export function canonicalJson(value: unknown, maxBytes = DEFAULT_PAYLOAD_BYTES): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new SessionError('INVALID_PAYLOAD_LIMIT')
   let nodes = 0
   function visit(item: unknown, depth: number): string {
     if (++nodes > 4096 || depth > 24) throw new SessionError('PAYLOAD_TOO_COMPLEX')
     if (item === null || typeof item === 'boolean' || typeof item === 'string') return JSON.stringify(item)
     if (typeof item === 'number' && Number.isFinite(item)) return JSON.stringify(item)
     if (Array.isArray(item)) {
-      if (Object.keys(item).length !== item.length) throw new SessionError('INVALID_PAYLOAD')
-      return `[${item.map(child => visit(child, depth + 1)).join(',')}]`
+      if (Object.getPrototypeOf(item) !== Array.prototype || Reflect.ownKeys(item).length !== item.length + 1) {
+        throw new SessionError('INVALID_PAYLOAD')
+      }
+      const children: string[] = []
+      for (let index = 0; index < item.length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(item, String(index))
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new SessionError('INVALID_PAYLOAD')
+        children.push(visit(descriptor.value, depth + 1))
+      }
+      return `[${children.join(',')}]`
     }
     if (item === null || typeof item !== 'object') {
       throw new SessionError('INVALID_PAYLOAD')
@@ -174,17 +183,37 @@ export function createViewStore<Draft = unknown>(options: {
     catch { throw new SessionError('LOCAL_REFERENCE_CORRUPT', 'Preserve and inspect the local record before replacing it') }
   }
   function write(key: string, value: unknown): void {
-    try { storage.setItem(key, canonicalJson(value, 65536)) }
+    const encoded = canonicalJson(value, 65536)
+    try { storage.setItem(key, encoded) }
     catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
       throw new SessionError('LOCAL_STORAGE_UNAVAILABLE', `Could not retain the local record: ${detail}`)
     }
   }
-  function operationKey(reference: OperationReference): string {
+  function operationKey(reference: OperationReference, retainedViewId = viewId): string {
     if (reference.applicationId !== applicationId || (historyId !== undefined && reference.historyId !== historyId)) {
       throw new SessionError('OPERATION_SCOPE_MISMATCH')
     }
-    return `${prefix}operation:${historySegment(reference.historyId)}:${signerId(reference.author)}:${segment(reference.operationId)}:view:${segment(viewId)}`
+    for (const field of ['attemptId', 'generation'] as const) {
+      const digest = reference[field]
+      if (digest !== undefined && (typeof digest !== 'string' || !/^[0-9a-f]{64}$/u.test(digest))) throw new SessionError('OPERATION_REFERENCE_INVALID')
+    }
+    return `${prefix}operation:${historySegment(reference.historyId)}:${signerId(reference.author)}:${segment(reference.operationId)}:view:${segment(retainedViewId)}`
+  }
+
+  function readRetained(key: string): RetainedOperation | null {
+    const encoded = storage.getItem(key)
+    if (encoded === null) return null
+    try {
+      const value = JSON.parse(encoded) as RetainedOperation
+      if (value === null || typeof value !== 'object' || typeof value.viewId !== 'string' ||
+          value.context === null || typeof value.context !== 'object' || Array.isArray(value.context) ||
+          operationKey(value.reference, value.viewId) !== key) throw new Error()
+      canonicalJson(value, 65536)
+      return value
+    } catch {
+      throw new SessionError('LOCAL_REFERENCE_CORRUPT', 'Preserve and inspect the local record before replacing it')
+    }
   }
 
   return Object.freeze({
@@ -195,8 +224,14 @@ export function createViewStore<Draft = unknown>(options: {
     removeDraft(draftId = 'main'): void { storage.removeItem(`${viewPrefix}draft:${segment(draftId)}`) },
     retainOperation(reference: OperationReference, context: Record<string, unknown> = {}): RetainedOperation {
       const key = operationKey(reference)
-      const existing = read<RetainedOperation>(key)
-      const value: RetainedOperation = { reference, viewId, context }
+      const existing = readRetained(key)
+      if (context === null || typeof context !== 'object' || Array.isArray(context)) throw new SessionError('INVALID_PAYLOAD')
+      const captured: OperationReference = { applicationId: reference.applicationId, historyId: reference.historyId,
+        author: reference.author, operationId: reference.operationId,
+        ...(reference.attemptId === undefined ? {} : { attemptId: reference.attemptId }),
+        ...(reference.generation === undefined ? {} : { generation: reference.generation }),
+      }
+      const value: RetainedOperation = { reference: captured, viewId, context }
       if (existing !== null && canonicalJson(existing.context, 65536) !== canonicalJson(context, 65536)) {
         throw new SessionError('OPERATION_REFERENCE_CONFLICT', 'The original operation input must remain unchanged')
       }
@@ -205,11 +240,14 @@ export function createViewStore<Draft = unknown>(options: {
           throw new SessionError('OPERATION_REFERENCE_CONFLICT', 'The original signed attempt must remain unchanged')
         }
       }
-      const retained: RetainedOperation = existing !== null ? { ...existing, reference: { ...existing.reference, ...reference } } : value
+      const retained: RetainedOperation = existing !== null ? { ...existing, reference: { ...captured,
+        ...(existing.reference.attemptId === undefined || reference.attemptId !== undefined ? {} : { attemptId: existing.reference.attemptId }),
+        ...(existing.reference.generation === undefined || reference.generation !== undefined ? {} : { generation: existing.reference.generation }),
+      } } : value
       write(key, retained)
       return retained
     },
-    inspectOperation(reference: OperationReference): RetainedOperation | null { return read<RetainedOperation>(operationKey(reference)) },
+    inspectOperation(reference: OperationReference): RetainedOperation | null { return readRetained(operationKey(reference)) },
     removeOperation(reference: OperationReference): void { storage.removeItem(operationKey(reference)) },
     pending(pendingOptions: { readonly allViews?: boolean } = {}): readonly RetainedOperation[] {
       const allViews = pendingOptions.allViews ?? false
@@ -217,7 +255,7 @@ export function createViewStore<Draft = unknown>(options: {
       for (let i = 0; i < storage.length; i++) {
         const key = storage.key(i)
         if (key?.startsWith(`${prefix}operation:`) === true) {
-          const value = read<RetainedOperation>(key)
+          const value = readRetained(key)
           if (value !== null && (allViews || value.viewId === viewId)) values.push(value)
         }
       }
