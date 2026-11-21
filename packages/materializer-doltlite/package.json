@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./browser": "./src/browser.ts",
+    "./wasm-node": "./src/wasm-node.ts",
     "./testing": "./src/test-fixtures.ts"
   },
   "dependencies": {

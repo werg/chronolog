@@ -40,6 +40,9 @@
       "@chronolog/materializer-doltlite/browser": [
         "packages/materializer-doltlite/src/browser.ts"
       ],
+      "@chronolog/materializer-doltlite/wasm-node": [
+        "packages/materializer-doltlite/src/wasm-node.ts"
+      ],
       "@chronolog/signals": [
         "packages/signals/src/index.ts"
       ],
@@ -90,6 +93,9 @@
       ],
       "@chronolog/peer-session/sql-browser": [
         "packages/peer-session/src/sql-browser.ts"
+      ],
+      "@chronolog/peer-session/sql-wasm": [
+        "packages/peer-session/src/sql-wasm.ts"
       ],
       "@chronolog/transport-websocket": [
         "packages/transport-websocket/src/index.ts"

@@ -14,6 +14,7 @@
     "lint:fix": "pnpm lint --fix",
     "check:commit": "pnpm lint && pnpm typecheck",
     "test": "vitest run",
+    "test:fast": "node tools/run-fast-tests.mjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:fuzz": "vitest run packages/canonical/src/cbor.fuzz.test.ts packages/protocol/src/sql.fuzz.test.ts",

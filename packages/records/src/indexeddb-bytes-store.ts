@@ -69,6 +69,26 @@ export class IndexedDbBytesStore implements BytesStore {
     })
   }
 
+  async entries(): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
+    return this.#enqueue(async () => {
+      const rawEntries = await this.#transaction('readonly', table => {
+        const keysRequest = table.getAllKeys()
+        const valuesRequest = table.getAll()
+        return () => ({ keys: keysRequest.result, values: valuesRequest.result })
+      })
+      const items: { readonly key: string; readonly value: Uint8Array }[] = []
+      for (let i = 0; i < rawEntries.keys.length; i++) {
+        const key = rawEntries.keys[i]
+        const raw = rawEntries.values[i] as unknown
+        if (typeof key !== 'string' || !(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) {
+          throw new Error('INDEXEDDB_VALUE_CORRUPT')
+        }
+        items.push({ key, value: await decodeRecordValue(key, raw, 'INDEXEDDB_VALUE_CORRUPT') })
+      }
+      return items.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+    })
+  }
+
   close(): Promise<void> {
     if (this.#closing !== undefined) return this.#closing
     this.#closed = true

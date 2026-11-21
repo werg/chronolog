@@ -13,6 +13,7 @@
     "./tendriller": "./src/tendriller.ts",
     "./sql": "./src/sql.ts",
     "./sql-browser": "./src/sql-browser.ts",
+    "./sql-wasm": "./src/sql-wasm.ts",
     "./websocket": "./src/websocket.ts",
     "./worker": "./src/worker.ts"
   },

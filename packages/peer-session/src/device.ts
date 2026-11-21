@@ -17,6 +17,7 @@ export interface DeviceMetadataStore extends BytesStore {
   initialize?(entries: readonly { readonly key: string; readonly value: Uint8Array }[]): Promise<void>
   compareAndSwap?(key: string, expected: Uint8Array | null, value: Uint8Array): Promise<boolean>
 }
+import { assertDeviceNotRetired } from './checkpoint.js'
 const DEVICE_KEY = 'peer-session/device/v1'
 const DEVICE_BINDING = 'peer-session/device-binding/v1'
 const STORAGE_BINDING = 'peer-session/storage-binding/v1'
@@ -30,6 +31,7 @@ export async function openApplicationDevice(options: {
   readonly openStorage?: () => ApplicationStorage | Promise<ApplicationStorage>
   readonly close?: () => void | Promise<void>
 }): Promise<ApplicationDevice> {
+  await assertDeviceNotRetired(options.store)
   let raw = await options.store.get(DEVICE_KEY), binding = await options.store.get(DEVICE_BINDING)
   // Atomic initialization can commit between these separate metadata reads.
   // Its immutable binding confirms creation finished; check the signer again

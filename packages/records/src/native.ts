@@ -84,6 +84,19 @@ export class NativeBytesStore implements BytesStore {
     }
   }
 
+  async entries(): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
+    this.#assertOpen()
+    const rows = this.#database.prepare('SELECT key, value FROM stored_bytes ORDER BY key ASC').all() as
+      { key: string; value: Uint8Array }[]
+    return rows.map(row => ({ key: row.key, value: Uint8Array.from(row.value) }))
+  }
+
+  /** Flush WAL frames cleanly into the main database file before external snapshot/backup. */
+  checkpointWal(): void {
+    this.#assertOpen()
+    this.#database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+  }
+
   usageBytes(): number {
     this.#assertOpen()
     return this.#usedBytes
