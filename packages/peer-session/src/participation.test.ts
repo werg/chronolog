@@ -36,6 +36,8 @@ class Introductions {
   kind: 'direct' | 'relay' = 'direct'
   directAvailable = true
   upgradeAttempts = 0
+  readonly lastInvitation = new Map<string, ApplicationPeerInvitation>()
+  repeat(identity: string): void { const invitation = this.lastInvitation.get(identity); if (invitation !== undefined) this.#listeners.get(identity)?.(invitation) }
   readonly descriptions = new WeakMap<FramedPeerConnection, { kind: 'direct' | 'relay' }>()
   counted(connection: FramedPeerConnection, kind = this.kind): FramedPeerConnection {
     const value: FramedPeerConnection = { signal: connection.signal, ...(connection.live === undefined ? {} : { live: connection.live }),
@@ -60,7 +62,8 @@ class Introductions {
             ? input.peer.route.channel : crypto.randomUUID()
           const kind = upgrade ? 'direct' : hub.kind
           hub.#connections.set(token, hub.counted(right, kind))
-          target({ peer: { identity, route: identity }, token, ...(upgrade ? {upgrade:true as const} : {}) })
+          const invitation = { peer: { identity, route: identity }, token, ...(upgrade ? {upgrade:true as const} : {}) }
+          hub.lastInvitation.set(input.peer.identity, invitation); target(invitation)
           return hub.counted(left, kind)
     }
     return {
@@ -177,6 +180,55 @@ function gate() {
   return { promise, resolve }
 }
 
+/** Ordinary invitations exercise participation admission before the real network handshake. */
+async function incomingFixture({ maxPeers = 1, timeoutMs = 2000, beforeConnect }: {
+  maxPeers?: number; timeoutMs?: number; beforeConnect?: (a: ApplicationSession, b: ApplicationSession) => void
+} = {}) {
+  const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(a.deviceId)
+  const terminal = gate(), accepted: Awaited<ReturnType<typeof a.connectPeer>>[] = []
+  let incoming = 0, delivered = 0, expired = 0, stale = false
+  let opening = async (connection: FramedPeerConnection): Promise<FramedPeerConnection> => connection
+  let promoted = async (): Promise<void> => {}
+  const connect = a.connectPeer.bind(a)
+  vi.spyOn(a, 'connectPeer').mockImplementation(async input => { const link = await connect(input); accepted.push(link); await promoted(); return link })
+  beforeConnect?.(a, b)
+  const ap = f.participate(a, {
+    discovery: { ...ports.discovery, async *invitations(options) {
+      for await (const invitation of ports.discovery.invitations(options)) { yield invitation; delivered++ }
+    }, async *notifications() {
+      yield { type: 'ready' as const }; await terminal.promise
+      throw Object.assign(new Error('HOST_REVOKED'), { retryable: false })
+    } },
+    transport: { ...ports.transport, async open(input, options) {
+      let connection: FramedPeerConnection
+      try { connection = await ports.transport.open(input, options) }
+      catch (error) { if (error instanceof Error && error.message === 'INVITATION_EXPIRED') expired++; throw error }
+      if (input.invitation !== undefined) incoming++
+      if (incoming === 1) return { ...connection,
+        async send(bytes, options) { if (!stale) await connection.send(bytes, options) },
+        async *frames(signal) { for await (const bytes of connection.frames(signal)) if (!stale) yield bytes },
+      }
+      return opening(connection)
+    } },
+    connections: { maxPeers, timeoutMs },
+  })
+  const invite = async (remote = b) => {
+    const connection = await f.hub.ports(remote.deviceId).transport.open({ peer: { identity: a.deviceId, route: null } }, { signal: remote.signal })
+    closing.push(() => connection.close())
+    return { connection, connect: () => remote.connectPeer({ connection, peerIdentity: a.deviceId, handshakeTimeoutMs: 2000 }) }
+  }
+  await until(() => f.hub.directory.has(a.deviceId))
+  const old = await (await invite()).connect(); await old.synchronize()
+  await until(() => accepted.length === 1 && ap.status.connectedPeers.includes(b.deviceId))
+  closing.push(() => terminal.resolve())
+  return { ...f, a, b, ap, accepted, old, invite, terminal,
+    incoming: () => incoming, delivered: () => delivered, expired: () => expired,
+    promoted(value: typeof promoted) { promoted = value },
+    stale() { stale = true },
+    opening(value: typeof opening) { opening = value },
+  }
+}
+
 /** A real verified coordinator reconnects through an invitation already owned by the follower. */
 async function holdIncomingCoordinator({ advertised = true } = {}) {
   const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), ports = f.hub.ports(b.deviceId)
@@ -273,6 +325,157 @@ describe('owned application participation', () => {
     expect(f.counts.selections).toBe(0)
   })
 
+  it('rejoins a physically stale route without waiting for the old link signal to abort', async () => {
+    const h = await incomingFixture(), revision = h.ap.status.connectionRevision
+    h.stale()
+    expect(h.old.signal.aborted).toBe(false); expect(h.accepted[0]!.signal.aborted).toBe(false)
+    const fresh = await (await h.invite()).connect(); await fresh.synchronize()
+    await until(() => h.ap.status.connectionRevision > revision)
+    await post(h.b, 'rejoined-without-old-close')
+    expect(h.ap.status.connectedPeers).toEqual([h.b.deviceId]); expect(h.counts.selections).toBe(0)
+  })
+
+  it('admits only one pending incoming restart per peer and rejects a new logical peer at capacity', async () => {
+    const h = await incomingFixture(), opened = gate(), release = gate()
+    h.opening(async connection => { opened.resolve(); await release.promise; return connection })
+    closing.push(() => release.resolve())
+    const first = await h.invite(); await opened.promise
+    await h.invite(); await h.invite(await h.open(h.c))
+    // The iterator resumes only after #listen has dispatched each invitation.
+    await until(() => h.delivered() === 4)
+    expect(h.incoming()).toBe(2)
+    expect(h.old.signal.aborted).toBe(false)
+    release.resolve(); const fresh = await first.connect(); await fresh.synchronize()
+    await until(() => h.accepted.length === 2)
+    expect(h.ap.status.connectedPeers).toEqual([h.b.deviceId])
+    await post(h.b, 'single-candidate-winner')
+  })
+
+  it('counts a replacement once logically while admitting another peer within the independent physical budget', async () => {
+    const h = await incomingFixture({ maxPeers: 2 }), release = gate()
+    h.opening(async connection => { await release.promise; return connection })
+    closing.push(() => release.resolve())
+    const replacement = await h.invite(), c = await h.open(h.c), newcomer = await h.invite(c)
+    await until(() => h.incoming() === 3)
+    expect(h.old.signal.aborted).toBe(false)
+    release.resolve()
+    const fresh = await Promise.all([replacement.connect(), newcomer.connect()])
+    await Promise.all(fresh.map(link => link.synchronize()))
+    await until(() => h.ap.status.connectedPeers.length === 2)
+    expect(h.ap.status.connectedPeers.slice().sort()).toEqual([h.b.deviceId, c.deviceId].sort())
+    await post(h.b, 'replaced-peer-with-spare-slot'); await post(c, 'new-peer-with-spare-slot')
+  })
+
+  it('keeps timed-out uncooperative restart openings within the physical candidate budget', async () => {
+    const h = await incomingFixture({ timeoutMs: 1000 }), opened = gate(), release = gate()
+    let candidate: FramedPeerConnection | undefined
+    h.opening(async connection => { candidate = connection; opened.resolve(); await release.promise; return connection })
+    closing.push(() => release.resolve())
+    await h.invite(); await opened.promise
+    await until(() => h.ap.status.error === 'APPLICATION_CONNECTION_TIMEOUT')
+    await h.invite(); await until(() => h.delivered() === 3)
+    expect(h.incoming()).toBe(2)
+    expect(h.old.signal.aborted).toBe(false)
+    release.resolve(); await until(() => candidate?.signal.aborted === true)
+    h.opening(async connection => connection)
+    const fresh = await (await h.invite()).connect(); await fresh.synchronize()
+    await post(h.b, 'after-candidate-slot-release')
+  })
+
+  it('coalesces a duplicate pending invitation and consumes a replay without churning the authenticated winner', async () => {
+    const h = await incomingFixture(), opened = gate(), release = gate(), before = h.ap.status.connectionRevision
+    h.opening(async connection => { opened.resolve(); await release.promise; return connection })
+    closing.push(() => release.resolve())
+    const invitation = await h.invite(); await opened.promise
+    h.hub.repeat(h.a.deviceId); await until(() => { expect(h.delivered(), 'duplicate dispatched').toBe(3); return true })
+    expect(h.incoming()).toBe(2)
+    release.resolve(); const fresh = await invitation.connect(); await fresh.synchronize()
+    await until(() => { expect(h.accepted.length, 'candidate accepted').toBe(2); expect(h.ap.status.connectionRevision, 'candidate published').toBeGreaterThan(before); return true })
+    const revision = h.ap.status.connectionRevision
+    h.hub.repeat(h.a.deviceId)
+    await until(() => h.expired() === 1)
+    expect(h.ap.status.connectionRevision).toBe(revision)
+    expect(h.accepted).toHaveLength(2); expect(fresh.signal.aborted).toBe(false)
+    await post(h.b, 'winner-survives-invitation-replay')
+  })
+
+  it('discards a raw incoming candidate if another authenticated route wins while open is awaited', async () => {
+    const h = await incomingFixture(), opened = gate(), release = gate()
+    let candidate: FramedPeerConnection | undefined
+    h.opening(async connection => { candidate = connection; opened.resolve(); await release.promise; return connection })
+    closing.push(() => release.resolve())
+    const stale = await h.invite(); await opened.promise
+    const [left, right] = createFramedPeerConnectionPair()
+    const winner = await Promise.all([
+      h.a.connectPeer({ connection: left, peerIdentity: h.b.deviceId }),
+      h.b.connectPeer({ connection: right, peerIdentity: h.a.deviceId }),
+    ])
+    closing.push(async () => { await Promise.all(winner.map(link => link.close())) })
+    const attempts = h.accepted.length
+    release.resolve(); await until(() => candidate?.signal.aborted === true)
+    expect(stale.connection.signal.aborted).toBe(true)
+    expect(h.accepted).toHaveLength(attempts)
+    expect(winner.every(link => !link.signal.aborted)).toBe(true)
+    await post(h.b, 'newer-winner-kept')
+  })
+
+  it('cancels a pending ordinary incoming replacement on terminal discovery and preserves the incumbent', async () => {
+    const h = await incomingFixture(), opened = gate(), release = gate()
+    let candidate: FramedPeerConnection | undefined
+    h.opening(async connection => { candidate = connection; opened.resolve(); await release.promise; return connection })
+    closing.push(() => release.resolve())
+    await h.invite(); await opened.promise
+    const revision = h.ap.status.connectionRevision
+    h.terminal.resolve(); await until(() => h.ap.status.phase === 'unavailable')
+    release.resolve(); await until(() => candidate?.signal.aborted === true)
+    expect(h.accepted).toHaveLength(1); expect(h.old.signal.aborted).toBe(false)
+    expect(h.ap.status.connectionRevision).toBe(revision)
+    await post(h.b, 'incumbent-survives-host-terminal')
+  })
+
+  it('keeps an authenticated incoming winner when terminal discovery races the connect continuation', async () => {
+    const h = await incomingFixture(), entered = gate(), release = gate()
+    h.promoted(async () => { entered.resolve(); await release.promise })
+    closing.push(() => release.resolve())
+    const fresh = await (await h.invite()).connect()
+    await entered.promise
+    // The network has promoted the authenticated route, but participation is
+    // still awaiting owner.connect and has not synchronized its data facet.
+    h.terminal.resolve(); await until(() => h.ap.status.phase === 'unavailable')
+    expect(fresh.signal.aborted).toBe(false)
+    expect(h.accepted[1]!.signal.aborted).toBe(false)
+    release.resolve(); await fresh.synchronize()
+    expect(h.ap.status.connectedPeers).toEqual([h.b.deviceId])
+    await post(h.b, 'replacement-survives-host-terminal')
+  })
+
+  it('finishes the same signed in-flight command while an ordinary incoming restart takes over', async () => {
+    const entered = gate(), release = gate()
+    let hold = false
+    const h = await incomingFixture({ beforeConnect(a) {
+      observePeerWire(a.deviceId, async packet => {
+        if (hold && packet.kind === 'response' && packet.message?.action === 'submit') {
+          hold = false; entered.resolve(); await release.promise
+        }
+      })
+    } })
+    closing.push(() => release.resolve())
+    hold = true
+    const operation = await h.b.command('say', 'inflight incoming restart', { operationId: 'incoming-inflight' })
+    await entered.promise
+    const fresh = await (await h.invite()).connect()
+    expect(h.old.signal.aborted).toBe(false)
+    release.resolve()
+    expect((await operation.applied({ signal: AbortSignal.timeout(5000) })).outcome).toBe('accepted')
+    await fresh.synchronize()
+    for (const session of [h.a, h.b]) {
+      const view = await session.readView()
+      try { expect(view.readEvents().events.map(event => event.operationId)).toEqual(['incoming-inflight']) }
+      finally { view.release() }
+    }
+    expect(h.counts.selections).toBe(0)
+  })
+
   it('preserves commands, history and live traffic on an upgraded direct peer after terminal discovery failure', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b), terminal = gate()
     f.hub.kind = 'relay'
@@ -350,13 +553,13 @@ describe('owned application participation', () => {
     } finally { release.resolve() }
   })
 
-  it('reserves only one incoming upgrade after concurrent invitations supersede the same outgoing attempt', async () => {
+  it.each([true, false])('reserves one incoming candidate after concurrent invitations supersede an outgoing upgrade (upgrade: %s)', async upgrade => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const target = a.deviceId > b.deviceId ? a : b, remote = target === a ? b : a
     const started = gate(), closingCandidate = gate(), releaseClose = gate(), bothDelivered = gate()
     const targetPorts = f.hub.ports(target.deviceId), remotePorts = f.hub.ports(remote.deviceId)
     const [stalled, unused] = createFramedPeerConnectionPair()
-    let delivered = 0, incomingOpenings = 0
+    let delivered = 0, incomingOpenings = 0, observing = false
     const candidate: FramedPeerConnection = { ...stalled,
       async send(frame, options) { started.resolve(); await stalled.send(frame, options) },
       async close() { closingCandidate.resolve(); await releaseClose.promise; await stalled.close() },
@@ -368,13 +571,16 @@ describe('owned application participation', () => {
     const participation = f.participate(target, {
       discovery: { ...targetPorts.discovery, async *invitations(options) {
         for await (const invitation of targetPorts.discovery.invitations(options)) {
-          if (invitation.upgrade) delivered++
+          if (observing) delivered++
           yield invitation
           // Resuming after yield means #listen has dispatched this invitation.
           if (delivered === 2) bothDelivered.resolve()
         }
       } },
-      transport: { ...targetPorts.transport, async upgrade(input, options) {
+      transport: { ...targetPorts.transport, async open(input, options) {
+        if (observing && input.invitation !== undefined) incomingOpenings++
+        return targetPorts.transport.open(input, options)
+      }, async upgrade(input, options) {
         if (input.invitation === undefined) return candidate
         incomingOpenings++
         return targetPorts.transport.upgrade!(input, options)
@@ -388,10 +594,13 @@ describe('owned application participation', () => {
     const outgoing = participation.reconsiderConnections()
     await started.promise
     try {
-      const first = await remotePorts.transport.upgrade!({ peer: { identity: target.deviceId, route: null } }, { signal: remote.signal })
+      observing = true
+      const offer = (input: Parameters<ApplicationTransportPort['open']>[0], options: { signal: AbortSignal }) =>
+        upgrade ? remotePorts.transport.upgrade!(input, options) : remotePorts.transport.open(input, options)
+      const first = await offer({ peer: { identity: target.deviceId, route: null } }, { signal: remote.signal })
       closing.push(() => first.close())
       await closingCandidate.promise
-      const second = await remotePorts.transport.upgrade!({ peer: { identity: target.deviceId, route: null } }, { signal: remote.signal })
+      const second = await offer({ peer: { identity: target.deviceId, route: null } }, { signal: remote.signal })
       closing.push(() => second.close())
       await bothDelivered.promise
       // Both incoming tasks have reached the same still-pending predecessor.
@@ -402,7 +611,7 @@ describe('owned application participation', () => {
       const winner = await remote.connectPeer({ connection: first, peerIdentity: target.deviceId })
       closing.push(() => winner.close())
       await winner.synchronize()
-      await until(async () => (await participation.diagnostics())[0]?.kind === 'direct')
+      await until(async () => (await participation.diagnostics())[0]?.kind === (upgrade ? 'direct' : 'relay'))
       expect(incomingOpenings).toBe(1)
       expect([a.status.connectedPeers, b.status.connectedPeers]).toEqual([1, 1])
       await post(b, 'one-incoming-upgrade-wins')

@@ -23,7 +23,7 @@ interface Owner {
   resume(): Promise<void>
 }
 interface Observation { readonly generation: string; readonly point: HistoryPoint; readonly observedAt: number }
-interface Joining { readonly controller: AbortController; readonly incoming: boolean; readonly upgrade: boolean; readonly finished: Promise<void> }
+interface Joining { readonly controller: AbortController; readonly incoming: boolean; readonly replacement: boolean; readonly finished: Promise<void> }
 const identity = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value)
 const samePoint = (left: HistoryPoint, right: HistoryPoint): boolean => left.generation === right.generation && left.sequence === right.sequence && left.root === right.root
 const message = (error: unknown): string => error instanceof Error ? error.message : 'APPLICATION_PARTICIPATION_FAILED'
@@ -275,7 +275,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
             this.#proposal = null; this.#approved = null
             this.#discoveryFence.abort(error)
             for (const [peerId, joining] of this.#joining) {
-              if (!joining.upgrade && !this.#links().some(link => link.peerId === peerId && link.data === 'active')) joining.controller.abort(error)
+              if (!joining.replacement && !this.#links().some(link => link.peerId === peerId && link.data === 'active')) joining.controller.abort(error)
             }
             this.#wake(); break
           }
@@ -465,15 +465,15 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
     const signal = AbortSignal.any([this.signal, controller.signal])
     // Hosted discovery may fence an opening, never an authenticated replacement.
     // The network owner promotes synchronously before its connect promise resumes.
-    const fenceUpgrade = (): void => {
+    const fenceCandidate = (): void => {
       if (!this.#links().some(value => value.peerId === peer.identity && value !== current)) controller.abort(this.#discoveryFence.signal.reason)
     }
-    if (input.upgrade) {
-      this.#discoveryFence.signal.addEventListener('abort', fenceUpgrade, { once: true })
-      if (this.#discoveryFence.signal.aborted) fenceUpgrade()
+    if (current !== undefined) {
+      this.#discoveryFence.signal.addEventListener('abort', fenceCandidate, { once: true })
+      if (this.#discoveryFence.signal.aborted) fenceCandidate()
     }
     let finished!: () => void, settled = false, link: ApplicationPeerLink | undefined, connection: FramedPeerConnection | undefined
-    const joining: Joining = { controller, incoming, upgrade: input.upgrade === true, finished: new Promise(resolve => { finished = resolve }) }
+    const joining: Joining = { controller, incoming, replacement: current !== undefined, finished: new Promise(resolve => { finished = resolve }) }
     this.#joining.set(peer.identity, joining); this.#physicalOpenings.add(token)
     const timer = setTimeout(() => controller.abort(new Error('APPLICATION_CONNECTION_TIMEOUT')), this.#timeoutMs)
     const opening = Promise.resolve().then(() => {
@@ -494,7 +494,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
           input.upgrade && description.kind !== 'direct') throw new Error('APPLICATION_TRANSPORT_DESCRIPTION_INVALID')
       link = await this.#owner.connect({ connection, peerIdentity: peer.identity, signal,
         handshakeTimeoutMs: this.#timeoutMs, requestTimeoutMs: this.#timeoutMs, transferTimeoutMs: this.#timeoutMs })
-      this.#discoveryFence.signal.removeEventListener('abort', fenceUpgrade)
+      this.#discoveryFence.signal.removeEventListener('abort', fenceCandidate)
       this.#transports.set(link, { kind: description.kind, ...(description.reason === undefined ? {} : { reason: description.reason }) })
       try { await awaitOwnedTask(signal, () => link!.synchronize()) }
       catch (error) { if (!isPeerDataUnavailable(error)) throw error }
@@ -507,7 +507,7 @@ export class OwnedApplicationParticipation implements ApplicationParticipation {
       throw error
     } finally {
       clearTimeout(timer)
-      this.#discoveryFence.signal.removeEventListener('abort', fenceUpgrade)
+      this.#discoveryFence.signal.removeEventListener('abort', fenceCandidate)
       if (settled) this.#physicalOpenings.delete(token)
       if (this.#joining.get(peer.identity) === joining) this.#joining.delete(peer.identity)
       finished()
