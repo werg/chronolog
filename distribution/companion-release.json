@@ -3,107 +3,107 @@
   "stage": "qualified",
   "core": {
     "repository": "werg/tendriller",
-    "source": "acb45edff2daaae73dd52070c3174e5dd85857b2",
-    "sourceTree": "8b14b3c41be588d74afcd0b6843bd2ceca42eb25",
+    "source": "9e24deea741f828890feb7ea26d62b292df19518",
+    "sourceTree": "8c5670e805c8d6d77aa25ec6e37a2fe25d113720",
     "dirty": false
   },
   "release": {
-    "sourceCommit": "acb45edff2daaae73dd52070c3174e5dd85857b2",
+    "sourceCommit": "9e24deea741f828890feb7ea26d62b292df19518",
     "coreRelease": "0.3.0-rc.17",
-    "runtimeId": "555036d5168e81efbe9bbd16b5abd33e62f2fd3a4edd610978002da1373256b2",
-    "compositionId": "2baed5ebe4cbff388c566f2859d40778a5894c29baab6c77ab96840c1d98efaf",
-    "manifestSha256": "0b56de7e113442bbcdb38cd429ad7257773915702f10492e9cd01ef5d4524741"
+    "runtimeId": "e752a28caf9f68fe0bf2944fcce2a08b138b0cbd60c79166776474f21e708157",
+    "compositionId": "5067e44bb896c692d1e560e244d8e4d7fb78bedb3b6c7539eb5d014be2ffbef8",
+    "manifestSha256": "39c7d4baf16cd17c6a173b3e370e6a5d840d9212c07e8ea5e45fd160a7917447"
   },
   "kernel": {
     "repository": "werg/chronolog-db",
-    "source": "21a5a4565b59716d0a63157a43ae11d317ba8534",
-    "sourceTree": "e4d0c68582d4ceed9688882d30c9d96d14e25d23",
+    "source": "6f8b00fb3a80854690689be959b1b1c062b0d460",
+    "sourceTree": "abdc83f5359bc30c8cd72e06d864bb650be98065",
     "dirty": false,
     "archive": {
       "role": "session",
-      "file": "chronolog-peer-session-21a5a4565b59716d0a63157a43ae11d317ba8534.tgz",
-      "sha256": "1592aa26083b74c6082eb6b1295fdf3de93a5b5913a2e36b24719e5b14c6be20",
-      "size": 219583
+      "file": "chronolog-peer-session-6f8b00fb3a80854690689be959b1b1c062b0d460.tgz",
+      "sha256": "57cd26fe458ce61509f0276ae3af3f6e86829d209b8bbc2ea8013a35a7a6a6ca",
+      "size": 208003
     }
   },
   "contrib": {
     "repository": "werg/tendriller-contrib",
-    "source": "6e3c55f32aa6792bdea6bd6fdfa493b2af94c8a6",
-    "sourceTree": "a595f3b74338a632dc898459d5a3b74747d5e0ff",
+    "source": "5be458853f39b0e2975d421a6f38a2789985f488",
+    "sourceTree": "d74a622ae85c27c53b876fc17dc202bb2852c504",
     "dirty": false,
     "gates": [
       {
         "workflow": "ci.yml",
-        "run": 44932094022,
+        "run": 44982342932,
         "attempt": 1,
         "artifacts": [
           {
-            "id": 14718625134,
+            "id": 14738346135,
             "name": "cookbook-content",
-            "sha256": "abe297e8f6abef501f059060c0a4dd7612d05eb97300b9155dbda8738ba04b16"
+            "sha256": "00071635c2b5599eef43c22fc8d778a329f0757064c09242b29df5d722ee45bf"
           }
         ]
       },
       {
         "workflow": "peer-generation.yml",
-        "run": 44932093971,
+        "run": 44982342924,
         "attempt": 1,
         "artifacts": [
           {
-            "id": 14718565590,
-            "name": "independent-peer-generation-native-sql-evidence",
-            "sha256": "e726eb7a771b0d55ce0ba30fe18484c2e97f83eb5b6274a41f247cf684e9c2e2"
-          },
-          {
-            "id": 14718475854,
-            "name": "independent-peer-generation-native-rtc-evidence",
-            "sha256": "ec16cfeaac35fb631c0caa28d6b1b91f234d1bd63ff4be9131cdc57d476ec192"
-          },
-          {
-            "id": 14718461212,
-            "name": "independent-peer-generation-relay-evidence",
-            "sha256": "e386f8f85a305db426dcb67af78f77bf8947d66cf60cf1f0fa7fd51aa734eac6"
-          },
-          {
-            "id": 14718411153,
-            "name": "independent-peer-generation-direct-evidence",
-            "sha256": "31a6a3914014805385ddc56fe030f77392c53d1f5aab6c6f501d42b3e1e5da5b"
-          },
-          {
-            "id": 14718281671,
+            "id": 14739165059,
             "name": "independent-peer-generation-browser-native-evidence",
-            "sha256": "ab2abf745514c2f2488ff97f48ed4aad1a088c5a11cafe45a75745c1e7f2fbf8"
+            "sha256": "685a7795f75ca47821a8c5b2372e5be5ad2bebc4489ff76cf33b72cdfe4eede3"
           },
           {
-            "id": 14717863099,
-            "name": "independent-peer-generation-hosted-evidence",
-            "sha256": "6cf23cfaea39a9e25b1a1d9f82b951278d7fde5ccb0b0a45610b61d7e2b4c3a8"
+            "id": 14738780316,
+            "name": "independent-peer-generation-relay-evidence",
+            "sha256": "8cd88cea19f62e79d946016b2a55cc601d17cd3e7b9c92067fa337f34d2c1b58"
           },
           {
-            "id": 14717229519,
-            "name": "independent-peer-generation-browser-relay-evidence",
-            "sha256": "f45bbad85cf95e777d94853c2d8c31b6124083975db5d032442b9bea281e26ae"
-          },
-          {
-            "id": 14717099626,
+            "id": 14738770453,
             "name": "qualified-local-peer-composition",
-            "sha256": "516b863a390b2af369175da5ceb58640fc1f61fcf1e64e832262c89e868a2311"
+            "sha256": "e9d3aa56e376822f7258d49d686279a3b0f376a32517838cf86572af437e2681"
+          },
+          {
+            "id": 14738415893,
+            "name": "independent-peer-generation-direct-evidence",
+            "sha256": "aeebfd8ca906cc9efefa5b25ca8e95afa421de9fda68c35d8b667b6c99c050e3"
+          },
+          {
+            "id": 14738196881,
+            "name": "independent-peer-generation-native-rtc-evidence",
+            "sha256": "782a2efa40ee24780e1beb8c7aff4d75b03b27b27de3f095569fd772943f1952"
+          },
+          {
+            "id": 14738192958,
+            "name": "independent-peer-generation-browser-relay-evidence",
+            "sha256": "11ad5674e055a64ecaee499e48ed56839c83401c77902951d848d80d4d182a65"
+          },
+          {
+            "id": 14737894323,
+            "name": "independent-peer-generation-hosted-evidence",
+            "sha256": "f55d5948da9fdc017972bbd10845479f5f97cf3b1637b0695984df910150be62"
+          },
+          {
+            "id": 14737864573,
+            "name": "independent-peer-generation-native-sql-evidence",
+            "sha256": "7ccc189835854136045128e394ea9801454bfcb536137f75ef7f47f85cb8e70f"
           }
         ]
       },
       {
         "workflow": "collaboration.yml",
-        "run": 44932093994,
+        "run": 44982342893,
         "attempt": 1,
         "artifacts": [
           {
-            "id": 14719000216,
-            "name": "collaboration-6e3c55f32aa6792bdea6bd6fdfa493b2af94c8a6-evidence",
-            "sha256": "0f197ef3e8504dc36f7c7f94c875342a39726c46cfbf269922f012b4fddd47d7"
+            "id": 14738981655,
+            "name": "collaboration-5be458853f39b0e2975d421a6f38a2789985f488-evidence",
+            "sha256": "8cba73c5af5e90577565ae22458852571f70c23730269e92d6fa8b2785742f9e"
           }
         ]
       }
     ]
   },
-  "id": "5d781924fe502c71ee95508d4dc0b6c12231cd4f74e1f27b079375d342a51411"
+  "id": "251868e4e74ac5b9c9048479e9d5cbdb301514b2fa7c09496a451c444e0dafe7"
 }
