@@ -13,13 +13,41 @@ export interface BytesStore {
   put(key: string, bytes: Uint8Array): Promise<void>
   /** Optional deterministic snapshot enumeration for atomic encrypted device checkpoints. */
   entries?(): Promise<readonly BytesStoreEntry[]>
+  /** Atomically initialize an empty store; false leaves an existing store untouched. */
+  putAllIfEmpty?(entries: readonly BytesStoreEntry[]): Promise<boolean>
 }
 
 /** Independent ephemeral storage for disposable peers and tests; not a durability claim. */
 export class MemoryBytesStore implements BytesStore {
   readonly #values = new Map<string, Uint8Array>()
+  readonly #quotaBytes: number
+  readonly #maxValueBytes: number
+  #usedBytes = 0
+  constructor(options: { readonly quotaBytes?: number; readonly maxValueBytes?: number } = {}) {
+    for (const limit of [options.quotaBytes, options.maxValueBytes]) {
+      if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new Error('BYTES_STORE_QUOTA_INVALID')
+    }
+    this.#quotaBytes = options.quotaBytes ?? Infinity
+    this.#maxValueBytes = options.maxValueBytes ?? Infinity
+  }
   async get(key: string): Promise<Uint8Array | null> { return this.#values.get(key)?.slice() ?? null }
-  async put(key: string, bytes: Uint8Array): Promise<void> { this.#values.set(key, bytes.slice()) }
+  async put(key: string, bytes: Uint8Array): Promise<void> {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
+    const used = this.#usedBytes - (this.#values.get(key)?.byteLength ?? 0) + bytes.byteLength
+    if (used > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
+    this.#values.set(key, bytes.slice()); this.#usedBytes = used
+  }
+  async putAllIfEmpty(entries: readonly BytesStoreEntry[]): Promise<boolean> {
+    const captured = entries.map(entry => ({ key: entry.key, value: entry.value.slice() }))
+    if (new Set(captured.map(entry => entry.key)).size !== captured.length) throw new Error('BYTES_STORE_DUPLICATE_KEY')
+    if (captured.some(entry => entry.value.byteLength > this.#maxValueBytes)) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
+    const bytes = captured.reduce((sum, entry) => sum + entry.value.byteLength, 0)
+    if (bytes > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
+    if (this.#values.size !== 0) return false
+    for (const entry of captured) this.#values.set(entry.key, entry.value)
+    this.#usedBytes = bytes
+    return true
+  }
   async entries(): Promise<readonly BytesStoreEntry[]> {
     return [...this.#values.entries()]
       .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)

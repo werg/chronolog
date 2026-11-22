@@ -69,6 +69,30 @@ export class IndexedDbBytesStore implements BytesStore {
     })
   }
 
+  async putAllIfEmpty(entries: readonly { readonly key: string; readonly value: Uint8Array }[]): Promise<boolean> {
+    const captured = entries.map(entry => ({ key: entry.key, value: entry.value.slice() }))
+    const seen = new Set<string>()
+    for (const entry of captured) {
+      assertRecordKey(entry.key)
+      if (entry.value.length > MAX_RECORD_VALUE_BYTES) throw new Error('BYTES_STORE_VALUE_LIMIT')
+      if (seen.has(entry.key)) throw new Error('BYTES_STORE_DUPLICATE_KEY')
+      seen.add(entry.key)
+    }
+    return this.#enqueue(async () => {
+      const encoded: { key: string; value: Uint8Array }[] = []
+      for (const entry of captured) encoded.push({ key: entry.key, value: await encodeRecordValue(entry.key, entry.value) })
+      return this.#transaction('readwrite', table => {
+        let initialized = false
+        const count = table.count()
+        count.onsuccess = () => {
+          if (count.result !== 0) return
+          for (const entry of encoded) table.add(entry.value, entry.key)
+          initialized = true
+        }
+        return () => initialized
+      })
+    })
+  }
   async entries(): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
     return this.#enqueue(async () => {
       const rawEntries = await this.#transaction('readonly', table => {

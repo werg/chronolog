@@ -209,6 +209,7 @@ writeFileSync(join(output, 'manifest.json'), JSON.stringify({
   format: 1, toolchain: 'emscripten-4.0.20', nativeManifest, runtimeVersions,
   portabilityPatches: ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1'],
   deterministicSourceSha256: digest(deterministic), wasmSha256: digest(readFileSync(join(output, 'sqlite3.wasm'))),
+  loaderSha256: digest(readFileSync(join(output, 'sqlite3.mjs'))),
   wasmBytes: statSync(join(output, 'sqlite3.wasm')).size,
 }, null, 2) + '\n')
 console.log(`Built Chronolog WASM engine in ${output}`)

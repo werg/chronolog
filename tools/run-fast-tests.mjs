@@ -5,11 +5,12 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import process from 'node:process';
+import { createNativeSqlClassifier } from './lib/native-sql-closure.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const packagesDir = join(root, 'packages');
 const NATIVE_SQL_RE = /(?:^|\/)materializer-doltlite(?:\/|$)|@chronolog\/materializer-doltlite|@dolthub\/doltlite/;
-const IMPORT_RE = /(?:from\s+|import\s*\(\s*|import\s+)['"]([^'"]+)['"]/g;
+
 
 // Map workspace package names -> source entry paths from tsconfig.base.json
 const tsconfig = JSON.parse(readFileSync(join(root, 'tsconfig.base.json'), 'utf8'));
@@ -48,25 +49,11 @@ function resolveImport(specifier, fromFile) {
   return null;
 }
 
-const cache = new Map();
-function touchesNativeSql(file, stack = new Set()) {
-  if (NATIVE_SQL_RE.test(relative(root, file).replaceAll('\\', '/'))) return true;
-  if (cache.has(file)) return cache.get(file);
-  if (stack.has(file)) return false;
-  stack.add(file);
-  const content = readFileSync(file, 'utf8');
-  let touches = false;
-  for (const match of content.matchAll(IMPORT_RE)) {
-    const target = resolveImport(match[1], file);
-    if (target === 'NATIVE_SQL' || (target && touchesNativeSql(target, stack))) {
-      touches = true;
-      break;
-    }
-  }
-  stack.delete(file);
-  cache.set(file, touches);
-  return touches;
-}
+const touchesNativeSql = createNativeSqlClassifier({
+  read: file => readFileSync(file, 'utf8'),
+  resolveImport,
+  isNative: file => NATIVE_SQL_RE.test(relative(root, file).replaceAll('\\', '/')),
+});
 
 const allTests = [...walkTests(packagesDir), ...walkTests(join(root, 'test'))].sort();
 const fastTests = [];
@@ -83,8 +70,9 @@ if (process.argv.includes('--list')) {
 }
 
 process.stderr.write(`test:fast: running ${fastTests.length} pure-JS test files (excluded ${excludedTests.length} native-SQL closure files)\n`);
+if (fastTests.length === 0) { process.stderr.write('No JS-only test files selected.\n'); process.exit(0); }
 const start = Date.now();
-execFileSync(process.execPath, [join(root, 'node_modules/vitest/vitest.mjs'), 'run', ...fastTests], {
+execFileSync(process.execPath, [join(root, 'node_modules/vitest/vitest.mjs'), 'run', '--maxWorkers=1', '--no-file-parallelism', ...fastTests], {
   cwd: root,
   stdio: 'inherit',
 });

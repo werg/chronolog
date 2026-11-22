@@ -7,7 +7,7 @@ Chronolog-DB is the central peer-session pipe for Tendriller and standalone loca
 ### JS-only contributor fast lane (zero native C/C++ builds)
 ```sh
 pnpm install --frozen-lockfile --ignore-scripts
-pnpm test:fast          # Import-closure JS test suite (< 15s; excludes tests transitively importing native SQL)
+pnpm test:fast          # Serial import-closure JS test suite (excludes tests transitively importing native SQL)
 pnpm lint && pnpm typecheck && pnpm docs:check
 ```
 

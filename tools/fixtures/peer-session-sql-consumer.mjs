@@ -9,9 +9,18 @@ import {
 } from '@chronolog/peer-session';
 import { openNativeDevice } from '@chronolog/peer-session/native';
 import { openSqlApplication, prepareSqlApplication } from '@chronolog/peer-session/sql';
-import { createNativeSqlEngine } from '@chronolog/peer-session/sql-native';
 
-const directory = process.argv[2], sessions = [], links = [], engine = createNativeSqlEngine();
+
+const directory = process.argv[2], sessions = [], links = [];
+let engine;
+if (process.argv[3]) {
+  const { loadNodeWasmEngine, createNodeWasmSqlEngine } = await import('@chronolog/peer-session/sql-wasm');
+  const loaded = await loadNodeWasmEngine(process.argv[3]);
+  engine = createNodeWasmSqlEngine({ module: loaded.module, manifest: loaded.manifest });
+} else {
+  const { createNativeSqlEngine } = await import('@chronolog/peer-session/sql-native');
+  engine = createNativeSqlEngine();
+}
 const team = bytesToHex(APPLICATION_COLLECTIVE_ID);
 const definition = defineApplication({ id: 'packed-shared-board', version: '1',
   schema: program('CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE)'),

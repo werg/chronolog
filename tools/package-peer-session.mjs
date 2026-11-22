@@ -1,3 +1,5 @@
+import { sqlProfileSuffix } from './lib/session-profile.mjs';
+import { execNpmSync } from './lib/npm-cli.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -87,15 +89,16 @@ for (const entry of ['index', 'browser', 'worker', 'tendriller', ...(sqlEnabled 
 }
 const declaration = declarations(Object.values(entries));
 const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
-  'packages/peer-session/package.json', 'packages/peer-session/README.md', 'tools/package-peer-session.mjs',
+  'packages/peer-session/package.json', 'packages/peer-session/README.md', 'tools/package-peer-session.mjs', 'tools/lib/npm-cli.mjs', 'tools/lib/session-profile.mjs',
   ...(values['sql-native'] ? ['patches/@dolthub__doltlite@0.11.29.patch'] : [])])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('PEER_SESSION_PACKAGE_REQUIRES_CLEAN_INPUTS');
-const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}${nativeRtc ? '' : '-relay'}${values['sql-native'] ? '-sql' : ''}${values['sql-browser'] || values['sql-wasm'] ? '-wasm' : ''}`, version = `0.0.0-g${suffix}`;
+const dirty = Boolean(changed), suffix = `${source.slice(0, 8)}${dirty ? '-dirty' : ''}${nativeRtc ? '' : '-relay'}${sqlProfileSuffix({ native: values['sql-native'], browser: values['sql-browser'], wasmNode: values['sql-wasm'] })}`, version = `0.0.0-g${suffix}`;
 await rm(packageRoot, { force: true, recursive: true });
 await mkdir(packageRoot, { recursive: true });
 const files = new Map();
 let nativeEngine;
+const libc = values['sql-native'] && process.platform === 'linux' ? (process.report.getReport().header.glibcVersionRuntime ? 'glibc' : 'musl') : undefined;
 if (values['sql-native']) {
   const require = createRequire(join(root, 'packages/materializer-doltlite/package.json'));
   const engineRoot = dirname(require.resolve('@dolthub/doltlite'));
@@ -104,7 +107,7 @@ if (values['sql-native']) {
   for (const [from, to] of [['index.js', 'index.cjs'], ['index.d.ts', 'index.d.ts'], ['package.json', 'package.json'],
     ['build/Release/doltlite.node', 'build/Release/doltlite.node']]) files.set(`engine/${to}`, await readFile(join(engineRoot, from)));
   nativeEngine = { implementation: '@dolthub/doltlite@0.11.29', platform: process.platform, architecture: process.arch,
-    node: process.version, manifest: engine.chronologNativeManifest(),
+    node: process.version, ...(libc ? { libc } : {}), manifest: engine.chronologNativeManifest(),
     patchSha256: hash(await readFile(join(root, 'patches/@dolthub__doltlite@0.11.29.patch'))) };
 }
 let wasmEngine;
@@ -116,10 +119,13 @@ if (values['wasm-dir']) {
   const loaderBytes = await readFile(join(wasmDir, 'sqlite3.mjs'));
   const manifest = JSON.parse(manifestBytes.toString('utf8'));
   assert.equal(hash(wasmBytes), manifest.wasmSha256, 'WASM binary digest mismatch against manifest.json');
+  assert.equal(hash(loaderBytes), manifest.loaderSha256, 'WASM loader digest mismatch against manifest.json');
+  assert.equal(wasmBytes.byteLength, manifest.wasmBytes, 'WASM binary size mismatch against manifest.json');
   files.set('wasm/manifest.json', manifestBytes);
   files.set('wasm/sqlite3.wasm', wasmBytes);
   files.set('wasm/sqlite3.mjs', loaderBytes);
-  wasmEngine = { toolchain: manifest.toolchain, wasmSha256: manifest.wasmSha256, wasmBytes: wasmBytes.byteLength };
+  files.set('wasm/sqlite3-opfs-async-proxy.js', await readFile(join(wasmDir, 'sqlite3-opfs-async-proxy.js')));
+  wasmEngine = { toolchain: manifest.toolchain, wasmSha256: manifest.wasmSha256, loaderSha256: manifest.loaderSha256, wasmBytes: wasmBytes.byteLength };
 }
 for (const file of bundled.outputFiles) files.set(relative(packageRoot, file.path).replaceAll('\\', '/'), file.contents);
 for (const [path, content] of declaration.files) files.set(path, content);
@@ -131,7 +137,7 @@ files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', vers
   files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json',
     ...(values['sql-native'] ? ['engine'] : []), ...(wasmEngine ? ['wasm'] : [])],
   ...(nativeRtc ? { dependencies: { werift: '0.27.0' } } : {}), engines: { node: '>=22.15' },
-  ...(values['sql-native'] ? { imports: { [engineImport]: './engine/index.cjs' }, os: [process.platform], cpu: [process.arch] } : {}),
+  ...(values['sql-native'] ? { imports: { [engineImport]: './engine/index.cjs' }, os: [process.platform], cpu: [process.arch], ...(libc ? { libc: [libc] } : {}) } : {}),
 }, null, 2) + '\n');
 for (const [path, content] of files) { await mkdir(dirname(join(packageRoot, path)), { recursive: true }); await writeFile(join(packageRoot, path), content); }
 assert.equal(git(['rev-parse', 'HEAD']).trim(), source, 'Source commit changed during packaging');
@@ -141,7 +147,7 @@ await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: '
   repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
   inputs, runtimeInputs, runtimeModules, nativeRtc, sqlEngines: [
     ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : []), ...(values['sql-wasm'] ? ['wasm-node'] : [])], nativeEngine, wasmEngine, sha256 }, null, 2) + '\n');
-const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
+const packed = JSON.parse(execNpmSync(['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 }))[0];
 const artifact = join(output, `chronolog-peer-session-${suffix}.tgz`);

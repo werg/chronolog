@@ -84,6 +84,27 @@ export class NativeBytesStore implements BytesStore {
     }
   }
 
+  async putAllIfEmpty(entries: readonly { readonly key: string; readonly value: Uint8Array }[]): Promise<boolean> {
+    this.#assertOpen()
+    let bytes = 0
+    const seen = new Set<string>()
+    for (const entry of entries) {
+      validateKey(entry.key)
+      if (!(entry.value instanceof Uint8Array) || entry.value.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
+      if (seen.has(entry.key)) throw new Error('BYTES_STORE_DUPLICATE_KEY')
+      seen.add(entry.key); bytes += entry.value.byteLength
+    }
+    if (bytes > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
+    this.#database.exec('BEGIN IMMEDIATE')
+    try {
+      if ((this.#database.prepare('SELECT count(*) AS count FROM stored_bytes').get() as { count: number }).count !== 0) {
+        this.#database.exec('COMMIT'); return false
+      }
+      const insert = this.#database.prepare('INSERT INTO stored_bytes (key, value) VALUES (?, ?)')
+      for (const entry of entries) insert.run(entry.key, entry.value)
+      this.#database.exec('COMMIT'); this.#usedBytes = bytes; return true
+    } catch (error) { this.#database.exec('ROLLBACK'); throw error }
+  }
   async entries(): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
     this.#assertOpen()
     const rows = this.#database.prepare('SELECT key, value FROM stored_bytes ORDER BY key ASC').all() as
