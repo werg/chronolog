@@ -47,7 +47,7 @@ export async function openDisposableNativeDevice(options: {
   readonly maxValueBytes?: number
 } = {}): Promise<DisposableNativeDevice> {
   if (options.sql !== true) {
-    const store = new MemoryBytesStore()
+    const store = new MemoryBytesStore(options)
     const device = await openApplicationDevice({ store, create: true })
     return Object.freeze({
       ...device,
@@ -66,7 +66,9 @@ export async function openDisposableNativeDevice(options: {
     ...(options.quotaBytes === undefined ? {} : { quotaBytes: options.quotaBytes }),
     ...(options.maxValueBytes === undefined ? {} : { maxValueBytes: options.maxValueBytes }),
   }
-  const store = new NativeBytesStore(storePath, limits)
+  let store: NativeBytesStore
+  try { store = new NativeBytesStore(storePath, limits) }
+  catch (error) { rmSync(temporaryDirectory, { recursive: true, force: true }); throw error }
   let cleaned = false
   const cleanupDir = (): void => {
     if (cleaned) return

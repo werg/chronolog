@@ -1,3 +1,4 @@
+import { execNpmSync } from './lib/npm-cli.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -21,14 +22,14 @@ try {
   await writeFile(join(directory, 'package.json'), JSON.stringify({ name: 'isolated-signals-consumer', private: true, type: 'module' }));
   // Offline installation with a fresh cache proves the tarball has no fetched
   // runtime dependencies. Lifecycle scripts and workspace links cannot help it.
-  execFileSync('npm', ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', artifact], {
+  execNpmSync(['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', artifact], {
     cwd: directory, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, npm_config_cache: join(directory, 'npm-cache') },
   });
   const installed = join(directory, 'node_modules/@chronolog/signals');
   const metadata = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'));
   assert.equal(metadata.name, '@chronolog/signals');
   for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) assert.deepEqual(metadata[field] ?? {}, {});
-  const tree = JSON.parse(execFileSync('npm', ['ls', '--all', '--json'], { cwd: directory, encoding: 'utf8' }));
+  const tree = JSON.parse(execNpmSync(['ls', '--all', '--json'], { cwd: directory, encoding: 'utf8' }));
   assert.deepEqual(Object.keys(tree.dependencies), ['@chronolog/signals']);
   assert.deepEqual(tree.dependencies['@chronolog/signals'].dependencies ?? {}, {});
   assert.deepEqual((await readdir(installed)).sort(), ['README.md', 'index.d.ts', 'index.mjs', 'package.json', 'payload.d.ts', 'provenance.json']);

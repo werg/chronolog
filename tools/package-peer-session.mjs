@@ -1,3 +1,4 @@
+import { execNpmSync } from './lib/npm-cli.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -87,7 +88,7 @@ for (const entry of ['index', 'browser', 'worker', 'tendriller', ...(sqlEnabled 
 }
 const declaration = declarations(Object.values(entries));
 const inputs = [...new Set([...runtimeInputs, ...declaration.inputs, 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
-  'packages/peer-session/package.json', 'packages/peer-session/README.md', 'tools/package-peer-session.mjs',
+  'packages/peer-session/package.json', 'packages/peer-session/README.md', 'tools/package-peer-session.mjs', 'tools/lib/npm-cli.mjs',
   ...(values['sql-native'] ? ['patches/@dolthub__doltlite@0.11.29.patch'] : [])])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('PEER_SESSION_PACKAGE_REQUIRES_CLEAN_INPUTS');
@@ -144,7 +145,7 @@ await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: '
   repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
   inputs, runtimeInputs, runtimeModules, nativeRtc, sqlEngines: [
     ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : []), ...(values['sql-wasm'] ? ['wasm-node'] : [])], nativeEngine, wasmEngine, sha256 }, null, 2) + '\n');
-const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
+const packed = JSON.parse(execNpmSync(['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 }))[0];
 const artifact = join(output, `chronolog-peer-session-${suffix}.tgz`);

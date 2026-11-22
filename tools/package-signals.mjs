@@ -1,3 +1,4 @@
+import { execNpmSync } from './lib/npm-cli.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -23,7 +24,7 @@ assert(Object.values(bundled.metafile.outputs).every(value => value.imports.leng
 
 const inputs = [...new Set([...runtimeInputs, 'packages/signals/package.json', 'packages/signals/README.md',
   'packages/canonical/package.json', 'package.json', 'pnpm-lock.yaml', 'tsconfig.base.json',
-  'tools/package-signals.mjs', 'tools/test-signals-package.mjs'])].sort();
+  'tools/package-signals.mjs', 'tools/lib/npm-cli.mjs', 'tools/test-signals-package.mjs'])].sort();
 const changed = git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim();
 if (changed && !values['allow-dirty']) throw new Error('SIGNALS_PACKAGE_REQUIRES_CLEAN_INPUTS (commit package inputs before building)');
 const declarations = emitDeclarations();
@@ -51,7 +52,7 @@ const sha256 = Object.fromEntries(await Promise.all(['index.mjs', 'index.d.ts', 
   .map(async name => [name, hash(await readFile(join(output, name)))])));
 await writeFile(join(output, 'provenance.json'), JSON.stringify({ format: 'chronolog-signals-package/v1',
   repository: 'werg/chronolog-db', source, dirty, inputs, runtimeInputs, sha256 }, null, 2) + '\n');
-const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
+const packed = JSON.parse(execNpmSync(['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: output, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 }))[0];
 const artifact = join(output, `chronolog-signals-${suffix}.tgz`);

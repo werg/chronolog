@@ -170,3 +170,37 @@ node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-sessio
 ```
 
 See [Qualification](../../docs/release-hardening.md) and [Browser storage](../../docs/browser-storage.md) for verification details.
+
+
+## Quiesced device handoff and disposable sessions
+
+A device move requires the old participant to stop first. Export rejects known
+active device/session use. `exportDeviceCheckpoint(store, { secret, persist })`
+requires the `persist({ bytes, metadata })` callback to durably retain the encrypted
+handoff before retiring the source. Persist into private staging and fsync it;
+publish the staged file/directory only after export succeeds. If publication
+fails afterward, retain staging for recovery. A failed persistence callback leaves
+the source usable. `retireSource:false` is an explicit backup, not a safe move or
+permission to run two copies of the same signing identity.
+
+`restoreDeviceCheckpoint(store, bytes, { secret })` requires enumeration and atomic
+`putAllIfEmpty`. It never merges with or overwrites existing identity. Memory,
+native SQLite and IndexedDB stores implement this primitive; other stores fail
+closed until they supply it. Stage a fresh private target, restore any returned
+SQL bytes beside it, reopen and verify its device identity, then publish the target
+directory as one unit. Checkpoints are bounded to 4096 records, 1024 outbox entries,
+16 MiB raw record/SQL data and 32 MiB encrypted data. The caller owns quiescence of
+external/direct store writers and consistency of separately captured SQL bytes.
+
+Disposable devices are explicitly ephemeral and non-resumable. Requested memory
+store quotas are enforced, and failed SQL-device construction removes its managed
+temporary directory. Closing an ergonomic client fences new submissions; cancelling
+submitted work reports known/uncertain outcomes without claiming it was rolled back.
+
+Node WASM SQL requires Node's built-in `node:sqlite` for its small OS-released owner
+fence, plus the verified WASM engine; no patched native addon is compiled. The VFS
+implements per-connection SQLite locks within that owner. The SQLite cache budget
+is per connection, not a total process/WASM RSS guarantee; temporary SQL storage
+uses files. Unknown budget options fail closed. The loader and WASM binary must
+match the hashes in a trusted build manifest. SQL WASM package consumers are
+qualified independently on Linux, macOS and Windows in remote CI.

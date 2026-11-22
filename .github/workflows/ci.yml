@@ -14,6 +14,20 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  fast-js:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: node --test tools/run-fast-tests.test.mjs tools/npm-cli.test.mjs
+      - run: pnpm test:fast
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30

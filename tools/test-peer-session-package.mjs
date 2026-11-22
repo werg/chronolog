@@ -1,3 +1,4 @@
+import { execNpmSync } from './lib/npm-cli.mjs';
 // Verify the default archive as a normal npm consumer, including real native RTC.
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
@@ -17,7 +18,7 @@ await mkdir(output); await mkdir(consumer);
 await writeFile(join(consumer, 'package.json'), JSON.stringify({ name: 'default-session-package-consumer', private: true, type: 'module', dependencies: { '@chronolog/peer-session': `file:${artifact}` } }));
 // Only the archive is requested. npm must install its exact native dependency;
 // there is no optional peer, global install or separately supplied Werift copy.
-execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: consumer, timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
+execNpmSync(['install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: consumer, timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
 const packageRoot = join(consumer, 'node_modules/@chronolog/peer-session');
 const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json')));
 assert.deepEqual(metadata.dependencies, { werift: '0.27.0' });
