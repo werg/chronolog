@@ -1,3 +1,4 @@
+import { nodeVfsFileIdentity, nodeVfsFullPath } from './node-vfs-path.js'
 import { DatabaseSync } from 'node:sqlite'
 import {
   closeSync,
@@ -12,6 +13,7 @@ import {
   realpathSync,
   readSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -144,8 +146,23 @@ interface OpenNodeFile {
   readonly fd: number
   readonly path: string
   readonly deleteOnClose: boolean
-  readonly owner?: { lease: DatabaseSync; users: Set<OpenNodeFile> }
+  readonly owner?: FileOwner
   lock: number
+}
+
+interface FileOwner { readonly key: string; readonly lease: DatabaseSync; readonly users: Set<OpenNodeFile> }
+
+function vfsDiagnostic(operation: string, stage: string, raw: string | undefined, error?: unknown): void {
+  if (process.env.CHRONOLOG_NODE_VFS_DIAGNOSTICS !== '1') return
+  const failure = error as { code?: unknown; errcode?: unknown } | undefined
+  try {
+    process.stderr.write('chronolog-node-vfs ' + JSON.stringify({ operation, stage,
+      pathHash: raw === undefined ? null : createHash('sha256').update(raw).digest('hex').slice(0, 16),
+      length: raw?.length, colon: raw?.indexOf(':'), backslash: raw?.includes('\\'), slash: raw?.includes('/'),
+      lockFile: raw?.endsWith('-lock'), code: typeof failure?.code === 'string' && /^[A-Z0-9_]{1,64}$/u.test(failure.code) ? failure.code : null,
+      errno: typeof failure?.errcode === 'number' ? failure.errcode : null,
+    }) + '\n')
+  } catch { /* Diagnostics cannot change VFS behavior. */ }
 }
 
 /**
@@ -182,21 +199,22 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
   const SQLITE_BUSY = 5
 
   const openFiles = new Map<number, OpenNodeFile>()
-  const owners = new Map<string, { lease: DatabaseSync; users: Set<OpenNodeFile> }>()
-  function owner(path: string) {
-    let group = owners.get(path)
+  const owners = new Map<string, FileOwner>()
+  function owner(path: string, fd: number) {
+    const key = nodeVfsFileIdentity(path, fstatSync(fd, { bigint: true }))
+    let group = owners.get(key)
     if (group !== undefined) return group
     const lease = new DatabaseSync(path + '.chronolog-owner.sqlite')
     try {
       lease.exec('PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS ownership (id INTEGER); COMMIT')
     } catch (error) { lease.close(); throw error }
-    group = { lease, users: new Set() }; owners.set(path, group)
+    group = { key, lease, users: new Set() }; owners.set(key, group)
     return group
   }
   function release(entry: OpenNodeFile) {
     if (entry.owner === undefined) return
     entry.owner.users.delete(entry)
-    if (entry.owner.users.size === 0) { entry.owner.lease.close(); owners.delete(entry.path) }
+    if (entry.owner.users.size === 0) { entry.owner.lease.close(); owners.delete(entry.owner.key) }
   }
   const vfsStruct = new capi.sqlite3_vfs()
   const ioStruct = new capi.sqlite3_io_methods()
@@ -326,25 +344,32 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
   const encoder = new TextEncoder()
   const vfsMethods: Record<string, (...args: never[]) => unknown> = {
     xOpen(_pVfs: number, zName: number, pFile: number, flags: number, pOutFlags: number) {
-      let fd: number | undefined, entry: OpenNodeFile | undefined
+      let fd: number | undefined, entry: OpenNodeFile | undefined, raw: string | undefined
+      let stage = 'name'
       try {
         const hasName = zName !== 0 && (wasm.peek8?.(zName) ?? 1) !== 0
-        const requestedPath = hasName ? resolve(wasm.cstrToJs!(zName))
+        raw = hasName ? wasm.cstrToJs!(zName) : undefined
+        const requestedPath = raw !== undefined ? resolve(raw)
           : join(tmpdir(), `chronolog-wasm-tmp-${process.pid}-${randomBytes(8).toString('hex')}.db`)
         const readOnly = (flags & SQLITE_OPEN_READONLY) !== 0, create = (flags & SQLITE_OPEN_CREATE) !== 0
+        stage = 'directory'
         if (!readOnly) mkdirSync(dirname(requestedPath), { recursive: true })
         let openFlags = readOnly ? fsConstants.O_RDONLY : fsConstants.O_RDWR
         if (!readOnly && create) openFlags |= fsConstants.O_CREAT
+        stage = 'open'
         fd = openSync(requestedPath, openFlags, 0o600)
+        stage = 'realpath'
         const filePath = realpathSync(requestedPath)
-        const group = (flags & SQLITE_OPEN_MAIN_DB) !== 0 ? owner(filePath) : undefined
+        stage = 'owner'
+        const group = (flags & SQLITE_OPEN_MAIN_DB) !== 0 ? owner(filePath, fd) : undefined
         entry = { fd, path: filePath, deleteOnClose: !hasName || (flags & SQLITE_OPEN_DELETEONCLOSE) !== 0,
           lock: 0, ...(group === undefined ? {} : { owner: group }) }
         group?.users.add(entry); openFiles.set(pFile, entry)
         wasm.pokePtr!(pFile, ioStruct.pointer)
         if (pOutFlags) wasm.poke32!(pOutFlags, flags)
         return SQLITE_OK
-      } catch {
+      } catch (error) {
+        vfsDiagnostic('xOpen', stage, raw, error)
         if (fd !== undefined) { try { closeSync(fd) } catch { /* Preserve CANTOPEN. */ } }
         if (entry !== undefined) { openFiles.delete(pFile); release(entry) }
         wasm.pokePtr!(pFile, 0)
@@ -355,7 +380,7 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
       try {
         const filePath = resolve(wasm.cstrToJs!(zName))
         if (existsSync(filePath)) {
-          if (owners.has(realpathSync(filePath))) return SQLITE_IOERR_DELETE
+          if (owners.has(nodeVfsFileIdentity(realpathSync(filePath), statSync(filePath, { bigint: true })))) return SQLITE_IOERR_DELETE
           unlinkSync(filePath)
         }
         if (syncDir) syncDirectoryBestEffort(dirname(filePath))
@@ -375,14 +400,18 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
       return SQLITE_OK
     },
     xFullPathname(_pVfs: number, zName: number, nOut: number, pOut: number) {
-      const full = resolve(wasm.cstrToJs!(zName))
-      const encoded = encoder.encode(full)
-      if (encoded.byteLength + 1 > nOut) return SQLITE_CANTOPEN
-      const heap = wasm.heap8u()
-      const start = Number(pOut)
-      heap.set(encoded, start)
-      heap[start + encoded.byteLength] = 0
-      return SQLITE_OK
+      let raw: string | undefined
+      try {
+        raw = wasm.cstrToJs!(zName)
+        const full = nodeVfsFullPath(raw)
+        vfsDiagnostic('xFullPathname', 'input', raw)
+        vfsDiagnostic('xFullPathname', 'output', full)
+        const encoded = encoder.encode(full)
+        if (encoded.byteLength + 1 > nOut) return SQLITE_CANTOPEN
+        const heap = wasm.heap8u(), start = Number(pOut)
+        heap.set(encoded, start); heap[start + encoded.byteLength] = 0
+        return SQLITE_OK
+      } catch (error) { vfsDiagnostic('xFullPathname', 'resolve', raw, error); return SQLITE_CANTOPEN }
     },
     xRandomness(_pVfs: number, nByte: number, zOut: number) {
       const bytes = randomBytes(nByte)
@@ -493,7 +522,7 @@ export function createNodeWasmSqlEngine(options: {
       }
       const hostPath = resolve(openOptions.path)
       mkdirSync(dirname(hostPath), { recursive: true })
-      const opened = base.openDatabase({ ...openOptions, path: hostPath })
+      const opened = base.openDatabase({ ...openOptions, path: nodeVfsFullPath(hostPath) })
       try {
         opened.database.exec(`PRAGMA cache_size = -${cacheSizeKiB}`)
         opened.database.exec('PRAGMA temp_store = FILE')

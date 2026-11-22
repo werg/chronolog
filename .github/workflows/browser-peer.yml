@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -66,6 +68,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -77,6 +81,8 @@ jobs:
           name: wasm-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/portable-wasm
       - name: Verify exact portable archive without building a native addon
+        env:
+          CHRONOLOG_NODE_VFS_DIAGNOSTICS: '1'
         shell: bash
         run: |
           archives=(artifacts/portable-wasm/session-wasm/*.tgz)

@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -33,6 +35,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -52,6 +56,7 @@ jobs:
           pnpm test:signals-package
           pnpm package:control
           pnpm package:session
+          node tools/package-peer-session.mjs --no-native-rtc --output artifacts/peer-session-relay
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -63,6 +68,8 @@ jobs:
             artifacts/peer-generation-control/*.tgz
             artifacts/peer-session/*.tgz
             artifacts/peer-session/package/provenance.json
+            artifacts/peer-session-relay/*.tgz
+            artifacts/peer-session-relay/package/provenance.json
           if-no-files-found: warn
           retention-days: 30
 
@@ -76,6 +83,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -99,6 +108,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
