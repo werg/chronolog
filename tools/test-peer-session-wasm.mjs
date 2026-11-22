@@ -1,3 +1,4 @@
+import { checkedPackagePath } from './lib/package-path.mjs';
 import { execNpmSync } from './lib/npm-cli.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -23,8 +24,7 @@ assert(!provenance.nativeEngine, 'Portable archive must not contain the native a
 assert(provenance.sqlEngines.includes('wasm-node'), 'Artifact must expose Node WASM SQL');
 assert(provenance.wasmEngine, 'Artifact must carry verified WASM assets');
 for (const [name, expected] of Object.entries(provenance.sha256)) {
-  const path = resolve(packageRoot, name);
-  assert(path.startsWith(packageRoot + '/'), 'Unsafe provenance file path');
+  const path = checkedPackagePath(packageRoot, name);
   assert.equal(hash(await readFile(path)), expected, `Artifact hash mismatch for ${name}`);
 }
 await cp(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/peer-session-sql-consumer.mjs'), join(consumer, 'consumer.mjs'));

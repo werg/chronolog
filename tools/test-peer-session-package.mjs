@@ -1,7 +1,7 @@
 import { execNpmSync } from './lib/npm-cli.mjs';
 // Verify the default archive as a normal npm consumer, including real native RTC.
 import assert from 'node:assert/strict';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';

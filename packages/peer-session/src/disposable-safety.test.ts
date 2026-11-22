@@ -1,9 +1,10 @@
+import type * as nodeCrypto from 'node:crypto'
 import { existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { MemoryBytesStore } from '@chronolog/records'
-vi.mock('node:crypto',async original=>({...await original<typeof import('node:crypto')>(),randomUUID:()=>`test-failed-disposable-${process.pid}`}))
+vi.mock('node:crypto',async original=>({...await original<typeof nodeCrypto>(),randomUUID:()=>`test-failed-disposable-${process.pid}`}))
 import { openDisposableNativeDevice } from './native.js'
 it('cleans its managed SQL directory when storage construction fails',async()=>{
  const path=join(tmpdir(),`tendriller-disposable-test-failed-disposable-${process.pid}`)
