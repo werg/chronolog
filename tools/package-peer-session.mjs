@@ -116,10 +116,13 @@ if (values['wasm-dir']) {
   const loaderBytes = await readFile(join(wasmDir, 'sqlite3.mjs'));
   const manifest = JSON.parse(manifestBytes.toString('utf8'));
   assert.equal(hash(wasmBytes), manifest.wasmSha256, 'WASM binary digest mismatch against manifest.json');
+  assert.equal(hash(loaderBytes), manifest.loaderSha256, 'WASM loader digest mismatch against manifest.json');
+  assert.equal(wasmBytes.byteLength, manifest.wasmBytes, 'WASM binary size mismatch against manifest.json');
   files.set('wasm/manifest.json', manifestBytes);
   files.set('wasm/sqlite3.wasm', wasmBytes);
   files.set('wasm/sqlite3.mjs', loaderBytes);
-  wasmEngine = { toolchain: manifest.toolchain, wasmSha256: manifest.wasmSha256, wasmBytes: wasmBytes.byteLength };
+  files.set('wasm/sqlite3-opfs-async-proxy.js', await readFile(join(wasmDir, 'sqlite3-opfs-async-proxy.js')));
+  wasmEngine = { toolchain: manifest.toolchain, wasmSha256: manifest.wasmSha256, loaderSha256: manifest.loaderSha256, wasmBytes: wasmBytes.byteLength };
 }
 for (const file of bundled.outputFiles) files.set(relative(packageRoot, file.path).replaceAll('\\', '/'), file.contents);
 for (const [path, content] of declaration.files) files.set(path, content);

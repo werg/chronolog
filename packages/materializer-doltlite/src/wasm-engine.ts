@@ -73,6 +73,7 @@ export interface WasmBuildManifest {
   readonly runtimeVersions: { readonly doltlite: string; readonly sqlite: string; readonly vec: string }
   readonly portabilityPatches: readonly ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1']
   readonly deterministicSourceSha256: string
+  readonly loaderSha256: string
   readonly wasmSha256: string
   readonly wasmBytes: number
 }
