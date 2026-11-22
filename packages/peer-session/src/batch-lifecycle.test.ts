@@ -30,3 +30,18 @@ it('client close is idempotent and fences an in-flight persistence hook before t
  await started.promise;const first=client.close();expect(client.close()).toBe(first);await first;await rejected;gate.resolve();await Promise.resolve()
  expect(f.command).not.toHaveBeenCalled();expect(close).toHaveBeenCalledOnce();await expect(client.query('q')).rejects.toThrow('APPLICATION_CLIENT_CLOSED')
 })
+it('returns completed prefix and uncertain in-flight entry after an already-aborted recovery read',async()=>{
+ const f=fixture(),stop=new AbortController(),started=deferred<void>(),pending=deferred<never>()
+ const applied={status:'applied' as const,attemptId:'a',operationId:'first',generation:'g',author:'signer',sequence:1,outcome:'accepted' as const,rejectionCode:null}
+ f.session.command=async(_name,_input,options)=>options.operationId==='first'?{get:async()=>applied,applied:async()=>applied}:{get:async()=>null,applied:async()=>{started.resolve();return pending.promise}}
+ const task=submitBatch(f.session,[{operationId:'first',command:'write',input:null},{operationId:'second',command:'write',input:null}],{signal:stop.signal})
+ await started.promise;stop.abort(Error('cancel'))
+ expect(await task).toMatchObject([{operationId:'first',lifecycle:'applied'},{operationId:'second',lifecycle:'unknown'}])
+})
+it('retains a known applied result when closing cancels the subsequent journal read',async()=>{
+ const f=fixture(),stop=new AbortController(),started=deferred<void>(),pending=deferred<never>()
+ const applied={status:'applied' as const,attemptId:'a',operationId:'op',generation:'g',author:'signer',sequence:1,outcome:'accepted' as const,rejectionCode:null}
+ f.session.command=async()=>({get:async()=>{started.resolve();return pending.promise},applied:async()=>applied})
+ const task=submitBatch(f.session,[{operationId:'op',command:'write',input:null}],{signal:stop.signal})
+ await started.promise;stop.abort(Error('cancel'));expect(await task).toMatchObject([{lifecycle:'applied',applied,state:applied}])
+})

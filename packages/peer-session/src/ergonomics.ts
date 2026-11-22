@@ -151,21 +151,30 @@ export async function submitBatch(
   }
   const results: BatchCommandResult[] = []
   for (const entry of items) {
+    if (lifetime.aborted && results.length > 0) break
     lifetime.throwIfAborted()
-    if (options.beforeSubmit !== undefined) await awaitOwnedTask(lifetime, () => options.beforeSubmit!(structuredClone(entry)))
-    lifetime.throwIfAborted()
+    try {
+      if (options.beforeSubmit !== undefined) await awaitOwnedTask(lifetime, () => options.beforeSubmit!(structuredClone(entry)))
+      lifetime.throwIfAborted()
+    } catch (error) {
+      if (lifetime.aborted && results.length > 0) break
+      throw error
+    }
+    let applied: AppliedResult | null = null
     try {
       const handle = await awaitOwnedTask(lifetime, () => session.command(entry.command, entry.input, {
         operationId: entry.operationId, ...(entry.basedOn === undefined ? {} : { basedOn: entry.basedOn }),
       }))
-      const applied = options.wait === 'recorded' ? null : await awaitOwnedTask(lifetime, () => handle.applied({ signal: lifetime }))
+      applied = options.wait === 'recorded' ? null : await awaitOwnedTask(lifetime, () => handle.applied({ signal: lifetime }))
       const state = await awaitOwnedTask(lifetime, () => handle.get())
       const summary = describeOperationLifecycle(entry.operationId, state ?? applied)
       results.push(Object.freeze({ operationId: entry.operationId, command: entry.command, lifecycle: summary.lifecycle, applied, state, error: null }))
       if (options.stopOnError === true && (summary.lifecycle === 'rejected' || summary.lifecycle === 'unknown')) break
     } catch (error) {
       // A rejected call is not evidence that preparation/submission never happened.
-      const state = await awaitOwnedTask(lifetime, () => session.operations.get(entry.operationId)).catch(() => null)
+      let state: OperationState | null = applied
+      try { state = await awaitOwnedTask(lifetime, () => session.operations.get(entry.operationId)) ?? applied }
+      catch { /* Cancellation may throw synchronously; preserve the completed batch prefix and known application. */ }
       const summary = describeOperationLifecycle(entry.operationId, state, { error })
       const err = error as { code?: unknown; message?: unknown } | null
       results.push(Object.freeze({ operationId: entry.operationId, command: entry.command, lifecycle: summary.lifecycle,
