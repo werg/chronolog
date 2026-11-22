@@ -175,6 +175,12 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
     .filter(entry => entry.key !== DEVICE_RETIRED_KEY)
     .map(entry => ({ key: entry.key, value: entry.value.slice() }))
     .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  const seenKeys = new Set<string>()
+  for (const entry of rawEntries) {
+    if (typeof entry.key !== 'string' || entry.key.length === 0 || entry.key.length > 2048 ||
+        [...entry.key].some(c => c.charCodeAt(0) < 32) || seenKeys.has(entry.key)) throw fail('CHECKPOINT_CORRUPT', 'Invalid source checkpoint key.')
+    seenKeys.add(entry.key)
+  }
   const sqlBytes = options.sqlDatabaseBytes?.slice() ?? null
   const outbox = structuredClone(options.outbox ?? [])
   if (rawEntries.length > MAX_ENTRIES || rawEntries.reduce((size, entry) => size + entry.value.byteLength, sqlBytes?.byteLength ?? 0) > MAX_CHECKPOINT_BYTES / 2) {
@@ -254,6 +260,7 @@ export async function restoreDeviceCheckpoint(
     throw fail('CHECKPOINT_KEY_MISMATCH', expectRaw ? 'This checkpoint requires a 32-byte raw key.' : 'This checkpoint requires a passphrase.')
   }
   const salt = encryptedBytes.subarray(offset, offset + SALT_BYTES); offset += SALT_BYTES
+  if (expectRaw && salt.some(byte => byte !== 0)) throw fail('CHECKPOINT_CORRUPT', 'Raw-key checkpoint salt must be zero.')
   const iv = new Uint8Array(encryptedBytes.subarray(offset, offset + IV_BYTES)); offset += IV_BYTES
   const ciphertext = new Uint8Array(encryptedBytes.subarray(offset))
   const key = await deriveAesKey(options.secret, salt, ['decrypt'])

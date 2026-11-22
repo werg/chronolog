@@ -31,7 +31,13 @@ it('sorts readback independently of adapter iteration order',async()=>{
 })
 it('invalid headers and ciphertext cannot write the target',async()=>{
  const source=new MemoryBytesStore(),secret=generateCheckpointKey(),cp=await exportDeviceCheckpoint(source,{secret,retireSource:false})
- for(const mutate of [(b:Uint8Array)=>{b[5]=128},(b:Uint8Array)=>{b[b.length-1]!^=1}]){
+ for(const mutate of [(b:Uint8Array)=>{b[5]=128},(b:Uint8Array)=>{b[6]=1},(b:Uint8Array)=>{b[b.length-1]!^=1}]){
   const bytes=cp.bytes.slice();mutate(bytes);const target=new MemoryBytesStore();await expect(restoreDeviceCheckpoint(target,bytes,{secret})).rejects.toBeInstanceOf(Error);expect(await target.entries()).toEqual([])
  }
+})
+
+it('refuses an unrestorable source key before persisting or retiring it',async()=>{
+ const source=new MemoryBytesStore(),persist=vi.fn();await source.put('',new Uint8Array([1]))
+ await expect(exportDeviceCheckpoint(source,{secret:generateCheckpointKey(),persist})).rejects.toMatchObject({code:'CHECKPOINT_CORRUPT'})
+ expect(persist).not.toHaveBeenCalled();expect((await isDeviceRetired(source)).retired).toBe(false)
 })
