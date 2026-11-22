@@ -79,7 +79,7 @@ export class IndexedDbBytesStore implements BytesStore {
       seen.add(entry.key)
     }
     return this.#enqueue(async () => {
-      const encoded = []
+      const encoded: { key: string; value: Uint8Array }[] = []
       for (const entry of captured) encoded.push({ key: entry.key, value: await encodeRecordValue(entry.key, entry.value) })
       return this.#transaction('readwrite', table => {
         let initialized = false

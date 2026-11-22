@@ -37,10 +37,52 @@ jobs:
         env:
           CHRONOLOG_REQUIRE_WASM: '1'
         run: pnpm exec vitest run packages/materializer-doltlite/src/wasm-conformance.test.ts packages/materializer-doltlite/src/wasm-node.test.ts
+      - name: Package verified portable Node WASM SQL
+        run: node tools/package-peer-session.mjs --no-native-rtc --sql-wasm --wasm-dir artifacts/wasm --output artifacts/session-wasm
+      - name: Verify independent portable SQL consumer
+        shell: bash
+        run: |
+          archives=(artifacts/session-wasm/*.tgz)
+          node tools/test-peer-session-wasm.mjs --artifact "${archives[0]}"
       - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: wasm-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/wasm/manifest.json
+          path: |
+            artifacts/wasm/manifest.json
+            artifacts/session-wasm/*.tgz
+            artifacts/peer-session-wasm-check/report.json
           if-no-files-found: error
           retention-days: 30
+
+  portable-node:
+    name: Portable WASM SQL (${{ matrix.os }})
+    needs: qualify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@v7
+        with:
+          name: wasm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/portable-wasm
+      - name: Verify exact portable archive without building a native addon
+        shell: bash
+        run: |
+          archives=(artifacts/portable-wasm/session-wasm/*.tgz)
+          node tools/test-peer-session-wasm.mjs --artifact "${archives[0]}"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: portable-wasm-${{ matrix.os }}-${{ github.run_id }}
+          path: artifacts/peer-session-wasm-check/report.json

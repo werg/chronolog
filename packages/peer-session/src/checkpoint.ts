@@ -220,8 +220,8 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
   await options.persist?.(Object.freeze({ bytes: out.slice(), metadata }))
   const retireSource = options.retireSource !== false
   if (retireSource) {
-    await store.put(DEVICE_RETIRED_KEY, encoder.encode(JSON.stringify({ retiredAt: createdAt, manifestSha256 })))
     retireDeviceStore(store)
+    await store.put(DEVICE_RETIRED_KEY, encoder.encode(JSON.stringify({ retiredAt: createdAt, manifestSha256 })))
   }
   return Object.freeze({ bytes: out, metadata, retiredSource: retireSource })
   } finally { release() }

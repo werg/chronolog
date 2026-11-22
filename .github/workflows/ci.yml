@@ -37,6 +37,7 @@ jobs:
           pnpm package:signals
           pnpm test:signals-package
           pnpm package:control
+          pnpm package:session
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -46,6 +47,8 @@ jobs:
             artifacts/signals/*.tgz
             artifacts/signals/*.consumer.json
             artifacts/peer-generation-control/*.tgz
+            artifacts/peer-session/*.tgz
+            artifacts/peer-session/package/provenance.json
           if-no-files-found: warn
           retention-days: 30
 
