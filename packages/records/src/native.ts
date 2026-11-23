@@ -80,6 +80,7 @@ export class NativeBytesStore implements BytesStore {
     const copy = Uint8Array.from(value)
     return this.#enqueue(() => this.#request('put', { key, value: copy }))
   }
+  delete(key: string): Promise<void> { return this.#enqueue(() => this.#request('delete', { key })) }
   async *iterateEntries(): AsyncIterable<BytesStoreEntry> {
     let release!: () => void, started!: () => void
     const held = new Promise<void>(resolve => { release = resolve }), ready = new Promise<void>(resolve => { started = resolve })

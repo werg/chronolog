@@ -178,6 +178,8 @@ export function serveApplicationWorker(session: ApplicationSession, endpoint: En
       case 'content.stage': return (await session.content.stage(args[0] as { bytes: number; mediaType?: string })).id
       case 'content.resume': return (await session.content.resume(args[0] as string)).id
       case 'content.write': return (await session.content.resume(args[0] as string)).write(args[1] as number, args[2] as Uint8Array)
+      case 'content.prune': return session.content.prune(args[0] as ContentReference)
+      case 'content.discard': return session.content.discard(args[0] as string)
       case 'content.progress': return (await session.content.resume(args[0] as string)).progress()
       case 'content.commit': return (await session.content.resume(args[0] as string)).commit()
       case 'content.retain': return session.content.retain(args[0] as ContentReference, { signal })

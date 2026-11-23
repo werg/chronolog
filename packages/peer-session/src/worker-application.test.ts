@@ -459,6 +459,14 @@ describe('owned browser application facade', () => {
     expect(chunks).toEqual([bytes])
     expect((await b.content.retained(reference)).payload.peer).toBe(b.deviceId)
     expect((await a.content.retention(reference)).some(value => value.payload.peer === b.deviceId)).toBe(true)
+    const large = new Uint8Array(1024 * 1024 + 17).fill(71)
+    const largeRef = await a.content.putBytes(large, { mediaType: 'audio/webm' })
+    await expect(b.content.readBytes(largeRef, { maxBytes: 1024 })).rejects.toThrow('CONTENT_READ_LIMIT_EXCEEDED')
+    expect(await b.content.readBytes(largeRef, { maxBytes: large.length })).toEqual(large)
+    await b.content.prune(largeRef); await b.content.prune(largeRef)
+    await expect(b.content.retained(largeRef)).rejects.toThrow('CONTENT_NOT_RETAINED')
+    await a.content.prune(largeRef)
+    await upload.discard(); await upload.discard()
     expect((await a.query('messages', null)).value.events).toHaveLength(0)
   })
 
@@ -741,4 +749,35 @@ it('withdraws finite request metadata immediately on caller cancellation', async
     expect(client.boundedRequest).toBeNull()
     expect(await result).toMatchObject({ message: 'CALLER_CANCELLED' })
   } finally { release(); send.mockRestore() }
+})
+
+
+describe('public content byte helpers through the Worker facade', () => {
+  it('cleans an aborted Worker upload after the in-flight write settles', async () => {
+    const store = new MemoryBytesStore(), f = await fixture({ openStorageA: async () => ({ store, close: async () => undefined }) })
+    const { client } = await facade(f.a)
+    await client.content.putBytes(Uint8Array.of(7))
+    const before = (await store.entries()).filter(entry => entry.key.startsWith('peer-content/')).map(entry => entry.key).sort()
+    const put = store.put.bind(store), stop = new AbortController()
+    let cancel = true
+    const writing = vi.spyOn(store, 'put').mockImplementation(async (key, bytes) => {
+      await put(key, bytes)
+      if (cancel && key.includes('/chunk/')) { cancel = false; stop.abort(new Error('TEST_WORKER_CAPTURE_STOPPED')) }
+    })
+    try {
+      await expect(client.content.putBytes(new Uint8Array(65_537), { signal: stop.signal })).rejects.toThrow('TEST_WORKER_CAPTURE_STOPPED')
+      await vi.waitFor(async () => {
+        expect((await store.entries()).filter(entry => entry.key.startsWith('peer-content/')).map(entry => entry.key).sort()).toEqual(before)
+      })
+    } finally { writing.mockRestore() }
+  })
+
+  it('captures direct-session pruning input before opening the durable facet', async () => {
+    const f = await fixture(), discarded = await f.a.content.putBytes(Uint8Array.of(1)), kept = await f.a.content.putBytes(Uint8Array.of(2))
+    const input = { ...discarded }, pruning = f.a.content.prune(input)
+    Object.assign(input, kept)
+    await pruning
+    expect(await f.a.content.readBytes(kept, { maxBytes: 1 })).toEqual(Uint8Array.of(2))
+    await expect(f.a.content.readBytes(discarded, { maxBytes: 1 })).rejects.toThrow('CONTENT_UNAVAILABLE')
+  })
 })

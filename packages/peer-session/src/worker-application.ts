@@ -5,6 +5,7 @@ import type { EphemeralSignal, Signals } from '@chronolog/signals'
 import type { EventPayload } from '@chronolog/protocol'
 import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from './definition.js'
 import type { ContentReference, ContentRetention, ContentUpload } from './content.js'
+import { putContentBytes, readContentBytes, type ContentPutBytesOptions, type ContentReadBytesOptions } from './content-bytes.js'
 import type { ApplicationRecoveryExpectation, ApplicationTransition } from './recovery.js'
 import type { ApplicationChange, ApplicationEventBatch, ApplicationEventOptions, CommandOptions, QueryParameter, QueryRows, SessionStatus } from './session-types.js'
 import type { ApplicationParticipation, ApplicationParticipationStatus, ApplicationConnectionDiagnostic } from './participation-types.js'
@@ -70,8 +71,13 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       ...(options.mode === undefined ? {} : { mode: options.mode }), ...(options.streams === undefined ? {} : { streams: options.streams }) }], options.signal),
   }
   readonly content = {
+    putBytes: (bytes: Uint8Array, options: ContentPutBytesOptions = {}): Promise<ContentReference> =>
+      putContentBytes(this.content, bytes, { ...options, signal: options.signal === undefined ? this.signal : AbortSignal.any([this.signal, options.signal]) }),
+    readBytes: (reference: ContentReference, options: ContentReadBytesOptions): Promise<Uint8Array> => readContentBytes(this.content, reference, options),
+    prune: (reference: ContentReference): Promise<void> => this.#call('content.prune', [reference]),
     stage: async (options: { readonly bytes: number; readonly mediaType?: string }): Promise<ContentUpload> => this.#upload(await this.#call('content.stage', [options])),
     resume: async (id: string): Promise<ContentUpload> => this.#upload(await this.#call('content.resume', [id])),
+    discard: (id: string): Promise<void> => this.#call('content.discard', [id]),
     read: (reference: ContentReference, options: { readonly offset?: number; readonly length?: number; readonly signal?: AbortSignal } = {}): AsyncIterable<Uint8Array> =>
       this.#stream('content', [reference, { ...(options.offset === undefined ? {} : { offset: options.offset }), ...(options.length === undefined ? {} : { length: options.length }) }], options.signal),
     retain: (reference: ContentReference, options: { readonly signal?: AbortSignal } = {}): Promise<ContentRetention> => this.#call('content.retain', [reference], options.signal),
@@ -299,7 +305,7 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
   }
   #upload(id: string): ContentUpload {
     return { id, write: (index, bytes) => this.#call('content.write', [id, index, bytes]),
-      progress: () => this.#call('content.progress', [id]), commit: () => this.#call('content.commit', [id]) }
+      progress: () => this.#call('content.progress', [id]), commit: () => this.#call('content.commit', [id]), discard: () => this.#call('content.discard', [id]) }
   }
   async #observe(name: string, listener: (value: unknown) => void): Promise<void> {
     try { for await (const value of this.#stream(name, [], this.signal)) listener(value) }

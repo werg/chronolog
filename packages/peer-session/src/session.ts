@@ -33,7 +33,7 @@ type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I
 type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
 interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void>; readonly link: { close(): Promise<void> } }
 const internals = new WeakMap<ApplicationSession, ApplicationPeerPort>()
-export type ApplicationContentAccess = Pick<ApplicationContent, 'stage' | 'resume' | 'read' | 'retain' | 'retained' | 'retention' | 'observeRetention'>
+export type ApplicationContentAccess = Pick<ApplicationContent, 'stage' | 'resume' | 'discard' | 'putBytes' | 'readBytes' | 'prune' | 'read' | 'retain' | 'retained' | 'retention' | 'observeRetention'>
 export type ApplicationRecoveryAccess = Pick<ApplicationRecovery, 'inspect' | 'takeover' | 'handover'>
 export type ApplicationKeyAccess = Pick<ApplicationKeyring, 'install' | 'ensure' | 'request' | 'offer' | 'validate'> & {
   missing(requiredEpochs?: readonly number[]): Promise<readonly number[]>
@@ -105,6 +105,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.content = Object.freeze({
       stage: async input => (await this.#requireData()).content.stage(input),
       resume: async id => (await this.#requireData()).content.resume(id),
+      discard: async id => (await this.#requireData()).content.discard(id),
+      putBytes: async (bytes, input = {}) => (await this.#dataFor(input.signal)).content.putBytes(bytes, input),
+      readBytes: async (reference, input) => (await this.#dataFor(input?.signal)).content.readBytes(reference, input),
+      prune: async reference => { const captured = structuredClone(reference); return (await this.#requireData()).content.prune(captured) },
       read(reference, input = {}) { return deferredStream(async signal =>
         (await session.#dataFor(signal)).content.read(reference, { ...input, signal }), {
         signal: input.signal === undefined ? session.signal : AbortSignal.any([session.signal, input.signal]),

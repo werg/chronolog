@@ -12,6 +12,7 @@ export interface OpfsFile {
 }
 export interface OpfsDirectory {
   getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFile>
+  removeEntry?(name: string): Promise<void>
 }
 
 /** An atomic OPFS writer; the same envelope and ordering rules as the IDB backend. */
@@ -53,6 +54,16 @@ export class OpfsBytesStore implements BytesStore {
         try { await writer.abort() } catch { /* Preserve the original storage failure. */ }
         throw error
       }
+    })
+  }
+
+  async delete(key: string): Promise<void> {
+    assertRecordKey(key)
+    const remove = this.#directory.removeEntry?.bind(this.#directory)
+    if (remove === undefined) throw new Error('BYTES_STORE_DELETE_UNSUPPORTED')
+    return this.#enqueue(async () => {
+      try { await remove(await recordFilename(key)) }
+      catch (error) { if (!(error instanceof DOMException) || error.name !== 'NotFoundError') throw error }
     })
   }
 

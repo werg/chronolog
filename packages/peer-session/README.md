@@ -180,10 +180,71 @@ const participation = session.participate({
 
 ## Content, signals, and agent tools
 
-- **Content**: `session.content.stage()`, `read(ref, { offset, length })`, `retain()`, and `retention()` transfer encrypted 64 KiB chunks peer-to-peer under current reader grants.
+- **Content**: `session.content.putBytes()`, `readBytes(ref, { maxBytes })`, `stage()`, `read(ref, { offset, length })`, `retain()`, and `retention()` transfer encrypted 64 KiB chunks peer-to-peer under current reader grants. `prune(ref)` explicitly evicts a local copy when the application no longer needs it.
 - **Signals**: `session.signals.send(topic, payload, opts)` and `subscribe(opts)` share ephemeral signed updates over the live lane. With `mode: 'latest'`, an active subscription coalesces newly received updates; it does not return a current-value snapshot or replay earlier messages.
 - **Agent tools**: `createApplicationTools(session)` exposes declared commands/queries as schema-validated tool descriptors for local or remote assistants.
 - **Multi-client ownership**: `createApplicationOwner()` and `acquireApplicationOwnerLock()` allow multiple tabs or local attachments to share one owning session while keeping operation scopes, bounded RPC deadlines (`boundedRequest`), and read-view authority isolated.
+
+### Bounded snapshots and clips
+
+Both native sessions and browser Worker facades provide the same convenience APIs:
+
+```ts
+const stop = new AbortController()
+const reference = await session.content.putBytes(clipBytes, {
+  mediaType: 'audio/webm', signal: stop.signal,
+})
+const received = await session.content.readBytes(reference, {
+  maxBytes: 8 * 1024 * 1024, signal: stop.signal,
+})
+// After review/discard, when this application no longer needs its local copy:
+await session.content.prune(reference)
+```
+
+`putBytes` accepts a `Uint8Array`, chunks it at 64 KiB, and returns a committed
+`ContentReference`. Content is limited to 128 MiB. Do not mutate the input until
+the promise settles. `readBytes` requires an explicit integer `maxBytes` between
+zero and 128 MiB, rejects larger references before fetching, allocates one result
+buffer, and verifies the complete byte count. Use `read(ref, { offset, length,
+signal })` to process larger permitted content incrementally instead of assembling
+it in memory. Worker calls retain the same bounded per-chunk message sizes.
+
+Aborting a convenience upload or download rejects its wait and prevents a late
+result from being returned. An upload queues local discard after already-started
+writes settle; aborting does not claim to undo physical storage work immediately.
+If the storage owner closes or storage fails, cleanup can fail too. Applications
+that need explicitly resumable uploads should use `stage`, keep its ID, and use
+`resume`; a returned upload also has an idempotent `discard()` method that removes
+its local staged or committed copy. `session.content.discard(uploadId)` performs
+the same idempotent cleanup from a saved ID without requiring the old stage epoch
+to remain current. The native session and Worker facade expose both forms.
+
+`prune` is local eviction: it removes the manifest, reference-owned encrypted chunks, associated
+upload records, and this device's cached retention observations. It aborts current
+reads of that reference and fences late provider replies before they can restore
+the deleted bytes. A durable deletion inventory permits retry after an interrupted
+prune; reads remain fenced until `prune(reference)` completes. Repeated calls are
+safe. Pruning a reference does not discard an independent pending upload that
+shares its stage identity; call `discard(uploadId)` to explicitly stop that upload.
+Unrelated application records and other devices' copies are unchanged, and a
+later explicit read may fetch the content again. Retention receipts held by other
+peers remain historical observations; pruning neither retracts them nor erases an
+application command that references the content. The application chooses when an
+observation is disposable and when a declared command retains its reference.
+
+Memory, native SQLite, IndexedDB, and OPFS storage support eviction. Custom
+`BytesStore` implementations may supply optional `delete(key)`; pruning reports
+`CONTENT_PRUNE_UNSUPPORTED` when deletion is absent. Native deletion releases
+logical quota and reusable SQLite pages; it does not promise file compaction or
+secure physical erasure.
+
+New uploads and downloads store chunks under each content reference. Older stores
+used a global chunk hash that can be shared by multiple manifests. Those ambiguous
+legacy ciphertext records remain readable and are conservatively preserved during
+pruning; removing one old reference must not silently destroy another offline copy.
+The manifest and associated metadata are still evicted. This compatibility policy
+can leave legacy payload bytes on disk; it does not affect reclamation of newly
+captured media under the reference-owned layout.
 
 ## Owned view and tool helpers
 

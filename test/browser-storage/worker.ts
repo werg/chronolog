@@ -43,6 +43,10 @@ async function exercise(store: BytesStore): Promise<void> {
   const third = store.get('ordering')
   await Promise.all([first, second])
   check((await third)?.[0] === 2, 'queued read after both puts')
+  check(store.delete !== undefined, 'local eviction is available')
+  await store.put('evicted', new Uint8Array(65536))
+  await store.delete('evicted'); await store.delete('evicted')
+  check(await store.get('evicted') === null, 'local eviction removes exactly its key')
   await fails(store.put('', Uint8Array.of(1)), 'OPFS_KEY_INVALID')
   await fails(store.get('x'.repeat(4097)), 'OPFS_KEY_INVALID')
 }
@@ -84,6 +88,7 @@ async function idbConformance(name: string): Promise<void> {
   await fails(store.put('after-close', Uint8Array.of(1)), 'INDEXEDDB_STORE_CLOSED')
   store = await IndexedDbBytesStore.open(name)
   check((await store.get('ordering'))?.[0] === 2, 'IDB persisted order')
+  check(await store.get('evicted') === null, 'IDB deletion survives reopen')
   await store.close()
 
   // Inject wrong-key envelopes in the real IDB object store, not a fake decoder.
@@ -113,6 +118,7 @@ async function opfsConformance(name: string): Promise<void> {
   await store.close()
   store = new OpfsBytesStore(directory)
   check((await store.get('ordering'))?.[0] === 2, 'OPFS persisted order')
+  check(await store.get('evicted') === null, 'OPFS deletion survives reopen')
   await store.close()
   await root.removeEntry('test-records-' + name, { recursive: true })
 }

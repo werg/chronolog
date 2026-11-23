@@ -11,6 +11,8 @@ export interface BytesStoreEntry {
 export interface BytesStore {
   get(key: string): Promise<Uint8Array | null>
   put(key: string, bytes: Uint8Array): Promise<void>
+  /** Optional durable, idempotent local eviction. Owners must fence concurrent writers. */
+  delete?(key: string): Promise<void>
   /** Optional bounded-key batch, preserving input order. */
   getMany?(keys: readonly string[]): Promise<readonly (Uint8Array | null)[]>
   /** Optional deterministic snapshot enumeration for atomic encrypted device checkpoints. */
@@ -42,6 +44,10 @@ export class MemoryBytesStore implements BytesStore {
     const used = this.#usedBytes - (this.#values.get(key)?.byteLength ?? 0) + bytes.byteLength
     if (used > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
     this.#values.set(key, Uint8Array.from(bytes)); this.#usedBytes = used
+  }
+  async delete(key: string): Promise<void> {
+    this.#usedBytes -= this.#values.get(key)?.byteLength ?? 0
+    this.#values.delete(key)
   }
   async putAllIfEmpty(entries: readonly BytesStoreEntry[]): Promise<boolean> {
     const captured = entries.map(entry => ({ key: entry.key, value: Uint8Array.from(entry.value) }))

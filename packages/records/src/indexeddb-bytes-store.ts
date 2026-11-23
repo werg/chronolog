@@ -88,6 +88,11 @@ export class IndexedDbBytesStore implements BytesStore {
     })
   }
 
+  async delete(key: string): Promise<void> {
+    assertRecordKey(key)
+    return this.#enqueue(() => this.#transaction('readwrite', table => { table.delete(key); return () => undefined }))
+  }
+
   async putAllIfEmpty(entries: readonly { readonly key: string; readonly value: Uint8Array }[]): Promise<boolean> {
     const captured = entries.map(entry => ({ key: entry.key, value: entry.value.slice() }))
     const seen = new Set<string>()

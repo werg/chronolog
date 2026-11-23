@@ -35,6 +35,7 @@ const get = db.prepare('SELECT value FROM stored_bytes WHERE key = ?')
 const size = db.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?')
 const put = db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
 const insert = db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?)')
+const remove = db.prepare('DELETE FROM stored_bytes WHERE key = ?')
 const count = db.prepare('SELECT count(*) AS count FROM stored_bytes')
 const page = db.prepare('SELECT key,value FROM stored_bytes WHERE key > ? ORDER BY key')
 reply(0)
@@ -50,6 +51,10 @@ parentPort.on('message', ({ id, method, args }) => {
       const next = used - (size.get(args.key)?.bytes ?? 0) + args.value.length
       if (next > quota) error('BYTES_STORE_QUOTA_EXCEEDED')
       put.run(args.key, args.value); used = next
+    } else if (method === 'delete') {
+      validate(args.key)
+      const prior = size.get(args.key)?.bytes ?? 0
+      remove.run(args.key); used -= prior
     } else if (method === 'page') {
       value = []; let bytes = 0
       for (const row of page.iterate(args.after)) {

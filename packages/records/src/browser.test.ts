@@ -6,6 +6,7 @@ function directory() {
   const values = new Map<string, Uint8Array>()
   let failClose = false
   const handles: OpfsDirectory = {
+    async removeEntry(name) { if (!values.delete(name)) throw new DOMException('absent', 'NotFoundError') },
     async getFileHandle(name, options) {
       if (!values.has(name)) {
         if (!options?.create) throw new DOMException('absent', 'NotFoundError')
@@ -31,6 +32,19 @@ function directory() {
 }
 
 describe('OPFS atomic bytes', () => {
+  it('durably deletes only the selected value and remains idempotent across reopen', async () => {
+    const { handles, values } = directory(), store = new OpfsBytesStore(handles)
+    await store.put('media/transient', new Uint8Array(65536))
+    await store.put('application/keep', Uint8Array.of(7))
+    await store.delete('media/transient'); await store.delete('media/transient')
+    expect(values.size).toBe(1)
+    await store.close()
+    const reopened = new OpfsBytesStore(handles)
+    expect(await reopened.get('media/transient')).toBeNull()
+    expect(await reopened.get('application/keep')).toEqual(Uint8Array.of(7))
+    await reopened.close()
+  })
+
   it('reopens exact committed values and makes private namespaces independent', async () => {
     const { handles } = directory()
     let store = new OpfsBytesStore(handles)
