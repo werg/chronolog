@@ -1,7 +1,7 @@
 import type { BytesStore } from '@chronolog/records'
 import { DOMAINS } from '@chronolog/protocol'
 import {
-  boundedText, check, isArray, decodePeerValue, encodePeerValue, hex, object, peerDigest,
+  boundedText, bytesToHex, check, isArray, decodePeerValue, encodePeerValue, hex, object, peerDigest,
   samePeerValue, Serial, signPeerValue, uint, verifyPeerValue,
 } from './codec.js'
 import {
@@ -116,14 +116,27 @@ interface SelectedSegment { readonly generation: SignedGeneration; readonly cuto
 /** Constructed only after checking the signed descriptor, control chain and every selection. */
 export class PeerAuthority {
   readonly #bundle: Omit<AuthorityBundle, 'controls' | 'generations'> & { controls: SignedControlRevision[]; generations: SignedGeneration[] }
-  // Only verify() constructs authorities, from its private cloned input.
+  readonly #byId = new Map<string, SignedGeneration>()
+  readonly #transitions = new Map<string, SignedGeneration>()
+  readonly #depth = new Map<string, number>()
+  readonly #ancestors = new Map<string, readonly string[]>()
+  // Construction uses cloned wire data or an already verified private prefix.
   private constructor(bundle: AuthorityBundle) { this.#bundle = { ...bundle, controls: [...bundle.controls], generations: [...bundle.generations] } }
+  get signedDescriptor(): SignedApplicationDescriptor { return structuredClone(this.#bundle.descriptor) }
+  get generationCount(): number { return this.#bundle.generations.length }
+  get controlCount(): number { return this.#bundle.controls.length }
+  generationAt(index: number): SignedGeneration | null { return structuredClone(this.#bundle.generations[index] ?? null) }
+  suffix(controls: number, generations: number): Pick<AuthorityBundle, 'controls' | 'generations'> {
+    uint(controls, this.controlCount); uint(generations, this.generationCount)
+    return { controls: structuredClone(this.#bundle.controls.slice(controls)), generations: structuredClone(this.#bundle.generations.slice(generations)) }
+  }
+  transition(id: string): SignedGeneration | null { return structuredClone(this.#transitions.get(id) ?? null) }
   get bundle(): AuthorityBundle { return structuredClone(this.#bundle) }
   get descriptor(): ApplicationDescriptor { return structuredClone(this.#bundle.descriptor.payload) }
   get current(): SignedGeneration | null { return structuredClone(this.#bundle.generations.at(-1) ?? null) }
   get control(): SignedControlRevision { return structuredClone(this.#bundle.controls.at(-1)!) }
   generation(id: string): SignedGeneration {
-    const value = this.#bundle.generations.find(generation => generation.id === id)
+    const value = this.#byId.get(id)
     check(value !== undefined, 'PEER_GENERATION_UNKNOWN'); return structuredClone(value)
   }
   controlAt(revision: number): SignedControlRevision {
@@ -132,29 +145,59 @@ export class PeerAuthority {
   grant(publicKey: string, revision = this.control.payload.revision): PeerGrant | null {
     return structuredClone(this.controlAt(revision).payload.grants.find(grant => grant.publicKey === publicKey) ?? null)
   }
+  #append(generation: SignedGeneration): void {
+    const parent = generation.payload.adopted?.generation
+    const ancestors: string[] = parent === undefined ? [] : [parent]
+    for (let level = 1; ancestors[level - 1] !== undefined; level++) {
+      const ancestor = this.#ancestors.get(ancestors[level - 1]!)?.[level - 1]
+      if (ancestor === undefined) break
+      ancestors.push(ancestor)
+    }
+    this.#transitions.set(generation.payload.transition.payload.transitionId, generation)
+    this.#byId.set(generation.id, generation)
+    this.#depth.set(generation.id, parent === undefined ? 0 : this.#depth.get(parent)! + 1)
+    this.#ancestors.set(generation.id, ancestors)
+    this.#bundle.generations.push(generation)
+  }
+  #lift(id: string, distance: number): string | undefined {
+    let current: string | undefined = id
+    for (let level = 0; distance > 0 && current !== undefined; level++, distance = Math.floor(distance / 2)) {
+      if (distance % 2 === 1) current = this.#ancestors.get(current)?.[level]
+    }
+    return current
+  }
+  #segment(id: string): SelectedSegment | undefined {
+    const current = this.#bundle.generations.at(-1), generation = this.#byId.get(id)
+    if (current === undefined || generation === undefined) return undefined
+    if (id === current.id) return { generation, cutoff: null }
+    const distance = this.#depth.get(current.id)! - this.#depth.get(id)!
+    if (distance < 1) return undefined
+    const child = this.#lift(current.id, distance - 1)
+    const cutoff = child === undefined ? undefined : this.#byId.get(child)!.payload.adopted
+    return cutoff?.generation === id ? { generation, cutoff } : undefined
+  }
   selectedSegments(): readonly SelectedSegment[] {
-    const current = this.current
-    if (current === null) return []
+    const current = this.#bundle.generations.at(-1)
+    if (current === undefined) return []
     const reversed: SelectedSegment[] = [{ generation: current, cutoff: null }]
     let adopted = current.payload.adopted
     while (adopted !== null) {
-      const generation = this.generation(adopted.generation)
+      const generation = this.#byId.get(adopted.generation)!
       reversed.push({ generation, cutoff: adopted }); adopted = generation.payload.adopted
-      check(reversed.length <= this.#bundle.generations.length, 'PEER_ANCESTRY_CYCLE')
     }
-    return reversed.reverse()
+    return structuredClone(reversed.reverse())
   }
   /** Structural inclusion; a complete replica additionally checks the local retained root. */
   contains(point: HistoryPoint): boolean {
     validateHistoryPoint(point)
-    const segment = this.selectedSegments().find(value => value.generation.id === point.generation)
+    const segment = this.#segment(point.generation)
     return segment !== undefined && (segment.cutoff === null || point.sequence <= segment.cutoff.sequence &&
       (point.sequence !== segment.cutoff.sequence || point.root === segment.cutoff.root))
   }
   async verifyPrefix(proof: PrefixProof): Promise<void> {
     object(proof, ['point', 'receipt', 'bridge']); validateHistoryPoint(proof.point)
     check(isArray(proof.bridge) && proof.bridge.length <= 4096, 'PEER_PREFIX_PROOF_TOO_LARGE')
-    const segment = this.selectedSegments().find(value => value.generation.id === proof.point.generation)
+    const segment = this.#segment(proof.point.generation)
     check(segment !== undefined && this.contains(proof.point), 'PEER_PREFIX_EXCLUDED')
     const { point } = proof
     if (point.sequence === 0) {
@@ -175,10 +218,9 @@ export class PeerAuthority {
   }
   /** Compare points on the selected history after their roots have been authenticated. */
   atOrAfter(point: HistoryPoint, floor: HistoryPoint): boolean {
-    const segments = this.selectedSegments()
-    const left = segments.findIndex(value => value.generation.id === point.generation)
-    const right = segments.findIndex(value => value.generation.id === floor.generation)
-    return left >= 0 && right >= 0 && (left > right || left === right && point.sequence >= floor.sequence)
+    const left = this.#segment(point.generation), right = this.#segment(floor.generation)
+    return left !== undefined && right !== undefined && (left.generation.payload.number > right.generation.payload.number ||
+      point.generation === floor.generation && point.sequence >= floor.sequence)
   }
   async authorizeTransition(request: SignedTransitionRequest, nextControl = this.control): Promise<void> {
     validateRequest(request.payload); scope(request.payload, this.descriptor)
@@ -210,6 +252,37 @@ export class PeerAuthority {
       // claim protection for a root whose relation to that base was never checked.
       if (floor !== null && !samePeerValue(floor, previousFloor)) check(samePeerValue(floor, value.base.point), 'PEER_NEW_FLOOR_MUST_MATCH_BASE')
     }
+  }
+  /** Verify only new signed suffix records, preserving the verified prefix by reference. */
+  async extend(inputControls: readonly SignedControlRevision[], inputGenerations: readonly SignedGeneration[]): Promise<PeerAuthority> {
+    if (inputControls.length === 0 && inputGenerations.length === 0) return this
+    const controls = structuredClone(inputControls), generations = structuredClone(inputGenerations)
+    check(this.controlCount + controls.length <= 4096 && this.generationCount + generations.length <= 4096, 'PEER_AUTHORITY_LIMIT')
+    const next = new PeerAuthority(this.#bundle)
+    for (const [id, value] of this.#byId) next.#byId.set(id, value)
+    for (const [id, value] of this.#depth) next.#depth.set(id, value)
+    for (const [id, value] of this.#ancestors) next.#ancestors.set(id, value)
+    for (const [id, value] of this.#transitions) next.#transitions.set(id, value)
+    const allControls = [...this.#bundle.controls, ...controls], descriptor = this.descriptor
+    for (let index = this.controlCount; index < allControls.length; index++) await verifyNextControl(descriptor, allControls[index - 1]!, allControls[index]!)
+    for (const generation of generations) {
+      object(generation, ['payload', 'signature', 'id']); hex(generation.id); validateGeneration(generation.payload)
+      const value = generation.payload; scope(value, descriptor)
+      await verifyPeerValue(DOMAINS.peerGeneration, { payload: value, signature: generation.signature }, descriptor.controlPublicKey)
+      check(generation.id === await peerDigest(['chronolog/peer-generation/generation/v1', value]), 'PEER_GENERATION_ID_INVALID')
+      check(value.number === next.generationCount && value.previous === (next.current?.id ?? null), 'PEER_GENERATION_CHAIN_INVALID')
+      const control = allControls[value.controlRevision]
+      check(control !== undefined && value.controlDigest === await peerDigest(control), 'PEER_CONTROL_DIGEST_MISMATCH')
+      check(value.controlRevision === next.controlCount - 1 || value.controlRevision === next.controlCount, 'PEER_CONTROL_CHAIN_INVALID')
+      await next.authorizeTransition(value.transition, control)
+      check(value.coordinator === value.transition.payload.coordinator && samePeerValue(value.adopted, value.transition.payload.base?.point ?? null) &&
+        samePeerValue(value.recoveryFloor, control.payload.recoveryFloor) && value.executionManifestDigest === descriptor.executionManifestDigest, 'PEER_DELEGATION_MISMATCH')
+      check(!next.#transitions.has(value.transition.payload.transitionId), 'PEER_TRANSITION_DUPLICATE')
+      if (value.controlRevision === next.controlCount) next.#bundle.controls.push(control)
+      next.#append(generation)
+    }
+    check(next.controlCount === allControls.length, 'PEER_CONTROL_NOT_ACTIVATED')
+    return next
   }
   static async verify(input: AuthorityBundle, pinned?: SignedApplicationDescriptor): Promise<PeerAuthority> {
     const bundle = structuredClone(input)
@@ -245,7 +318,7 @@ export class PeerAuthority {
         value.executionManifestDigest === descriptor.executionManifestDigest, 'PEER_DELEGATION_MISMATCH')
       check(!transitions.has(value.transition.payload.transitionId), 'PEER_TRANSITION_DUPLICATE'); transitions.add(value.transition.payload.transitionId)
       if (value.controlRevision >= verified.#bundle.controls.length) verified.#bundle.controls.push(control)
-      verified.#bundle.generations.push(generation)
+      verified.#append(generation)
     }
     check(verified.control.payload.revision === bundle.controls.length - 1, 'PEER_CONTROL_NOT_ACTIVATED')
     return verified
@@ -277,7 +350,12 @@ function registryLock(store: BytesStore, key: string): Serial {
   if (lock === undefined) { lock = new Serial(); keys.set(key, lock) }
   return lock
 }
-/** The host owns an exclusive durable store; no command body is accepted by this service. */
+interface RegistryHead { readonly format: 'chronolog-authority-log-v1'; readonly length: number }
+interface RegistryEntry { readonly generation: SignedGeneration; readonly control: SignedControlRevision | null }
+interface RegistryCache { readonly head: string; readonly authority: PeerAuthority }
+const registryCaches = new WeakMap<BytesStore, Map<string, RegistryCache>>()
+
+/** Append signed records before atomically publishing a small head. Legacy bundles migrate on selection. */
 export async function createGenerationRegistry(options: {
   readonly store: BytesStore
   readonly descriptor: SignedApplicationDescriptor
@@ -285,55 +363,80 @@ export async function createGenerationRegistry(options: {
   readonly signer: PeerIdentity
   readonly requireExisting?: boolean
 }): Promise<GenerationRegistry> {
-  const key = `peer-generation/registry/${options.descriptor.payload.applicationId}`
-  const lock = registryLock(options.store, key)
+  const key = `peer-generation/registry/${options.descriptor.payload.applicationId}`, lock = registryLock(options.store, key)
+  let caches = registryCaches.get(options.store)
+  if (caches === undefined) { caches = new Map(); registryCaches.set(options.store, caches) }
+  const cache = caches
   check(options.signer.publicKey === options.descriptor.payload.controlPublicKey, 'PEER_CONTROL_KEY_MISMATCH')
-  const read = async (): Promise<AuthorityBundle> => {
+  const read = async (): Promise<PeerAuthority> => {
     const bytes = await options.store.get(key); check(bytes !== null, 'PEER_CONTROL_STATE_MISSING')
-    const bundle = decodePeerValue<AuthorityBundle>(bytes)
-    await verifyAuthorityBundle(bundle, options.descriptor); return bundle
+    const head = bytesToHex(bytes), retained = cache.get(key)
+    if (retained?.head === head) { check(samePeerValue(retained.authority.signedDescriptor, options.descriptor), 'PEER_DESCRIPTOR_CHANGED'); return retained.authority }
+    const decoded = decodePeerValue<AuthorityBundle | RegistryHead>(bytes)
+    let bundle: AuthorityBundle
+    if ('format' in decoded) {
+      object(decoded, ['format', 'length'])
+      check(decoded.format === 'chronolog-authority-log-v1', 'PEER_CONTROL_STATE_INVALID'); uint(decoded.length, 4096)
+      const base = await options.store.get(`${key}/base`); check(base !== null, 'PEER_CONTROL_STATE_MISSING')
+      bundle = decodePeerValue<AuthorityBundle>(base)
+      check(bundle.generations.length <= decoded.length, 'PEER_CONTROL_STATE_INVALID')
+      const controls = [...bundle.controls], generations = [...bundle.generations]
+      for (let index = generations.length; index < decoded.length; index++) {
+        const raw = await options.store.get(`${key}/log/${index}`); check(raw !== null, 'PEER_CONTROL_STATE_MISSING')
+        const entry = decodePeerValue<RegistryEntry>(raw); object(entry, ['generation', 'control'])
+        generations.push(entry.generation)
+        if (entry.control !== null) controls.push(entry.control)
+      }
+      bundle = { descriptor: bundle.descriptor, controls, generations }
+    } else bundle = decoded
+    const authority = await verifyAuthorityBundle(bundle, options.descriptor)
+    cache.set(key, { head, authority })
+    return authority
   }
   await lock.run(async () => {
     if (await options.store.get(key) === null) {
       check(options.requireExisting !== true, 'PEER_CONTROL_STATE_MISSING')
       const initial = { descriptor: options.descriptor, controls: options.controls, generations: [] }
       await verifyAuthorityBundle(initial)
-      await options.store.put(key, encodePeerValue(initial))
+      await options.store.put(`${key}/base`, encodePeerValue(initial))
+      await options.store.put(key, encodePeerValue({ format: 'chronolog-authority-log-v1', length: 0 } satisfies RegistryHead))
     }
     await read()
   })
   return {
-    read: () => lock.run(read),
+    read: () => lock.run(async () => (await read()).bundle),
     async select(input, inputOptions = {}) {
       const request = structuredClone(input), next = structuredClone(inputOptions.control)
       return lock.run(async () => {
-        const bundle = await read(), authority = await verifyAuthorityBundle(bundle)
+        const authority = await read()
         validateRequest(request.payload)
         await verifyPeerValue(DOMAINS.peerTransition, request, request.payload.requester)
-        const retry = bundle.generations.find(value => value.payload.transition.payload.transitionId === request.payload.transitionId)
-        if (retry !== undefined) {
+        const retry = authority.transition(request.payload.transitionId)
+        if (retry !== null) {
           check(samePeerValue(retry.payload.transition, request), 'PEER_TRANSITION_ID_REUSED')
-          if (next !== undefined) check(samePeerValue(bundle.controls[retry.payload.controlRevision], next), 'PEER_TRANSITION_ID_REUSED')
+          if (next !== undefined) check(samePeerValue(authority.controlAt(retry.payload.controlRevision), next), 'PEER_TRANSITION_ID_REUSED')
           return retry
         }
         const control = next ?? authority.control
         await authority.authorizeTransition(request, control)
         const payload: GenerationRecord = {
           applicationId: authority.descriptor.applicationId, profile: PEER_GENERATION_PROFILE, policy: PEER_GENERATION_POLICY,
-          number: bundle.generations.length, previous: authority.current?.id ?? null,
+          number: authority.generationCount, previous: authority.current?.id ?? null,
           coordinator: request.payload.coordinator, controlRevision: control.payload.revision,
           controlDigest: await peerDigest(control), adopted: request.payload.base?.point ?? null,
-          recoveryFloor: control.payload.recoveryFloor, executionManifestDigest: authority.descriptor.executionManifestDigest,
-          transition: request,
+          recoveryFloor: control.payload.recoveryFloor, executionManifestDigest: authority.descriptor.executionManifestDigest, transition: request,
         }
         const signed = await signPeerValue(DOMAINS.peerGeneration, payload, options.signer)
         const generation = { ...signed, id: await peerDigest(['chronolog/peer-generation/generation/v1', payload]) }
-        const updated = { descriptor: bundle.descriptor,
-          controls: next === undefined ? bundle.controls : [...bundle.controls, next], generations: [...bundle.generations, generation] }
-        await verifyAuthorityBundle(updated, options.descriptor)
-        // This atomic pointer publishes controls and generation together. A lost
-        // acknowledgment is resolved by rereading this exact transition identity.
-        await options.store.put(key, encodePeerValue(updated))
+        const updated = await authority.extend(next === undefined ? [] : [next], [generation])
+        const currentBytes = await options.store.get(key); check(currentBytes !== null, 'PEER_CONTROL_STATE_MISSING')
+        if (!('format' in decodePeerValue<AuthorityBundle | RegistryHead>(currentBytes))) {
+          await options.store.put(`${key}/base`, encodePeerValue(authority.bundle))
+        }
+        await options.store.put(`${key}/log/${generation.payload.number}`, encodePeerValue({ generation, control: next ?? null } satisfies RegistryEntry))
+        const head = encodePeerValue({ format: 'chronolog-authority-log-v1', length: updated.generationCount } satisfies RegistryHead)
+        await options.store.put(key, head)
+        cache.set(key, { head: bytesToHex(head), authority: updated })
         return structuredClone(generation)
       })
     },

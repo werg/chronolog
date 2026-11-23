@@ -31,7 +31,7 @@ const entries = Object.fromEntries(['index', 'native', 'browser', 'worker', 'web
 const bundled = await build({ entryPoints: entries, outdir: packageRoot, write: false, bundle: true,
   // Shared chunks preserve class identity and session ownership across all entrypoints.
   splitting: true, platform: 'neutral', conditions: ['import', 'default'], mainFields: ['module', 'main'],
-  format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root, external: ['node:*', 'werift'],
+  format: 'esm', target: 'es2022', metafile: true, absWorkingDir: root, external: ['node:*', 'werift', 'fs-native-extensions'],
   plugins: values['sql-native'] ? [{ name: 'pinned-native-engine', setup(plugin) {
     plugin.onResolve({ filter: /^@dolthub\/doltlite$/ }, () => ({ path: engineImport, external: true }));
   } }] : [],
@@ -40,7 +40,7 @@ const runtimeInputs = Object.keys(bundled.metafile.inputs).sort();
 assert(runtimeInputs.every(path => sqlEnabled || !path.includes('materializer-doltlite/')),
   'The default session artifact must not contain SQL engine code');
 assert(Object.values(bundled.metafile.outputs).flatMap(value => value.imports).every(value => !value.external || value.path.startsWith('node:') ||
-  value.path === 'werift' || values['sql-native'] && value.path === engineImport),
+  value.path === 'werift' || values['sql-wasm'] && value.path === 'fs-native-extensions' || values['sql-native'] && value.path === engineImport),
   'The session artifact may import only its declared native runtime dependencies');
 // The common SQL path and browser adapter must stay independently browser-loadable,
 // even when the same archive also contains the optional native engine.
@@ -136,7 +136,7 @@ files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', vers
   exports: Object.fromEntries(Object.keys(entries).map(name => [name === 'index' ? '.' : `./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
   files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json',
     ...(values['sql-native'] ? ['engine'] : []), ...(wasmEngine ? ['wasm'] : [])],
-  ...(nativeRtc ? { dependencies: { werift: '0.27.0' } } : {}), engines: { node: '>=22.15' },
+  dependencies: { 'better-sqlite3': '13.2.0', ...(nativeRtc ? { werift: '0.27.0' } : {}), ...(values['sql-wasm'] ? { 'fs-native-extensions': '1.5.4' } : {}) }, engines: { node: '>=22.15' },
   ...(values['sql-native'] ? { imports: { [engineImport]: './engine/index.cjs' }, os: [process.platform], cpu: [process.arch], ...(libc ? { libc: [libc] } : {}) } : {}),
 }, null, 2) + '\n');
 for (const [path, content] of files) { await mkdir(dirname(join(packageRoot, path)), { recursive: true }); await writeFile(join(packageRoot, path), content); }

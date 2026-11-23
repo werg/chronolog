@@ -10,6 +10,7 @@
     "./indexeddb-browser": "./src/indexeddb-bytes-store.ts"
   },
   "dependencies": {
-    "@chronolog/canonical": "workspace:*"
+    "@chronolog/canonical": "workspace:*",
+    "better-sqlite3": "13.2.0"
   }
 }

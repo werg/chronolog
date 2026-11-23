@@ -58,6 +58,27 @@ async function idbConformance(name: string): Promise<void> {
   check(entries[2]?.value.length === 128 * 1024 + 13 && entries[3]?.value[0] === 2, 'large and replaced IDB snapshot values')
   entries[0].value[0] = 99
   check((await store.get('data'))?.[0] === 1, 'IDB snapshot does not alias storage')
+  const batch = await store.getMany(['missing', 'ordering', 'empty', 'data'])
+  check(batch[0] === null && batch[1]?.[0] === 2 && batch[2]?.length === 0 && batch[3]?.[0] === 1, 'ordered IDB batch with absent and empty values')
+  for (let index = 0; index < 150; index++) await store.put(`page/${index.toString().padStart(3, '0')}`, new Uint8Array(128).fill(index))
+  let seen = 0
+  for await (const entry of store.iterateEntries()) { check(entry.value instanceof Uint8Array, 'streamed IDB value'); seen++ }
+  check(seen === 155, 'IDB enumeration crosses bounded pages')
+  const iterator = store.iterateEntries()[Symbol.asyncIterator]()
+  await iterator.next()
+  let written = false
+  const writing = store.put('after-snapshot', Uint8Array.of(7)).then(() => { written = true })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  check(!written, 'IDB enumeration owns the mutation queue')
+  await iterator.return?.(); await writing
+  const target = await IndexedDbBytesStore.open(name + '-stream-restore')
+  try {
+    await fails(target.putStreamIfEmpty((async function* () { yield { key: 'identity', value: Uint8Array.of(1) }; throw Error('restore-interrupted') })()), 'restore-interrupted')
+    check((await target.entries()).length === 0, 'interrupted IDB import publishes no identity')
+    check(await target.putStreamIfEmpty(store.iterateEntries()), 'IDB streamed atomic restore')
+    check((await target.entries()).length === 156, 'IDB staged restore publishes all pages')
+    check(!await target.putStreamIfEmpty((async function* () { throw Error('must not consume input') })()), 'IDB restore refuses existing identity')
+  } finally { await target.close() }
   const closing = store.close()
   await closing
   await fails(store.put('after-close', Uint8Array.of(1)), 'INDEXEDDB_STORE_CLOSED')
@@ -67,7 +88,7 @@ async function idbConformance(name: string): Promise<void> {
 
   // Inject wrong-key envelopes in the real IDB object store, not a fake decoder.
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open('chronolog-data:' + name, 1)
+    const request = indexedDB.open('chronolog-data:' + name, 2)
     request.onsuccess = () => { resolve(request.result) }
     request.onerror = () => { reject(request.error) }
   })

@@ -1,5 +1,5 @@
 import { nodeVfsFileIdentity, nodeVfsFullPath } from './node-vfs-path.js'
-import { DatabaseSync } from 'node:sqlite'
+import { tryLock, unlock } from 'fs-native-extensions'
 import {
   closeSync,
   constants as fsConstants,
@@ -150,7 +150,7 @@ interface OpenNodeFile {
   lock: number
 }
 
-interface FileOwner { readonly key: string; readonly lease: DatabaseSync; readonly users: Set<OpenNodeFile> }
+interface FileOwner { readonly key: string; readonly lease: number; readonly users: Set<OpenNodeFile> }
 
 function vfsDiagnostic(operation: string, stage: string, raw: string | undefined, error?: unknown): void {
   if (process.env.CHRONOLOG_NODE_VFS_DIAGNOSTICS !== '1') return
@@ -204,17 +204,22 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
     const key = nodeVfsFileIdentity(path, fstatSync(fd, { bigint: true }))
     let group = owners.get(key)
     if (group !== undefined) return group
-    const lease = new DatabaseSync(path + '.chronolog-owner.sqlite')
+    // A lock on the database inode survives path aliases and needs no sidecar.
+    // Reserve a byte far beyond SQLite's addressable pages so Windows mandatory
+    // byte-range locks do not interfere with database reads/writes.
+    if (existsSync(path + '.chronolog-owner.sqlite')) throw new Error('SQLITE_LEGACY_OWNER_MIGRATION_REQUIRED: stop older runtimes and remove their obsolete owner sidecar before opening this database')
+    const lease = openSync(path, 'r+')
     try {
-      lease.exec('PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS ownership (id INTEGER); COMMIT')
-    } catch (error) { lease.close(); throw error }
+      if (nodeVfsFileIdentity(path, fstatSync(lease, { bigint: true })) !== key) throw new Error('SQLITE_BUSY: file identity changed during owner acquisition')
+      if (!tryLock(lease, 2 ** 52, 1)) throw new Error('SQLITE_BUSY: database already owned')
+    } catch (error) { closeSync(lease); throw error }
     group = { key, lease, users: new Set() }; owners.set(key, group)
     return group
   }
   function release(entry: OpenNodeFile) {
     if (entry.owner === undefined) return
     entry.owner.users.delete(entry)
-    if (entry.owner.users.size === 0) { entry.owner.lease.close(); owners.delete(entry.owner.key) }
+    if (entry.owner.users.size === 0) { unlock(entry.owner.lease, 2 ** 52, 1); closeSync(entry.owner.lease); owners.delete(entry.owner.key) }
   }
   const vfsStruct = new capi.sqlite3_vfs()
   const ioStruct = new capi.sqlite3_io_methods()
@@ -521,6 +526,8 @@ export function createNodeWasmSqlEngine(options: {
         throw new Error('MATERIALIZER_PERSISTENT_PATH_REQUIRED')
       }
       const hostPath = resolve(openOptions.path)
+      const existingPath = existsSync(hostPath) ? realpathSync(hostPath) : hostPath
+      if (existsSync(existingPath + '.chronolog-owner.sqlite')) throw unavailable('Legacy WASM owner sidecar found. Stop older runtimes before removing the obsolete owner SQLite file and its WAL/SHM companions.')
       mkdirSync(dirname(hostPath), { recursive: true })
       const opened = base.openDatabase({ ...openOptions, path: nodeVfsFullPath(hostPath) })
       try {

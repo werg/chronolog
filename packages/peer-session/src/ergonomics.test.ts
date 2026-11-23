@@ -160,7 +160,7 @@ describe('ergonomics, batch submission, checkpoints, and disposable storage', ()
       // Non-empty target refuses accidental overwrite
       await expect(restoreDeviceCheckpoint(targetStore, exported.bytes, { secret: rawKey }))
         .rejects.toMatchObject({ code: 'CHECKPOINT_TARGET_NOT_EMPTY' })
-      targetStore.close()
+      await targetStore.close()
 
       // Reopening restored NativeBytesStore as an ApplicationDevice preserves identity verbatim
       const reopened = await openNativeDevice({ path: targetPath })

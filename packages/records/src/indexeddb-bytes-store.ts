@@ -1,8 +1,9 @@
-import type { BytesStore } from './bytes-store.js'
+import type { BytesStore, BytesStoreEntry } from './bytes-store.js'
 import { assertRecordKey, decodeRecordValue, encodeRecordValue, MAX_RECORD_ENVELOPE_BYTES, MAX_RECORD_VALUE_BYTES } from './record-envelope.js'
 
 const TABLE = 'values'
-const VERSION = 1
+const STAGING = 'checkpoint-staging'
+const VERSION = 2
 
 /** Transaction-complete, per-key atomic durable records; no signer or protocol state lives here. */
 export class IndexedDbBytesStore implements BytesStore {
@@ -25,14 +26,15 @@ export class IndexedDbBytesStore implements BytesStore {
     return new Promise((resolve, reject) => {
       let blocked = false, missing = false
       const request = indexedDB.open('chronolog-data:' + name, VERSION)
-      request.onupgradeneeded = () => {
+      request.onupgradeneeded = event => {
         if (blocked) { request.transaction?.abort(); return }
-        if (!create) {
+        if (!create && event.oldVersion === 0) {
           missing = true
           request.transaction?.abort()
           return
         }
-        request.result.createObjectStore(TABLE)
+        if (!request.result.objectStoreNames.contains(TABLE)) request.result.createObjectStore(TABLE)
+        if (!request.result.objectStoreNames.contains(STAGING)) request.result.createObjectStore(STAGING)
       }
       request.onerror = () => {
         reject(missing ? new Error('APPLICATION_DATA_STORAGE_MISSING') : request.error ?? new Error('INDEXEDDB_STORE_OPEN_FAILED'))
@@ -55,6 +57,23 @@ export class IndexedDbBytesStore implements BytesStore {
       if (raw === undefined) return null
       if (!(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) throw new Error('INDEXEDDB_VALUE_CORRUPT')
       return decodeRecordValue(key, raw, 'INDEXEDDB_VALUE_CORRUPT')
+    })
+  }
+
+  getMany(keys: readonly string[]): Promise<readonly (Uint8Array | null)[]> {
+    const captured = [...keys]
+    if (captured.length > 128) return Promise.reject(new Error('BYTES_STORE_BATCH_LIMIT'))
+    for (const key of captured) assertRecordKey(key)
+    return this.#enqueue(async () => {
+      const raw = await this.#transaction('readonly', table => {
+        const requests = captured.map(key => table.get(key))
+        return () => requests.map(request => request.result as unknown)
+      })
+      return Promise.all(raw.map(async (value, index) => {
+        if (value === undefined) return null
+        if (!(value instanceof Uint8Array) || value.length > MAX_RECORD_ENVELOPE_BYTES) throw new Error('INDEXEDDB_VALUE_CORRUPT')
+        return decodeRecordValue(captured[index]!, value, 'INDEXEDDB_VALUE_CORRUPT')
+      }))
     })
   }
 
@@ -93,30 +112,78 @@ export class IndexedDbBytesStore implements BytesStore {
       })
     })
   }
-  async entries(): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
-    return this.#enqueue(async () => {
-      // Capture one transaction snapshot without separate key/value arrays.
-      // Decode in place afterwards so consumed envelopes can be collected,
-      // rather than retaining a second full copy beside all decoded values.
-      const items = await this.#transaction('readonly', table => {
-        const entries: { key: string; value: Uint8Array }[] = []
-        let failure: Error | undefined
-        const request = table.openCursor()
-        request.onsuccess = () => {
-          const cursor = request.result
-          if (cursor === null) return
-          const key = cursor.key, raw: unknown = cursor.value
-          if (typeof key !== 'string' || !(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) {
-            failure = new Error('INDEXEDDB_VALUE_CORRUPT')
-            return
+  async *iterateEntries(): AsyncIterable<BytesStoreEntry> {
+    // The storage contract has one mutation owner. Hold its queue across pages
+    // so neither caller backpressure nor async hashing permits an interleaved put.
+    let release!: () => void, started!: () => void
+    const held = new Promise<void>(resolve => { release = resolve }), ready = new Promise<void>(resolve => { started = resolve })
+    const owner = this.#enqueue(async () => { started(); await held })
+    await Promise.race([ready, owner])
+    try {
+      let after: string | undefined
+      for (;;) {
+        const items = await this.#transaction('readonly', table => {
+          const entries: { key: string; value: Uint8Array }[] = []
+          let failure: Error | undefined, bytes = 0
+          const request = table.openCursor(after === undefined ? undefined : IDBKeyRange.lowerBound(after, true))
+          request.onsuccess = () => {
+            const cursor = request.result
+            if (cursor === null) return
+            const key = cursor.key, raw: unknown = cursor.value
+            if (typeof key !== 'string' || !(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) {
+              failure = new Error('INDEXEDDB_VALUE_CORRUPT'); return
+            }
+            entries.push({ key, value: raw }); bytes += raw.length
+            if (entries.length < 64 && bytes < 1024 * 1024) cursor.continue()
           }
-          entries.push({ key, value: raw })
-          cursor.continue()
+          return () => { if (failure !== undefined) throw failure; return entries }
+        })
+        if (items.length === 0) break
+        for (const entry of items) {
+          after = entry.key
+          yield { key: entry.key, value: await decodeRecordValue(entry.key, entry.value, 'INDEXEDDB_VALUE_CORRUPT') }
         }
-        return () => { if (failure !== undefined) throw failure; return entries }
-      })
-      for (const entry of items) entry.value = await decodeRecordValue(entry.key, entry.value, 'INDEXEDDB_VALUE_CORRUPT')
-      return items.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+      }
+    } finally { release(); await owner }
+  }
+  async entries(): Promise<readonly BytesStoreEntry[]> {
+    const entries: BytesStoreEntry[] = []
+    for await (const entry of this.iterateEntries()) entries.push(entry)
+    return entries.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  }
+  putStreamIfEmpty(entries: AsyncIterable<BytesStoreEntry>): Promise<boolean> {
+    return this.#enqueue(async () => {
+      const empty = await this.#transaction('readonly', table => { const count = table.count(); return () => count.result === 0 })
+      if (!empty) return false
+      const clear = () => this.#transaction('readwrite', table => { table.clear(); return () => undefined }, STAGING)
+      await clear()
+      try {
+        for await (const entry of entries) {
+          assertRecordKey(entry.key)
+          const raw = await encodeRecordValue(entry.key, entry.value)
+          await this.#transaction('readwrite', table => { table.add(raw, entry.key); return () => undefined }, STAGING)
+        }
+        // Staged envelopes stay on disk until the authenticated input ends.
+        // Publish them in one IDB transaction, including the empty-store check.
+        return await new Promise<boolean>((resolve, reject) => {
+          const tx = this.#database.transaction([TABLE, STAGING], 'readwrite', { durability: 'strict' })
+          const table = tx.objectStore(TABLE), staging = tx.objectStore(STAGING)
+          let initialized = false
+          const count = table.count()
+          count.onsuccess = () => {
+            if (count.result !== 0) return
+            initialized = true
+            const cursor = staging.openCursor()
+            cursor.onsuccess = () => {
+              const entry = cursor.result
+              if (entry === null) { staging.clear(); return }
+              table.add(entry.value, entry.key); entry.continue()
+            }
+          }
+          tx.oncomplete = () => resolve(initialized)
+          tx.onabort = () => reject(tx.error ?? new Error('INDEXEDDB_RESTORE_FAILED'))
+        })
+      } finally { await clear() }
     })
   }
 
@@ -138,13 +205,13 @@ export class IndexedDbBytesStore implements BytesStore {
     return task
   }
 
-  #transaction<T>(mode: IDBTransactionMode, enqueue: (table: IDBObjectStore) => () => T): Promise<T> {
+  #transaction<T>(mode: IDBTransactionMode, enqueue: (table: IDBObjectStore) => () => T, name = TABLE): Promise<T> {
     return new Promise((resolve, reject) => {
       let transaction: IDBTransaction
-      try { transaction = this.#database.transaction(TABLE, mode, { durability: 'strict' }) }
+      try { transaction = this.#database.transaction(name, mode, { durability: 'strict' }) }
       catch (error) { reject(error); return }
       let value: () => T
-      try { value = enqueue(transaction.objectStore(TABLE)) }
+      try { value = enqueue(transaction.objectStore(name)) }
       catch (error) {
         try { transaction.abort() } catch { /* Preserve the original request failure. */ }
         reject(error); return

@@ -6,20 +6,20 @@ The findings below describe the reviewed implementation before these fixes.
 
 | Item | Status |
 | --- | --- |
-| 1.1 | Fixed for the default 256 MiB store: 65,536 entries, 256 MiB raw (including optional SQL bytes), and 384 MiB encrypted. Checkpoints remain bounded and materialized in memory; larger custom stores or SQL snapshots may still exceed these limits. |
+| 1.1 | Fixed: byte-array checkpoints use optional caller budgets instead of fixed store-size/entry caps. `exportDeviceCheckpointStream` / `restoreDeviceCheckpointStream` support large handoffs with bounded encrypted frames, sink backpressure, and optional streaming SQL. A 264 MiB handoff is covered by a regression test. |
 | 1.2 | Fixed: persist the retirement marker before fencing the source in memory. |
 | 1.3 | Fixed: mark the initial view captured only after `readView()` resolves. Recovery after capture still requires review. |
 | 1.4 | Removed abandoned-operation truncation. `unknownLoss` remains conservative: a signed handover request can adopt an older prefix, so the handover reason alone does not prove the absence of unseen work. A lossless classification needs additional protocol evidence. |
 | 1.5 | Fixed: retention checks verify local ciphertext hashes without decrypting; `retain()` signs after its verified read without a second full pass. |
 | 2.1 | Fixed: coverage waits use a direct selected receipt-root lookup. |
-| 2.2 | Removed repeated prefix slicing and bundle cloning during verification. Ancestry verification, full handshake bundles, and registry rewrites still need broader optimization. |
-| 2.3 | Removed duplicate attempt encoding. Full startup verification and redundant retained state remain; changing these requires a trusted snapshot/replay design. |
-| 2.4 | Cached the get, size, and upsert statements. Synchronous SQLite still needs a worker-backed storage design to avoid blocking the event loop. |
+| 2.2 | Fixed: indexed ancestry checks avoid repeated selected-history walks; verified suffixes reuse prior verification. Registry selections append signed records behind a small atomic head, with legacy-bundle migration and exact retry after lost acknowledgments. Peer hello/state exchanges send compact summaries and missing signed suffixes; full bundles remain available as a compatibility mode or when no common prefix is available. |
+| 2.3 | Fixed: startup prefetches bounded batches and reuses small device-keyed HMAC attestations to skip repeated origin/receipt signature verification. Original persisted bytes are still read and hashed; stale/corrupt caches fall back to full verification. Each attempt/body/core is shared across internal indexes. `verificationCache: false` forces a full audit. Reading and decoding the retained history remains linear, as required to check original storage integrity without compaction. |
+| 2.4 | Fixed: the stable `better-sqlite3` binding and prepared statements run in a dedicated worker. Acquisition, reads, writes, enumeration, WAL checkpointing and close are asynchronous. Await `NativeBytesStore.open()` and `close()`; the existing SQLite file/table format is preserved. |
 | 2.5 | Open: history compaction and snapshot truncation require protocol and recovery design. |
 | 3.1 | Fixed: new passphrase exports use PBKDF2-SHA256 with 600,000 iterations and authenticated, bounded algorithm/work-factor parameters. Legacy 100,000-iteration checkpoints remain readable. Raw-key exports retain their existing layout. |
 | 3.2 | Open: reducing the native patch requires upstream/library work. |
-| 3.3 | Open: replacing `node:sqlite` is a platform decision. The owner sidecar must retain a stable file identity for locking; unlinking on close can race another owner opening it. |
-| 3.4 | Reduced peak memory: cursor enumeration replaces `getAll()` / `getAllKeys()`, and captured envelopes are decoded in place, preserving one transaction snapshot without retaining a separate full decoded copy. Streaming export still needs a different enumeration/checkpoint API. |
+| 3.3 | Fixed: neither storage adapter imports experimental `node:sqlite`. The WASM VFS uses prebuilt OS file-lock bindings on the database inode and creates no owner sidecar. Old owner sidecars require offline removal after stopping older runtimes; opening refuses these legacy markers to prevent overlapping old/new fencing protocols. |
+| 3.4 | Fixed: `iterateEntries()` reads IndexedDB in bounded pages under the storage mutation queue; consumer backpressure and early iterator release are supported. Streamed restore stages envelopes on disk and publishes them in one transaction only after the authenticated input completes. The compatibility `entries()` array API necessarily retains its returned array; streaming checkpoint APIs bypass it. |
 
 New PBKDF2 exports use the [OWASP PBKDF2-HMAC-SHA256 work factor](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2).
 

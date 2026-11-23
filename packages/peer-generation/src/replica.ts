@@ -1,15 +1,16 @@
-import type { BytesStore } from '@chronolog/records'
+import { VerifiedReplayCache } from './verified-cache.js'
+import { readBytesMany, type BytesStore } from '@chronolog/records'
 import {
-  DOMAINS, encodeChangeProgram, encodeTransactionCore, transactionDigest,
+  DOMAINS, encodeChangeProgram, transactionDigest,
   type TransactionCore,
 } from '@chronolog/protocol'
 import type { ReplayProposal, PeerExecutionControls } from '@chronolog/materializer'
-import { createSignedAttempt, validatePeerRevision, verifyAttempt } from './attempt.js'
+import { createSignedAttempt, validatePeerRevision } from './attempt.js'
 import {
   boundedText, bytesDigest, bytesToHex, check, isArray, decodePeerValue, encodePeerValue, hex, object,
   hexToBytes, peerDigest, PeerGenerationError, samePeerValue, Serial, signPeerValue, verifyPeerValue,
 } from './codec.js'
-import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, validateHistoryPoint, verifyAuthorityBundle, verifyOrderReceipt } from './control.js'
+import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, validateHistoryPoint, verifyAuthorityBundle } from './control.js'
 import { PEER_MAX_RECORDS, PEER_MAX_HISTORY_BYTES } from './control-types.js'
 import type {
   AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, HistoryReceiveResult, OperationState, OrderedCommand,
@@ -63,11 +64,13 @@ class Replica implements PeerReplica {
   readonly #recoveryListeners = new Set<(notice: RecoveryNotice) => void>()
   readonly #recoveries: RecoveryNotice[] = []
   readonly #prefix: string
+  readonly #verified: VerifiedReplayCache
 
   constructor(options: PeerReplicaOptions, authority: PeerAuthority) {
     this.#options = options; this.#authority = authority
     this.queryCapabilities = Object.freeze({ sql: options.materializer.queries.capabilities.sql })
     this.#prefix = `peer-generation/replica/${authority.descriptor.applicationId}`
+    this.#verified = new VerifiedReplayCache(options.store, this.#prefix, options.device, options.epochKeys, options.verificationCache !== false)
   }
   get descriptor() { return this.#authority.descriptor }
   get device() { return this.#options.device }
@@ -131,12 +134,13 @@ class Replica implements PeerReplica {
     const journal = await this.#options.store.get(`${this.#prefix}/journal-head`)
     this.#journalHead = journal === null ? 0 : decodePeerValue<number>(journal)
     check(Number.isSafeInteger(this.#journalHead) && this.#journalHead >= 0 && this.#journalHead <= this.#maxRecords, 'PEER_JOURNAL_INVALID')
-    for (let index = 1; index <= this.#journalHead; index++) {
-      const bytes = await this.#options.store.get(`${this.#prefix}/journal/${index}`)
-      check(bytes !== null, 'PEER_JOURNAL_INCOMPLETE')
-      const attempt = decodePeerValue<SignedAttempt>(bytes)
-      await verifyAttempt(attempt, this.#authority, this.#options.epochKeys)
-      this.#remember(attempt)
+    for (let start = 1; start <= this.#journalHead; start += 16) {
+      const keys = Array.from({ length: Math.min(16, this.#journalHead - start + 1) }, (_, offset) => `${this.#prefix}/journal/${start + offset}`)
+      const values = await readBytesMany(this.#options.store, keys)
+      const attempts = values.map(bytes => { check(bytes !== null, 'PEER_JOURNAL_INCOMPLETE'); return decodePeerValue<SignedAttempt>(bytes) })
+      await this.#verified.prefetch(attempts)
+      await Promise.all(attempts.map(attempt => this.#verified.attempt(attempt, this.#authority)))
+      for (const attempt of attempts) this.#remember(attempt)
     }
     for (const generation of this.#authority.bundle.generations) await this.#loadGeneration(generation, this.#authority)
     const pauseBytes = await this.#options.store.get(`${this.#prefix}/ordering-pause`)
@@ -198,11 +202,14 @@ class Replica implements PeerReplica {
   #writeSelection(authority: PeerAuthority, recovery: PendingRecovery | null): Promise<void> {
     return this.#write(`${this.#prefix}/selection`, encodePeerValue({ authority: authority.bundle, recovery } satisfies StoredSelection))
   }
-  #remember(attempt: SignedAttempt): void {
+  #remember(attempt: SignedAttempt): SignedAttempt {
     const key = operationKey(attempt.payload.header.author, attempt.payload.header.operationId)
     const previous = this.#operations.get(key)
     check(previous === undefined || previous === attempt.id, 'PEER_OPERATION_ID_REUSED')
-    this.#operations.set(key, attempt.id); this.#attempts.set(attempt.id, structuredClone(attempt))
+    this.#operations.set(key, attempt.id)
+    const owned = this.#attempts.get(attempt.id) ?? attempt
+    this.#attempts.set(attempt.id, owned)
+    return owned
   }
   async #loadGeneration(generation: SignedGeneration, authority: PeerAuthority): Promise<void> {
     if (this.#heads.has(generation.id)) return
@@ -213,18 +220,23 @@ class Replica implements PeerReplica {
       Number.isSafeInteger(head.bytes) && head.bytes >= 0, 'PEER_HEAD_INVALID')
     this.#heads.set(generation.id, { sequence: 0, root: start, bytes: 0 })
     this.#records.set(generation.id, new Map())
-    for (let index = 1; index <= head.sequence; index++) {
-      const retained = await this.#options.store.get(`${this.#prefix}/record/${generation.id}/${index}`)
-      check(retained !== null, 'PEER_HISTORY_INCOMPLETE')
-      await this.#retain(decodePeerValue<OrderedCommand>(retained), authority, false)
-      const command = this.#records.get(generation.id)!.get(index)!.command
-      const resultBytes = await this.#options.store.get(`${this.#prefix}/result/${command.attempt.id}`)
-      if (resultBytes !== null) {
-        const result = decodePeerValue<AppliedResult>(resultBytes)
-        check(result.status === 'applied' && result.attemptId === command.attempt.id && result.generation === generation.id &&
-          result.sequence === index && result.operationId === command.receipt.payload.operationId &&
-          result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected'), 'PEER_RESULT_JOURNAL_INVALID')
-        this.#lastOutcomes.set(command.attempt.id, result)
+    for (let start = 1; start <= head.sequence; start += 16) {
+      const keys = Array.from({ length: Math.min(16, head.sequence - start + 1) }, (_, offset) => `${this.#prefix}/record/${generation.id}/${start + offset}`)
+      const values = await readBytesMany(this.#options.store, keys)
+      const commands = values.map(bytes => { check(bytes !== null, 'PEER_HISTORY_INCOMPLETE'); return decodePeerValue<OrderedCommand>(bytes) })
+      await this.#verified.prefetch(commands.map(command => command.attempt))
+      await Promise.all(commands.map(command => this.#verified.receipt(command.receipt, command.attempt, authority)))
+      const outcomes = await readBytesMany(this.#options.store, commands.map(command => `${this.#prefix}/result/${command.attempt.id}`))
+      for (const [offset, command] of commands.entries()) {
+        await this.#retain(command, authority, false)
+        const resultBytes = outcomes[offset]!
+        if (resultBytes !== null) {
+          const result = decodePeerValue<AppliedResult>(resultBytes)
+          check(result.status === 'applied' && result.attemptId === command.attempt.id && result.generation === generation.id &&
+            result.sequence === start + offset && result.operationId === command.receipt.payload.operationId &&
+            result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected'), 'PEER_RESULT_JOURNAL_INVALID')
+          this.#lastOutcomes.set(command.attempt.id, result)
+        }
       }
     }
     check(samePeerValue(this.#heads.get(generation.id), head), 'PEER_HEAD_ROOT_MISMATCH')
@@ -232,8 +244,8 @@ class Replica implements PeerReplica {
   }
   async #retain(command: OrderedCommand, authority: PeerAuthority, persist: boolean): Promise<void> {
     const { receipt, attempt } = command, generation = authority.generation(receipt.payload.generation)
-    await verifyOrderReceipt(receipt, generation, this.descriptor)
-    const core = await verifyAttempt(attempt, authority, this.#options.epochKeys)
+    const verified = await this.#verified.receipt(receipt, attempt, authority)
+    const core = verified.core
     const attemptBytes = encodePeerValue(attempt)
     check(receipt.payload.attemptId === attempt.id && receipt.payload.author === attempt.payload.header.author &&
       receipt.payload.operationId === attempt.payload.header.operationId && receipt.payload.generation === attempt.payload.header.generation &&
@@ -264,11 +276,12 @@ class Replica implements PeerReplica {
       await this.#write(`${this.#prefix}/head/${generation.id}`, encodePeerValue(next))
     }
     this.#heads.set(generation.id, next)
-    entries.set(next.sequence, { command: structuredClone(command), proposal: {
+    command = { receipt, attempt: this.#remember(attempt) }
+    entries.set(next.sequence, { command, proposal: {
       txId: hexToBytes(attempt.id), candidateDigest: hexToBytes(attempt.payload.header.coreDigest),
-      canonicalCandidate: encodeTransactionCore(core), core,
+      canonicalCandidate: verified.encoded, core,
     } })
-    this.#remember(attempt); this.#receipts.set(attempt.id, structuredClone(command)); this.#retainedBytes += recordBytes.length + 2
+    this.#receipts.set(attempt.id, command); this.#retainedBytes += recordBytes.length + 2
   }
   /** Describe retained selected segments without visiting their individual records. */
   #selectedRanges(authority: PeerAuthority, complete = true): SelectedRange[] {
@@ -401,7 +414,7 @@ class Replica implements PeerReplica {
       this.#assertReady(); boundedText(captured.operationId)
       const previousId = this.#operations.get(operationKey(this.device.publicKey, captured.operationId))
       if (previousId !== undefined) {
-        const previous = this.#attempts.get(previousId)!, core = await verifyAttempt(previous, this.#authority, this.#options.epochKeys)
+        const previous = this.#attempts.get(previousId)!, core = (await this.#verified.attempt(previous, this.#authority)).core
         check(bytesToHex(encodeChangeProgram(core.program)) === bytesToHex(encodeChangeProgram(captured.program)) &&
           previous.payload.header.command === (captured.command ?? 'raw') && previous.payload.header.commandVersion === (captured.commandVersion ?? '1') &&
           previous.payload.header.reapplyOf === (captured.reapplyOf ?? null) &&
@@ -425,7 +438,7 @@ class Replica implements PeerReplica {
         operationId: captured.operationId, definitionDigest: this.descriptor.definitionDigest, command: captured.command ?? 'raw',
         commandVersion: captured.commandVersion ?? '1', basedOn: captured.basedOn ?? null, reapplyOf: captured.reapplyOf ?? null,
         coreDigest: bytesToHex(await transactionDigest(core)) }, core, key, this.device)
-      await verifyAttempt(attempt, this.#authority, this.#options.epochKeys)
+      await this.#verified.attempt(attempt, this.#authority)
       check(this.#journalHead < this.#maxRecords, 'PEER_STORAGE_QUOTA')
       await this.#write(`${this.#prefix}/journal/${this.#journalHead + 1}`, encodePeerValue(attempt))
       await this.#write(`${this.#prefix}/journal-head`, encodePeerValue(this.#journalHead + 1))
@@ -436,7 +449,7 @@ class Replica implements PeerReplica {
     const attempt = structuredClone(input)
     return this.#serial.run(async () => {
       this.#assertReady(); check(this.isCoordinator, 'PEER_NOT_COORDINATOR'); check(!this.#fenced.has(this.generation.id), 'PEER_COORDINATOR_FENCED')
-      await verifyAttempt(attempt, this.#authority, this.#options.epochKeys)
+      await this.#verified.attempt(attempt, this.#authority)
       const existing = this.#receipts.get(attempt.id)
       if (existing !== undefined) {
         check(this.#selectedIds.has(attempt.id), 'PEER_ATTEMPT_ABANDONED')
@@ -729,6 +742,7 @@ class Replica implements PeerReplica {
     await this.#serial.run(async () => {
       if (this.#disposed) return
       this.#disposed = true
+      if (!this.#closed) await this.#verified.flush()
       this.#closed = true; this.#listeners.clear(); this.#recoveryListeners.clear()
       try { await this.#options.materializer.close() }
       finally { activeOwners.get(this.#options.store)?.delete(this.descriptor.applicationId) }

@@ -31,9 +31,9 @@ async function fixture() {
   }
   await select(a, null, 'initial')
   const materializers = new Map<PeerReplica, Awaited<ReturnType<typeof createEventMaterializationRuntime>>>()
-  const open = async (identity: PeerIdentity, store: BytesStore = new MemoryBytesStore(), authority?: AuthorityBundle, storageId = identity.publicKey) => {
+  const open = async (identity: PeerIdentity, store: BytesStore = new MemoryBytesStore(), authority?: AuthorityBundle, storageId = identity.publicKey, verificationCache = true) => {
     const materializer = await createEventMaterializationRuntime({ store, namespace: 'test' })
-    const peer = await createPeerReplica({ authority: authority ?? await registry.read(), device: identity, store, storageId, materializer, epochKeys: keys })
+    const peer = await createPeerReplica({ authority: authority ?? await registry.read(), device: identity, store, storageId, materializer, epochKeys: keys, verificationCache })
     opened.push(peer); materializers.set(peer, materializer); return peer
   }
   return { host, a, b, c, key, keys, control, registry, select, open, materializers }
@@ -41,6 +41,40 @@ async function fixture() {
 const event = (name: string) => program(emit('message', { name }))
 
 describe('peer-owned encrypted history and tolerant recovery', () => {
+  it('reuses sealed origin verification on reopen while allowing a full cryptographic audit', async () => {
+    const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store)
+    for (let index = 0; index < 16; index++) await a.order(await a.prepare({ operationId: `cached-${index}`, program: event('cached') }))
+    await a.close()
+    expect((await store.entries()).filter(entry => entry.key.includes('/verified/'))).toHaveLength(16)
+    const verify = vi.spyOn(crypto.subtle, 'verify')
+    try {
+      const warm = await f.open(f.a, store), warmCalls = verify.mock.calls.filter(([algorithm]) => algorithm !== 'HMAC').length
+      expect((await warm.exportCommands()).length).toBe(16)
+      await warm.close(); verify.mockClear()
+      const audited = await f.open(f.a, store, undefined, f.a.publicKey, false)
+      expect(verify.mock.calls.filter(([algorithm]) => algorithm !== 'HMAC').length).toBeGreaterThanOrEqual(warmCalls + 32)
+      expect(await audited.operation('cached-15')).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    } finally { verify.mockRestore() }
+  })
+
+  it('falls back from a corrupt cache and still rejects altered original signed records', async () => {
+    const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store)
+    const attempt = await a.prepare({ operationId: 'integrity', program: event('private') })
+    await a.order(attempt); await a.close()
+    const cacheKey = `peer-generation/replica/${a.descriptor.applicationId}/verified/${attempt.id}`
+    const cache = decodePeerValue<{ receipt: string | null; mac: string }>((await store.get(cacheKey))!)
+    cache.mac = '00'.repeat(32)
+    await store.put(cacheKey, encodePeerValue(cache))
+    const recovered = await f.open(f.a, store)
+    expect(await recovered.operation('integrity')).toMatchObject({ outcome: 'accepted' })
+    await recovered.close()
+    const recordKey = `peer-generation/replica/${a.descriptor.applicationId}/record/${a.generation.id}/1`
+    const command = decodePeerValue<{ receipt: { signature: string } }>((await store.get(recordKey))!)
+    command.receipt.signature = '00'.repeat(64)
+    await store.put(recordKey, encodePeerValue(command))
+    await expect(f.open(f.a, store)).rejects.toThrow('PEER_SIGNATURE_INVALID')
+  })
+
   it('drains ordering into a durable reviewed prefix and retains its pause across reopen', async () => {
     const f = await fixture(), store = new MemoryBytesStore(), a = await f.open(f.a, store), b = await f.open(f.b)
     const first = await a.prepare({ operationId: 'before-pause', program: event('first') })

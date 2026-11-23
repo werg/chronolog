@@ -53,7 +53,8 @@ async function fixture(options: { readerOnly?: boolean; localEcho?: boolean } = 
 /** The public handshake remains visible to an untrusted relay. */
 function rewrite(connection: FramedPeerConnection, change: (value: Record<string, unknown>) => unknown): FramedPeerConnection {
   return { ...connection, async send(bytes, options) {
-    const frame = assertCanonicalCbor(bytes)
+    let frame
+    try { frame = assertCanonicalCbor(bytes) } catch { await connection.send(bytes, options); return }
     if (Array.isArray(frame) && frame.length === 5 && frame[2] === 0n && frame[4] instanceof Uint8Array && frame[3] === BigInt(frame[4].length)) {
       const value = decodePeerValue<Record<string, unknown>>(frame[4]), encoded = encodePeerValue(change(value))
       await connection.send(encodeCanonicalCbor([frame[0]!, frame[1]!, 0n, BigInt(encoded.length), encoded]), options)
@@ -67,6 +68,21 @@ function rewriteParticipant(connection: FramedPeerConnection, identity: string, 
 }
 
 describe('authenticated peer application connections', () => {
+  it.each(['suffix', 'bundle'] as const)('exchanges authority using %s mode for peers sharing a verified head', async authorityExchange => {
+    const f = await fixture(), a = await f.openCold(f.a), b = await f.openCold(f.b)
+    const hello: unknown[] = [], states: unknown[] = []
+    const [left, right] = createFramedPeerConnectionPair()
+    const observed = rewrite(left, packet => { if (packet.kind === 'hello') hello.push((packet.value as { authority: unknown }).authority); return packet })
+    observePeerWire(a.deviceId, packet => { if (packet.kind === 'response' && packet.message?.action === 'state') states.push((packet.message.payload as { authority: unknown }).authority) })
+    const links = await Promise.all([a.connectPeer({ connection: observed, authorityExchange }), b.connectPeer({ connection: right, authorityExchange })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await Promise.all(links.map(link => link.synchronize()))
+    expect(hello).toEqual([expect.objectContaining(authorityExchange === 'suffix' ? { format: 'authority-summary-v1', controls: 1, generations: 1 } : { controls: expect.any(Array), generations: expect.any(Array) })])
+    expect(states.length).toBeGreaterThan(0)
+    const expected = authorityExchange === 'suffix' ? 0 : 1
+    expect(states.every(state => (state as { controls: unknown[]; generations: unknown[] }).controls.length === expected && (state as { generations: unknown[] }).generations.length === expected)).toBe(true)
+  })
+
   it('preserves a submitted command and its pending reply across authenticated replacement without duplicating history', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     let entered!: () => void, release!: () => void, hold = false
@@ -314,7 +330,7 @@ describe('authenticated peer application connections', () => {
     const a = await f.openCold(f.a), b = await f.openCold({ ...f.b, openStorage: openB }), responses: unknown[] = []
     let inject = false
     observePeerWire(a.deviceId, value => inject && value.kind === 'request' && value.message?.action === 'state'
-      ? { ...value, message: { ...value.message, facet, action } } : value)
+      ? { ...value, message: { ...value.message, facet, action, payload: null } } : value)
     observePeerWire(b.deviceId, value => { if (value.kind === 'response') responses.push(value.message?.payload) })
     const [left, right] = createFramedPeerConnectionPair()
     const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])

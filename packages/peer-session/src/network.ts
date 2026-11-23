@@ -1,7 +1,7 @@
 import {
   encodePeerValue, peerDigest, verifyAuthorityBundle, validateHistoryPoint,
   createParticipantRequest, createParticipantResponse, validateParticipantRequest, validateParticipantResponse, PEER_PARTICIPANT_POLICY,
-  type AuthorityBundle, type HistoryPoint, type PeerAuthority, type ParticipantRequest, type ParticipantInterest,
+  type AuthorityBundle, type SignedControlRevision, type SignedGeneration, type HistoryPoint, type PeerAuthority, type ParticipantRequest, type ParticipantInterest,
 } from '@chronolog/peer-generation/control'
 import type { OrderedCommand, PeerRevision, SignedAttempt, SignedRetainedCoverage } from '@chronolog/peer-generation'
 import { bytesToHex, hexToBytes, signDomain, verifyDomain, DOMAINS } from '@chronolog/protocol'
@@ -43,6 +43,8 @@ export interface ApplicationPeerPort {
 }
 export interface ApplicationPeerConnectOptions {
   readonly connection: FramedPeerConnection
+  /** Full bundles for compatibility with older endpoints; suffix exchange is the default. */
+  readonly authorityExchange?: 'suffix' | 'bundle'
   readonly peerIdentity?: string
   readonly signal?: AbortSignal
   readonly handshakeTimeoutMs?: number
@@ -51,8 +53,44 @@ export interface ApplicationPeerConnectOptions {
   /** Replacement drain budget, measured once from retirement (default 5 seconds). */
   readonly drainTimeoutMs?: number
 }
-interface Hello { readonly application: string; readonly profile: 'peer-generation-v1'; readonly descriptor: string; readonly author: string; readonly nonce: string; readonly authority: AuthorityBundle; readonly channel: ApplicationChannelHello }
-interface RemoteState { readonly authority: AuthorityBundle; readonly data: boolean; readonly point: HistoryPoint | null; readonly revision: PeerRevision | null }
+interface Hello { readonly application: string; readonly profile: 'peer-generation-v1'; readonly descriptor: string; readonly author: string; readonly nonce: string; readonly authority: AuthorityBundle | AuthoritySummary; readonly channel: ApplicationChannelHello }
+interface AuthoritySummary {
+  readonly format: 'authority-summary-v1'
+  readonly controls: number
+  readonly generations: number
+  readonly generation: string | null
+  readonly controlDigest: string
+}
+interface AuthoritySuffix {
+  readonly base: AuthoritySummary | null
+  readonly controls: readonly SignedControlRevision[]
+  readonly generations: readonly SignedGeneration[]
+}
+async function authoritySummary(authority: PeerAuthority): Promise<AuthoritySummary> {
+  return { format: 'authority-summary-v1', controls: authority.controlCount, generations: authority.generationCount,
+    generation: authority.current?.id ?? null, controlDigest: await peerDigest(authority.control) }
+}
+function validateSummary(input: unknown): AuthoritySummary {
+  const summary = record(input, ['format', 'controls', 'generations', 'generation', 'controlDigest'])
+  requireNetwork(summary.format === 'authority-summary-v1' && Number.isSafeInteger(summary.controls) && (summary.controls as number) > 0 &&
+    (summary.controls as number) <= 4096 && Number.isSafeInteger(summary.generations) && (summary.generations as number) >= 0 && (summary.generations as number) <= 4096 &&
+    (summary.generations === 0 ? summary.generation === null : hexadecimal(summary.generation)) && hexadecimal(summary.controlDigest), 'APPLICATION_NETWORK_AUTHORITY_INVALID')
+  return summary as unknown as AuthoritySummary
+}
+async function authoritySuffix(authority: PeerAuthority, base: AuthoritySummary): Promise<AuthoritySuffix> {
+  const matches = base.generations <= authority.generationCount && base.controls <= authority.controlCount &&
+    (authority.generationAt(base.generations - 1)?.id ?? null) === base.generation &&
+    await peerDigest(authority.controlAt(base.controls - 1)) === base.controlDigest
+  return { base: matches ? base : null, ...authority.suffix(matches ? base.controls : 0, matches ? base.generations : 0) }
+}
+async function applyAuthoritySuffix(authority: PeerAuthority, input: unknown): Promise<PeerAuthority> {
+  const suffix = record(input, ['base', 'controls', 'generations']) as unknown as AuthoritySuffix
+  requireNetwork(Array.isArray(suffix.controls) && suffix.controls.length <= 4096 && Array.isArray(suffix.generations) && suffix.generations.length <= 4096, 'APPLICATION_NETWORK_AUTHORITY_INVALID')
+  if (suffix.base === null) return verifyAuthorityBundle({ descriptor: authority.signedDescriptor, controls: suffix.controls, generations: suffix.generations })
+  requireNetwork(same(validateSummary(suffix.base), await authoritySummary(authority)), 'APPLICATION_NETWORK_AUTHORITY_INVALID')
+  return authority.extend(suffix.controls, suffix.generations)
+}
+interface RemoteState { readonly authority: PeerAuthority; readonly data: boolean; readonly point: HistoryPoint | null; readonly revision: PeerRevision | null }
 type Method = 'state' | 'openData' | 'range' | 'submit' | 'coverage' | 'keyShare' | 'contentManifest' | 'contentChunk' | 'contentRetained' | 'contentObserveRetention'
 const methods: readonly Method[] = ['state', 'openData', 'range', 'submit', 'coverage', 'keyShare', 'contentManifest', 'contentChunk', 'contentRetained', 'contentObserveRetention']
 const interests: Readonly<Record<Method, ParticipantInterest>> = {
@@ -118,12 +156,11 @@ function atOrAfter(authority: PeerAuthority, left: HistoryPoint, right: HistoryP
   return a[0] > b[0] || a[0] === b[0] && a[1] >= b[1]
 }
 function newest(left: PeerAuthority, right: PeerAuthority): PeerAuthority {
-  const a = left.bundle, b = right.bundle
-  requireNetwork(same(a.descriptor, b.descriptor), 'APPLICATION_NETWORK_SCOPE_MISMATCH')
-  const [old, current] = a.generations.length <= b.generations.length ? [a, b] : [b, a]
-  requireNetwork(current.controls.length >= old.controls.length && old.controls.every((value, index) => same(value, current.controls[index])) &&
-    old.generations.every((value, index) => same(value, current.generations[index])), 'PEER_CONTROL_EQUIVOCATION')
-  return current === b ? right : left
+  requireNetwork(same(left.signedDescriptor, right.signedDescriptor), 'APPLICATION_NETWORK_SCOPE_MISMATCH')
+  const [old, current] = left.generationCount <= right.generationCount ? [left, right] : [right, left]
+  requireNetwork(current.controlCount >= old.controlCount && (old.current?.id ?? null) === (current.generationAt(old.generationCount - 1)?.id ?? null) &&
+    same(old.control, current.controlAt(old.controlCount - 1)), 'PEER_CONTROL_EQUIVOCATION')
+  return left.generationCount === right.generationCount ? left : current
 }
 /** Largest remotely retained point that remains selected by the latest authority. */
 function transferTarget(remote: PeerAuthority, latest: PeerAuthority, point: HistoryPoint | null): HistoryPoint | null {
@@ -163,6 +200,11 @@ class NetworkPeer implements ApplicationPeerLink {
   #readyReject!: (error: unknown) => void
   #completeResolve!: () => void
   #completeReject!: (error: unknown) => void
+  #knownAuthority: PeerAuthority | undefined
+  #localSummary: AuthoritySummary | undefined
+  #localAuthority: PeerAuthority | undefined
+  #authorityRequested = false
+  #authorityAnswered = false
   #local: Hello | undefined
   #remote: Hello | undefined
   #authenticated = false
@@ -226,9 +268,13 @@ class NetworkPeer implements ApplicationPeerLink {
     const participant = this.#port.participant
     requireNetwork(this.#input.peerIdentity === undefined || hexadecimal(this.#input.peerIdentity), 'APPLICATION_PEER_IDENTITY_INVALID')
     requireNetwork(grant(participant, participant.device.publicKey, 'reader'), 'APPLICATION_PEER_NOT_AUTHORIZED')
+    this.#localAuthority = await verifyAuthorityBundle(participant.authority)
+    this.#knownAuthority = this.#localAuthority
+    this.#localSummary = await authoritySummary(this.#localAuthority)
+    requireNetwork(this.#input.authorityExchange === undefined || ['suffix', 'bundle'].includes(this.#input.authorityExchange), 'APPLICATION_NETWORK_AUTHORITY_INVALID')
     this.#local = { application: participant.descriptor.applicationId, profile: 'peer-generation-v1',
       descriptor: await peerDigest(participant.authority.descriptor), author: participant.device.publicKey,
-      nonce: bytesToHex(crypto.getRandomValues(new Uint8Array(32))), authority: participant.authority, channel: await this.#channel.hello() }
+      nonce: bytesToHex(crypto.getRandomValues(new Uint8Array(32))), authority: this.#input.authorityExchange === 'bundle' ? this.#localAuthority.bundle : this.#localSummary, channel: await this.#channel.hello() }
     const handshake = timeout(this.#handshakeMs, 'APPLICATION_PEER_HANDSHAKE_TIMEOUT')
     void this.#read().catch(error => this.#fail(error))
     try {
@@ -303,6 +349,25 @@ class NetworkPeer implements ApplicationPeerLink {
     })
     return true
   }
+  async #currentAuthority(): Promise<PeerAuthority> {
+    if (this.#knownAuthority?.current?.id !== this.#port.participant.generation.id) this.#knownAuthority = await verifyAuthorityBundle(this.#port.participant.authority)
+    return this.#knownAuthority
+  }
+  async #proveHello(remote: PeerAuthority): Promise<void> {
+    const current = await this.#currentAuthority()
+    this.signal.throwIfAborted()
+    const latest = newest(current, remote)
+    if (latest !== current) await this.#port.participant.adoptAuthority(latest.bundle)
+    this.#knownAuthority = latest
+    this.signal.throwIfAborted(); this.#reader()
+    const encapsulatedKey = await this.#channel.prepare(this.#remote!.channel.receiverKey, this.#local!, this.#remote!)
+    this.#reader()
+    const signature = await signDomain(DOMAINS.peerConnection, encodePeerValue({ sender: this.#local, receiver: this.#remote, encapsulatedKey }), this.#port.participant.device.privateKey)
+    this.#reader()
+    this.#proofSent = this.#wire.send({ kind: 'proof', signature: bytesToHex(signature), encapsulatedKey }, () => this.#reader())
+      .then(() => { this.#channel.enableSending() })
+    void this.#proofSent.catch(error => this.#fail(error))
+  }
   async #read(): Promise<void> {
     for await (const value of this.#wire.messages()) {
       this.signal.throwIfAborted()
@@ -317,26 +382,29 @@ class NetworkPeer implements ApplicationPeerLink {
           input.application === local.application && input.profile === local.profile &&
           input.descriptor === local.descriptor && hexadecimal(input.author) && hexadecimal(input.nonce) &&
           input.author !== local.author && (this.#input.peerIdentity === undefined || input.author === this.#input.peerIdentity), 'APPLICATION_NETWORK_SCOPE_MISMATCH')
-        // Public authority evidence is authenticated independently of its relay.
-        // Learn a new reader grant before requiring that reader's fresh proof.
-        const remote = await verifyAuthorityBundle(input.authority as AuthorityBundle, this.#port.participant.authority.descriptor)
-        this.signal.throwIfAborted()
-        const current = await verifyAuthorityBundle(this.#port.participant.authority)
-        this.signal.throwIfAborted()
-        const latest = newest(current, remote)
-        if (!same(latest.bundle, current.bundle)) await this.#port.participant.adoptAuthority(latest.bundle)
-        this.signal.throwIfAborted()
         this.#remote = input as unknown as Hello
-        this.#reader()
-        const encapsulatedKey = await this.#channel.prepare(channel.receiverKey, this.#local, this.#remote)
-        this.#reader()
-        const signature = await signDomain(DOMAINS.peerConnection, encodePeerValue({ sender: this.#local, receiver: this.#remote, encapsulatedKey }), this.#port.participant.device.privateKey)
-        this.#reader()
-        // Continue reading while the other endpoint applies stream backpressure.
-        // Both peers may be waiting to send their proof at this exact boundary.
-        this.#proofSent = this.#wire.send({ kind: 'proof', signature: bytesToHex(signature), encapsulatedKey }, () => this.#reader())
-          .then(() => { this.#channel.enableSending() })
-        void this.#proofSent.catch(error => this.#fail(error))
+        const offered = input.authority
+        if (offered !== null && typeof offered === 'object' && 'format' in offered) {
+          const summary = validateSummary(offered)
+          if (same(summary, this.#localSummary)) await this.#proveHello(this.#localAuthority!)
+          else {
+            this.#authorityRequested = true
+            void this.#wire.send({ kind: 'authority-request', base: this.#localSummary }).catch(error => this.#fail(error))
+          }
+        } else await this.#proveHello(await verifyAuthorityBundle(offered as AuthorityBundle, this.#localAuthority!.signedDescriptor))
+      } else if (kind === 'authority-request') {
+        const message = record(value, ['kind', 'base'])
+        requireNetwork(!this.#authenticated && this.#remote !== undefined && !this.#authorityAnswered, 'APPLICATION_NETWORK_HANDSHAKE_ORDER')
+        this.#authorityAnswered = true
+        const suffix = await authoritySuffix(this.#localAuthority!, validateSummary(message.base))
+        void this.#wire.send({ kind: 'authority-response', suffix }).catch(error => this.#fail(error))
+      } else if (kind === 'authority-response') {
+        const message = record(value, ['kind', 'suffix'])
+        requireNetwork(!this.#authenticated && this.#authorityRequested && this.#proofSent === undefined, 'APPLICATION_NETWORK_HANDSHAKE_ORDER')
+        this.#authorityRequested = false
+        const authority = await applyAuthoritySuffix(this.#localAuthority!, message.suffix)
+        requireNetwork(same(await authoritySummary(authority), this.#remote!.authority), 'APPLICATION_NETWORK_AUTHORITY_INVALID')
+        await this.#proveHello(authority)
       } else if (kind === 'proof') {
         const message = record(value, ['kind', 'signature', 'encapsulatedKey'])
         requireNetwork(!this.#authenticated && this.#remote !== undefined && this.#proofSent !== undefined &&
@@ -459,11 +527,15 @@ class NetworkPeer implements ApplicationPeerLink {
     this.#remoteOpening = work; return work
   }
   async #readState(): Promise<RemoteState> {
-    const response = record(await this.#request('state', null), ['authority', 'data', 'point', 'revision']) as unknown as RemoteState
+    const base = await this.#currentAuthority()
+    const response = record(await this.#request('state', this.#input.authorityExchange === 'bundle' ? null : await authoritySummary(base)), ['authority', 'data', 'point', 'revision'])
+    const offered = response.authority
+    const remote = offered !== null && typeof offered === 'object' && 'base' in offered
+      ? await applyAuthoritySuffix(base, offered) : await verifyAuthorityBundle(offered as AuthorityBundle, base.signedDescriptor)
     requireNetwork(typeof response.data === 'boolean' && (response.data || response.point === null && response.revision === null), 'APPLICATION_NETWORK_STATE_INVALID')
     this.#remoteData = response.data
     if (response.data) this.#remoteDataFailure = undefined
-    return response
+    return { ...response, authority: remote } as unknown as RemoteState
   }
   async #respond(request: ParticipantRequest, method: Method): Promise<void> {
     try {
@@ -471,9 +543,10 @@ class NetworkPeer implements ApplicationPeerLink {
       const participant = this.#port.participant, input = request.payload
       let value: unknown
       if (method === 'state') {
-        requireNetwork(input === null, 'APPLICATION_NETWORK_MESSAGE_INVALID')
+        const authority = await this.#currentAuthority()
+        const offered = input === null ? authority.bundle : await authoritySuffix(authority, validateSummary(input))
         const replica = participant.data?.replica, revision = replica?.ready === true ? replica.revision : null
-        value = { authority: participant.authority, data: replica !== undefined, point: revision?.point ?? availablePoint(replica), revision }
+        value = { authority: offered, data: replica !== undefined, point: revision?.point ?? availablePoint(replica), revision }
       } else value = await this.#serveData(method, input)
       this.#reader(); await this.#wire.send({ kind: 'response', ok: true, message: createParticipantResponse(request, value, PEER_PARTICIPANT_POLICY) })
     } catch (error) {
@@ -590,11 +663,12 @@ class NetworkPeer implements ApplicationPeerLink {
   async #pull(opened = false): Promise<void> {
     const requestedAt = Date.now(), participant = this.#port.participant
     const response = await this.#readState()
-    const remote = await verifyAuthorityBundle(response.authority, participant.authority.descriptor)
-    const local = await verifyAuthorityBundle(participant.authority)
+    const remote = response.authority
+    const local = await this.#currentAuthority()
     this.#reader()
     const latest = newest(local, remote)
-    if (!same(latest.bundle, local.bundle)) await participant.adoptAuthority(latest.bundle)
+    if (latest !== local) await participant.adoptAuthority(latest.bundle)
+    this.#knownAuthority = latest
     this.#reader()
     const target = transferTarget(remote, latest, response.point)
     const at = response.revision !== null && remote.current?.id === latest.current?.id ? response.revision : null

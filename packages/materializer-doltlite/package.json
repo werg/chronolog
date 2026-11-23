@@ -13,7 +13,8 @@
     "@chronolog/canonical": "workspace:*",
     "@chronolog/materializer": "workspace:*",
     "@chronolog/protocol": "workspace:*",
-    "@dolthub/doltlite": "0.11.29"
+    "@dolthub/doltlite": "0.11.29",
+    "fs-native-extensions": "1.5.4"
   },
   "devDependencies": {
     "@chronolog/crypto": "workspace:*"

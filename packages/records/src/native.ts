@@ -1,142 +1,127 @@
-import { mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
-import { DatabaseSync, type StatementSync } from 'node:sqlite'
-
-import type { BytesStore } from './bytes-store.js'
+import { createRequire } from 'node:module'
+import { Worker } from 'node:worker_threads'
+import type { BytesStore, BytesStoreEntry } from './bytes-store.js'
+import { nativeWorkerSource } from './native-worker.js'
 
 export interface NativeBytesStoreOptions {
   readonly quotaBytes?: number
   readonly maxValueBytes?: number
 }
+interface Response { readonly id: number; readonly value?: unknown; readonly used: number; readonly error?: { readonly message: string; readonly code?: string } }
 
-/**
- * One native storage owner for records, authority state, outboxes and local
- * consumer checkpoints. Each durable atomic key replacement shares the
- * same BytesStore contract. SQLite holds the exclusive writer fence until close (also
- * across processes); a process crash releases it without a stale lock file.
- */
+/** Stable SQLite in a dedicated worker. Await open() for acquisition and close() for release. */
 export class NativeBytesStore implements BytesStore {
-  readonly #database: DatabaseSync
-  readonly #getStatement: StatementSync
-  readonly #sizeStatement: StatementSync
-  readonly #putStatement: StatementSync
-  readonly #quotaBytes: number
+  readonly #worker: Worker
+  readonly #requests = new Map<number, { resolve(value: unknown): void; reject(error: unknown): void }>()
+  readonly #ready: Promise<void>
   readonly #maxValueBytes: number
+  #pending: Promise<unknown> = Promise.resolve()
+  #nextId = 0
   #usedBytes = 0
   #closed = false
+  #closing: Promise<void> | undefined
+  #failure: Error | undefined
 
   constructor(path: string, options: NativeBytesStoreOptions = {}) {
-    this.#quotaBytes = options.quotaBytes ?? 256 * 1024 * 1024
-    this.#maxValueBytes = options.maxValueBytes ?? 128 * 1024 * 1024
-    for (const value of [this.#quotaBytes, this.#maxValueBytes]) {
-      if (!Number.isSafeInteger(value) || value < 1) throw new Error('BYTES_STORE_QUOTA_INVALID')
-    }
     if (path.length === 0) throw new Error('BYTES_STORE_PATH_REQUIRED')
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-    this.#database = new DatabaseSync(path)
+    for (const value of [options.quotaBytes, options.maxValueBytes]) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new Error('BYTES_STORE_QUOTA_INVALID')
+    }
+    this.#maxValueBytes = options.maxValueBytes ?? 128 * 1024 * 1024
+    this.#worker = new Worker(nativeWorkerSource, { eval: true,
+      workerData: { path, options, sqliteModule: createRequire(import.meta.url).resolve('better-sqlite3') } })
+    this.#ready = new Promise((resolve, reject) => { this.#requests.set(0, { resolve: () => resolve(), reject }) })
+    void this.#ready.catch(() => undefined)
+    this.#worker.on('message', (response: Response) => {
+      this.#usedBytes = response.used
+      const request = this.#requests.get(response.id)
+      this.#requests.delete(response.id)
+      if (response.error === undefined) request?.resolve(response.value)
+      else request?.reject(Object.assign(new Error(response.error.message), response.error.code === undefined ? {} : { code: response.error.code }))
+      if (this.#requests.size === 0) this.#worker.unref()
+    })
+    this.#worker.on('error', (error: Error) => this.#fail(error))
+    this.#worker.on('exit', code => { if (!this.#closed || this.#requests.size !== 0) this.#fail(new Error(`BYTES_STORE_WORKER_EXIT: ${code}`)) })
+  }
+  static async open(path: string, options: NativeBytesStoreOptions = {}): Promise<NativeBytesStore> {
+    const store = new NativeBytesStore(path, options)
+    try { await store.#ready; return store }
+    catch (error) { await store.#worker.terminate(); throw error }
+  }
+  #fail(error: Error): void {
+    this.#failure = error
+    for (const request of this.#requests.values()) request.reject(error)
+    this.#requests.clear()
+  }
+  async #request<T>(method: string, args: unknown = {}): Promise<T> {
+    await this.#ready
+    if (this.#failure !== undefined) throw this.#failure
+    const id = ++this.#nextId
+    return new Promise<T>((resolve, reject) => {
+      this.#requests.set(id, { resolve: value => resolve(value as T), reject })
+      this.#worker.ref()
+      try { this.#worker.postMessage({ id, method, args }) }
+      catch (error) { this.#requests.delete(id); if (this.#requests.size === 0) this.#worker.unref(); reject(error) }
+    })
+  }
+  #enqueue<T>(work: () => Promise<T>): Promise<T> {
+    if (this.#closed) return Promise.reject(new Error('BYTES_STORE_CLOSED'))
+    const task = this.#pending.then(work)
+    this.#pending = task.catch(() => undefined)
+    return task
+  }
+  get(key: string): Promise<Uint8Array | null> { return this.#enqueue(() => this.#request('get', { key })) }
+  getMany(keys: readonly string[]): Promise<readonly (Uint8Array | null)[]> {
+    const captured = [...keys]
+    return this.#enqueue(() => this.#request('getMany', { keys: captured }))
+  }
+  put(key: string, value: Uint8Array): Promise<void> {
+    if (!(value instanceof Uint8Array) || value.length > this.#maxValueBytes) return Promise.reject(new Error('BYTES_STORE_VALUE_TOO_LARGE'))
+    const copy = Uint8Array.from(value)
+    return this.#enqueue(() => this.#request('put', { key, value: copy }))
+  }
+  async *iterateEntries(): AsyncIterable<BytesStoreEntry> {
+    let release!: () => void, started!: () => void
+    const held = new Promise<void>(resolve => { release = resolve }), ready = new Promise<void>(resolve => { started = resolve })
+    const owner = this.#enqueue(async () => { started(); await held })
+    await Promise.race([ready, owner])
     try {
-      // In WAL mode an exclusive connection retains its file lock after the
-      // initial commit, fencing every process until the owner closes.
-      this.#database.exec('PRAGMA busy_timeout = 0')
-      this.#database.exec('PRAGMA locking_mode = EXCLUSIVE')
-      this.#database.exec('PRAGMA journal_mode = WAL')
-      this.#database.exec('PRAGMA synchronous = FULL')
-      this.#database.exec('BEGIN EXCLUSIVE')
-      this.#database.exec(`CREATE TABLE IF NOT EXISTS stored_bytes (
-        key TEXT PRIMARY KEY,
-        value BLOB NOT NULL
-      )`)
-      this.#database.exec('COMMIT')
-      // An exclusive owner accounts once on reopen. Appending one value must
-      // not scan every retained body merely to enforce its storage quota.
-      this.#usedBytes = (this.#database.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get() as { bytes: number }).bytes
-      this.#getStatement = this.#database.prepare('SELECT value FROM stored_bytes WHERE key = ?')
-      this.#sizeStatement = this.#database.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?')
-      this.#putStatement = this.#database.prepare('INSERT INTO stored_bytes (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-    } catch (error) {
-      try { this.#database.close() } catch { /* failed opening */ }
-      if (/locked|busy/iu.test(error instanceof Error ? error.message : '')) {
-        throw new Error('BYTES_STORE_IN_USE', { cause: error })
+      let after = ''
+      for (;;) {
+        const page = await this.#request<BytesStoreEntry[]>('page', { after })
+        if (page.length === 0) break
+        for (const entry of page) { after = entry.key; yield entry }
       }
-      throw error
-    }
+    } finally { release(); await owner }
   }
-
-  async get(key: string): Promise<Uint8Array | null> {
-    this.#assertOpen()
-    validateKey(key)
-    const row = this.#getStatement.get(key) as
-      { value: Uint8Array } | undefined
-    return row === undefined ? null : Uint8Array.from(row.value)
+  async entries(): Promise<readonly BytesStoreEntry[]> {
+    const entries: BytesStoreEntry[] = []
+    for await (const entry of this.iterateEntries()) entries.push(entry)
+    return entries
   }
-
-  async put(key: string, value: Uint8Array): Promise<void> {
-    this.#assertOpen()
-    validateKey(key)
-    if (!(value instanceof Uint8Array) || value.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
-    this.#database.exec('BEGIN IMMEDIATE')
-    try {
-      const previous = this.#sizeStatement.get(key) as
-        { bytes: number } | undefined
-      const used = this.#usedBytes - (previous?.bytes ?? 0) + value.byteLength
-      if (used > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
-      this.#putStatement.run(key, value)
-      this.#database.exec('COMMIT')
-      this.#usedBytes = used
-    } catch (error) {
-      this.#database.exec('ROLLBACK')
-      throw error
-    }
+  putAllIfEmpty(entries: readonly BytesStoreEntry[]): Promise<boolean> {
+    if (entries.some(entry => !(entry.value instanceof Uint8Array) || entry.value.length > this.#maxValueBytes)) return Promise.reject(new Error('BYTES_STORE_VALUE_TOO_LARGE'))
+    const captured = entries.map(entry => ({ key: entry.key, value: Uint8Array.from(entry.value) }))
+    return this.putStreamIfEmpty((async function* () { yield* captured })())
   }
-
-  async putAllIfEmpty(entries: readonly { readonly key: string; readonly value: Uint8Array }[]): Promise<boolean> {
-    this.#assertOpen()
-    let bytes = 0
-    const seen = new Set<string>()
-    for (const entry of entries) {
-      validateKey(entry.key)
-      if (!(entry.value instanceof Uint8Array) || entry.value.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
-      if (seen.has(entry.key)) throw new Error('BYTES_STORE_DUPLICATE_KEY')
-      seen.add(entry.key); bytes += entry.value.byteLength
-    }
-    if (bytes > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
-    this.#database.exec('BEGIN IMMEDIATE')
-    try {
-      if ((this.#database.prepare('SELECT count(*) AS count FROM stored_bytes').get() as { count: number }).count !== 0) {
-        this.#database.exec('COMMIT'); return false
-      }
-      const insert = this.#database.prepare('INSERT INTO stored_bytes (key, value) VALUES (?, ?)')
-      for (const entry of entries) insert.run(entry.key, entry.value)
-      this.#database.exec('COMMIT'); this.#usedBytes = bytes; return true
-    } catch (error) { this.#database.exec('ROLLBACK'); throw error }
+  putStreamIfEmpty(entries: AsyncIterable<BytesStoreEntry>): Promise<boolean> {
+    return this.#enqueue(async () => {
+      if (!await this.#request<boolean>('restoreBegin')) return false
+      try {
+        for await (const entry of entries) await this.#request('restorePut', entry)
+        await this.#request('restoreCommit')
+        return true
+      } catch (error) { await this.#request('restoreAbort'); throw error }
+    })
   }
-  async entries(): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
-    this.#assertOpen()
-    const rows = this.#database.prepare('SELECT key, value FROM stored_bytes ORDER BY key ASC').all() as
-      { key: string; value: Uint8Array }[]
-    return rows.map(row => ({ key: row.key, value: Uint8Array.from(row.value) }))
-  }
-
-  /** Flush WAL frames cleanly into the main database file before external snapshot/backup. */
-  checkpointWal(): void {
-    this.#assertOpen()
-    this.#database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-  }
-
-  usageBytes(): number {
-    this.#assertOpen()
-    return this.#usedBytes
-  }
-
-  close(): void {
-    if (this.#closed) return
-    this.#database.close()
+  checkpointWal(): Promise<void> { return this.#enqueue(() => this.#request('checkpoint')) }
+  usageBytes(): number { if (this.#closed) throw new Error('BYTES_STORE_CLOSED'); return this.#usedBytes }
+  close(): Promise<void> {
+    if (this.#closing !== undefined) return this.#closing
     this.#closed = true
+    this.#closing = this.#pending.then(async () => {
+      try { await this.#request('close') } finally { await this.#worker.terminate() }
+    })
+    return this.#closing
   }
-
-  #assertOpen(): void { if (this.#closed) throw new Error('BYTES_STORE_CLOSED') }
-}
-
-function validateKey(key: string): void {
-  if (key.length === 0 || key.length > 2048 || [...key].some((character) => character.charCodeAt(0) < 32)) throw new Error('BYTES_STORE_KEY_INVALID')
 }

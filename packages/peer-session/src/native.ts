@@ -31,9 +31,9 @@ export async function openNativeDevice(options: {
     ...(options.quotaBytes === undefined ? {} : { quotaBytes: options.quotaBytes }),
     ...(options.maxValueBytes === undefined ? {} : { maxValueBytes: options.maxValueBytes }),
   }
-  const store = new NativeBytesStore(options.path, limits)
+  const store = await NativeBytesStore.open(options.path, limits)
   try { return await openApplicationDevice({ store, ...(options.create === undefined ? {} : { create: options.create }), close: () => store.close() }) }
-  catch (error) { store.close(); throw error }
+  catch (error) { await store.close(); throw error }
 }
 
 /**
@@ -67,13 +67,13 @@ export async function openDisposableNativeDevice(options: {
     ...(options.maxValueBytes === undefined ? {} : { maxValueBytes: options.maxValueBytes }),
   }
   let store: NativeBytesStore
-  try { store = new NativeBytesStore(storePath, limits) }
+  try { store = await NativeBytesStore.open(storePath, limits) }
   catch (error) { rmSync(temporaryDirectory, { recursive: true, force: true }); throw error }
   let cleaned = false
   const cleanupDir = (): void => {
     if (cleaned) return
     cleaned = true
-    try { store.close() } catch { /* ignore on exit */ }
+    try { void store.close().catch(() => undefined) } catch { /* ignore on exit */ }
     try { rmSync(temporaryDirectory, { recursive: true, force: true }) } catch { /* best-effort temp cleanup */ }
   }
   const onExit = (): void => { cleanupDir() }
@@ -82,7 +82,8 @@ export async function openDisposableNativeDevice(options: {
     const device = await openApplicationDevice({
       store,
       create: true,
-      close() {
+      async close() {
+        await store.close()
         process.removeListener('exit', onExit)
         cleanupDir()
       },
@@ -97,6 +98,7 @@ export async function openDisposableNativeDevice(options: {
     })
   } catch (error) {
     process.removeListener('exit', onExit)
+    try { await store.close() } catch { /* Preserve the construction error. */ }
     cleanupDir()
     throw error
   }

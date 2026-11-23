@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { DOMAINS } from '@chronolog/protocol'
 import {
-  controlParticipantGrant, createGenerationRegistry, createPeerIdentity, generationStartRoot, participantGrant, peerDigest,
+  PeerAuthority, controlParticipantGrant, createGenerationRegistry, createPeerIdentity, generationStartRoot, participantGrant, peerDigest,
   signApplicationDescriptor, signControlRevision, signTransitionRequest, verifyAuthorityBundle,
   type AuthorityBundle, type OrderReceipt, type PeerIdentity, type PrefixProof, type SignedGeneration,
 } from './control.js'
@@ -47,6 +47,42 @@ function proof(receipt: OrderReceipt, bridge: readonly OrderReceipt[] = []): Pre
 }
 
 describe('portable peer generation authority', () => {
+  it('appends bounded authority records and reopens the atomic head without ancestry scans', async () => {
+    const f = await fixture(), writes = vi.spyOn(f.store, 'put')
+    let current = f.g1
+    for (let index = 0; index < 40; index++) {
+      const base: PrefixProof = { point: { generation: current.id, sequence: 0, root: await generationStartRoot(current) }, receipt: null, bridge: [] }
+      current = await f.registry.select(await f.transition(f.a, f.a, current.id, base, `generation-${index}`))
+    }
+    const key = `peer-generation/registry/${f.descriptor.payload.applicationId}`
+    expect(writes.mock.calls.filter(([name]) => name === key).every(([, bytes]) => bytes.length < 128)).toBe(true)
+    expect(writes.mock.calls.filter(([name]) => name.includes('/log/'))).toHaveLength(40)
+    const reopened = await createGenerationRegistry({ ...f, store: { get: name => f.store.get(name), put: (name, bytes) => f.store.put(name, bytes) },
+      descriptor: f.descriptor, controls: [f.control], signer: f.host, requireExisting: true })
+    const bundle = await reopened.read(), scan = vi.spyOn(PeerAuthority.prototype, 'selectedSegments').mockImplementation(() => { throw Error('full ancestry scan') })
+    try {
+      const verified = await verifyAuthorityBundle(bundle)
+      expect(verified.current).toEqual(current)
+      expect(verified.contains({ generation: f.g1.id, sequence: 0, root: await generationStartRoot(f.g1) })).toBe(true)
+    } finally { scan.mockRestore() }
+  })
+
+  it('migrates legacy bundles and exactly retries a lost head-write acknowledgment', async () => {
+    const f = await fixture(), bundle = await f.registry.read(), key = `peer-generation/registry/${f.descriptor.payload.applicationId}`
+    // Legacy authority uses the same canonical encoding as every signed control record.
+    const { encodePeerValue } = await import('./codec.js')
+    await f.store.put(key, encodePeerValue(bundle))
+    const put = f.store.put.bind(f.store)
+    let lost = false
+    f.store.put = async (name, bytes) => { await put(name, bytes); if (name === key && !lost) { lost = true; throw Error('lost acknowledgment') } }
+    const base: PrefixProof = { point: { generation: f.g1.id, sequence: 0, root: await generationStartRoot(f.g1) }, receipt: null, bridge: [] }
+    const request = await f.transition(f.a, f.a, f.g1.id, base, 'lost-head')
+    await expect(f.registry.select(request)).rejects.toThrow('lost acknowledgment')
+    const selected = await f.registry.select(request)
+    expect((await f.registry.read()).generations).toHaveLength(2)
+    expect(selected.payload.transition).toEqual(request)
+  })
+
   it('requires an explicit publisher grant independently of every other role', async () => {
     const f = await fixture()
     expect(participantGrant(f.a.publicKey, { administrator: true })).toMatchObject({ administrator: true, publisher: false })

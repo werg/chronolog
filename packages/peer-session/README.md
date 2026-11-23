@@ -126,8 +126,8 @@ const participation = session.participate({
 
 ## Content, signals, and agent tools
 
-- **Content**: `session.content.stage()`, `read(ref, { start, end })`, `retain()`, and `retention()` transfer encrypted 64 KiB chunks peer-to-peer under current reader grants.
-- **Signals**: `session.signals.send(topic, payload, opts)` and `subscribe(opts)` share ephemeral signed updates over the live lane.
+- **Content**: `session.content.stage()`, `read(ref, { offset, length })`, `retain()`, and `retention()` transfer encrypted 64 KiB chunks peer-to-peer under current reader grants.
+- **Signals**: `session.signals.send(topic, payload, opts)` and `subscribe(opts)` share ephemeral signed updates over the live lane. With `mode: 'latest'`, an active subscription coalesces newly received updates; it does not return a current-value snapshot or replay earlier messages.
 - **Agent tools**: `createApplicationTools(session)` exposes declared commands/queries as schema-validated tool descriptors for local or remote assistants.
 - **Multi-client ownership**: `createApplicationOwner()` and `acquireApplicationOwnerLock()` allow multiple tabs or local attachments to share one owning session while keeping operation scopes, bounded RPC deadlines (`boundedRequest`), and read-view authority isolated.
 
@@ -188,17 +188,64 @@ permission to run two copies of the same signing identity.
 native SQLite and IndexedDB stores implement this primitive; other stores fail
 closed until they supply it. Stage a fresh private target, restore any returned
 SQL bytes beside it, reopen and verify its device identity, then publish the target
-directory as one unit. Checkpoints are bounded to 4096 records, 1024 outbox entries,
-16 MiB raw record/SQL data and 32 MiB encrypted data. The caller owns quiescence of
-external/direct store writers and consistency of separately captured SQL bytes.
+directory as one unit. The byte-array compatibility APIs materialize the checkpoint;
+optional `limits: { maxBytes, maxEntries, maxValueBytes }` set caller budgets rather
+than imposing a smaller fixed quota than the source store. Outboxes remain bounded
+to 1024 records. The caller owns quiescence of external/direct store writers and
+consistency of separately captured SQL bytes.
+
+For large stores, use `exportDeviceCheckpointStream(store, { secret, sink })`.
+The sink receives bounded binary AES-GCM frames through `write(bytes)` and must
+resolve `commit(metadata)` only after the complete checkpoint is durable. Source
+retirement follows commit. Supply `retireSource: false` for a backup. Optional
+`sqlDatabase: { bytes, chunks }` streams quiesced SQL bytes without copying the
+whole database into the checkpoint encoder. Frame counters and an authenticated
+footer reject reordered, truncated, or trailing input.
+
+`restoreDeviceCheckpointStream(target, encryptedChunks, { secret, limits, sqlSink })`
+uses `putStreamIfEmpty` to stage entries and atomically publish them only after the
+whole input authenticates. The target must be fresh. Memory, native SQLite and
+IndexedDB implement this primitive; other stores fail closed. A SQL sink stages
+its bytes separately and commits only after authentication; publish its SQL output
+and the restored target together as one private device directory. Without a SQL
+sink, SQL bytes are returned in memory. Streaming has no fixed aggregate quota;
+memory use follows one store value and bounded transport pages/frames. Individual
+values and the destination store remain subject to their configured quotas.
+
+Native records use stable prebuilt `better-sqlite3` bindings in a dedicated worker.
+Await `NativeBytesStore.open(path, options)` for acquisition and `await store.close()`
+for durable release before reopening or deleting the file. `checkpointWal()` also
+returns a promise; `usageBytes()` reports the last completed worker operation.
+Existing `node:sqlite`-created stores reopen without conversion. No native C/C++
+compilation is required on platforms supplied by the binding's prebuilt packages.
+
+Peer hello and state exchanges use authority summaries and signed missing suffixes.
+Use `connectPeer({ ..., authorityExchange: 'bundle' })` when connecting to an older
+endpoint that only understands complete bundles. Registry state migrates existing
+bundles to an append log on the first successful selection. Signed records are
+written before the small head; failed head acknowledgments are resolved by retrying
+the exact transition ID.
+
+Replica startup reads and hashes original journal/record bytes in bounded batches.
+Small HMAC attestations, keyed from the local signing identity through HKDF, allow
+unchanged originals to reuse prior origin/receipt verification; they contain no
+plaintext command bodies. Invalid or stale attestations trigger full verification.
+Only a clean close writes optional attestations. They are acceleration data, never
+an alternative source of history. `createPeerReplica({ ..., verificationCache: false })`
+forces a full cryptographic audit. Retained encrypted bodies and decoded cores are
+shared by the replica's internal indexes.
 
 Disposable devices are explicitly ephemeral and non-resumable. Requested memory
 store quotas are enforced, and failed SQL-device construction removes its managed
 temporary directory. Closing an ergonomic client fences new submissions; cancelling
 submitted work reports known/uncertain outcomes without claiming it was rolled back.
 
-Node WASM SQL requires Node's built-in `node:sqlite` for its small OS-released owner
-fence, plus the verified WASM engine; no patched native addon is compiled. The VFS
+Node WASM SQL uses prebuilt `fs-native-extensions` OS locks on the database inode,
+plus the verified WASM engine. It creates no SQLite owner sidecar and needs no
+experimental Node SQLite API. Stop all older runtimes before removing obsolete
+`<db>.chronolog-owner.sqlite` files (and their WAL/SHM companions). The new VFS
+refuses a database with an old marker because older processes use a different
+ownership fence. The VFS
 implements per-connection SQLite locks within that owner. The SQLite cache budget
 is per connection, not a total process/WASM RSS guarantee; temporary SQL storage
 uses files. Unknown budget options fail closed. The loader and WASM binary must

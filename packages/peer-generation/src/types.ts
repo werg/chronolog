@@ -80,6 +80,8 @@ export interface PeerReplicaOptions {
   readonly storageId: string
   readonly materializer: ChronologMaterializationRuntime
   readonly epochKeys: ReadonlyMap<number, Uint8Array>
+  /** Disable the local sealed verification cache to force a full cryptographic audit on reopen. */
+  readonly verificationCache?: boolean
   readonly now?: () => number
   readonly maxRecords?: number
   readonly maxHistoryBytes?: number

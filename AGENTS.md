@@ -29,7 +29,7 @@ node tools/package-peer-session.mjs --sql-native --sql-browser --sql-wasm # Full
 ## Package Boundaries
 
 - `packages/canonical`, `packages/crypto`, `packages/protocol`: deterministic CBOR, Ed25519/X25519/AES-GCM, wire formats. Zero native bindings.
-- `packages/records`: `BytesStore` (`MemoryBytesStore`, `NativeBytesStore` via `node:sqlite`, `IndexedDbBytesStore`), framed peer channels.
+- `packages/records`: `BytesStore` (`MemoryBytesStore`, `NativeBytesStore` via worker-backed `better-sqlite3`, `IndexedDbBytesStore`), framed peer channels.
 - `packages/peer-generation`: `peer-generation-v1` control authority, publications, and filtered host participant (`@chronolog/peer-generation/participant`). Must stay portable (zero `node:*` imports in control/participant bundles).
 - `packages/materializer` & `packages/materializer-doltlite`: event materializer (pure JS) and deterministic SQL materializer (native Node-API + browser/Node WASM adapters).
 - `packages/peer-session`: unified session runtime, reactive views, view stores, encrypted checkpoints, event outbox, ergonomic batch/lifecycle client, and scoped tools. Passive browser/worker entrypoints must never eagerly load durable storage or SQL modules (verified by `tools/package-peer-session.mjs`).

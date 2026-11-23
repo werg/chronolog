@@ -25,6 +25,7 @@ it('fences independent WASM modules until the last connection releases ownership
   expect(b.open(path).rc).toBe(14)
   a.io.xClose!(left.p);expect(b.open(path).rc).toBe(14)
   a.io.xClose!(sibling.p);const winner=b.open(path);expect(winner.rc).toBe(0);b.io.xClose!(winner.p)
+  expect(readdirSync(dir)).toEqual(['app.db'])
  }finally{rmSync(dir,{recursive:true,force:true})}
 })
 it('implements shared/reserved/pending/exclusive locks and reserved-lock observation',()=>{
