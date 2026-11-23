@@ -1,0 +1,36 @@
+name: Celld peer session
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  celld-peer-session:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Package the celld workspace runtime
+        run: pnpm package:session --no-native-rtc --sql-celld --output artifacts/celld-peer-session
+      - name: Attest the celld workspace runtime
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: artifacts/celld-peer-session/*.tgz
+      - name: Upload the celld workspace runtime
+        uses: actions/upload-artifact@v6
+        with:
+          name: celld-peer-session-${{ github.sha }}
+          path: artifacts/celld-peer-session/*.tgz
+          if-no-files-found: error
+          retention-days: 90
