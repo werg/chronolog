@@ -146,6 +146,8 @@ export interface PeerReplica {
   prefixProof(point: HistoryPoint): Promise<PrefixProof>
   /** The contiguous retained selected prefix, including evidence available while recovery is pending. */
   exportCommands(options?: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly maxBytes?: number; readonly at?: PeerRevision }): Promise<readonly OrderedCommand[]>
+  /** Receipt root for a retained command on the selected history, without copying its body. */
+  receiptRoot(attemptId: string): string | null
   pendingAttempts(): Promise<readonly SignedAttempt[]>
   retainedCoverage(point?: HistoryPoint): Promise<SignedRetainedCoverage>
   observeCoverage(coverage: SignedRetainedCoverage): Promise<void>

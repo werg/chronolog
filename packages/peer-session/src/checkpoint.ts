@@ -55,17 +55,22 @@ export interface RestoredCheckpoint {
 const MAGIC = new Uint8Array([0x43, 0x4c, 0x43, 0x50, 0x01]) // "CLCP\x01"
 const SALT_BYTES = 16
 const IV_BYTES = 12
-const PBKDF2_ITERATIONS = 100_000
+const LEGACY_PBKDF2_ITERATIONS = 100_000
+const PBKDF2_ITERATIONS = 600_000
+const KDF_HEADER_BYTES = 5 // algorithm (1 = PBKDF2-SHA256), iterations (uint32 BE)
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
-const MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024
-const MAX_ENTRIES = 4096
+// Cover the default 256 MiB durable store, including journal/result duplication
+// and Base64 expansion, while retaining bounded allocations on restore.
+const MAX_RAW_BYTES = 256 * 1024 * 1024
+const MAX_CHECKPOINT_BYTES = 384 * 1024 * 1024
+const MAX_ENTRIES = 65_536
 
 function fail(code: string, message: string): Error {
   return Object.assign(new Error(message), { code })
 }
 
-async function deriveAesKey(secret: Uint8Array | string, salt: Uint8Array, usage: readonly KeyUsage[]): Promise<CryptoKey> {
+async function deriveAesKey(secret: Uint8Array | string, salt: Uint8Array, usage: readonly KeyUsage[], iterations = PBKDF2_ITERATIONS): Promise<CryptoKey> {
   if (secret instanceof Uint8Array) {
     if (secret.byteLength !== 32) throw fail('CHECKPOINT_KEY_INVALID', 'Raw checkpoint encryption key must be exactly 32 bytes.')
     const copy = new Uint8Array(secret.byteLength)
@@ -79,12 +84,19 @@ async function deriveAesKey(secret: Uint8Array | string, salt: Uint8Array, usage
   const saltCopy = new Uint8Array(salt.byteLength)
   saltCopy.set(salt)
   return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', hash: 'SHA-256', salt: saltCopy, iterations: PBKDF2_ITERATIONS },
+    { name: 'PBKDF2', hash: 'SHA-256', salt: saltCopy, iterations },
     baseKey,
     { name: 'AES-GCM', length: 256 },
     false,
     [...usage],
   )
+}
+
+function checkpointAad(kdfHeader: Uint8Array): Uint8Array<ArrayBuffer> {
+  const format = encoder.encode(CHECKPOINT_FORMAT)
+  const aad = new Uint8Array(format.length + kdfHeader.length)
+  aad.set(format); aad.set(kdfHeader, format.length)
+  return aad
 }
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -183,7 +195,7 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
   }
   const sqlBytes = options.sqlDatabaseBytes?.slice() ?? null
   const outbox = structuredClone(options.outbox ?? [])
-  if (rawEntries.length > MAX_ENTRIES || rawEntries.reduce((size, entry) => size + entry.value.byteLength, sqlBytes?.byteLength ?? 0) > MAX_CHECKPOINT_BYTES / 2) {
+  if (rawEntries.length > MAX_ENTRIES || rawEntries.reduce((size, entry) => size + entry.value.byteLength, sqlBytes?.byteLength ?? 0) > MAX_RAW_BYTES) {
     throw fail('CHECKPOINT_LIMIT_EXCEEDED', 'Checkpoint data exceeds the bounded handoff limit.')
   }
   const createdAt = new Date().toISOString()
@@ -211,14 +223,18 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
   const salt = isRawKey ? new Uint8Array(SALT_BYTES) : crypto.getRandomValues(new Uint8Array(SALT_BYTES))
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES))
   const key = await deriveAesKey(options.secret, salt, ['encrypt'])
-  const aad = encoder.encode(CHECKPOINT_FORMAT)
+  const kdfHeader = new Uint8Array(isRawKey ? 0 : KDF_HEADER_BYTES)
+  if (!isRawKey) { kdfHeader[0] = 1; new DataView(kdfHeader.buffer).setUint32(1, PBKDF2_ITERATIONS) }
+  const aad = checkpointAad(kdfHeader)
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, plaintext))
 
-  // Wire layout: MAGIC(5) | FLAGS(1: bit0=rawKey) | SALT(16) | IV(12) | CIPHERTEXT+TAG
-  const out = new Uint8Array(MAGIC.length + 1 + SALT_BYTES + IV_BYTES + ciphertext.byteLength)
+  // Wire layout: MAGIC(5) | FLAGS(1: 0=legacy, 1=raw, 2=parameterized KDF)
+  // | optional KDF(5) | SALT(16) | IV(12) | CIPHERTEXT+TAG
+  const out = new Uint8Array(MAGIC.length + 1 + kdfHeader.length + SALT_BYTES + IV_BYTES + ciphertext.byteLength)
   let offset = 0
   out.set(MAGIC, offset); offset += MAGIC.length
-  out[offset++] = isRawKey ? 1 : 0
+  out[offset++] = isRawKey ? 1 : 2
+  out.set(kdfHeader, offset); offset += kdfHeader.length
   out.set(salt, offset); offset += SALT_BYTES
   out.set(iv, offset); offset += IV_BYTES
   out.set(ciphertext, offset)
@@ -226,8 +242,8 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
   await options.persist?.(Object.freeze({ bytes: out.slice(), metadata }))
   const retireSource = options.retireSource !== false
   if (retireSource) {
-    retireDeviceStore(store)
     await store.put(DEVICE_RETIRED_KEY, encoder.encode(JSON.stringify({ retiredAt: createdAt, manifestSha256 })))
+    retireDeviceStore(store)
   }
   return Object.freeze({ bytes: out, metadata, retiredSource: retireSource })
   } finally { release() }
@@ -254,8 +270,16 @@ export async function restoreDeviceCheckpoint(
   }
   let offset = MAGIC.length
   const flags = encryptedBytes[offset++]!
-  if (flags !== 0 && flags !== 1) throw fail('CHECKPOINT_CORRUPT', 'Unrecognized checkpoint flags.')
-  const expectRaw = (flags & 1) === 1
+  if (flags !== 0 && flags !== 1 && flags !== 2) throw fail('CHECKPOINT_CORRUPT', 'Unrecognized checkpoint flags.')
+  let iterations = LEGACY_PBKDF2_ITERATIONS
+  const kdfHeader = flags === 2 ? encryptedBytes.slice(offset, offset + KDF_HEADER_BYTES) : new Uint8Array()
+  if (flags === 2) {
+    if (encryptedBytes.length <= headerLength + KDF_HEADER_BYTES + 16 || kdfHeader[0] !== 1) throw fail('CHECKPOINT_CORRUPT', 'Unsupported checkpoint KDF.')
+    iterations = new DataView(kdfHeader.buffer).getUint32(1)
+    if (iterations < PBKDF2_ITERATIONS || iterations > 2_000_000) throw fail('CHECKPOINT_CORRUPT', 'Checkpoint KDF work factor is out of bounds.')
+    offset += KDF_HEADER_BYTES
+  }
+  const expectRaw = flags === 1
   if (expectRaw !== (options.secret instanceof Uint8Array)) {
     throw fail('CHECKPOINT_KEY_MISMATCH', expectRaw ? 'This checkpoint requires a 32-byte raw key.' : 'This checkpoint requires a passphrase.')
   }
@@ -263,8 +287,8 @@ export async function restoreDeviceCheckpoint(
   if (expectRaw && salt.some(byte => byte !== 0)) throw fail('CHECKPOINT_CORRUPT', 'Raw-key checkpoint salt must be zero.')
   const iv = new Uint8Array(encryptedBytes.subarray(offset, offset + IV_BYTES)); offset += IV_BYTES
   const ciphertext = new Uint8Array(encryptedBytes.subarray(offset))
-  const key = await deriveAesKey(options.secret, salt, ['decrypt'])
-  const aad = encoder.encode(CHECKPOINT_FORMAT)
+  const key = await deriveAesKey(options.secret, salt, ['decrypt'], iterations)
+  const aad = checkpointAad(kdfHeader)
   let plaintext: ArrayBuffer
   try {
     plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ciphertext)
@@ -293,6 +317,7 @@ export async function restoreDeviceCheckpoint(
       .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
     sqlDatabaseBytes = decoded.sqlDatabaseBase64 === null ? null : decodeBase64(decoded.sqlDatabaseBase64)
   } catch { throw fail('CHECKPOINT_CORRUPT', 'Invalid encoded checkpoint data.') }
+  if (entries.reduce((size, entry) => size + entry.value.byteLength, sqlDatabaseBytes?.byteLength ?? 0) > MAX_RAW_BYTES) throw fail('CHECKPOINT_LIMIT_EXCEEDED', 'Checkpoint data exceeds the bounded handoff limit.')
   const actualDigest = await manifestDigest(entries, sqlDatabaseBytes, decoded.outbox)
   if (actualDigest !== decoded.metadata.manifestSha256) {
     throw fail('CHECKPOINT_INTEGRITY_MISMATCH', 'Checkpoint manifest SHA-256 verification failed.')

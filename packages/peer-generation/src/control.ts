@@ -115,8 +115,9 @@ interface SelectedSegment { readonly generation: SignedGeneration; readonly cuto
 
 /** Constructed only after checking the signed descriptor, control chain and every selection. */
 export class PeerAuthority {
-  readonly #bundle: AuthorityBundle
-  private constructor(bundle: AuthorityBundle) { this.#bundle = structuredClone(bundle) }
+  readonly #bundle: Omit<AuthorityBundle, 'controls' | 'generations'> & { controls: SignedControlRevision[]; generations: SignedGeneration[] }
+  // Only verify() constructs authorities, from its private cloned input.
+  private constructor(bundle: AuthorityBundle) { this.#bundle = { ...bundle, controls: [...bundle.controls], generations: [...bundle.generations] } }
   get bundle(): AuthorityBundle { return structuredClone(this.#bundle) }
   get descriptor(): ApplicationDescriptor { return structuredClone(this.#bundle.descriptor.payload) }
   get current(): SignedGeneration | null { return structuredClone(this.#bundle.generations.at(-1) ?? null) }
@@ -226,7 +227,7 @@ export class PeerAuthority {
       if (index === 0) check(control.payload.previous === null && control.payload.recoveryFloor === null, 'PEER_INITIAL_CONTROL_INVALID')
       else await verifyNextControl(descriptor, bundle.controls[index - 1]!, control)
     }
-    let verified = new PeerAuthority({ descriptor: bundle.descriptor, controls: [bundle.controls[0]!], generations: [] })
+    const verified = new PeerAuthority({ descriptor: bundle.descriptor, controls: [bundle.controls[0]!], generations: [] })
     const transitions = new Set<string>()
     for (const [number, generation] of bundle.generations.entries()) {
       object(generation, ['payload', 'signature', 'id']); hex(generation.id); validateGeneration(generation.payload)
@@ -243,7 +244,8 @@ export class PeerAuthority {
         samePeerValue(value.recoveryFloor, control.payload.recoveryFloor) &&
         value.executionManifestDigest === descriptor.executionManifestDigest, 'PEER_DELEGATION_MISMATCH')
       check(!transitions.has(value.transition.payload.transitionId), 'PEER_TRANSITION_DUPLICATE'); transitions.add(value.transition.payload.transitionId)
-      verified = new PeerAuthority({ descriptor: bundle.descriptor, controls: bundle.controls.slice(0, value.controlRevision + 1), generations: bundle.generations.slice(0, number + 1) })
+      if (value.controlRevision >= verified.#bundle.controls.length) verified.#bundle.controls.push(control)
+      verified.#bundle.generations.push(generation)
     }
     check(verified.control.payload.revision === bundle.controls.length - 1, 'PEER_CONTROL_NOT_ACTIVATED')
     return verified

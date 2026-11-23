@@ -154,10 +154,17 @@ export class ApplicationContent {
     const manifest = await this.serveManifest(this.#replica.device.publicKey, reference)
     if (manifest === null) throw new Error('CONTENT_NOT_RETAINED')
     for (let index = 0; index < manifest.chunks.length; index++) {
-      const bytes = await this.serveChunk(this.#replica.device.publicKey, reference, index)
+      const descriptor = manifest.chunks[index]!
+      const bytes = await this.#store.get(this.#chunkKey(descriptor.hash))
       if (bytes === null) throw new Error('CONTENT_NOT_RETAINED')
-      await this.#decrypt(manifest, index, bytes)
+      await this.#verifyChunk(descriptor, bytes)
+      this.#access(this.#replica.device.publicKey)
     }
+    return this.#signRetention(reference)
+  }
+
+  async #signRetention(reference: ContentReference): Promise<ContentRetention> {
+    this.#access(this.#replica.device.publicKey)
     const generation = this.#replica.generation
     const payload: ContentRetention['payload'] = { reference: structuredClone(reference), peer: this.#replica.device.publicKey,
       storageId: this.#storageId, generation: generation.id, controlRevision: generation.payload.controlRevision, retainedAt: Date.now() }
@@ -170,7 +177,7 @@ export class ApplicationContent {
   async retain(reference: ContentReference, options: { readonly signal?: AbortSignal } = {}): Promise<ContentRetention> {
     const signal = this.#signal(options.signal)
     for await (const _chunk of this.read(reference, options)) { /* Persistence precedes each yielded chunk. */ }
-    const receipt = await this.retained(reference)
+    const receipt = await this.#signRetention(reference)
     signal.throwIfAborted()
     for (const [peer, attached] of [...this.#sources]) {
       const { source } = attached

@@ -63,9 +63,9 @@ export async function forwardSessionEvents<Projected>(options: EventForwarderOpt
       if (!queued) return
       queued = false
       for (;;) {
-        captured = true
         const batch = await awaitOwnedTask(lifetime, async () => {
           const view = await session.readView()
+          captured = true
           let result: ApplicationEventBatch
           try {
             lifetime.throwIfAborted()

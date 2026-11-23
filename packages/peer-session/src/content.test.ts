@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, executionManifestArtifacts } from '@chronolog/protocol'
 import {
@@ -33,7 +33,7 @@ async function fixture() {
     const content = new ApplicationContent({ replica: opened[index]!, store: stores[index]!, storageId: [a, b][index]!.publicKey, epochKeys: keys })
     contents.push(content); return content
   }
-  return { host, a, b, outsider, keys, control, registry, peers: opened, openContent }
+  return { host, a, b, outsider, keys, control, registry, peers: opened, stores, openContent }
 }
 async function collect(content: ApplicationContent, ref: ContentReference, options: { offset?: number; length?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
   const pieces: Uint8Array[] = []
@@ -50,6 +50,25 @@ function deferred<T>() {
 }
 
 describe('peer-held application content', () => {
+  it('retains with one decrypt pass and verifies retained ciphertext without decrypting again', async () => {
+    const f = await fixture(), content = f.openContent(0)
+    const stage = await content.stage({ bytes: 3 })
+    await stage.write(0, Uint8Array.of(1, 2, 3))
+    const reference = await stage.commit(), decrypt = vi.spyOn(crypto.subtle, 'decrypt')
+    try {
+      expect((await content.retain(reference)).payload.reference).toEqual(reference)
+      expect(decrypt).toHaveBeenCalledTimes(1)
+      decrypt.mockClear()
+      await content.retained(reference)
+      await content.retained(reference)
+      expect(decrypt).not.toHaveBeenCalled()
+      const chunk = (await f.stores[0]!.entries()).find(entry => entry.key.includes('/chunk/'))!
+      chunk.value[0]! ^= 1
+      await f.stores[0]!.put(chunk.key, chunk.value)
+      await expect(content.retained(reference)).rejects.toThrow('CONTENT_CHUNK_HASH_MISMATCH')
+    } finally { decrypt.mockRestore() }
+  })
+
   it('resumes indexed encrypted staging and preserves exact committed identity', async () => {
     const f = await fixture(), content = f.openContent(0)
     const body = new Uint8Array(CONTENT_CHUNK_BYTES + 17).fill(91)

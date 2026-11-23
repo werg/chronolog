@@ -116,6 +116,32 @@ describe('event-forwarder cancellation and checkpoints', () => {
 })
 
 describe('event-forwarder recovery and failure evidence', () => {
+  it('starts from the recovered view when recovery precedes the first capture', async () => {
+    const f = forwardFixture(), started = deferred<void>(), recovered = deferred<void>()
+    const pending = deferred<Awaited<ReturnType<EventForwarderSession['readView']>>>()
+    let step = 0
+    f.session.changes = () => ({ [Symbol.asyncIterator]: () => ({
+      next: async () => {
+        if (step++ === 0) return { done: false as const, value: change }
+        if (step === 2) { await recovered.promise; return { done: false as const, value: { ...change, kind: 'recovery' as const, recovery: notice } } }
+        return f.next.promise
+      },
+    }) })
+    f.session.readView = () => { started.resolve(); return pending.promise }
+    const saved = deferred<void>()
+    f.save.mockImplementation(() => { saved.resolve() })
+    const task = forwardSessionEvents(f.options)
+    await started.promise
+    recovered.resolve()
+    await new Promise(setImmediate)
+    pending.resolve({ readEvents: () => f.batch, release: f.release })
+    await saved.promise
+    f.next.resolve({ done: true, value: undefined })
+    await task
+    expect(f.deliver).toHaveBeenCalled()
+    expect(f.save).toHaveBeenCalledWith('cursor')
+  })
+
   it('observes recovery during a pending external delivery and never saves that old cursor', async () => {
     const f = forwardFixture(), pending = deferred<void>(), started = deferred<void>()
     f.deliver.mockImplementation(() => { started.resolve(); return pending.promise })

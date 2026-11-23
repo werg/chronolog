@@ -48,7 +48,16 @@ async function exercise(store: BytesStore): Promise<void> {
 }
 async function idbConformance(name: string): Promise<void> {
   let store = await IndexedDbBytesStore.open(name)
+  check((await store.entries()).length === 0, 'empty IDB enumeration')
   await exercise(store)
+  const snapshot = store.entries(), laterWrite = store.put('later', Uint8Array.of(8))
+  const entries = await snapshot
+  await laterWrite
+  check(entries.map(entry => entry.key).join(',') === 'data,empty,large,ordering', 'sorted IDB snapshot precedes queued write')
+  check(entries[0]?.value[0] === 1 && entries[1]?.value.length === 0, 'decoded IDB snapshot values')
+  check(entries[2]?.value.length === 128 * 1024 + 13 && entries[3]?.value[0] === 2, 'large and replaced IDB snapshot values')
+  entries[0].value[0] = 99
+  check((await store.get('data'))?.[0] === 1, 'IDB snapshot does not alias storage')
   const closing = store.close()
   await closing
   await fails(store.put('after-close', Uint8Array.of(1)), 'INDEXEDDB_STORE_CLOSED')
@@ -71,6 +80,7 @@ async function idbConformance(name: string): Promise<void> {
   database.close()
   store = await IndexedDbBytesStore.open(name)
   await fails(store.get('ordering'), 'INDEXEDDB_VALUE_CORRUPT')
+  await fails(store.entries(), 'INDEXEDDB_VALUE_CORRUPT')
   await store.close()
 }
 async function opfsConformance(name: string): Promise<void> {

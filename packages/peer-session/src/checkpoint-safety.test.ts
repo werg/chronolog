@@ -41,3 +41,67 @@ it('refuses an unrestorable source key before persisting or retiring it',async()
  await expect(exportDeviceCheckpoint(source,{secret:generateCheckpointKey(),persist})).rejects.toMatchObject({code:'CHECKPOINT_CORRUPT'})
  expect(persist).not.toHaveBeenCalled();expect((await isDeviceRetired(source)).retired).toBe(false)
 })
+
+it('keeps the source usable when the durable retirement marker cannot be written', async () => {
+  const store = new MemoryBytesStore(), device = await openApplicationDevice({ store, create: true })
+  const put = store.put.bind(store), original = Error('retirement I/O failure')
+  store.put = async (key, value) => {
+    if (key === 'peer-session/checkpoint-retired/v1') throw original
+    await put(key, value)
+  }
+  await expect(exportDeviceCheckpoint(store, { secret: generateCheckpointKey(), persist: () => undefined })).rejects.toBe(original)
+  expect((await isDeviceRetired(store)).retired).toBe(false)
+  const release = claimApplicationDevice(device)
+  release()
+  store.put = put
+  await expect(exportDeviceCheckpoint(store, { secret: generateCheckpointKey(), persist: () => undefined })).resolves.toMatchObject({ retiredSource: true })
+})
+
+it('round-trips a store exceeding both old checkpoint entry and raw-byte limits', async () => {
+  const store = new MemoryBytesStore(), secret = generateCheckpointKey()
+  for (let index = 0; index < 4500; index++) await store.put(`record/${index}`, Uint8Array.of(index % 256))
+  const body = new Uint8Array(17 * 1024 * 1024).fill(42)
+  await store.put('content', body)
+  const checkpoint = await exportDeviceCheckpoint(store, { secret, retireSource: false }), target = new MemoryBytesStore()
+  expect((await restoreDeviceCheckpoint(target, checkpoint.bytes, { secret })).restoredEntries).toBe(4501)
+  const restored = await target.get('content')
+  expect(restored?.length).toBe(body.length)
+  expect(restored?.every(byte => byte === 42)).toBe(true)
+})
+
+it('authenticates bounded passphrase KDF parameters and rejects wrong passphrases', async () => {
+  const store = new MemoryBytesStore(), secret = 'a sufficiently long passphrase'
+  await store.put('key', Uint8Array.of(7))
+  const checkpoint = await exportDeviceCheckpoint(store, { secret, retireSource: false })
+  expect(checkpoint.bytes[5]).toBe(2)
+  expect(checkpoint.bytes[6]).toBe(1)
+  expect(new DataView(checkpoint.bytes.buffer).getUint32(7)).toBe(600_000)
+  const target = new MemoryBytesStore()
+  await restoreDeviceCheckpoint(target, checkpoint.bytes, { secret })
+  expect(await target.get('key')).toEqual(Uint8Array.of(7))
+  await expect(restoreDeviceCheckpoint(new MemoryBytesStore(), checkpoint.bytes, { secret: 'a different long passphrase' })).rejects.toMatchObject({ code: 'CHECKPOINT_DECRYPT_FAILED' })
+  const altered = checkpoint.bytes.slice()
+  new DataView(altered.buffer).setUint32(7, 600_001)
+  await expect(restoreDeviceCheckpoint(new MemoryBytesStore(), altered, { secret })).rejects.toMatchObject({ code: 'CHECKPOINT_DECRYPT_FAILED' })
+  new DataView(altered.buffer).setUint32(7, 0xffff_ffff)
+  await expect(restoreDeviceCheckpoint(new MemoryBytesStore(), altered, { secret })).rejects.toMatchObject({ code: 'CHECKPOINT_CORRUPT' })
+})
+
+it('restores legacy passphrase checkpoints with the original PBKDF2 work factor', async () => {
+  const store = new MemoryBytesStore(), raw = generateCheckpointKey(), secret = 'legacy passphrase secret'
+  await store.put('legacy', Uint8Array.of(9))
+  const checkpoint = await exportDeviceCheckpoint(store, { secret: raw, retireSource: false })
+  const aad = new TextEncoder().encode('chronolog-device-checkpoint-v1')
+  const rawKey = await crypto.subtle.importKey('raw', new Uint8Array(raw), 'AES-GCM', false, ['decrypt'])
+  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: checkpoint.bytes.slice(22, 34), additionalData: aad }, rawKey, checkpoint.bytes.slice(34))
+  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12))
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), 'PBKDF2', false, ['deriveKey'])
+  const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100_000 }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt'])
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, plaintext))
+  const legacy = new Uint8Array(34 + ciphertext.length)
+  legacy.set(checkpoint.bytes.slice(0, 5)); legacy[5] = 0
+  legacy.set(salt, 6); legacy.set(iv, 22); legacy.set(ciphertext, 34)
+  const target = new MemoryBytesStore()
+  await restoreDeviceCheckpoint(target, legacy, { secret })
+  expect(await target.get('legacy')).toEqual(Uint8Array.of(9))
+})

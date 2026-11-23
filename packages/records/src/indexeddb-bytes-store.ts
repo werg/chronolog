@@ -95,20 +95,27 @@ export class IndexedDbBytesStore implements BytesStore {
   }
   async entries(): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
     return this.#enqueue(async () => {
-      const rawEntries = await this.#transaction('readonly', table => {
-        const keysRequest = table.getAllKeys()
-        const valuesRequest = table.getAll()
-        return () => ({ keys: keysRequest.result, values: valuesRequest.result })
-      })
-      const items: { readonly key: string; readonly value: Uint8Array }[] = []
-      for (let i = 0; i < rawEntries.keys.length; i++) {
-        const key = rawEntries.keys[i]
-        const raw = rawEntries.values[i] as unknown
-        if (typeof key !== 'string' || !(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) {
-          throw new Error('INDEXEDDB_VALUE_CORRUPT')
+      // Capture one transaction snapshot without separate key/value arrays.
+      // Decode in place afterwards so consumed envelopes can be collected,
+      // rather than retaining a second full copy beside all decoded values.
+      const items = await this.#transaction('readonly', table => {
+        const entries: { key: string; value: Uint8Array }[] = []
+        let failure: Error | undefined
+        const request = table.openCursor()
+        request.onsuccess = () => {
+          const cursor = request.result
+          if (cursor === null) return
+          const key = cursor.key, raw: unknown = cursor.value
+          if (typeof key !== 'string' || !(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) {
+            failure = new Error('INDEXEDDB_VALUE_CORRUPT')
+            return
+          }
+          entries.push({ key, value: raw })
+          cursor.continue()
         }
-        items.push({ key, value: await decodeRecordValue(key, raw, 'INDEXEDDB_VALUE_CORRUPT') })
-      }
+        return () => { if (failure !== undefined) throw failure; return entries }
+      })
+      for (const entry of items) entry.value = await decodeRecordValue(entry.key, entry.value, 'INDEXEDDB_VALUE_CORRUPT')
       return items.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
     })
   }

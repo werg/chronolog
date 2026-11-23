@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, type StatementSync } from 'node:sqlite'
 
 import type { BytesStore } from './bytes-store.js'
 
@@ -17,6 +17,9 @@ export interface NativeBytesStoreOptions {
  */
 export class NativeBytesStore implements BytesStore {
   readonly #database: DatabaseSync
+  readonly #getStatement: StatementSync
+  readonly #sizeStatement: StatementSync
+  readonly #putStatement: StatementSync
   readonly #quotaBytes: number
   readonly #maxValueBytes: number
   #usedBytes = 0
@@ -47,6 +50,9 @@ export class NativeBytesStore implements BytesStore {
       // An exclusive owner accounts once on reopen. Appending one value must
       // not scan every retained body merely to enforce its storage quota.
       this.#usedBytes = (this.#database.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get() as { bytes: number }).bytes
+      this.#getStatement = this.#database.prepare('SELECT value FROM stored_bytes WHERE key = ?')
+      this.#sizeStatement = this.#database.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?')
+      this.#putStatement = this.#database.prepare('INSERT INTO stored_bytes (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
     } catch (error) {
       try { this.#database.close() } catch { /* failed opening */ }
       if (/locked|busy/iu.test(error instanceof Error ? error.message : '')) {
@@ -59,7 +65,7 @@ export class NativeBytesStore implements BytesStore {
   async get(key: string): Promise<Uint8Array | null> {
     this.#assertOpen()
     validateKey(key)
-    const row = this.#database.prepare('SELECT value FROM stored_bytes WHERE key = ?').get(key) as
+    const row = this.#getStatement.get(key) as
       { value: Uint8Array } | undefined
     return row === undefined ? null : Uint8Array.from(row.value)
   }
@@ -70,12 +76,11 @@ export class NativeBytesStore implements BytesStore {
     if (!(value instanceof Uint8Array) || value.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
     this.#database.exec('BEGIN IMMEDIATE')
     try {
-      const previous = this.#database.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?').get(key) as
+      const previous = this.#sizeStatement.get(key) as
         { bytes: number } | undefined
       const used = this.#usedBytes - (previous?.bytes ?? 0) + value.byteLength
       if (used > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
-      this.#database.prepare('INSERT INTO stored_bytes (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-        .run(key, value)
+      this.#putStatement.run(key, value)
       this.#database.exec('COMMIT')
       this.#usedBytes = used
     } catch (error) {

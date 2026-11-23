@@ -195,10 +195,9 @@ export class ApplicationData<D extends ApplicationDefinition = ApplicationDefini
       if (!this.#replica.ready) return undefined
       const current = await this.#replica.operation(applied.operationId, applied.author)
       if (current?.status === 'abandoned' || current?.status === 'needsReapply') throw new AbandonedOperationError(current)
-      const commands = await this.#replica.exportCommands()
-      const command = commands.find(value => value.attempt.id === applied.attemptId)
-      if (command === undefined) return undefined
-      const coverage = this.#replica.shared({ generation: applied.generation, sequence: applied.sequence, root: command.receipt.root })
+      const root = this.#replica.receiptRoot(applied.attemptId)
+      if (root === null) return undefined
+      const coverage = this.#replica.shared({ generation: applied.generation, sequence: applied.sequence, root })
       return coverage.length === 0 ? undefined : coverage
     })
   }

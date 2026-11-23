@@ -195,13 +195,24 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
       await expect(a.order(await a.prepare({ operationId: 'later', program: event('later') }))).rejects.toThrow('PEER_REPLAY_OUTCOME_CONFLICT')
     } finally { replay.mockRestore(); read.mockRestore() }
   })
+  it('reports every locally abandoned attempt beyond the former notice limit', async () => {
+    const f = await fixture(), a = await f.open(f.a)
+    for (let index = 0; index < 1025; index++) await a.prepare({ operationId: `pending-${index}`, program: event('pending') })
+    await f.select(f.b, await a.recoveryPoint(), 'replace-pending')
+    const notice = await a.adopt(await f.registry.read())
+    expect(notice?.abandoned).toHaveLength(1025)
+    expect(notice?.abandoned).toContainEqual(expect.objectContaining({ operationId: 'pending-1024', status: 'needsReapply' }))
+  }, 20_000)
+
   it('adopts an older complete prefix, seeds a fresh peer and quarantines the returning suffix', async () => {
     const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
     const one = await a.prepare({ operationId: 'one', program: event('one') })
     await a.order(one); await b.ingest(await a.exportCommands())
     const inheritedView = await b.capture(); const inheritedRevision = inheritedView.revision; inheritedView.release()
     const two = await a.prepare({ operationId: 'two', program: event('two') })
-    await a.order(two)
+    const orderedTwo = await a.order(two)
+    expect(a.receiptRoot(two.id)).toBe(orderedTwo.receipt.root)
+    expect(a.receiptRoot('unknown')).toBeNull()
     const held = await a.capture(), oldRevision = held.revision
     const base = await b.recoveryPoint(), g2 = await f.select(f.b, base, 'second')
     await b.adopt(await f.registry.read())
@@ -215,6 +226,7 @@ describe('peer-owned encrypted history and tolerant recovery', () => {
     expect(notice?.abandoned).toContainEqual(expect.objectContaining({ operationId: 'two', status: 'abandoned' }))
     expect(notice?.unknownLoss, 'known abandoned work does not prove that no unseen suffix exists').toBe(true)
     expect((await a.operation('two'))?.status).toBe('abandoned')
+    expect(a.receiptRoot(two.id)).toBeNull()
     expect(held.read.orderLength).toBe(2); held.release()
     await expect(a.prepare({ operationId: 'stale-view', program: event('stale'), basedOn: oldRevision })).rejects.toThrow('PEER_VIEW_RECOVERY_REQUIRED')
     await expect(b.order(two)).rejects.toThrow('PEER_ATTEMPT_NEEDS_REAPPLY')

@@ -234,9 +234,10 @@ class Replica implements PeerReplica {
     const { receipt, attempt } = command, generation = authority.generation(receipt.payload.generation)
     await verifyOrderReceipt(receipt, generation, this.descriptor)
     const core = await verifyAttempt(attempt, authority, this.#options.epochKeys)
+    const attemptBytes = encodePeerValue(attempt)
     check(receipt.payload.attemptId === attempt.id && receipt.payload.author === attempt.payload.header.author &&
       receipt.payload.operationId === attempt.payload.header.operationId && receipt.payload.generation === attempt.payload.header.generation &&
-      receipt.payload.bodyHash === await bytesDigest(encodePeerValue(attempt)) && receipt.payload.bodyBytes === encodePeerValue(attempt).length,
+      receipt.payload.bodyHash === await bytesDigest(attemptBytes) && receipt.payload.bodyBytes === attemptBytes.length,
     'PEER_ORDER_BODY_MISMATCH')
     const entries = this.#records.get(generation.id), head = this.#heads.get(generation.id)
     check(entries !== undefined && head !== undefined, 'PEER_GENERATION_NOT_LOADED')
@@ -368,7 +369,7 @@ class Replica implements PeerReplica {
         if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
       }
       notice = { previousGeneration: pending.previousGeneration, generation: pending.generation, adopted: this.generation.payload.adopted,
-        revision: this.revision, abandoned: abandoned.slice(0, 1024),
+        revision: this.revision, abandoned,
         unknownLoss: true }
       const recoveries = [...this.#recoveries, structuredClone(notice)].slice(-32)
       await this.#write(`${this.#prefix}/recoveries`, encodePeerValue(recoveries))
@@ -637,6 +638,10 @@ class Replica implements PeerReplica {
     return structuredClone({ operationId: pause.operationId, generation: pause.generation, base: pause.base })
   }
   prefixProof(point: HistoryPoint): Promise<PrefixProof> { return this.#serial.run(async () => { this.#assertReady(); return this.#proof(point) }) }
+  receiptRoot(attemptId: string): string | null {
+    this.#assertOpen()
+    return this.#selectedIds.has(attemptId) ? this.#receipts.get(attemptId)?.receipt.root ?? null : null
+  }
   exportCommands(options: { readonly after?: HistoryPoint; readonly offset?: number; readonly limit?: number; readonly maxBytes?: number; readonly at?: PeerRevision } = {}): Promise<readonly OrderedCommand[]> {
     return this.#serial.run(async () => {
       this.#assertOpen()
