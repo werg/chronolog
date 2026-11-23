@@ -137,8 +137,13 @@ function availablePoint(replica: ApplicationDataPort['replica'] | undefined): Hi
     throw error
   }
 }
-function grant(participant: Pick<ApplicationParticipant, 'grant'>, key: string, role: 'reader' | 'writer'): boolean {
+function grant(participant: Pick<ApplicationParticipant, 'grant'>, key: string, role: 'reader' | 'writer' | 'relay'): boolean {
   return participant.grant(key)?.[role] === true
+}
+function requireSubmitter(participant: ApplicationParticipant, carrier: string, input: unknown): void {
+  const author = (input as SignedAttempt | null)?.payload?.header?.author
+  requireNetwork(typeof author === 'string' && grant(participant, author, 'writer') &&
+    (author === carrier || grant(participant, carrier, 'relay')), 'PEER_AUTHOR_FORBIDDEN')
 }
 function deadline(value: number | undefined, fallback: number): number {
   const selected = value ?? fallback
@@ -288,7 +293,7 @@ class NetworkPeer implements ApplicationPeerLink {
       if (previous !== undefined) void previous.retire().catch(() => undefined)
       this.#detach = this.#port.attach(this.peerId, async attempt => {
         this.#reader()
-        requireNetwork(attempt.payload.header.author === participant.device.publicKey && grant(participant, participant.device.publicKey, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+        requireSubmitter(participant, participant.device.publicKey, attempt)
         await this.#request('submit', attempt)
         this.#reader(); await this.synchronize()
       }, this)
@@ -499,7 +504,7 @@ class NetworkPeer implements ApplicationPeerLink {
       const timer = setTimeout(() => this.#fail(networkError('APPLICATION_NETWORK_REQUEST_TIMEOUT')), this.#requestMs)
       this.#pending.set(id, { method, request, resolve, reject, cancel: () => clearTimeout(timer) })
       void Promise.resolve().then(() => this.#wire.send({ kind: 'request', message: request }, () => {
-        if (method === 'submit') requireNetwork(grant(this.#port.participant, this.#port.participant.device.publicKey, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+        if (method === 'submit') requireSubmitter(this.#port.participant, this.#port.participant.device.publicKey, value)
         if (method === 'keyShare') requireNetwork((value as ApplicationKeyRequest).payload.recipient === this.#port.participant.device.publicKey,
           'APPLICATION_KEY_REQUEST_INVALID')
       })).then(() => { this.#sentRequests++ }).catch(error => {
@@ -562,7 +567,7 @@ class NetworkPeer implements ApplicationPeerLink {
       requireNetwork(participant.isCoordinator, 'PEER_NOT_COORDINATOR')
     }
     if (method === 'submit') {
-      requireNetwork((input as SignedAttempt)?.payload?.header?.author === this.peerId && grant(participant, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+      requireSubmitter(participant, this.peerId, input)
       requireNetwork(participant.isCoordinator, 'PEER_NOT_COORDINATOR')
     }
     // Only an explicit activation or a writer's submission requests coordinator
@@ -597,8 +602,8 @@ class NetworkPeer implements ApplicationPeerLink {
           { generation: command.receipt.payload.generation, sequence: command.receipt.payload.sequence, root: command.receipt.root }))
       } else if (method === 'submit') {
         const attempt = input as SignedAttempt
-        requireNetwork(attempt?.payload?.header?.author === this.peerId && grant(participant, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
-        await replica.order(attempt); this.#reader(); requireNetwork(grant(participant, this.peerId, 'writer'), 'PEER_AUTHOR_FORBIDDEN')
+        requireSubmitter(participant, this.peerId, attempt)
+        await replica.order(attempt); this.#reader(); requireSubmitter(participant, this.peerId, attempt)
       } else if (method === 'coverage') {
         const request = record(input, ['generation', 'point'])
         validateHistoryPoint(request.point as HistoryPoint)

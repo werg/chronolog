@@ -76,6 +76,60 @@ const session = await connectApplicationWorker({ port: worker })
 
 Existing devices should open with `mode: 'open'` so missing storage fails closed instead of minting a replacement identity.
 
+## Run a device inside celld
+
+The `@chronolog/peer-session/celld` entry uses a celld Durable Object's
+SQLite storage for the same device identity and application session.
+
+```ts
+import { openCelldApplication, openCelldDevice } from '@chronolog/peer-session/celld'
+
+const device = await openCelldDevice({ storage: ctx.storage })
+const session = await openCelldApplication({ device, definition, authority })
+```
+
+Pass `create: true` during explicit device setup. Later activations reopen
+the retained signer and history. Provide `openDataStorage` to open a
+separate SQLite facet on demand. Closing the device releases its handles
+within the Durable Object. Pass `frameCelldPeerStream(stream)` as the
+`connection` to `session.connectPeer()` for streams opened or accepted
+by the same object. The session authenticates the peer's application
+identity. The Iroh node ID identifies the transport endpoint.
+
+For a host-managed device, declare the Ed25519 private key as a class
+secret. Use the admitted public key and the secret's lowercase PKCS#8 hex
+value on every activation.
+
+```ts
+import { importCelldSigningIdentity, openCelldDevice } from '@chronolog/peer-session/celld'
+
+const managedSigner = await importCelldSigningIdentity(admittedPublicKey, env.CHRONOLOG_SIGNER_PKCS8)
+const device = await openCelldDevice({ storage: ctx.storage, managedSigner })
+```
+
+Pass `create: true` on the initial managed enrollment. The device metadata
+keeps only the public identity and its storage binding. A missing or
+different key prevents resume. The same imported identity can sign
+generation selections through `openCelldApplicationControl` where it
+matches that application's registered control key.
+
+### Invite a device
+
+After the control object selects a generation with the member's reader
+grant, an admitted administrator can sign a celld invitation with
+`signCelldApplicationInvitation({ authority, memberPublicKey, endpoint, inviter })`.
+Use the administrator device's Ed25519 identity and its actual Iroh
+endpoint. The signed invitation carries the selected authority and
+endpoint. Epoch keys remain on the authenticated peer link.
+
+On the invited device, call
+`acceptCelldApplicationInvitation(device, invitation)`. It checks the exact
+member key, signature and signed control history, and retains the authority
+before opening the application. Pass the returned `authority` to
+`openCelldApplication` and use the returned `peer` and `endpoint` with
+`createCelldPeerTransport`. The application session authenticates that peer
+and synchronizes the selected history over the connection.
+
 ## Commands, queries, and change streams
 
 ```ts
@@ -171,6 +225,8 @@ node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-sessio
 
 See [Qualification](../../docs/release-hardening.md) and [Browser storage](../../docs/browser-storage.md) for verification details.
 
+
+Use `--sql-celld` to include the signed SQL and workspace adapters for celld. The release workflow attests this archive for host builds.
 
 ## Quiesced device handoff and disposable sessions
 

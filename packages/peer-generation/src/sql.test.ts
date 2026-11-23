@@ -51,7 +51,7 @@ it('uses real deterministic SQL, protected signed genesis and coherent rollback 
       program: program("INSERT INTO tasks (id,title) VALUES (2,'first')", emit('task.created', { id: 2 })) })
     await pa.replica.order(duplicate); await pb.replica.ingest(await pa.replica.exportCommands())
     expect(await pa.replica.operation('first')).toMatchObject({ status: 'applied', outcome: 'accepted' })
-    expect(await pa.replica.operation('duplicate')).toMatchObject({ status: 'applied', outcome: 'rejected', rejectionCode: 'constraint' })
+    expect(await pa.replica.operation('duplicate')).toMatchObject({ status: 'applied', outcome: 'rejected', rejectionCode: 'constraint', failingStatementIndex: 0 })
     const av = await pa.replica.capture(), bv = await pb.replica.capture()
     try {
       expect(av.read.query('SELECT id,title FROM tasks ORDER BY id').rows).toEqual(bv.read.query('SELECT id,title FROM tasks ORDER BY id').rows)

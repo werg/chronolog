@@ -29,12 +29,16 @@ const claimed = new WeakSet<ApplicationDevice>()
 export async function openApplicationDevice(options: {
   readonly store: DeviceMetadataStore
   readonly create?: true
+  /** A host-managed signer is resolved on every activation and never serialized. */
+  readonly managedSigner?: PeerIdentity
   readonly openStorage?: () => ApplicationStorage | Promise<ApplicationStorage>
   readonly close?: () => void | Promise<void>
 }): Promise<ApplicationDevice> {
   const releaseOpening = useDeviceStore(options.store)
   try {
   await assertDeviceNotRetired(options.store)
+  const managedSigner = options.managedSigner && { ...options.managedSigner }
+  if (managedSigner) await verifyDeviceSigner(managedSigner)
   let raw = await options.store.get(DEVICE_KEY), binding = await options.store.get(DEVICE_BINDING)
   // Atomic initialization can commit between these separate metadata reads.
   // Its immutable binding confirms creation finished; check the signer again
@@ -44,11 +48,14 @@ export async function openApplicationDevice(options: {
   if (raw === null) {
     if (binding !== null) throw new Error('APPLICATION_DEVICE_KEYS_MISSING')
     if (options.create !== true) throw new Error('APPLICATION_DEVICE_NOT_FOUND')
-    const candidate = await createPeerIdentity(), candidateStorageId = crypto.randomUUID()
+    const candidate = managedSigner ?? await createPeerIdentity()
+    const candidateStorageId = crypto.randomUUID()
+    const record = managedSigner
+      ? [2n, candidate.publicKey, candidateStorageId]
+      : [1n, candidate.publicKey, await exportEd25519PrivateKey(candidate.privateKey), candidateStorageId]
     const entries = [
       { key: DEVICE_BINDING, value: encodeCanonicalCbor([candidate.publicKey, candidateStorageId]) },
-      { key: DEVICE_KEY, value: encodeCanonicalCbor([1n, candidate.publicKey,
-        await exportEd25519PrivateKey(candidate.privateKey), candidateStorageId]) },
+      { key: DEVICE_KEY, value: encodeCanonicalCbor(record) },
     ]
     if (options.store.initialize !== undefined) await options.store.initialize(entries)
     else for (const entry of entries) await options.store.put(entry.key, entry.value)
@@ -59,16 +66,17 @@ export async function openApplicationDevice(options: {
   }
   {
     const value = assertCanonicalCbor(raw)
-    if (!Array.isArray(value) || value.length !== 4 || value[0] !== 1n || typeof value[1] !== 'string' ||
-        !/^[0-9a-f]{64}$/u.test(value[1]) || !(value[2] instanceof Uint8Array) || typeof value[3] !== 'string' ||
-        value[3].length > 128 || value[3].length === 0) throw new Error('APPLICATION_DEVICE_INVALID')
-    identity = { publicKey: value[1], privateKey: await importEd25519PrivateKey(value[2]) }; storageId = value[3]
+    if (!Array.isArray(value) || typeof value[1] !== 'string' || !/^[0-9a-f]{64}$/u.test(value[1])) throw new Error('APPLICATION_DEVICE_INVALID')
+    if (value[0] === 2n && value.length === 3 && validStorageId(value[2])) {
+      if (managedSigner === undefined) throw new Error('APPLICATION_DEVICE_MANAGED_SIGNER_REQUIRED')
+      if (managedSigner.publicKey !== value[1]) throw new Error('APPLICATION_DEVICE_KEY_MISMATCH')
+      identity = managedSigner; storageId = value[2]
+    } else if (value[0] === 1n && value.length === 4 && value[2] instanceof Uint8Array && validStorageId(value[3])) {
+      if (managedSigner !== undefined) throw new Error('APPLICATION_DEVICE_STORAGE_MODE_MISMATCH')
+      identity = { publicKey: value[1], privateKey: await importEd25519PrivateKey(value[2]) }; storageId = value[3]
+      await verifyDeviceSigner(identity)
+    } else throw new Error('APPLICATION_DEVICE_INVALID')
     if (binding === null || !sameBytes(binding, encodeCanonicalCbor([identity.publicKey, storageId]))) throw new Error('APPLICATION_DEVICE_BINDING_INVALID')
-    const proof = new TextEncoder().encode('chronolog/device-resume/v1')
-    const signature = await crypto.subtle.sign('Ed25519', identity.privateKey, proof)
-    if (!await crypto.subtle.verify('Ed25519', await importEd25519PublicKey(hexToBytes(identity.publicKey)), signature, proof)) {
-      throw new Error('APPLICATION_DEVICE_KEY_MISMATCH')
-    }
   }
   let closed = false, storage: ApplicationStorage | undefined
   let opening: Promise<ApplicationStorage> | undefined, closing: Promise<void> | undefined
@@ -120,5 +128,16 @@ export function claimApplicationDevice(device: ApplicationDevice): () => void {
   const release = useDeviceStore(device.store)
   claimed.add(device)
   return () => { claimed.delete(device); release() }
+}
+function validStorageId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128
+}
+export async function verifyDeviceSigner(identity: PeerIdentity): Promise<void> {
+  if (!/^[0-9a-f]{64}$/u.test(identity.publicKey)) throw new Error('APPLICATION_DEVICE_KEY_MISMATCH')
+  const proof = new TextEncoder().encode('chronolog/device-resume/v1')
+  const signature = await crypto.subtle.sign('Ed25519', identity.privateKey, proof)
+  if (!await crypto.subtle.verify('Ed25519', await importEd25519PublicKey(hexToBytes(identity.publicKey)), signature, proof)) {
+    throw new Error('APPLICATION_DEVICE_KEY_MISMATCH')
+  }
 }
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean { return a.length === b.length && a.every((byte, index) => byte === b[index]) }

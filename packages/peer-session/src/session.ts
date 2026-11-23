@@ -1,9 +1,9 @@
 import {
   PEER_GENERATION_CAPABILITIES, assertAuthorityExtension, verifyAuthorityBundle,
-  type AuthorityBundle, type PeerAuthority,
+  type AuthorityBundle, type PeerAuthority, type PeerGrant, type PeerIdentity,
 } from '@chronolog/peer-generation/control'
 import type { PeerRevision, AppliedResult, OperationState, RecoveryNotice, SignedAttempt, SignedRetainedCoverage, PeerOrderingPause, PrefixProof } from '@chronolog/peer-generation'
-import { bytesToHex, hexToBytes, type EventPayload } from '@chronolog/protocol'
+import { bytesToHex, hexToBytes, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import { SignalChannel, type Signals } from '@chronolog/signals'
 import { describeApplication, type ApplicationCommand, type ApplicationDefinition, type ApplicationQuery } from './definition.js'
 import type { OpenPeerApplicationOptions } from './runtime.js'
@@ -19,14 +19,14 @@ import type { ApplicationParticipation, ApplicationParticipationOptions } from '
 import { connectApplicationPeer, connectApplicationPeerPair, connectedApplicationPeers,
   type ApplicationPeerConnectOptions, type ApplicationPeerLink, type ApplicationPeerPort } from './network.js'
 import type { ApplicationChange, ApplicationReadView, CommandOptions, SessionStatus } from './session-types.js'
-import type { ApplicationOperation } from './operation.js'
+import type { ApplicationOperation, ApplicationSubmission } from './operation.js'
 import { awaitOwnedTask } from './lifetime.js'
 import { deferredStream } from './deferred-stream.js'
 import { retainApplicationAuthority } from './session-authority.js'
 
 export * from './session-types.js'
 export * from './errors.js'
-export { ApplicationOperation } from './operation.js'
+export { ApplicationOperation, type ApplicationSubmission } from './operation.js'
 
 type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
 type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
@@ -246,11 +246,23 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async command<Name extends keyof D['commands'] & string>(name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions): Promise<ApplicationOperation> {
     return (await this.#requireData()).command(name, input, options)
   }
+  /** The owning host has authenticated and approved the use of this signing identity. */
+  async submitProgramAs(program: ChangeProgram, author: PeerIdentity, options: CommandOptions): Promise<ApplicationSubmission> {
+    const capturedProgram = structuredClone(program), identity = { ...author }, request = structuredClone(options)
+    return (await this.#requireData()).submitProgramAs(capturedProgram, identity, request)
+  }
   async reapply<Name extends keyof D['commands'] & string>(id: string, name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions & { readonly originalAuthor?: string }): Promise<ApplicationOperation> {
     return (await this.#requireData()).reapply(id, name, input, options)
   }
   async query<Name extends keyof D['queries'] & string>(name: Name, input: QueryArguments<D['queries'][Name]>): Promise<{ readonly revision: PeerRevision; readonly value: QueryResult<D['queries'][Name]> }> {
     return (await this.#requireData()).query(name, input)
+  }
+  memberGrant(publicKey: string): PeerGrant | null {
+    this.#assertOpen()
+    return this.#participant.grant(publicKey)
+  }
+  async operationByAttempt(attemptId: string, author: string): Promise<OperationState | null> {
+    return (await this.#requireData()).replica.operationByAttempt(attemptId, author)
   }
   async readView(): Promise<ApplicationReadView> { return (await this.#requireData()).readView() }
   onRecovery(listener: (notice: RecoveryNotice) => void): () => void {
@@ -325,7 +337,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }, { once: true })
     return participant
   }
-  async retry(id: string): Promise<void> { return (await this.#requireData()).retry(id) }
+  async retry(id: string, author?: string): Promise<void> { return (await this.#requireData()).retry(id, author) }
   async resume(): Promise<void> {
     this.#assertOpen()
     if (this.#participant.data !== undefined) await this.#data?.resume()

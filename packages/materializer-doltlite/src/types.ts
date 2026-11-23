@@ -1,4 +1,4 @@
-import type { ChangeProgram, ExecutionManifest, TransactionOrderKey } from '@chronolog/protocol'
+import type { ChangeProgram, ExecutionManifest, SqlStatement, TransactionOrderKey } from '@chronolog/protocol'
 export type { ReplayProposal } from '@chronolog/materializer'
 
 export type TransactionOutcomeKind = 'accepted' | 'rejected'
@@ -157,6 +157,11 @@ export interface StatementLike {
 }
 
 export interface DatabaseLike {
+  /** The host enforces the SQL profile in-process when callbacks belong to another runtime. */
+  readonly nativeProfile?: {
+    executeConsensus(statement: SqlStatement, schemaAdmin: boolean): string | null
+    prepare(sql: string, mode: 'platform' | 'local_read', limits: SqlRuntimeLimits): StatementLike
+  }
   /** Engine tokenizer inspection, identical in native and WASM profiles. */
   triggerUsesIgnore(sql: string): boolean
   readonly inTransaction: boolean
@@ -197,10 +202,10 @@ export interface DatabaseLike {
 /** Explicit execution capability; adapters supply an engine without owning an application. */
 export interface SqlEngine {
   readonly executionManifest: ExecutionManifest
-  openDatabase(options: { readonly path: string }): {
+  openDatabase(options: { readonly path: string; readonly readOnly?: boolean }): {
     readonly database: DatabaseLike
     readonly backend: MaterializerBackendInfo
-    readonly security: SecurityConfiguration
+    readonly security?: SecurityConfiguration
   }
 }
 

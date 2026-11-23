@@ -1,7 +1,7 @@
 import { isEmitStep, isPlatformOp, type SqlStatement, type ChangeProgram } from '@chronolog/protocol'
 
 import { cachedInternalStatement, PlatformRejection, PlatformSession, toDatabaseValue, writeProtectedTables, lifecycleTriggerNames } from './platform/session.js'
-import { isOperationalSqliteError, SqlProfileError, sqlitePrimaryCode, withProfiledStatement, type SqlAuthorizationOptions } from './sql-profile.js'
+import { isOperationalSqliteError, NativeSqlRejection, SqlProfileError, sqlitePrimaryCode, withProfiledStatement, type SqlAuthorizationOptions } from './sql-profile.js'
 import type { DatabaseLike, SqlRuntimeLimits, StatementLike } from './types.js'
 
 export { toDatabaseValue }
@@ -100,6 +100,11 @@ function executeStatement(
   authorization: SqlAuthorizationOptions,
 ): void {
   try {
+    if (database.nativeProfile !== undefined) {
+      const rejection = database.nativeProfile.executeConsensus(statement, authorization.schemaAdmin === true)
+      if (rejection !== null) throw new SqlRejection(rejection, index)
+      return
+    }
     withProfiledStatement(database, statement.sql, 'consensus', (prepared) => {
       prepared.run(bindingArray(prepared, statement, index))
     }, limits, authorization)
@@ -134,6 +139,7 @@ function bindingArray(prepared: StatementLike, statement: SqlStatement, index: n
 
 function rejectionFor(error: unknown, index: number | null): Error {
   if (error instanceof SqlRejection) return error
+  if (error instanceof NativeSqlRejection) return new SqlRejection(error.code, index)
   if (error instanceof PlatformRejection) return new SqlRejection(error.code, index)
   if (error instanceof SqlProfileError) {
     switch (error.code) {

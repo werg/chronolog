@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./native": "./src/native.ts",
+    "./celld": "./src/celld.ts",
     "./browser": "./src/browser.ts",
     "./indexeddb-browser": "./src/indexeddb-bytes-store.ts"
   },

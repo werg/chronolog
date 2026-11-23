@@ -599,8 +599,14 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       // Roll back to the savepoint rather than the outer transaction: a full
       // ROLLBACK after checking out a replay branch can restore DoltLite's
       // previous branch working set, resurrecting later log rows.
-      if (rejection !== null) this.#writer.exec('ROLLBACK TO SAVEPOINT chronolog_program')
-      this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
+      if (rejection !== null && !this.#writer.inTransaction) {
+        // A native write interrupt has rolled back the whole program.
+        // Record the deterministic refusal in a new transaction.
+        this.#writer.exec('BEGIN IMMEDIATE')
+      } else {
+        if (rejection !== null) this.#writer.exec('ROLLBACK TO SAVEPOINT chronolog_program')
+        this.#writer.exec('RELEASE SAVEPOINT chronolog_program')
+      }
       this.#writer.exec('DELETE FROM chronolog_execution_context')
       if (generation !== undefined) this.#writer.prepare('INSERT INTO chronolog_attempt_generations (transaction_id, generation) VALUES (?, ?)').run(transaction.txId, generation)
       insertSystemLogRow(this.#writer, logRow(transaction, orderIndex, rejection))
@@ -651,7 +657,7 @@ function openPublishedReader(options: MaterializerOptions, writer: DatabaseLike,
   writer.doltBranch(branchRef, commit)
   let database: DatabaseLike | undefined
   try {
-    const opened = openDatabase(options)
+    const opened = openDatabase(options, true)
     database = opened.database
     if (!bytesEqual(opened.backend.engineDigest, options.engine.executionManifest.engineDigest)) {
       throw new MaterializerInputError('MATERIALIZER_ENGINE_DIGEST_MISMATCH')
@@ -713,6 +719,7 @@ function isFreshRepository(database: DatabaseLike): boolean {
      WHERE type IN ('table', 'view', 'trigger', 'index')
        AND name NOT LIKE 'sqlite_%'
        AND name NOT LIKE 'dolt_%'
+       ${database.nativeProfile === undefined ? '' : "AND name NOT GLOB '_cf_*'"}
      LIMIT 1
   `).get() === undefined
 }
@@ -796,8 +803,8 @@ async function validateTransactionSet(
   }
 }
 
-function openDatabase(options: MaterializerOptions): ReturnType<MaterializerOptions['engine']['openDatabase']> {
-  return options.engine.openDatabase({ path: options.path })
+function openDatabase(options: MaterializerOptions, readOnly = false): ReturnType<MaterializerOptions['engine']['openDatabase']> {
+  return options.engine.openDatabase({ path: options.path, ...(readOnly ? { readOnly } : {}) })
 }
 
 function verifyFinalTransactions(final: readonly TransactionLogRow[], transactions: readonly ReplayProposal[]): void {

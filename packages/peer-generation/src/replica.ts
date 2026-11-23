@@ -14,7 +14,7 @@ import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, vali
 import { PEER_MAX_RECORDS, PEER_MAX_HISTORY_BYTES } from './control-types.js'
 import type {
   AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, HistoryReceiveResult, OperationState, OrderedCommand,
-  PeerGrant, PeerReplica, PeerReplicaOptions, PeerRevision, PeerOrderingPause, PrefixProof, PrepareCommand,
+  PeerGrant, PeerIdentity, PeerOrderingPause, PeerReplica, PeerReplicaOptions, PeerRevision, PrefixProof, PrepareCommand,
   RecoveryNotice, SignedAttempt, SignedGeneration, SignedRetainedCoverage,
 } from './types.js'
 
@@ -234,7 +234,9 @@ class Replica implements PeerReplica {
           const result = decodePeerValue<AppliedResult>(resultBytes)
           check(result.status === 'applied' && result.attemptId === command.attempt.id && result.generation === generation.id &&
             result.sequence === start + offset && result.operationId === command.receipt.payload.operationId &&
-            result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected'), 'PEER_RESULT_JOURNAL_INVALID')
+            result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected') &&
+            (result.failingStatementIndex === undefined || result.outcome === 'rejected' &&
+              Number.isSafeInteger(result.failingStatementIndex) && result.failingStatementIndex >= 0), 'PEER_RESULT_JOURNAL_INVALID')
           this.#lastOutcomes.set(command.attempt.id, result)
         }
       }
@@ -365,10 +367,14 @@ class Replica implements PeerReplica {
       check(outcome !== null, 'PEER_OUTCOME_MISSING')
       const result: AppliedResult = { status: 'applied', attemptId: attempt.id, operationId: receipt.payload.operationId,
         author: receipt.payload.author, generation: receipt.payload.generation, sequence: receipt.payload.sequence,
-        outcome: outcome.outcome, rejectionCode: outcome.rejectionCode }
+        outcome: outcome.outcome, rejectionCode: outcome.rejectionCode,
+        ...(outcome.failingStatementIndex === null ? {} : { failingStatementIndex: outcome.failingStatementIndex }) }
       const previous = this.#lastOutcomes.get(attempt.id)
-      check(previous === undefined || samePeerValue(previous, result), 'PEER_REPLAY_OUTCOME_CONFLICT')
-      if (previous === undefined) await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
+      // Older journals saved the outcome code alone. Recover its precise step from replay.
+      const restoreStep = previous !== undefined && previous.failingStatementIndex === undefined && result.failingStatementIndex !== undefined
+      check(previous === undefined || samePeerValue(restoreStep ? { ...previous, failingStatementIndex: result.failingStatementIndex } : previous, result),
+        'PEER_REPLAY_OUTCOME_CONFLICT')
+      if (previous === undefined || restoreStep) await this.#write(`${this.#prefix}/result/${attempt.id}`, encodePeerValue(result))
       this.#lastOutcomes.set(attempt.id, result)
     }
   }
@@ -409,10 +415,15 @@ class Replica implements PeerReplica {
       this.#pointAvailable(revision.point), 'PEER_VIEW_RECOVERY_REQUIRED')
   }
   prepare(input: PrepareCommand): Promise<SignedAttempt> {
+    return this.prepareAs(input, this.device)
+  }
+  prepareAs(input: PrepareCommand, author: PeerIdentity): Promise<SignedAttempt> {
     const captured = structuredClone(input)
+    const identity = { ...author }
     return this.#serial.run(async () => {
       this.#assertReady(); boundedText(captured.operationId)
-      const previousId = this.#operations.get(operationKey(this.device.publicKey, captured.operationId))
+      const generation = this.generation, control = this.#authority.controlAt(generation.payload.controlRevision)
+      const previousId = this.#operations.get(operationKey(identity.publicKey, captured.operationId))
       if (previousId !== undefined) {
         const previous = this.#attempts.get(previousId)!, core = (await this.#verified.attempt(previous, this.#authority)).core
         check(bytesToHex(encodeChangeProgram(core.program)) === bytesToHex(encodeChangeProgram(captured.program)) &&
@@ -421,8 +432,8 @@ class Replica implements PeerReplica {
           (captured.basedOn === undefined || samePeerValue(previous.payload.header.basedOn, captured.basedOn)), 'PEER_OPERATION_ID_REUSED')
         return structuredClone(previous)
       }
-      const generation = this.generation, control = this.#authority.controlAt(generation.payload.controlRevision)
-      check(this.#authority.grant(this.device.publicKey, control.payload.revision)?.writer === true, 'PEER_AUTHOR_FORBIDDEN')
+      check(this.#authority.grant(identity.publicKey, control.payload.revision)?.writer === true, 'PEER_AUTHOR_FORBIDDEN')
+      check(identity.publicKey === this.device.publicKey || this.#authority.grant(this.device.publicKey)?.relay === true, 'PEER_AUTHOR_FORBIDDEN')
       if (captured.basedOn !== undefined) this.#checkView(captured.basedOn)
       if (captured.reapplyOf !== undefined) {
         const old = this.#attempts.get(captured.reapplyOf)
@@ -431,13 +442,13 @@ class Replica implements PeerReplica {
       const key = this.#options.epochKeys.get(control.payload.epoch); check(key !== undefined, 'PEER_EPOCH_KEY_UNAVAILABLE')
       const core: TransactionCore = { operationId: captured.operationId, groupId: hexToBytes(this.descriptor.applicationId),
         membershipRevision: hexToBytes(await peerDigest(control)), validationPolicy: hexToBytes(await peerDigest([this.descriptor.profile, this.descriptor.policy])),
-        authorId: hexToBytes(this.device.publicKey), authorTimestampMs: captured.authorTimestampMs ?? BigInt(this.#now()),
+        authorId: hexToBytes(identity.publicKey), authorTimestampMs: captured.authorTimestampMs ?? BigInt(this.#now()),
         nonce: crypto.getRandomValues(new Uint8Array(16)), executionManifestDigest: hexToBytes(this.descriptor.executionManifestDigest), program: captured.program }
       const attempt = await createSignedAttempt({ applicationId: this.descriptor.applicationId, profile: 'peer-generation-v1',
-        generation: generation.id, controlRevision: control.payload.revision, epoch: control.payload.epoch, author: this.device.publicKey,
+        generation: generation.id, controlRevision: control.payload.revision, epoch: control.payload.epoch, author: identity.publicKey,
         operationId: captured.operationId, definitionDigest: this.descriptor.definitionDigest, command: captured.command ?? 'raw',
         commandVersion: captured.commandVersion ?? '1', basedOn: captured.basedOn ?? null, reapplyOf: captured.reapplyOf ?? null,
-        coreDigest: bytesToHex(await transactionDigest(core)) }, core, key, this.device)
+        coreDigest: bytesToHex(await transactionDigest(core)) }, core, key, identity)
       await this.#verified.attempt(attempt, this.#authority)
       check(this.#journalHead < this.#maxRecords, 'PEER_STORAGE_QUOTA')
       await this.#write(`${this.#prefix}/journal/${this.#journalHead + 1}`, encodePeerValue(attempt))
@@ -555,6 +566,13 @@ class Replica implements PeerReplica {
   }
   operation(operationId: string, author = this.device.publicKey): Promise<OperationState | null> {
     return this.#serial.run(async () => { this.#assertReady(); const id = this.#operations.get(operationKey(author, operationId)); return id === undefined ? null : this.#state(this.#attempts.get(id)!) })
+  }
+  operationByAttempt(attemptId: string, author: string): Promise<OperationState | null> {
+    return this.#serial.run(async () => {
+      this.#assertReady()
+      const attempt = this.#attempts.get(attemptId)
+      return attempt?.payload.header.author === author ? this.#state(attempt) : null
+    })
   }
   attempt(operationId: string, author = this.device.publicKey): Promise<SignedAttempt | null> {
     return this.#serial.run(async () => { this.#assertOpen(); const id = this.#operations.get(operationKey(author, operationId)); return structuredClone(id === undefined ? null : this.#attempts.get(id)!) })

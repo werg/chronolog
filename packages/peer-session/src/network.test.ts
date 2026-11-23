@@ -20,8 +20,8 @@ const definition = defineApplication({ id: 'network', version: '1', commands: {
 }, queries: {} })
 const closing: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of closing.splice(0).reverse()) await close() })
-async function fixture(options: { readerOnly?: boolean; localEcho?: boolean } = {}) {
-  const host = await createPeerIdentity(), a = await openApplicationDevice({ store: new MemoryBytesStore(), create: true }),
+async function fixture(options: { readerOnly?: boolean; relay?: true; localEcho?: boolean } = {}) {
+  const host = await createPeerIdentity(), account = await createPeerIdentity(), a = await openApplicationDevice({ store: new MemoryBytesStore(), create: true }),
     b = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32)), keys = new Map([[0, key]])
   const manifest = await executionManifestArtifacts(await eventExecutionManifest())
@@ -32,7 +32,8 @@ async function fixture(options: { readerOnly?: boolean; localEcho?: boolean } = 
   const control = await signControlRevision({ applicationId: descriptor.payload.applicationId, profile: descriptor.payload.profile,
     policy: descriptor.payload.policy, revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
     grants: [controlParticipantGrant(host.publicKey), participantGrant(a.identity.publicKey, { dataRole: 'admin' }),
-      { ...participantGrant(b.identity.publicKey), ...(options.readerOnly === true ? { writer: false, coordinator: false, recovery: false } : {}) }] }, host)
+      participantGrant(account.publicKey),
+      { ...participantGrant(b.identity.publicKey, options.relay === true ? { relay: true } : {}), ...(options.readerOnly === true ? { writer: false, coordinator: false, recovery: false } : {}) }] }, host)
   const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host })
   await registry.select(await signTransitionRequest({ applicationId: descriptor.payload.applicationId,
     profile: descriptor.payload.profile, policy: descriptor.payload.policy, transitionId: 'initial', expectedGeneration: null,
@@ -47,7 +48,7 @@ async function fixture(options: { readerOnly?: boolean; localEcho?: boolean } = 
     const session = await openCold(...args)
     await session.keys.missing(); return session
   }
-  return { a, b, host, keys, descriptor, control, registry, open, openCold }
+  return { a, b, host, account, keys, descriptor, control, registry, open, openCold }
 }
 
 /** The public handshake remains visible to an untrusted relay. */
@@ -355,6 +356,33 @@ describe('authenticated peer application connections', () => {
     await expect(links[1].synchronize()).rejects.toThrow('PEER_PARTICIPANT_RESPONSE_MISMATCH')
     expect(responses).toContain('PEER_AUTHOR_FORBIDDEN')
     expect(openA).not.toHaveBeenCalled(); expect(a.status.database).toBe('idle')
+  })
+
+  it('resumes an independently signed account write on a relay and keeps operation IDs separate by author', async () => {
+    const f = await fixture({ relay: true }), a = await f.open(f.a), offline = await f.open(f.b)
+    const input = program(emit('message', { text: 'account write' }))
+    const operation = await offline.submitProgramAs(input, f.account, { operationId: 'same-id' })
+    const saved = await offline.operations.inspect('same-id', { author: f.account.publicKey })
+    expect(saved?.attempt.payload.header.author).toBe(f.account.publicKey)
+    await offline.command('say', 'device write', { operationId: 'same-id' })
+    await offline.close()
+
+    await expect(a.submitProgramAs(input, f.account, { operationId: 'same-id' })).rejects.toThrow('PEER_AUTHOR_FORBIDDEN')
+    const b = await f.open(await openApplicationDevice({ store: f.b.store })), [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    const resumed = await b.submitProgramAs(input, f.account, { operationId: 'same-id' })
+    await resumed.applied({ signal: AbortSignal.timeout(5000) })
+    await b.operations.wait('same-id', { signal: AbortSignal.timeout(5000) })
+    expect(await b.operations.inspect('same-id', { author: f.account.publicKey })).toMatchObject({ attempt: saved?.attempt })
+    expect(await a.operations.inspect('same-id', { author: f.account.publicKey })).toMatchObject({
+      attempt: saved?.attempt, state: { status: 'applied', outcome: 'accepted' },
+    })
+    expect(await a.operations.get('same-id', { author: b.deviceId })).toMatchObject({ status: 'applied', outcome: 'accepted' })
+    expect(operation.author).toBe(f.account.publicKey)
+    const view = await a.readView()
+    try { expect(view.readEvents().events.map(event => event.author)).toEqual(expect.arrayContaining([f.account.publicKey, b.deviceId])) }
+    finally { view.release() }
   })
 
   it('routes original saved commands, fragmented ciphertext, exact coverage and live signals over separate lanes', async () => {

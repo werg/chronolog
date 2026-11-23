@@ -1,8 +1,9 @@
 import type { BytesStore } from '@chronolog/records'
 import { createPeerReplica, type PeerReplica, type PeerRevision, type AppliedResult, type OperationState, type AuthorityBundle,
   type RecoveryNotice, type SignedAttempt, type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView } from '@chronolog/peer-generation'
+import type { PeerIdentity } from '@chronolog/peer-generation/control'
 import { createEventMaterializationRuntime, type ChronologMaterializationRuntime, type MaterializedLocalSqlValue } from '@chronolog/materializer'
-import { bytesToHex, decodeTransactionCore, isEmitStep, type EventPayload } from '@chronolog/protocol'
+import { bytesToHex, decodeTransactionCore, isEmitStep, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from './definition.js'
 import type { ApplicationDevice, ApplicationStorage } from './device.js'
 import type { ApplicationSession } from './session.js'
@@ -11,7 +12,7 @@ import type { ApplicationDataPort } from './participant-types.js'
 import { APPLICATION_EVENT_CURSOR_LIMIT, type ApplicationChange, type ApplicationEvent, type ApplicationEventBatch,
   type ApplicationEventOptions, type ApplicationReadView, type CommandOptions, type QueryParameter } from './session-types.js'
 import { AbandonedOperationError, RecoveredViewError } from './errors.js'
-import { ApplicationOperation } from './operation.js'
+import { ApplicationOperation, type ApplicationSubmission } from './operation.js'
 import { ApplicationRecovery } from './recovery.js'
 import { ApplicationContent } from './content.js'
 import { ApplicationKeyring } from './keys.js'
@@ -75,6 +76,14 @@ export class ApplicationData<D extends ApplicationDefinition = ApplicationDefini
     // Preparation is the only local journal write. Disconnection never creates another queue.
     void this.retry(options.operationId).catch(() => undefined)
     return new ApplicationOperation(this.#session, options.operationId)
+  }
+
+  async submitProgramAs(program: ChangeProgram, author: PeerIdentity, options: CommandOptions): Promise<ApplicationSubmission> {
+    this.#assertOpen()
+    const { id: attemptId, payload: { header } } = await this.#replica.prepareAs({ operationId: options.operationId, program,
+      ...(options.basedOn === undefined ? {} : { basedOn: options.basedOn }) }, author)
+    void this.retry(header.operationId, header.author).catch(() => undefined)
+    return Object.assign(new ApplicationOperation(this.#session, header.operationId, header.author), { attemptId })
   }
 
   async reapply<Name extends keyof D['commands'] & string>(operationId: string, name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions & { readonly originalAuthor?: string }): Promise<ApplicationOperation> {
@@ -155,28 +164,29 @@ export class ApplicationData<D extends ApplicationDefinition = ApplicationDefini
     return projection as ApplicationProjectionHandle<State>
   }
 
-  async retry(operationId: string): Promise<void> {
+  async retry(operationId: string, author = this.#replica.device.publicKey): Promise<void> {
     this.#assertOpen()
-    const existing = this.#inflight.get(operationId)
+    const key = JSON.stringify([author, operationId])
+    const existing = this.#inflight.get(key)
     if (existing !== undefined) return existing
     const task = (async () => {
-      const state = await this.#replica.operation(operationId)
+      const state = await this.#replica.operation(operationId, author)
       if (state === null) throw new Error('APPLICATION_OPERATION_NOT_FOUND')
       if (state.status === 'applied') return
       if (state.status === 'abandoned' || state.status === 'needsReapply') throw new AbandonedOperationError(state)
-      const attempt = await this.#replica.attempt(operationId)
+      const attempt = await this.#replica.attempt(operationId, author)
       if (attempt === null) throw new Error('APPLICATION_ATTEMPT_MISSING')
       if (this.#replica.isCoordinator) await this.#replica.order(attempt)
       else await this.#submit(attempt)
     })()
-    this.#inflight.set(operationId, task)
-    try { await task } finally { this.#inflight.delete(operationId) }
+    this.#inflight.set(key, task)
+    try { await task } finally { this.#inflight.delete(key) }
   }
 
   async resume(): Promise<void> {
     this.#assertOpen()
     if (!this.#replica.ready) return
-    for (const attempt of await this.#replica.pendingAttempts()) await this.retry(attempt.payload.header.operationId)
+    for (const { payload: { header } } of await this.#replica.pendingAttempts()) await this.retry(header.operationId, header.author)
   }
 
   async waitFor(operationId: string, options: { readonly author?: string; readonly signal?: AbortSignal } = {}): Promise<AppliedResult> {

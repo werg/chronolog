@@ -1,9 +1,35 @@
 import { describe, expect, it, vi } from 'vitest'
-import { assertCanonicalCbor, encodeCanonicalCbor } from '@chronolog/protocol'
+import { assertCanonicalCbor, bytesToHex, encodeCanonicalCbor, exportEd25519PrivateKey } from '@chronolog/protocol'
 import { MemoryBytesStore, type BytesStore } from '@chronolog/peer-generation'
+import { createPeerIdentity } from '@chronolog/peer-generation/control'
+import { importCelldSigningIdentity } from './celld.js'
 import { openApplicationDevice, type ApplicationDevice } from './device.js'
 
 describe('owned application device identities', () => {
+  it('resumes a host-managed signer without retaining its key bytes', async () => {
+    const store = new MemoryBytesStore()
+    const generated = await createPeerIdentity(), unrelated = await createPeerIdentity()
+    const secret = bytesToHex(await exportEd25519PrivateKey(generated.privateKey))
+    const managedSigner = await importCelldSigningIdentity(generated.publicKey, secret)
+    expect(managedSigner.privateKey.extractable).toBe(false)
+    const original = await openApplicationDevice({ store, create: true, managedSigner })
+    await original.openStorage()
+    const identity = original.identity.publicKey, storageId = original.storageId
+    await original.close()
+    expect(assertCanonicalCbor((await store.get('peer-session/device/v1'))!))
+      .toEqual([2n, identity, storageId])
+    await expect(openApplicationDevice({ store, create: true })).rejects.toThrow('APPLICATION_DEVICE_MANAGED_SIGNER_REQUIRED')
+    await expect(openApplicationDevice({ store, create: true, managedSigner: unrelated }))
+      .rejects.toThrow('APPLICATION_DEVICE_KEY_MISMATCH')
+    await expect(importCelldSigningIdentity(unrelated.publicKey, secret)).rejects.toThrow('CELLD_SIGNING_SECRET_INVALID')
+    await expect(importCelldSigningIdentity(identity, undefined)).rejects.toThrow('CELLD_SIGNING_SECRET_MISSING')
+    const resumed = await openApplicationDevice({ store, managedSigner: await importCelldSigningIdentity(identity, secret) })
+    expect(resumed.identity.publicKey).toBe(identity)
+    expect(resumed.storageId).toBe(storageId)
+    await resumed.openStorage()
+    await resumed.close()
+  })
+
   it('keeps protocol identity independent of lazy data storage and coalesces first use', async () => {
     const metadata = new MemoryBytesStore(), data = new MemoryBytesStore(), closed = vi.fn()
     const openStorage = vi.fn(async () => ({ store: data, close: closed }))

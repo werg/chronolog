@@ -150,3 +150,19 @@ jobs:
             artifacts/peer-session-sql-check/report.json
           if-no-files-found: error
           retention-days: 90
+      - name: Package the celld workspace runtime
+        if: matrix.os == 'ubuntu-latest'
+        run: pnpm package:session --no-native-rtc --sql-celld --output artifacts/celld-peer-session
+      - name: Attest the celld workspace runtime
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: artifacts/celld-peer-session/*.tgz
+      - name: Upload the celld workspace runtime
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v6
+        with:
+          name: celld-peer-session-${{ github.sha }}
+          path: artifacts/celld-peer-session/*.tgz
+          if-no-files-found: error
+          retention-days: 90
