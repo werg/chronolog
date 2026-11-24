@@ -114,15 +114,20 @@ jobs:
           test "${#archives[@]}" -eq 1
           node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
           node artifacts/contrib/cookbooks/run-a-peer-application/checks/run-peer-generation.mjs --artifact "${archives[0]}" --domain tasks --output artifacts/qualification/tasks
-      - name: Install real Chromium
+      - name: Install real Chromium and WebKit
         id: chromium
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
-        run: pnpm exec playwright install --with-deps chromium
+        run: pnpm exec playwright install --with-deps chromium webkit
       - name: Qualify portable SharedWorker and DedicatedWorker RTC endpoints
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: pnpm exec tsx tools/test-worker-webrtc-endpoint.ts
-      - name: Qualify both browser record stores and pinned ownership
+      - name: Qualify Chromium record stores, pinned ownership and browser restart
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        run: pnpm exec tsx tools/test-browser-storage.ts
+      - name: Qualify WebKit record stores, pinned ownership and browser restart
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        env:
+          CHRONOLOG_STORAGE_BROWSER: webkit
         run: pnpm exec tsx tools/test-browser-storage.ts
       - name: Qualify packed browser Worker, OPFS and native RTC
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' && steps.chromium.outcome == 'success' }}

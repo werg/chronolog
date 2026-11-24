@@ -259,6 +259,23 @@ async function run(name: string): Promise<{ id: string; storageId: string; backe
     const unpinned = await openBrowserDevice({ name: name + '-no-directory', create: true })
     try { await fails(unpinned.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS') }
     finally { await unpinned.close() }
+
+    // An exposed but failing directory API (as in WebKit private contexts)
+    // is not proof that selecting an empty IndexedDB history would be safe.
+    Object.defineProperty(navigator.storage, 'getDirectory', { configurable: true, value: async () => {
+      throw new DOMException('Storage directory unavailable', 'UnknownError')
+    } })
+    const failedProbe = await probeBrowserCapabilities()
+    check(failedProbe.indexedDb.writable && !failedProbe.events.supported && failedProbe.events.backend === null &&
+      failedProbe.events.reason?.startsWith('UnknownError:'), 'directory I/O errors remain fail-closed: ' + JSON.stringify(failedProbe))
+    const unavailableName = name + '-directory-error'
+    const unavailable = await openBrowserDevice({ name: unavailableName, create: true })
+    const unavailableMetadata = await BrowserMetadataStore.open(unavailableName)
+    try {
+      await fails(unavailable.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS')
+      check(await unavailableMetadata.get(pinKey) === null, 'directory error never pins a fallback backend')
+      check(!await inspectExistingIndexedDbRecords(unavailableName), 'directory error never creates empty fallback history')
+    } finally { unavailableMetadata.close(); await unavailable.close() }
   } finally {
     if (directoryMethod) Object.defineProperty(navigator.storage, 'getDirectory', directoryMethod)
     else Reflect.deleteProperty(navigator.storage, 'getDirectory')
