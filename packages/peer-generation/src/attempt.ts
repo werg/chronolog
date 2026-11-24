@@ -43,8 +43,8 @@ export async function verifyAttempt(attempt: SignedAttempt, authority: PeerAutho
   check(typeof attempt.payload.ciphertext === 'string' && attempt.payload.ciphertext.length <= 2 * 524_288 &&
     attempt.payload.ciphertext.length >= 32 && /^(?:[0-9a-f]{2})+$/u.test(attempt.payload.ciphertext), 'PEER_ATTEMPT_BODY_INVALID')
   const { header } = attempt.payload, descriptor = authority.descriptor
-  check(header.applicationId === descriptor.applicationId && header.definitionDigest === descriptor.definitionDigest, 'PEER_SCOPE_MISMATCH')
   const generation = authority.generation(header.generation), control = authority.controlAt(generation.payload.controlRevision)
+  check(header.applicationId === descriptor.applicationId && header.definitionDigest === authority.definitionDigestAt(control.payload.revision), 'PEER_SCOPE_MISMATCH')
   check(header.controlRevision === control.payload.revision && header.epoch === control.payload.epoch, 'PEER_ATTEMPT_CONTROL_MISMATCH')
   check(authority.grant(header.author, header.controlRevision)?.writer === true, 'PEER_AUTHOR_FORBIDDEN')
   check(attempt.id === await peerDigest(['chronolog/peer-generation/attempt/v1', attempt.payload]), 'PEER_ATTEMPT_ID_INVALID')

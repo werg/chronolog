@@ -2,7 +2,7 @@ import {
   PEER_GENERATION_CAPABILITIES, assertAuthorityExtension, verifyAuthorityBundle,
   type AuthorityBundle, type PeerAuthority, type PeerGrant, type PeerIdentity,
 } from '@chronolog/peer-generation/control'
-import type { PeerRevision, AppliedResult, OperationState, RecoveryNotice, SignedAttempt, SignedRetainedCoverage, PeerOrderingPause, PrefixProof } from '@chronolog/peer-generation'
+import type { PeerRevision, AppliedResult, OperationState, RecoveryNotice, SignedAttempt, SignedRetainedCoverage, PeerOrderingPause, PrefixProof, HistoryCompactionOptions, HistoryCompactionResult } from '@chronolog/peer-generation'
 import { bytesToHex, hexToBytes, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
 import { SignalChannel, type Signals } from '@chronolog/signals'
 import { describeApplication, type ApplicationCommand, type ApplicationDefinition, type ApplicationQuery } from './definition.js'
@@ -18,7 +18,7 @@ import { OwnedApplicationParticipation } from './participation.js'
 import type { ApplicationParticipation, ApplicationParticipationOptions } from './participation-types.js'
 import { connectApplicationPeer, connectApplicationPeerPair, connectedApplicationPeers,
   type ApplicationPeerConnectOptions, type ApplicationPeerLink, type ApplicationPeerPort } from './network.js'
-import type { ApplicationChange, ApplicationReadView, CommandOptions, SessionStatus } from './session-types.js'
+import type { ApplicationChange, ApplicationEvent, ApplicationReadView, CommandOptions, SessionStatus } from './session-types.js'
 import type { ApplicationOperation, ApplicationSubmission } from './operation.js'
 import { awaitOwnedTask } from './lifetime.js'
 import { deferredStream } from './deferred-stream.js'
@@ -283,6 +283,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const data = await this.#requireData(), notice = await this.#adoptAuthority(authority)
     this.#assertDataAvailable()
     return await data.adopt(this.#participant.authority) ?? notice
+  }
+  async compact(options: HistoryCompactionOptions & {
+    readonly summarize?: (events: readonly ApplicationEvent[]) => ChangeProgram | null | Promise<ChangeProgram | null>
+    readonly operationId?: string
+    readonly signal?: AbortSignal
+  } = {}): Promise<HistoryCompactionResult> {
+    return (await this.#dataFor(options.signal)).compact(options)
   }
   changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {
     return deferredStream(async signal => (await this.#dataFor(signal)).changes({ signal }), {

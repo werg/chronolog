@@ -13,6 +13,8 @@ export interface BytesStore {
   put(key: string, bytes: Uint8Array): Promise<void>
   /** Optional durable, idempotent local eviction. Owners must fence concurrent writers. */
   delete?(key: string): Promise<void>
+  /** Optional bounded atomic multi-key write, committing all entries together. */
+  putMany?(entries: readonly BytesStoreEntry[]): Promise<void>
   /** Optional bounded-key batch, preserving input order. */
   getMany?(keys: readonly string[]): Promise<readonly (Uint8Array | null)[]>
   /** Optional deterministic snapshot enumeration for atomic encrypted device checkpoints. */
@@ -44,6 +46,19 @@ export class MemoryBytesStore implements BytesStore {
     const used = this.#usedBytes - (this.#values.get(key)?.byteLength ?? 0) + bytes.byteLength
     if (used > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
     this.#values.set(key, Uint8Array.from(bytes)); this.#usedBytes = used
+  }
+  async putMany(entries: readonly BytesStoreEntry[]): Promise<void> {
+    if (entries.length === 0) return
+    const staged = new Map<string, Uint8Array>()
+    for (const entry of entries) {
+      if (!(entry.value instanceof Uint8Array) || entry.value.byteLength > this.#maxValueBytes) throw new Error('BYTES_STORE_VALUE_TOO_LARGE')
+      staged.set(entry.key, Uint8Array.from(entry.value))
+    }
+    let used = this.#usedBytes
+    for (const [key, value] of staged) used = used - (this.#values.get(key)?.byteLength ?? 0) + value.byteLength
+    if (used > this.#quotaBytes) throw new Error('BYTES_STORE_QUOTA_EXCEEDED')
+    for (const [key, value] of staged) this.#values.set(key, value)
+    this.#usedBytes = used
   }
   async delete(key: string): Promise<void> {
     this.#usedBytes -= this.#values.get(key)?.byteLength ?? 0
@@ -92,4 +107,12 @@ export class MemoryBytesStore implements BytesStore {
 /** Bounded prefetch for owners reopening an authenticated journal. */
 export async function readBytesMany(store: BytesStore, keys: readonly string[]): Promise<readonly (Uint8Array | null)[]> {
   return store.getMany === undefined ? Promise.all(keys.map(key => store.get(key))) : store.getMany(keys)
+}
+
+/** Coalesced atomic write when supported by the store, otherwise sequential durable puts in order. */
+export async function writeBytesMany(store: BytesStore, entries: readonly BytesStoreEntry[]): Promise<void> {
+  if (entries.length === 0) return
+  if (entries.length === 1) { await store.put(entries[0]!.key, entries[0]!.value); return }
+  if (store.putMany !== undefined) { await store.putMany(entries); return }
+  for (const entry of entries) await store.put(entry.key, entry.value)
 }

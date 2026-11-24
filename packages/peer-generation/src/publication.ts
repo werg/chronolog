@@ -76,7 +76,7 @@ export async function verifyPublicationManifest(input: SignedPublication, author
   const value = validatePublicationManifest(publication.payload), descriptor = authority.descriptor
   check(value.applicationId === descriptor.applicationId && value.historyId === descriptor.historyId &&
     value.profile === descriptor.profile, 'PEER_PUBLICATION_SCOPE_MISMATCH')
-  check(value.definitionDigest === descriptor.definitionDigest && value.executionManifestDigest === descriptor.executionManifestDigest,
+  check(value.definitionDigest === authority.definitionDigestAt(value.controlRevision) && value.executionManifestDigest === descriptor.executionManifestDigest,
     'PEER_PUBLICATION_SEMANTICS_MISMATCH')
   check(authority.grant(value.author, value.controlRevision)?.publisher === true, 'PEER_PUBLICATION_FORBIDDEN')
   check(publication.id === await peerDigest(['chronolog/publication/v1', value]), 'PEER_PUBLICATION_ID_INVALID')

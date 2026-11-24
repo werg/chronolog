@@ -51,6 +51,19 @@ parentPort.on('message', ({ id, method, args }) => {
       const next = used - (size.get(args.key)?.bytes ?? 0) + args.value.length
       if (next > quota) error('BYTES_STORE_QUOTA_EXCEEDED')
       put.run(args.key, args.value); used = next
+    } else if (method === 'putMany') {
+      if (!Array.isArray(args.entries) || args.entries.length > 128) error('BYTES_STORE_BATCH_LIMIT')
+      const staged = new Map()
+      for (const entry of args.entries) { validate(entry.key, entry.value); staged.set(entry.key, entry.value) }
+      let next = used
+      for (const [k, v] of staged) next = next - (size.get(k)?.bytes ?? 0) + v.length
+      if (next > quota) error('BYTES_STORE_QUOTA_EXCEEDED')
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        for (const [k, v] of staged) put.run(k, v)
+        db.exec('COMMIT')
+        used = next
+      } catch (cause) { try { db.exec('ROLLBACK') } catch {} throw cause }
     } else if (method === 'delete') {
       validate(args.key)
       const prior = size.get(args.key)?.bytes ?? 0

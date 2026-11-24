@@ -45,6 +45,8 @@ export interface SignalSubscribeOptions {
   /** OR of bounded exact selectors, applied before latest coalescing. */
   readonly streams?: readonly SignalStreamSelector[]
   readonly mode?: 'all' | 'latest'
+  /** Seed a latest-mode subscription with currently fresh retained values for late joiners. */
+  readonly includeLatest?: boolean
   readonly signal?: AbortSignal
 }
 export interface Signals {
@@ -106,6 +108,7 @@ export interface SignalLimits {
   readonly maxSubscriptions?: number
   readonly maxQueuedSignals?: number
   readonly maxQueuedBytes?: number
+  readonly maxRetainedLatest?: number
   readonly sendTimeoutMs?: number
 }
 
@@ -151,13 +154,17 @@ export class SignalChannel implements Signals {
   readonly #maxSubscriptions: number
   readonly #maxQueuedSignals: number
   readonly #maxQueuedBytes: number
+  readonly #maxRetainedLatest: number
   readonly #sendTimeout: number
+  readonly #verifyKeys = new Map<string, CryptoKey>()
+  readonly #retainedLatest = new Map<string, { readonly value: EphemeralSignal; readonly bytes: number }>()
   #sequence = 0
   #sendTail: Promise<unknown> = Promise.resolve()
   #pendingSends = 0
   #pendingReceives = 0
   #remembered = 0
   #observedTime = 0
+  #lastPruneAt = 0
 
   constructor(options: SignalChannelOptions) {
     if (typeof options.scope !== 'string' || options.scope.length === 0 || new TextEncoder().encode(options.scope).length > 256 ||
@@ -178,6 +185,7 @@ export class SignalChannel implements Signals {
     this.#maxSubscriptions = bound(options.maxSubscriptions ?? 16, 1, 1024)
     this.#maxQueuedSignals = bound(options.maxQueuedSignals ?? 64, 1, 4096)
     this.#maxQueuedBytes = bound(options.maxQueuedBytes ?? 262_144, 1, 16_777_216)
+    this.#maxRetainedLatest = bound(options.maxRetainedLatest ?? 128, 0, 4096)
     this.#sendTimeout = bound(options.sendTimeoutMs ?? 10_000, 1, 120_000)
     if (options.trySend !== undefined) this.attachRoute({ trySend: options.trySend })
   }
@@ -299,7 +307,15 @@ export class SignalChannel implements Signals {
     const value: EphemeralSignal = { scope: this.#options.scope, authorId: bytesToHex(frame[3]), sessionId: bytesToHex(frame[5]),
       sequence: Number(frame[6]), issuedAtMs: Number(frame[7]), expiresAtMs: Number(frame[8]), topic: frame[9], payload, ...(stream === undefined ? {} : { stream }) }
     this.#assertClock(value)
-    const key = await crypto.subtle.importKey('raw', frame[3].slice().buffer, 'Ed25519', false, ['verify'])
+    let key = this.#verifyKeys.get(value.authorId)
+    if (key === undefined) {
+      key = await crypto.subtle.importKey('raw', frame[3].slice().buffer, 'Ed25519', false, ['verify'])
+      if (this.#verifyKeys.size >= 256) {
+        const oldest = this.#verifyKeys.keys().next().value
+        if (oldest !== undefined) this.#verifyKeys.delete(oldest)
+      }
+      this.#verifyKeys.set(value.authorId, key)
+    }
     if (!await crypto.subtle.verify('Ed25519', key, (frame[frame.length - 1] as Uint8Array).slice().buffer, encodeCanonicalCbor(frame.slice(0, -1)).slice().buffer)) {
       throw new SignalError('SIGNAL_SIGNATURE_INVALID')
     }
@@ -381,14 +397,31 @@ export class SignalChannel implements Signals {
     return (await Promise.allSettled(attempts)).some(result => result.status === 'fulfilled' && result.value)
   }
 
-  #remember(value: EphemeralSignal): boolean {
-    const now = this.#now()
+  #pruneRemembered(now: number): void {
+    this.#lastPruneAt = now
     for (const [id, progress] of this.#sessions) {
       for (const [sequence, expiresAtMs] of progress.seen) if (expiresAtMs <= now) { progress.seen.delete(sequence); this.#remembered -= 1 }
       if (progress.seen.size === 0) this.#sessions.delete(id)
     }
-    const key = `${value.authorId}/${value.sessionId}`, previous = this.#sessions.get(key)
-    if (previous?.seen.has(value.sequence) === true) return false
+  }
+
+  #remember(value: EphemeralSignal): boolean {
+    const now = this.#now()
+    const key = `${value.authorId}/${value.sessionId}`
+    let previous = this.#sessions.get(key)
+    const existingExpiry = previous?.seen.get(value.sequence)
+    if (existingExpiry !== undefined) {
+      if (existingExpiry > now) return false
+      previous!.seen.delete(value.sequence); this.#remembered -= 1
+      if (previous!.seen.size === 0) { this.#sessions.delete(key); previous = undefined }
+    }
+    if (now - this.#lastPruneAt >= 1_000 ||
+        (previous === undefined && this.#sessions.size >= this.#maxSessions) ||
+        (previous?.seen.size ?? 0) >= this.#maxSequences ||
+        this.#remembered >= this.#maxRemembered) {
+      this.#pruneRemembered(now)
+      previous = this.#sessions.get(key)
+    }
     if (previous === undefined && this.#sessions.size >= this.#maxSessions) return false
     if ((previous?.seen.size ?? 0) >= this.#maxSequences || this.#remembered >= this.#maxRemembered) return false
     // Relay paths can reorder distinct sequences. Retain each fresh identity;
@@ -406,15 +439,30 @@ export class SignalChannel implements Signals {
   }
 
   #deliver(value: EphemeralSignal, bytes: number): void {
+    const now = this.#now()
+    const streamKey = JSON.stringify([value.authorId, value.sessionId, value.topic, value.stream?.endpointId ?? null, value.stream?.endpointIncarnation ?? null, value.stream?.streamId ?? null, value.stream?.target ?? null])
+    if (this.#maxRetainedLatest > 0 && value.expiresAtMs > now) {
+      const prior = this.#retainedLatest.get(streamKey)
+      if (prior === undefined || prior.value.sequence < value.sequence || prior.value.expiresAtMs <= now) {
+        if (prior !== undefined) this.#retainedLatest.delete(streamKey)
+        else if (this.#retainedLatest.size >= this.#maxRetainedLatest) {
+          for (const [id, entry] of this.#retainedLatest) if (entry.value.expiresAtMs <= now) this.#retainedLatest.delete(id)
+          if (this.#retainedLatest.size >= this.#maxRetainedLatest) {
+            const oldest = this.#retainedLatest.keys().next().value
+            if (oldest !== undefined) this.#retainedLatest.delete(oldest)
+          }
+        }
+        this.#retainedLatest.set(streamKey, { value: structuredClone(value), bytes })
+      }
+    }
     for (const subscriber of this.#subscriptions) {
       if (subscriber.topics !== null && !subscriber.topics.has(value.topic)) continue
       if (subscriber.streams !== null && !subscriber.streams.some(selector => matchesStream(value, selector))) continue
-      const now = this.#now()
       for (let index = subscriber.pending.length - 1; index >= 0; index -= 1) {
         if (subscriber.pending[index]!.value.expiresAtMs <= now) subscriber.bytes -= subscriber.pending.splice(index, 1)[0]!.bytes
       }
       for (const [id, latest] of subscriber.latest) if (latest.retainThroughMs <= now) subscriber.latest.delete(id)
-      const key = JSON.stringify([value.authorId, value.sessionId, value.topic, value.stream?.endpointId ?? null, value.stream?.endpointIncarnation ?? null, value.stream?.streamId ?? null, value.stream?.target ?? null])
+      const key = streamKey
       if (subscriber.mode === 'latest') {
         const previous = subscriber.latest.get(key)
         if (previous !== undefined && previous.sequence >= value.sequence) continue
@@ -471,6 +519,19 @@ export class SignalChannel implements Signals {
     if (this.#subscriptions.size >= this.#maxSubscriptions) throw new SignalError('SIGNAL_SUBSCRIPTION_QUOTA_EXCEEDED')
     const subscriber: Subscription = { topics: options.topics === undefined ? null : new Set(options.topics), streams, mode,
       pending: [], latest: new Map(), bytes: 0, error: null, wake: null, clean: () => undefined }
+    if (options.includeLatest === true) {
+      if (mode !== 'latest') throw new SignalError('SIGNAL_SUBSCRIPTION_MODE_INVALID')
+      const now = this.#now()
+      for (const [key, entry] of this.#retainedLatest) {
+        if (entry.value.expiresAtMs <= now) { this.#retainedLatest.delete(key); continue }
+        if (subscriber.topics !== null && !subscriber.topics.has(entry.value.topic)) continue
+        if (subscriber.streams !== null && !subscriber.streams.some(selector => matchesStream(entry.value, selector))) continue
+        if (subscriber.pending.length >= this.#maxQueuedSignals || subscriber.bytes + entry.bytes > this.#maxQueuedBytes) break
+        subscriber.latest.set(key, { sequence: entry.value.sequence, retainThroughMs: now + this.#ttl + this.#skew })
+        subscriber.pending.push({ value: structuredClone(entry.value), bytes: entry.bytes, key })
+        subscriber.bytes += entry.bytes
+      }
+    }
     this.#subscriptions.add(subscriber)
     const signal = options.signal
     const abort = (): void => {
@@ -503,7 +564,7 @@ export class SignalChannel implements Signals {
     this.#lifetime.abort(new SignalError('SIGNAL_CHANNEL_CLOSED'))
     for (const route of this.#routes) this.#detach(route)
     for (const subscriber of this.#subscriptions) { subscriber.pending.length = 0; subscriber.latest.clear(); subscriber.clean(); subscriber.wake?.() }
-    this.#subscriptions.clear(); this.#sessions.clear(); this.#remembered = 0
+    this.#subscriptions.clear(); this.#sessions.clear(); this.#retainedLatest.clear(); this.#verifyKeys.clear(); this.#remembered = 0
   }
 
   #detach(route: Route, retire = false, reason: unknown = new SignalError('SIGNAL_ROUTE_CLOSED')): void {

@@ -65,6 +65,19 @@ export interface HistoryReceiveResult {
   readonly ready: boolean
   readonly recovery: RecoveryNotice | null
 }
+export interface HistoryCompactionOptions {
+  /** Number of most-recent selected records to keep uncompacted in the live tail (default 0). */
+  readonly keepTail?: number
+  /** Also reclaim records/results from non-selected abandoned generations (default true). */
+  readonly pruneAbandoned?: boolean
+}
+export interface HistoryCompactionResult {
+  readonly compactedRecords: number
+  readonly prunedAbandonedRecords: number
+  readonly retainedRecords: number
+  readonly reclaimedKeys: number
+  readonly floorPoint: HistoryPoint | null
+}
 export interface RetainedCoverage {
   readonly applicationId: string
   readonly generation: string
@@ -158,6 +171,8 @@ export interface PeerReplica {
   retainedCoverage(point?: HistoryPoint): Promise<SignedRetainedCoverage>
   observeCoverage(coverage: SignedRetainedCoverage): Promise<void>
   shared(point?: HistoryPoint): readonly SignedRetainedCoverage[]
+  /** Compact older selected records and abandoned generations, reclaiming disk/RAM and history quota. */
+  compact(options?: HistoryCompactionOptions): Promise<HistoryCompactionResult>
   subscribe(listener: () => void): () => void
   onRecovery(listener: (notice: RecoveryNotice) => void): () => void
   inspectRecovery(): readonly RecoveryNotice[]

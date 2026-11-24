@@ -1,5 +1,5 @@
 import { VerifiedReplayCache } from './verified-cache.js'
-import { readBytesMany, type BytesStore } from '@chronolog/records'
+import { readBytesMany, writeBytesMany, type BytesStore, type BytesStoreEntry } from '@chronolog/records'
 import {
   DOMAINS, encodeChangeProgram, transactionDigest,
   type TransactionCore,
@@ -13,16 +13,24 @@ import {
 import { assertAuthorityExtension, generationStartRoot, type PeerAuthority, validateHistoryPoint, verifyAuthorityBundle } from './control.js'
 import { PEER_MAX_RECORDS, PEER_MAX_HISTORY_BYTES } from './control-types.js'
 import type {
-  AppliedResult, AuthorityBundle, CapturedPeerView, HistoryPoint, HistoryReceiveResult, OperationState, OrderedCommand,
+  AppliedResult, AuthorityBundle, CapturedPeerView, HistoryCompactionOptions, HistoryCompactionResult,
+  HistoryPoint, HistoryReceiveResult, OperationState, OrderedCommand,
   PeerGrant, PeerIdentity, PeerOrderingPause, PeerReplica, PeerReplicaOptions, PeerRevision, PrefixProof, PrepareCommand,
   RecoveryNotice, SignedAttempt, SignedGeneration, SignedRetainedCoverage,
 } from './types.js'
 
-interface Head { readonly sequence: number; readonly root: string; readonly bytes: number }
+interface Head {
+  readonly sequence: number
+  readonly root: string
+  readonly bytes: number
+  readonly floorSequence?: number
+  readonly floorRoot?: string
+}
 interface Retained { readonly command: OrderedCommand; readonly proposal: ReplayProposal }
 interface SelectedRange {
   readonly generation: string
   readonly offset: number
+  readonly startSequence: number
   readonly length: number
   readonly records: ReadonlyMap<number, Retained>
 }
@@ -48,8 +56,10 @@ class Replica implements PeerReplica {
   #publishedRevision: PeerRevision | null = null
   #pendingRecovery: PendingRecovery | null = null
   #orderingPause: StoredOrderingPause | null = null
+  #journalFloor = 0
   #journalHead = 0
   #retainedBytes = 0
+  readonly #journalIndex = new Map<string, number>()
   readonly #heads = new Map<string, Head>()
   readonly #records = new Map<string, Map<number, Retained>>()
   readonly #attempts = new Map<string, SignedAttempt>()
@@ -65,6 +75,7 @@ class Replica implements PeerReplica {
   readonly #recoveries: RecoveryNotice[] = []
   readonly #prefix: string
   readonly #verified: VerifiedReplayCache
+  readonly #controlDigestCache = new Map<number, { readonly signature: string; readonly digest: Uint8Array }>()
 
   constructor(options: PeerReplicaOptions, authority: PeerAuthority) {
     this.#options = options; this.#authority = authority
@@ -131,16 +142,22 @@ class Replica implements PeerReplica {
     check(this.#authority.current !== null, 'PEER_NO_SELECTED_GENERATION')
     check(bytesToHex(this.#options.materializer.queries.executionManifestDigest) === this.descriptor.executionManifestDigest,
       'PEER_EXECUTION_MANIFEST_MISMATCH')
+    const journalFloorBytes = await this.#options.store.get(`${this.#prefix}/journal-floor`)
+    this.#journalFloor = journalFloorBytes === null ? 0 : decodePeerValue<number>(journalFloorBytes)
+    check(Number.isSafeInteger(this.#journalFloor) && this.#journalFloor >= 0, 'PEER_JOURNAL_INVALID')
     const journal = await this.#options.store.get(`${this.#prefix}/journal-head`)
     this.#journalHead = journal === null ? 0 : decodePeerValue<number>(journal)
-    check(Number.isSafeInteger(this.#journalHead) && this.#journalHead >= 0 && this.#journalHead <= this.#maxRecords, 'PEER_JOURNAL_INVALID')
-    for (let start = 1; start <= this.#journalHead; start += 16) {
+    check(Number.isSafeInteger(this.#journalHead) && this.#journalHead >= this.#journalFloor && this.#journalHead - this.#journalFloor <= this.#maxRecords, 'PEER_JOURNAL_INVALID')
+    for (let start = this.#journalFloor + 1; start <= this.#journalHead; start += 16) {
       const keys = Array.from({ length: Math.min(16, this.#journalHead - start + 1) }, (_, offset) => `${this.#prefix}/journal/${start + offset}`)
       const values = await readBytesMany(this.#options.store, keys)
       const attempts = values.map(bytes => { check(bytes !== null, 'PEER_JOURNAL_INCOMPLETE'); return decodePeerValue<SignedAttempt>(bytes) })
       await this.#verified.prefetch(attempts)
       await Promise.all(attempts.map(attempt => this.#verified.attempt(attempt, this.#authority)))
-      for (const attempt of attempts) this.#remember(attempt)
+      for (const [offset, attempt] of attempts.entries()) {
+        this.#remember(attempt)
+        this.#journalIndex.set(attempt.id, start + offset)
+      }
     }
     for (const generation of this.#authority.bundle.generations) await this.#loadGeneration(generation, this.#authority)
     const pauseBytes = await this.#options.store.get(`${this.#prefix}/ordering-pause`)
@@ -199,6 +216,10 @@ class Replica implements PeerReplica {
       this.#fail(error)
     }
   }
+  async #writeMany(entries: readonly BytesStoreEntry[]): Promise<void> {
+    try { await writeBytesMany(this.#options.store, entries) }
+    catch (error) { this.#fail(error) }
+  }
   #writeSelection(authority: PeerAuthority, recovery: PendingRecovery | null): Promise<void> {
     return this.#write(`${this.#prefix}/selection`, encodePeerValue({ authority: authority.bundle, recovery } satisfies StoredSelection))
   }
@@ -216,12 +237,18 @@ class Replica implements PeerReplica {
     const start = await generationStartRoot(generation)
     const bytes = await this.#options.store.get(`${this.#prefix}/head/${generation.id}`)
     const head = bytes === null ? { sequence: 0, root: start, bytes: 0 } : decodePeerValue<Head>(bytes)
-    check(Number.isSafeInteger(head.sequence) && head.sequence >= 0 && head.sequence <= this.#maxRecords &&
+    const floorSequence = head.floorSequence ?? 0
+    const floorRoot = floorSequence > 0 ? head.floorRoot : start
+    check(Number.isSafeInteger(floorSequence) && floorSequence >= 0 && typeof floorRoot === 'string' &&
+      Number.isSafeInteger(head.sequence) && head.sequence >= floorSequence && head.sequence - floorSequence <= this.#maxRecords &&
       Number.isSafeInteger(head.bytes) && head.bytes >= 0, 'PEER_HEAD_INVALID')
-    this.#heads.set(generation.id, { sequence: 0, root: start, bytes: 0 })
+    this.#heads.set(generation.id, {
+      sequence: floorSequence, root: floorRoot, bytes: 0,
+      ...(floorSequence > 0 ? { floorSequence, floorRoot } : {}),
+    })
     this.#records.set(generation.id, new Map())
-    for (let start = 1; start <= head.sequence; start += 16) {
-      const keys = Array.from({ length: Math.min(16, head.sequence - start + 1) }, (_, offset) => `${this.#prefix}/record/${generation.id}/${start + offset}`)
+    for (let batchStart = floorSequence + 1; batchStart <= head.sequence; batchStart += 16) {
+      const keys = Array.from({ length: Math.min(16, head.sequence - batchStart + 1) }, (_, offset) => `${this.#prefix}/record/${generation.id}/${batchStart + offset}`)
       const values = await readBytesMany(this.#options.store, keys)
       const commands = values.map(bytes => { check(bytes !== null, 'PEER_HISTORY_INCOMPLETE'); return decodePeerValue<OrderedCommand>(bytes) })
       await this.#verified.prefetch(commands.map(command => command.attempt))
@@ -233,7 +260,7 @@ class Replica implements PeerReplica {
         if (resultBytes !== null) {
           const result = decodePeerValue<AppliedResult>(resultBytes)
           check(result.status === 'applied' && result.attemptId === command.attempt.id && result.generation === generation.id &&
-            result.sequence === start + offset && result.operationId === command.receipt.payload.operationId &&
+            result.sequence === batchStart + offset && result.operationId === command.receipt.payload.operationId &&
             result.author === command.receipt.payload.author && (result.outcome === 'accepted' || result.outcome === 'rejected') &&
             (result.failingStatementIndex === undefined || result.outcome === 'rejected' &&
               Number.isSafeInteger(result.failingStatementIndex) && result.failingStatementIndex >= 0), 'PEER_RESULT_JOURNAL_INVALID')
@@ -271,11 +298,16 @@ class Replica implements PeerReplica {
     check(existing === undefined || existing === attempt.id, 'PEER_OPERATION_ID_REUSED')
     const knownOrder = this.#receipts.get(attempt.id)
     check(knownOrder === undefined || samePeerValue(knownOrder.receipt, receipt), 'PEER_ATTEMPT_ORDERED_TWICE')
-    const next = { sequence: receipt.payload.sequence, root: receipt.root, bytes: head.bytes + receipt.payload.bodyBytes }
+    const next: Head = {
+      sequence: receipt.payload.sequence, root: receipt.root, bytes: head.bytes + receipt.payload.bodyBytes,
+      ...(head.floorSequence ? { floorSequence: head.floorSequence, floorRoot: head.floorRoot! } : {}),
+    }
     if (persist) {
-      // Persist exact original body and signed receipt before publishing the head.
-      await this.#write(`${this.#prefix}/record/${generation.id}/${next.sequence}`, recordBytes)
-      await this.#write(`${this.#prefix}/head/${generation.id}`, encodePeerValue(next))
+      // Persist exact original body and signed receipt together with the head.
+      await this.#writeMany([
+        { key: `${this.#prefix}/record/${generation.id}/${next.sequence}`, value: recordBytes },
+        { key: `${this.#prefix}/head/${generation.id}`, value: encodePeerValue(next) },
+      ])
     }
     this.#heads.set(generation.id, next)
     command = { receipt, attempt: this.#remember(attempt) }
@@ -299,8 +331,10 @@ class Replica implements PeerReplica {
         const root = through === 0 ? records.get(1)?.command.receipt.payload.previousRoot ?? head.root : records.get(through)?.command.receipt.root
         check(root === segment.cutoff.root, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
       }
-      ranges.push({ generation: segment.generation.id, offset, length: through, records })
-      offset += through
+      const startSequence = (head.floorSequence ?? 0) + 1
+      const count = Math.max(0, through - (head.floorSequence ?? 0))
+      ranges.push({ generation: segment.generation.id, offset, startSequence, length: count, records })
+      offset += count
       // Later generations cannot fill an earlier missing prefix. Export the
       // available evidence without publishing an incomplete application view.
       if (through < requested) break
@@ -310,7 +344,7 @@ class Replica implements PeerReplica {
   #selectedHistory(authority: PeerAuthority, complete = true): Retained[] {
     const result: Retained[] = []
     for (const range of this.#selectedRanges(authority, complete)) {
-      for (let sequence = 1; sequence <= range.length; sequence++) {
+      for (let sequence = range.startSequence; sequence < range.startSequence + range.length; sequence++) {
         const retained = range.records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); result.push(retained)
       }
     }
@@ -353,9 +387,19 @@ class Replica implements PeerReplica {
     const controls: PeerExecutionControls = { applicationId: hexToBytes(authority.descriptor.applicationId),
       attemptGenerations: selected.map(value => ({ attemptId: hexToBytes(value.command.attempt.id), generation: hexToBytes(value.command.attempt.payload.header.generation) })),
       currentRevision: authority.current!.payload.controlRevision,
-      revisions: await Promise.all(authority.bundle.controls.map(async control => ({ revision: control.payload.revision,
-        digest: hexToBytes(await peerDigest(control)), members: control.payload.grants.flatMap(grant => grant.dataRole === null ? [] :
-          [{ publicKey: hexToBytes(grant.publicKey), role: grant.dataRole }]) }))) }
+      revisions: await Promise.all(authority.bundle.controls.map(async control => {
+        const rev = control.payload.revision
+        const cached = this.#controlDigestCache.get(rev)
+        let digestBytes: Uint8Array
+        if (cached !== undefined && cached.signature === control.signature) {
+          digestBytes = cached.digest
+        } else {
+          digestBytes = hexToBytes(await peerDigest(control))
+          this.#controlDigestCache.set(rev, { signature: control.signature, digest: digestBytes })
+        }
+        return { revision: rev, digest: digestBytes, members: control.payload.grants.flatMap(grant => grant.dataRole === null ? [] :
+          [{ publicKey: hexToBytes(grant.publicKey), role: grant.dataRole }]) }
+      })) }
     const output = await this.#options.materializer.coordinator.materialize(admitted, controls)
     if (output !== null) await this.#options.materializer.publications.publish(output.publication)
     const previousLength = this.#selected.length, changedFrom = output?.revision.earliestChangedOrderIndex ?? previousLength
@@ -446,14 +490,19 @@ class Replica implements PeerReplica {
         nonce: crypto.getRandomValues(new Uint8Array(16)), executionManifestDigest: hexToBytes(this.descriptor.executionManifestDigest), program: captured.program }
       const attempt = await createSignedAttempt({ applicationId: this.descriptor.applicationId, profile: 'peer-generation-v1',
         generation: generation.id, controlRevision: control.payload.revision, epoch: control.payload.epoch, author: identity.publicKey,
-        operationId: captured.operationId, definitionDigest: this.descriptor.definitionDigest, command: captured.command ?? 'raw',
+        operationId: captured.operationId, definitionDigest: this.#authority.definitionDigestAt(control.payload.revision), command: captured.command ?? 'raw',
         commandVersion: captured.commandVersion ?? '1', basedOn: captured.basedOn ?? null, reapplyOf: captured.reapplyOf ?? null,
         coreDigest: bytesToHex(await transactionDigest(core)) }, core, key, identity)
       await this.#verified.attempt(attempt, this.#authority)
-      check(this.#journalHead < this.#maxRecords, 'PEER_STORAGE_QUOTA')
-      await this.#write(`${this.#prefix}/journal/${this.#journalHead + 1}`, encodePeerValue(attempt))
-      await this.#write(`${this.#prefix}/journal-head`, encodePeerValue(this.#journalHead + 1))
-      this.#journalHead++; this.#remember(attempt); this.#publish(); return structuredClone(attempt)
+      check(this.#journalHead - this.#journalFloor < this.#maxRecords, 'PEER_STORAGE_QUOTA')
+      const nextJournal = this.#journalHead + 1
+      await this.#writeMany([
+        { key: `${this.#prefix}/journal/${nextJournal}`, value: encodePeerValue(attempt) },
+        { key: `${this.#prefix}/journal-head`, value: encodePeerValue(nextJournal) },
+      ])
+      this.#journalHead = nextJournal; this.#journalIndex.set(attempt.id, nextJournal); this.#remember(attempt); this.#publish()
+      if (this.#verified.dirtyCount >= 32) void this.#verified.flush().catch(() => undefined)
+      return structuredClone(attempt)
     })
   }
   order(input: SignedAttempt): Promise<OrderedCommand> {
@@ -612,8 +661,8 @@ class Replica implements PeerReplica {
         // An incomplete inherited segment lacks both application bodies and
         // the receipt bridge to its selected cutoff. Keep the last complete
         // ancestor instead; later stored branches cannot repair this gap.
-        if (segment.cutoff !== null && range.length < segment.cutoff.sequence) break
-        for (let sequence = 1; sequence <= range.length; sequence++) {
+        if (segment.cutoff !== null && range.startSequence + range.length - 1 < segment.cutoff.sequence) break
+        for (let sequence = range.startSequence; sequence < range.startSequence + range.length; sequence++) {
           const retained = range.records.get(sequence); check(retained !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE'); selected.push(retained)
         }
         const head = this.#heads.get(range.generation)!
@@ -703,7 +752,8 @@ class Replica implements PeerReplica {
       const through = Math.min(end, start + limit)
       let bytes = 0
       for (const range of ranges) {
-        const first = Math.max(1, start - range.offset + 1), last = Math.min(range.length, through - range.offset)
+        const first = Math.max(range.startSequence, range.startSequence + (start - range.offset))
+        const last = Math.min(range.startSequence + range.length - 1, range.startSequence + (through - range.offset) - 1)
         for (let sequence = first; sequence <= last; sequence++) {
           const value = range.records.get(sequence); check(value !== undefined, 'PEER_RECOVERY_PREFIX_INCOMPLETE')
           const size = encodePeerValue(value.command).byteLength
@@ -751,6 +801,137 @@ class Replica implements PeerReplica {
       value.payload.peer !== this.device.publicKey && value.payload.generation === this.generation.id &&
       this.#authority.grant(value.payload.peer)?.reader === true &&
       this.#pointAvailable(value.payload.point) && this.#authority.atOrAfter(value.payload.point, point)).map(value => structuredClone(value))
+  }
+  compact(options: HistoryCompactionOptions = {}): Promise<HistoryCompactionResult> {
+    const keepTail = options.keepTail ?? 0
+    const pruneAbandoned = options.pruneAbandoned ?? true
+    return this.#serial.run(async () => {
+      this.#assertReady()
+      check(Number.isSafeInteger(keepTail) && keepTail >= 0, 'PEER_COMPACTION_OPTIONS_INVALID')
+      const remove = this.#options.store.delete?.bind(this.#options.store)
+      check(remove !== undefined, 'PEER_COMPACTION_UNSUPPORTED')
+      const totalSelected = this.#selected.length
+      const compactCount = Math.max(0, totalSelected - keepTail)
+      let compactedRecords = 0, prunedAbandonedRecords = 0, reclaimedKeys = 0
+      let floorPoint: HistoryPoint | null = null
+      const keysToDelete: string[] = []
+      const compactedAttemptIds = new Set<string>()
+      const headUpdates: BytesStoreEntry[] = []
+
+      if (compactCount > 0) {
+        const compactedSlice = this.#selected.slice(0, compactCount)
+        const lastCompacted = compactedSlice.at(-1)!.command
+        floorPoint = {
+          generation: lastCompacted.receipt.payload.generation,
+          sequence: lastCompacted.receipt.payload.sequence,
+          root: lastCompacted.receipt.root,
+        }
+        const byGen = new Map<string, Retained[]>()
+        for (const item of compactedSlice) {
+          const gen = item.command.receipt.payload.generation
+          const list = byGen.get(gen) ?? []
+          list.push(item)
+          byGen.set(gen, list)
+          compactedAttemptIds.add(item.command.attempt.id)
+        }
+        for (const [gen, items] of byGen) {
+          const head = this.#heads.get(gen)!, records = this.#records.get(gen)!
+          const last = items.at(-1)!.command
+          let removedBytes = 0
+          for (const item of items) {
+            removedBytes += item.command.receipt.payload.bodyBytes
+            keysToDelete.push(`${this.#prefix}/record/${gen}/${item.command.receipt.payload.sequence}`)
+          }
+          const nextHead: Head = {
+            sequence: head.sequence, root: head.root, bytes: Math.max(0, head.bytes - removedBytes),
+            floorSequence: last.receipt.payload.sequence, floorRoot: last.receipt.root,
+          }
+          headUpdates.push({ key: `${this.#prefix}/head/${gen}`, value: encodePeerValue(nextHead) })
+          this.#heads.set(gen, nextHead)
+          for (const item of items) {
+            records.delete(item.command.receipt.payload.sequence)
+            compactedRecords++
+          }
+        }
+      }
+
+      if (pruneAbandoned) {
+        const selectedGens = new Set(this.#authority.selectedSegments().map(segment => segment.generation.id))
+        for (const [gen, records] of this.#records) {
+          if (selectedGens.has(gen)) continue
+          const head = this.#heads.get(gen)
+          for (const [seq, item] of records) {
+            keysToDelete.push(`${this.#prefix}/record/${gen}/${seq}`)
+            compactedAttemptIds.add(item.command.attempt.id)
+            prunedAbandonedRecords++
+          }
+          if (records.size > 0 && head !== undefined) {
+            const nextHead: Head = { sequence: head.sequence, root: head.root, bytes: 0, floorSequence: head.sequence, floorRoot: head.root }
+            headUpdates.push({ key: `${this.#prefix}/head/${gen}`, value: encodePeerValue(nextHead) })
+            this.#heads.set(gen, nextHead)
+            records.clear()
+          }
+        }
+      }
+
+      // Advance contiguous journal floor for compacted attempts before deleting journal keys.
+      const compactedIndices = new Set<number>()
+      for (const attemptId of compactedAttemptIds) {
+        const idx = this.#journalIndex.get(attemptId)
+        if (idx !== undefined) compactedIndices.add(idx)
+      }
+      let nextJournalFloor = this.#journalFloor
+      while (compactedIndices.has(nextJournalFloor + 1)) {
+        nextJournalFloor++
+        keysToDelete.push(`${this.#prefix}/journal/${nextJournalFloor}`)
+      }
+      if (nextJournalFloor > this.#journalFloor) {
+        headUpdates.push({ key: `${this.#prefix}/journal-floor`, value: encodePeerValue(nextJournalFloor) })
+      }
+
+      if (headUpdates.length > 0) await this.#writeMany(headUpdates)
+      this.#journalFloor = nextJournalFloor
+
+      for (const attemptId of compactedAttemptIds) {
+        const command = this.#receipts.get(attemptId)
+        if (command !== undefined) {
+          this.#retainedBytes = Math.max(0, this.#retainedBytes - (encodePeerValue(command).length + 2))
+          this.#receipts.delete(attemptId)
+        }
+        const attempt = this.#attempts.get(attemptId)
+        if (attempt !== undefined && (this.#journalIndex.get(attemptId) ?? 0) <= this.#journalFloor) {
+          this.#attempts.delete(attemptId)
+          this.#journalIndex.delete(attemptId)
+          const opKey = operationKey(attempt.payload.header.author, attempt.payload.header.operationId)
+          if (this.#operations.get(opKey) === attemptId) this.#operations.delete(opKey)
+        }
+        this.#lastOutcomes.delete(attemptId)
+        keysToDelete.push(`${this.#prefix}/result/${attemptId}`, `${this.#prefix}/verified/${attemptId}`)
+      }
+
+      if (compactCount > 0) {
+        const nextSelected = this.#selected.slice(compactCount)
+        await this.#replay(nextSelected, this.#authority, false)
+        this.#selected = nextSelected
+        this.#selectedIds = new Set(nextSelected.map(item => item.command.attempt.id))
+        const generation = this.generation, head = this.#heads.get(generation.id)!
+        this.#publishedRevision = {
+          applicationId: this.descriptor.applicationId, historyId: this.descriptor.historyId,
+          generation: generation.id, point: { generation: generation.id, sequence: head.sequence, root: head.root },
+          controlRevision: generation.payload.controlRevision,
+          materializationRevision: String(this.#options.materializer.queries.revision),
+        }
+      }
+
+      for (const key of keysToDelete) {
+        try { await remove(key); reclaimedKeys++ } catch { /* Best-effort deletion after durable head advance. */ }
+      }
+      if (compactCount > 0 || prunedAbandonedRecords > 0) this.#publish()
+      return {
+        compactedRecords, prunedAbandonedRecords, retainedRecords: this.#selected.length,
+        reclaimedKeys, floorPoint,
+      }
+    })
   }
   #now(): number { const now = (this.#options.now ?? Date.now)(); check(Number.isSafeInteger(now) && now >= 0, 'PEER_CLOCK_INVALID'); return now }
   subscribe(listener: () => void): () => void { this.#listeners.add(listener); return () => this.#listeners.delete(listener) }

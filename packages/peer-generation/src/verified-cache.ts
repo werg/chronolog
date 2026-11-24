@@ -98,7 +98,12 @@ export class VerifiedReplayCache {
     }
     return verified
   }
-  /** Optional acceleration is written only at clean close, never on the command critical path. */
+  get dirtyCount(): number {
+    let count = 0
+    for (const value of this.#values.values()) if (value.dirty) count++
+    return count
+  }
+  /** Optional acceleration written periodically and at clean close, never blocking the command critical path. */
   async flush(): Promise<void> {
     const key = await this.#sealKey()
     if (key === null) return

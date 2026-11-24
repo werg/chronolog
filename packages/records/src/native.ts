@@ -80,6 +80,16 @@ export class NativeBytesStore implements BytesStore {
     const copy = Uint8Array.from(value)
     return this.#enqueue(() => this.#request('put', { key, value: copy }))
   }
+  putMany(entries: readonly BytesStoreEntry[]): Promise<void> {
+    if (entries.length === 0) return Promise.resolve()
+    if (entries.length > 128) return Promise.reject(new Error('BYTES_STORE_BATCH_LIMIT'))
+    const captured: BytesStoreEntry[] = []
+    for (const entry of entries) {
+      if (!(entry.value instanceof Uint8Array) || entry.value.length > this.#maxValueBytes) return Promise.reject(new Error('BYTES_STORE_VALUE_TOO_LARGE'))
+      captured.push({ key: entry.key, value: Uint8Array.from(entry.value) })
+    }
+    return this.#enqueue(() => this.#request('putMany', { entries: captured }))
+  }
   delete(key: string): Promise<void> { return this.#enqueue(() => this.#request('delete', { key })) }
   async *iterateEntries(): AsyncIterable<BytesStoreEntry> {
     let release!: () => void, started!: () => void

@@ -44,10 +44,28 @@ export async function createEventMaterializationRuntime(options: {
     try { if (closed) throw new Error('EVENT_EXECUTION_CLOSED'); return await task() } finally { release() }
   }
   const storage = new EventHistoryStore(options.store, key, digest, quota)
-  const evaluate = async (next: readonly ReplayProposal[]): Promise<MaterializedTransactionOutcome[]> => {
-    const operations = new Set<string>(), transactions = new Set<string>(), proposals = new Set<string>()
+  const verifiedInputs = new WeakMap<ReplayProposal, ReplayProposal>()
+  let knownOperations = new Set<string>(), knownTransactions = new Set<string>(), knownProposals = new Set<string>()
+  const rebuildIndices = (entries: readonly ReplayProposal[]) => {
+    knownOperations = new Set<string>()
+    knownTransactions = new Set<string>()
+    knownProposals = new Set<string>()
+    for (const entry of entries) {
+      knownTransactions.add(bytesToHex(entry.txId))
+      knownProposals.add(bytesToHex(entry.candidateDigest))
+      knownOperations.add(`${bytesToHex(entry.core.authorId)}/${entry.core.operationId}`)
+    }
+  }
+  const evaluateRange = async (
+    next: readonly ReplayProposal[],
+    start: number,
+    operations: Set<string>,
+    transactions: Set<string>,
+    proposals: Set<string>,
+  ): Promise<MaterializedTransactionOutcome[]> => {
     const result: MaterializedTransactionOutcome[] = []
-    for (const [index, entry] of next.entries()) {
+    for (let index = start; index < next.length; index++) {
+      const entry = next[index]!
       const core = entry.core
       if (entry.txId.length === 0) {
         throw new Error('EVENT_EXECUTION_INPUT_INVALID')
@@ -75,7 +93,7 @@ export async function createEventMaterializationRuntime(options: {
   if (persisted !== null) {
     revision = persisted.revision; finalLength = persisted.finalLength; finalRevision = persisted.finalRevision
     order = [...persisted.order]
-    outcomes = await evaluate(order)
+    outcomes = await evaluateRange(order, 0, knownOperations, knownTransactions, knownProposals)
   }
   let outcomeIndex = new Map(outcomes.map(outcome => [bytesToHex(outcome.txId), outcome]))
   const persist = async (state: EventHistoryState, difference: number): Promise<string> => {
@@ -106,38 +124,87 @@ export async function createEventMaterializationRuntime(options: {
   return {
     coordinator: {
       materialize: async (input) => {
-        const next = structuredClone(input) as ReplayProposal[]
+        // Own unverified suffix inputs synchronously before queuing, while keeping
+        // already-verified prefix references O(1) without cloning the whole history.
+        const snapshotInput = input.map(entry => verifiedInputs.has(entry) ? entry : structuredClone(entry))
         return serial(async () => {
-          const nextOutcomes = await evaluate(next)
-          for (let i = 0; i < finalLength; i++) if (next[i] === undefined || !sameIdentity(order[i]!, next[i]!)) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_CHANGED')
+          let difference = 0
+          while (difference < order.length && difference < snapshotInput.length) {
+            const incoming = snapshotInput[difference]!, retained = order[difference]!
+            if (verifiedInputs.get(incoming) === retained) { difference++; continue }
+            if (!sameIdentity(retained, incoming)) break
+            if (!equalBytes(encodeTransactionCore(incoming.core), incoming.canonicalCandidate)) {
+              throw new Error('EVENT_EXECUTION_INPUT_INVALID')
+            }
+            difference++
+          }
+          if (difference < finalLength) throw new Error('EVENT_EXECUTION_FINAL_PREFIX_CHANGED')
+          const suffix = snapshotInput.slice(difference)
+          const next = difference === order.length && suffix.length === 0 ? order : [...order.slice(0, difference), ...suffix]
+          const pureAppend = difference === order.length
+          const operations = pureAppend ? new Set(knownOperations) : new Set<string>()
+          const transactions = pureAppend ? new Set(knownTransactions) : new Set<string>()
+          const proposals = pureAppend ? new Set(knownProposals) : new Set<string>()
+          if (!pureAppend) {
+            for (let i = 0; i < difference; i++) {
+              const entry = order[i]!
+              transactions.add(bytesToHex(entry.txId))
+              proposals.add(bytesToHex(entry.candidateDigest))
+              operations.add(`${bytesToHex(entry.core.authorId)}/${entry.core.operationId}`)
+            }
+          }
+          const suffixOutcomes = await evaluateRange(next, difference, operations, transactions, proposals)
+          if (pureAppend && suffix.length === 0) return null
           // A provisional preview may lose authorization before its timestamp
           // closes. Selection may change; original proposal bytes never do.
-          const previousById = new Map(order.map(entry => [bytesToHex(entry.txId), entry]))
-          for (const entry of next) {
-            const previous = previousById.get(bytesToHex(entry.txId))
-            if (previous !== undefined && !sameIdentity(previous, entry)) throw new Error('EVENT_EXECUTION_IDENTITY_CONFLICT')
+          if (!pureAppend) {
+            const previousById = new Map(order.map(entry => [bytesToHex(entry.txId), entry]))
+            for (const entry of suffix) {
+              const previous = previousById.get(bytesToHex(entry.txId))
+              if (previous !== undefined && !sameIdentity(previous, entry)) throw new Error('EVENT_EXECUTION_IDENTITY_CONFLICT')
+            }
           }
-          let difference = 0
-          while (difference < order.length && difference < next.length && sameIdentity(order[difference]!, next[difference]!)) difference++
-          if (difference === order.length && difference === next.length) return null
+          const nextOutcomes = [...outcomes.slice(0, difference), ...suffixOutcomes]
           const previousRevision = revision
           const nextRevision = revision + 1n
-          const changes: MaterializationOutcomeChange[] = nextOutcomes.flatMap((current) => {
-            const before = outcomeIndex.get(bytesToHex(current.txId))
-            return before?.outcome === current.outcome && before.rejectionCode === current.rejectionCode ? [] : [{
-              txId: current.txId.slice(), previous: before?.outcome ?? null, current: current.outcome,
-              previousRejectionCode: before?.rejectionCode ?? null, currentRejectionCode: current.rejectionCode,
-            }]
-          })
-          const selected = new Set(next.map(entry => bytesToHex(entry.txId)))
-          for (const removed of outcomes) if (!selected.has(bytesToHex(removed.txId))) changes.push({
-            txId: removed.txId.slice(), previous: removed.outcome, current: null,
-            previousRejectionCode: removed.rejectionCode, currentRejectionCode: null,
-          })
+          const changes: MaterializationOutcomeChange[] = []
+          if (pureAppend) {
+            for (const current of suffixOutcomes) {
+              changes.push({
+                txId: current.txId.slice(), previous: null, current: current.outcome,
+                previousRejectionCode: null, currentRejectionCode: current.rejectionCode,
+              })
+            }
+          } else {
+            for (const current of suffixOutcomes) {
+              const before = outcomeIndex.get(bytesToHex(current.txId))
+              if (before?.outcome !== current.outcome || before.rejectionCode !== current.rejectionCode) {
+                changes.push({
+                  txId: current.txId.slice(), previous: before?.outcome ?? null, current: current.outcome,
+                  previousRejectionCode: before?.rejectionCode ?? null, currentRejectionCode: current.rejectionCode,
+                })
+              }
+            }
+            const selected = new Set(next.map(entry => bytesToHex(entry.txId)))
+            for (let i = difference; i < outcomes.length; i++) {
+              const removed = outcomes[i]!
+              if (!selected.has(bytesToHex(removed.txId))) changes.push({
+                txId: removed.txId.slice(), previous: removed.outcome, current: null,
+                previousRejectionCode: removed.rejectionCode, currentRejectionCode: null,
+              })
+            }
+          }
           // Indexed immutable records are published by one small atomic head.
           const contentHash = await persist({ order: next, revision: nextRevision, finalLength, finalRevision }, difference)
+          for (let i = 0; i < suffix.length; i++) verifiedInputs.set(snapshotInput[difference + i]!, suffix[i]!)
           order = next; outcomes = nextOutcomes; revision = nextRevision
-          outcomeIndex = new Map(outcomes.map(outcome => [bytesToHex(outcome.txId), outcome]))
+          knownOperations = operations; knownTransactions = transactions; knownProposals = proposals
+          if (pureAppend) {
+            for (const outcome of suffixOutcomes) outcomeIndex.set(bytesToHex(outcome.txId), outcome)
+          } else {
+            outcomeIndex = new Map(outcomes.map(outcome => [bytesToHex(outcome.txId), outcome]))
+            rebuildIndices(order)
+          }
           const result = { revision, previousRevision, orderLength: order.length, replayFromIndex: difference,
             replayedTransactions: order.length - difference, checkpointPrefix: difference, contentHash,
             manifestDigest: digest.slice(), earliestChangedOrderIndex: difference, outcomeChanges: changes }

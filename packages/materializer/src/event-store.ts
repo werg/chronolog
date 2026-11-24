@@ -1,4 +1,4 @@
-import type { BytesStore } from '@chronolog/records'
+import { writeBytesMany, type BytesStore, type BytesStoreEntry } from '@chronolog/records'
 import { bytesToHex, hexToBytes, sha256 } from '@chronolog/canonical'
 import { assertCanonicalCbor, decodeTransactionCore, encodeCanonicalCbor, equalBytes } from '@chronolog/protocol'
 import type { ReplayProposal } from './types.js'
@@ -54,6 +54,7 @@ export class EventHistoryStore {
         difference > state.order.length || state.order.length > 100_000) throw new Error('EVENT_EXECUTION_STORE_INVALID')
     const anchors = this.#anchors.slice(0, difference), sizes = this.#prefixBytes.slice(0, difference)
     let tail = anchors.at(-1) ?? null, used = sizes.at(-1) ?? 0
+    const pendingWrites: BytesStoreEntry[] = []
     for (let index = difference; index < state.order.length; index++) {
       const entry = state.order[index]!
       const node = encodeCanonicalCbor(['chronolog/event-record/v1', BigInt(index), tail === null ? null : hexToBytes(tail),
@@ -62,17 +63,29 @@ export class EventHistoryStore {
       if (used > this.quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
       const hash = bytesToHex(await sha256(node)), key = `${this.key}/node/${hash}`
       const existing = await this.store.get(key)
-      if (existing === null) await this.store.put(key, node)
+      if (existing === null) pendingWrites.push({ key, value: node })
       else if (!equalBytes(existing, node)) throw new Error('EVENT_EXECUTION_RECORD_CORRUPT')
       anchors.push(hash); sizes.push(used); tail = hash
     }
     const head = encodeCanonicalCbor(['chronolog/event-head/v2', this.digest, state.revision, BigInt(state.finalLength),
       state.finalRevision, BigInt(state.order.length), tail === null ? null : hexToBytes(tail), BigInt(used)])
     if (used + head.length > this.quota) throw new Error('EVENT_EXECUTION_QUOTA_EXCEEDED')
-    // All immutable bodies precede the one atomic publication boundary. A failed
-    // acknowledgment fences the runtime; reopen chooses only the durable head.
-    await this.store.put(this.key, head)
+    // All immutable bodies precede the one atomic publication boundary. When the
+    // store supports putMany, write nodes and head in a single atomic transaction.
+    pendingWrites.push({ key: this.key, value: head })
+    for (let offset = 0; offset < pendingWrites.length; offset += 128) {
+      await writeBytesMany(this.store, pendingWrites.slice(offset, offset + 128))
+    }
+    const superseded = this.#anchors.slice(difference)
     this.#anchors = anchors; this.#prefixBytes = sizes
+    if (superseded.length > 0 && this.store.delete !== undefined) {
+      const active = new Set(anchors)
+      for (const oldHash of superseded) {
+        if (!active.has(oldHash)) {
+          try { await this.store.delete(`${this.key}/node/${oldHash}`) } catch { /* Best-effort node reclamation. */ }
+        }
+      }
+    }
     return bytesToHex(await sha256(head))
   }
 }

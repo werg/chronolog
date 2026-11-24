@@ -1,6 +1,7 @@
 import type { BytesStore } from '@chronolog/records'
 import { createPeerReplica, type PeerReplica, type PeerRevision, type AppliedResult, type OperationState, type AuthorityBundle,
-  type RecoveryNotice, type SignedAttempt, type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView } from '@chronolog/peer-generation'
+  type RecoveryNotice, type SignedAttempt, type SignedRetainedCoverage, type PrefixProof, type CapturedPeerView,
+  type HistoryCompactionOptions, type HistoryCompactionResult } from '@chronolog/peer-generation'
 import type { PeerIdentity } from '@chronolog/peer-generation/control'
 import { createEventMaterializationRuntime, type ChronologMaterializationRuntime, type MaterializedLocalSqlValue } from '@chronolog/materializer'
 import { bytesToHex, decodeTransactionCore, isEmitStep, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
@@ -139,6 +140,42 @@ export class ApplicationData<D extends ApplicationDefinition = ApplicationDefini
     const notice = await this.#replica.adopt(authority)
     void this.resume().catch(() => undefined)
     return notice
+  }
+
+  /** Compact older history records and abandoned generations, optionally retaining a summary command first. */
+  async compact(options: HistoryCompactionOptions & {
+    readonly summarize?: (events: readonly ApplicationEvent[]) => ChangeProgram | null | Promise<ChangeProgram | null>
+    readonly operationId?: string
+    readonly signal?: AbortSignal
+  } = {}): Promise<HistoryCompactionResult> {
+    this.#assertOpen()
+    const keepTail = options.keepTail ?? 0
+    let extraTail = 0
+    if (options.summarize !== undefined) {
+      if (typeof options.operationId !== 'string' || options.operationId.length === 0) throw new Error('APPLICATION_COMPACT_OPERATION_ID_REQUIRED')
+      const view = await this.readView()
+      const allEvents: ApplicationEvent[] = []
+      try {
+        let cursor: string | undefined
+        for (;;) {
+          const batch = view.readEvents({ limit: 1024, ...(cursor === undefined ? {} : { cursor }) })
+          allEvents.push(...batch.events)
+          if (!batch.hasMore) break
+          cursor = batch.cursor
+        }
+      } finally { view.release() }
+      const summaryProgram = await options.summarize(allEvents)
+      if (summaryProgram !== null) {
+        const submission = await this.submitProgramAs(summaryProgram, this.#replica.device, { operationId: options.operationId })
+        const applied = await submission.applied({ ...(options.signal === undefined ? {} : { signal: options.signal }) })
+        if (applied.outcome !== 'accepted') throw new Error(`APPLICATION_COMPACT_SUMMARY_REJECTED:${applied.rejectionCode ?? 'unknown'}`)
+        extraTail = 1
+      }
+    }
+    return this.#replica.compact({
+      keepTail: keepTail + extraTail,
+      ...(options.pruneAbandoned === undefined ? {} : { pruneAbandoned: options.pruneAbandoned }),
+    })
   }
 
   changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {

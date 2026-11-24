@@ -26,8 +26,8 @@ export async function openPeerApplication<const D extends ApplicationDefinition>
   try {
     const requiresSql = options.definition.schema !== undefined || options.authority.descriptor.payload.schemaDigest !== null
     if (requiresSql && options.createMaterializer === undefined) throw new Error('APPLICATION_SCHEMA_REQUIRES_SQL')
-    if (await applicationDefinitionDigest(options.definition) !== options.authority.descriptor.payload.definitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
     const authority = await retainApplicationAuthority(options.device, options.authority)
+    if (await applicationDefinitionDigest(options.definition) !== authority.currentDefinitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
     if (authority.current === null) throw new Error('PEER_NO_SELECTED_GENERATION')
     const captured = { ...options, ...(options.epochKeys === undefined ? {} : {
       epochKeys: new Map([...options.epochKeys].map(([epoch, key]) => [epoch, key.slice()])) }) }

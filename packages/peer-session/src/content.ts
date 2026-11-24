@@ -81,6 +81,7 @@ export class ApplicationContent {
   readonly #readers = new Map<string, Set<AbortController>>()
   readonly #prunes = new Map<string, Promise<void>>()
   readonly #evicting = new Map<string, number>()
+  readonly #cryptoKeys = new WeakMap<Uint8Array, { readonly keyDigest: string; readonly key: CryptoKey }>()
 
   constructor(options: { readonly replica: PeerReplica; readonly store: BytesStore; readonly storageId: string; readonly epochKeys: ReadonlyMap<number, Uint8Array>; readonly acquireKey?: (epoch: number) => Promise<void> }) {
     this.#replica = options.replica; this.#store = options.store; this.#storageId = options.storageId
@@ -156,16 +157,32 @@ export class ApplicationContent {
       signal.throwIfAborted()
       const manifest = await this.#manifest(reference, signal)
       if (manifest === null) throw new Error('CONTENT_UNAVAILABLE')
-      for (let index = Math.floor(offset / CONTENT_CHUNK_BYTES); index * CONTENT_CHUNK_BYTES < offset + length; index++) {
+      const firstIndex = Math.floor(offset / CONTENT_CHUNK_BYTES)
+      const lastIndex = length === 0 ? firstIndex - 1 : Math.floor((offset + length - 1) / CONTENT_CHUNK_BYTES)
+      const PREFETCH = 2
+      const inflight = new Map<number, Promise<Uint8Array | null>>()
+      const startFetch = (idx: number) => {
+        if (idx <= lastIndex && !inflight.has(idx)) {
+          const task = this.#chunk(reference, manifest, idx, signal)
+          void task.catch(() => undefined)
+          inflight.set(idx, task)
+        }
+      }
+      for (let i = firstIndex; i < firstIndex + PREFETCH && i <= lastIndex; i++) startFetch(i)
+      for (let index = firstIndex; index <= lastIndex; index++) {
         this.#access(this.#replica.device.publicKey); signal.throwIfAborted()
-        const chunk = await this.#chunk(reference, manifest, index, signal)
+        const task = inflight.get(index)!
+        inflight.delete(index)
+        const chunk = await task
         if (chunk === null) throw new Error('CONTENT_UNAVAILABLE')
+        startFetch(index + PREFETCH)
         const plain = await this.#decrypt(manifest, index, chunk)
         this.#access(this.#replica.device.publicKey); signal.throwIfAborted()
         yield plain.slice(Math.max(0, offset - index * CONTENT_CHUNK_BYTES), Math.min(plain.length, offset + length - index * CONTENT_CHUNK_BYTES))
       }
       signal.throwIfAborted()
     } finally {
+      reader.abort()
       readers.delete(reader)
       if (readers.size === 0) this.#readers.delete(reference.id)
     }
@@ -314,9 +331,14 @@ export class ApplicationContent {
     const bytes = this.#keys.get(epoch)
     if (bytes?.length !== 32) throw new Error('CONTENT_KEY_UNAVAILABLE')
     const control = this.#replica.authority.controls.find(item => item.payload.epoch === epoch)?.payload
-    if (control === undefined || await bytesDigest(bytes) !== control.keyDigest) throw new Error('CONTENT_KEY_MISMATCH')
+    if (control === undefined) throw new Error('CONTENT_KEY_MISMATCH')
+    const cached = this.#cryptoKeys.get(bytes)
+    if (cached !== undefined && cached.keyDigest === control.keyDigest) return cached.key
+    if (await bytesDigest(bytes) !== control.keyDigest) throw new Error('CONTENT_KEY_MISMATCH')
     this.#access(this.#replica.device.publicKey)
-    return crypto.subtle.importKey('raw', new Uint8Array(bytes), 'AES-GCM', false, ['encrypt', 'decrypt'])
+    const imported = await crypto.subtle.importKey('raw', new Uint8Array(bytes), 'AES-GCM', false, ['encrypt', 'decrypt'])
+    this.#cryptoKeys.set(bytes, { keyDigest: control.keyDigest, key: imported })
+    return imported
   }
   #stageKey(id: string): string { return `${this.#prefix}/stage/${id}` }
   #chunkKey(hash: string, referenceId?: string): string { return `${this.#prefix}/chunk/${referenceId === undefined ? '' : referenceId + '/'}${hash}` }

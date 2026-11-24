@@ -88,6 +88,25 @@ export class IndexedDbBytesStore implements BytesStore {
     })
   }
 
+  async putMany(entries: readonly BytesStoreEntry[]): Promise<void> {
+    if (entries.length === 0) return
+    if (entries.length > 128) return Promise.reject(new Error('BYTES_STORE_BATCH_LIMIT'))
+    const staged = new Map<string, Uint8Array>()
+    for (const entry of entries) {
+      assertRecordKey(entry.key)
+      if (entry.value.length > MAX_RECORD_VALUE_BYTES) return Promise.reject(new Error('BYTES_STORE_VALUE_LIMIT'))
+      staged.set(entry.key, entry.value.slice())
+    }
+    return this.#enqueue(async () => {
+      const encoded: { key: string; value: Uint8Array }[] = []
+      for (const [key, value] of staged) encoded.push({ key, value: await encodeRecordValue(key, value) })
+      await this.#transaction('readwrite', table => {
+        for (const entry of encoded) table.put(entry.value, entry.key)
+        return () => undefined
+      })
+    })
+  }
+
   async delete(key: string): Promise<void> {
     assertRecordKey(key)
     return this.#enqueue(() => this.#transaction('readwrite', table => { table.delete(key); return () => undefined }))

@@ -42,9 +42,12 @@ export function validateHistoryPoint(point: HistoryPoint): void {
   object(point, ['generation', 'sequence', 'root']); hex(point.generation); uint(point.sequence); hex(point.root)
 }
 function validateControl(value: ControlRevision): void {
-  object(value, ['applicationId', 'profile', 'policy', 'revision', 'previous', 'epoch', 'keyDigest', 'grants', 'recoveryFloor'])
+  const controlFields = ['applicationId', 'profile', 'policy', 'revision', 'previous', 'epoch', 'keyDigest', 'grants', 'recoveryFloor']
+  if (value?.definitionDigest !== undefined) controlFields.push('definitionDigest')
+  object(value, controlFields)
   hex(value.applicationId); uint(value.revision); uint(value.epoch); hex(value.keyDigest)
   if (value.previous !== null) hex(value.previous)
+  if (value.definitionDigest !== undefined) hex(value.definitionDigest)
   check(isArray(value.grants) && value.grants.length > 0 && value.grants.length <= 1024, 'PEER_GRANTS_INVALID')
   const keys = new Set<string>()
   for (const grant of value.grants) {
@@ -145,6 +148,15 @@ export class PeerAuthority {
   controlAt(revision: number): SignedControlRevision {
     const value = this.#bundle.controls[revision]; check(value !== undefined, 'PEER_CONTROL_UNKNOWN'); return structuredClone(value)
   }
+  definitionDigestAt(revision = this.control.payload.revision): string {
+    uint(revision, this.#bundle.controls.length - 1)
+    for (let index = revision; index >= 0; index--) {
+      const digest = this.#bundle.controls[index]!.payload.definitionDigest
+      if (digest !== undefined) return digest
+    }
+    return this.#bundle.descriptor.payload.definitionDigest
+  }
+  get currentDefinitionDigest(): string { return this.definitionDigestAt() }
   grant(publicKey: string, revision = this.control.payload.revision): PeerGrant | null {
     return structuredClone(this.controlAt(revision).payload.grants.find(grant => grant.publicKey === publicKey) ?? null)
   }

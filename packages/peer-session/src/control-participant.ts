@@ -111,10 +111,11 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
 
   async definition(): Promise<PublishedApplicationDefinition> {
     const result = await this.#request<PublishedApplicationDefinition>('publication', 'definition', {})
+    const authority = await verifyAuthorityBundle(this.#participant.authority)
     const descriptor = this.#participant.authority.descriptor
     if (await peerDigest(result.descriptor) !== await peerDigest(descriptor)) throw new Error('PEER_DESCRIPTOR_CHANGED')
     const definition = validateApplicationDescription(result.definition)
-    if (await applicationDescriptionDigest(definition) !== descriptor.payload.definitionDigest ||
+    if (await applicationDescriptionDigest(definition) !== authority.currentDefinitionDigest ||
       (result.schema === null ? null : await peerDigest(result.schema)) !== descriptor.payload.schemaDigest ||
       (definition.schema === null) !== (result.schema === null) || result.schema !== null && definition.schema !== result.schema.payload.program) {
       throw new Error('APPLICATION_DEFINITION_MISMATCH')
@@ -172,7 +173,7 @@ export class ApplicationControlParticipant implements ApplicationControlHost {
         const publication = await signPublicationManifest({ applicationId: descriptor.applicationId, historyId: descriptor.historyId,
           profile: descriptor.profile, controlRevision: authority.control.payload.revision, author: this.#participant.device.publicKey,
           operationId: captured.operationId, revision: (current?.publication.payload.revision ?? -1) + 1,
-          previous: current?.publication.id ?? null, definitionDigest: descriptor.definitionDigest,
+          previous: current?.publication.id ?? null, definitionDigest: authority.currentDefinitionDigest,
           executionManifestDigest: descriptor.executionManifestDigest, entry: captured.entry, files: captured.files }, this.#participant.device)
         this.#signal.throwIfAborted()
         return encodePeerValue(publication)

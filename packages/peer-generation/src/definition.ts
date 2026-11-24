@@ -169,6 +169,14 @@ export async function applicationDescriptionDigest(value: ApplicationDescription
   return bytesDigest(new TextEncoder().encode(descriptionJson(description)))
 }
 
+/** Verify a monotonic definition evolution preserves application identity and storage profile. */
+export function assertCompatibleDefinitionEvolution(previous: ApplicationDescription, next: ApplicationDescription): void {
+  const prior = validateApplicationDescription(previous), updated = validateApplicationDescription(next)
+  check(prior.id === updated.id, 'APPLICATION_DEFINITION_ID_MISMATCH')
+  check((prior.schema === null) === (updated.schema === null), 'APPLICATION_DEFINITION_PROFILE_MISMATCH')
+  if (prior.schema !== null) check(prior.schema === updated.schema, 'APPLICATION_DEFINITION_SCHEMA_CHANGED')
+}
+
 function descriptionJson(value: ApplicationDescription): string {
   return canonicalJson(value as unknown as EventPayload, { maxBytes: 262_144, maxNodes: 65_536, maxDepth: 32 })
 }
