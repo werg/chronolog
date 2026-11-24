@@ -115,6 +115,17 @@ async function opfsConformance(name: string): Promise<void> {
   const directory = await root.getDirectoryHandle('test-records-' + name, { create: true })
   let store = new OpfsBytesStore(directory)
   await exercise(store)
+  const iterator = store.iterateEntries()[Symbol.asyncIterator]()
+  await iterator.next()
+  let written = false
+  const writing = store.put('after-snapshot', Uint8Array.of(7)).then(() => { written = true })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  check(!written, 'OPFS enumeration owns the mutation queue')
+  await iterator.return?.(); await writing
+  const entries = []
+  for await (const entry of store.iterateEntries()) entries.push(entry)
+  check(entries.map(entry => entry.key).sort().join(',') === 'after-snapshot,data,empty,large,ordering', 'OPFS authenticated logical key enumeration')
+  check(entries.find(entry => entry.key === 'large')?.value.length === 128 * 1024 + 13, 'OPFS streamed large value')
   await store.close()
   store = new OpfsBytesStore(directory)
   check((await store.get('ordering'))?.[0] === 2, 'OPFS persisted order')

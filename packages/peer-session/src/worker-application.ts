@@ -323,9 +323,11 @@ export class WorkerApplicationSession<D extends ApplicationDefinition = Applicat
       if (pending === undefined) return // A cancelled waiter can have an already posted result.
       // Validate and publish the response snapshot while this waiter is still
       // owned. A malformed reply must reject it immediately when the port ends.
-      this.#update(response.snapshot); this.#pending.delete(response.id)
-      if (response.error === undefined) pending.resolve(response.value)
-      else pending.reject(fromError(response.error))
+      this.#update(response.snapshot)
+      const error = response.error === undefined ? undefined : fromError(response.error)
+      this.#pending.delete(response.id)
+      if (error === undefined) pending.resolve(response.value)
+      else pending.reject(error)
     } catch (error) { this.#fail(error) }
   }
   readonly #messageError = (): void => { this.#fail(new Error('APPLICATION_WORKER_MESSAGE_INVALID')) }

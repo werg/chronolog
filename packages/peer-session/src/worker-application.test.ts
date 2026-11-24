@@ -13,7 +13,7 @@ import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolo
 import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
 import { openApplicationDevice, type ApplicationStorage } from './device.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
-import { AbandonedOperationError, RecoveredViewError, connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
+import { AbandonedOperationError, RecoveredViewError, connectApplications, type ApplicationRecoveryEvidence, type ApplicationReadView, type ApplicationSession } from './session.js'
 import { EventForwarderRecoveryError, forwardSessionEvents } from './event-forwarder.js'
 import { connectApplicationWorker } from './worker-application.js'
 import type { ApplicationControlHost } from './recovery.js'
@@ -281,6 +281,28 @@ describe('owned browser application facade', () => {
     expect(() => f.b.projection('releasable')).toThrow('APPLICATION_PROJECTION_NOT_FOUND')
     await client.close()
     expect((await pending).every(value => value.status === 'rejected')).toBe(true)
+  })
+
+  it.each([null, 'valid', 'malformed'] as const)('preserves recovery evidence and settles invalid error waiters: %s', async kind => {
+    const f = await fixture(), { client } = await facade(f.a)
+    const recovery = kind === null ? null : kind === 'valid'
+      ? { reason: 'handover' as const, adopted: f.a.revision!.point, unknownLoss: true }
+      : { reason: 'invented', adopted: null, unknownLoss: true } as unknown as ApplicationRecoveryEvidence
+    const error = new RecoveredViewError(f.a.revision!, recovery)
+    const query = vi.spyOn(f.a, 'query').mockRejectedValue(error)
+    cleanup.push(() => { query.mockRestore() })
+    if (kind === 'malformed') {
+      let settled = false
+      const waiting = client.query('messages', null).finally(() => { settled = true })
+      const rejected = expect(waiting).rejects.toThrow('APPLICATION_WORKER_MESSAGE_INVALID')
+      await vi.waitFor(() => expect(client.signal.aborted).toBe(true))
+      expect(settled).toBe(true)
+      await rejected
+    } else {
+      await expect(client.query('messages', null)).rejects.toMatchObject({ name: 'RecoveredViewError',
+        code: 'APPLICATION_VIEW_RECOVERED', revision: f.a.revision, recovery })
+      expect(client.signal.aborted).toBe(false)
+    }
   })
 
   it('settles the requesting waiter when its response contains malformed participation metadata', async () => {
