@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { chromium, webkit } from '@playwright/test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { chromium, webkit, type BrowserContext } from '@playwright/test'
 import { build } from 'esbuild'
 
 const bundle = await build({ entryPoints: ['test/browser-storage/worker.ts'], write: false, bundle: true,
@@ -15,28 +18,27 @@ const server = createServer((request, response) => {
   response.end(path === '/worker.js' ? workerCode :
     '<!doctype html><meta charset="utf-8"><title>Record storage qualification</title>')
 })
+const profile = await mkdtemp(join(tmpdir(), 'chronolog-storage-profile-'))
 server.listen(0, '127.0.0.1')
 await once(server, 'listening')
 const address = server.address()
 assert(address !== null && typeof address !== 'string')
-let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined
-try {
-  const engine = process.env.CHRONOLOG_STORAGE_BROWSER === 'webkit' ? webkit : chromium
-  const executablePath = process.env.CHRONOLOG_STORAGE_BROWSER_EXECUTABLE
-  browser = await engine.launch({ headless: true, ...(executablePath ? { executablePath } : {}) })
-  const page = await browser.newPage()
-  await page.goto('http://127.0.0.1:' + address.port)
-  await page.addInitScript({ content: 'globalThis.__name = (value) => value' })
-  await page.reload()
-  const result = await page.evaluate(async (name: string) => {
-    async function command(method: 'run' | 'resume'): Promise<{ id: string; storageId: string; backend?: string }> {
+const origin = 'http://127.0.0.1:' + address.port
+
+type Result = { id: string; storageId: string; backend?: string }
+async function command(context: BrowserContext, method: 'run' | 'resume', name: string): Promise<Result> {
+  const page = await context.newPage()
+  try {
+    await page.addInitScript({ content: 'globalThis.__name = (value) => value' })
+    await page.goto(origin)
+    return await page.evaluate(async ({ method, name }) => {
       const worker = new Worker('/worker.js', { type: 'module' })
       try {
-        return await new Promise((resolve, reject) => {
+        return await new Promise<Result>((resolve, reject) => {
           const timer = setTimeout(() => { reject(new Error('Storage Worker qualification timed out')) }, 45_000)
           worker.onerror = event => { clearTimeout(timer); reject(new Error(event.message)) }
           worker.onmessage = event => {
-            const data = event.data as { error?: string; value?: { id: string; storageId: string; backend?: string } }
+            const data = event.data as { error?: string; value?: Result }
             clearTimeout(timer)
             if (data.error) reject(new Error(data.error))
             else if (data.value !== undefined) resolve(data.value)
@@ -45,19 +47,36 @@ try {
           worker.postMessage({ id: 1, method, name })
         })
       } finally { worker.terminate() }
-    }
-    const initial = await command('run')
-    const resumed = await command('resume')
-    return { initial, resumed }
-  }, 'browser-storage-' + randomUUID())
-  assert.equal(result.initial.id, result.resumed.id)
-  assert.equal(result.initial.storageId, result.resumed.storageId)
-  assert.ok(result.initial.backend === 'opfs' || result.initial.backend === 'indexeddb')
-  console.log('Browser record stores, backend pin, legacy protection and Worker restart passed:', result.initial.backend)
+    }, { method, name })
+  } finally { await page.close() }
+}
+
+let context: BrowserContext | undefined
+try {
+  const engine = process.env.CHRONOLOG_STORAGE_BROWSER === 'webkit' ? webkit : chromium
+  const executablePath = process.env.CHRONOLOG_STORAGE_BROWSER_EXECUTABLE
+  const launch = () => engine.launchPersistentContext(profile, { headless: true, ...(executablePath ? { executablePath } : {}) })
+  // WebKit's private contexts expose getDirectory(), but reject it with
+  // UnknownError. Qualify durable storage in a fresh normal profile instead;
+  // never weaken fail-closed backend selection to accommodate private mode.
+  context = await launch()
+  const name = 'browser-storage-' + randomUUID()
+  const initial = await command(context, 'run', name)
+  await context.close(); context = undefined
+  context = await launch()
+  const resumed = await command(context, 'resume', name)
+  assert.equal(initial.id, resumed.id)
+  assert.equal(initial.storageId, resumed.storageId)
+  assert.ok(initial.backend === 'opfs' || initial.backend === 'indexeddb')
+  console.log('Browser record stores, backend pin, legacy protection and browser restart passed:', engine.name(), initial.backend)
 } finally {
-  await browser?.close()
-  server.closeAllConnections()
-  await new Promise<void>((resolve, reject) => {
-    server.close(error => error === undefined ? resolve() : reject(error))
-  })
+  try { await context?.close() } finally {
+    server.closeAllConnections()
+    await Promise.all([
+      rm(profile, { recursive: true, force: true }),
+      new Promise<void>((resolve, reject) => {
+        server.close(error => error === undefined ? resolve() : reject(error))
+      }),
+    ])
+  }
 }

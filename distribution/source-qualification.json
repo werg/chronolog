@@ -1,0 +1,7 @@
+{
+  "format": "chronolog-source-qualification/v1",
+  "contrib": {
+    "repository": "werg/tendriller-contrib",
+    "source": "a771cb26f36f5aab65621ce00453022248c29b0a"
+  }
+}

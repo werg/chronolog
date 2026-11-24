@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import process from 'node:process';
 import { URL, pathToFileURL } from 'node:url';
 
-export function select(tuple, mode, env = {}) {
+export function select(tuple, mode, env = {}, sourceQualification) {
   const { id, ...body } = tuple;
   assert.equal(tuple.format, 'tendriller-companion-release/v1');
   assert.equal(id, createHash('sha256').update(JSON.stringify(body)).digest('hex'), 'Tuple digest mismatch');
@@ -19,11 +19,20 @@ export function select(tuple, mode, env = {}) {
   if (mode === 'contrib') return { HOST_REF: host, CORE_REF: host, CHRONOLOG_REF: sha(env.CHRONOLOG_REF_INPUT || tuple.kernel.source) };
   assert.equal(mode, 'chronolog'); assert.equal(tuple.stage, 'qualified');
   assert.equal(tuple.contrib.repository, 'werg/tendriller-contrib');
-  return { HOST_REF: host, CONTRIB_REF: sha(env.CONTRIB_REF_INPUT || tuple.contrib.source) };
+  // A reviewed consumer can qualify newer kernel source without rewriting the
+  // immutable release receipt or claiming that the new combination has passed.
+  if (sourceQualification !== undefined) {
+    assert.equal(sourceQualification.format, 'chronolog-source-qualification/v1');
+    assert.equal(sourceQualification.contrib.repository, 'werg/tendriller-contrib');
+    sha(sourceQualification.contrib.source);
+  }
+  return { HOST_REF: host, CONTRIB_REF: sha(env.CONTRIB_REF_INPUT || sourceQualification?.contrib.source || tuple.contrib.source) };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const mode = process.argv[2];
   const tuple = JSON.parse(readFileSync(new URL('./companion-release.json', import.meta.url)));
-  for (const [key, value] of Object.entries(select(tuple, mode, process.env))) log(`${key}=${value}`);
+  const sourceQualification = mode === 'chronolog'
+    ? JSON.parse(readFileSync(new URL('./source-qualification.json', import.meta.url))) : undefined;
+  for (const [key, value] of Object.entries(select(tuple, mode, process.env, sourceQualification))) log(`${key}=${value}`);
 }
