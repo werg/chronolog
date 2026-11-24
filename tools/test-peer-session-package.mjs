@@ -21,7 +21,7 @@ await writeFile(join(consumer, 'package.json'), JSON.stringify({ name: 'default-
 execNpmSync(['install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: consumer, timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
 const packageRoot = join(consumer, 'node_modules/@chronolog/peer-session');
 const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json')));
-assert.deepEqual(metadata.dependencies, { werift: '0.27.0' });
+assert.deepEqual(metadata.dependencies, { 'better-sqlite3': '13.2.0', werift: '0.27.0' });
 assert.equal(metadata.peerDependencies, undefined); assert.equal(metadata.peerDependenciesMeta, undefined);
 assert.ok(metadata.exports['./webrtc-native']); assert.equal(metadata.exports['./sql'], undefined);
 const proof = JSON.parse(await readFile(join(packageRoot, 'provenance.json')));
