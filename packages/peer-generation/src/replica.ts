@@ -431,7 +431,8 @@ class Replica implements PeerReplica {
       for (const [id, attempt] of this.#attempts) {
         if (!this.#selectedIds.has(id) && attempt.payload.header.generation !== this.generation.id) abandoned.push(this.#state(attempt))
       }
-      notice = { previousGeneration: pending.previousGeneration, generation: pending.generation, adopted: this.generation.payload.adopted,
+      notice = { previousGeneration: pending.previousGeneration, generation: pending.generation,
+        reason: this.generation.payload.transition.payload.reason, adopted: this.generation.payload.adopted,
         revision: this.revision, abandoned,
         unknownLoss: true }
       const recoveries = [...this.#recoveries, structuredClone(notice)].slice(-32)

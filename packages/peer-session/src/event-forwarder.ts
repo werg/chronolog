@@ -1,5 +1,21 @@
 import { awaitOwnedTask } from './lifetime.js'
+import type { ApplicationRecoveryEvidence } from './errors.js'
 import type { ApplicationChange, ApplicationEvent, ApplicationEventBatch, ApplicationEventOptions } from './session-types.js'
+
+/** Preserves the recovery stop and the selected transition evidence during delivery. */
+export class EventForwarderRecoveryError extends Error {
+  readonly code = 'EVENT_FORWARDER_REVIEW_RECOVERY' as const
+  readonly revision: ApplicationChange['revision']
+  readonly recovery: ApplicationRecoveryEvidence | null
+  constructor(change: ApplicationChange) {
+    super('EVENT_FORWARDER_REVIEW_RECOVERY'); this.name = 'EventForwarderRecoveryError'
+    this.revision = structuredClone(change.revision)
+    this.recovery = change.recovery === null ? null : {
+      reason: change.recovery.reason ?? null, adopted: structuredClone(change.recovery.adopted),
+      unknownLoss: change.recovery.unknownLoss,
+    }
+  }
+}
 
 export interface EventForwarderSession {
   readonly signal: AbortSignal
@@ -52,7 +68,7 @@ export async function forwardSessionEvents<Projected>(options: EventForwarderOpt
         const next = await awaitOwnedTask(lifetime, () => changes.next())
         if (next.done === true) { ended = true; wake(); return }
         if (next.value.kind === 'recovery' && (cursor !== undefined || captured)) {
-          throw Object.assign(new Error('EVENT_FORWARDER_REVIEW_RECOVERY'), { code: 'EVENT_FORWARDER_REVIEW_RECOVERY' })
+          throw new EventForwarderRecoveryError(next.value)
         }
         queued = true; wake()
       }

@@ -1,7 +1,7 @@
 import type { BytesStore } from '@chronolog/records'
 import type { ChangeProgram } from '@chronolog/protocol'
 import type { ChronologMaterializationRuntime, MaterializedQueryCapabilities, MaterializedReadHandle } from '@chronolog/materializer'
-import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerGrant, PeerIdentity, PrefixProof, Signed, SignedGeneration } from './control-types.js'
+import type { ApplicationDescriptor, AuthorityBundle, HistoryPoint, OrderReceipt, PeerGrant, PeerIdentity, PrefixProof, Signed, SignedGeneration, TransitionReason } from './control-types.js'
 import type { PEER_GENERATION_PROFILE } from './control-types.js'
 export * from './control-types.js'
 
@@ -54,6 +54,8 @@ export type OperationState =
   | { readonly status: 'abandoned' | 'needsReapply'; readonly attemptId: string; readonly operationId: string; readonly generation: string; readonly selectedGeneration: string; readonly previous: AppliedResult | null }
 
 export interface RecoveryNotice {
+  /** Reason of the selected verified transition; absent in older retained notices. */
+  readonly reason?: TransitionReason
   readonly previousGeneration: string
   readonly generation: string
   readonly adopted: HistoryPoint | null

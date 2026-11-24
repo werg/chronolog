@@ -6,13 +6,21 @@ import { ApplicationSecureChannel } from './secure-channel.js'
 
 type Packet = { readonly kind: string; readonly message?: ParticipantRequest }
 type Inspect = (packet: Packet, bytes: number) => Packet | void | Promise<Packet | void>
+type InspectSignal = (frame: Uint8Array) => Uint8Array | Promise<Uint8Array>
+const signalObservers = new Map<string, InspectSignal>()
 const observers = new Map<string, Inspect>()
 let restore: (() => void) | undefined
-afterEach(() => { restore?.(); restore = undefined; observers.clear() })
+afterEach(() => { restore?.(); restore = undefined; observers.clear(); signalObservers.clear() })
 
 /** A malicious/observed participant, before encryption; the relay cannot inspect or rewrite these messages. */
 export function observePeerWire(identity: string, inspect: Inspect): void {
-  observers.set(identity, inspect)
+  observers.set(identity, inspect); installObserver()
+}
+/** Simulate a remote signal sender before authenticated transport encryption. */
+export function observePeerSignals(identity: string, inspect: InspectSignal): void {
+  signalObservers.set(identity, inspect); installObserver()
+}
+function installObserver(): void {
   if (restore !== undefined) return
   // eslint-disable-next-line @typescript-eslint/unbound-method -- The replacement supplies its actual channel through call().
   const original = ApplicationSecureChannel.prototype.prepare
@@ -22,6 +30,12 @@ export function observePeerWire(identity: string, inspect: Inspect): void {
     if (inspect !== undefined) {
       const framed = intercept({ ...this.connection }, inspect)
       this.connection.send = (frame, options) => framed.send(frame, options)
+    }
+    const inspectSignal = signalObservers.get((sender as { readonly author: string }).author)
+    const live = this.connection.live
+    if (inspectSignal !== undefined && live !== undefined) {
+      const send = live.trySend.bind(live)
+      live.trySend = async (frame, options) => send(await inspectSignal(frame), options)
     }
     return result
   })

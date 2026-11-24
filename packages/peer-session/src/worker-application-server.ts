@@ -293,7 +293,7 @@ function errorValue(error: unknown): WireError {
   return { name: error.name, message: error.message,
     ...('code' in error && typeof error.code === 'string' ? { code: error.code } : {}),
     ...(error instanceof AbandonedOperationError ? { operation: error.operation } : {}),
-    ...(error instanceof RecoveredViewError ? { revision: error.revision } : {}) }
+    ...(error instanceof RecoveredViewError ? { revision: error.revision, recovery: error.recovery } : {}) }
 }
 /** One coalesced callback value, independent of how long a page stops pulling. */
 function observe<T>(subscribe: (listener: (value: T) => void) => () => void, signal: AbortSignal): AsyncIterator<T> {

@@ -1,3 +1,4 @@
+import type { SignalReceiveDiagnostics } from '@chronolog/signals'
 import type { HistoryPoint } from '@chronolog/peer-generation'
 import type { FramedPeerConnection } from '@chronolog/records'
 import type { ApplicationControlHost } from './recovery.js'
@@ -49,6 +50,8 @@ export interface ApplicationConnectionDiagnostic extends ApplicationTransportDes
   readonly receivedLiveBytes: number
   readonly sentRequests: number
   readonly receivedRequests: number
+  /** Receive-route rejects only; absence means the implementation does not report them. */
+  readonly signalRejections?: SignalReceiveDiagnostics
 }
 /** Opens bytes only. Authentication, authority and recovery remain in the session. */
 export interface ApplicationTransportPort {

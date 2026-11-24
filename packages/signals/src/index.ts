@@ -74,10 +74,23 @@ export interface SignalTransport {
   /** Retire an underlying connection on its actual failure or dispatch deadline. */
   close?(reason?: unknown): void | Promise<void>
 }
+/** Fixed-size, payload-free counters for nonfatal frame drops on one receive route. */
+export interface SignalReceiveDiagnostics {
+  readonly total: number
+  readonly clockSkew: number
+  readonly expired: number
+  readonly unauthorized: number
+  readonly duplicate: number
+  readonly capacity: number
+}
+type SignalRejectionReason = Exclude<keyof SignalReceiveDiagnostics, 'total'>
+type MutableSignalReceiveDiagnostics = { -readonly [Key in keyof SignalReceiveDiagnostics]: number }
 export interface SignalRoute {
+  /** A detached snapshot. Counters saturate at Number.MAX_SAFE_INTEGER. */
+  readonly diagnostics: SignalReceiveDiagnostics
   /**
    * Verify once, deliver locally and relay unchanged to the other live routes.
-   * Returns null for duplicate/expired/unauthorized frames or a capacity drop before delivery.
+   * Returns null for signed future-dated/expired, duplicate/unauthorized frames or a capacity drop before delivery.
    * Capacity drops do not evict retained replay protection or queue a retry.
    */
   receive(frame: Uint8Array): Promise<EphemeralSignal | null>
@@ -113,7 +126,12 @@ export interface SignalLimits {
 }
 
 interface SessionProgress { readonly seen: Map<number, number> }
-interface Route extends SignalTransport { readonly lifetime: AbortController; busy: boolean; retired: boolean }
+interface Route extends SignalTransport {
+  readonly lifetime: AbortController
+  readonly rejections: MutableSignalReceiveDiagnostics
+  busy: boolean
+  retired: boolean
+}
 interface QueuedSignal { readonly value: EphemeralSignal; readonly bytes: number; readonly key: string }
 interface Subscription {
   readonly topics: ReadonlySet<string> | null
@@ -197,9 +215,11 @@ export class SignalChannel implements Signals {
     if (typeof transport.trySend !== 'function') throw new SignalError('SIGNAL_TRANSPORT_INVALID')
     if (this.#routes.size + this.#retiring.size >= this.#maxRoutes) throw new SignalError('SIGNAL_ROUTE_QUOTA_EXCEEDED')
     const route: Route = { trySend: transport.trySend.bind(transport), lifetime: new AbortController(), busy: false, retired: false,
+      rejections: { total: 0, clockSkew: 0, expired: 0, unauthorized: 0, duplicate: 0, capacity: 0 },
       ...(transport.close === undefined ? {} : { close: transport.close.bind(transport) }) }
     this.#routes.add(route)
-    return { receive: frame => this.#enqueueReceive(frame, route), close: () => this.#detach(route) }
+    return { receive: frame => this.#enqueueReceive(frame, route), close: () => this.#detach(route),
+      get diagnostics() { return { ...route.rejections } } }
   }
 
   send(topic: string, payload: SignalPayload, options: SignalSendOptions = {}): Promise<EphemeralSignal> {
@@ -271,7 +291,7 @@ export class SignalChannel implements Signals {
       this.#assertOpen()
       if (!(input instanceof Uint8Array) || input.byteLength > MAX_SIGNAL_BYTES) throw new SignalError('SIGNAL_FRAME_TOO_LARGE')
       if (route?.lifetime.signal.aborted === true) throw new SignalError('SIGNAL_ROUTE_CLOSED')
-      if (this.#pendingReceives >= this.#maxReceives) return Promise.resolve(null)
+      if (this.#pendingReceives >= this.#maxReceives) return Promise.resolve(this.#reject(route, 'capacity'))
       const frame = input.slice()
       const routes = [...this.#routes].filter(attached => attached !== route)
       this.#pendingReceives += 1
@@ -280,8 +300,8 @@ export class SignalChannel implements Signals {
       const signal = AbortSignal.any([this.#lifetime.signal, expiry.signal, ...(route === undefined ? [] : [route.lifetime.signal])])
       const operation = (async () => {
         signal.throwIfAborted()
-        const verified = await this.#verify(frame, signal)
-        if (verified === null || !this.#remember(verified.value)) return null
+        const verified = await this.#verify(frame, signal, route)
+        if (verified === null || !this.#remember(verified.value, route)) return null
         this.#deliver(verified.value, frame.length)
         if (this.#options.relay === true) await this.#dispatch(verified, routes, signal, false)
         return structuredClone(verified.value)
@@ -290,7 +310,7 @@ export class SignalChannel implements Signals {
     } catch (error) { return Promise.reject(error) }
   }
 
-  async #verify(bytes: Uint8Array, signal: AbortSignal): Promise<VerifiedSignal | null> {
+  async #verify(bytes: Uint8Array, signal: AbortSignal, route?: Route): Promise<VerifiedSignal | null> {
     const frame = assertCanonicalCbor(bytes, { maxBytes: MAX_SIGNAL_BYTES, maxDepth: 2, maxArrayItems: 13,
       maxMapItems: 0, maxTextBytes: MAX_SIGNAL_BYTES, maxBlobBytes: 1024 })
     if (!Array.isArray(frame) || !(frame.length === 12 && frame[0] === 1n && frame[1] === SIGNAL_DOMAIN || frame.length === 13 && frame[0] === 2n && frame[1] === SIGNAL_STREAM_DOMAIN) || frame[2] !== this.#options.scope ||
@@ -306,7 +326,9 @@ export class SignalChannel implements Signals {
     if (canonicalSignalPayload(payload) !== frame[10]) throw new SignalError('SIGNAL_PAYLOAD_INVALID')
     const value: EphemeralSignal = { scope: this.#options.scope, authorId: bytesToHex(frame[3]), sessionId: bytesToHex(frame[5]),
       sequence: Number(frame[6]), issuedAtMs: Number(frame[7]), expiresAtMs: Number(frame[8]), topic: frame[9], payload, ...(stream === undefined ? {} : { stream }) }
-    this.#assertClock(value)
+    // Reject malformed numeric fields before crypto, but classify wall-clock
+    // skew only after signature and current authorization have been verified.
+    this.#assertClockFields(value)
     let key = this.#verifyKeys.get(value.authorId)
     if (key === undefined) {
       key = await crypto.subtle.importKey('raw', frame[3].slice().buffer, 'Ed25519', false, ['verify'])
@@ -321,9 +343,10 @@ export class SignalChannel implements Signals {
     }
     const credential = frame[4] as Uint8Array | null
     const authorization: SignalAuthorization = { scope: value.scope, authorId: frame[3].slice(), topic: value.topic, credential: credential?.slice() ?? null, ...(stream === undefined ? {} : { stream }) }
-    if (!await this.#allowed(authorization, signal)) return null
-    this.#assertClock(value)
-    if (value.expiresAtMs <= this.#now()) return null
+    if (!await this.#allowed(authorization, signal)) return this.#reject(route, 'unauthorized')
+    const now = this.#now()
+    if (value.issuedAtMs > now + this.#skew) return this.#reject(route, 'clockSkew')
+    if (value.expiresAtMs <= now) return this.#reject(route, 'expired')
     return { value, authorization, frame: bytes }
   }
 
@@ -405,13 +428,21 @@ export class SignalChannel implements Signals {
     }
   }
 
-  #remember(value: EphemeralSignal): boolean {
+  #reject(route: Route | undefined, reason: SignalRejectionReason): null {
+    if (route !== undefined) {
+      route.rejections.total = Math.min(Number.MAX_SAFE_INTEGER, route.rejections.total + 1)
+      route.rejections[reason] = Math.min(Number.MAX_SAFE_INTEGER, route.rejections[reason] + 1)
+    }
+    return null
+  }
+
+  #remember(value: EphemeralSignal, route?: Route): boolean {
     const now = this.#now()
     const key = `${value.authorId}/${value.sessionId}`
     let previous = this.#sessions.get(key)
     const existingExpiry = previous?.seen.get(value.sequence)
     if (existingExpiry !== undefined) {
-      if (existingExpiry > now) return false
+      if (existingExpiry > now) { this.#reject(route, 'duplicate'); return false }
       previous!.seen.delete(value.sequence); this.#remembered -= 1
       if (previous!.seen.size === 0) { this.#sessions.delete(key); previous = undefined }
     }
@@ -422,8 +453,10 @@ export class SignalChannel implements Signals {
       this.#pruneRemembered(now)
       previous = this.#sessions.get(key)
     }
-    if (previous === undefined && this.#sessions.size >= this.#maxSessions) return false
-    if ((previous?.seen.size ?? 0) >= this.#maxSequences || this.#remembered >= this.#maxRemembered) return false
+    if (previous === undefined && this.#sessions.size >= this.#maxSessions ||
+        (previous?.seen.size ?? 0) >= this.#maxSequences || this.#remembered >= this.#maxRemembered) {
+      this.#reject(route, 'capacity'); return false
+    }
     // Relay paths can reorder distinct sequences. Retain each fresh identity;
     // never evict still-valid duplicates to make room for unbounded traffic.
     const progress = previous ?? { seen: new Map<number, number>() }
@@ -580,11 +613,15 @@ export class SignalChannel implements Signals {
     this.#assertClock(value)
     if (value.expiresAtMs <= this.#now()) throw new SignalError('SIGNAL_EXPIRED')
   }
-  #assertClock(value: EphemeralSignal): void {
-    const now = this.#now()
+  #assertClockFields(value: EphemeralSignal): void {
     if (!Number.isSafeInteger(value.sequence) || value.sequence < 1 || !Number.isSafeInteger(value.issuedAtMs) || value.issuedAtMs < 0 ||
-        !Number.isSafeInteger(value.expiresAtMs) || value.expiresAtMs <= value.issuedAtMs || value.expiresAtMs - value.issuedAtMs > this.#ttl ||
-        value.issuedAtMs > now + this.#skew) throw new SignalError('SIGNAL_CLOCK_INVALID')
+        !Number.isSafeInteger(value.expiresAtMs) || value.expiresAtMs <= value.issuedAtMs || value.expiresAtMs - value.issuedAtMs > this.#ttl) {
+      throw new SignalError('SIGNAL_CLOCK_INVALID')
+    }
+  }
+  #assertClock(value: EphemeralSignal): void {
+    this.#assertClockFields(value)
+    if (value.issuedAtMs > this.#now() + this.#skew) throw new SignalError('SIGNAL_CLOCK_INVALID')
   }
   #now(): number {
     const now = bound(this.#options.now?.() ?? Date.now(), 0, Number.MAX_SAFE_INTEGER, 'SIGNAL_CLOCK_INVALID')

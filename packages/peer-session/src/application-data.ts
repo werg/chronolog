@@ -327,7 +327,15 @@ function readEvents(captured: CapturedPeerView, options: ApplicationEventOptions
     try {
       if (options.cursor.length > APPLICATION_EVENT_CURSOR_LIMIT) throw new Error()
       const cursor = JSON.parse(options.cursor) as { historyId: string; generation: string; index: number; anchor: string | null; topics: readonly string[] | null }
-      if (cursor.historyId !== captured.revision.historyId || cursor.generation !== captured.revision.generation) throw new RecoveredViewError(captured.revision)
+      if (cursor.historyId !== captured.revision.historyId || cursor.generation !== captured.revision.generation) {
+        // Evidence describes the selected verified transition, not continuity
+        // from this cursor, which contains no committed prefix root.
+        const selected = cursor.historyId === captured.revision.historyId
+          ? captured.authority.generations.find(value => value.id === captured.revision.generation) : undefined
+        throw new RecoveredViewError(captured.revision, selected === undefined ? null : {
+          reason: selected.payload.transition.payload.reason, adopted: selected.payload.adopted, unknownLoss: true,
+        })
+      }
       if (!Number.isSafeInteger(cursor.index) || cursor.index < 0 || cursor.index > captured.read.orderLength || JSON.stringify(cursor.topics) !== JSON.stringify(topics) ||
           cursor.anchor !== (cursor.index === 0 ? null : bytesToHex(captured.read.transactionAt(cursor.index - 1)!.txId))) throw new Error()
       index = cursor.index

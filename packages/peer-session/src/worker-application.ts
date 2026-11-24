@@ -10,7 +10,8 @@ import type { ApplicationRecoveryExpectation, ApplicationTransition } from './re
 import type { ApplicationChange, ApplicationEventBatch, ApplicationEventOptions, CommandOptions, QueryParameter, QueryRows, SessionStatus } from './session-types.js'
 import type { ApplicationParticipation, ApplicationParticipationStatus, ApplicationConnectionDiagnostic } from './participation-types.js'
 import type { ApplicationProjectionHandle, ApplicationProjectionSnapshot } from './projection-types.js'
-import { AbandonedOperationError, RecoveredViewError } from './errors.js'
+import { AbandonedOperationError, RecoveredViewError, type ApplicationRecoveryEvidence } from './errors.js'
+import { validateHistoryPoint } from '@chronolog/peer-generation/control'
 import { awaitOwnedTask } from './lifetime.js'
 import { PROTOCOL, MAX_REQUESTS, MAX_RELEASES, MAX_STREAMS, releasesResource, bounded,
   type Endpoint, type Description, type Metadata, type Snapshot, type WireError, type Request, type Response } from './worker-application-protocol.js'
@@ -437,8 +438,19 @@ function validateParticipation(value: unknown): asserts value is ApplicationPart
 }
 function fromError(error: WireError): Error {
   if (error.name === 'AbandonedOperationError' && error.operation && (error.operation.status === 'abandoned' || error.operation.status === 'needsReapply')) return new AbandonedOperationError(error.operation)
-  if (error.name === 'RecoveredViewError' && error.revision) return new RecoveredViewError(error.revision)
+  if (error.name === 'RecoveredViewError' && error.revision) return new RecoveredViewError(error.revision, recoveryEvidence(error.recovery))
   return Object.assign(new Error(error.message), { name: error.name, ...(error.code === undefined ? {} : { code: error.code }) })
+}
+
+function recoveryEvidence(value: unknown): ApplicationRecoveryEvidence | null {
+  // An older owner omits the field. Missing evidence is never a continuity proof.
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 3) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
+  const evidence = value as ApplicationRecoveryEvidence
+  if (evidence.reason !== null && !['create', 'handover', 'takeover', 'control-change'].includes(evidence.reason) ||
+      typeof evidence.unknownLoss !== 'boolean' || !('adopted' in evidence)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
+  if (evidence.adopted !== null) validateHistoryPoint(evidence.adopted)
+  return evidence
 }
 
 function validateStatus(value: unknown): asserts value is SessionStatus {
@@ -467,13 +479,21 @@ function validateConnectionDiagnostics(value: unknown): asserts value is readonl
     if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
     const record = item as Record<string, unknown>
     const counts = ['sentBytes', 'receivedBytes', 'sentReliableBytes', 'receivedReliableBytes', 'sentLiveBytes', 'receivedLiveBytes', 'sentRequests', 'receivedRequests']
-    if (Object.keys(record).some(key => !['peerId', 'kind', 'reason', ...counts].includes(key)) ||
+    if (Object.keys(record).some(key => !['peerId', 'kind', 'reason', 'signalRejections', ...counts].includes(key)) ||
         typeof record.peerId !== 'string' || !/^[0-9a-f]{64}$/u.test(record.peerId) || peers.has(record.peerId) ||
         !['direct', 'relay', 'unknown'].includes(record.kind as string) ||
         record.reason !== undefined && !['direct_failed', 'direct_timeout'].includes(record.reason as string) ||
         counts.some(key => !Number.isSafeInteger(record[key]) || (record[key] as number) < 0) ||
         record.sentBytes !== (record.sentReliableBytes as number) + (record.sentLiveBytes as number) ||
         record.receivedBytes !== (record.receivedReliableBytes as number) + (record.receivedLiveBytes as number)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+    if (record.signalRejections !== undefined) {
+      const fields = ['total', 'clockSkew', 'expired', 'unauthorized', 'duplicate', 'capacity']
+      const rejected = record.signalRejections
+      if (rejected === null || typeof rejected !== 'object' || Array.isArray(rejected) ||
+          Object.keys(rejected).length !== fields.length ||
+          fields.some(key => !Number.isSafeInteger((rejected as Record<string, unknown>)[key]) ||
+            ((rejected as Record<string, unknown>)[key] as number) < 0)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
+    }
     peers.add(record.peerId)
   }
 }

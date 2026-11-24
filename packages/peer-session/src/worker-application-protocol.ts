@@ -1,5 +1,6 @@
 import type { OperationState, PeerRevision } from '@chronolog/peer-generation'
 import type { ApplicationSession } from './session.js'
+import type { ApplicationRecoveryEvidence } from './errors.js'
 import type { SessionStatus } from './session-types.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
 import type { ApplicationEndpointBinding, APPLICATION_OWNER_PROTOCOL } from './owner-types.js'
@@ -22,7 +23,7 @@ export interface Metadata extends Snapshot {
   readonly endpoint?: ApplicationEndpointBinding
   readonly signalDelivery?: 'neighbors' | 'application'
 }
-export interface WireError { readonly name: string; readonly message: string; readonly code?: string; readonly operation?: OperationState; readonly revision?: PeerRevision }
+export interface WireError { readonly name: string; readonly message: string; readonly code?: string; readonly operation?: OperationState; readonly revision?: PeerRevision; readonly recovery?: ApplicationRecoveryEvidence | null }
 export interface Request { readonly id: number; readonly method: string; readonly args: readonly unknown[] }
 export interface Response { readonly id: number; readonly value?: unknown; readonly error?: WireError; readonly snapshot: Snapshot }
 

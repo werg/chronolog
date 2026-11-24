@@ -5,12 +5,12 @@ import {
   type OrderedCommand, type ParticipantRequest,
 } from '@chronolog/peer-generation'
 import { createEventMaterializationRuntime, eventExecutionManifest } from '@chronolog/materializer'
-import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program } from '@chronolog/protocol'
+import { assertCanonicalCbor, bytesToHex, emit, encodeCanonicalCbor, executionManifestArtifacts, program, type CborValue } from '@chronolog/protocol'
 import { defineApplication, defineCommand, applicationDefinitionDigest } from './definition.js'
 import { openApplicationDevice } from './device.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
 import { createFramedPeerConnectionPair, type FramedPeerConnection } from './network.js'
-import { observePeerWire } from './network.test-helpers.js'
+import { observePeerWire, observePeerSignals } from './network.test-helpers.js'
 import { ApplicationKeyring } from './keys.js'
 
 const definition = defineApplication({ id: 'network', version: '1', commands: {
@@ -69,6 +69,55 @@ function rewriteParticipant(connection: FramedPeerConnection, identity: string, 
 }
 
 describe('authenticated peer application connections', () => {
+  it('keeps reliable replication and later signals alive after signed clock and expiry rejects', async () => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    let mode: 'future' | 'expired' | 'valid' = 'future'
+    observePeerSignals(b.deviceId, async bytes => {
+      if (mode === 'valid') return bytes
+      const frame = assertCanonicalCbor(bytes) as CborValue[], now = Date.now()
+      frame[7] = BigInt(mode === 'future' ? now + 10_000 : now - 2000)
+      frame[8] = frame[7] + 1000n
+      frame[frame.length - 1] = new Uint8Array(await crypto.subtle.sign('Ed25519', f.b.identity.privateKey,
+        encodeCanonicalCbor(frame.slice(0, -1)).slice().buffer))
+      return encodeCanonicalCbor(frame)
+    })
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    const stream = a.signals.subscribe({ signal: AbortSignal.timeout(5000) })[Symbol.asyncIterator](), incoming = stream.next()
+    await b.signals.send('typing', 'future')
+    await expect.poll(() => links[0].stats.signalRejections?.clockSkew).toBe(1)
+    mode = 'expired'; await b.signals.send('typing', 'expired')
+    await expect.poll(() => links[0].stats.signalRejections?.expired).toBe(1)
+    expect(links.every(link => !link.signal.aborted)).toBe(true)
+    const work = await b.command('say', 'durable work after clock skew', { operationId: 'after-clock-skew' })
+    await work.applied({ signal: AbortSignal.timeout(5000) }); await links[0].synchronize()
+    const view = await a.readView()
+    try { expect(view.readEvents().events.map(event => event.payload)).toContainEqual({ text: 'durable work after clock skew' }) }
+    finally { view.release() }
+    mode = 'valid'; const valid = await b.signals.send('typing', 'fresh')
+    expect((await incoming).value).toEqual(valid); await stream.return?.()
+    expect(links[0].stats.signalRejections).toEqual({ total: 2, clockSkew: 1, expired: 1, unauthorized: 0, duplicate: 0, capacity: 0 })
+    expect(links.every(link => !link.signal.aborted)).toBe(true)
+  })
+
+  it.each(['signature', 'timestamp'] as const)('retains fatal live-frame policy for invalid %s after clock rejection isolation', async fault => {
+    const f = await fixture(), a = await f.open(f.a), b = await f.open(f.b)
+    observePeerSignals(b.deviceId, bytes => {
+      const frame = assertCanonicalCbor(bytes) as CborValue[]
+      if (fault === 'timestamp') frame[8] = frame[7]!
+      else { const signature = (frame.at(-1) as Uint8Array).slice(); signature[0] = signature[0]! ^ 1; frame[frame.length - 1] = signature }
+      return encodeCanonicalCbor(frame)
+    })
+    const [left, right] = createFramedPeerConnectionPair()
+    const links = await Promise.all([a.connectPeer({ connection: left }), b.connectPeer({ connection: right })])
+    closing.push(async () => { await Promise.all(links.map(link => link.close())) })
+    await b.signals.send('typing', 'invalid')
+    await expect.poll(() => links[0].signal.aborted).toBe(true)
+    expect(links[0].signal.reason).toMatchObject({ code: fault === 'signature' ? 'SIGNAL_SIGNATURE_INVALID' : 'SIGNAL_CLOCK_INVALID' })
+    expect(a.signal.aborted).toBe(false)
+  })
+
   it.each(['suffix', 'bundle'] as const)('exchanges authority using %s mode for peers sharing a verified head', async authorityExchange => {
     const f = await fixture(), a = await f.openCold(f.a), b = await f.openCold(f.b)
     const hello: unknown[] = [], states: unknown[] = []

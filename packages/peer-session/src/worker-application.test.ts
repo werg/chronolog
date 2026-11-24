@@ -5,7 +5,7 @@ import { serveApplicationWorker } from './worker-application-server.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   bytesDigest, createGenerationRegistry, createPeerIdentity, MemoryBytesStore, participantGrant,
-  signApplicationDescriptor, signControlRevision, signTransitionRequest, type RecoveryNotice, type SignedTransitionRequest,
+  signApplicationDescriptor, signControlRevision, signTransitionRequest, peerDigest, type RecoveryNotice, type SignedTransitionRequest,
 } from '@chronolog/peer-generation'
 import { eventExecutionManifest } from '@chronolog/materializer'
 import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
@@ -13,7 +13,8 @@ import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolo
 import { applicationDefinitionDigest, defineApplication, defineCommand, defineQuery } from './definition.js'
 import { openApplicationDevice, type ApplicationStorage } from './device.js'
 import { openPeerApplication, type OpenPeerApplicationOptions } from './runtime.js'
-import { AbandonedOperationError, connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
+import { AbandonedOperationError, RecoveredViewError, connectApplications, type ApplicationReadView, type ApplicationSession } from './session.js'
+import { EventForwarderRecoveryError, forwardSessionEvents } from './event-forwarder.js'
 import { connectApplicationWorker } from './worker-application.js'
 import type { ApplicationControlHost } from './recovery.js'
 import type { ApplicationParticipation, ApplicationParticipationStatus } from './participation-types.js'
@@ -56,7 +57,7 @@ async function fixture(options: { readonly closeA?: () => Promise<void>; readonl
     cleanup.push(() => session.close())
     if (options.data !== false) await session.keys.missing()
   }
-  return { a: sessions[0]!, b: sessions[1]!, registry }
+  return { a: sessions[0]!, b: sessions[1]!, registry, host, control, identity: a.identity, bIdentity: b.identity }
 }
 
 async function facade(session: ApplicationSession, host?: ApplicationControlHost, options: {
@@ -76,6 +77,55 @@ async function facade(session: ApplicationSession, host?: ApplicationControlHost
 }
 
 describe('owned browser application facade', () => {
+  it.each(['control-change', 'takeover'] as const)('preserves %s recovery evidence across direct readers, attachments and in-flight forwarding', async reason => {
+    const f = await fixture(), { client } = await facade(f.a)
+    await (await f.a.command('say', 'retained', { operationId: 'retained' })).applied()
+    const retained = await f.a.recoveryPoint(), handled = (await f.a.query('messages', null)).value.cursor
+    await (await f.a.command('say', 'pending work', { operationId: 'pending' })).applied()
+    const stale = (await f.a.query('messages', null)).value.cursor, save = vi.fn()
+    let start!: () => void, finish!: () => void
+    const started = new Promise<void>(resolve => { start = resolve }), pending = new Promise<void>(resolve => { finish = resolve })
+    const pump = forwardSessionEvents({ session: f.a, checkpoint: { load: () => handled, save },
+      project: event => event, deliver: async () => { start(); await pending } })
+    const stopped = pump.catch((error: unknown) => error)
+    const notices: RecoveryNotice[] = [], unsubscribe = f.a.onRecovery(notice => notices.push(notice))
+    try {
+      await started
+      const base = reason === 'control-change' ? await f.a.recoveryPoint() : retained
+      const control = reason === 'control-change'
+        ? await signControlRevision({ ...f.control.payload, revision: 1, previous: await peerDigest(f.control) }, f.host) : undefined
+      await f.registry.select(await signTransitionRequest({ applicationId: f.a.applicationId,
+        profile: 'peer-generation-v1', policy: 'eligible-members-v1', transitionId: 'review-recovery',
+        expectedGeneration: f.a.revision!.generation, coordinator: reason === 'control-change' ? f.a.deviceId : f.b.deviceId,
+        requester: f.identity.publicKey, controlRevision: control === undefined ? 0 : 1, reason, base }, f.identity),
+      control === undefined ? {} : { control })
+      await f.a.adopt(await f.registry.read())
+      const evidence = { reason, adopted: base.point, unknownLoss: true }, forwarded = await stopped
+      expect(forwarded).toBeInstanceOf(EventForwarderRecoveryError)
+      expect(forwarded).toMatchObject({ code: 'EVENT_FORWARDER_REVIEW_RECOVERY', revision: f.a.revision, recovery: evidence })
+      expect(notices.at(-1)).toMatchObject({ reason, adopted: base.point, unknownLoss: true })
+      finish(); await new Promise(setImmediate); expect(save).not.toHaveBeenCalled()
+      const direct = await f.a.readView(), attached = await client.readView()
+      try {
+        expect(() => direct.readEvents({ cursor: stale })).toThrow(RecoveredViewError)
+        try { direct.readEvents({ cursor: stale }) } catch (error) {
+          expect(error).toMatchObject({ code: 'APPLICATION_VIEW_RECOVERED', recovery: evidence, revision: f.a.revision })
+        }
+        await expect(attached.readEvents({ cursor: stale })).rejects.toMatchObject({
+          name: 'RecoveredViewError', code: 'APPLICATION_VIEW_RECOVERED', recovery: evidence, revision: f.a.revision,
+        })
+        const selected = direct.readEvents()
+        expect(selected.events.map(event => event.payload)).toEqual(reason === 'control-change'
+          ? [{ text: 'retained' }, { text: 'pending work' }] : [{ text: 'retained' }])
+        expect(() => direct.readEvents({ cursor: selected.cursor, topics: ['different'] })).toThrow('APPLICATION_EVENT_CURSOR_INVALID')
+        const invalid = { ...JSON.parse(selected.cursor) as Record<string, unknown>, anchor: '0'.repeat(64) }
+        expect(() => direct.readEvents({ cursor: JSON.stringify(invalid) })).toThrow('APPLICATION_EVENT_CURSOR_INVALID')
+        await expect(attached.readEvents({ cursor: JSON.stringify({ ...JSON.parse(selected.cursor) as Record<string, unknown>, historyId: 'another-history' }) }))
+          .rejects.toMatchObject({ code: 'APPLICATION_VIEW_RECOVERED', recovery: null })
+      } finally { direct.release(); await attached.release() }
+    } finally { finish(); unsubscribe() }
+  })
+
   it('keeps an unused facade and live exchange cold, then shares first data initialization across callers', async () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve }), closeStorage = vi.fn()
@@ -322,7 +372,10 @@ describe('owned browser application facade', () => {
       if (id !== status.recovery?.id) throw new Error('APPLICATION_RECOVERY_PROPOSAL_CHANGED')
       status = { ...status, phase: 'coordinating', recovery: null }; publish()
     })
-    const diagnostics = vi.fn(async () => []), reconsiderConnections = vi.fn(async () => {})
+    const report = [{ peerId: f.b.deviceId, kind: 'direct' as const, sentBytes: 0, receivedBytes: 0,
+      sentReliableBytes: 0, receivedReliableBytes: 0, sentLiveBytes: 0, receivedLiveBytes: 0, sentRequests: 0, receivedRequests: 0,
+      signalRejections: { total: 2, clockSkew: 1, expired: 1, unauthorized: 0, duplicate: 0, capacity: 0 } }]
+    const diagnostics = vi.fn(async () => report), reconsiderConnections = vi.fn(async () => {})
     const participation: ApplicationParticipation = {
       get status() { return status }, signal: lifetime.signal,
       onStatus(listener) { listeners.add(listener); listener(status); return () => { listeners.delete(listener) } },
@@ -333,7 +386,7 @@ describe('owned browser application facade', () => {
     cleanup.push(() => { getter.mockRestore() })
     const { client } = await facade(f.a)
     expect(client.participation?.status).toEqual(status)
-    expect(await client.participation!.diagnostics()).toEqual([])
+    expect(await client.participation!.diagnostics()).toEqual(report)
     await client.participation!.reconsiderConnections()
     expect(diagnostics).toHaveBeenCalledTimes(1)
     expect(reconsiderConnections).toHaveBeenCalledTimes(1)

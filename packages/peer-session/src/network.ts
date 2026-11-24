@@ -5,7 +5,7 @@ import {
 } from '@chronolog/peer-generation/control'
 import type { OrderedCommand, PeerRevision, SignedAttempt, SignedRetainedCoverage } from '@chronolog/peer-generation'
 import { bytesToHex, hexToBytes, signDomain, verifyDomain, DOMAINS } from '@chronolog/protocol'
-import { MAX_SIGNAL_BYTES, type SignalChannel, type SignalRoute } from '@chronolog/signals'
+import { MAX_SIGNAL_BYTES, type SignalChannel, type SignalRoute, type SignalReceiveDiagnostics } from '@chronolog/signals'
 import type { ContentManifest, ContentReference, ContentRetention } from './content.js'
 import type { ApplicationKeyRequest, ApplicationKeyShare } from './keys.js'
 import type { ApplicationDataPort, ApplicationParticipant } from './participant-types.js'
@@ -25,7 +25,7 @@ export interface ApplicationPeerLink {
   readonly signal: AbortSignal
   readonly completion: Promise<void>
   /** Local application framing bytes; excludes channel encryption and transport/billing overhead. */
-  readonly stats: { readonly sentBytes: number; readonly receivedBytes: number; readonly sentLiveBytes: number; readonly receivedLiveBytes: number; readonly sentRequests: number; readonly receivedRequests: number }
+  readonly stats: { readonly sentBytes: number; readonly receivedBytes: number; readonly sentLiveBytes: number; readonly receivedLiveBytes: number; readonly sentRequests: number; readonly receivedRequests: number; readonly signalRejections?: SignalReceiveDiagnostics }
   synchronize(): Promise<void>
   /** Stop routing new work and retain authenticated RPC traffic until the bounded drain deadline. */
   retire(): Promise<void>
@@ -262,7 +262,9 @@ class NetworkPeer implements ApplicationPeerLink {
   get data(): ApplicationPeerLink['data'] { return this.#remoteData === true ? 'active' : this.#remoteDataFailure === undefined ? 'idle' : 'unavailable' }
   get signal(): AbortSignal { return this.#controller.signal }
   get stats(): ApplicationPeerLink['stats'] {
-    return { ...this.#wire.stats, sentLiveBytes: this.#sentLiveBytes, receivedLiveBytes: this.#receivedLiveBytes, sentRequests: this.#sentRequests, receivedRequests: this.#receivedRequests }
+    return { ...this.#wire.stats, sentLiveBytes: this.#sentLiveBytes, receivedLiveBytes: this.#receivedLiveBytes,
+      sentRequests: this.#sentRequests, receivedRequests: this.#receivedRequests,
+      ...(this.#route === undefined ? {} : { signalRejections: this.#route.diagnostics }) }
   }
   #reader(): void {
     this.signal.throwIfAborted()

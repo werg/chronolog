@@ -262,6 +262,52 @@ Recovery during processing stops the forwarder for explicit review; it never
 silently resets an old cursor. Cancellation fences later callbacks and checkpoints;
 it cannot undo delivery or a checkpoint write already started by the caller.
 
+### Review and resume after a generation change
+
+A routine device enrollment can select a new generation even when its retained
+history is unchanged. An old event cursor still stops with `RecoveredViewError`
+(`code: APPLICATION_VIEW_RECOVERED`). The direct reader and attached Worker/native
+facade expose `revision` and `recovery: { reason, adopted, unknownLoss } | null`.
+`reason` is the **selected transition's** verified reason (`control-change`,
+`handover`, `takeover`, or `create`), not a statement about all transitions since
+the cursor. `adopted` is that selection's retained history point. Missing evidence
+is `null`; an older retained notice can have `reason: null`.
+
+`forwardSessionEvents` keeps its `EVENT_FORWARDER_REVIEW_RECOVERY` stop during
+in-flight delivery and exposes the same `revision`/`recovery` fields on
+`EventForwarderRecoveryError`. Starting a forwarder with an already-stale
+checkpoint can instead surface the reader's `APPLICATION_VIEW_RECOVERED`; both
+errors preserve the same evidence shape. Newly generated `RecoveryNotice` values also carry
+the verified `reason`; older retained notices can omit it. The cursor is never
+rewritten or advanced automatically. `control-change`, an empty `abandoned`
+list, or a retained point is not proof that the complete handled prefix survived;
+`unknownLoss` remains explicit. There is no transparent continuation guarantee.
+
+After a recovery stop:
+
+1. Stop the old consumer and preserve its last **handled** checkpoint and durable
+   work records. Reconcile any external effect already started, using the same
+   provider idempotency key or read-back evidence; cancellation cannot undo it.
+2. Confirm the application/history and selected revision. Review the reason,
+   adopted point and any abandoned/uncertain work. Missing evidence needs explicit
+   review; never catch the error by jumping to the newest cursor.
+3. Open a fresh selected view. Rebuild the application's declared durable inbox
+   if it has one, or explicitly rescan retained events from the beginning with no
+   cursor. Release each view before performing external work.
+4. Reconcile each event against the existing durable work store. Scope event
+   identities by application/history; `event.id` contains the signed attempt and
+   emitted-event ordinal. Use the application's stable request identity when a
+   deliberate reapplication should refer to the same external effect. A bare
+   operation ID is not globally unique. No unbounded in-memory deduplication set
+   is required.
+5. Save a new handled cursor only after that batch's work/receipts have durable
+   outcomes. A crash or rescan can redeliver events, so retain the same idempotency
+   policy. Do not replay excluded effects automatically or claim exactly-once
+   behavior for external systems.
+
+This is an explicit consumer recovery procedure over existing retained state,
+not a cursor migration or a new host event store.
+
 `createScopedApplicationTools(session, { queries, commands })` defaults to no
 permissions. Journal inspection, retry and wait verify the saved signed command
 against the allowed name; reapplication requires permission for both the original

@@ -23,6 +23,52 @@ function gate() {
 }
 
 describe('standalone live signals', () => {
+  it('contains signed clock rejects, reports fixed route counters, and accepts later valid signals', async () => {
+    let receiverTime = 10_000, senderTime = 12_000, allowed = true
+    const relayed: Uint8Array[] = []
+    const { sender, receiver, frames } = await fixture({ now: () => receiverTime, relay: true, authorize: () => allowed }, { now: () => senderTime })
+    const route = receiver.attachRoute({ trySend: async () => true })
+    receiver.attachRoute({ trySend: async frame => { relayed.push(frame); return true } })
+    const boundary = await sender.send('typing', 'at tolerance', { ttlMs: 5000 })
+    expect(await route.receive(frames[0]!)).toEqual(boundary)
+    senderTime++
+    const future = await sender.send('typing', 'outside tolerance', { ttlMs: 5000 })
+    for (let count = 0; count < 65; count++) expect(await route.receive(frames[1]!)).toBeNull()
+    expect(relayed).toHaveLength(1)
+    expect(route.diagnostics).toEqual({ total: 65, clockSkew: 65, expired: 0, unauthorized: 0, duplicate: 0, capacity: 0 })
+    const snapshot = route.diagnostics as { total: number }; snapshot.total = -1
+    expect(route.diagnostics.total).toBe(65)
+    receiverTime = senderTime
+    expect(await route.receive(frames[1]!)).toEqual(future)
+    expect(await route.receive(frames[1]!)).toBeNull()
+    receiverTime = 17_001
+    expect(await route.receive(frames[1]!)).toBeNull()
+    senderTime = receiverTime = 20_000
+    const fresh = await sender.send('typing', 'current', { ttlMs: 5000 })
+    allowed = false
+    expect(await route.receive(frames[2]!)).toBeNull()
+    allowed = true
+    expect(await route.receive(frames[2]!)).toEqual(fresh)
+    expect(route.diagnostics).toEqual({ total: 68, clockSkew: 65, expired: 1, unauthorized: 1, duplicate: 1, capacity: 0 })
+    expect(relayed).toHaveLength(3)
+  })
+
+  it('does not classify malformed or unauthenticated timestamps as harmless clock skew', async () => {
+    const { sender, receiver, frames } = await fixture({ now: () => 10_000 }, { now: () => 12_001 })
+    const route = receiver.attachRoute({ trySend: async () => true })
+    await sender.send('typing', 'future', { ttlMs: 1000 })
+    const frame = assertCanonicalCbor(frames[0]!) as CborValue[]
+    const signature = (frame.at(-1) as Uint8Array).slice(); signature[0] = signature[0]! ^ 1
+    frame[frame.length - 1] = signature
+    await expect(route.receive(encodeCanonicalCbor(frame))).rejects.toMatchObject({ code: 'SIGNAL_SIGNATURE_INVALID' })
+    frame[6] = 0n
+    await expect(route.receive(encodeCanonicalCbor(frame))).rejects.toMatchObject({ code: 'SIGNAL_CLOCK_INVALID' })
+    frame[6] = 1n; frame[8] = frame[7]!
+    await expect(route.receive(encodeCanonicalCbor(frame))).rejects.toMatchObject({ code: 'SIGNAL_CLOCK_INVALID' })
+    await expect(route.receive(new Uint8Array(16_385))).rejects.toMatchObject({ code: 'SIGNAL_FRAME_TOO_LARGE' })
+    expect(route.diagnostics.total).toBe(0)
+  })
+
   it('counts unsettled route policy work across route replacements until it actually settles', async () => {
     const blocked = gate()
     let heldChecks = 0
@@ -327,9 +373,11 @@ describe('standalone live signals', () => {
     const { sender, receiver, frames } = await fixture({ maxPendingReceives: 1,
       authorize: async () => { blocked.enter(); await blocked.wait; return true } })
     await sender.send('preview', 1); await sender.send('preview', 2)
-    const receiving = receiver.receive(frames[0]!)
+    const route = receiver.attachRoute({ trySend: async () => true })
+    const receiving = route.receive(frames[0]!)
     await blocked.entered
-    await expect(receiver.receive(frames[1]!)).resolves.toBeNull()
+    await expect(route.receive(frames[1]!)).resolves.toBeNull()
+    expect(route.diagnostics).toEqual({ total: 1, clockSkew: 0, expired: 0, unauthorized: 0, duplicate: 0, capacity: 1 })
     blocked.release(); await receiving
     const invalid = receiver.subscribe({ topics: 'typing' as unknown as readonly string[] })[Symbol.asyncIterator]()
     await expect(invalid.next()).rejects.toThrow('SIGNAL_TOPIC_FILTER_TOO_LARGE')

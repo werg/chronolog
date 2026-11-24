@@ -27,6 +27,35 @@ const route = channel.attachRoute({ trySend, close })
 
 Set `relay: true` to forward verified frames to sibling routes (`delivery: 'application'`), and `localEcho: true` to deliver local sends to local subscribers.
 
+## Receive freshness and diagnostics
+
+`maxClockSkewMs` defaults to 2,000 ms and accepts values from 0 through
+10,000 ms. After verifying the signature and current authorization, a receiver
+drops a frame whose `issuedAtMs` is more than that tolerance ahead of its local
+clock, or whose `expiresAtMs` has already passed. These freshness drops return
+`null`; they do not close an attached peer's reliable replication lane. Changing
+the tolerance does not synchronize clocks. A sender sufficiently behind the
+receiver can still produce already-expired frames.
+
+Malformed timestamp/sequence/TTL fields, invalid signatures, oversized frames,
+and actual transport failures retain their explicit error paths. They are not
+reclassified as harmless clock skew. Dropped frames are neither delivered nor
+relayed, and do not consume replay identities.
+
+`route.diagnostics` returns a detached snapshot of nonfatal drops with fixed counters:
+`{ total, clockSkew, expired, unauthorized, duplicate, capacity }`. Every counter
+saturates at `Number.MAX_SAFE_INTEGER`. Fatal errors retain their failure path and
+are not counted as these drops. Counters describe this receive route,
+contain no signal payloads or per-author history, and are not an estimate of a
+remote clock offset. The same optional `signalRejections` snapshot is available
+on `ApplicationPeerLink.stats` and each `session.participation.diagnostics()`
+connection. A missing field means that implementation does not report it.
+
+A successful `send()` confirms only the configured local/route dispatch.
+`localEcho: true` can succeed from local delivery even without a remote route;
+it never establishes remote receipt or processing. Work that must survive an
+absent receiver belongs in durable application commands/events.
+
 ## Stream context (`v2`)
 
 When multiple local endpoints or runs share one signing identity, attach `stream: { streamId, endpointId, endpointIncarnation, target }` to `send()` and filter with `streams: [...]` in `subscribe()`. Coalescing and filtering apply per stream before queuing.

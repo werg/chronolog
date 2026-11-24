@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { PeerRevision, RecoveryNotice } from '@chronolog/peer-generation'
 import { createLiveView, type LiveViewSession } from './live-view.js'
-import { forwardSessionEvents, type EventForwarderSession } from './event-forwarder.js'
+import { EventForwarderRecoveryError, forwardSessionEvents, type EventForwarderSession } from './event-forwarder.js'
 import type { ApplicationChange, ApplicationEventBatch, SessionStatus } from './session-types.js'
 
 function deferred<T>() {
@@ -116,6 +116,12 @@ describe('event-forwarder cancellation and checkpoints', () => {
 })
 
 describe('event-forwarder recovery and failure evidence', () => {
+  it('represents missing recovery evidence explicitly without asserting continuity', () => {
+    const error = new EventForwarderRecoveryError({ ...change, kind: 'recovery', recovery: null })
+    expect(error.recovery).toBeNull(); expect(error.revision).toEqual(revision)
+    expect(error.code).toBe('EVENT_FORWARDER_REVIEW_RECOVERY')
+  })
+
   it('starts from the recovered view when recovery precedes the first capture', async () => {
     const f = forwardFixture(), started = deferred<void>(), recovered = deferred<void>()
     const pending = deferred<Awaited<ReturnType<EventForwarderSession['readView']>>>()
@@ -146,7 +152,8 @@ describe('event-forwarder recovery and failure evidence', () => {
     const f = forwardFixture(), pending = deferred<void>(), started = deferred<void>()
     f.deliver.mockImplementation(() => { started.resolve(); return pending.promise })
     const task = forwardSessionEvents({ ...f.options, checkpoint: { load: () => 'previous', save: f.save } })
-    const rejected = expect(task).rejects.toThrow('EVENT_FORWARDER_REVIEW_RECOVERY')
+    const rejected = expect(task).rejects.toMatchObject({ name: 'EventForwarderRecoveryError', code: 'EVENT_FORWARDER_REVIEW_RECOVERY',
+      revision, recovery: { reason: null, adopted: null, unknownLoss: false } })
     await started.promise; f.next.resolve({ done: false, value: { kind: 'recovery', revision, recovery: notice } })
     await rejected; pending.resolve(); await new Promise(setImmediate)
     expect(f.save).not.toHaveBeenCalled(); expect(f.returned).toHaveBeenCalledOnce()
