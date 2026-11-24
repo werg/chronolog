@@ -157,18 +157,19 @@ await rename(join(output, packed.filename), artifact);
 process.stdout.write(JSON.stringify({ artifact, version, source, sourceTree, dirty, sha256: hash(await readFile(artifact)) }) + '\n');
 
 function declarations(entryPoints) {
+  const ambientInputs = values['sql-wasm'] ? ['packages/materializer-doltlite/src/fs-native-extensions.d.ts'] : [];
   const configuration = ts.readConfigFile(join(root, 'tsconfig.base.json'), ts.sys.readFile);
   if (configuration.error) throw new Error(ts.flattenDiagnosticMessageText(configuration.error.messageText, '\n'));
   const parsed = ts.parseJsonConfigFileContent(configuration.config, ts.sys, root);
   const out = join(packageRoot, 'types');
   const options = { ...parsed.options, rootDir: root, outDir: out, types: ['node'], noEmit: false,
     declaration: true, declarationMap: false, sourceMap: false, emitDeclarationOnly: true, noEmitOnError: true };
-  const compiler = ts.createProgram(entryPoints, options);
+  const compiler = ts.createProgram([...entryPoints, ...ambientInputs.map(path => join(root, path))], options);
   const diagnostics = [...parsed.errors, ...ts.getPreEmitDiagnostics(compiler)];
   if (diagnostics.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(diagnostics, {
     getCurrentDirectory: () => root, getCanonicalFileName: name => name, getNewLine: () => '\n',
   }));
-  const files = new Map(), inputs = new Set();
+  const files = new Map(), inputs = new Set(ambientInputs);
   const result = compiler.emit(undefined, (path, content, _bom, _error, sourceFiles) => {
     if (!path.endsWith('.d.ts')) return;
     for (const file of sourceFiles ?? []) inputs.add(relative(root, file.fileName).replaceAll('\\', '/'));

@@ -198,6 +198,9 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
   const SQLITE_OPEN_MAIN_DB = 0x00000100
   const SQLITE_BUSY = 5
 
+  // macOS supports only whole-file flock; other platforms keep the reserved
+  // byte range so Windows mandatory locks cannot block database reads/writes.
+  const ownerLockRange: readonly [number, number] = process.platform === 'darwin' ? [0, 0] : [2 ** 52, 1]
   const openFiles = new Map<number, OpenNodeFile>()
   const owners = new Map<string, FileOwner>()
   function owner(path: string, fd: number) {
@@ -205,13 +208,11 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
     let group = owners.get(key)
     if (group !== undefined) return group
     // A lock on the database inode survives path aliases and needs no sidecar.
-    // Reserve a byte far beyond SQLite's addressable pages so Windows mandatory
-    // byte-range locks do not interfere with database reads/writes.
     if (existsSync(path + '.chronolog-owner.sqlite')) throw new Error('SQLITE_LEGACY_OWNER_MIGRATION_REQUIRED: stop older runtimes and remove their obsolete owner sidecar before opening this database')
     const lease = openSync(path, 'r+')
     try {
       if (nodeVfsFileIdentity(path, fstatSync(lease, { bigint: true })) !== key) throw new Error('SQLITE_BUSY: file identity changed during owner acquisition')
-      if (!tryLock(lease, 2 ** 52, 1)) throw new Error('SQLITE_BUSY: database already owned')
+      if (!tryLock(lease, ...ownerLockRange)) throw new Error('SQLITE_BUSY: database already owned')
     } catch (error) { closeSync(lease); throw error }
     group = { key, lease, users: new Set() }; owners.set(key, group)
     return group
@@ -219,7 +220,7 @@ export function installNodeFsVfs(module: NodeChronologWasmModule, vfsName = NODE
   function release(entry: OpenNodeFile) {
     if (entry.owner === undefined) return
     entry.owner.users.delete(entry)
-    if (entry.owner.users.size === 0) { unlock(entry.owner.lease, 2 ** 52, 1); closeSync(entry.owner.lease); owners.delete(entry.owner.key) }
+    if (entry.owner.users.size === 0) { unlock(entry.owner.lease, ...ownerLockRange); closeSync(entry.owner.lease); owners.delete(entry.owner.key) }
   }
   const vfsStruct = new capi.sqlite3_vfs()
   const ioStruct = new capi.sqlite3_io_methods()

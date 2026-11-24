@@ -91,13 +91,23 @@ async function synchronize(links: readonly ApplicationPeerLink[]) { await Promis
 
 describe('bounded authenticated link handover', () => {
   it('has no idle heartbeats or idle timers once a connection is authenticated', async () => {
-    const f = await fixture()
+    const f = await fixture(), initialPulls = [gate(), gate()]
+    for (const [index, identity] of [f.a, f.b].entries()) observePeerWire(identity.publicKey, packet => {
+      if (packet.kind === 'request' && packet.message?.action === 'state') initialPulls[index]!.release()
+    })
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    const links = await f.connect(); await synchronize(links)
+    const links = await f.connect()
+    // Both opening hints must have started their background pulls before the
+    // explicit barriers. Otherwise a zero-timer gap during authority verification
+    // can precede a queued pull, whose real WebCrypto work races fake time.
+    await Promise.all(initialPulls.map(pull => pull.promise))
+    await synchronize(links)
     await vi.waitFor(() => { expect(vi.getTimerCount()).toBe(0) }, { interval: 1, timeout: 1000 })
     const before = links.map(link => link.stats)
     await vi.advanceTimersByTimeAsync(120_000)
     expect(links.map(link => link.stats)).toEqual(before)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(links.map(link => link.signal.reason)).toEqual([undefined, undefined])
     expect(links.every(link => !link.signal.aborted)).toBe(true)
   })
 

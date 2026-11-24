@@ -1,5 +1,5 @@
 name: Independent application qualification
-run-name: "Companion core=${{ inputs.host_ref || 'tuple' }} contrib=${{ inputs.contrib_ref || 'tuple' }}"
+run-name: "Companion core=${{ inputs.host_ref || 'tuple' }} contrib=${{ inputs.contrib_ref || 'source pin' }}"
 
 on:
   pull_request:
@@ -34,7 +34,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - name: Select verified companion tuple
+      - name: Select reviewed source CI companions (not a release promotion)
         env:
           TENDRILLER_REF: ${{ inputs.host_ref }}
           CONTRIB_REF_INPUT: ${{ inputs.contrib_ref }}

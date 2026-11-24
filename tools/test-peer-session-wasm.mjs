@@ -23,6 +23,8 @@ const provenance = JSON.parse(await readFile(join(packageRoot, 'provenance.json'
 assert(!provenance.nativeEngine, 'Portable archive must not contain the native addon');
 assert(provenance.sqlEngines.includes('wasm-node'), 'Artifact must expose Node WASM SQL');
 assert(provenance.wasmEngine, 'Artifact must carry verified WASM assets');
+assert(provenance.inputs.includes('packages/materializer-doltlite/src/fs-native-extensions.d.ts'),
+  'WASM declaration inputs must include the native file-locking declaration');
 for (const [name, expected] of Object.entries(provenance.sha256)) {
   const path = checkedPackagePath(packageRoot, name);
   assert.equal(hash(await readFile(path)), expected, `Artifact hash mismatch for ${name}`);
