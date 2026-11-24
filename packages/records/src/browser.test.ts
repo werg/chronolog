@@ -7,6 +7,7 @@ function directory() {
   let failClose = false
   const handles: OpfsDirectory = {
     async removeEntry(name) { if (!values.delete(name)) throw new DOMException('absent', 'NotFoundError') },
+    async *entries() { for (const name of values.keys()) yield [name, {}] },
     async getFileHandle(name, options) {
       if (!values.has(name)) {
         if (!options?.create) throw new DOMException('absent', 'NotFoundError')
@@ -32,6 +33,40 @@ function directory() {
 }
 
 describe('OPFS atomic bytes', () => {
+  it('enumerates a fenced snapshot and releases writes when abandoned', async () => {
+    const { handles, values } = directory(), store = new OpfsBytesStore(handles)
+    await store.put('keep', Uint8Array.of(1)); await store.put('discard', Uint8Array.of(2))
+    const iterator = store.iterateEntries()[Symbol.asyncIterator]()
+    await iterator.next()
+    let deleted = false
+    const deleting = store.delete('discard').then(() => { deleted = true })
+    await new Promise(setImmediate)
+    expect(deleted).toBe(false)
+    await iterator.return?.(); await deleting
+    expect(values.size).toBe(1)
+    const entries = []
+    for await (const entry of store.iterateEntries()) entries.push(entry)
+    expect(entries).toEqual([{ key: 'keep', value: Uint8Array.of(1) }])
+    await store.close()
+    const reopened = new OpfsBytesStore(handles)
+    expect(await reopened.get('discard')).toBeNull()
+    expect(await reopened.get('keep')).toEqual(Uint8Array.of(1))
+    await reopened.close()
+    await expect(store.iterateEntries()[Symbol.asyncIterator]().next()).rejects.toThrow('OPFS_STORE_CLOSED')
+  })
+
+  it('rejects a valid envelope stored under the wrong digest and releases its fence', async () => {
+    const { handles, values } = directory(), store = new OpfsBytesStore(handles)
+    await store.put('a', Uint8Array.of(1)); await store.put('b', Uint8Array.of(2))
+    const names = [...values.keys()]
+    values.set(names[0]!, values.get(names[1]!)!)
+    const read = async () => { for await (const entry of store.iterateEntries()) void entry }
+    await expect(read()).rejects.toThrow('OPFS_VALUE_CORRUPT')
+    await store.put('a', Uint8Array.of(3))
+    expect(await store.get('a')).toEqual(Uint8Array.of(3))
+    await store.close()
+  })
+
   it('durably deletes only the selected value and remains idempotent across reopen', async () => {
     const { handles, values } = directory(), store = new OpfsBytesStore(handles)
     await store.put('media/transient', new Uint8Array(65536))

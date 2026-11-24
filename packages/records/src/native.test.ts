@@ -79,3 +79,19 @@ it('releases the durable SQLite fence when its owning process is killed', async 
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+
+it('deletes durable local bytes, reclaims quota, and preserves absent keys on reopen', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'chronolog-prune-')), path = join(directory, 'peer.sqlite')
+  let store = await NativeBytesStore.open(path, { quotaBytes: 4 })
+  try {
+    await store.put('discard', Uint8Array.of(1, 2, 3, 4))
+    await store.delete('discard'); await store.delete('discard')
+    expect(store.usageBytes()).toBe(0)
+    await store.put('keep', Uint8Array.of(4, 3, 2, 1)); await store.close()
+    store = await NativeBytesStore.open(path, { quotaBytes: 4 })
+    expect(await store.get('discard')).toBeNull()
+    expect(await store.get('keep')).toEqual(Uint8Array.of(4, 3, 2, 1))
+    expect(store.usageBytes()).toBe(4)
+  } finally { await store.close(); await rm(directory, { recursive: true, force: true }) }
+})

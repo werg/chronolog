@@ -23,14 +23,22 @@ export async function encodeRecordValue(key: string, bytes: Uint8Array): Promise
 
 export async function decodeRecordValue(key: string, raw: Uint8Array, corruptionCode: string): Promise<Uint8Array> {
   assertRecordKey(key)
+  const entry = await decodeRecordEntry(raw, corruptionCode)
+  if (entry.key !== key) throw new Error(corruptionCode)
+  return entry.value
+}
+
+/** Recover a logical key for bounded OPFS enumeration; authenticate the same envelope. */
+export async function decodeRecordEntry(raw: Uint8Array, corruptionCode: string): Promise<{ key: string; value: Uint8Array }> {
   if (raw.length === 0 || raw.length > MAX_RECORD_ENVELOPE_BYTES) throw new Error(corruptionCode)
   try {
     const decoded = assertCanonicalCbor(raw, { ...DEFAULT_DECODE_LIMITS,
       maxBytes: MAX_RECORD_ENVELOPE_BYTES, maxBlobBytes: MAX_RECORD_VALUE_BYTES })
-    if (!Array.isArray(decoded) || decoded.length !== 4 || decoded[0] !== 1n || decoded[1] !== key ||
+    if (!Array.isArray(decoded) || decoded.length !== 4 || decoded[0] !== 1n || typeof decoded[1] !== 'string' ||
         !(decoded[2] instanceof Uint8Array) || !(decoded[3] instanceof Uint8Array) ||
         !equalBytes(decoded[3], await sha256(decoded[2]))) throw new Error(corruptionCode)
-    return decoded[2].slice()
+    assertRecordKey(decoded[1])
+    return { key: decoded[1], value: decoded[2].slice() }
   } catch {
     throw new Error(corruptionCode)
   }

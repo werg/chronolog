@@ -1,5 +1,5 @@
-import type { BytesStore } from './bytes-store.js'
-import { assertRecordKey, decodeRecordValue, encodeRecordValue, recordFilename } from './record-envelope.js'
+import type { BytesStore, BytesStoreEntry } from './bytes-store.js'
+import { assertRecordKey, decodeRecordEntry, decodeRecordValue, encodeRecordValue, recordFilename, MAX_RECORD_ENVELOPE_BYTES } from './record-envelope.js'
 
 export interface OpfsWriter {
   write(bytes: ArrayBuffer): Promise<void>
@@ -7,12 +7,13 @@ export interface OpfsWriter {
   abort(): Promise<void>
 }
 export interface OpfsFile {
-  getFile(): Promise<{ arrayBuffer(): Promise<ArrayBuffer> }>
+  getFile(): Promise<{ readonly size?: number; arrayBuffer(): Promise<ArrayBuffer> }>
   createWritable(): Promise<OpfsWriter>
 }
 export interface OpfsDirectory {
   getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFile>
   removeEntry?(name: string): Promise<void>
+  entries?(): AsyncIterable<[string, unknown]>
 }
 
 /** An atomic OPFS writer; the same envelope and ordering rules as the IDB backend. */
@@ -55,6 +56,30 @@ export class OpfsBytesStore implements BytesStore {
         throw error
       }
     })
+  }
+
+  async *iterateEntries(): AsyncIterable<BytesStoreEntry> {
+    const entries = this.#directory.entries?.bind(this.#directory)
+    if (entries === undefined) throw new Error('BYTES_STORE_ENUMERATION_UNSUPPORTED')
+    let release!: () => void, started!: () => void
+    const held = new Promise<void>(resolve => { release = resolve }), ready = new Promise<void>(resolve => { started = resolve })
+    const owner = this.#enqueue(async () => { started(); await held })
+    await Promise.race([ready, owner])
+    try {
+      const files: string[] = []
+      for await (const [name] of entries()) if (/^value-[0-9a-f]{64}$/u.test(name)) files.push(name)
+      // The owner fences replacements until the caller releases this snapshot.
+      // Digest ordering is deterministic; decode only one bounded value at a time.
+      for (const name of files.sort()) {
+        const file = await (await this.#directory.getFileHandle(name)).getFile()
+        if (file.size !== undefined && file.size > MAX_RECORD_ENVELOPE_BYTES) throw new Error('OPFS_VALUE_CORRUPT')
+        const raw = new Uint8Array(await file.arrayBuffer())
+        if (raw.length === 0) continue // Uncommitted createWritable placeholder.
+        const entry = await decodeRecordEntry(raw, 'OPFS_VALUE_CORRUPT')
+        if (await recordFilename(entry.key) !== name) throw new Error('OPFS_VALUE_CORRUPT')
+        yield entry
+      }
+    } finally { release(); await owner }
   }
 
   async delete(key: string): Promise<void> {
