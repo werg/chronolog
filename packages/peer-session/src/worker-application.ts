@@ -10,6 +10,7 @@ import type { FinalityStatement as InlineFinalityStatement } from '@chronolog/au
 import type { SignedProvisioningRequest as InlineSignedProvisioningRequest } from './provisioning.js'
 import type { SignedProvisioningPackage as InlineSignedProvisioningPackage } from './provisioning.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
+import type { SessionFacts as InlineSessionFacts } from './session.js'
 import { APPLICATION_OWNER_PROTOCOL, type OwnerNotice, type OwnerResponse } from './worker-application-protocol.js'
 import type { ApplicationChange, ApplicationEventOptions, ApplicationReadView, CommandOptions, MaterializedRevision, QueryParameter, QueryRows, SessionStatus, WaitOptions } from './session-types.js'
 import type { ApplicationSubmission, MaterializedOperation, OperationInspection, RetentionEvidence } from './operation.js'
@@ -119,6 +120,10 @@ export class WorkerApplicationSession {
   readAuthority(): Promise<InlineAuthorityBundle> { return this.request('authority.read', []) }
   endpoints(): Promise<readonly (InlineApplicationEndpointBinding & { readonly state: 'active' | 'suspended' })[]> { return this.request('endpoints.list', []) }
   mergeAuthority(bundle: InlineAuthorityBundle): Promise<void> { return this.request('authority.merge', [bundle]) }
+  /** The owner's authenticated operation-set facts (signed envelopes, retention and finality evidence). */
+  exportFacts(): Promise<InlineSessionFacts> { return this.request('facts.export', []) }
+  /** Verify and merge facts from another replica; ordering remains signed author time, never arrival order. */
+  mergeFacts(facts: InlineSessionFacts): Promise<void> { return this.request('facts.merge', [facts]) }
   readonly finality = {
     closeAuthorTime: (options: { readonly throughMs: bigint }): Promise<{ readonly closedThroughMs: bigint | null; readonly proofs: readonly InlineFinalityProof[] }> => this.request('finality.closeAuthorTime', [options]),
     voteAuthorTime: (options: { readonly throughMs: bigint }): Promise<readonly InlineSigned<InlineFinalityStatement>[]> => this.request('finality.voteAuthorTime', [options]),

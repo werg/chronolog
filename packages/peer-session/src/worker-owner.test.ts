@@ -125,3 +125,19 @@ it('fences copied active view namespaces across real attachments while retaining
   const detachedEndpoint = f.owner.endpoints().find(endpoint => endpoint.endpointId === copied.endpoint?.endpointId)!; expect(detachedEndpoint.context.viewId).toBe(copied.endpoint?.context.viewId)
   await copied.detach(); expect(f.owner.endpoints().some(endpoint => endpoint.endpointId === detachedEndpoint.endpointId)).toBe(false)
 })
+it('replication capability exchanges authenticated operation-set facts with an out-of-band replica in both directions', async () => {
+  const f = await sessionFixture({ count: 2 }), session = await f.open(0), replica = await f.open(1), owner = createApplicationOwner(session)
+  const attach = async (capabilities?: NonNullable<ApplicationAttachmentPolicy['capabilities']>) => { const channel = new MessageChannel(); owner.attach(channel.port1 as unknown as ApplicationWorkerEndpoint, capabilities === undefined ? {} : { capabilities }); const client = await connectApplicationOwner(channel.port2 as unknown as ApplicationWorkerEndpoint, { applicationId: f.applicationId }); closes.push(() => client.detach()); return client }
+  closes.push(() => owner.close(), () => replica.close())
+  const client = await attach(), denied = await attach(['diagnostics'])
+  await expect(denied.exportFacts()).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN'); await expect(denied.mergeFacts({ envelopes: [], retentions: [], finality: [] })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  const local = await client.command('say', 'from owner', { operationId: 'owner-1', authorTimestampMs: 20n }); await local.materialized()
+  const remote = await replica.command('say', 'from replica', { operationId: 'replica-1', authorTimestampMs: 10n }); await remote.materialized()
+  await replica.mergeFacts(await client.exportFacts()); await client.mergeFacts(replica.exportFacts())
+  const read = async (target: { readEvents(): Promise<ApplicationEventBatch> }) => (await target.readEvents()).events.map(event => event.payload)
+  await expect.poll(() => read(client)).toEqual(['from replica', 'from owner']); await expect.poll(() => read(replica)).toEqual(['from replica', 'from owner'])
+  // Re-merging is idempotent, and a forged envelope from a non-member is rejected rather than stored.
+  await client.mergeFacts(replica.exportFacts()); expect((await client.exportFacts()).envelopes).toHaveLength(2)
+  const forged = structuredClone(replica.exportFacts().envelopes[0]!); (forged as { signer: string }).signer = 'ef'.repeat(32)
+  await expect(client.mergeFacts({ envelopes: [forged], retentions: [], finality: [] })).rejects.toThrow(); expect((await client.exportFacts()).envelopes).toHaveLength(2)
+})

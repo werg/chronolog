@@ -117,6 +117,10 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'authority.read') { allow('diagnostics'); return session.authority.bundle() }
         if (method === 'endpoints.list') { allow('diagnostics'); return owner.endpoints() }
         if (method === 'authority.merge') { allow('diagnostics'); return session.mergeAuthority(args[0] as AuthorityBundle) }
+        // Authenticated operation-set exchange for an owner-chosen out-of-band replica (for example a blind
+        // envelope relay). Merged envelopes are verified against current authority exactly as peer facts are.
+        if (method === 'facts.export') { allow('replication'); return session.exportFacts() }
+        if (method === 'facts.merge') { allow('replication'); return session.mergeFacts(args[0] as Parameters<ApplicationSession['mergeFacts']>[0]) }
         if (method === 'finality.closeAuthorTime') { allow('finality'); return session.finality.closeAuthorTime(args[0] as { throughMs: bigint }) }
         if (method === 'finality.voteAuthorTime') { allow('finality'); return session.finality.voteAuthorTime(args[0] as { throughMs: bigint }) }
         if (method === 'finality.submitProofs') { allow('finality'); return session.finality.submitProofs(args[0] as readonly FinalityProof[]) }

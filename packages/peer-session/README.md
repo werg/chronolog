@@ -252,7 +252,7 @@ being implied by the record-store pool.
 
 ## Attachment boundaries and lifetime
 
-Owner attachment capabilities independently name `commands`, `queries`, `events`, `content`, `signals`, `operations`, `diagnostics`, `finality`, and `provisioning`. Diagnostic access only reads public authority/endpoint metadata; it does not grant private finalizer or key-provisioning actions. Configured command/query allowlists and captured raw-SQL/event checks remain independent. `prepareCommand` receives the actual owner-bound endpoint context, not an unverified document label.
+Owner attachment capabilities independently name `commands`, `queries`, `events`, `content`, `signals`, `operations`, `diagnostics`, `finality`, `provisioning`, and `replication`. Diagnostic access only reads public authority/endpoint metadata; it does not grant private finalizer or key-provisioning actions. `replication` exposes `exportFacts()`/`mergeFacts()` so an attached page can relay the owner's signed, encrypted operation-set facts through an out-of-band replica; merged envelopes are verified against current authority and ordered only by signed author time. Configured command/query allowlists and captured raw-SQL/event checks remain independent. `prepareCommand` receives the actual owner-bound endpoint context, not an unverified document label.
 
 The owner reserves each live attachment's local `viewId`. A cloned tab requesting an already-held ID receives a fresh owner-issued ID; hidden/suspended attachments retain their reservations. Detach or physical close releases the claim so the original page can request its retained ID again. This fences local draft namespaces, not application authorization or operation identity.
 
