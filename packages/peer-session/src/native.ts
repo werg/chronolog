@@ -2,10 +2,12 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { SigningIdentity } from '@chronolog/authority'
 import { MemoryBytesStore } from '@chronolog/records'
 import { NativeBytesStore, type NativeBytesStoreOptions } from '@chronolog/records/native'
 
 import { openApplicationDevice, type ApplicationDevice } from './device.js'
+import { registerExitCleanup } from './exit-cleanup.js'
 export { createApplicationSession } from './index.js'
 export type { CreateApplicationSessionOptions } from './runtime.js'
 export { NativeBytesStore } from '@chronolog/records/native'
@@ -20,10 +22,17 @@ export interface DisposableNativeDevice extends ApplicationDevice {
   readonly databasePath: string | null
 }
 
-/** The SQLite file is the exclusive signer/history owner; a second process receives a busy error. */
+/**
+ * The SQLite file is the exclusive history owner; a second owner receives a busy error.
+ * Without `managedSigner` the file holds its own device-local Ed25519 key. With
+ * `managedSigner` (the agent path) the file records only that identity's public key,
+ * so one agent signer can own many application devices in one process; every
+ * resume must supply the same signer.
+ */
 export async function openNativeDevice(options: {
   readonly path: string
   readonly create?: true
+  readonly managedSigner?: SigningIdentity
   readonly quotaBytes?: number
   readonly maxValueBytes?: number
 }): Promise<ApplicationDevice> {
@@ -32,7 +41,12 @@ export async function openNativeDevice(options: {
     ...(options.maxValueBytes === undefined ? {} : { maxValueBytes: options.maxValueBytes }),
   }
   const store = await NativeBytesStore.open(options.path, limits)
-  try { return await openApplicationDevice({ store, ...(options.create === undefined ? {} : { create: options.create }), close: () => store.close() }) }
+  try {
+    return await openApplicationDevice({ store,
+      ...(options.create === undefined ? {} : { create: options.create }),
+      ...(options.managedSigner === undefined ? {} : { managedSigner: options.managedSigner }),
+      close: () => store.close() })
+  }
   catch (error) { await store.close(); throw error }
 }
 
@@ -43,12 +57,14 @@ export async function openNativeDevice(options: {
  */
 export async function openDisposableNativeDevice(options: {
   readonly sql?: boolean
+  readonly managedSigner?: SigningIdentity
   readonly quotaBytes?: number
   readonly maxValueBytes?: number
 } = {}): Promise<DisposableNativeDevice> {
+  const signer = options.managedSigner === undefined ? {} : { managedSigner: options.managedSigner }
   if (options.sql !== true) {
     const store = new MemoryBytesStore(options)
-    const device = await openApplicationDevice({ store, create: true })
+    const device = await openApplicationDevice({ store, create: true, ...signer })
     return Object.freeze({
       ...device,
       ephemeral: true as const,
@@ -76,15 +92,15 @@ export async function openDisposableNativeDevice(options: {
     try { void store.close().catch(() => undefined) } catch { /* ignore on exit */ }
     try { rmSync(temporaryDirectory, { recursive: true, force: true }) } catch { /* best-effort temp cleanup */ }
   }
-  const onExit = (): void => { cleanupDir() }
-  process.once('exit', onExit)
+  const unregister = registerExitCleanup(cleanupDir)
   try {
     const device = await openApplicationDevice({
       store,
       create: true,
+      ...signer,
       async close() {
         await store.close()
-        process.removeListener('exit', onExit)
+        unregister()
         cleanupDir()
       },
     })
@@ -97,7 +113,7 @@ export async function openDisposableNativeDevice(options: {
       databasePath,
     })
   } catch (error) {
-    process.removeListener('exit', onExit)
+    unregister()
     try { await store.close() } catch { /* Preserve the construction error. */ }
     cleanupDir()
     throw error

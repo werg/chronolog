@@ -42,7 +42,7 @@ const sbom = {
   components,
 }
 
-const subjects = await collectSubjects(['dist', 'patches', 'artifacts/peer-session', 'artifacts/peer-generation-control', 'artifacts/signals'])
+const subjects = await collectSubjects(['dist', 'patches', 'artifacts/peer-session', 'artifacts/authority', 'artifacts/signals'])
 const provenance = {
   _type: 'https://in-toto.io/Statement/v1',
   subject: subjects.map((subject) => ({

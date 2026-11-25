@@ -8,8 +8,8 @@ The [authored operation-set contract](../../docs/CRDT_CONTRACT.md) is normative.
 
 | Import | Purpose |
 | --- | --- |
-| `@chronolog/peer-session` | `createApplicationSession`, definitions, authority helpers/types, live views, view stores, projections, scoped tools, event forwarding, checkpoints and owner composition |
-| `@chronolog/peer-session/native` | `openNativeDevice`, `openDisposableNativeDevice`, `NativeBytesStore`, `createApplicationSession` |
+| `@chronolog/peer-session` | `createApplicationSession`, definitions, authority helpers/types, live views, view stores, projections, scoped tools, single/multi-session event forwarding, checkpoints and owner composition |
+| `@chronolog/peer-session/native` | `openNativeDevice` (optional `managedSigner`), `openDisposableNativeDevice`, `NativeBytesStore`, `createApplicationSession` |
 | `@chronolog/peer-session/worker` | `openBrowserDevice`, `createApplicationSession`, `createApplicationOwner`, owner locks and lazy browser capability probing |
 | `@chronolog/peer-session/browser` | `connectApplicationOwner`, the page facade, live views, view stores, scoped tools and event forwarding; no signing keys or SQL engine |
 | `@chronolog/peer-session/webrtc` | Browser RTC transport and the page/Worker raw-frame bridge |
@@ -188,6 +188,67 @@ A public signed request can precede enrollment. Export requires the enrolled rec
 - `signals.send(topic, payload, options)` and `signals.subscribe(options)` share disposable signed updates over the independent live lane. `mode: 'latest'` coalesces; `includeLatest` requests still-fresh remembered values. Signal updates never change the application revision.
 - `createScopedApplicationTools(session, { commands, queries })` defaults to no named permissions. `operationId(raw, { caller })` and `execute` use the same caller-scoped identity, including an explicit trusted physical binding namespace when present. Inspect/retry/wait cannot adopt another caller's handle.
 - `forwardSessionEvents` rederives effective captured snapshots, emits stable-ID upserts/retractions and independent fact updates, and checkpoints a bounded pending delivery ledger before callbacks. Lost acknowledgements can redeliver the same identity. Delivery must be idempotent; neither finality nor this helper promises exactly-once external effects.
+
+## Many applications in one agent process
+
+One agent program can hold one owned device file per application while sharing one retained
+`SigningIdentity`. Supply that identity as `managedSigner`; each device file records only its
+public key and storage binding, and every resume must supply the same private signer. Shared
+identity does not grant application access: authenticate/enroll that key and provision the
+explicit reader/writer permissions and epoch keys separately for each application. Publication,
+finalizer eligibility and SQL privileges remain independent grants.
+
+```ts
+import { createApplicationSession, mergeSessionChanges, forwardManySessionEvents } from '@chronolog/peer-session'
+import { openNativeDevice } from '@chronolog/peer-session/native'
+
+// agentSigner is retained in private agent secret storage, never in application assets.
+const device = await openNativeDevice({
+  path: `./private/apps/${applicationId}.sqlite`, create: true, managedSigner: agentSigner,
+})
+const session = await createApplicationSession({ device, definition, authority: verifiedAuthority })
+// Complete this application's explicit key provisioning before authoring encrypted work.
+
+const changes = mergeSessionChanges([session]) // also accepts an async session registry
+changes.add(otherSession)
+for await (const { applicationId, kind, revision, revisedProposalIds } of changes) {
+  invalidate(applicationId, { kind, revision, revisedProposalIds })
+}
+
+const forwarders = forwardManySessionEvents({
+  sessions: [session, otherSession], topics: ['note'],
+  checkpoints: {
+    load: scope => privateLedgers.get(scope.key),
+    save: (scope, state) => { privateLedgers.set(scope.key, state) },
+  },
+  project: (event, _batch, { view }) => ({
+    applicationId: view.applicationId, name: event.topic, payload: event.payload,
+  }),
+  deliver: (projection, event, batch, signal) => deliverForApplication(projection.applicationId, projection, event, batch, signal),
+  onError: (error, failed) => report(failed.applicationId, error),
+})
+```
+
+`mergeSessionChanges` holds at most one pending invalidation per session, supports `add`/`remove`,
+and drops a closed or failed source. `onError` isolates a failed source; without it the merged
+stream fails. Notifications are cues to reread that application's coherent snapshot, never a
+combined application log or cross-application ordering mechanism. Call `changes.close()` when
+its consumer ends.
+
+`forwardManySessionEvents` preserves the single-session snapshot/upsert/retract and independent
+fact semantics. Its private checkpoint adapter receives `{ applicationId, key }`, with
+`key = sessionCheckpointKey(applicationId)`. Run one owned forwarder per application in a
+checkpoint namespace; isolate different owner profiles/exporters in separate private adapters.
+These are durable pending-delivery ledgers, not arrival cursors or a second application database.
+A failed forwarder is reported to `onError` without stopping other applications; `close()` stops
+and waits for the group's forwarders. External delivery still requires idempotency. Host traffic
+remains approved control/tool/event delivery, not a newly hosted application data backend.
+
+Native record files share one process-wide SQLite pool worker while retaining separate quotas
+and exclusive file locks. `NativeBytesStore.poolStatus()` exposes its serving thread and store
+count. Closing the last store retires that worker; disposable SQL device directories share one
+process-exit cleanup listener. SQL engine and transport resources remain explicit rather than
+being implied by the record-store pool.
 
 ## Attachment boundaries and lifetime
 

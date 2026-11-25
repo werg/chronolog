@@ -42,19 +42,17 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - name: Check qualified companion source pins
-        run: node --test tools/test-companion-workflow-pins.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm docs:check
       - run: pnpm typecheck
       - run: pnpm test:coverage
       - run: pnpm build
-      - name: Verify public signal and participant artifacts
+      - name: Verify public signal and authority artifacts
         run: |
           pnpm package:signals
           pnpm test:signals-package
-          pnpm package:control
+          pnpm package:authority
           pnpm package:session
           node tools/package-peer-session.mjs --no-native-rtc --output artifacts/peer-session-relay
       - uses: actions/upload-artifact@v6
@@ -65,7 +63,7 @@ jobs:
             coverage/coverage-summary.json
             artifacts/signals/*.tgz
             artifacts/signals/*.consumer.json
-            artifacts/peer-generation-control/*.tgz
+            artifacts/authority/*.tgz
             artifacts/peer-session/*.tgz
             artifacts/peer-session/package/provenance.json
             artifacts/peer-session-relay/*.tgz

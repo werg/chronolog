@@ -114,7 +114,7 @@ jobs:
         if: ${{ matrix.id == 'linux-x64-gnu' || matrix.id == 'darwin-x64' }}
       - run: pnpm package:signals
       - run: pnpm test:signals-package
-      - run: pnpm package:control
+      - run: pnpm package:authority
       - name: Package relay-only and SQL peer-session profiles
         shell: bash
         run: |
@@ -135,7 +135,7 @@ jobs:
             artifacts/release/provenance.intoto.jsonl
             artifacts/peer-session/*.tgz
             artifacts/peer-session-relay/*.tgz
-            artifacts/peer-generation-control/*.tgz
+            artifacts/authority/*.tgz
             artifacts/signals/*.tgz
       - uses: actions/upload-artifact@v6
         with:
@@ -144,7 +144,7 @@ jobs:
             artifacts/release/
             artifacts/peer-session/*.tgz
             artifacts/peer-session-relay/*.tgz
-            artifacts/peer-generation-control/*.tgz
+            artifacts/authority/*.tgz
             artifacts/signals/*.tgz
             artifacts/signals/*.consumer.json
             artifacts/peer-session-sql-check/report.json
