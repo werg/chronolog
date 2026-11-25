@@ -159,13 +159,20 @@ before resuming an invalidated cursor.
 
 Chronolog exposes observation and forwarding, not a model execution loop.
 An external host adapter must establish how it submits work to the exact
-conversation, starts or resumes a turn, serializes competing requests and reports
-blocked delivery. See Tendriller's maintained
+conversation, injects input into its active turn or starts/resumes an idle turn,
+serializes dispatch and reports blocked delivery. For Codex, a plain CLI queue
+waits while a turn is running. A receiver that must inject incoming requests
+uses the verified `turn/steer` route with the observed active turn identity;
+queue/resume is the idle/unloaded route. Steering makes input available at the
+next applicable continuation boundary, not an interruption of an in-flight tool.
+Preserve explicit user interruption and uncertain admission outcomes. See Tendriller's maintained
 [conversation-delivery qualification](https://github.com/werg/tendriller/blob/master/docs/CONVERSATION_DELIVERY.md)
 and [worker-owned request example](https://github.com/werg/tendriller/blob/master/docs/AGENT_REQUESTS.md).
 A CLI queue or app-server API must be qualified against the installed host and
 same conversation; no Chronolog method implies that every Codex or ChatGPT
-surface supports it. Verify a second request after the first turn ends, and stop
+surface supports it. Verify a request reaches the same active Codex turn before
+it ends, then verify idle wake and a second request after the answering turn ends.
+A notice queued until completion does not pass the active-delivery check. Stop
 only the worker while leaving the native session connected to verify that its
 availability disappears and unanswered requests remain retained.
 
