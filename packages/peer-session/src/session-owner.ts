@@ -46,7 +46,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
       const views = new Map<string, ApplicationReadView>(), uploads = new Map<string, ContentUpload>(), completedUploads = new Map<string, ContentUpload>(), readers = new Map<string, Reader>(), streams = new Map<string, SignalStream>(), pending = new Map<number, RequestContext>()
       let effective = policy, attachment = '', initialized = false, detached = false, suspended = false, highestRequest = 0, viewReservations = 0, uploadReservations = 0, lastReceived = performance.now(), context: ApplicationEndpointContext = policy.context ?? {}
       let claimedViewId: string | undefined
-      let stopStatus: (() => void) | undefined, stopChange: (() => void) | undefined
+      let stopStatus: (() => void) | undefined, stopChange: (() => void) | undefined, stopExtension: (() => void) | undefined
       const physical = endpoint as unknown as { addEventListener(type: string, listener: EventListener): void; removeEventListener(type: string, listener: EventListener): void; on?(type: string, listener: () => void): void; off?(type: string, listener: () => void): void }
       const binding = (): ApplicationEndpointBinding => ({ ownerInstanceId, endpointId, endpointIncarnation, context: structuredClone(context), evidence: 'owner-bound', contextEvidence: effective.contextEvidence ?? 'caller-asserted', capabilities: [...(effective.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES)], ...(effective.identity === undefined ? {} : { identity: structuredClone(effective.identity) }) })
       const has = (capability: ApplicationAttachmentCapability): boolean => (effective.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES).includes(capability)
@@ -64,7 +64,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         for (const request of pending.values()) request.lifetime.abort(new Error('ENDPOINT_CLOSED')); pending.clear()
         endpoint.removeEventListener('message', receive); physical.removeEventListener('close', physicalClose); physical.removeEventListener('messageerror', physicalClose); physical.off?.('close', close); physical.off?.('messageerror', close)
         if (claimedViewId !== undefined && heldViewIds.get(claimedViewId) === endpointId) heldViewIds.delete(claimedViewId)
-        stopStatus?.(); stopChange?.(); releaseResources(); uploads.clear(); completedUploads.clear(); attachments.delete(endpointId); endpoint.close?.()
+        stopStatus?.(); stopChange?.(); stopExtension?.(); releaseResources(); uploads.clear(); completedUploads.clear(); attachments.delete(endpointId); endpoint.close?.()
         if (!closed && attachments.size === 0 && options.lastClient === 'shutdown') void owner.close()
       }
       const physicalClose: EventListener = () => close()
@@ -84,6 +84,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           context = { ...requested, viewId }; initialized = true
           stopStatus = session.onStatus(value => { if (!suspended) post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'status', value }) })
           stopChange = session.onChange(value => { if (!suspended) post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'change', value }) })
+          if (has('extensions')) stopExtension = options.extensions?.subscribe?.(value => { if (!suspended) post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'extension', value }) })
           return { applicationId: session.applicationId, identity: session.identity, definition: describeApplication(session.definition), status: session.status, binding: binding() }
         }
         if (method === 'close') return null
@@ -124,9 +125,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'finality.closeAuthorTime') { allow('finality'); return session.finality.closeAuthorTime(args[0] as { throughMs: bigint }) }
         if (method === 'finality.voteAuthorTime') { allow('finality'); return session.finality.voteAuthorTime(args[0] as { throughMs: bigint }) }
         if (method === 'finality.submitProofs') { allow('finality'); return session.finality.submitProofs(args[0] as readonly FinalityProof[]) }
-        if (method === 'provisioning.createProvisioningRequest') { allow('provisioning'); return session.provisioning.createProvisioningRequest() }
-        if (method === 'provisioning.exportProvisioning') { allow('provisioning'); return session.provisioning.exportProvisioning(args[0] as Parameters<ApplicationSession['provisioning']['exportProvisioning']>[0]) }
-        if (method === 'provisioning.importProvisioning') { allow('provisioning'); return session.provisioning.importProvisioning(args[0] as Parameters<ApplicationSession['provisioning']['importProvisioning']>[0]) }
+        if (method === 'extension.call') { allow('extensions'); check(options.extensions !== undefined, 'ENDPOINT_METHOD_UNKNOWN'); const name = args[0], input = args[1]; check(typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/u.test(name) && Array.isArray(input), 'ENDPOINT_REQUEST_INVALID'); return options.extensions.call(name, input as readonly unknown[], { endpoint: binding(), signal: request.signal }) }
         if (['content.retain', 'content.retention', 'content.retained', 'content.discard'].includes(method)) { allow('content'); const reference = args[0] as Parameters<ApplicationSession['content']['retain']>[0]; if (method === 'content.retain') return session.content.retain(reference, { signal: request.signal }); if (method === 'content.retention') return session.content.retention(reference, { signal: request.signal }); if (method === 'content.retained') return session.content.retained(reference); return session.content.discard(reference) }
         if (method === 'content.stage') { allow('content'); check(uploads.size + uploadReservations < 4, 'ENDPOINT_UPLOAD_LIMIT'); uploadReservations++; let upload: ContentUpload | undefined; try { upload = await session.content.stage(args[0] as Parameters<ApplicationSession['content']['stage']>[0]); active(request); uploads.set(upload.id, upload); const id = upload.id; upload = undefined; return id } finally { uploadReservations--; if (upload !== undefined) await upload.discard() } }
         if (['upload.write', 'upload.progress', 'upload.commit'].includes(method)) {

@@ -115,8 +115,8 @@ try {
   const manifest = await executionManifestArtifacts(await eventExecutionManifest())
   const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: identity.publicKey,
     authorityPublicKey: owner.publicKey, executionManifestDigest: bytesToHex(manifest.executionManifestDigest), finalityPolicy: { kind: 'signed-frontier', signer: identity.publicKey, scopes: [{ id: '56'.repeat(32), authorTimeAfterMs: -1n }] } }, owner)
-  const membership = await signMembership({ applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n, epoch: 0,
-    epochKeyDigest: await epochKeyCommitment(applicationId, 0, key), members: [nativeDevice.identity.publicKey, identity.publicKey].map(publicKey => ({ publicKey,
+  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n, epoch: 0,
+    epochKeyDigest: await epochKeyCommitment(applicationId, 0, key), members: [nativeDevice.identity.publicKey, identity.publicKey].map(publicKey => ({ publicKey, wrapKey: null,
       reader: true, writer: true, administrator: false, publisher: false, finalizer: publicKey === identity.publicKey })) }, owner)
   const authority = { descriptor, memberships: [membership] }
   native = await createApplicationSession({ device: nativeDevice, authority, definition, epochKeys: new Map([[0, key]]) })

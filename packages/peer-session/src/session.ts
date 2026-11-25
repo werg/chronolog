@@ -62,7 +62,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#options = options; this.authority = options.authority; this.definition = options.definition; this.device = options.device
     this.#key = `operation-set/${options.authority.descriptor.applicationId}`; this.#journal = journal
     this.#revision = { digest: '', view: 'local', executionManifestDigest: this.authority.descriptor.executionManifestDigest, policyDigest }
-    this.provisioning = createApplicationProvisioning({ store: options.device.store, authority: options.authority, identity: options.device.identity })
+    this.provisioning = createApplicationProvisioning({ authority: options.authority, identity: options.device.identity })
     this.content = new ApplicationContent({ store: options.store, authority: options.authority, identity: options.device.identity, storageId: options.device.storageId })
     this.signals = new SignalChannel({ scope: options.authority.descriptor.applicationId, identity: { publicKeyBytes: hexToBytes(options.device.identity.publicKey), privateKey: options.device.identity.privateKey }, localEcho: true, relay: true, authorize: input => options.authority.grant(bytesToHex(input.authorId))?.reader === true })
     this.#stopAuthority = this.authority.subscribe(() => { this.#scheduleReplay(); this.#factsChanged() })

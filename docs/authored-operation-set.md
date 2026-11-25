@@ -11,7 +11,7 @@ Chronolog replicates application history across browser Workers and native peers
 - A missing body, epoch key or authority predecessor is a visible pending dependency, not a deterministic rejection. Engine failures are operational errors, not transaction outcomes.
 - No peer coordinates, selects or hands over ordering, and there is no generation, takeover, reapplication or compatibility API.
 
-A browser or native device that has already been enrolled and provisioned reopens its cached identity, authority, keys and store, then authors and materializes with no host, peer, agent or finalizer reachable. A fresh browser must first enroll and receive explicit key provisioning. An empty browser cannot invent missing private keys.
+A browser or native device that has already been admitted and given its keys reopens its cached identity, authority, keys and store, then authors and materializes with no host, peer, agent or finalizer reachable. A fresh browser must first enroll and receive explicit key provisioning. An empty browser cannot invent missing private keys.
 
 ## Observations of an operation
 

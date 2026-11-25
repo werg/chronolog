@@ -7,8 +7,6 @@ import type { AuthorityBundle as InlineAuthorityBundle } from '@chronolog/author
 import type { FinalityProof as InlineFinalityProof } from '@chronolog/authority'
 import type { Signed as InlineSigned } from '@chronolog/authority'
 import type { FinalityStatement as InlineFinalityStatement } from '@chronolog/authority'
-import type { SignedProvisioningRequest as InlineSignedProvisioningRequest } from './provisioning.js'
-import type { SignedProvisioningPackage as InlineSignedProvisioningPackage } from './provisioning.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
 import type { SessionFacts as InlineSessionFacts } from './session.js'
 import { APPLICATION_OWNER_PROTOCOL, type OwnerNotice, type OwnerResponse } from './worker-application-protocol.js'
@@ -33,6 +31,7 @@ export class WorkerApplicationSession {
   readonly #pending = new Map<number, { method: string; startedAt: number; deadline: number; resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout>; cleanup(): void }>()
   readonly #statuses = new Set<(value: SessionStatus) => void>()
   readonly #changes = new Set<(value: ApplicationChange) => void>()
+  readonly #extensions = new Set<(value: unknown) => void>()
   readonly #ownedViews = new Set<string>()
   #next = 0
   #binding: InlineApplicationEndpointBinding | undefined
@@ -64,6 +63,7 @@ export class WorkerApplicationSession {
       const notice = message as OwnerNotice
       if (notice.topic === 'closed') { this.#detach(new Error(String(notice.value))); return }
       if (notice.topic === 'status') { this.#status = notice.value as SessionStatus; for (const listener of this.#statuses) { try { listener(this.status) } catch { /* Isolated observers. */ } } }
+      if (notice.topic === 'extension') for (const listener of this.#extensions) { try { listener(notice.value) } catch { /* Isolated observers. */ } }
       if (notice.topic === 'change') for (const listener of this.#changes) { try { listener(notice.value as ApplicationChange) } catch { /* Isolated observers. */ } }
     }
   }
@@ -129,10 +129,10 @@ export class WorkerApplicationSession {
     voteAuthorTime: (options: { readonly throughMs: bigint }): Promise<readonly InlineSigned<InlineFinalityStatement>[]> => this.request('finality.voteAuthorTime', [options]),
     submitProofs: (proofs: readonly InlineFinalityProof[]): Promise<void> => this.request('finality.submitProofs', [proofs]),
   }
-  readonly provisioning = {
-    createProvisioningRequest: (): Promise<InlineSignedProvisioningRequest> => this.request('provisioning.createProvisioningRequest', []),
-    exportProvisioning: (request: InlineSignedProvisioningRequest): Promise<InlineSignedProvisioningPackage> => this.request('provisioning.exportProvisioning', [request]),
-    importProvisioning: (value: InlineSignedProvisioningPackage): Promise<void> => this.request('provisioning.importProvisioning', [value]),
+  /** Owner-composed named actions and notices; requires the `extensions` capability. */
+  readonly extensions = {
+    call: <T = unknown>(name: string, args: readonly unknown[] = [], options: WaitOptions = {}): Promise<T> => this.request('extension.call', [name, args], options),
+    subscribe: (listener: (value: unknown) => void): (() => void) => { this.#extensions.add(listener); return () => { this.#extensions.delete(listener) } },
   }
   readonly signals = {
     delivery: 'application' as const,
@@ -162,7 +162,7 @@ export class WorkerApplicationSession {
     readBytes: (reference: ContentReference, options: ContentReadBytesOptions) => readContentBytes(this.content, reference, options),
   }
   readEvents(options: ApplicationEventOptions = {}): Promise<ReturnType<ApplicationReadView['readEvents']>> { return this.request('events.read', [options]) }
-  #detach(reason: unknown): void { if (this.signal.aborted) return; this.#attachmentState = 'detached'; clearInterval(this.#heartbeat); this.#status = { ...this.#status, phase: 'closed', database: 'closed', canAuthor: false }; for (const listener of this.#statuses) { try { listener(this.status) } catch { /* Isolated observers. */ } }; this.#lifetime.abort(reason); this.#endpoint.removeEventListener('message', this.#receive); const physical = this.#endpoint as unknown as EventTarget & { off?(type: string, listener: () => void): void }; physical.removeEventListener('close', this.#physicalClose); physical.removeEventListener('messageerror', this.#physicalClose); physical.off?.('close', this.#physicalClose); physical.off?.('messageerror', this.#physicalClose); for (const pending of this.#pending.values()) { clearTimeout(pending.timer); pending.cleanup(); pending.reject(reason) }; this.#pending.clear(); this.#statuses.clear(); this.#changes.clear(); this.#endpoint.close?.() }
+  #detach(reason: unknown): void { if (this.signal.aborted) return; this.#attachmentState = 'detached'; clearInterval(this.#heartbeat); this.#status = { ...this.#status, phase: 'closed', database: 'closed', canAuthor: false }; for (const listener of this.#statuses) { try { listener(this.status) } catch { /* Isolated observers. */ } }; this.#lifetime.abort(reason); this.#endpoint.removeEventListener('message', this.#receive); const physical = this.#endpoint as unknown as EventTarget & { off?(type: string, listener: () => void): void }; physical.removeEventListener('close', this.#physicalClose); physical.removeEventListener('messageerror', this.#physicalClose); physical.off?.('close', this.#physicalClose); physical.off?.('messageerror', this.#physicalClose); for (const pending of this.#pending.values()) { clearTimeout(pending.timer); pending.cleanup(); pending.reject(reason) }; this.#pending.clear(); this.#statuses.clear(); this.#changes.clear(); this.#extensions.clear(); this.#endpoint.close?.() }
   async close(): Promise<void> { if (this.signal.aborted) return; for (const id of this.#ownedViews) void this.request('view.release', [id]).catch(() => undefined); try { await this.request('close', [], { timeoutMs: 1000 }) } finally { this.#detach(new Error('ENDPOINT_CLOSED')) } }
 }
 export async function connectApplicationOwner(endpoint: ApplicationWorkerEndpoint & { start?(): void }, options: { readonly applicationId: string; readonly context?: InlineApplicationEndpointContext }): Promise<WorkerApplicationSession> {

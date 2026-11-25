@@ -51,7 +51,7 @@ The native program-step ABI uses `mode: "replicated"` and `ddlPermissions` inste
 
 ## Browser-first and reactive consumers
 
-After initial enrollment/key provisioning, local identity/authority/store reopening must not wait for remote discovery, host refresh, agent availability or finality. A fresh browser still needs its actual keys; no plaintext key material enters authored assets.
+After creation or admission and key wrapping, local identity/authority/store reopening must not wait for remote discovery, host refresh, agent availability or finality. A fresh browser still needs its actual keys; no plaintext key material enters authored assets.
 
 Render domain UI from coherent materialized snapshots plus separate local view/draft state. Notifications invalidate/rederive; they are not an append-only source for a second UI database. Late state/schema changes update rows, counts, inspectors and outcomes, preserve stable-ID focus/drafts, and expose stale-query errors honestly. Local durable submission—not network readiness—gates the ordinary Save action.
 
