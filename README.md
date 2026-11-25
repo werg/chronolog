@@ -86,13 +86,9 @@ Tendriller or its cookbooks.
 ## Documentation
 
 - [Session API reference](packages/peer-session/README.md)
-<<<<<<< HEAD
+- [Worker lifetime and conversation delivery](packages/peer-session/README.md#separate-the-session-owner-request-worker-and-conversation-host)
 - [Authored operation-set contract](docs/CRDT_CONTRACT.md)
 - [Architecture and authority](docs/authored-operation-set.md)
-=======
-- [Worker lifetime and conversation delivery](packages/peer-session/README.md#separate-the-session-owner-request-worker-and-conversation-host)
-- [Architecture and authority](docs/peer-generation-v1.md)
->>>>>>> origin/main
 - [Deterministic SQL](docs/implementation-specs/10-deterministic-sql-transactions.md)
 - [Row ownership](docs/design-owner-rows.md)
 - [Sealed values](docs/sealed-data.md)

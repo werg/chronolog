@@ -250,59 +250,7 @@ count. Closing the last store retires that worker; disposable SQL device directo
 process-exit cleanup listener. SQL engine and transport resources remain explicit rather than
 being implied by the record-store pool.
 
-<<<<<<< HEAD
 ## Attachment boundaries and lifetime
-=======
-### Separate the session owner, request worker and conversation host
-
-A connected session establishes peer transport and authorized application access.
-It does not establish that an assistant is processing requests. One native owner
-can keep several pages connected while a separate worker is stopped, or while a
-one-shot event waiter has already returned. A forwarder can successfully deliver
-a notice while the destination conversation remains idle.
-
-Bind live availability to the actual request handler's lifetime and advertised
-topics. Workers sharing one signer need distinct consumer/run identities; the
-signer alone cannot distinguish a mailbox fetcher from an assistant. Publish
-short-lived [signals](../signals/README.md#worker-presence) only while that worker
-can accept the named work. Stop its observer, timer and availability announcement
-when it exits. A best-effort stopped signal helps graceful shutdown; expiry must
-also handle a crash. Do not renew an assistant heartbeat from the session owner's
-transport loop, and do not append periodic durable events merely to keep a badge
-green. Durable receipt and answer commands remain separate evidence.
-
-The `cursors` map in the example above illustrates the checkpoint interface; it
-does not survive process exit. A supervised consumer supplies a durable store
-scoped by application, history, consumer and filter version, with one writer per
-checkpoint. Preserve the last handled cursor through failure, retain stable
-request/event identities for deduplication, and save progress only after the
-required work has a durable outcome. A notice accepted by a conversation host
-can advance that notice-delivery checkpoint; it cannot advance the independent
-request-handler checkpoint. Reconnect and drain retained work before waiting for
-another signal. See [recovery review](#review-and-resume-after-a-generation-change)
-before resuming an invalidated cursor.
-
-Chronolog exposes observation and forwarding, not a model execution loop.
-An external host adapter must establish how it submits work to the exact
-conversation, injects input into its active turn or starts/resumes an idle turn,
-serializes dispatch and reports blocked delivery. For Codex, a plain CLI queue
-waits while a turn is running. A receiver that must inject incoming requests
-uses the verified `turn/steer` route with the observed active turn identity;
-queue/resume is the idle/unloaded route. Steering makes input available at the
-next applicable continuation boundary, not an interruption of an in-flight tool.
-Preserve explicit user interruption and uncertain admission outcomes. See Tendriller's maintained
-[conversation-delivery qualification](https://github.com/werg/tendriller/blob/master/docs/CONVERSATION_DELIVERY.md)
-and [worker-owned request example](https://github.com/werg/tendriller/blob/master/docs/AGENT_REQUESTS.md).
-A CLI queue or app-server API must be qualified against the installed host and
-same conversation; no Chronolog method implies that every Codex or ChatGPT
-surface supports it. Verify a request reaches the same active Codex turn before
-it ends, then verify idle wake and a second request after the answering turn ends.
-A notice queued until completion does not pass the active-delivery check. Stop
-only the worker while leaving the native session connected to verify that its
-availability disappears and unanswered requests remain retained.
-
-## Run a device inside celld
->>>>>>> origin/main
 
 Owner attachment capabilities independently name `commands`, `queries`, `events`, `content`, `signals`, `operations`, `diagnostics`, `finality`, and `provisioning`. Diagnostic access only reads public authority/endpoint metadata; it does not grant private finalizer or key-provisioning actions. Configured command/query allowlists and captured raw-SQL/event checks remain independent. `prepareCommand` receives the actual owner-bound endpoint context, not an unverified document label.
 
@@ -331,3 +279,50 @@ node tools/package-peer-session.mjs --sql-native --sql-browser --sql-wasm --sql-
 The default suite reports optional actual-Celld bridge skips unless `CHRONOLOG_CELLD_BINARY` names the rebuilt engine. Browser/native RTC diagnostics run separately. Dirty-source diagnostics are not clean release attestations; deployment is a separate action.
 
 See [release hardening](../../docs/release-hardening.md) and [browser storage](../../docs/browser-storage.md) for qualification boundaries.
+
+### Separate the session owner, request worker and conversation host
+
+A connected session establishes peer transport and authorized application access.
+It does not establish that an assistant is processing requests. One native owner
+can keep several pages connected while a separate worker is stopped, or while a
+one-shot event waiter has already returned. A forwarder can successfully deliver
+a notice while the destination conversation remains idle.
+
+Bind live availability to the actual request handler's lifetime and advertised
+topics. Workers sharing one signer need distinct consumer/run identities; the
+signer alone cannot distinguish a mailbox fetcher from an assistant. Publish
+short-lived [signals](../signals/README.md#worker-presence) only while that worker
+can accept the named work. Stop its observer, timer and availability announcement
+when it exits. A best-effort stopped signal helps graceful shutdown; expiry must
+also handle a crash. Do not renew an assistant heartbeat from the session owner's
+transport loop, and do not append periodic durable events merely to keep a badge
+green. Durable receipt and answer commands remain separate evidence.
+
+A supervised event consumer supplies a durable checkpoint scoped by application,
+consumer, filter and captured revision, with one writer per checkpoint. A stored
+snapshot cursor does not remain valid after the projection is revised: handle the
+explicit reset/stale-cursor boundary and rederive the current effective view.
+Preserve stable authenticated event/request identities for deduplication and save
+progress only after the required work has a durable outcome. A notice accepted by
+a conversation host cannot advance the independent request-handler checkpoint.
+Reconnect and inspect retained work before waiting for another disposable signal;
+provisional events do not grant irreversible or exactly-once external effects.
+
+Chronolog exposes observation and forwarding, not a model execution loop.
+An external host adapter must establish how it submits work to the exact
+conversation, injects input into its active turn or starts/resumes an idle turn,
+serializes dispatch and reports blocked delivery. For Codex, a plain CLI queue
+waits while a turn is running. A receiver that must inject incoming requests
+uses the verified `turn/steer` route with the observed active turn identity;
+queue/resume is the idle/unloaded route. Steering makes input available at the
+next applicable continuation boundary, not an interruption of an in-flight tool.
+Preserve explicit user interruption and uncertain admission outcomes. See Tendriller's maintained
+[conversation-delivery qualification](https://github.com/werg/tendriller/blob/master/docs/CONVERSATION_DELIVERY.md)
+and [worker-owned request example](https://github.com/werg/tendriller/blob/master/docs/AGENT_REQUESTS.md).
+A CLI queue or app-server API must be qualified against the installed host and
+same conversation; no Chronolog method implies that every Codex or ChatGPT
+surface supports it. Verify a request reaches the same active Codex turn before
+it ends, then verify idle wake and a second request after the answering turn ends.
+A notice queued until completion does not pass the active-delivery check. Stop
+only the worker while leaving the native session connected to verify that its
+availability disappears and unanswered requests remain retained.
