@@ -42,8 +42,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - name: Check qualified companion source pins
-        run: node --test tools/test-companion-workflow-pins.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm docs:check

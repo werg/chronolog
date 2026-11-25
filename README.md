@@ -73,23 +73,12 @@ node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-sessio
 node tools/package-peer-generation-control.mjs
 ```
 
-## Independent source CI
+## Package and browser CI
 
-The application qualification workflow tests the current kernel archive against
-an exact independently reviewed consumer. Its default consumer commit lives in
-[`distribution/source-qualification.json`](distribution/source-qualification.json).
-This source-only pin is not evidence that the combination is qualified and does
-not change the immutable release receipt in
-[`distribution/companion-release.json`](distribution/companion-release.json).
-The host still defaults to the receipt's exact reviewed core commit.
-
-The selector gives explicit workflow-dispatch `contrib_ref` precedence over the
-source consumer pin; without a source pin argument its library API retains the
-receipt's consumer default. Explicit `host_ref` overrides the receipt's host.
-All selected refs must be full commit SHAs, and CI verifies both checkout
-identities. Reports retain the actual consumer commit/tree, kernel archive
-provenance and host artifacts; only the release promotion process may record a
-new qualified composition. Updating the source pin never promotes a release.
+The package and browser workflow builds the public session archives, installs
+them in a clean consumer, and exercises Worker RTC endpoints and Chromium/WebKit
+record stores. Chronolog CI tests Chronolog only; it does not check out or pin
+Tendriller or its cookbooks.
 
 ## Documentation
 
