@@ -1,5 +1,7 @@
 // Kept as JavaScript source so the same worker runs from TypeScript sources,
 // compiled JS and the self-contained distribution bundle without a TS loader.
+// One pool worker serves every NativeBytesStore in the process. Each store is a
+// separate SQLite file addressed by its numeric handle.
 export const nativeWorkerSource = String.raw`
 (async () => {
 const { parentPort, workerData } = await import('node:worker_threads')
@@ -8,99 +10,132 @@ const require = createRequire(workerData.sqliteModule)
 const { mkdirSync } = require('node:fs')
 const { dirname } = require('node:path')
 const Database = require(workerData.sqliteModule)
-let db, used = 0, restoring = false, restoredBytes = 0
-const quota = workerData.options.quotaBytes ?? 256 * 1024 * 1024
-const maxValue = workerData.options.maxValueBytes ?? 128 * 1024 * 1024
+const stores = new Map()
 function error(message) { throw new Error(message) }
-function validate(key, value) {
+function validate(store, key, value) {
   if (typeof key !== 'string' || key.length === 0 || key.length > 4096 || [...key].some(c => c.charCodeAt(0) < 32)) error('BYTES_STORE_KEY_INVALID')
-  if (value !== undefined && (!(value instanceof Uint8Array) || value.length > maxValue)) error('BYTES_STORE_VALUE_TOO_LARGE')
+  if (value !== undefined && (!(value instanceof Uint8Array) || value.length > store.maxValue)) error('BYTES_STORE_VALUE_TOO_LARGE')
 }
-function reply(id, value, cause) {
-  parentPort.postMessage({ id, value, used, ...(cause ? { error: { message: cause.message, code: cause.code } } : {}) })
+function reply(id, store, value, cause) {
+  parentPort.postMessage({ id, value, used: store?.used ?? 0, ...(cause ? { error: { message: cause.message, code: cause.code } } : {}) })
 }
-try {
-  if (workerData.path !== ':memory:') mkdirSync(dirname(workerData.path), { recursive: true })
-  db = new Database(workerData.path, { timeout: 0 })
-  db.exec('PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS stored_bytes (key TEXT PRIMARY KEY, value BLOB NOT NULL); COMMIT')
-  used = db.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get().bytes
-} catch (cause) {
-  try { db?.close() } catch {}
-  if (/locked|busy/i.test(cause.message)) cause = new Error('BYTES_STORE_IN_USE', { cause })
-  reply(0, undefined, cause)
-  parentPort.close()
-  return
-}
-const get = db.prepare('SELECT value FROM stored_bytes WHERE key = ?')
-const size = db.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?')
-const put = db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-const insert = db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?)')
-const remove = db.prepare('DELETE FROM stored_bytes WHERE key = ?')
-const count = db.prepare('SELECT count(*) AS count FROM stored_bytes')
-const page = db.prepare('SELECT key,value FROM stored_bytes WHERE key > ? ORDER BY key')
-reply(0)
-parentPort.on('message', ({ id, method, args }) => {
+function open(handle, { path, options }) {
+  if (stores.has(handle)) error('BYTES_STORE_HANDLE_IN_USE')
+  let db
   try {
-    let value
-    if (method === 'getMany') {
-      if (!Array.isArray(args.keys) || args.keys.length > 128) error('BYTES_STORE_BATCH_LIMIT')
-      value = args.keys.map(key => { validate(key); return get.get(key)?.value ?? null })
-    } else if (method === 'get') { validate(args.key); value = get.get(args.key)?.value ?? null }
-    else if (method === 'put') {
-      validate(args.key, args.value)
-      const next = used - (size.get(args.key)?.bytes ?? 0) + args.value.length
-      if (next > quota) error('BYTES_STORE_QUOTA_EXCEEDED')
-      put.run(args.key, args.value); used = next
-    } else if (method === 'putMany') {
-      if (!Array.isArray(args.entries) || args.entries.length > 128) error('BYTES_STORE_BATCH_LIMIT')
-      const staged = new Map()
-      for (const entry of args.entries) { validate(entry.key, entry.value); staged.set(entry.key, entry.value) }
-      let next = used
-      for (const [k, v] of staged) next = next - (size.get(k)?.bytes ?? 0) + v.length
-      if (next > quota) error('BYTES_STORE_QUOTA_EXCEEDED')
-      db.exec('BEGIN IMMEDIATE')
-      try {
-        for (const [k, v] of staged) put.run(k, v)
-        db.exec('COMMIT')
-        used = next
-      } catch (cause) { try { db.exec('ROLLBACK') } catch {} throw cause }
-    } else if (method === 'delete') {
-      validate(args.key)
-      const prior = size.get(args.key)?.bytes ?? 0
-      remove.run(args.key); used -= prior
-    } else if (method === 'page') {
-      value = []; let bytes = 0
-      for (const row of page.iterate(args.after)) {
-        value.push(row); bytes += row.value.length
-        if (value.length >= 64 || bytes >= 1024 * 1024) break
-      }
-    } else if (method === 'restoreBegin') {
-      if (restoring) error('BYTES_STORE_RESTORE_IN_PROGRESS')
-      db.exec('BEGIN IMMEDIATE')
-      if (count.get().count !== 0) { db.exec('ROLLBACK'); value = false }
-      else { restoring = true; restoredBytes = 0; value = true }
-    } else if (method === 'restorePut') {
-      if (!restoring) error('BYTES_STORE_RESTORE_NOT_STARTED')
-      validate(args.key, args.value)
-      if (restoredBytes + args.value.length > quota) error('BYTES_STORE_QUOTA_EXCEEDED')
-      try { insert.run(args.key, args.value) } catch (cause) {
-        if (cause.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') error('BYTES_STORE_DUPLICATE_KEY')
-        throw cause
-      }
-      restoredBytes += args.value.length
-    } else if (method === 'restoreCommit') {
-      if (!restoring) error('BYTES_STORE_RESTORE_NOT_STARTED')
-      db.exec('COMMIT'); restoring = false; used = restoredBytes
-    } else if (method === 'restoreAbort') {
-      if (restoring) { db.exec('ROLLBACK'); restoring = false }
-    } else if (method === 'checkpoint') db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-    else if (method === 'close') {
-      if (restoring) { db.exec('ROLLBACK'); restoring = false }
-      db.close()
-    } else error('BYTES_STORE_METHOD_INVALID')
-    reply(id, value)
-    if (method === 'close') parentPort.close()
-  } catch (cause) { reply(id, undefined, cause) }
+    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
+    db = new Database(path, { timeout: 0 })
+    db.exec('PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS stored_bytes (key TEXT PRIMARY KEY, value BLOB NOT NULL); COMMIT')
+  } catch (cause) {
+    try { db?.close() } catch {}
+    if (/locked|busy/i.test(cause.message)) throw new Error('BYTES_STORE_IN_USE', { cause })
+    throw cause
+  }
+  const store = {
+    db, restoring: false, restoredBytes: 0,
+    quota: options.quotaBytes ?? 256 * 1024 * 1024,
+    maxValue: options.maxValueBytes ?? 128 * 1024 * 1024,
+    used: db.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get().bytes,
+    get: db.prepare('SELECT value FROM stored_bytes WHERE key = ?'),
+    size: db.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?'),
+    put: db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'),
+    insert: db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?)'),
+    remove: db.prepare('DELETE FROM stored_bytes WHERE key = ?'),
+    count: db.prepare('SELECT count(*) AS count FROM stored_bytes'),
+    page: db.prepare('SELECT key,value FROM stored_bytes WHERE key > ? ORDER BY key'),
+  }
+  stores.set(handle, store)
+  return store
+}
+function run(store, method, args) {
+  const db = store.db
+  if (method === 'getMany') {
+    if (!Array.isArray(args.keys) || args.keys.length > 128) error('BYTES_STORE_BATCH_LIMIT')
+    return args.keys.map(key => { validate(store, key); return store.get.get(key)?.value ?? null })
+  }
+  if (method === 'get') { validate(store, args.key); return store.get.get(args.key)?.value ?? null }
+  if (method === 'put') {
+    validate(store, args.key, args.value)
+    const next = store.used - (store.size.get(args.key)?.bytes ?? 0) + args.value.length
+    if (next > store.quota) error('BYTES_STORE_QUOTA_EXCEEDED')
+    store.put.run(args.key, args.value); store.used = next
+    return undefined
+  }
+  if (method === 'putMany') {
+    if (!Array.isArray(args.entries) || args.entries.length > 128) error('BYTES_STORE_BATCH_LIMIT')
+    const staged = new Map()
+    for (const entry of args.entries) { validate(store, entry.key, entry.value); staged.set(entry.key, entry.value) }
+    let next = store.used
+    for (const [k, v] of staged) next = next - (store.size.get(k)?.bytes ?? 0) + v.length
+    if (next > store.quota) error('BYTES_STORE_QUOTA_EXCEEDED')
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const [k, v] of staged) store.put.run(k, v)
+      db.exec('COMMIT')
+      store.used = next
+    } catch (cause) { try { db.exec('ROLLBACK') } catch {} throw cause }
+    return undefined
+  }
+  if (method === 'delete') {
+    validate(store, args.key)
+    const prior = store.size.get(args.key)?.bytes ?? 0
+    store.remove.run(args.key); store.used -= prior
+    return undefined
+  }
+  if (method === 'page') {
+    const value = []; let bytes = 0
+    for (const row of store.page.iterate(args.after)) {
+      value.push(row); bytes += row.value.length
+      if (value.length >= 64 || bytes >= 1024 * 1024) break
+    }
+    return value
+  }
+  if (method === 'restoreBegin') {
+    if (store.restoring) error('BYTES_STORE_RESTORE_IN_PROGRESS')
+    db.exec('BEGIN IMMEDIATE')
+    if (store.count.get().count !== 0) { db.exec('ROLLBACK'); return false }
+    store.restoring = true; store.restoredBytes = 0
+    return true
+  }
+  if (method === 'restorePut') {
+    if (!store.restoring) error('BYTES_STORE_RESTORE_NOT_STARTED')
+    validate(store, args.key, args.value)
+    if (store.restoredBytes + args.value.length > store.quota) error('BYTES_STORE_QUOTA_EXCEEDED')
+    try { store.insert.run(args.key, args.value) } catch (cause) {
+      if (cause.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') error('BYTES_STORE_DUPLICATE_KEY')
+      throw cause
+    }
+    store.restoredBytes += args.value.length
+    return undefined
+  }
+  if (method === 'restoreCommit') {
+    if (!store.restoring) error('BYTES_STORE_RESTORE_NOT_STARTED')
+    db.exec('COMMIT'); store.restoring = false; store.used = store.restoredBytes
+    return undefined
+  }
+  if (method === 'restoreAbort') {
+    if (store.restoring) { db.exec('ROLLBACK'); store.restoring = false }
+    return undefined
+  }
+  if (method === 'checkpoint') { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); return undefined }
+  error('BYTES_STORE_METHOD_INVALID')
+}
+parentPort.on('message', ({ id, handle, method, args }) => {
+  let store
+  try {
+    if (method === 'open') { store = open(handle, args); reply(id, store); return }
+    store = stores.get(handle)
+    if (store === undefined) error('BYTES_STORE_CLOSED')
+    if (method === 'close') {
+      stores.delete(handle)
+      if (store.restoring) { try { store.db.exec('ROLLBACK') } catch {} store.restoring = false }
+      store.db.close()
+      reply(id, store)
+      return
+    }
+    reply(id, store, run(store, method, args))
+  } catch (cause) { reply(id, store, undefined, cause) }
 })
+parentPort.postMessage({ id: 0, used: 0 })
 })()
 `

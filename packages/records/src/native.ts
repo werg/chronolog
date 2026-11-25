@@ -8,19 +8,85 @@ export interface NativeBytesStoreOptions {
   readonly maxValueBytes?: number
 }
 interface Response { readonly id: number; readonly value?: unknown; readonly used: number; readonly error?: { readonly message: string; readonly code?: string } }
+interface Reply { readonly value: unknown; readonly used: number }
 
-/** Stable SQLite in a dedicated worker. Await open() for acquisition and close() for release. */
+/** Diagnostic view of the process-wide store pool. */
+export interface NativeBytesStorePoolStatus {
+  /** Worker thread serving every open store, or null when no store is open. */
+  readonly threadId: number | null
+  readonly stores: number
+}
+
+/**
+ * One worker thread multiplexing every NativeBytesStore in the process by handle.
+ * The worker starts with the first store and exits once the last store closes.
+ */
+class NativeStorePool {
+  readonly worker: Worker
+  readonly #requests = new Map<number, { resolve(reply: Reply): void; reject(error: unknown): void }>()
+  readonly #ready: Promise<void>
+  #nextId = 0
+  #nextHandle = 0
+  #stores = 0
+  #terminating = false
+  failure: Error | undefined
+
+  constructor() {
+    this.worker = new Worker(nativeWorkerSource, { eval: true,
+      workerData: { sqliteModule: createRequire(import.meta.url).resolve('better-sqlite3') } })
+    this.#ready = new Promise((resolve, reject) => { this.#requests.set(0, { resolve: () => resolve(), reject }) })
+    void this.#ready.catch(() => undefined)
+    this.worker.on('message', (response: Response) => {
+      const request = this.#requests.get(response.id)
+      this.#requests.delete(response.id)
+      if (response.error === undefined) request?.resolve({ value: response.value, used: response.used })
+      else request?.reject(Object.assign(new Error(response.error.message), response.error.code === undefined ? {} : { code: response.error.code }))
+      if (this.#requests.size === 0) this.worker.unref()
+    })
+    this.worker.on('error', (error: Error) => this.#fail(error))
+    this.worker.on('exit', code => { if (!this.#terminating || this.#requests.size !== 0) this.#fail(new Error(`BYTES_STORE_WORKER_EXIT: ${code}`)) })
+  }
+  get stores(): number { return this.#stores }
+  acquire(): number { this.#stores++; return ++this.#nextHandle }
+  release(): void {
+    if (--this.#stores !== 0) return
+    this.#terminating = true
+    if (pool === this) pool = undefined
+    void this.worker.terminate()
+  }
+  #fail(error: Error): void {
+    this.failure ??= error
+    if (pool === this) pool = undefined
+    for (const request of this.#requests.values()) request.reject(error)
+    this.#requests.clear()
+  }
+  async request(handle: number, method: string, args: unknown = {}): Promise<Reply> {
+    await this.#ready
+    if (this.failure !== undefined) throw this.failure
+    const id = ++this.#nextId
+    return new Promise<Reply>((resolve, reject) => {
+      this.#requests.set(id, { resolve, reject })
+      this.worker.ref()
+      try { this.worker.postMessage({ id, handle, method, args }) }
+      catch (error) { this.#requests.delete(id); if (this.#requests.size === 0) this.worker.unref(); reject(error) }
+    })
+  }
+}
+let pool: NativeStorePool | undefined
+
+/**
+ * Stable SQLite file served by the process-wide store pool worker.
+ * Await open() for acquisition and close() for release; each store keeps its own file and exclusive lock.
+ */
 export class NativeBytesStore implements BytesStore {
-  readonly #worker: Worker
-  readonly #requests = new Map<number, { resolve(value: unknown): void; reject(error: unknown): void }>()
+  readonly #pool: NativeStorePool
+  readonly #handle: number
   readonly #ready: Promise<void>
   readonly #maxValueBytes: number
   #pending: Promise<unknown> = Promise.resolve()
-  #nextId = 0
   #usedBytes = 0
   #closed = false
   #closing: Promise<void> | undefined
-  #failure: Error | undefined
 
   constructor(path: string, options: NativeBytesStoreOptions = {}) {
     if (path.length === 0) throw new Error('BYTES_STORE_PATH_REQUIRED')
@@ -28,41 +94,31 @@ export class NativeBytesStore implements BytesStore {
       if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new Error('BYTES_STORE_QUOTA_INVALID')
     }
     this.#maxValueBytes = options.maxValueBytes ?? 128 * 1024 * 1024
-    this.#worker = new Worker(nativeWorkerSource, { eval: true,
-      workerData: { path, options, sqliteModule: createRequire(import.meta.url).resolve('better-sqlite3') } })
-    this.#ready = new Promise((resolve, reject) => { this.#requests.set(0, { resolve: () => resolve(), reject }) })
+    const limits = {
+      ...(options.quotaBytes === undefined ? {} : { quotaBytes: options.quotaBytes }),
+      ...(options.maxValueBytes === undefined ? {} : { maxValueBytes: options.maxValueBytes }),
+    }
+    this.#pool = pool ??= new NativeStorePool()
+    this.#handle = this.#pool.acquire()
+    this.#ready = this.#pool.request(this.#handle, 'open', { path, options: limits }).then(
+      reply => { this.#usedBytes = reply.used },
+      error => { this.#pool.release(); throw error })
     void this.#ready.catch(() => undefined)
-    this.#worker.on('message', (response: Response) => {
-      this.#usedBytes = response.used
-      const request = this.#requests.get(response.id)
-      this.#requests.delete(response.id)
-      if (response.error === undefined) request?.resolve(response.value)
-      else request?.reject(Object.assign(new Error(response.error.message), response.error.code === undefined ? {} : { code: response.error.code }))
-      if (this.#requests.size === 0) this.#worker.unref()
-    })
-    this.#worker.on('error', (error: Error) => this.#fail(error))
-    this.#worker.on('exit', code => { if (!this.#closed || this.#requests.size !== 0) this.#fail(new Error(`BYTES_STORE_WORKER_EXIT: ${code}`)) })
   }
   static async open(path: string, options: NativeBytesStoreOptions = {}): Promise<NativeBytesStore> {
     const store = new NativeBytesStore(path, options)
-    try { await store.#ready; return store }
-    catch (error) { await store.#worker.terminate(); throw error }
+    await store.#ready
+    return store
   }
-  #fail(error: Error): void {
-    this.#failure = error
-    for (const request of this.#requests.values()) request.reject(error)
-    this.#requests.clear()
+  /** The shared worker and how many stores it currently serves. */
+  static poolStatus(): NativeBytesStorePoolStatus {
+    return Object.freeze({ threadId: pool?.worker.threadId ?? null, stores: pool?.stores ?? 0 })
   }
   async #request<T>(method: string, args: unknown = {}): Promise<T> {
     await this.#ready
-    if (this.#failure !== undefined) throw this.#failure
-    const id = ++this.#nextId
-    return new Promise<T>((resolve, reject) => {
-      this.#requests.set(id, { resolve: value => resolve(value as T), reject })
-      this.#worker.ref()
-      try { this.#worker.postMessage({ id, method, args }) }
-      catch (error) { this.#requests.delete(id); if (this.#requests.size === 0) this.#worker.unref(); reject(error) }
-    })
+    const reply = await this.#pool.request(this.#handle, method, args)
+    this.#usedBytes = reply.used
+    return reply.value as T
   }
   #enqueue<T>(work: () => Promise<T>): Promise<T> {
     if (this.#closed) return Promise.reject(new Error('BYTES_STORE_CLOSED'))
@@ -131,7 +187,8 @@ export class NativeBytesStore implements BytesStore {
     if (this.#closing !== undefined) return this.#closing
     this.#closed = true
     this.#closing = this.#pending.then(async () => {
-      try { await this.#request('close') } finally { await this.#worker.terminate() }
+      try { await this.#ready } catch { return }
+      try { await this.#request('close') } finally { this.#pool.release() }
     })
     return this.#closing
   }

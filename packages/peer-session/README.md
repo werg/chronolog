@@ -6,8 +6,8 @@ Public application session for Node.js and browser Workers. Owns device identity
 
 | Import | Purpose |
 | --- | --- |
-| `@chronolog/peer-session` | Definitions, session types, tools (`createApplicationTools`, `createScopedApplicationTools`), `createLiveView`, `forwardSessionEvents`, `createViewStore`, `operationReference`, `SessionError`, `canonicalJson`, control participant, owner lock, and authority helpers |
-| `@chronolog/peer-session/native` | `openNativeDevice`, `openNativeApplication`, `NativeBytesStore` |
+| `@chronolog/peer-session` | Definitions, session types, tools (`createApplicationTools`, `createScopedApplicationTools`), `createLiveView`, `forwardSessionEvents`, `forwardManySessionEvents`, `mergeSessionChanges`, `createViewStore`, `operationReference`, `SessionError`, `canonicalJson`, control participant, owner lock, and authority helpers |
+| `@chronolog/peer-session/native` | `openNativeDevice` (optional agent `managedSigner`), `openDisposableNativeDevice`, `openNativeApplication`, `NativeBytesStore` |
 | `@chronolog/peer-session/worker` | `openBrowserDevice`, `openBrowserApplication`, `serveApplicationWorker`, `probeBrowserCapabilities`, `createApplicationOwner` |
 | `@chronolog/peer-session/browser` | Page-side facade: `connectApplicationWorker`, `connectApplicationOwner`, `createLiveView`, `createViewStore`, `operationReference`, `SessionError` (no keys or durable storage) |
 | `@chronolog/peer-session/webrtc` | `openWebRtcConnection`, `connectApplicationWebRtc`, Worker RTC bridge |
@@ -54,7 +54,7 @@ For guarded SQL transactions, include `schema` on the definition, sign it with `
 ```ts
 import { openNativeDevice, openNativeApplication } from '@chronolog/peer-session/native'
 
-const device = await openNativeDevice({ path: './device.sqlite', mode: 'openOrCreate' })
+const device = await openNativeDevice({ path: './device.sqlite', create: true })
 const session = await openNativeApplication({ device, definition: notesApp, authority })
 ```
 
@@ -75,6 +75,58 @@ const session = await connectApplicationWorker({ port: worker })
 ```
 
 Existing devices should open with `mode: 'open'` so missing storage fails closed instead of minting a replacement identity.
+A native device reopens without `create`; pass `create: true` only during explicit setup.
+
+## Run many applications in one agent process
+
+An agent that serves many applications (for example one Tendriller page each)
+uses one signing identity and one device file per application. Pass the agent's
+Ed25519 identity as `managedSigner`. The device file records only its public key
+and storage binding, so the private key stays with the agent's own secret storage,
+and every resume must pass the same signer. Without `managedSigner` a native
+device creates and keeps its own device-local key, as a standalone participant does.
+
+```ts
+import { forwardManySessionEvents, mergeSessionChanges } from '@chronolog/peer-session'
+import { openNativeApplication, openNativeDevice } from '@chronolog/peer-session/native'
+
+const signer = await loadAgentSigner()  // PeerIdentity retained outside the device files
+const device = await openNativeDevice({ path: `./pages/${pageId}.sqlite`, create: true, managedSigner: signer })
+const session = await openNativeApplication({ device, definition, authority })
+
+const changes = mergeSessionChanges([session])  // or an async iterable that yields sessions as they open
+changes.add(otherSession)
+for await (const { applicationId, historyId, kind, revision, recovery } of changes) rederive(applicationId, kind)
+
+const forwarders = forwardManySessionEvents({
+  sessions: [session, otherSession], topics: ['note'],
+  checkpoints: { load: scope => cursors.get(scope.key), save: (scope, cursor) => cursors.set(scope.key, cursor) },
+  project: event => event.payload, deliver: payload => publish(payload),
+  onError: (error, failed) => report(failed.applicationId, error),
+})
+```
+
+All native device files in a process share one SQLite pool worker, and
+disposable SQL devices share one process `exit` cleanup listener, so dozens of
+sessions do not add threads or `MaxListenersExceededWarning`s. Each file keeps
+its own exclusive lock. The worker exits after the last store closes.
+
+`mergeSessionChanges(source, { signal, onError })` returns one invalidation
+stream of `{ applicationId, historyId, kind, revision, recovery }`. `source` is a
+collection of sessions or an async iterable registry; `add(session)` and
+`remove(session)` change membership at runtime, and a session whose own feed ends
+(for example because it closed) leaves automatically. At most one change per
+session waits for the consumer, so slow consumers see each session's coalesced
+latest change. A failing session feed is removed and passed to `onError`; without
+`onError` the merged stream fails. Treat each item as a cue to reread that
+session's view, as with `session.changes()`.
+
+`forwardManySessionEvents({ sessions, checkpoints, onError, ...forwarder })` runs
+`forwardSessionEvents` for each session with its own cursor. `checkpoints.load(scope)`
+and `save(scope, cursor)` receive `{ applicationId, historyId, key }`, where `key`
+is `sessionCheckpointKey(applicationId, historyId)`. A forwarder that stops with an
+error, including the recovery review stop, is removed and reported to `onError`;
+the other sessions continue. `close()` stops all forwarders and waits for them.
 
 ## Run a device inside celld
 
@@ -375,8 +427,11 @@ sink, SQL bytes are returned in memory. Streaming has no fixed aggregate quota;
 memory use follows one store value and bounded transport pages/frames. Individual
 values and the destination store remain subject to their configured quotas.
 
-Native records use stable prebuilt `better-sqlite3` bindings in a dedicated worker.
-Await `NativeBytesStore.open(path, options)` for acquisition and `await store.close()`
+Native records use stable prebuilt `better-sqlite3` bindings in one process-wide
+pool worker. Every `NativeBytesStore` remains its own SQLite file with its own
+exclusive lock; the worker multiplexes their handles, starts with the first open
+store and exits after the last one closes. `NativeBytesStore.poolStatus()` reports
+the serving `threadId` and open store count. Await `NativeBytesStore.open(path, options)` for acquisition and `await store.close()`
 for durable release before reopening or deleting the file. `checkpointWal()` also
 returns a promise; `usageBytes()` reports the last completed worker operation.
 Existing `node:sqlite`-created stores reopen without conversion. No native C/C++
