@@ -1,14 +1,26 @@
 import { frameRtcPeerChannels, WEBRTC_LIMITS } from './channel.js'
 import type { PeerDataChannelConnection } from './channel.js'
+import {
+  createPeerMediaAndStreams, serializeIceCandidate, validatePeerDescription, validatePeerIceCandidate,
+} from './renegotiation.js'
 import { observeWebRtcRoute } from './route.js'
-import type { PeerDescription, RtcPeerConnection, WebRtcChannels, WebRtcOptions, WebRtcSession } from './types.js'
+import type {
+  PeerDescription, PeerIceCandidate, PeerSignalingMessage, RtcPeerConnection,
+  WebRtcChannels, WebRtcOptions, WebRtcSession,
+} from './types.js'
 
 const PROTOCOL = 'chronolog.peer.v2'
+const MAX_INITIAL_TRICKLE_CANDIDATES = 32
+
+function isDescription(value: unknown): value is PeerDescription {
+  return typeof value === 'object' && value !== null && 'type' in value && 'sdp' in value
+}
 
 /**
  * Both fixed negotiated channels are created synchronously on each endpoint.
- * The callback attaches raw framing synchronously. The portable Worker bridge
- * forwards opaque frames; it does not transfer these channels.
+ * The callback attaches raw framing synchronously. Supports trickle ICE during
+ * initial rendezvous (default when adapter implements `addIceCandidate`) plus
+ * in-band W3C Perfect Negotiation after Chronolog peer authentication.
  */
 export async function negotiateWebRtc(options: WebRtcOptions & {
   readonly onDataChannels: (channels: WebRtcChannels) => void
@@ -23,22 +35,38 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     const factory = options.createPeerConnection ?? ((configuration: RTCConfiguration) => new RTCPeerConnection(configuration))
     connection = factory(structuredClone(options.configuration ?? {}))
   } catch (error) {
-    // The caller already handed us a signaling lifetime. Even a failed peer
-    // factory must retire it; an uncooperative cleanup cannot hide that error.
     void Promise.resolve().then(() => options.signaling.close()).catch(() => undefined)
     throw error
   }
   const controller = new AbortController(), signal = controller.signal
+  const useTrickle = options.trickle !== false && typeof connection.addIceCandidate === 'function'
   let negotiationFailed = false
   let closing: Promise<void> | undefined, outcome: WebRtcSession | undefined
   let negotiationError: unknown
   let sentMessages = 0, receivedMessages = 0, sentBytes = 0, receivedBytes = 0
+  let bootstrapActive = true
+  let localDescriptionSent = false
+  let sentCandidates = 0
+  const bufferedLocalCandidates: Array<PeerIceCandidate | null> = []
+  let remoteDescriptionSet = false
+  const bufferedRemoteCandidates: Array<PeerIceCandidate | null> = []
+
+  const mediaAndStreams = createPeerMediaAndStreams(connection, signal, {
+    onUnexpectedPreAuthChannel(unexpected) {
+      try { unexpected.close() } catch { /* Already closed. */ }
+      controller.abort(new Error('WEBRTC_CHANNEL_UNEXPECTED'))
+      void close().catch(() => undefined)
+    },
+  })
+
   const close = (): Promise<void> => {
     if (closing !== undefined) return closing
+    bootstrapActive = false
     controller.abort(new Error('WEBRTC_CONNECTION_CLOSED'))
     options.signal?.removeEventListener('abort', abort)
-    connection.removeEventListener('datachannel', dataChannel)
     connection.removeEventListener('connectionstatechange', failed)
+    connection.removeEventListener('icecandidate', onBootstrapCandidate)
+    mediaAndStreams.close()
     closing = Promise.resolve().then(() => connection.close())
     return closing
   }
@@ -50,34 +78,90 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
     }
   }
   connection.addEventListener('connectionstatechange', failed)
-  // Only the two predeclared lanes belong to this connection. A remote DCEP
-  // channel cannot inject a new unbound application path into the session.
-  const dataChannel: EventListener = event => {
-    const unexpected = (event as RTCDataChannelEvent).channel
-    unexpected.close()
-    controller.abort(new Error('WEBRTC_CHANNEL_UNEXPECTED'))
-    void close().catch(() => undefined)
+
+  const sendLocalCandidate = (candidate: PeerIceCandidate | null): void => {
+    if (!bootstrapActive || signal.aborted || sentCandidates >= MAX_INITIAL_TRICKLE_CANDIDATES) return
+    sentCandidates += 1
+    sentMessages += 1
+    sentBytes += candidate ? new TextEncoder().encode(candidate.candidate).length : 4
+    void Promise.resolve(options.signaling.send({ kind: 'candidate', candidate })).catch(() => undefined)
   }
-  connection.addEventListener('datachannel', dataChannel)
+
+  const onBootstrapCandidate: EventListener = event => {
+    if (!useTrickle || !bootstrapActive || signal.aborted) return
+    const raw = (event as { candidate?: unknown }).candidate
+    let candidate: PeerIceCandidate | null
+    try { candidate = serializeIceCandidate(raw) } catch { return }
+    if (!localDescriptionSent) {
+      if (bufferedLocalCandidates.length < MAX_INITIAL_TRICKLE_CANDIDATES) bufferedLocalCandidates.push(candidate)
+      return
+    }
+    sendLocalCandidate(candidate)
+  }
+  if (useTrickle) connection.addEventListener('icecandidate', onBootstrapCandidate)
+
   if (options.signal?.aborted === true) abort()
   const timeout = setTimeout(() => controller.abort(new Error('WEBRTC_NEGOTIATION_TIMEOUT')), timeoutMs)
-  let descriptions: AsyncIterator<PeerDescription> | undefined
-  const receivedDescription = async (type: PeerDescription['type']): Promise<PeerDescription> => {
-    const item = await interruptible(descriptions!.next(), signal)
-    if (item.done) throw new Error('WEBRTC_SIGNALING_ENDED')
-    const description = validateDescription(item.value, type)
-    receivedMessages += 1; receivedBytes += new TextEncoder().encode(description.sdp).length
-    return description
+  let messages: AsyncIterator<PeerSignalingMessage> | undefined
+
+  const applyRemoteCandidate = async (candidate: PeerIceCandidate | null): Promise<void> => {
+    if (typeof connection.addIceCandidate !== 'function') return
+    if (!remoteDescriptionSet) {
+      if (bufferedRemoteCandidates.length < MAX_INITIAL_TRICKLE_CANDIDATES + 4) {
+        bufferedRemoteCandidates.push(candidate)
+      }
+      return
+    }
+    try { await connection.addIceCandidate(candidate) } catch { /* Ignore stale/duplicate trickle candidate. */ }
   }
+
+  const flushBufferedCandidates = async (): Promise<void> => {
+    remoteDescriptionSet = true
+    if (typeof connection.addIceCandidate !== 'function') return
+    for (const candidate of bufferedRemoteCandidates.splice(0)) {
+      if (signal.aborted) return
+      try { await connection.addIceCandidate(candidate) } catch { /* Ignore stale candidate. */ }
+    }
+  }
+
+  const receivedDescription = async (type: PeerDescription['type']): Promise<PeerDescription> => {
+    while (true) {
+      const item = await interruptible(messages!.next(), signal)
+      if (item.done) throw new Error('WEBRTC_SIGNALING_ENDED')
+      const value = item.value
+      if (isDescription(value)) {
+        const description = validatePeerDescription(value, type)
+        receivedMessages += 1; receivedBytes += new TextEncoder().encode(description.sdp).length
+        return description
+      }
+      if (useTrickle && typeof value === 'object' && value !== null && 'kind' in value && value.kind === 'candidate') {
+        const candidate = validatePeerIceCandidate(value.candidate)
+        receivedMessages += 1
+        receivedBytes += candidate ? new TextEncoder().encode(candidate.candidate).length : 4
+        await applyRemoteCandidate(candidate)
+        continue
+      }
+      throw new Error('WEBRTC_DESCRIPTION_INVALID')
+    }
+  }
+
   const publish = async (type: PeerDescription['type']): Promise<void> => {
-    const complete = await gatherBatch(connection, gatheringMs, signal)
-    const description = validateDescription(connection.localDescription, type)
-    // Only locally generated SDP is inspected here. Preserve every candidate and
-    // SDP attribute; a slow server must not block a usable batch until full ICE.
-    if (!complete && !usableCandidate(description.sdp, options.configuration?.iceTransportPolicy)) throw new Error('WEBRTC_ICE_CANDIDATES_UNAVAILABLE')
+    if (!useTrickle) {
+      const complete = await gatherBatch(connection, gatheringMs, signal)
+      const description = validatePeerDescription(connection.localDescription, type)
+      if (!complete && !usableCandidate(description.sdp, options.configuration?.iceTransportPolicy)) throw new Error('WEBRTC_ICE_CANDIDATES_UNAVAILABLE')
+      await interruptible(options.signaling.send(description), signal)
+      sentMessages += 1; sentBytes += new TextEncoder().encode(description.sdp).length
+      return
+    }
+    const description = validatePeerDescription(connection.localDescription, type)
     await interruptible(options.signaling.send(description), signal)
     sentMessages += 1; sentBytes += new TextEncoder().encode(description.sdp).length
+    localDescriptionSent = true
+    for (const candidate of bufferedLocalCandidates.splice(0)) sendLocalCandidate(candidate)
   }
+
+  let trickleDrain: Promise<void> | undefined
   try {
     const channels: WebRtcChannels = {
       reliable: connection.createDataChannel('chronolog.reliable', { negotiated: true, id: 0, ordered: true, protocol: PROTOCOL }),
@@ -88,30 +172,64 @@ export async function negotiateWebRtc(options: WebRtcOptions & {
       void Promise.resolve(returned).catch(() => undefined)
       throw new Error('WEBRTC_CHANNEL_HANDOFF_MUST_BE_SYNCHRONOUS')
     }
-    descriptions = options.signaling.messages[Symbol.asyncIterator]()
+    messages = options.signaling.messages[Symbol.asyncIterator]()
     if (options.role === 'offerer') {
       await interruptible(connection.setLocalDescription(await interruptible(connection.createOffer(), signal)), signal)
       await publish('offer')
       await interruptible(connection.setRemoteDescription(await receivedDescription('answer')), signal)
+      await flushBufferedCandidates()
     } else {
       await interruptible(connection.setRemoteDescription(await receivedDescription('offer')), signal)
+      await flushBufferedCandidates()
       await interruptible(connection.setLocalDescription(await interruptible(connection.createAnswer(), signal)), signal)
       await publish('answer')
     }
+    // Keep reading incoming trickle candidates while waiting for ICE to connect.
+    if (useTrickle) {
+      trickleDrain = (async () => {
+        let receivedCandidates = 0
+        while (bootstrapActive && !signal.aborted && receivedCandidates <= MAX_INITIAL_TRICKLE_CANDIDATES + 4) {
+          const item = await messages.next()
+          if (item.done || !bootstrapActive) break
+          const value = item.value
+          if (typeof value === 'object' && value !== null && 'kind' in value && value.kind === 'candidate') {
+            receivedCandidates += 1
+            const candidate = validatePeerIceCandidate(value.candidate)
+            receivedMessages += 1
+            receivedBytes += candidate ? new TextEncoder().encode(candidate.candidate).length : 4
+            await applyRemoteCandidate(candidate)
+          }
+        }
+      })().catch(() => undefined)
+    }
     await waitFor(connection, 'connectionstatechange', () => connection.connectionState === 'connected', signal)
     signal.throwIfAborted()
-    outcome = { connection, signal, signaling: { sentMessages, receivedMessages, sentBytes, receivedBytes },
-      getRoute: () => observeWebRtcRoute(connection), close }
+    bootstrapActive = false
+    connection.removeEventListener('icecandidate', onBootstrapCandidate)
+    if (useTrickle) {
+      void Promise.resolve(options.signaling.send({ kind: 'connected' })).catch(() => undefined)
+    }
+    outcome = {
+      connection,
+      signal,
+      signaling: { sentMessages, receivedMessages, sentBytes, receivedBytes },
+      media: mediaAndStreams.media,
+      streams: mediaAndStreams.streams,
+      attachInBandSignaling: binding => mediaAndStreams.attachInBandSignaling(binding),
+      getRoute: () => observeWebRtcRoute(connection),
+      close,
+    }
   } catch (error) { negotiationFailed = true; negotiationError = error; await close().catch(() => undefined) }
+  bootstrapActive = false
+  connection.removeEventListener('icecandidate', onBootstrapCandidate)
   try { await interruptible(Promise.resolve().then(() => options.signaling.close()), signal) }
   catch (error) {
     await close().catch(() => undefined)
     if (!negotiationFailed) { negotiationFailed = true; negotiationError = error }
   }
   clearTimeout(timeout)
-  // close() is the signaling cancellation boundary; do not wait for a remote
-  // iterator return that can remain blocked after an aborted negotiation.
-  void Promise.resolve().then(() => descriptions?.return?.()).catch(() => undefined)
+  void trickleDrain
+  void Promise.resolve().then(() => messages?.return?.()).catch(() => undefined)
   if (negotiationFailed) throw negotiationError
   if (outcome === undefined) throw new Error('WEBRTC_NEGOTIATION_INCOMPLETE')
   return outcome
@@ -131,17 +249,13 @@ export async function openWebRtcConnection(options: WebRtcOptions): Promise<Peer
   try { await interruptible(selected.ready, AbortSignal.any([handshake.signal, session.signal])) }
   catch (error) { await selected.close(); await session.close(); throw error }
   finally { clearTimeout(timer) }
-  return { ready: selected.ready, signal: selected.signal, session, live: selected.live, get stats() { return selected.stats },
+  return {
+    ready: selected.ready, signal: selected.signal, session, live: selected.live,
+    get stats() { return selected.stats },
     send: (bytes, sendOptions) => selected.send(bytes, sendOptions),
-    frames: signal => selected.frames(signal), async close() { await selected.close(); await session.close() } }
-}
-
-function validateDescription(value: unknown, type: PeerDescription['type']): PeerDescription {
-  if (typeof value !== 'object' || value === null || !('type' in value) || value.type !== type || !('sdp' in value) ||
-      typeof value.sdp !== 'string' || value.sdp.length < 1 || new TextEncoder().encode(value.sdp).length > WEBRTC_LIMITS.sdpBytes) {
-    throw new Error('WEBRTC_DESCRIPTION_INVALID')
+    frames: signal => selected.frames(signal),
+    async close() { await selected.close(); await session.close() },
   }
-  return { type, sdp: value.sdp }
 }
 
 function interruptible<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -164,7 +278,7 @@ function waitFor(connection: RtcPeerConnection, event: string, complete: () => b
   })
 }
 
-/** Event-driven batch gathering. Only this active phase owns a timer. */
+/** Event-driven batch gathering (used only when trickle ICE is explicitly disabled). */
 function gatherBatch(connection: RtcPeerConnection, budgetMs: number, signal: AbortSignal): Promise<boolean> {
   signal.throwIfAborted()
   if (connection.iceGatheringState === 'complete') return Promise.resolve(true)

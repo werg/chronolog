@@ -38,11 +38,12 @@ export function createHttpWebRtcSignaling(options: {
       reading = true
       yield await answer.promise
     } },
-    async send(description) {
+    async send(message) {
+      if (!('type' in message)) return
       if (sent || closed) throw new Error('WEBRTC_HTTP_OFFER_ALREADY_SENT_OR_CLOSED')
       sent = true
       try {
-        const body = envelope(description, 'offer'), headers = new Headers(options.headers)
+        const body = envelope(message, 'offer'), headers = new Headers(options.headers)
         headers.set('Content-Type', 'application/json'); headers.set('Accept', 'application/json')
         requests++; requestBytes += new TextEncoder().encode(body).length
         const fetching = (options.fetch ?? globalThis.fetch)(url, { method: 'POST', headers, body, cache: 'no-store',
@@ -161,9 +162,9 @@ export function createWebRtcOfferHandler(options: {
         const body = await readJson(request, controller.signal)
         const offer = descriptionFromEnvelope(body.value, 'offer')
         offers++
-        opening = openWebRtcConnection({ role: 'answerer', signaling: {
+        opening = openWebRtcConnection({ role: 'answerer', trickle: false, signaling: {
           messages: { async *[Symbol.asyncIterator]() { yield offer } },
-          async send(description) { answer.resolve(description) },
+          async send(message) { if ('type' in message) answer.resolve(message) },
           close() { /* The one HTTP response owns signaling only, never the RTC session. */ },
         }, createPeerConnection: options.createPeerConnection, configuration: options.configuration ?? {}, timeoutMs, signal: controller.signal })
         const opened = await opening

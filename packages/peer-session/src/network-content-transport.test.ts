@@ -3,7 +3,7 @@ import { createServer } from 'node:http'
 import type { Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { FramedPeerConnection } from '@chronolog/records'
-import { openWebRtcConnection, type PeerDescription, type PeerSignaling } from '@chronolog/transport-webrtc'
+import { openWebRtcConnection, type PeerSignaling, type PeerSignalingMessage } from '@chronolog/transport-webrtc'
 import { createNativePeerConnection } from '@chronolog/transport-webrtc/native'
 import { openWebSocketConnection } from '@chronolog/transport-websocket'
 import { CONTENT_CHUNK_BYTES } from './content.js'
@@ -12,11 +12,26 @@ import { sessionFixture } from './test-fixture.js'
 
 const cleanup: Array<() => Promise<unknown>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+function mailbox() {
+  const items: PeerSignalingMessage[] = []
+  let wake: (() => void) | undefined, closed = false
+  return {
+    push(value: PeerSignalingMessage) { if (!closed) { items.push(value); wake?.(); wake = undefined } },
+    async *messages() {
+      while (true) {
+        if (items.length > 0) { yield items.shift()!; continue }
+        if (closed) return
+        await new Promise<void>(resolve => { wake = resolve })
+      }
+    },
+    close() { closed = true; wake?.(); wake = undefined },
+  }
+}
 function signaling(): readonly [PeerSignaling, PeerSignaling] {
-  const left = deferred<PeerDescription>(), right = deferred<PeerDescription>()
+  const left = mailbox(), right = mailbox()
   return [
-    { messages: { async *[Symbol.asyncIterator]() { yield await left.promise } }, send: async value => { right.resolve(structuredClone(value)) }, close() {} },
-    { messages: { async *[Symbol.asyncIterator]() { yield await right.promise } }, send: async value => { left.resolve(structuredClone(value)) }, close() {} },
+    { messages: left.messages(), send: async value => { right.push(structuredClone(value)) }, close: () => left.close() },
+    { messages: right.messages(), send: async value => { left.push(structuredClone(value)) }, close: () => right.close() },
   ]
 }
 async function rtc(): Promise<readonly [FramedPeerConnection, FramedPeerConnection]> {

@@ -5,7 +5,7 @@ export type { FramedPeerConnection, PeerLiveLane } from '@chronolog/records'
 export const APPLICATION_NETWORK_LIMITS = Object.freeze({
   messageBytes: 32 * 1024 * 1024, fragmentBytes: 48 * 1024, queuedMessages: 8,
   queuedBytes: 32 * 1024 * 1024, pendingRequests: 4, incomingRequests: 4,
-  rangeCommands: 32, rangeBytes: 4 * 1024 * 1024, peers: 8,
+  rangeCommands: 32, rangeBytes: 4 * 1024 * 1024, peers: 16,
 })
 export function networkError(code: string): Error { return new Error(code) }
 export function requireNetwork(value: unknown, code: string): asserts value {

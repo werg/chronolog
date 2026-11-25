@@ -82,6 +82,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   get signal(): AbortSignal { return this.#lifetime.signal }
   connectPeer(options: InlineApplicationPeerConnectOptions): Promise<InlineApplicationPeerLink> { return import('./network.js').then(module => module.connectApplicationPeer(this, options)) }
   diagnostics(): Promise<readonly InlineApplicationPeerDiagnostics[]> { return import('./network.js').then(module => module.applicationPeerDiagnostics(this)) }
+  peerLinks(): Promise<readonly InlineApplicationPeerLink[]> { return import('./network.js').then(module => module.applicationPeerLinks(this)) }
+  onPeerLink(listener: (event: { readonly type: 'connected' | 'disconnected'; readonly link: InlineApplicationPeerLink }) => void): Promise<() => void> {
+    return import('./network.js').then(module => module.onApplicationPeerLink(this, listener))
+  }
   get applicationId(): string { return this.authority.descriptor.applicationId }
   get identity(): { readonly publicKey: string } { return { publicKey: this.device.identity.publicKey } }
   get revision(): MaterializedRevision { return { ...this.#revision } }
@@ -295,7 +299,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #notify(): void { for (const listener of this.#listeners) { try { listener() } catch { /* Isolated observers. */ } }; for (const listener of this.#statusListeners) { try { listener(this.status) } catch { /* Isolated observers. */ } } }
   onStatus(listener: (value: SessionStatus) => void): () => void { this.#statusListeners.add(listener); try { listener(this.status) } catch { /* Observation cannot reject a committed session. */ }; return () => { this.#statusListeners.delete(listener) } }
   onChange(listener: (value: ApplicationChange) => void): () => void { this.#changeListeners.add(listener); return () => { this.#changeListeners.delete(listener) } }
-  setConnectedPeers(count: number): void { check(Number.isSafeInteger(count) && count >= 0 && count <= 8, 'SESSION_PEER_LIMIT'); if (count !== this.#connectedPeers) this.#connectionRevision++; this.#connectedPeers = count; this.#notify() }
+  setConnectedPeers(count: number): void { check(Number.isSafeInteger(count) && count >= 0 && count <= 16, 'SESSION_PEER_LIMIT'); if (count !== this.#connectedPeers) this.#connectionRevision++; this.#connectedPeers = count; this.#notify() }
   #scheduleReplay(): void {
     if (this.#closed) return
     this.#replayTail = this.#replayTail.then(() => this.#replay()).catch(error => { this.#error = error instanceof Error ? error : new Error('MATERIALIZATION_FAILED', { cause: error }); this.#database = 'failed'; this.#notify() })

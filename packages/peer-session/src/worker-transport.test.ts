@@ -108,9 +108,9 @@ describe('portable Worker RTC endpoint', () => {
     pair.worker.postMessage({ type: PROTOCOL, from: 'worker', id: crypto.randomUUID(), action: 'open', role: 'coordinator', timeoutMs: 5000 })
     await vi.waitFor(() => expect(pair.page.sent.at(-1)?.error).toBe('APPLICATION_WORKER_OPTIONS_INVALID'))
     expect(openWebRtcConnection).not.toHaveBeenCalled()
-    for (let i = 0; i < 9; i++) pair.worker.postMessage({ type: PROTOCOL, from: 'worker', id: crypto.randomUUID(), action: 'open', role: 'offerer', timeoutMs: 5000 })
+    for (let i = 0; i < 17; i++) pair.worker.postMessage({ type: PROTOCOL, from: 'worker', id: crypto.randomUUID(), action: 'open', role: 'offerer', timeoutMs: 5000 })
     await vi.waitFor(() => expect(pair.page.sent.at(-1)?.error).toBe('APPLICATION_PEER_LIMIT'))
-    expect(openWebRtcConnection).toHaveBeenCalledTimes(8)
+    expect(openWebRtcConnection).toHaveBeenCalledTimes(16)
     const first = page.close(); expect(page.close()).toBe(first); await first
   })
 
